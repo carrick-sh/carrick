@@ -4819,8 +4819,8 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
             [r_fd, BUF_ADDR, 1, 0, 0, 0],
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_ESPIPE),
-        "pwrite64 on pipe read end must return ESPIPE"
+        DispatchOutcome::errno(LINUX_EBADF),
+        "pwrite64 on pipe read end must return EBADF"
     );
     assert_eq!(
         dispatch_call(
@@ -4829,8 +4829,8 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
             [r_fd, IOV_ADDR, 1, 0, 0, 0],
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_ESPIPE),
-        "pwritev on pipe read end must return ESPIPE"
+        DispatchOutcome::errno(LINUX_EBADF),
+        "pwritev on pipe read end must return EBADF"
     );
 
     // 3. Correct directions succeed
@@ -6259,5 +6259,582 @@ fn proc_self_fd_reopen_offsets_are_independent() {
         &mut memory,
         SYS_CLOSE,
         [ro_tmp_fd as u64, 0, 0, 0, 0, 0],
+    );
+}
+
+#[test]
+fn lseek_data_and_hole_across_backends() {
+    use carrick_abi::{LINUX_ENXIO, LINUX_SEEK_DATA, LINUX_SEEK_HOLE};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    let dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x1000, vec![0; 0x10000]);
+    let reporter = CompatReporter::default();
+
+    const SYS_LSEEK: u64 = 62;
+
+    let lseek =
+        |dispatcher: &SyscallDispatcher, fd: i32, off: i64, whence: u64, mem: &mut LinearMemory| {
+            let ctx = dispatcher.capture_one_task_context().unwrap();
+            match dispatcher
+                .dispatch_normalized(
+                    &ctx,
+                    SyscallRequest::new(
+                        SYS_LSEEK,
+                        SyscallArgs::from([fd as u64, off as u64, whence, 0, 0, 0]),
+                    ),
+                    mem,
+                    &reporter,
+                    None,
+                )
+                .expect("claimed")
+            {
+                Ok(outcome) => outcome,
+                Err(crate::dispatch::DispatchError::Errno(errno)) => DispatchOutcome::errno(errno),
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        };
+
+    // 1. Dense in-memory file (100 bytes)
+    let dense_desc = OpenDescription::File {
+        base: OpenDescriptionBase::new(0),
+        path: "/dense_file".to_string(),
+        metadata: RootFsMetadata {
+            path: PathBuf::from("/dense_file"),
+            kind: RootFsEntryKind::File,
+            mode: 0o644,
+            size: 100,
+        },
+        contents: FileContents::Dense(vec![0xAA; 100]),
+        offset: 0,
+        writable: true,
+    };
+    let dense_fd = match dispatcher.install_fd(dense_desc, 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install dense fd: {other:?}"),
+    };
+
+    // SEEK_DATA
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 0, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 50, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 50 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 100, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 200, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, -1, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    // SEEK_HOLE
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 0, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 50, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 100, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 200, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, -1, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    // Check offset was updated to 100 by the last successful SEEK_HOLE
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 0, LINUX_SEEK_CUR, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+
+    // Invalid whence
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 0, 5, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    assert_eq!(
+        lseek(&dispatcher, dense_fd, 0, u64::MAX, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    // 2. RootFsBacked file (100 bytes)
+    let rootfs_desc = OpenDescription::File {
+        base: OpenDescriptionBase::new(0),
+        path: "/rootfs_file".to_string(),
+        metadata: RootFsMetadata {
+            path: PathBuf::from("/rootfs_file"),
+            kind: RootFsEntryKind::File,
+            mode: 0o644,
+            size: 100,
+        },
+        contents: FileContents::shared_backed(Arc::from(vec![0xBB; 100]), BTreeMap::new(), 100),
+        offset: 0,
+        writable: true,
+    };
+    let rootfs_fd = match dispatcher.install_fd(rootfs_desc, 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install rootfs fd: {other:?}"),
+    };
+    assert_eq!(
+        lseek(&dispatcher, rootfs_fd, 0, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, rootfs_fd, 50, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 50 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, rootfs_fd, 100, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, rootfs_fd, -1, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    assert_eq!(
+        lseek(&dispatcher, rootfs_fd, 0, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, rootfs_fd, 50, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, rootfs_fd, 100, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, rootfs_fd, -1, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    // 3. InMemoryFile (100 bytes)
+    let memfile_desc = OpenDescription::InMemoryFile {
+        base: OpenDescriptionBase::new(0),
+        path: "/inmem_file".to_string(),
+        contents: Arc::new(parking_lot::RwLock::new(vec![0xCC; 100])),
+        offset: 0,
+        writable: true,
+        max_size: 1000,
+    };
+    let memfile_fd = match dispatcher.install_fd(memfile_desc, 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install memfile fd: {other:?}"),
+    };
+    assert_eq!(
+        lseek(&dispatcher, memfile_fd, 0, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, memfile_fd, 50, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 50 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, memfile_fd, 100, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, memfile_fd, -1, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    assert_eq!(
+        lseek(&dispatcher, memfile_fd, 0, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, memfile_fd, 50, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, memfile_fd, 100, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, memfile_fd, -1, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    // 4. SyntheticFile (100 bytes)
+    let synth_desc = OpenDescription::SyntheticFile {
+        base: OpenDescriptionBase::new(0),
+        path: "/synth_file".to_string(),
+        contents: vec![0xDD; 100],
+        offset: 0,
+    };
+    let synth_fd = match dispatcher.install_fd(synth_desc, 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install synth fd: {other:?}"),
+    };
+    assert_eq!(
+        lseek(&dispatcher, synth_fd, 0, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, synth_fd, 50, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 50 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, synth_fd, 100, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, synth_fd, -1, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    assert_eq!(
+        lseek(&dispatcher, synth_fd, 0, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, synth_fd, 50, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, synth_fd, 100, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, synth_fd, -1, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    // 5. HostBacked file (1 MiB sparse file: 4 KiB data at 0, hole, 4 KiB data at 512 KiB, hole to EOF)
+    use std::os::fd::AsRawFd;
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let raw_fd = temp.as_file().as_raw_fd();
+    unsafe {
+        assert_eq!(libc::ftruncate(raw_fd, 1048576), 0);
+        let buf = [0xEEu8; 4096];
+        assert_eq!(libc::pwrite(raw_fd, buf.as_ptr().cast(), 4096, 0), 4096);
+        assert_eq!(
+            libc::pwrite(raw_fd, buf.as_ptr().cast(), 4096, 524288),
+            4096
+        );
+    }
+    let owned_fd: std::os::fd::OwnedFd = temp.into_file().into();
+    let host_backed_desc = OpenDescription::File {
+        base: OpenDescriptionBase::new(0),
+        path: "/host_backed_sparse".to_string(),
+        metadata: RootFsMetadata {
+            path: PathBuf::from("/host_backed_sparse"),
+            kind: RootFsEntryKind::File,
+            mode: 0o644,
+            size: 1048576,
+        },
+        contents: FileContents::host_backed(owned_fd),
+        offset: 0,
+        writable: true,
+    };
+    let host_backed_fd = match dispatcher.install_fd(host_backed_desc, 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install host-backed fd: {other:?}"),
+    };
+    assert_eq!(
+        lseek(&dispatcher, host_backed_fd, 0, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            100,
+            LINUX_SEEK_DATA,
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            4096,
+            LINUX_SEEK_DATA,
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 524288 }
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            524288,
+            LINUX_SEEK_DATA,
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 524288 }
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            528384,
+            LINUX_SEEK_DATA,
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            1048576,
+            LINUX_SEEK_DATA,
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            -1,
+            LINUX_SEEK_DATA,
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    assert_eq!(
+        lseek(&dispatcher, host_backed_fd, 0, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 4096 }
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            100,
+            LINUX_SEEK_HOLE,
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 4096 }
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            4096,
+            LINUX_SEEK_HOLE,
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 4096 }
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            524288,
+            LINUX_SEEK_HOLE,
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 528384 }
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            528384,
+            LINUX_SEEK_HOLE,
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 528384 }
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            1048576,
+            LINUX_SEEK_HOLE,
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            -1,
+            LINUX_SEEK_HOLE,
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    // Verify offset was tracked in OpenDescription::File
+    assert_eq!(
+        lseek(
+            &dispatcher,
+            host_backed_fd,
+            4096,
+            LINUX_SEEK_DATA,
+            &mut memory
+        ),
+        DispatchOutcome::Returned { value: 524288 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, host_backed_fd, 0, LINUX_SEEK_CUR, &mut memory),
+        DispatchOutcome::Returned { value: 524288 }
+    );
+
+    // 6. HostFile
+    let temp_hf = tempfile::NamedTempFile::new().unwrap();
+    let raw_hf = temp_hf.as_file().as_raw_fd();
+    unsafe {
+        assert_eq!(libc::ftruncate(raw_hf, 1048576), 0);
+        let buf = [0xFFu8; 4096];
+        assert_eq!(libc::pwrite(raw_hf, buf.as_ptr().cast(), 4096, 0), 4096);
+        assert_eq!(
+            libc::pwrite(raw_hf, buf.as_ptr().cast(), 4096, 524288),
+            4096
+        );
+    }
+    let path_hf = temp_hf.path().to_path_buf();
+    let hf_desc = OpenDescription::HostFile {
+        base: OpenDescriptionBase::new(0),
+        host_fd: HostFdRef::new(raw_hf),
+        metadata: RootFsMetadata {
+            path: path_hf,
+            kind: RootFsEntryKind::File,
+            mode: 0o644,
+            size: 1048576,
+        },
+        writable: true,
+    };
+    let hf_fd = match dispatcher.install_fd(hf_desc, 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install host file fd: {other:?}"),
+    };
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 0, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 100, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 100 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 4096, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 524288 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 524288, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::Returned { value: 524288 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 528384, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 1048576, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, -1, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 0, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 4096 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 100, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 4096 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 4096, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 4096 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 524288, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 528384 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 528384, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::Returned { value: 528384 }
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, 1048576, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_ENXIO)
+    );
+    assert_eq!(
+        lseek(&dispatcher, hf_fd, -1, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    // 7. Directory returns EINVAL on whence 3/4
+    let dir_open = test_directory_open_file("/some_dir");
+    let dir_fd = match dispatcher.install_fd_at_or_above(3, dir_open) {
+        Ok(fd) => fd,
+        Err(e) => panic!("install dir fd: {e:?}"),
+    };
+    assert_eq!(
+        lseek(&dispatcher, dir_fd, 0, LINUX_SEEK_DATA, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+    assert_eq!(
+        lseek(&dispatcher, dir_fd, 0, LINUX_SEEK_HOLE, &mut memory),
+        DispatchOutcome::errno(LINUX_EINVAL)
+    );
+
+    // 8. Pipe returns ESPIPE on whence 3/4
+    let pipe_pair = TestPipePair::new(4096, 4096);
+    let pipe_read = pipe_pair.in_read_fd;
+    let pipe_write = pipe_pair.in_write_fd;
+    assert_eq!(
+        lseek(
+            &pipe_pair.dispatcher,
+            pipe_read,
+            0,
+            LINUX_SEEK_DATA,
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_ESPIPE)
+    );
+    assert_eq!(
+        lseek(
+            &pipe_pair.dispatcher,
+            pipe_read,
+            0,
+            LINUX_SEEK_HOLE,
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_ESPIPE)
+    );
+    assert_eq!(
+        lseek(
+            &pipe_pair.dispatcher,
+            pipe_write,
+            0,
+            LINUX_SEEK_DATA,
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_ESPIPE)
+    );
+    assert_eq!(
+        lseek(
+            &pipe_pair.dispatcher,
+            pipe_write,
+            0,
+            LINUX_SEEK_HOLE,
+            &mut memory
+        ),
+        DispatchOutcome::errno(LINUX_ESPIPE)
     );
 }
