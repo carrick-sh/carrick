@@ -1262,3 +1262,24 @@ lands; same files).
   minutes with the script on a pipe. `carrick trace` should bound itself
   (the flow script's 45 s bound is the model) and refuse a non-file script
   path; reaped with `scripts/sudo/kill.sh --all`.
+
+## 2026-09-05 night: Stage1Authority broke exec-in-a-forked-child; caught by the gate
+
+The probe gate on the post-landing main failed every shard at its first
+probe: the carrier's executor pool refused shutdown ("quantum returned
+without execution lease authority"). Reduced to `sh -c '/bin/true; echo
+rc=$?'` → `rc=139`: every exec in a forked child died past its point of no
+return with "install replacement HVPatch table arena source: conflicting
+arena source". Two-point bisect (`1cb713732` good, `c3d001378` bad) named
+the refactor; `replace_for_exec` kept the retired image's arena source and
+the runtime's install of the replacement lease's source then refused. Fix:
+the source retires with the image (red-first unit test
+`exec_replacement_drops_the_retired_source_so_the_replacement_lease_installs`).
+
+Why the worker's receipts missed it: its live checks were `run-elf` of
+single probes and a CPython fork+`_exit`, none of which exec in a child.
+Review rule from here: a page-table or exec landing's live receipt must
+include the harness launch shape (`sh -c 'base64 -d > /tmp/p && … && /tmp/p'`)
+and a fork+exec (`sh -c '/bin/true'`). Workers `mmap-lazy` and
+`fork-table-copy` branched from the broken base; their fork/exec
+measurements are void until they rebase.
