@@ -38,8 +38,8 @@ pub use clone_plan::{
     VforkMode,
 };
 pub use container::{
-    CarrierScopeId, ClockDomain, Container, ContainerId, LaunchAuthorization, LaunchContext,
-    RegistryContainerId, RunId, SignedDuration, TimeControl, TimeError,
+    AdjtimexState, CarrierScopeId, ClockDomain, Container, ContainerId, LaunchAuthorization,
+    LaunchContext, RegistryContainerId, RunId, SignedDuration, TimeControl, TimeError,
 };
 pub use crash_capture::{
     CrashCaptureAuthority, CrashCaptureGeneration, CrashGenerationExhausted, CrashQuorum,
