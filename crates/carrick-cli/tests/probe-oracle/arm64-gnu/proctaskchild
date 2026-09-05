@@ -1,0 +1,7 @@
+487d258b7ba62213
+child_task_dir_contains_leader=true
+child_task_dir_contains_thread=true
+child_task_leader_status_readable=true
+child_task_thread_status_readable=true
+child_reaped_cleanly=true
+reaped_child_task_dir_enoent=true
