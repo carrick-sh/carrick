@@ -2029,6 +2029,10 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(status_flags),
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
+                peer_cred: None,
+                cork_buffer: Vec::new(),
+                cork_dest_addr: None,
+                cork_enabled: false,
             })),
             status_flags,
             fd_flags,
@@ -2144,6 +2148,10 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(LINUX_O_RDWR),
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
+                peer_cred: None,
+                cork_buffer: Vec::new(),
+                cork_dest_addr: None,
+                cork_enabled: false,
             }
         } else if kind == libc::S_IFIFO {
             // A pipe end. Probe its direction so reads/writes route correctly;
@@ -2428,9 +2436,30 @@ impl SyscallDispatcher {
     /// the same guest process. A cross-process AF_UNIX peer would need the
     /// endpoint registry to carry the connector's identity; until it does, this
     /// still answers in the guest's domain rather than leaking the host's.
-    fn peer_ucred(&self, _host_fd: i32) -> (u32, u32, u32) {
-        let creds = self.cred_snapshot();
-        (self.identity_pid(), creds.euid.raw(), creds.egid.raw())
+    fn peer_ucred(&self, fd: i32) -> (u32, u32, u32) {
+        if let Some(open_file) = self.open_file(fd)
+            && let Some(open) = open_file.description.read()
+            && let OpenDescription::HostSocket {
+                peer_cred: Some(cred),
+                ..
+            } = &*open
+        {
+            return (cred.pid.0 as u32, cred.uid.raw(), cred.gid.raw());
+        }
+        (0, 0xFFFF_FFFF, 0xFFFF_FFFF)
+    }
+
+    pub(in crate::dispatch) fn record_unix_peer_cred(
+        &self,
+        fd: i32,
+        cred: crate::dispatch::fd_table::SocketPeerCred,
+    ) {
+        if let Some(open_file) = self.open_file(fd)
+            && let Some(mut open) = open_file.description.write()
+            && let OpenDescription::HostSocket { peer_cred, .. } = &mut *open
+        {
+            *peer_cred = Some(cred);
+        }
     }
 
     /// The GUEST-requested socket type for `fd` (e.g. SOCK_SEQPACKET), which can
@@ -2918,6 +2947,11 @@ impl SyscallDispatcher {
         }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
+        let peer_cred = if family == LINUX_AF_UNIX {
+            support::pop_pending_unix_client(host_fd)
+        } else {
+            None
+        };
         let open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::HostSocket {
                 host_fd: HostFdRef::new(new_host),
@@ -2927,6 +2961,10 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(status_flags),
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
+                peer_cred,
+                cork_buffer: Vec::new(),
+                cork_dest_addr: None,
+                cork_enabled: false,
             })),
             status_flags,
             fd_flags,
@@ -4762,6 +4800,10 @@ mod netlink_readiness_tests {
                     protocol: 0,
                     mcast_memberships: Vec::new(),
                     synthetic_recv: VecDeque::new(),
+                    peer_cred: None,
+                    cork_buffer: Vec::new(),
+                    cork_dest_addr: None,
+                    cork_enabled: false,
                 })),
                 LINUX_O_RDWR,
                 0,
@@ -7423,6 +7465,14 @@ impl SyscallDispatcher {
             }
             let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
             let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
+            let my_cred = {
+                let creds = this.cred_snapshot();
+                crate::dispatch::fd_table::SocketPeerCred {
+                    pid: crate::dispatch::abi_args::NsPid(this.identity_pid() as i32),
+                    uid: creds.euid,
+                    gid: creds.egid,
+                }
+            };
             let first = OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: HostFdRef::new(host_fds[0]),
@@ -7432,6 +7482,10 @@ impl SyscallDispatcher {
                     base: OpenDescriptionBase::new(status_flags),
                     mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
+                    peer_cred: Some(my_cred),
+                    cork_buffer: Vec::new(),
+                    cork_dest_addr: None,
+                    cork_enabled: false,
                 })),
                 status_flags,
                 fd_flags,
@@ -7445,6 +7499,10 @@ impl SyscallDispatcher {
                     base: OpenDescriptionBase::new(status_flags),
                     mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
+                    peer_cred: Some(my_cred),
+                    cork_buffer: Vec::new(),
+                    cork_dest_addr: None,
+                    cork_enabled: false,
                 })),
                 status_flags,
                 fd_flags,
@@ -7733,6 +7791,13 @@ impl SyscallDispatcher {
                     host_fd.get(),
                     crate::event_ring::path_hash(&host_addr[2..end]),
                 );
+                let creds = this.cred_snapshot();
+                let my_cred = crate::dispatch::fd_table::SocketPeerCred {
+                    pid: crate::dispatch::abi_args::NsPid(this.identity_pid() as i32),
+                    uid: creds.euid,
+                    gid: creds.egid,
+                };
+                support::register_unix_listener(&host_addr[2..end], host_fd.get(), my_cred);
                 // Stamp the guest sun_path onto the just-created host node so a
                 // DIFFERENT carrick process (whose per-process registry lacks
                 // this bind) can reverse-translate it in getsockname/getpeername
@@ -8066,6 +8131,17 @@ impl SyscallDispatcher {
                     rc,
                     crate::event_ring::path_hash(&host_addr[2..end]),
                 );
+                let creds = this.cred_snapshot();
+                let client_cred = crate::dispatch::fd_table::SocketPeerCred {
+                    pid: crate::dispatch::abi_args::NsPid(this.identity_pid() as i32),
+                    uid: creds.euid,
+                    gid: creds.egid,
+                };
+                if let Some(server_cred) =
+                    support::lookup_and_queue_unix_connect(&host_addr[2..end], client_cred)
+                {
+                    this.record_unix_peer_cred(fd, server_cred);
+                }
             }
             if rc == 0 {
                 if !synthetic_error_after_send {
@@ -8533,11 +8609,76 @@ impl SyscallDispatcher {
             }
             // On connected SCTP stream sockets (backed by host TCP), clear host_addr
             // after address validation / provider routing so Darwin sends implicitly.
-            let host_addr = if is_sctp_stream && host_socket_is_connected(host_fd.get()) {
+            let mut host_addr = if is_sctp_stream && host_socket_is_connected(host_fd.get()) {
                 None
             } else {
                 host_addr
             };
+            let is_msg_more = carrick_abi::LinuxMsgFlags::from_bits_retain(flags)
+                .contains(carrick_abi::LinuxMsgFlags::MORE);
+            let (is_cork_enabled, has_pending_cork) = if let Some(open_file) = this.open_file(fd)
+                && let Some(open) = open_file.description.read()
+                && let OpenDescription::HostSocket { cork_enabled, cork_buffer, .. } = &*open
+            {
+                (*cork_enabled, !cork_buffer.is_empty())
+            } else {
+                (false, false)
+            };
+
+            if is_cork_enabled || is_msg_more {
+                let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
+                if let Some(open_file) = this.open_file(fd)
+                    && let Some(mut open) = open_file.description.write()
+                    && let OpenDescription::HostSocket {
+                        cork_buffer,
+                        cork_dest_addr,
+                        ..
+                    } = &mut *open
+                {
+                    cork_buffer.extend_from_slice(data);
+                    if cork_dest_addr.is_none() && let Some(ref addr) = host_addr {
+                        *cork_dest_addr = Some(addr.clone());
+                    }
+                }
+                return Ok(DispatchOutcome::Returned { value: len as i64 });
+            }
+
+            let pending_cork_data = if has_pending_cork {
+                if let Some(open_file) = this.open_file(fd)
+                    && let Some(mut open) = open_file.description.write()
+                    && let OpenDescription::HostSocket {
+                        cork_buffer,
+                        cork_dest_addr,
+                        ..
+                    } = &mut *open
+                {
+                    let buf = std::mem::take(cork_buffer);
+                    let dest = cork_dest_addr.take();
+                    Some((buf, dest))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let (combined_buf, current_payload_len) = if let Some((mut buf, dest)) = pending_cork_data {
+                if host_addr.is_none() {
+                    host_addr = dest;
+                }
+                let cur = len;
+                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(data_ptr, len) });
+                (Some(buf), cur)
+            } else {
+                (None, len)
+            };
+
+            let (data_ptr, len) = if let Some(ref buf) = combined_buf {
+                (buf.as_ptr(), buf.len())
+            } else {
+                (data_ptr, len)
+            };
+
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let connected_send = dest_addr == 0;
@@ -8628,6 +8769,12 @@ impl SyscallDispatcher {
             if connected_send && matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
                 this.queue_socket_error_after_send(fd);
             }
+            let outcome = match outcome {
+                DispatchOutcome::Returned { value } if value >= 0 => DispatchOutcome::Returned {
+                    value: current_payload_len as i64,
+                },
+                other => other,
+            };
             Ok(outcome)
 
         }
@@ -8935,6 +9082,53 @@ impl SyscallDispatcher {
                 }
             }
             let (host_fd, family) = this.host_socket_lookup(fd)?;
+            if (level == crate::linux_abi::LINUX_SOL_UDP
+                && optname == crate::linux_abi::LINUX_UDP_CORK)
+                || (level == crate::linux_abi::LINUX_SOL_TCP
+                    && optname == crate::linux_abi::LINUX_TCP_CORK)
+            {
+                if optlen < 4 {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let b = match memory.read_bytes(optval_addr, 4) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+                let v = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                if let Some(open_file) = this.open_file(fd)
+                    && let Some(mut open) = open_file.description.write()
+                    && let OpenDescription::HostSocket {
+                        host_fd,
+                        cork_buffer,
+                        cork_dest_addr,
+                        cork_enabled,
+                        ..
+                    } = &mut *open
+                {
+                    *cork_enabled = v != 0;
+                    if !*cork_enabled && !cork_buffer.is_empty() {
+                        let dest_ptr = cork_dest_addr
+                            .as_ref()
+                            .map_or(core::ptr::null(), |a| a.as_ptr().cast());
+                        let dest_len = cork_dest_addr
+                            .as_ref()
+                            .map_or(0, |a| a.len() as libc::socklen_t);
+                        let send_flags = libc::MSG_DONTWAIT;
+                        unsafe {
+                            libc::sendto(
+                                host_fd.raw(),
+                                cork_buffer.as_ptr().cast(),
+                                cork_buffer.len(),
+                                send_flags,
+                                dest_ptr,
+                                dest_len,
+                            );
+                        }
+                        cork_buffer.clear();
+                    }
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             // Record the GUEST-intended SO_REUSEADDR / SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF so
             // getsockopt reports what the guest set rather than carrick's
             // host-side widening (SO_REUSEADDR→SO_REUSEPORT for UDP; AF_UNIX
@@ -9450,12 +9644,24 @@ impl SyscallDispatcher {
             // (peer uid + primary gid via `xucred`) and LOCAL_PEERPID (peer pid).
             // Used by D-Bus / systemd peer authentication over AF_UNIX. Done here
             // because `linux_to_host_sockopt` has no Darwin opt to map it to.
+            if (level == crate::linux_abi::LINUX_SOL_UDP
+                && optname == crate::linux_abi::LINUX_UDP_CORK)
+                || (level == crate::linux_abi::LINUX_SOL_TCP
+                    && optname == crate::linux_abi::LINUX_TCP_CORK)
+            {
+                let enabled = if let Some(open_file) = this.open_file(fd)
+                    && let Some(open) = open_file.description.read()
+                    && let OpenDescription::HostSocket { cork_enabled, .. } = &*open
+                {
+                    if *cork_enabled { 1i32 } else { 0i32 }
+                } else {
+                    0i32
+                };
+                return write_sockopt_value(memory, optval_addr, optlen_addr, &enabled.to_ne_bytes());
+            }
             if level == LINUX_SOL_SOCKET && optname == crate::linux_abi::LINUX_SO_PEERCRED {
-                let (host_fd, _family) = this.host_socket_lookup(fd)?;
-                // Best-effort peer creds, resolved per host (Linux: SO_PEERCRED
-                // -> ucred; Darwin: LOCAL_PEERCRED + LOCAL_PEERPID). Returns 0s
-                // if the socket isn't connected, matching the guest's tolerance.
-                let (pid, uid, gid) = carrick_portable::peer_ucred(host_fd.get());
+                let (_host_fd, _family) = this.host_socket_lookup(fd)?;
+                let (pid, uid, gid) = this.peer_ucred(fd);
                 let mut ucred = [0u8; crate::linux_abi::LINUX_UCRED_SIZE];
                 ucred[0..4].copy_from_slice(&pid.to_ne_bytes());
                 ucred[4..8].copy_from_slice(&uid.to_ne_bytes());
@@ -9716,7 +9922,7 @@ impl SyscallDispatcher {
         if is_netlink {
             return Ok(self.netlink_send(context, fd, &data));
         }
-        let host_addr = if msg.name == 0 || msg.namelen == 0 {
+        let mut host_addr = if msg.name == 0 || msg.namelen == 0 {
             None
         } else {
             match read_linux_sockaddr(memory, msg.name, msg.namelen, family) {
@@ -9724,6 +9930,70 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
         };
+        let is_msg_more = carrick_abi::LinuxMsgFlags::from_bits_retain(flags)
+            .contains(carrick_abi::LinuxMsgFlags::MORE);
+        let (is_cork_enabled, has_pending_cork) = if let Some(open_file) = self.open_file(fd)
+            && let Some(open) = open_file.description.read()
+            && let OpenDescription::HostSocket {
+                cork_enabled,
+                cork_buffer,
+                ..
+            } = &*open
+        {
+            (*cork_enabled, !cork_buffer.is_empty())
+        } else {
+            (false, false)
+        };
+
+        if is_cork_enabled || is_msg_more {
+            let data_len = data.len();
+            if let Some(open_file) = self.open_file(fd)
+                && let Some(mut open) = open_file.description.write()
+                && let OpenDescription::HostSocket {
+                    cork_buffer,
+                    cork_dest_addr,
+                    ..
+                } = &mut *open
+            {
+                cork_buffer.extend_from_slice(&data);
+                if cork_dest_addr.is_none()
+                    && let Some(ref addr) = host_addr
+                {
+                    *cork_dest_addr = Some(addr.clone());
+                }
+            }
+            return Ok(DispatchOutcome::Returned {
+                value: data_len as i64,
+            });
+        }
+
+        let pending_cork_data = if has_pending_cork {
+            if let Some(open_file) = self.open_file(fd)
+                && let Some(mut open) = open_file.description.write()
+                && let OpenDescription::HostSocket {
+                    cork_buffer,
+                    cork_dest_addr,
+                    ..
+                } = &mut *open
+            {
+                let buf = std::mem::take(cork_buffer);
+                let dest = cork_dest_addr.take();
+                Some((buf, dest))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let current_payload_len = data.len();
+        if let Some((mut buf, dest)) = pending_cork_data {
+            if host_addr.is_none() {
+                host_addr = dest;
+            }
+            buf.extend_from_slice(&data);
+            data = buf;
+        }
         if family == LINUX_AF_INET
             && self.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
             && let Some(requested) = host_addr
@@ -9858,6 +10128,12 @@ impl SyscallDispatcher {
         } else {
             rights.abort();
         }
+        let outcome = match outcome {
+            DispatchOutcome::Returned { value } if value >= 0 => DispatchOutcome::Returned {
+                value: current_payload_len as i64,
+            },
+            other => other,
+        };
         Ok(outcome)
     }
 
@@ -10402,7 +10678,7 @@ impl SyscallDispatcher {
                 // budget. (audit M2)
                 let mut cred_trunc = false;
                 if !is_netlink && self.socket_so_passcred(fd) {
-                    let (pid, uid, gid) = self.peer_ucred(host_fd.get());
+                    let (pid, uid, gid) = self.peer_ucred(fd);
                     let remaining = (msg.controllen as usize).saturating_sub(scm.len());
                     let (creds, t) = build_linux_scm_creds(pid, uid, gid, remaining);
                     scm.extend_from_slice(&creds);

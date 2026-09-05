@@ -4959,6 +4959,7 @@ bitflags! {
         const WAITALL = LINUX_MSG_WAITALL;
         const ERRQUEUE = LINUX_MSG_ERRQUEUE;
         const NOSIGNAL = LINUX_MSG_NOSIGNAL;
+        const MORE = LINUX_MSG_MORE;
         const CMSG_CLOEXEC = LINUX_MSG_CMSG_CLOEXEC;
     }
 
@@ -5590,6 +5591,7 @@ pub const LINUX_MSG_WAITALL: i32 = 0x0100;
 /// keeps no error queue, so the queue is always empty.
 pub const LINUX_MSG_ERRQUEUE: i32 = 0x2000;
 pub const LINUX_MSG_NOSIGNAL: i32 = 0x4000;
+pub const LINUX_MSG_MORE: i32 = 0x8000;
 pub const LINUX_MSG_CMSG_CLOEXEC: i32 = 0x4000_0000_u32 as i32;
 // Linux socket option levels and names. Linux numbers them as small
 // integers (SOL_SOCKET=1) while macOS reuses the IPPROTO/SO scheme
@@ -5619,6 +5621,7 @@ pub const LINUX_SOL_TCP: i32 = 6; // IPPROTO_TCP
 pub const LINUX_IPPROTO_TCP: i32 = 6;
 pub const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
 pub const LINUX_IPPROTO_UDP: i32 = 17;
+pub const LINUX_UDP_CORK: i32 = 1;
 /// Linux protocol number for UDP-Lite (RFC 3828). macOS has no such protocol;
 /// carrick backs it with a plain UDP socket (only the checksum-coverage
 /// sockopts differ, accepted as no-ops).
@@ -6219,6 +6222,7 @@ mod kernel_abi_tests {
         assert_eq!(LinuxMsgFlags::from_bits_retain(-1).bits(), -1);
         assert_eq!(LinuxMsgFlags::CMSG_CLOEXEC.bits(), LINUX_MSG_CMSG_CLOEXEC);
         assert_eq!(LinuxMsgFlags::ERRQUEUE.bits(), LINUX_MSG_ERRQUEUE);
+        assert_eq!(LinuxMsgFlags::MORE.bits(), LINUX_MSG_MORE);
 
         // adjtimex/clock_adjtime modes and status cross the ABI as raw wire
         // words, but dispatch must reason about them through typed domains.
