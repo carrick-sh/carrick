@@ -933,3 +933,35 @@ typed but the runtime does not yet re-retain there.
 - Pre-existing unit failure `pipe_end_direction_matrix_and_fd_lifecycle_closure`
   (pwrite64 on a pipe read end EBADF vs expected ESPIPE) predates today's fs
   commits through `7f11d985b`; bisect continuing over the later merges.
+
+## 2026-09-05 (evening): the arena source kept disappearing — four leaks, one instrument
+
+After extension arenas got backing, growth still failed in specific shapes.
+Each leak was a place a manager was built or replaced without the source:
+
+1. **exec** (`311c6e858`): `replace_page_tables` only applied a PENDING source
+   and the old source belongs to the retired mm's lease → mint a fresh source
+   for the replacement lease at exec commit. Then, because the slot is shared
+   and the first sparse mmap could build the manager before that install
+   took, **eager build at install** (`31b30f96f`).
+2. **sibling threads** (`0fa4c7eff`): the deferral was engine-local, so a
+   `CLONE_THREAD` sibling's lazy build came up sourceless → shared
+   `DeferredArenaSource` in the sibling spec.
+3. **foreign-COW rollback** and **parent fork-COW rollback** restored clones →
+   `adopt_live_extension_state`.
+4. **rolled-back fork** (`7d0ca6c5f`): a fork transaction that loses vCPU
+   admission (guest EAGAIN) restores the pre-fork clone. This was the CPython
+   `-v` case: `-v` runs `uname` via subprocess, the fork lost once, the root
+   lost its source, 755 refused mmaps. `RUST_LOG=debug` on the bind path hid
+   it by changing admission timing, which is why the USDT probes
+   `stage1-arena-bind`/`stage1-arena-install` and
+   `scripts/dtrace/hvpatch-stage1-arena.d` exist now (`f1a0995d2`).
+
+Lesson written into memory: the identity/scope class again — every one of
+these was correct with one process and one thread. Any path that writes a
+`PageTableManager` into the live slot must go through adoption or install,
+never a bare clone.
+
+Also landed: seekhole worker (`22b7a8d16` + ENXIO corrections), proctask
+worker (`28ba900e2`), probes `seekholemap`/`proctaskchild`/`pipeextra`
+blessed; pwrite-on-pipe smuggled change reverted (`f99ae555b`).
