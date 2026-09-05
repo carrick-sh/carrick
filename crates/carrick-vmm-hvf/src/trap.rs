@@ -37390,48 +37390,77 @@ impl HvfVmState {
         }
         let view_len = (file_len - offset).min(end - va);
         let view_end = va + view_len;
+        let file_pages_end = align_up(view_end, PAGE_SIZE).unwrap_or(end).min(end);
 
-        // The whole range must be a hole: a live mapping or a live
-        // process-scoped alias anywhere inside it means `MAP_FIXED` over
-        // occupied pages, which the eager path replaces byte-wise in place.
-        let mut page = va;
-        while page < end {
-            if self.mapping_for_range(page, 1).is_some() {
-                return Ok(false);
-            }
-            page = page.saturating_add(PAGE_SIZE);
-        }
-        let alias_overlaps = alias_registry().lock().iter().any(|alias| {
-            alias_matches_process_scope(
-                alias.ownership_scope,
-                self.mm_root_slot,
-                self.container_root,
-            ) && alias.start < end
-                && alias.start.saturating_add(alias.size as u64) > va
-                && alias_backing_is_live(alias.physical_host_addr)
+        // Holes vs overlapping existing mappings:
+        // A plain MAP_PRIVATE file mmap lands in a hole. A MAP_FIXED over an
+        // existing private mapping (such as the ELF loader's PROT_NONE reservation)
+        // retires the old backing for the range so it takes the lazy view too.
+        // If any overlapping mapping or process-scoped alias is non-private or
+        // non-dynamic (e.g. shared memory), refuse the lowering so dispatcher falls back.
+        let overlapping_aliases = alias_registry().lock().overlapping_process_aliases(
+            va,
+            len,
+            self.mm_root_slot,
+            self.container_root,
+        );
+        let has_non_retirable_alias = overlapping_aliases.iter().any(|(_, alias)| {
+            alias.sharing != GuestMappingSharing::Private
+                || !alias_backing_is_live(alias.physical_host_addr)
         });
-        if alias_overlaps {
+        if has_non_retirable_alias {
             return Ok(false);
+        }
+
+        let has_non_retirable_mapping = self.mappings.iter().any(|m| {
+            m.start < end
+                && m.end > va
+                && global_frame_region_owner_matches_in(self.custody(), m)
+                && (!m.is_dynamic_alias || m.sharing != GuestMappingSharing::Private)
+        });
+        if has_non_retirable_mapping {
+            return Ok(false);
+        }
+
+        if !overlapping_aliases.is_empty()
+            || self.mappings.iter().any(|m| {
+                m.start < end
+                    && m.end > va
+                    && m.is_dynamic_alias
+                    && global_frame_region_owner_matches_in(self.custody(), m)
+            })
+        {
+            self.unregister_process_alias(va, len)?;
+            self.mappings.retain(|m| {
+                !(m.is_dynamic_alias
+                    && m.sharing == GuestMappingSharing::Private
+                    && m.start >= va
+                    && m.end <= end)
+            });
+            flush_stage1()?;
         }
 
         let mut current = va;
         while current < end {
             if self.mapping_for_range(current, 1).is_some() {
-                // The hole check above ran outside the topology lock; a
-                // mapping appearing here means a sibling publication raced
-                // this mmap. Fail closed: the dispatcher's snapshot fallback
-                // rewrites the bytes and the extents already materialized
-                // privatize on that write.
+                // The hole check / retirement above ran outside the topology lock;
+                // a mapping appearing here means a sibling publication raced this
+                // mmap. Fail closed: the dispatcher's snapshot fallback rewrites
+                // the bytes and the extents already materialized privatize on that write.
                 return Err(TrapError::Hypervisor(format!(
                     "private file view at VA 0x{current:x} overlapped a mapping published mid-materialization"
                 )));
             }
-            let hole_end = if current < view_end { view_end } else { end };
-            let backing = if current < view_end {
+            let hole_end = if current < file_pages_end {
+                file_pages_end
+            } else {
+                end
+            };
+            let backing = if current < file_pages_end {
                 SparseExtentBacking::FileView {
                     fd,
                     offset: offset + (current - va),
-                    view_len: view_end - current,
+                    view_len: (view_end.saturating_sub(current)).min(hole_end - current),
                 }
             } else {
                 SparseExtentBacking::Anon
@@ -37685,14 +37714,11 @@ impl HvfVmState {
                                 "overlay private file view at VA 0x{start:x}: {error}"
                             ))
                         })?;
-                    // The view is host `PROT_READ`; a stage-2 write permission
-                    // would let a stray guest store fault the CARRIER instead of
-                    // the guest. Guest stores never reach stage-2 anyway: every
-                    // page is armed and the stage-1 leaf is read-only until the
-                    // frame COW moves it to private backing. Host writes route
-                    // through `ensure_frame_cow_write`, which sees the arm.
+                    // Stage-2 is RWX on the frame; stage-1 carries the guest
+                    // permission (AP_RO/UXN) and armed page-granular COW until
+                    // privatized on first write.
                     (
-                        applevisor::memory::MemPerms::ReadExec,
+                        applevisor::memory::MemPerms::ReadWriteExec,
                         Self::private_file_view_backing_identity(),
                         true,
                     )

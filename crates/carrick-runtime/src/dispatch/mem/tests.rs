@@ -1626,7 +1626,7 @@ fn mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success() {
 }
 
 #[test]
-fn mmap_shared_or_exec_private_is_never_offered_the_lowering() {
+fn mmap_shared_is_never_offered_the_lowering_and_exec_private_is_admitted() {
     const SYS_MMAP: u64 = 222;
     const PAGE_SIZE: u64 = 16 * 1024;
 
@@ -1636,38 +1636,63 @@ fn mmap_shared_or_exec_private_is_never_offered_the_lowering() {
         crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1320));
     let reporter = CompatReporter::default();
     let mut memory = FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * PAGE_SIZE as usize, true);
-    for flags_prot in [
-        (crate::linux_abi::LINUX_MAP_SHARED, LINUX_PROT_READ),
-        (
-            crate::linux_abi::LINUX_MAP_PRIVATE,
-            LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+
+    // MAP_SHARED file mapping legitimately publishes via the alias transaction
+    // and is never offered the private lowering.
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                0,
+                PAGE_SIZE,
+                LINUX_PROT_READ,
+                crate::linux_abi::LINUX_MAP_SHARED,
+                32,
+                0,
+            ]),
         ),
-    ] {
-        let outcome = threaded_memory_call(
-            &dispatcher,
-            &mut memory,
-            &registry,
-            &reporter,
-            SyscallRequest::new(
-                SYS_MMAP,
-                SyscallArgs([0, PAGE_SIZE, flags_prot.1, flags_prot.0, 32, 0]),
-            ),
-        );
-        // A MAP_SHARED file mapping legitimately publishes via the alias
-        // transaction; the exec-prot private control returns in place.
-        // Either way it must never be OFFERED the lowering.
-        assert!(
-            matches!(
-                outcome,
-                DispatchOutcome::Returned { .. } | DispatchOutcome::MapHostAlias { .. }
-            ),
-            "control mapping must still succeed, got {outcome:?}"
-        );
-    }
+    );
+    assert!(
+        matches!(outcome, DispatchOutcome::MapHostAlias { .. }),
+        "control mapping must still succeed, got {outcome:?}"
+    );
     assert!(
         memory.offers.borrow().is_empty(),
-        "shared and exec-prot mappings must keep the snapshot path: {:?}",
+        "shared allocation must never be offered the private lowering: {:?}",
         memory.offers.borrow()
+    );
+    drop(outcome);
+
+    // Private executable allocation IS admitted and offered the lowering.
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                0,
+                PAGE_SIZE,
+                LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC,
+                crate::linux_abi::LINUX_MAP_PRIVATE,
+                32,
+                0,
+            ]),
+        ),
+    );
+    assert!(
+        matches!(outcome, DispatchOutcome::Returned { .. }),
+        "executable private allocation must succeed, got {outcome:?}"
+    );
+    assert_eq!(
+        memory.offers.borrow().len(),
+        1,
+        "executable private allocation must be offered the lowering"
     );
 }
 
