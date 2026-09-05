@@ -4415,7 +4415,9 @@ fn vmsplice_in_memory_pipe_writer_full_blocking_parks_on_write_readiness_pollin(
     assert_eq!(unsafe { libc::poll(&mut poll_fd_struct, 1, 0) }, 0);
 
     // Free PIPE_BUF bytes from reader; readiness pipe must now be signaled
-    let drained = take_pipe_bytes(&test_pipe.pipe, PIPE_BUF, 0).expect("drain pipe bytes");
+    let PipeDrain::Bytes(drained) = take_pipe_bytes(&test_pipe.pipe, PIPE_BUF) else {
+        panic!("drain pipe bytes");
+    };
     assert_eq!(drained.len(), PIPE_BUF);
 
     let ready_after_drain = unsafe { libc::poll(&mut poll_fd_struct, 1, 0) };
