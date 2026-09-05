@@ -390,6 +390,8 @@ struct ProtectionTrackingMemory {
     repoint_payload: Vec<u8>,
     repoint_observed_shared: Vec<bool>,
     restored_shared_identity: Vec<(u64, usize)>,
+    repointed_shared_leaves: Vec<(u64, u64, usize)>,
+    unmapped_alias_ranges: Vec<(u64, usize)>,
     fail_repoint: bool,
     fail_repoint_indeterminate: bool,
     fail_protect: bool,
@@ -538,6 +540,8 @@ impl ProtectionTrackingMemory {
             repoint_payload: Vec::new(),
             repoint_observed_shared: Vec::new(),
             restored_shared_identity: Vec::new(),
+            repointed_shared_leaves: Vec::new(),
+            unmapped_alias_ranges: Vec::new(),
             fail_repoint: false,
             fail_repoint_indeterminate: false,
             fail_protect: false,
@@ -568,6 +572,21 @@ impl GuestMemory for ProtectionTrackingMemory {
 
     fn restore_shared_identity(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.restored_shared_identity.push((address, len));
+        Ok(())
+    }
+
+    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.unmapped_alias_ranges.push((address, len));
+        Ok(())
+    }
+
+    fn repoint_shared_leaf(
+        &mut self,
+        va: u64,
+        target_ipa: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        self.repointed_shared_leaves.push((va, target_ipa, len));
         Ok(())
     }
 
@@ -8291,7 +8310,11 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
-        shared_file_alias: Some(Arc::clone(&description)),
+        shared_file_alias: Some(SharedFileAliasCommit {
+            description: Arc::clone(&description),
+            extent_base: carrick_guest_mem::Gpa(base),
+            row_file_offset: 0,
+        }),
     });
 
     let src = base + PAGE;
@@ -8309,40 +8332,15 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         ),
     );
 
-    let (transaction, backing) = match outcome {
-        DispatchOutcome::MapHostAlias {
-            success_retval,
-            transaction,
-            va,
-            len,
-            backing,
-            ..
-        } => {
-            assert_eq!(success_retval, dst as i64);
-            assert_eq!(va.raw(), dst);
-            assert_eq!(len, PAGE);
-            (transaction, backing)
-        }
-        other => panic!("expected MapHostAlias, got {other:?}"),
-    };
-
-    match backing {
-        HostAliasBacking::File {
-            offset, sharing, ..
-        } => {
-            assert_eq!(offset, PAGE as libc::off_t);
-            assert_eq!(sharing, HostAliasSharing::Shared);
-        }
-        other => panic!("expected HostAliasBacking::File, got {other:?}"),
-    }
-
-    transaction
-        .with_claim_for_test(|install| {
-            dispatcher
-                .commit_host_alias_install(install)
-                .expect("publish successful host-alias install");
-        })
-        .expect("claim host-alias install");
+    assert_eq!(outcome, DispatchOutcome::Returned { value: dst as i64 });
+    assert_eq!(
+        memory.repointed_shared_leaves,
+        vec![(dst, base + PAGE, PAGE as usize)]
+    );
+    assert!(
+        memory.unmapped_alias_ranges.contains(&(src, PAGE as usize)),
+        "source range must be unmapped via unmap_alias_range"
+    );
 
     // Verify metadata after move:
     // Destination dst has file_page_offset == Some(1).
@@ -8364,9 +8362,9 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
             "source range must be unmapped from core_file_mappings"
         );
         assert!(
-            !mem.shared_file_alias_maps
-                .iter()
-                .any(|(r, _)| r.start().raw() < src + PAGE && r.end().raw() > src),
+            !mem.shared_file_alias_maps.iter().any(
+                |entry| entry.range.start().raw() < src + PAGE && entry.range.end().raw() > src
+            ),
             "source range must be unmapped from shared_file_alias_maps"
         );
     }
@@ -8383,40 +8381,21 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         ),
     );
 
-    let (back_transaction, back_backing) = match back_outcome {
-        DispatchOutcome::MapHostAlias {
-            success_retval,
-            transaction,
-            va,
-            len,
-            backing,
-            ..
-        } => {
-            assert_eq!(success_retval, src as i64);
-            assert_eq!(va.raw(), src);
-            assert_eq!(len, PAGE);
-            (transaction, backing)
-        }
-        other => panic!("expected MapHostAlias for move back, got {other:?}"),
-    };
-
-    match back_backing {
-        HostAliasBacking::File {
-            offset, sharing, ..
-        } => {
-            assert_eq!(offset, PAGE as libc::off_t);
-            assert_eq!(sharing, HostAliasSharing::Shared);
-        }
-        other => panic!("expected HostAliasBacking::File, got {other:?}"),
-    }
-
-    back_transaction
-        .with_claim_for_test(|install| {
-            dispatcher
-                .commit_host_alias_install(install)
-                .expect("publish successful host-alias install");
-        })
-        .expect("claim host-alias install");
+    assert_eq!(
+        back_outcome,
+        DispatchOutcome::Returned { value: src as i64 }
+    );
+    assert_eq!(
+        memory.repointed_shared_leaves,
+        vec![
+            (dst, base + PAGE, PAGE as usize),
+            (src, base + PAGE, PAGE as usize),
+        ]
+    );
+    assert!(
+        memory.unmapped_alias_ranges.contains(&(dst, PAGE as usize)),
+        "destination range must be unmapped via unmap_alias_range on reverse move"
+    );
 
     {
         let mem_authority = dispatcher.mem();
@@ -8482,7 +8461,11 @@ fn shared_file_fixed_mremap_rejects_missing_maymove_or_overlapping_ranges() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
-        shared_file_alias: Some(Arc::clone(&description)),
+        shared_file_alias: Some(SharedFileAliasCommit {
+            description: Arc::clone(&description),
+            extent_base: carrick_guest_mem::Gpa(base),
+            row_file_offset: 0,
+        }),
     });
 
     let src = base + PAGE;
