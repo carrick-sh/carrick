@@ -1143,3 +1143,38 @@ Also today: the probe gate's `docker_compose_shared_network_namespace_smoke`
 failed once with an empty `docker compose down` error and passed alone in
 5.5 s; it runs in the same test binary as carrick-lane smokes, so Docker and
 carrick overlap there. Open harness item.
+
+## 2026-09-05 evening: the VFS path-walk is the widest pathological term
+
+Per-syscall microbench in `python:3.12-slim` (20k-iteration loops), default
+lane, one binary; Docker on the same image:
+
+| guest op | carrick | Docker | ratio |
+|---|---|---|---|
+| `os.stat("/usr/local/bin/python3")` (symlink chain) | 23.2 µs | 0.8 µs | 29x |
+| `os.open`+`os.close` of the same | 33.1 µs | 1.2 µs | 28x |
+| `os.stat("/usr/lib/nonexistent")` | 46.9 µs | 0.6 µs | 78x |
+| `os.getpid()` | 0.06 µs | 0.17 µs | 0.35x |
+| `subprocess.run(["/bin/true"])` | 3.9 ms | 0.2 ms | 19x |
+| `subprocess.run(["python3","-c","pass"])` | 16.6 ms | 4.5 ms | 3.7x |
+
+A spawn is ~60 fs syscalls at 20–70 µs each (`hvpatch-guest-syscall-flow.d`
+reduced by `scratchpad/gsf_reduce.py`: newfstatat 42 µs avg, openat 44,
+getdents64 294). The carrier user-CPU ranking
+(`scripts/dtrace/hvpatch-carrier-user-cpu-ranking.d`, attached live) puts 89%
+of the ENOENT stat inside host `__openat`: `real_stat` → `dir_fd_for`,
+`stat_cache_get_or_fill`, `namei_leaf`, `fast_metadata_contained`,
+`lookup_kind_and_metadata`, `fast_nofollow_metadata`, `fast_lstat_contained`
+each re-open the same missing leaf, and nothing remembers a negative answer.
+The successful stat re-reads the symlink chain and re-stats every component
+per call (`canonicalize_following`, `layered_lstat`, `readlink_layered`);
+the stat cache refuses symlinks. `dir_fd_for` also pays a real `getpid()`
+syscall per call for host-fork detection the carrier never needs.
+
+The rootfs scratch is private to the run and every guest write goes through
+carrick, which is exactly the dcache invariant: carrick can cache positive
+and negative dentries and symlink targets and invalidate at its own mutating
+syscalls, with host revalidation only under shared (`-v`) mounts. Brief:
+`scratchpad/brief-dentry-cache.md`, worker `dentry-cache` dispatched from
+main (file-disjoint from the page-table workers). Targets: stat ≤ 4 µs,
+ENOENT ≤ 3 µs, open+close ≤ 8 µs.
