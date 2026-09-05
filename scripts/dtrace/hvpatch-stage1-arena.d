@@ -41,3 +41,9 @@ carrick*:::stage1-arena-replace
     printf("STAGE1ARENA|replace|ns=%d|pid=%d|tid=%d|site=%d|source_before=%d|source_after=%d|authority=0x%x\n",
         timestamp, pid, tid, arg0, arg1, arg2, arg3);
 }
+
+carrick*:::stage1-arena-absent
+{
+    printf("STAGE1ARENA|absent|ns=%d|pid=%d|tid=%d|site=%d|authority=0x%x\n",
+        timestamp, pid, tid, arg0, arg1);
+}
