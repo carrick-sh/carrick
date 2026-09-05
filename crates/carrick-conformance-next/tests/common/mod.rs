@@ -502,6 +502,16 @@ const SPECIAL_PROBE_LAUNCH_POLICIES: &[(&str, ProbeLaunchPolicy)] = &[
         },
     ),
     (
+        // fanotify_init needs CAP_SYS_ADMIN; without it both the Docker oracle
+        // and Carrick fail the group creation and the fanotify lines become
+        // vacuous (the documented under-privileged-oracle inversion).
+        "pipeblockedge",
+        ProbeLaunchPolicy {
+            security_opt: None,
+            cap_add: Some("SYS_ADMIN"),
+        },
+    ),
+    (
         "clonefilesexec",
         ProbeLaunchPolicy {
             security_opt: Some("seccomp=unconfined"),
@@ -641,6 +651,7 @@ pub fn select_cached_probes<'a>(probes: &'a [&'a str], requested: Option<&str>) 
 fn special_probe_container_lowers_required_privileges() {
     let cases = [
         ("clocksettimevdso", &["SYS_TIME"][..], &[][..]),
+        ("pipeblockedge", &["SYS_ADMIN"][..], &[][..]),
         ("usernsisolation", &[][..], &["seccomp=unconfined"][..]),
         ("clonefileshare", &[][..], &["seccomp=unconfined"][..]),
         ("clonefilesexec", &[][..], &["seccomp=unconfined"][..]),
