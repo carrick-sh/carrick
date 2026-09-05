@@ -742,3 +742,19 @@ shared file mapping). The mremap fix's first cut moved the VMA but minted a
 fresh host `MAP_SHARED` mmap at a 4 KiB file offset, which Darwin rejects on
 a 16 KiB page host; the correct lowering is a stage-1 repoint to the extent
 already mapped, sent back to the worker.
+
+`adjtimex01`/`adjtimex02` were the same inversion as `vhangup02`: Docker
+without `CAP_SYS_TIME` fails every modifying mode with EPERM. With the
+exact grant in both lanes (`3a2dc90b4`) the oracle passes 2/2 and 7/7 and
+Carrick's new adjtimex model MATCHes both plus `clock_adjtime01` 9/9.
+
+Gate incidents worth remembering: main's `conformance-probes/target` was
+found replaced by a self-referencing symlink (created while worktrees were
+being added and removed with symlinked probe directories), which made two
+"gates" report empty output for every probe; both were re-run after the
+directory was restored and the closure set rebuilt. The page-table growth
+branch (`e39cb980c`) hangs every guest at its first mmap: a live lldb
+backtrace shows its `HostArenaResolver` closure resolving an arena base
+through `mapping_for_range` -> `translate_va_for_cow`, which re-takes the
+page-table mutex the caller already holds under `sync_to_host`. Sent back
+with the frames.
