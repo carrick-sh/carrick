@@ -631,17 +631,9 @@ pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execfromthread", "vforkexecthread"
 /// Complete arm64 baseline mismatch inventory. Every shard derives its local
 /// subset from these global lists so adding a probe cannot silently orphan a
 /// known gap when the deterministic modulo partition moves.
-pub const MUSL_BASELINE_GAPS: &[&str] = &[
-    // process_vm_readv03: the remote read stops at the first non-resident
-    // page of the child (red on purpose, probe committed before the fix).
-    "processvmsparse",
-];
+pub const MUSL_BASELINE_GAPS: &[&str] = &[];
 
-pub const GNU_BASELINE_GAPS: &[&str] = &[
-    // process_vm_readv03: the remote read stops at the first non-resident
-    // page of the child (red on purpose, probe committed before the fix).
-    "processvmsparse",
-];
+pub const GNU_BASELINE_GAPS: &[&str] = &[];
 
 pub fn needs_live_oracle(probe: &str) -> bool {
     LIVE_ORACLE_PROBES.contains(&probe)

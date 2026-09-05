@@ -480,6 +480,7 @@ mod foreign_mm_tests {
         frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision,
         mapping_ids: Vec<carrick_hal::MappingId>,
         executable_ranges: Vec<carrick_hal::ForeignExecutableRange>,
+        readable_ranges: Vec<carrick_hal::ForeignReadableRange>,
     }
 
     impl carrick_hal::ForeignMmSnapshot for TestSnapshot {
@@ -507,6 +508,10 @@ mod foreign_mm_tests {
 
         fn executable_ranges(&self) -> &[carrick_hal::ForeignExecutableRange] {
             &self.executable_ranges
+        }
+
+        fn readable_ranges(&self) -> &[carrick_hal::ForeignReadableRange] {
+            &self.readable_ranges
         }
     }
 
@@ -867,6 +872,21 @@ mod foreign_mm_tests {
         data_len: usize,
         bytes: &[u8],
     ) -> InstalledMm {
+        install_mm_sparse(
+            transport, ordinal, root, data_ipa, data_len, data_len, bytes,
+        )
+    }
+
+    fn install_mm_sparse(
+        transport: &CarrierForeignMmTransport,
+        ordinal: u64,
+        root: u64,
+        data_ipa: u64,
+        data_len: usize,
+        vma_len: usize,
+        bytes: &[u8],
+    ) -> InstalledMm {
+        assert!(vma_len >= data_len, "vma_len must be at least data_len");
         assert!(data_len >= bytes.len(), "fixture bytes must fit data owner");
         assert_eq!(
             data_len as u64 % CowArmedRanges::COMPOUND_SIZE,
@@ -957,6 +977,13 @@ mod foreign_mm_tests {
                 carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(23),
             mapping_ids: vec![table_mapping, data_mapping],
             executable_ranges: Vec::new(),
+            readable_ranges: vec![
+                carrick_hal::ForeignReadableRange::from_kernel_projection(
+                    GuestVa(TEST_VA),
+                    GuestVa(TEST_VA + vma_len as u64),
+                )
+                .unwrap(),
+            ],
         };
         let state = MmAccessState::for_foreign_read_test(
             binding,
@@ -2431,6 +2458,48 @@ mod foreign_mm_tests {
     }
 
     #[test]
+    fn foreign_mm_read_unmaterialized_remote_page_within_vma_reads_zeros_and_full_length() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let page_size = CowArmedRanges::COMPOUND_SIZE as usize;
+        let vma_len = page_size * 2;
+        let installed = install_mm_sparse(
+            &transport,
+            108,
+            0x9600_0800_0000,
+            0x9700_0800_0000,
+            page_size,
+            vma_len,
+            b"hello world",
+        );
+        let mut dst = vec![0xaa_u8; vma_len];
+        let receipt = read_installed(&transport, &installed, &mut dst)
+            .expect("read sparse VMA spanning resident and unmaterialized pages");
+        assert_eq!(receipt.bytes_read(), vma_len);
+        assert_eq!(&dst[..11], b"hello world");
+        assert!(dst[11..page_size].iter().all(|&b| b == 0));
+        assert!(dst[page_size..vma_len].iter().all(|&b| b == 0));
+
+        let mut beyond = vec![0xaa_u8; page_size];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
+        let lease = endpoint
+            .retain(&installed.snapshot, deadline)
+            .expect("retain MM");
+        let beyond_res = lease.read(
+            &installed.live,
+            &installed.snapshot,
+            GuestVa(TEST_VA + vma_len as u64),
+            &mut beyond,
+            deadline,
+        );
+        assert!(matches!(
+            beyond_res,
+            Err(carrick_hal::ForeignMmTransportError::Translation(va)) if va == GuestVa(TEST_VA + vma_len as u64)
+        ));
+    }
+
+    #[test]
     fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let transport = CarrierForeignMmTransport::new();
@@ -3069,6 +3138,7 @@ mod foreign_mm_tests {
                 )
                 .unwrap(),
             ],
+            readable_ranges: Vec::new(),
         };
         let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(
             Arc::clone(&transport) as Arc<dyn carrick_hal::ForeignMmTransport>
@@ -4218,6 +4288,7 @@ mod foreign_mm_tests {
                 .map(|extent| extent.mapping)
                 .collect(),
             executable_ranges: Vec::new(),
+            readable_ranges: Vec::new(),
         };
         let child_live =
             TestLiveAuthority(Arc::new(parking_lot::RwLock::new(child_snapshot.clone())));
@@ -5430,6 +5501,7 @@ mod foreign_mm_tests {
                 )
                 .unwrap(),
             ],
+            readable_ranges: Vec::new(),
         };
         let retained = carrick_hal::ForeignMmEndpoint::for_carrier(
             Arc::clone(&transport) as Arc<dyn carrick_hal::ForeignMmTransport>
@@ -5500,6 +5572,7 @@ mod foreign_mm_tests {
                 carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
             mapping_ids: Vec::new(),
             executable_ranges: Vec::new(),
+            readable_ranges: Vec::new(),
         };
         assert!(
             Arc::ptr_eq(
@@ -6351,6 +6424,7 @@ mod foreign_mm_tests {
                 cow_mapping_id,
             ],
             executable_ranges: Vec::new(),
+            readable_ranges: Vec::new(),
         };
 
         let child_captured = CarrierForeignMmSnapshot::capture(&child_snapshot);
@@ -8797,6 +8871,7 @@ mod foreign_mm_tests {
                 carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
             mapping_ids: vec![],
             executable_ranges: Vec::new(),
+            readable_ranges: Vec::new(),
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let retain_missing = endpoint.retain(&missing_snapshot, deadline);
@@ -19364,6 +19439,7 @@ struct CarrierForeignMmSnapshot {
     frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision,
     mapping_ids: Vec<carrick_hal::MappingId>,
     executable_ranges: Vec<carrick_hal::ForeignExecutableRange>,
+    readable_ranges: Vec<carrick_hal::ForeignReadableRange>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -19380,11 +19456,26 @@ impl CarrierForeignMmSnapshot {
             frame_inventory_revision: snapshot.frame_inventory_revision(),
             mapping_ids: snapshot.mapping_ids().to_vec(),
             executable_ranges: snapshot.executable_ranges().to_vec(),
+            readable_ranges: snapshot.readable_ranges().to_vec(),
         }
     }
 
     fn matches(&self, snapshot: &dyn carrick_hal::ForeignMmSnapshot) -> bool {
         *self == Self::capture(snapshot)
+    }
+
+    fn readable_range(
+        &self,
+        va: carrick_guest_mem::GuestVa,
+    ) -> Option<carrick_hal::ForeignReadableRange> {
+        self.readable_ranges
+            .iter()
+            .copied()
+            .find(|range| range.contains(va))
+    }
+
+    fn is_readable(&self, va: carrick_guest_mem::GuestVa) -> bool {
+        self.readable_range(va).is_some()
     }
 }
 
@@ -19410,6 +19501,9 @@ impl carrick_hal::ForeignMmSnapshot for CarrierForeignMmSnapshot {
     }
     fn executable_ranges(&self) -> &[carrick_hal::ForeignExecutableRange] {
         &self.executable_ranges
+    }
+    fn readable_ranges(&self) -> &[carrick_hal::ForeignReadableRange] {
+        &self.readable_ranges
     }
 }
 
@@ -25048,6 +25142,7 @@ fn perform_foreign_cow_transaction(
         ),
         mapping_ids: committed_mapping_ids,
         executable_ranges: requested.executable_ranges.clone(),
+        readable_ranges: requested.readable_ranges.clone(),
     };
     let new_owner_arc = lease
         .custody
@@ -25114,19 +25209,45 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
                 return Err(carrick_hal::ForeignMmTransportError::Retry);
             }
             let current_va = carrick_guest_mem::GuestVa(cursor);
-            let ipa = foreign_stage1_translate(
+            let ipa = match foreign_stage1_translate(
                 &inner.backing,
                 requested.binding.stage1_root,
                 current_va,
                 &mut owner_generations,
-            )?;
+            ) {
+                Ok(ipa) => Some(ipa),
+                Err(carrick_hal::ForeignMmTransportError::Translation(failed_va)) => {
+                    if requested.is_readable(current_va) {
+                        None
+                    } else {
+                        return Err(carrick_hal::ForeignMmTransportError::Translation(failed_va));
+                    }
+                }
+                Err(err) => return Err(err),
+            };
             let page_remaining = 0x1000_usize - (current_va.raw() as usize & 0xfff);
-            let chunk = page_remaining.min(dst.len() - completed);
-            owner_generations.push(copy_from_pinned_owner(
-                &inner.backing,
-                ipa,
-                &mut dst[completed..completed + chunk],
-            )?);
+            let chunk = match ipa {
+                Some(ipa) => {
+                    let chunk = page_remaining.min(dst.len() - completed);
+                    owner_generations.push(copy_from_pinned_owner(
+                        &inner.backing,
+                        ipa,
+                        &mut dst[completed..completed + chunk],
+                    )?);
+                    chunk
+                }
+                None => {
+                    let readable_remaining = requested
+                        .readable_range(current_va)
+                        .map(|range| (range.end().raw() - current_va.raw()) as usize)
+                        .unwrap_or(page_remaining);
+                    let chunk = page_remaining
+                        .min(readable_remaining)
+                        .min(dst.len() - completed);
+                    dst[completed..completed + chunk].fill(0);
+                    chunk
+                }
+            };
             if !live_snapshot_matches(authority, &requested, deadline)? {
                 return Err(carrick_hal::ForeignMmTransportError::Retry);
             }

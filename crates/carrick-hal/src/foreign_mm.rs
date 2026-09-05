@@ -191,6 +191,33 @@ pub trait ForeignMmSnapshot: Debug + Send + Sync {
     fn frame_inventory_revision(&self) -> ForeignFrameInventoryRevision;
     fn mapping_ids(&self) -> &[MappingId];
     fn executable_ranges(&self) -> &[ForeignExecutableRange];
+    fn readable_ranges(&self) -> &[ForeignReadableRange] {
+        &[]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForeignReadableRange {
+    start: GuestVa,
+    end: GuestVa,
+}
+
+impl ForeignReadableRange {
+    pub fn from_kernel_projection(start: GuestVa, end: GuestVa) -> Option<Self> {
+        (start.raw() < end.raw()).then_some(Self { start, end })
+    }
+
+    pub const fn start(self) -> GuestVa {
+        self.start
+    }
+
+    pub const fn end(self) -> GuestVa {
+        self.end
+    }
+
+    pub fn contains(self, va: GuestVa) -> bool {
+        self.start.raw() <= va.raw() && va.raw() < self.end.raw()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

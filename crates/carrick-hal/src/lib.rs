@@ -25,7 +25,7 @@ pub use foreign_mm::{
     ForeignMmLiveAuthority, ForeignMmPreparedWrite, ForeignMmReadLease, ForeignMmReadReceipt,
     ForeignMmSnapshot, ForeignMmTransport, ForeignMmTransportError, ForeignMmWriteReceipt,
     ForeignOwnerGeneration, ForeignPtraceTextAuthority, ForeignPtraceTextCowPlan,
-    ForeignStage1Identity,
+    ForeignReadableRange, ForeignStage1Identity,
 };
 pub mod stage1_exclusive;
 
