@@ -1,0 +1,9 @@
+2e756d24b7bc7cea
+setup_ok=true
+parent_alive_after_child_slave_close=true
+parent_reads_child_output_after_exit=true
+payload_intact=true
+r2_setup_ok=true
+r2_parent_alive_after_child_exit=true
+r2_parent_reads_child_output_after_exit=true
+r2_payload_intact=true
