@@ -85,6 +85,11 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// direct case and to expose `current_pc` on a non-syscall kick. (x86 calls
     /// this `pending_resume_pc`.)
     pending_resume_pc: Option<u64>,
+    /// A stage-1 table arena source handed to this engine before its manager
+    /// exists. The manager is built lazily on the first page-table edit (or
+    /// replaced on exec), so the install must not depend on bring-up order:
+    /// it is applied the moment a manager is present.
+    pending_arena_source: Option<Box<dyn carrick_mem::page_table::TableArenaSource>>,
 
     /// Linux syscall number (x8) of the most recent trapped `svc`. Feeds the
     /// loop's SA_RESTART decision (`last_syscall_nr()`). `None` before the first
@@ -158,6 +163,7 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
 pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     vm: V,
     pending_resume_pc: Option<u64>,
+    pending_arena_source: Option<Box<dyn carrick_mem::page_table::TableArenaSource>>,
     last_syscall_nr: Option<u64>,
     last_syscall_orig_x0: u64,
     last_fault_esr: u64,
@@ -234,6 +240,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc: None,
+            pending_arena_source: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
@@ -348,6 +355,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc,
+            pending_arena_source,
             last_syscall_nr,
             last_syscall_orig_x0,
             last_fault_esr,
@@ -366,6 +374,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             Aarch64TaskEngineState {
                 vm,
                 pending_resume_pc,
+                pending_arena_source,
                 last_syscall_nr,
                 last_syscall_orig_x0,
                 last_fault_esr,
@@ -388,6 +397,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let Aarch64TaskEngineState {
             vm,
             pending_resume_pc,
+            pending_arena_source,
             last_syscall_nr,
             last_syscall_orig_x0,
             last_fault_esr,
@@ -406,6 +416,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc,
+            pending_arena_source,
             last_syscall_nr,
             last_syscall_orig_x0,
             last_fault_esr,
@@ -641,6 +652,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc: None,
+            pending_arena_source: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
@@ -720,7 +732,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// Replace this mm's stage-1 manager without splitting the engine/backend
     /// authority.  The HVPatch backend resolves permission faults itself, so
     /// every fresh `Arc` must be rebound before the stopped vCPU can resume.
-    fn replace_page_tables(&mut self, manager: Option<PageTableManager>) {
+    fn replace_page_tables(&mut self, mut manager: Option<PageTableManager>) {
+        if let (Some(manager), Some(source)) = (manager.as_mut(), self.pending_arena_source.take())
+        {
+            // A source installed before this rebuild belongs to the new
+            // manager. `set_arena_source` refuses a different lease; that is
+            // an invariant violation, not a recoverable condition.
+            manager.set_arena_source(source).unwrap_or_else(|error| {
+                panic!("apply deferred stage-1 table arena source on rebuild: {error:?}")
+            });
+        }
         let page_tables = Arc::new(Mutex::new(manager));
         self.vm.bind_stage1_page_tables(Arc::clone(&page_tables));
         self.page_tables = page_tables;
@@ -749,6 +770,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc: None,
+            pending_arena_source: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
@@ -872,11 +894,18 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 .map_err(|_| MemoryError::HostMap("read live page tables".to_string()))?;
             // Build through this engine's `GuestArch` MMU codec.
             use carrick_hal::PageTableCodec as _;
-            *guard = Some(
+            let mut manager =
                 <<Self as ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::new_manager(
                     bytes, pt_base,
-                ),
-            );
+                );
+            if let Some(source) = self.pending_arena_source.take() {
+                manager.set_arena_source(source).map_err(|error| {
+                    MemoryError::HostMap(format!(
+                        "apply deferred stage-1 table arena source: {error:?}"
+                    ))
+                })?;
+            }
+            *guard = Some(manager);
         }
         // INVARIANT: populated just above if it was `None` (so the else is dead);
         // a returned Err keeps us clear of the workspace's expect/panic deny lints.
@@ -2602,13 +2631,18 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         source: Box<dyn carrick_mem::page_table::TableArenaSource>,
     ) -> Result<(), TrapError> {
         let mut page_tables = self.page_tables.lock();
-        let manager = page_tables.as_mut().ok_or_else(|| {
-            TrapError::Hypervisor("no stage-1 manager bound on engine".to_owned())
-        })?;
-        manager.set_arena_source(source).map_err(|error| {
-            TrapError::Hypervisor(format!("set stage-1 table arena source: {error:?}"))
-        })?;
-        Ok(())
+        match page_tables.as_mut() {
+            Some(manager) => manager.set_arena_source(source).map_err(|error| {
+                TrapError::Hypervisor(format!("set stage-1 table arena source: {error:?}"))
+            }),
+            // No manager yet: it is built lazily on the first edit, or arrives
+            // with an exec rebuild. Keep the source and apply it then, so the
+            // install never depends on bring-up order.
+            None => {
+                self.pending_arena_source = Some(source);
+                Ok(())
+            }
+        }
     }
 
     fn resolve_frame_cow_fault(
