@@ -409,9 +409,12 @@ impl Stage1Authority {
     ///   Transitions the parent's authority back to `Exclusive` without touching
     ///   its manager or extension arenas; creates and returns a brand-new `Stage1Authority`
     ///   with `builder()?` for the child.
-    /// - If `Exclusive`: retires old extension arenas via `retirer`, updates the manager,
-    ///   preserves the existing authority and arena source, fires probe site 5
-    ///   if the source was present, and returns `self.clone()`.
+    /// - If `Exclusive`: retires the old image's extension arenas via `retirer`,
+    ///   retires its arena source WITH it (the source belongs to the lease of
+    ///   the mm being replaced; the runtime installs the replacement lease's
+    ///   source right after `execve_into`, and a stale source would refuse it
+    ///   `ConflictingArenaSource`), installs the new manager, fires probe
+    ///   site 5, and returns `self.clone()` — the authority identity survives.
     pub fn replace_for_exec<B, R, E>(
         &mut self,
         builder: B,
@@ -437,16 +440,23 @@ impl Stage1Authority {
             *self = new_authority.clone();
             Ok(new_authority)
         } else {
-            let mut old_mgr = self.inner.lock().manager.take();
+            let (mut old_mgr, old_source) = {
+                let mut inner = self.inner.lock();
+                (inner.manager.take(), inner.arena_source.take())
+            };
             if let Some(mut old) = old_mgr.take() {
                 retirer(&mut old)?;
             }
+            // The retired image's source retires with it: its extension
+            // arenas were just handed back and the replacement lease brings
+            // its own source.
+            drop(old_source);
             let new_manager = builder()?;
             let authority = self.authority_id();
             let mut inner = self.inner.lock();
             inner.manager = new_manager;
-            if inner.manager.is_some() && inner.arena_source.is_some() {
-                carrick_observability::probes::stage1_arena_install(5, 1, 0, authority);
+            if inner.manager.is_some() {
+                carrick_observability::probes::stage1_arena_install(5, 0, 0, authority);
             }
             Ok(self.clone())
         }
@@ -806,6 +816,50 @@ mod tests {
         fn return_arena(&mut self, gpa: Gpa) {
             self.returned.lock().unwrap().push(gpa);
         }
+    }
+
+    #[test]
+    fn exec_replacement_drops_the_retired_source_so_the_replacement_lease_installs() {
+        // A forked child that execs: the runtime installs the source for the
+        // REPLACEMENT lease after `execve_into`. The retired image's source
+        // must go with the retired image, or the install refuses
+        // `ConflictingArenaSource` and the exec dies past its point of no
+        // return (busybox `sh -c /bin/true` under the first landing).
+        let old = CountingArenaSource {
+            id: TableArenaSourceId(Gpa(LINUX_PAGE_TABLES_BASE)),
+            available: Arc::new(Mutex::new(Vec::new())),
+            returned: Arc::new(Mutex::new(Vec::new())),
+        };
+        let replacement = CountingArenaSource {
+            id: TableArenaSourceId(Gpa(0x9a_0020_0000)),
+            available: Arc::new(Mutex::new(Vec::new())),
+            returned: Arc::new(Mutex::new(Vec::new())),
+        };
+        let manager = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let mut authority = Stage1Authority::new_with_manager(Some(manager));
+        authority
+            .install_source(Box::new(old))
+            .expect("install the pre-exec source");
+        let retired = authority
+            .replace_for_exec(
+                || {
+                    Ok::<_, PageTableError>(Some(PageTableManager::new(
+                        stage1_hvpatch_page_tables(),
+                        LINUX_PAGE_TABLES_BASE,
+                    )))
+                },
+                |_| Ok(()),
+            )
+            .expect("exclusive exec replacement");
+        assert!(retired.shares_exact_authority(&authority));
+        assert!(
+            !authority.has_source(),
+            "the retired image's arena source must retire with it"
+        );
+        authority
+            .install_source(Box::new(replacement))
+            .expect("the replacement lease's source installs after exec");
+        assert!(authority.has_source());
     }
 
     #[test]
