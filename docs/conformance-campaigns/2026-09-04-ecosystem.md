@@ -821,3 +821,18 @@ demand to 8 MiB); probe `stackgrowmain` isolates it and is red-first
 pending the next Docker phase. The branch's last gate diffs
 (`processvmsparse`, `mremapfixedshared`) were its stale base; the clean
 rebase and full gate run now.
+
+## Page-table growth landed (ee7293816)
+
+Six commits: the worker's multi-arena `PageTableManager` (`TableArenaSource`,
+per-arena `HostArenaResolver`, extension root slots returned on
+retirement), the source plumbing through the fork request and the vCPU
+loop, the MM-scoped install, and the director's two commits deferring the
+install until a manager exists (lazy first edit or exec rebuild) and
+propagating a refused rebuild install as an error. Gate on the rebased
+branch: shards 0 and 1 green, shard 2 green except the not-yet-built
+`stackgrowmain` binary, lint-domains green, every guest boots. The
+`in_use=438 capacity=440` exhaustion is gone from `cpython-compile`; its
+remaining failure is the main-stack growth segfault tracked by
+`stackgrowmain`. Cost of the growth path on the hot mmap loop is not yet
+measured on a quiet host; it is the next A/B once the host is idle.
