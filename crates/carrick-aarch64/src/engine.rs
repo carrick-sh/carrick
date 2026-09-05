@@ -85,11 +85,9 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// direct case and to expose `current_pc` on a non-syscall kick. (x86 calls
     /// this `pending_resume_pc`.)
     pending_resume_pc: Option<u64>,
-    /// A stage-1 table arena source handed to this engine before its manager
-    /// exists. The manager is built lazily on the first page-table edit (or
-    /// replaced on exec), so the install must not depend on bring-up order:
-    /// it is applied the moment a manager is present.
-    pending_arena_source: Option<Box<dyn carrick_mem::page_table::TableArenaSource>>,
+    /// See [`DeferredArenaSource`]: applied by whichever engine over this
+    /// authority builds the manager first (lazy edit or exec rebuild).
+    pending_arena_source: DeferredArenaSource,
 
     /// Linux syscall number (x8) of the most recent trapped `svc`. Feeds the
     /// loop's SA_RESTART decision (`last_syscall_nr()`). `None` before the first
@@ -163,7 +161,7 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
 pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     vm: V,
     pending_resume_pc: Option<u64>,
-    pending_arena_source: Option<Box<dyn carrick_mem::page_table::TableArenaSource>>,
+    pending_arena_source: DeferredArenaSource,
     last_syscall_nr: Option<u64>,
     last_syscall_orig_x0: u64,
     last_fault_esr: u64,
@@ -240,7 +238,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc: None,
-            pending_arena_source: None,
+            pending_arena_source: Arc::new(Mutex::new(None)),
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
@@ -652,7 +650,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc: None,
-            pending_arena_source: None,
+            pending_arena_source: Arc::new(Mutex::new(None)),
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
@@ -740,7 +738,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         if let Some(mut old) = old_mgr {
             self.vm.retire_stage1_extension_arenas(&mut old)?;
         }
-        if let (Some(manager), Some(source)) = (manager.as_mut(), self.pending_arena_source.take())
+        if let (Some(manager), Some(source)) =
+            (manager.as_mut(), self.pending_arena_source.lock().take())
         {
             // A source installed before this rebuild belongs to the new
             // manager. `set_arena_source` refuses a different lease, which is
@@ -774,13 +773,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         vcpu: V::Vcpu,
         page_tables: Arc<Mutex<Option<PageTableManager>>>,
         protections: Arc<MemoryProtections>,
+        pending_arena_source: DeferredArenaSource,
     ) -> Self {
         vm.bind_stage1_page_tables(Arc::clone(&page_tables));
         Self {
             vm,
             vcpu,
             pending_resume_pc: None,
-            pending_arena_source: None,
+            pending_arena_source,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
@@ -937,7 +937,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 <<Self as ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::new_manager(
                     bytes, pt_base,
                 );
-            if let Some(source) = self.pending_arena_source.take() {
+            if let Some(source) = self.pending_arena_source.lock().take() {
                 manager.set_arena_source(source).map_err(|error| {
                     MemoryError::HostMap(format!(
                         "apply deferred stage-1 table arena source: {error:?}"
@@ -2504,6 +2504,15 @@ fn signal_interrupted_pc_for_live_level(
 /// the backend supplies how to build a sibling VM/vCPU from `builder`; the SEEDED
 /// register snapshot + the SHARED page-table editor / PROT_NONE set ride along so
 /// the new vCPU runs in the SAME guest address space on the SAME VM.
+/// A stage-1 table arena source handed to an address space before its manager
+/// exists. SHARED by every engine over the same page-table authority (the
+/// spawning vCPU and its `CLONE_THREAD` siblings), because the manager is
+/// built lazily by whichever engine edits first: an engine-local deferral let
+/// a sibling build a manager that could never grow (CPython's compile
+/// recursion test refused every mmap in roughly half its runs).
+pub type DeferredArenaSource =
+    Arc<Mutex<Option<Box<dyn carrick_mem::page_table::TableArenaSource>>>>;
+
 pub struct Aarch64SiblingSpec<V: Aarch64Vmm> {
     builder: V::SiblingBuilder,
     snapshot: Aarch64VcpuSnapshot,
@@ -2515,6 +2524,8 @@ pub struct Aarch64SiblingSpec<V: Aarch64Vmm> {
     /// load-bearing share is inside the backend `GuestRam` (via
     /// `from_shared_windows`); this is the engine-side mirror.
     protections: Arc<MemoryProtections>,
+    /// The parent's deferred arena source, SHARED (Arc clone).
+    pending_arena_source: DeferredArenaSource,
     process_asid: Option<u16>,
 }
 
@@ -2531,6 +2542,7 @@ pub struct Aarch64SiblingTaskOnlyParts<V: Aarch64Vmm> {
     pub snapshot: Aarch64VcpuSnapshot,
     pub page_tables: Arc<Mutex<Option<PageTableManager>>>,
     pub protections: Arc<MemoryProtections>,
+    pub pending_arena_source: DeferredArenaSource,
     pub process_asid: Option<u16>,
 }
 
@@ -2548,6 +2560,7 @@ impl<V: Aarch64Vmm> Aarch64SiblingSpec<V> {
             builder: self.builder,
             snapshot: self.snapshot,
             page_tables: self.page_tables,
+            pending_arena_source: self.pending_arena_source,
             protections: self.protections,
             process_asid: self.process_asid,
         }
@@ -2715,7 +2728,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     Ok(())
                 }
                 Err(_) => {
-                    self.pending_arena_source = Some(source);
+                    *self.pending_arena_source.lock() = Some(source);
                     Ok(())
                 }
             },
@@ -3336,7 +3349,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
             if let Err(error) = publish_parent {
                 let rollback_result = self.pt_edit_and_flush(|manager| {
-                    *manager = parent_page_tables_snapshot.clone();
+                    // Restore the pre-fork image but keep the live manager's
+                    // arena source and adopted extension arenas: a clone
+                    // carries neither, and a parent that lost them could
+                    // never grow again (see `adopt_live_extension_state`).
+                    let mut restored = parent_page_tables_snapshot.clone();
+                    restored.adopt_live_extension_state(manager);
+                    *manager = restored;
                     Ok(PageTableApplyOutcome::new(true, true))
                 });
                 if let Err(rollback_error) = rollback_result {
@@ -3381,7 +3400,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 });
             return Err(error);
         }
-        let mut engine = Self::from_parts_with_shared(vm, vcpu, spec.page_tables, spec.protections);
+        // A fresh process: its source was installed on the child tables by
+        // `build_process_spec`, so no deferral is inherited from the parent.
+        let mut engine = Self::from_parts_with_shared(
+            vm,
+            vcpu,
+            spec.page_tables,
+            spec.protections,
+            Arc::new(Mutex::new(None)),
+        );
         engine.process_asid = Some(spec.process_asid);
         Ok(engine)
     }
@@ -3599,6 +3626,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             // Share the SAME PROT_NONE bookkeeping (engine-side mirror; the backing
             // share lives in the backend `GuestRam`).
             protections: Arc::clone(&self.protections),
+            pending_arena_source: Arc::clone(&self.pending_arena_source),
             process_asid: self.process_asid,
         })
     }
@@ -3612,7 +3640,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // post-clone instruction.
         vcpu.restore_thread_start(&spec.snapshot)?;
         // SHARE the spawning thread's page-table editor + PROT_NONE set.
-        let mut engine = Self::from_parts_with_shared(vm, vcpu, spec.page_tables, spec.protections);
+        let mut engine = Self::from_parts_with_shared(
+            vm,
+            vcpu,
+            spec.page_tables,
+            spec.protections,
+            spec.pending_arena_source,
+        );
         engine.process_asid = spec.process_asid;
         Ok(engine)
     }
