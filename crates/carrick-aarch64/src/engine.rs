@@ -732,19 +732,25 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// Replace this mm's stage-1 manager without splitting the engine/backend
     /// authority.  The HVPatch backend resolves permission faults itself, so
     /// every fresh `Arc` must be rebound before the stopped vCPU can resume.
-    fn replace_page_tables(&mut self, mut manager: Option<PageTableManager>) {
+    fn replace_page_tables(
+        &mut self,
+        mut manager: Option<PageTableManager>,
+    ) -> Result<(), TrapError> {
         if let (Some(manager), Some(source)) = (manager.as_mut(), self.pending_arena_source.take())
         {
             // A source installed before this rebuild belongs to the new
-            // manager. `set_arena_source` refuses a different lease; that is
-            // an invariant violation, not a recoverable condition.
-            manager.set_arena_source(source).unwrap_or_else(|error| {
-                panic!("apply deferred stage-1 table arena source on rebuild: {error:?}")
-            });
+            // manager. `set_arena_source` refuses a different lease, which is
+            // an invariant violation the exec must fail on, not swallow.
+            manager.set_arena_source(source).map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "apply deferred stage-1 table arena source on rebuild: {error:?}"
+                ))
+            })?;
         }
         let page_tables = Arc::new(Mutex::new(manager));
         self.vm.bind_stage1_page_tables(Arc::clone(&page_tables));
         self.page_tables = page_tables;
+        Ok(())
     }
 
     /// The shared PROT_NONE EFAULT gate (cloned across `CLONE_THREAD` siblings,
@@ -2252,7 +2258,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // `execve_rebuild` installed a fresh table image. Drop the manager for
         // the old image before the hvpatch ASID configuration reserves its
         // per-mm root-slot aperture in the NEW tables.
-        self.replace_page_tables(self.vm.exec_page_tables());
+        self.replace_page_tables(self.vm.exec_page_tables())?;
         if let Some(protections) = self.vm.exec_protections() {
             self.protections = protections;
         }
