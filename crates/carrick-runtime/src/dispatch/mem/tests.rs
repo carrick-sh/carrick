@@ -347,11 +347,12 @@ impl GuestMemory for Stage1MmapMemory {
         let flags = LinuxProtFlags::from_bits_retain(prot);
         let executable = flags.contains(LinuxProtFlags::EXEC);
         let changed = if flags.contains(LinuxProtFlags::WRITE) {
-            self.page_tables.set_rw(address, len, executable)
+            self.page_tables.set_rw(address, len, executable, None)
         } else if flags.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
-            self.page_tables.set_readonly(address, len, executable)
+            self.page_tables
+                .set_readonly(address, len, executable, None)
         } else {
-            self.page_tables.set_prot_none(address, len)
+            self.page_tables.set_prot_none(address, len, None)
         };
         changed
             .map(|_| ())

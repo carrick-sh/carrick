@@ -392,7 +392,7 @@ impl TableArenaSourceId {
 }
 
 /// Provider of additional 2 MiB root slots when the primary stage-1 arena is exhausted.
-pub trait TableArenaSource: std::fmt::Debug + Send {
+pub trait TableArenaSource: std::fmt::Debug + Send + 'static {
     /// Return the typed identity of this arena source.
     fn id(&self) -> TableArenaSourceId;
 
@@ -507,7 +507,6 @@ struct TableArena {
 
 pub struct PageTableManager {
     arenas: Vec<TableArena>,
-    arena_source: Option<Box<dyn TableArenaSource>>,
     /// New or rebuilt terminal descriptors must carry nG. Derived from the
     /// canonical low user leaf so a rebased/cloned HVPatch table retains its
     /// ASID-scoped construction mode without a second out-of-band authority.
@@ -563,7 +562,6 @@ impl Clone for PageTableManager {
     fn clone(&self) -> Self {
         Self {
             arenas: self.arenas.clone(),
-            arena_source: None,
             asid_scoped_leaves: self.asid_scoped_leaves,
             free_tables: self.free_tables.clone(),
             multi_vcpu: self.multi_vcpu,
@@ -580,7 +578,6 @@ impl Clone for PageTableManager {
     /// which is the entire point on the 1.75 MiB table image.
     fn clone_from(&mut self, source: &Self) {
         self.arenas.clone_from(&source.arenas);
-        self.arena_source = None;
         self.asid_scoped_leaves = source.asid_scoped_leaves;
         self.free_tables.clone_from(&source.free_tables);
         self.multi_vcpu = source.multi_vcpu;
@@ -606,7 +603,6 @@ impl PageTableManager {
                 bytes,
                 next_free,
             }],
-            arena_source: None,
             asid_scoped_leaves,
             free_tables: Vec::new(),
             multi_vcpu: false,
@@ -626,39 +622,18 @@ impl PageTableManager {
         self.arenas[0].base
     }
 
-    pub fn set_arena_source(
-        &mut self,
-        source: Box<dyn TableArenaSource>,
-    ) -> Result<(), PageTableError> {
-        if let Some(existing) = self.arena_source.as_ref() {
-            if existing.id() == source.id() {
-                return Ok(());
-            }
-            return Err(PageTableError::ConflictingArenaSource);
-        }
-        self.arena_source = Some(source);
-        Ok(())
-    }
-
-    pub fn arena_source(&self) -> Option<&(dyn TableArenaSource + 'static)> {
-        self.arena_source.as_deref()
-    }
-
     /// Guest-physical base addresses of all extension arenas attached to this manager.
     pub fn extension_arena_bases(&self) -> Vec<u64> {
         self.arenas[1..].iter().map(|a| a.base).collect()
     }
 
-    /// Pop all extension arenas and return them to the installed arena source.
-    /// Returns the bases of the retired extension arenas so callers can unmap them.
+    /// Pop all extension arenas. Returns the bases of the retired extension
+    /// arenas so callers can unmap and retire them.
     pub fn retire_extension_arenas(&mut self) -> Vec<u64> {
         let mut bases = Vec::new();
         while self.arenas.len() > 1 {
             if let Some(arena) = self.arenas.pop() {
                 bases.push(arena.base);
-                if let Some(source) = self.arena_source.as_mut() {
-                    source.return_arena(carrick_guest_mem::Gpa(arena.base));
-                }
             }
         }
         bases
@@ -688,7 +663,11 @@ impl PageTableManager {
     /// publishing the new TTBR. Rebased table descriptors are marked dirty so
     /// an already-copied backing can alternatively be fixed with
     /// [`Self::sync_to_host`] before publication.
-    pub fn rebase(&mut self, new_base: u64) -> Result<(), PageTableError> {
+    pub fn rebase(
+        &mut self,
+        new_base: u64,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<(), PageTableError> {
         if !new_base.is_multiple_of(PT_PAGE) {
             return Err(PageTableError::BadAddress);
         }
@@ -699,20 +678,16 @@ impl PageTableManager {
             return Err(PageTableError::BadAddress);
         }
 
-        if self.arenas.len() > 1 && self.arena_source.is_none() {
+        if self.arenas.len() > 1 && source.is_none() {
             return Err(PageTableError::MissingArenaSource);
         }
 
         let mut new_bases = Vec::with_capacity(self.arenas.len());
         new_bases.push(new_base);
         for _ in 1..self.arenas.len() {
-            let Some(gpa) = self
-                .arena_source
-                .as_mut()
-                .and_then(|source| source.take_arena())
-            else {
+            let Some(gpa) = source.as_mut().and_then(|source| source.take_arena()) else {
                 for &b in &new_bases[1..] {
-                    if let Some(source) = self.arena_source.as_mut() {
+                    if let Some(source) = source.as_mut() {
                         source.return_arena(carrick_guest_mem::Gpa(b));
                     }
                 }
@@ -777,7 +752,7 @@ impl PageTableManager {
             Ok(res) => res,
             Err(err) => {
                 for &b in &new_bases[1..] {
-                    if let Some(source) = self.arena_source.as_mut() {
+                    if let Some(source) = source.as_mut() {
                         source.return_arena(carrick_guest_mem::Gpa(b));
                     }
                 }
@@ -987,11 +962,15 @@ impl PageTableManager {
     ///
     /// # Safety
     /// Resolver must return writable mappings for all touched arenas.
-    pub unsafe fn rollback_undo(&mut self, resolver: impl HostArenaResolver) {
+    pub unsafe fn rollback_undo(
+        &mut self,
+        resolver: impl HostArenaResolver,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Vec<u64> {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
 
         let Some(journal) = self.undo.take() else {
-            return;
+            return Vec::new();
         };
         for &(loc, previous) in journal.words.iter().rev() {
             let arena = &mut self.arenas[loc.arena];
@@ -1014,14 +993,17 @@ impl PageTableManager {
         self.free_tables = journal.free_tables;
         self.reclaim_pending = journal.reclaim_pending;
         self.dirty.truncate(journal.dirty_len);
+        let mut popped = Vec::new();
         while self.arenas.len() > journal.arenas_len {
             let Some(arena) = self.arenas.pop() else {
                 break;
             };
-            if let Some(source) = self.arena_source.as_mut() {
+            popped.push(arena.base);
+            if let Some(source) = source.as_mut() {
                 source.return_arena(carrick_guest_mem::Gpa(arena.base));
             }
         }
+        popped
     }
 
     /// Replace the live host backing with this manager's complete image across all arenas.
@@ -1074,27 +1056,13 @@ impl PageTableManager {
         )
     }
 
-    /// Whether an arena source is attached: an `OutOfTables` with `false` here
-    /// is a process that can never grow, not one that ran out of slots.
-    #[must_use]
-    pub fn has_arena_source(&self) -> bool {
-        self.arena_source.is_some()
-    }
-
-    /// Detach the arena source (a rebuild that keeps the same mm hands it to
-    /// the replacement manager).
-    pub fn take_arena_source(&mut self) -> Option<Box<dyn TableArenaSource>> {
-        self.arena_source.take()
-    }
-
     /// Restore a pre-transaction image over `live` without losing what the
-    /// live manager owns beyond its tables: the arena source moves over, and
-    /// every extension arena the live manager acquired after the image was
-    /// taken is adopted as an empty arena (its tables are unreachable from the
-    /// restored tree, and its stage-2 backing stays published), so a rollback
-    /// neither leaks pool slots nor leaves the process unable to grow.
-    pub fn adopt_live_extension_state(&mut self, live: &mut Self) {
-        self.arena_source = live.arena_source.take();
+    /// live manager owns beyond its tables: every extension arena the live
+    /// manager acquired after the image was taken is adopted as an empty arena
+    /// (its tables are unreachable from the restored tree, and its stage-2
+    /// backing stays published), so a rollback neither leaks pool slots nor
+    /// leaves the process unable to grow.
+    pub fn adopt_live_extension_state(&mut self, live: &Self) {
         for arena in live.arenas.iter().skip(1) {
             if self.arenas.iter().any(|mine| mine.base == arena.base) {
                 continue;
@@ -1274,7 +1242,10 @@ impl PageTableManager {
     /// Carve a zeroed table page: reuse a coalesced one if available, else bump
     /// the spare tail of the primary arena or an extension arena, or allocate a
     /// new extension arena from the attached source.
-    fn alloc_table(&mut self) -> Result<u64, PageTableError> {
+    fn alloc_table(
+        &mut self,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<u64, PageTableError> {
         if let Some(pa) = self.free_tables.pop() {
             return Ok(pa);
         }
@@ -1295,7 +1266,7 @@ impl PageTableManager {
         {
             return Ok(pa);
         }
-        if let Some(source) = self.arena_source.as_mut()
+        if let Some(source) = source.as_mut()
             && let Some(gpa) = source.take_arena()
         {
             let base = gpa.0;
@@ -1317,6 +1288,7 @@ impl PageTableManager {
         &mut self,
         parent_loc: TableLocation,
         level: usize,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<(), PageTableError> {
         let block = self.read_desc(parent_loc);
         let (parent_pa_mask, child_pa_mask, child_stride, child_is_page) = match level {
@@ -1335,7 +1307,7 @@ impl PageTableManager {
         let parent_valid = block & VALID != 0;
         let parent_empty = !parent_valid && base_pa == 0;
 
-        let table_pa = self.alloc_table()?;
+        let table_pa = self.alloc_table(source)?;
         let table_loc = self.pa_to_loc(table_pa)?;
         for i in 0..512u64 {
             let child_loc = table_loc.entry(i as usize);
@@ -1361,6 +1333,7 @@ impl PageTableManager {
         &mut self,
         va: u64,
         allocate: bool,
+        mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<(TableLocation, usize), PageTableError> {
         let idx = indices(va);
         let mut table_loc = TableLocation::new(0, 0);
@@ -1383,7 +1356,7 @@ impl PageTableManager {
             if !valid {
                 return Err(PageTableError::BadAddress);
             }
-            self.split_block(entry_loc, level)?;
+            self.split_block(entry_loc, level, source.as_deref_mut())?;
             let desc2 = self.read_desc(entry_loc);
             table_loc = self.pa_to_loc(desc2 & PA_MASK_TABLE)?;
         }
@@ -1583,6 +1556,7 @@ impl PageTableManager {
         va: u64,
         len: usize,
         op: PtOp,
+        mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
         let end = va + (len as u64).div_ceil(PT_PAGE) * PT_PAGE;
         let mut cur = va;
@@ -1590,7 +1564,7 @@ impl PageTableManager {
         let mut flush_required = false;
         while cur < end {
             // The existing covering descriptor (block or page) for `cur`.
-            let (off, level) = self.leaf_offset(cur, false)?;
+            let (off, level) = self.leaf_offset(cur, false, None)?;
             let (span, mask) = Self::level_span(level);
             let block_start = cur & mask;
             let block_end = block_start + span;
@@ -1720,7 +1694,7 @@ impl PageTableManager {
                 // in-range edits all happen to be no-ops.
                 let block = self.read_desc(off);
                 let parent_valid = block & VALID != 0;
-                self.split_block(off, level)?;
+                self.split_block(off, level, source.as_deref_mut())?;
                 changed = true;
                 if parent_valid {
                     flush_required = true;
@@ -1750,11 +1724,12 @@ impl PageTableManager {
         &mut self,
         va: u64,
         len: usize,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
         // A teardown is the only thing that can empty a sub-table, so this is
         // where the reclaim sweep becomes worth re-running.
         self.reclaim_pending = true;
-        self.apply(va, len, PtOp::Invalidate)
+        self.apply(va, len, PtOp::Invalidate, source)
     }
 
     /// `munmap`: invalidate `[va, va+len)` (the freed range faults until
@@ -1768,9 +1743,10 @@ impl PageTableManager {
         &mut self,
         va: u64,
         len: usize,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
         self.reclaim_pending = true;
-        self.apply(va, len, PtOp::Retire)
+        self.apply(va, len, PtOp::Retire, source)
     }
 
     /// `munmap` of a HIGH-VA alias: invalidate the range AND reclaim any spare
@@ -1789,8 +1765,9 @@ impl PageTableManager {
         &mut self,
         va: u64,
         len: usize,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
-        let mut outcome = self.invalidate(va, len)?;
+        let mut outcome = self.invalidate(va, len, source)?;
         let reclaimed = self.reclaim_invalid_tables(va, len);
         outcome.changed |= reclaimed;
         if reclaimed {
@@ -1961,8 +1938,9 @@ impl PageTableManager {
         va: u64,
         len: usize,
         exec: bool,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
-        self.apply(va, len, PtOp::ReadOnly { exec })
+        self.apply(va, len, PtOp::ReadOnly { exec }, source)
     }
 
     /// Arm a private fork range read-only and make the descriptor ASID-scoped.
@@ -1972,8 +1950,9 @@ impl PageTableManager {
         &mut self,
         va: u64,
         len: usize,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
-        self.apply(va, len, PtOp::ForkReadOnly)
+        self.apply(va, len, PtOp::ForkReadOnly, source)
     }
 
     /// Mark a Carrick-owned EL1 range read-only without granting EL0 access.
@@ -1984,8 +1963,9 @@ impl PageTableManager {
         va: u64,
         len: usize,
         exec: bool,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
-        self.apply(va, len, PtOp::KernelReadOnly { exec })
+        self.apply(va, len, PtOp::KernelReadOnly { exec }, source)
     }
 
     /// Restore `[va, va+len)` to a valid RW user page (identity-mapped). `exec`
@@ -1995,8 +1975,9 @@ impl PageTableManager {
         va: u64,
         len: usize,
         exec: bool,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<PageTableApplyOutcome, PageTableError> {
-        self.apply(va, len, PtOp::ReadWrite { exec })
+        self.apply(va, len, PtOp::ReadWrite { exec }, source)
     }
 
     /// Build a fresh VA→IPA translation for `[va, va+len)` for EL0, creating
@@ -2020,6 +2001,7 @@ impl PageTableManager {
         ipa: u64,
         len: u64,
         writable: bool,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
         let scope = if self.asid_scoped_leaves {
             NON_GLOBAL
@@ -2036,7 +2018,7 @@ impl PageTableManager {
         } else {
             (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | scope
         };
-        self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags)
+        self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags, source)
     }
 
     /// Build a per-mm VA→IPA translation whose TLB entries are ASID-scoped.
@@ -2051,6 +2033,7 @@ impl PageTableManager {
         ipa: u64,
         len: u64,
         writable: bool,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
         let block_flags = if writable {
             USER_BLOCK_FLAGS | NON_GLOBAL
@@ -2062,7 +2045,7 @@ impl PageTableManager {
         } else {
             (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
         };
-        self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags)
+        self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags, source)
     }
 
     /// Repoint an EL1-only Carrick control-page range while preserving the
@@ -2074,6 +2057,7 @@ impl PageTableManager {
         va: u64,
         ipa: u64,
         len: u64,
+        source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
         const KERNEL_ATTRS: u64 = (1u64 << 54) | NON_GLOBAL | (1 << 10) | (0b11 << 8);
         self.map_aliased_with_flags(
@@ -2082,6 +2066,7 @@ impl PageTableManager {
             len,
             KERNEL_ATTRS | TYPE_BLOCK,
             KERNEL_ATTRS | TYPE_TABLE_OR_PAGE,
+            source,
         )
     }
 
@@ -2095,6 +2080,7 @@ impl PageTableManager {
         va: u64,
         ipa: u64,
         len: u64,
+        mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
         const FOUR_KIB: u64 = 1 << 12;
         if va & (FOUR_KIB - 1) != ipa & (FOUR_KIB - 1) {
@@ -2105,7 +2091,7 @@ impl PageTableManager {
         for index in 0..pages {
             let page_va = (va & !(FOUR_KIB - 1)) + index * FOUR_KIB;
             let page_ipa = (ipa & !(FOUR_KIB - 1)) + index * FOUR_KIB;
-            let (loc, level) = self.leaf_offset(page_va, true)?;
+            let (loc, level) = self.leaf_offset(page_va, true, source.as_deref_mut())?;
             if level != 3 {
                 return Err(PageTableError::BadAddress);
             }
@@ -2127,13 +2113,14 @@ impl PageTableManager {
         &mut self,
         va: u64,
         len: usize,
+        mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
         const FOUR_KIB: u64 = 1 << 12;
         let pages = (len as u64).div_ceil(FOUR_KIB);
         let mut changed = false;
         for index in 0..pages {
             let page_va = (va & !(FOUR_KIB - 1)) + index * FOUR_KIB;
-            let (loc, level) = self.leaf_offset(page_va, true)?;
+            let (loc, level) = self.leaf_offset(page_va, true, source.as_deref_mut())?;
             if level != 3 {
                 return Err(PageTableError::BadAddress);
             }
@@ -2152,7 +2139,7 @@ impl PageTableManager {
 
     /// Spare pages still available to `alloc_table`: the free list plus the
     /// untouched bump tail across all arenas.
-    fn spare_tables_available(&self) -> u64 {
+    pub fn spare_tables_available(&self) -> u64 {
         let mut tail = 0u64;
         for arena in &self.arenas {
             tail += (arena.bytes.len() as u64).saturating_sub(arena.next_free) / PT_PAGE;
@@ -2195,6 +2182,7 @@ impl PageTableManager {
         len: u64,
         block_flags: u64,
         page_flags: u64,
+        mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<bool, PageTableError> {
         const ONE_GIB: u64 = 1 << 30;
         const TWO_MIB: u64 = 1 << 21;
@@ -2226,7 +2214,7 @@ impl PageTableManager {
             // before `alloc_table` is ever called and its last-resort sweep
             // would never run. Take the same one-shot reclaim here, then re-ask.
             self.reclaim_all_invalid_tables();
-            if self.arena_source.is_none() && needed > self.spare_tables_available() {
+            if source.is_none() && needed > self.spare_tables_available() {
                 return Err(PageTableError::OutOfTables);
             }
         }
@@ -2250,7 +2238,7 @@ impl PageTableManager {
             };
             let (span, mask) = Self::level_span(level);
             let flags = if level == 3 { page_flags } else { block_flags };
-            let table_loc = self.descend_creating(cursor, level)?;
+            let table_loc = self.descend_creating(cursor, level, source.as_deref_mut())?;
             let idx = indices(cursor);
             self.write_desc(table_loc.entry(idx[level]), (out & mask) | flags);
             cursor += span;
@@ -2266,6 +2254,7 @@ impl PageTableManager {
         &mut self,
         va: u64,
         target_level: usize,
+        mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<TableLocation, PageTableError> {
         let idx = indices(va);
         let mut table_loc = TableLocation::new(0, 0); // L0 at byte offset 0 in arena 0
@@ -2286,12 +2275,12 @@ impl PageTableManager {
                 // a 2 MiB block an earlier alias mapping created (the case a
                 // forked child hits when it maps inside a block its parent's
                 // cloned tables already established). Mirrors `leaf_offset`.
-                self.split_block(entry_loc, level)?;
+                self.split_block(entry_loc, level, source.as_deref_mut())?;
                 let desc2 = self.read_desc(entry_loc);
                 table_loc = self.pa_to_loc(desc2 & PA_MASK_TABLE)?;
                 continue;
             }
-            let pa = self.alloc_table()?;
+            let pa = self.alloc_table(source.as_deref_mut())?;
             table_loc = self.pa_to_loc(pa)?;
             self.write_table_desc(entry_loc, (pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
         }
@@ -2301,7 +2290,7 @@ impl PageTableManager {
     /// True iff the leaf for `va` (block or page) is valid. Test/diagnostic.
     #[cfg(test)]
     pub fn is_valid(&mut self, va: u64) -> bool {
-        match self.leaf_offset(va, false) {
+        match self.leaf_offset(va, false, None) {
             Ok((loc, _)) => self.read_desc(loc) & VALID != 0,
             Err(_) => false,
         }
@@ -2310,7 +2299,7 @@ impl PageTableManager {
     /// AP[2:1] of the leaf for `va`. Test/diagnostic.
     #[cfg(test)]
     pub fn ap_bits(&mut self, va: u64) -> u64 {
-        match self.leaf_offset(va, false) {
+        match self.leaf_offset(va, false, None) {
             Ok((loc, _)) => self.read_desc(loc) & AP_MASK,
             Err(_) => 0,
         }
@@ -2382,31 +2371,32 @@ mod tests {
         type Edit = Box<dyn Fn(&mut PageTableManager)>;
         let edits: Vec<Edit> = vec![
             Box::new(|m: &mut PageTableManager| {
-                m.set_readonly(LINUX_HEAP_BASE, 0x4000, false).ok();
+                m.set_readonly(LINUX_HEAP_BASE, 0x4000, false, None).ok();
             }),
             Box::new(|m: &mut PageTableManager| {
-                m.set_rw(LINUX_HEAP_BASE, 0x2000, false).ok();
+                m.set_rw(LINUX_HEAP_BASE, 0x2000, false, None).ok();
             }),
             Box::new(|m: &mut PageTableManager| {
-                m.map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x8000, false)
+                m.map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x8000, false, None)
                     .ok();
             }),
             Box::new(|m: &mut PageTableManager| {
-                m.set_prot_none(LINUX_MMAP_BASE, 0x4000).ok();
+                m.set_prot_none(LINUX_MMAP_BASE, 0x4000, None).ok();
             }),
             Box::new(|m: &mut PageTableManager| {
                 m.repoint_preserving_attributes(
                     LINUX_MMAP_BASE,
                     LINUX_ALIAS_IPA_BASE + 0x10000,
                     0x4000,
+                    None,
                 )
                 .ok();
             }),
             Box::new(|m: &mut PageTableManager| {
-                m.unmap_aliased(LINUX_MMAP_BASE, 0x8000).ok();
+                m.unmap_aliased(LINUX_MMAP_BASE, 0x8000, None).ok();
             }),
             Box::new(|m: &mut PageTableManager| {
-                m.invalidate(LINUX_HEAP_BASE, 0x4000).ok();
+                m.invalidate(LINUX_HEAP_BASE, 0x4000, None).ok();
             }),
         ];
 
@@ -2417,9 +2407,11 @@ mod tests {
             journalled.set_stage1_exclusive(true);
             // Some pre-transaction history, so the rollback target is not the
             // pristine image and repeated writes to one offset really occur.
-            journalled.set_readonly(LINUX_HEAP_BASE, 0x8000, false).ok();
             journalled
-                .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false)
+                .set_readonly(LINUX_HEAP_BASE, 0x8000, false, None)
+                .ok();
+            journalled
+                .map_private_aliased(LINUX_MMAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, false, None)
                 .ok();
 
             let oracle = journalled.clone();
@@ -2437,7 +2429,7 @@ mod tests {
             // SAFETY: `host` is a writable buffer of exactly the region length
             // and no guest is running against this test-local manager.
             unsafe {
-                journalled.rollback_undo((journalled.base(), host.as_mut_ptr()));
+                journalled.rollback_undo((journalled.base(), host.as_mut_ptr()), None);
             };
 
             assert!(
@@ -2472,7 +2464,7 @@ mod tests {
     fn undo_journal_commit_keeps_the_transaction() {
         let mut mgr = manager();
         mgr.begin_undo();
-        mgr.set_readonly(LINUX_HEAP_BASE, 0x4000, false)
+        mgr.set_readonly(LINUX_HEAP_BASE, 0x4000, false, None)
             .expect("protect heap");
         let after = mgr.clone();
         mgr.commit_undo();
@@ -2486,9 +2478,10 @@ mod tests {
         let leaf = |manager: &PageTableManager, va| terminal_descriptor(manager.debug_walk(va));
         let text = 0x0040_0000_u64;
 
-        mgr.set_readonly(text, 0x1000, true).expect("protect text");
+        mgr.set_readonly(text, 0x1000, true, None)
+            .expect("protect text");
         assert_ne!(leaf(&mgr, text) & NON_GLOBAL, 0);
-        mgr.set_rw(text, 0x1000, true).expect("restore text");
+        mgr.set_rw(text, 0x1000, true, None).expect("restore text");
         let restored = mgr.debug_walk(text);
         assert_ne!(terminal_descriptor(restored) & NON_GLOBAL, 0);
         assert_ne!(
@@ -2499,7 +2492,7 @@ mod tests {
 
         let shared_va = LINUX_SHARED_FILE_BASE;
         let shared_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
-        mgr.map_aliased(shared_va, shared_ipa, 0x4000, true)
+        mgr.map_aliased(shared_va, shared_ipa, 0x4000, true, None)
             .expect("publish physically shared per-mm alias");
         assert_ne!(
             leaf(&mgr, shared_va) & NON_GLOBAL,
@@ -2509,16 +2502,16 @@ mod tests {
 
         let private_va = LINUX_PRIVATE_OVERLAY_BASE;
         let first_private_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
-        mgr.map_private_aliased(private_va, first_private_ipa, 0x4000, true)
+        mgr.map_private_aliased(private_va, first_private_ipa, 0x4000, true, None)
             .expect("publish private alias");
         let replacement_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x60_0000;
-        mgr.repoint_preserving_attributes(private_va, replacement_ipa, 0x4000)
+        mgr.repoint_preserving_attributes(private_va, replacement_ipa, 0x4000, None)
             .expect("repoint private alias");
         assert_ne!(leaf(&mgr, private_va) & NON_GLOBAL, 0);
 
         let mut compatibility = manager();
         compatibility
-            .map_aliased(shared_va, shared_ipa, 0x4000, true)
+            .map_aliased(shared_va, shared_ipa, 0x4000, true, None)
             .expect("publish compatibility alias");
         assert_eq!(
             leaf(&compatibility, shared_va) & NON_GLOBAL,
@@ -2526,11 +2519,11 @@ mod tests {
             "HVPatch ASID scope must not blanket-change compatibility editors"
         );
 
-        mgr.unmap_aliased(crate::memory::LINUX_NULL_GUARD_END, 0x1000)
+        mgr.unmap_aliased(crate::memory::LINUX_NULL_GUARD_END, 0x1000, None)
             .expect("remove the low detection leaf");
         let mut reconstructed = PageTableManager::new(mgr.into_bytes(), LINUX_PAGE_TABLES_BASE);
         reconstructed
-            .map_aliased(shared_va, shared_ipa, 0x4000, true)
+            .map_aliased(shared_va, shared_ipa, 0x4000, true, None)
             .expect("publish alias after reconstructing the editor");
         assert_ne!(
             leaf(&reconstructed, shared_va) & NON_GLOBAL,
@@ -2550,7 +2543,7 @@ mod tests {
     fn host_walk_matches_the_copying_walk() {
         let mut mgr = manager();
         let va = LINUX_HEAP_BASE;
-        mgr.map_private_aliased(va, LINUX_ALIAS_IPA_BASE, 0x4000, true)
+        mgr.map_private_aliased(va, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
             .expect("map a private alias to force a full four-level walk");
         let bytes = mgr.as_bytes().to_vec();
         let base = mgr.base();
@@ -2580,7 +2573,7 @@ mod tests {
     fn clone_from_reproduces_clone_and_keeps_the_buffer() {
         let mut source = manager();
         source
-            .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true)
+            .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
             .expect("split a block so the source has allocator state to carry");
 
         let mut recycled = manager();
@@ -2654,7 +2647,8 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_MMAP_BASE + 0x10_0000; // inside a 1 GiB block
         assert!(mgr.is_valid(va), "arena starts mapped");
-        mgr.set_prot_none(va, 0x1000).expect("split + invalidate");
+        mgr.set_prot_none(va, 0x1000, None)
+            .expect("split + invalidate");
         assert!(!mgr.is_valid(va), "target page now faults");
         assert!(mgr.is_valid(va + 0x1000), "next page stays mapped");
         assert!(
@@ -2667,10 +2661,10 @@ mod tests {
     fn set_readonly_then_rw_round_trips() {
         let mut mgr = manager();
         let va = LINUX_MMAP_BASE + 0x20_0000;
-        mgr.set_readonly(va, 0x1000, true).expect("ro");
+        mgr.set_readonly(va, 0x1000, true, None).expect("ro");
         assert_eq!(mgr.ap_bits(va), AP_RO);
         assert!(mgr.is_valid(va));
-        mgr.set_rw(va, 0x1000, true).expect("rw");
+        mgr.set_rw(va, 0x1000, true, None).expect("rw");
         assert_eq!(mgr.ap_bits(va), AP_RW);
         assert!(mgr.is_valid(va));
     }
@@ -2681,7 +2675,8 @@ mod tests {
         let va = LINUX_MMAP_BASE + 0x24_0000;
         assert_eq!(mgr.debug_walk(va)[3] & (1 << 11), 0);
 
-        mgr.set_fork_readonly(va, 0x1000).expect("arm fork COW");
+        mgr.set_fork_readonly(va, 0x1000, None)
+            .expect("arm fork COW");
 
         let leaf = mgr.debug_walk(va)[3];
         assert_eq!(leaf & AP_MASK, AP_RO);
@@ -2693,12 +2688,13 @@ mod tests {
         let mut mgr = manager();
         let nx = LINUX_MMAP_BASE + 0x2c_0000;
         let x = LINUX_MMAP_BASE + 0x2c_1000;
-        mgr.set_rw(nx, 0x1000, false).expect("rw nx");
-        mgr.set_rw(x, 0x1000, true).expect("rw exec");
+        mgr.set_rw(nx, 0x1000, false, None).expect("rw nx");
+        mgr.set_rw(x, 0x1000, true, None).expect("rw exec");
         assert_ne!(mgr.debug_walk(nx)[3] & UXN, 0);
         assert_eq!(mgr.debug_walk(x)[3] & UXN, 0);
 
-        mgr.set_fork_readonly(nx, 0x2000).expect("arm fork COW");
+        mgr.set_fork_readonly(nx, 0x2000, None)
+            .expect("arm fork COW");
 
         for va in [nx, x] {
             let leaf = mgr.debug_walk(va)[3];
@@ -2717,7 +2713,9 @@ mod tests {
         );
         // Re-arming an already-armed range is satisfied regardless of UXN.
         assert!(
-            !mgr.set_fork_readonly(nx, 0x2000).expect("re-arm").changed,
+            !mgr.set_fork_readonly(nx, 0x2000, None)
+                .expect("re-arm")
+                .changed,
             "an armed leaf is satisfied whatever its execute bit"
         );
     }
@@ -2726,15 +2724,15 @@ mod tests {
     fn fork_readonly_preserves_prot_none_and_later_write_keeps_non_global() {
         let mut mgr = manager();
         let va = LINUX_MMAP_BASE + 0x28_0000;
-        mgr.set_prot_none(va, 0x1000).expect("PROT_NONE");
+        mgr.set_prot_none(va, 0x1000, None).expect("PROT_NONE");
         assert!(!mgr.is_valid(va));
 
-        mgr.set_fork_readonly(va, 0x1000)
+        mgr.set_fork_readonly(va, 0x1000, None)
             .expect("arm invalid fork leaf");
         assert!(!mgr.is_valid(va), "fork arming must not grant access");
         assert_ne!(mgr.debug_walk(va)[3] & NON_GLOBAL, 0);
 
-        mgr.set_rw(va, 0x1000, false).expect("mprotect write");
+        mgr.set_rw(va, 0x1000, false, None).expect("mprotect write");
         assert!(mgr.is_valid(va));
         assert_ne!(
             mgr.debug_walk(va)[3] & NON_GLOBAL,
@@ -2747,12 +2745,12 @@ mod tests {
     fn kernel_cow_arm_and_alias_preserve_el1_only_access() {
         let mut mgr = manager();
         let va = crate::memory::LINUX_SYSCALL_MAILBOX_BASE;
-        mgr.set_kernel_readonly(va, 0x4000, false)
+        mgr.set_kernel_readonly(va, 0x4000, false, None)
             .expect("arm kernel COW");
         assert_eq!(mgr.ap_bits(va), AP_PRIV_RO);
 
         let private_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
-        mgr.map_kernel_aliased(va, private_ipa, 0x4000)
+        mgr.map_kernel_aliased(va, private_ipa, 0x4000, None)
             .expect("publish kernel COW");
         assert_eq!(mgr.ap_bits(va), 0, "EL1 is writable and EL0 remains denied");
         assert_ne!(mgr.debug_walk(va)[3] & NON_GLOBAL, 0);
@@ -2764,9 +2762,9 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_HEAP_BASE + 0x40_0000;
         let new_ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
-        mgr.set_readonly(va, 0x4000, false)
+        mgr.set_readonly(va, 0x4000, false, None)
             .expect("arm compound read-only");
-        mgr.set_prot_none(va + 0x2000, 0x1000)
+        mgr.set_prot_none(va + 0x2000, 0x1000, None)
             .expect("semantic hole inside compound");
         let before = [
             mgr.debug_walk(va)[3],
@@ -2775,9 +2773,9 @@ mod tests {
             mgr.debug_walk(va + 0x3000)[3],
         ];
 
-        mgr.repoint_preserving_attributes(va, new_ipa, 0x4000)
+        mgr.repoint_preserving_attributes(va, new_ipa, 0x4000, None)
             .expect("repoint physical compound");
-        mgr.set_writable_preserving_attributes(va, 0x1000)
+        mgr.set_writable_preserving_attributes(va, 0x1000, None)
             .expect("faulting semantic page becomes writable");
 
         for index in 0..4_u64 {
@@ -2803,10 +2801,10 @@ mod tests {
     fn prot_none_then_rw_remaps() {
         let mut mgr = manager();
         let va = LINUX_MMAP_BASE + 0x30_0000;
-        mgr.set_prot_none(va, 0x2000).expect("none");
+        mgr.set_prot_none(va, 0x2000, None).expect("none");
         assert!(!mgr.is_valid(va));
         assert!(!mgr.is_valid(va + 0x1000));
-        mgr.set_rw(va, 0x2000, true).expect("rw");
+        mgr.set_rw(va, 0x2000, true, None).expect("rw");
         assert!(mgr.is_valid(va));
         assert!(mgr.is_valid(va + 0x1000));
     }
@@ -2816,16 +2814,16 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_SHARED_FILE_BASE + 0x4000;
         let overlay = LINUX_PRIVATE_OVERLAY_BASE + 0x8000;
-        mgr.map_aliased(va, overlay, 0x1000, true)
+        mgr.map_aliased(va, overlay, 0x1000, true, None)
             .expect("private overlay");
-        mgr.set_readonly(va, 0x1000, false)
+        mgr.set_readonly(va, 0x1000, false, None)
             .expect("protect overlay readonly");
         assert_eq!(mgr.translate(va), Some(overlay));
 
-        mgr.invalidate(va, 0x1000).expect("unmap overlay");
-        mgr.map_aliased(va, va, 0x1000, true)
+        mgr.invalidate(va, 0x1000, None).expect("unmap overlay");
+        mgr.map_aliased(va, va, 0x1000, true, None)
             .expect("restore shared identity");
-        mgr.set_rw(va, 0x1000, false)
+        mgr.set_rw(va, 0x1000, false, None)
             .expect("protect restored shared mapping");
         assert_eq!(
             mgr.translate(va),
@@ -2846,9 +2844,9 @@ mod tests {
         let mut mgr = manager();
         let va1 = 0x100_0020_0000u64; // > 1 TiB, 2 MiB aligned, never identity-mapped
         let va2 = va1 + (1 << 21); // next 2 MiB block — same L2 table
-        mgr.map_aliased(va1, 0x80_0000, 0x1000, true)
+        mgr.map_aliased(va1, 0x80_0000, 0x1000, true, None)
             .expect("alias 1");
-        mgr.map_aliased(va2, 0xA0_0000, 0x1000, true)
+        mgr.map_aliased(va2, 0xA0_0000, 0x1000, true, None)
             .expect("alias 2");
         assert!(
             mgr.is_valid(va1) && mgr.is_valid(va2),
@@ -2856,7 +2854,7 @@ mod tests {
         );
         let (two, _, _, _) = mgr.pool_stats();
 
-        let changed = mgr.unmap_aliased(va1, 0x1000).expect("unmap alias 1");
+        let changed = mgr.unmap_aliased(va1, 0x1000, None).expect("unmap alias 1");
         assert!(changed.changed, "unmap edited the tables");
         let (one, _, _, _) = mgr.pool_stats();
         assert_eq!(
@@ -2885,7 +2883,7 @@ mod tests {
         let bulk = 128 * (1u64 << 20); // 128 MiB (64 blocks)
         let len = bulk + 0x4000; // + 16 KiB tail → not 2 MiB-aligned
         let ok = mgr
-            .map_aliased(va, ipa, len, true)
+            .map_aliased(va, ipa, len, true, None)
             .expect("large unaligned alias must not exhaust the table pool");
         assert!(ok);
         assert!(mgr.is_valid(va), "first block of the bulk is mapped");
@@ -2910,7 +2908,7 @@ mod tests {
         let va = LINUX_HIGH_VA_THRESHOLD; // 1 TiB, 2 MiB-aligned
         let ipa = LINUX_ALIAS_IPA_BASE; // 96 GiB, 2 MiB-aligned
         let len = 0x1_0000; // 64 KiB (16 pages)
-        mgr.map_aliased(va, ipa, len, true).expect("map");
+        mgr.map_aliased(va, ipa, len, true, None).expect("map");
         // Base, mid-page offset, and a later page all keep the VA→IPA delta.
         assert_eq!(mgr.translate(va), Some(ipa));
         assert_eq!(mgr.translate(va + 0xabc), Some(ipa + 0xabc));
@@ -2932,11 +2930,12 @@ mod tests {
         let len = 0xc1_0000;
         let probe = 0x80_e280;
 
-        mgr.map_aliased(va, ipa, len, true).expect("map image");
+        mgr.map_aliased(va, ipa, len, true, None)
+            .expect("map image");
         let expected = ipa + (probe - va);
         assert_eq!(mgr.translate(probe), Some(expected));
 
-        mgr.set_readonly(0x5a_0000, 0x5d_4000, false)
+        mgr.set_readonly(0x5a_0000, 0x5d_4000, false, None)
             .expect("apply ELF rodata protection");
         assert_eq!(
             mgr.translate(probe),
@@ -2950,8 +2949,8 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_HIGH_VA_THRESHOLD;
         let ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
-        mgr.map_aliased(va, ipa, 0x4000, true).expect("map");
-        mgr.invalidate(va, 0x4000).expect("invalidate");
+        mgr.map_aliased(va, ipa, 0x4000, true, None).expect("map");
+        mgr.invalidate(va, 0x4000, None).expect("invalidate");
 
         assert_eq!(mgr.translate(va + 0x123), None);
         assert_eq!(mgr.translate_retained_output(va + 0x123), Some(ipa + 0x123));
@@ -2969,7 +2968,7 @@ mod tests {
         // 2 GiB + 16 KiB. A page-granular build needs ~1024 L3 tables — far
         // more than the spare pool — while coarse leaves need a handful.
         let len = 2 * ONE_GIB + 4 * 0x1000;
-        mgr.map_aliased(va, ipa, len, true)
+        mgr.map_aliased(va, ipa, len, true, None)
             .expect("a 2 GiB + 16 KiB alias must map");
         let (after, _, _, _) = mgr.pool_stats();
         assert!(
@@ -2992,7 +2991,7 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_HIGH_VA_THRESHOLD;
         let ipa = LINUX_ALIAS_IPA_BASE;
-        mgr.map_aliased(va, ipa, ONE_GIB, true)
+        mgr.map_aliased(va, ipa, ONE_GIB, true, None)
             .expect("a 1 GiB alias must map");
         let walk = mgr.debug_walk(va);
         assert_ne!(walk[1] & VALID, 0, "L1 leaf must be valid");
@@ -3018,7 +3017,7 @@ mod tests {
         let ipa = LINUX_ALIAS_IPA_BASE + FOUR_KIB;
         let before = mgr.pool_stats();
         assert_eq!(
-            mgr.map_aliased(va, ipa, ONE_GIB, true),
+            mgr.map_aliased(va, ipa, ONE_GIB, true, None),
             Err(PageTableError::OutOfTables)
         );
         assert_eq!(
@@ -3040,9 +3039,9 @@ mod tests {
         let mut mgr = manager();
         let va = LINUX_HIGH_VA_THRESHOLD + 2 * TWO_MIB;
         let ipa = LINUX_ALIAS_IPA_BASE + 4 * TWO_MIB;
-        mgr.map_aliased(va, ipa, TWO_MIB, false)
+        mgr.map_aliased(va, ipa, TWO_MIB, false, None)
             .expect("map aligned block");
-        mgr.invalidate(va, TWO_MIB as usize)
+        mgr.invalidate(va, TWO_MIB as usize, None)
             .expect("invalidate aligned block");
 
         let probe = va + 0x12_345;
@@ -3058,20 +3057,20 @@ mod tests {
     #[test]
     fn sparse_arena_materializes_only_exact_private_extent() {
         let mut mgr = manager();
-        mgr.set_prot_none(LINUX_MMAP_BASE, mmap_arena_size() as usize)
+        mgr.set_prot_none(LINUX_MMAP_BASE, mmap_arena_size() as usize, None)
             .expect("reserve sparse arena");
 
         let va = LINUX_MMAP_BASE + 0x41_000;
         let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x81_000;
         let len = 0x23_000;
-        mgr.map_private_aliased(va, ipa, len, false)
+        mgr.map_private_aliased(va, ipa, len, false, None)
             .expect("install exact private output");
         assert_ne!(
             terminal_descriptor(mgr.debug_walk(va)) & NON_GLOBAL,
             0,
             "a per-mm sparse output must be ASID scoped before publication"
         );
-        mgr.set_prot_none(va, len as usize)
+        mgr.set_prot_none(va, len as usize, None)
             .expect("keep new output inaccessible until VMA commit");
 
         assert_eq!(mgr.translate(va), None);
@@ -3091,7 +3090,7 @@ mod tests {
             "the uncommitted arena suffix must remain physically absent"
         );
 
-        mgr.set_rw(va, len as usize, false)
+        mgr.set_rw(va, len as usize, false, None)
             .expect("publish exact VMA writable");
         assert_eq!(mgr.translate(va + 0x12_345), Some(ipa + 0x12_345));
         assert_eq!(mgr.translate(va - 1), None);
@@ -3114,8 +3113,10 @@ mod tests {
         let b_va = a_va + a_len;
         let b_ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000; // a distinct 2 MiB IPA block
         let b_len = 0x2_2000;
-        mgr.map_aliased(a_va, a_ipa, a_len, true).expect("map A");
-        mgr.map_aliased(b_va, b_ipa, b_len, true).expect("map B");
+        mgr.map_aliased(a_va, a_ipa, a_len, true, None)
+            .expect("map A");
+        mgr.map_aliased(b_va, b_ipa, b_len, true, None)
+            .expect("map B");
         // The first page of B resolves to B's IPA (the bug resolved it via A).
         assert_eq!(mgr.translate(b_va + 0x1000), Some(b_ipa + 0x1000));
         // The last page of A still resolves to A.
@@ -3137,12 +3138,12 @@ mod tests {
         let b_va = a_va + a_len;
         let b_ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
 
-        mgr.map_aliased(b_va, b_ipa, 0x1000, true)
+        mgr.map_aliased(b_va, b_ipa, 0x1000, true, None)
             .expect("map neighbor B first");
         let b_before = mgr.debug_walk(b_va)[3];
         assert_eq!(mgr.translate(b_va), Some(b_ipa));
 
-        mgr.map_aliased(a_va, a_ipa, a_len, true)
+        mgr.map_aliased(a_va, a_ipa, a_len, true, None)
             .expect("map sub-16 KiB A");
 
         assert_eq!(
@@ -3168,10 +3169,10 @@ mod tests {
         let mut parent = manager();
         // Split two distinct 1 GiB regions → two live spare sub-tables.
         parent
-            .set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000)
+            .set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000, None)
             .unwrap();
         parent
-            .set_prot_none(LINUX_MMAP_BASE + 0x4080_0000, 0x1000)
+            .set_prot_none(LINUX_MMAP_BASE + 0x4080_0000, 0x1000, None)
             .unwrap();
         let (parent_in_use, _, _, _) = parent.pool_stats();
         assert!(parent_in_use >= 2, "two splits allocated >=2 tables");
@@ -3186,7 +3187,7 @@ mod tests {
         // A NEW split in the child must allocate a FRESH page (in_use grows),
         // never re-use a live table — and must not disturb the parent's edits.
         child
-            .set_prot_none(LINUX_MMAP_BASE + 0x8080_0000, 0x1000)
+            .set_prot_none(LINUX_MMAP_BASE + 0x8080_0000, 0x1000, None)
             .unwrap();
         let (child_in_use, _, _, _) = child.pool_stats();
         assert!(child_in_use > parent_in_use, "fresh table, no re-handout");
@@ -3203,7 +3204,7 @@ mod tests {
         bytes.truncate(6 * 0x1000);
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
         assert_eq!(
-            mgr.set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000),
+            mgr.set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000, None),
             Err(PageTableError::OutOfTables),
         );
     }
@@ -3219,7 +3220,7 @@ mod tests {
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
         // Already RW + non-exec → no change, no split, no allocation.
         assert_eq!(
-            mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000, false),
+            mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000, false, None),
             Ok(PageTableApplyOutcome::default())
         );
     }
@@ -3231,14 +3232,14 @@ mod tests {
         // spare cursor/free-list returns to its pre-split capacity.
         let mut mgr = manager();
         let block = LINUX_MMAP_BASE + 0x20_0000; // 2 MiB-aligned arena block
-        mgr.set_prot_none(block, 0x1000).expect("split");
+        mgr.set_prot_none(block, 0x1000, None).expect("split");
         let after_split = mgr.arenas[0].next_free;
         assert!(
             after_split > SPARE_START_OFFSET,
             "split consumed spare pages"
         );
         // Restore the entire 2 MiB block to RW -> uniform -> coalesce.
-        mgr.set_rw(block, 1 << 21, true).expect("restore");
+        mgr.set_rw(block, 1 << 21, true, None).expect("restore");
         assert!(mgr.is_valid(block));
         assert!(
             !mgr.free_tables.is_empty(),
@@ -3258,7 +3259,7 @@ mod tests {
             "arena base is 1 GiB-aligned"
         );
         let before = mgr.arenas[0].next_free;
-        mgr.set_prot_none(LINUX_MMAP_BASE, 512 << 20)
+        mgr.set_prot_none(LINUX_MMAP_BASE, 512 << 20, None)
             .expect("coarse prot_none");
         let pages_used = (mgr.arenas[0].next_free - before) / 0x1000;
         assert_eq!(
@@ -3279,12 +3280,12 @@ mod tests {
         // STAY invalid — splitting an invalid block must not revalidate it.
         let mut mgr = manager();
         let block = LINUX_MMAP_BASE; // 2 MiB-aligned
-        mgr.set_prot_none(block, 1 << 21)
+        mgr.set_prot_none(block, 1 << 21, None)
             .expect("reserve PROT_NONE");
         assert!(!mgr.is_valid(block));
         assert!(!mgr.is_valid(block + 0x1000));
         // Commit one page RW (splits the invalid 2 MiB block to L3).
-        mgr.set_rw(block + 0x10000, 0x1000, true)
+        mgr.set_rw(block + 0x10000, 0x1000, true, None)
             .expect("RW commit");
         assert!(mgr.is_valid(block + 0x10000), "committed page is RW");
         assert_eq!(mgr.ap_bits(block + 0x10000), AP_RW);
@@ -3307,7 +3308,7 @@ mod tests {
         bytes.truncate(6 * 0x1000);
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
         assert_eq!(
-            mgr.set_prot_none(LINUX_MMAP_BASE, 1 << 30),
+            mgr.set_prot_none(LINUX_MMAP_BASE, 1 << 30, None),
             Ok(PageTableApplyOutcome {
                 changed: true,
                 flush_required: true
@@ -3330,8 +3331,8 @@ mod tests {
         // Split the 2 MiB block, then tear the WHOLE block down so the L3 that
         // the split created is left with 512 invalid descriptors. Invalidating
         // one page only would leave 511 valid and nothing to reclaim.
-        mgr.set_prot_none(block, 0x1000).expect("split");
-        mgr.set_prot_none(block, 1 << 21)
+        mgr.set_prot_none(block, 0x1000, None).expect("split");
+        mgr.set_prot_none(block, 1 << 21, None)
             .expect("tear the block down");
         assert!(
             mgr.free_tables.is_empty(),
@@ -3349,8 +3350,8 @@ mod tests {
         mgr.set_multi_vcpu(true);
         mgr.set_stage1_exclusive(false);
         let block = LINUX_MMAP_BASE + 0x60_0000;
-        mgr.set_prot_none(block, 0x1000).expect("split");
-        mgr.set_prot_none(block, 1 << 21)
+        mgr.set_prot_none(block, 0x1000, None).expect("split");
+        mgr.set_prot_none(block, 1 << 21, None)
             .expect("tear the block down");
         assert!(!mgr.reclaim_all_invalid_tables());
         assert!(mgr.free_tables.is_empty(), "nothing may be reclaimed");
@@ -3365,8 +3366,8 @@ mod tests {
         mgr.set_multi_vcpu(true);
         mgr.set_stage1_exclusive(true);
         let block = LINUX_MMAP_BASE + 0x60_0000;
-        mgr.set_prot_none(block, 0x1000).expect("split");
-        mgr.set_prot_none(block, 1 << 21)
+        mgr.set_prot_none(block, 0x1000, None).expect("split");
+        mgr.set_prot_none(block, 1 << 21, None)
             .expect("tear the block down");
         assert!(
             mgr.reclaim_all_invalid_tables(),
@@ -3378,8 +3379,8 @@ mod tests {
         );
         // A fresh teardown re-arms it.
         let other = LINUX_MMAP_BASE + 0x80_0000;
-        mgr.set_prot_none(other, 0x1000).expect("split");
-        mgr.set_prot_none(other, 1 << 21)
+        mgr.set_prot_none(other, 0x1000, None).expect("split");
+        mgr.set_prot_none(other, 1 << 21, None)
             .expect("tear the block down");
         assert!(mgr.reclaim_all_invalid_tables(), "new teardown re-arms");
     }
@@ -3409,7 +3410,7 @@ mod tests {
         let mut block = LINUX_MMAP_BASE;
         let mut exhausted = false;
         for _ in 0..1024 {
-            match parent.set_prot_none(block, 0x1000) {
+            match parent.set_prot_none(block, 0x1000, None) {
                 Ok(_) => {}
                 Err(PageTableError::OutOfTables) => {
                     exhausted = true;
@@ -3418,7 +3419,7 @@ mod tests {
                 Err(other) => panic!("unexpected split failure: {other:?}"),
             }
             parent
-                .set_prot_none(block, 1 << 21)
+                .set_prot_none(block, 1 << 21, None)
                 .expect("tear the block down");
             block += 1 << 21;
         }
@@ -3436,7 +3437,7 @@ mod tests {
         // start from the same intact graph.
         let mut inherited = parent.clone();
         assert_eq!(
-            inherited.set_prot_none(block, 0x1000),
+            inherited.set_prot_none(block, 0x1000, None),
             Err(PageTableError::OutOfTables),
             "the inherited marker keeps refusing the sweep"
         );
@@ -3444,7 +3445,7 @@ mod tests {
         let mut offline = parent.clone();
         offline.declare_offline_private_image();
         assert_eq!(
-            offline.set_prot_none(block, 0x1000),
+            offline.set_prot_none(block, 0x1000, None),
             Ok(PageTableApplyOutcome {
                 changed: true,
                 flush_required: true
@@ -3466,8 +3467,8 @@ mod tests {
         let mut mgr = manager();
         mgr.set_multi_vcpu(true);
         let block = LINUX_MMAP_BASE + 0x60_0000;
-        mgr.set_prot_none(block, 0x1000).expect("split");
-        mgr.set_rw(block, 1 << 21, true).expect("restore");
+        mgr.set_prot_none(block, 0x1000, None).expect("split");
+        mgr.set_rw(block, 1 << 21, true, None).expect("restore");
         assert!(mgr.is_valid(block));
         assert!(
             mgr.free_tables.is_empty(),
@@ -3475,8 +3476,8 @@ mod tests {
         );
         // Back to single-vCPU, a subsequent full-block restore coalesces again.
         mgr.set_multi_vcpu(false);
-        mgr.set_prot_none(block, 0x1000).expect("split");
-        mgr.set_rw(block, 1 << 21, true).expect("restore");
+        mgr.set_prot_none(block, 0x1000, None).expect("split");
+        mgr.set_rw(block, 1 << 21, true, None).expect("restore");
         assert!(
             !mgr.free_tables.is_empty(),
             "single-vCPU coalesces/reclaims"
@@ -3488,13 +3489,15 @@ mod tests {
         // One page RO, the rest RW: NOT uniform -> must keep the sub-table.
         let mut mgr = manager();
         let block = LINUX_MMAP_BASE + 0x40_0000;
-        mgr.set_readonly(block, 0x1000, true).expect("ro one page");
-        mgr.set_rw(block, 1 << 21, true).expect("rw the rest");
+        mgr.set_readonly(block, 0x1000, true, None)
+            .expect("ro one page");
+        mgr.set_rw(block, 1 << 21, true, None).expect("rw the rest");
         // The RO page was overwritten to RW by the full-block set_rw, so it WILL
         // coalesce; instead verify a genuinely-mixed state is preserved:
         let mut mgr2 = manager();
-        mgr2.set_readonly(block, 0x1000, true).expect("ro one page");
-        mgr2.set_rw(block + 0x1000, 0x1000, true)
+        mgr2.set_readonly(block, 0x1000, true, None)
+            .expect("ro one page");
+        mgr2.set_rw(block + 0x1000, 0x1000, true, None)
             .expect("rw next page");
         assert_eq!(mgr2.ap_bits(block), AP_RO, "mixed block keeps RO page");
         assert_eq!(mgr2.ap_bits(block + 0x1000), AP_RW);
@@ -3505,7 +3508,7 @@ mod tests {
     fn as_bytes_into_bytes_round_trip() {
         let mut mgr = manager();
         let va = LINUX_MMAP_BASE + 0x40_0000;
-        mgr.set_prot_none(va, 0x1000).unwrap();
+        mgr.set_prot_none(va, 0x1000, None).unwrap();
         let bytes = mgr.into_bytes();
         let mut mgr2 = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
         assert!(!mgr2.is_valid(va), "edit survived round-trip through bytes");
@@ -3527,8 +3530,8 @@ mod tests {
         let invalid_va = LINUX_MMAP_BASE + 0x10_0000;
         let alias_va = LINUX_HIGH_VA_THRESHOLD + 0x20_0000;
         let alias_ipa = LINUX_ALIAS_IPA_BASE + 0x40_0000;
-        mgr.set_prot_none(invalid_va, 0x1000).expect("split");
-        mgr.map_aliased(alias_va, alias_ipa, 0x3000, false)
+        mgr.set_prot_none(invalid_va, 0x1000, None).expect("split");
+        mgr.map_aliased(alias_va, alias_ipa, 0x3000, false, None)
             .expect("alias");
         let identity_va = LINUX_HEAP_BASE + 0x1234;
         let before_identity = mgr.translate(identity_va);
@@ -3536,7 +3539,7 @@ mod tests {
         let old_base = mgr.base();
         let new_base = 0xa0_0000_0000;
 
-        mgr.rebase(new_base).expect("rebase cloned tables");
+        mgr.rebase(new_base, None).expect("rebase cloned tables");
 
         assert_eq!(mgr.base(), new_base);
         assert_eq!(mgr.translate(identity_va), before_identity);
@@ -3569,7 +3572,7 @@ mod tests {
         let mut boot = manager();
         boot.set_multi_vcpu(true); // the boot pass suppresses coalescing
         let ro_va = 0x40_0000; // image-shaped low VA inside a 2 MiB boot block
-        boot.set_readonly(ro_va, 0x2000, true)
+        boot.set_readonly(ro_va, 0x2000, true, None)
             .expect("boot RO span");
         let (used, _, _, _) = boot.pool_stats();
         assert!(used >= 1, "boot edit allocated spare table(s)");
@@ -3583,7 +3586,7 @@ mod tests {
         // A new split allocates a FRESH page (cursor really advanced past the
         // boot-allocated tables) and must not clobber the boot edit.
         rebuilt
-            .set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000)
+            .set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000, None)
             .expect("fresh split");
         let (after, _, _, _) = rebuilt.pool_stats();
         assert!(after > rebuilt_used, "fresh table allocated");
@@ -3670,7 +3673,7 @@ mod tests {
         mgr.set_multi_vcpu(true);
 
         // 1. Grow: make first heap page (0x1000) RW.
-        mgr.set_rw(LINUX_HEAP_BASE, 0x1000, false)
+        mgr.set_rw(LINUX_HEAP_BASE, 0x1000, false, None)
             .expect("grow heap page to RW");
         let bytes_after_grow = mgr.into_bytes();
         let walk_grow = |va| {
@@ -3704,7 +3707,7 @@ mod tests {
         // 2. Shrink: make first heap page PROT_NONE again.
         let mut mgr2 = PageTableManager::new(bytes_after_grow, LINUX_PAGE_TABLES_BASE);
         mgr2.set_multi_vcpu(true);
-        mgr2.set_prot_none(LINUX_HEAP_BASE, 0x1000)
+        mgr2.set_prot_none(LINUX_HEAP_BASE, 0x1000, None)
             .expect("shrink heap page to PROT_NONE");
         let bytes_after_shrink = mgr2.into_bytes();
         let walk_shrink = |va| {
@@ -3727,7 +3730,7 @@ mod tests {
     /// the sparse mmap arena reserved `PROT_NONE` (identity-invalid blocks).
     fn hvpatch_manager() -> PageTableManager {
         let mut mgr = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
-        mgr.set_prot_none(LINUX_MMAP_BASE, mmap_arena_size() as usize)
+        mgr.set_prot_none(LINUX_MMAP_BASE, mmap_arena_size() as usize, None)
             .expect("reserve sparse arena");
         mgr
     }
@@ -3746,7 +3749,7 @@ mod tests {
             }
             // A one-page RW edit inside a 2 MiB block bisects it: one L3 table
             // (plus an L2 the first time a fresh 1 GiB is entered).
-            if mgr.set_rw(block + 0x1000, 0x1000, false).is_err() {
+            if mgr.set_rw(block + 0x1000, 0x1000, false, None).is_err() {
                 break;
             }
             block += TWO_MIB;
@@ -3770,9 +3773,9 @@ mod tests {
         let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1234_5000;
         let probe = va + 0x5000;
         // 4 KiB granules force an L3 table; the leaves then go invalid-retained.
-        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true)
+        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true, None)
             .expect("publish sparse extent");
-        mgr.set_prot_none(va, (TWO_MIB - 0x1000) as usize)
+        mgr.set_prot_none(va, (TWO_MIB - 0x1000) as usize, None)
             .expect("arm first touch");
         assert_eq!(mgr.translate_retained_output(probe), Some(ipa + 0x5000));
 
@@ -3786,7 +3789,7 @@ mod tests {
         );
         // And the protection commit that follows a touch must publish the
         // retained frame, never a minted address.
-        mgr.set_rw(probe, 0x1000, false)
+        mgr.set_rw(probe, 0x1000, false, None)
             .expect("commit resident page");
         assert_eq!(mgr.translate(probe), Some(ipa + 0x5000));
     }
@@ -3801,10 +3804,10 @@ mod tests {
         mgr.declare_offline_private_image();
         let va = LINUX_MMAP_BASE + 8 * TWO_MIB;
         let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1234_5000;
-        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true)
+        mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true, None)
             .expect("publish sparse extent");
         let (in_use_before, _, _, _) = mgr.pool_stats();
-        mgr.invalidate(va, (TWO_MIB - 0x1000) as usize)
+        mgr.invalidate(va, (TWO_MIB - 0x1000) as usize, None)
             .expect("munmap");
         assert_eq!(
             mgr.translate_retained_output(va + 0x5000),
@@ -3824,10 +3827,11 @@ mod tests {
         // The freed table left an EMPTY L2 entry. Bisecting it (a one-page
         // PROT_NONE at the next reuse) must not manufacture `index * 4 KiB`
         // outputs that the next protection commit publishes as real IPAs.
-        mgr.set_prot_none(va + 0x1000, 0x1000)
+        mgr.set_prot_none(va + 0x1000, 0x1000, None)
             .expect("bisect empty entry");
         assert_eq!(mgr.translate_retained_output(va + 0x5000), None);
-        mgr.set_rw(va + 0x5000, 0x1000, false).expect("revalidate");
+        mgr.set_rw(va + 0x5000, 0x1000, false, None)
+            .expect("revalidate");
         assert_ne!(mgr.translate(va + 0x5000), Some(0x5000));
     }
 
@@ -3848,6 +3852,7 @@ mod tests {
             LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x7000,
             0x1000,
             true,
+            None,
         )
         .expect("publish one page");
         assert_eq!(
@@ -3855,7 +3860,7 @@ mod tests {
             0,
             "neighbour starts empty"
         );
-        mgr.set_prot_none(block, TWO_MIB as usize)
+        mgr.set_prot_none(block, TWO_MIB as usize, None)
             .expect("PROT_NONE the block");
         assert_eq!(
             terminal_descriptor(mgr.debug_walk(probe)),
@@ -3863,7 +3868,7 @@ mod tests {
             "invalidating an empty descriptor keeps it empty"
         );
         assert_eq!(mgr.translate_retained_output(probe), None);
-        mgr.set_rw(probe, 0x1000, false).expect("revalidate");
+        mgr.set_rw(probe, 0x1000, false, None).expect("revalidate");
         assert_ne!(
             mgr.translate(probe),
             Some(0),
@@ -3879,14 +3884,14 @@ mod tests {
         let page1 = block + 0x1000;
 
         // Ensure page0 and page1 are invalid leaves.
-        mgr.set_prot_none(block, 2 * 1024 * 1024)
+        mgr.set_prot_none(block, 2 * 1024 * 1024, None)
             .expect("set block to prot_none");
         assert!(!mgr.is_valid(page0));
         assert!(!mgr.is_valid(page1));
 
         // 1. Validating an invalid leaf reports flush_required=false
         let outcome_validating = mgr
-            .set_rw(page0, 0x1000, false)
+            .set_rw(page0, 0x1000, false, None)
             .expect("validate invalid leaf to rw");
         assert!(outcome_validating.changed, "leaf changed to valid");
         assert!(
@@ -3897,7 +3902,7 @@ mod tests {
 
         // 2. Changing a valid leaf's AP reports flush_required=true
         let outcome_perm_change = mgr
-            .set_readonly(page0, 0x1000, false)
+            .set_readonly(page0, 0x1000, false, None)
             .expect("change valid leaf AP to ro");
         assert!(outcome_perm_change.changed, "leaf changed to ro");
         assert!(
@@ -3909,7 +3914,7 @@ mod tests {
         // page0 is currently valid (RO), page1 is invalid (PROT_NONE).
         // Editing [page0, page0 + 0x2000) touches both.
         let outcome_both = mgr
-            .set_rw(page0, 0x2000, false)
+            .set_rw(page0, 0x2000, false, None)
             .expect("edit touching both invalid and valid leaves");
         assert!(outcome_both.changed);
         assert!(
@@ -3924,7 +3929,9 @@ mod tests {
         exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
-        let err = mgr.set_rw(next_block + 0x1000, 0x1000, false).unwrap_err();
+        let err = mgr
+            .set_rw(next_block + 0x1000, 0x1000, false, None)
+            .unwrap_err();
         assert_eq!(err, PageTableError::OutOfTables);
     }
 
@@ -3957,28 +3964,21 @@ mod tests {
         let mut live = hvpatch_manager();
         exhaust_spare_pool(&mut live, LINUX_MMAP_BASE);
         let ext_base = Gpa(0xb0_0000_0000);
-        let source = TestArenaSource {
+        let mut source = TestArenaSource {
             id: TableArenaSourceId(ext_base),
             available: Arc::new(Mutex::new(vec![ext_base])),
             returned: Arc::new(Mutex::new(Vec::new())),
         };
-        live.set_arena_source(Box::new(source)).unwrap();
         let image = live.clone();
-        assert!(
-            !image.has_arena_source(),
-            "clone drops the source by design"
-        );
 
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let va = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
-        live.set_rw(va, 0x1000, false)
+        live.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("grows into the extension arena");
         assert_eq!(live.arenas.len(), 2);
 
         let mut restored = image;
-        restored.adopt_live_extension_state(&mut live);
-        assert!(restored.has_arena_source());
-        assert!(!live.has_arena_source());
+        restored.adopt_live_extension_state(&live);
         assert_eq!(restored.arenas.len(), 2);
         assert_eq!(restored.arenas[1].base, ext_base.0);
         assert_eq!(
@@ -3992,7 +3992,7 @@ mod tests {
         );
         // The restored manager can keep growing from the adopted arena.
         restored
-            .set_rw(va, 0x1000, false)
+            .set_rw(va, 0x1000, false, Some(&mut source))
             .expect("restored manager allocates");
         assert_eq!(restored.arenas.len(), 2);
     }
@@ -4009,23 +4009,22 @@ mod tests {
         let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
         let va = next_block + 0x1000;
         assert_eq!(
-            mgr.set_rw(va, 0x1000, false).unwrap_err(),
+            mgr.set_rw(va, 0x1000, false, None).unwrap_err(),
             PageTableError::OutOfTables
         );
 
         let ext_base = Gpa(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
-        let source = TestArenaSource {
+        let mut source = TestArenaSource {
             id: TableArenaSourceId(ext_base),
             available: Arc::clone(&available),
             returned: Arc::clone(&returned),
         };
-        mgr.set_arena_source(Box::new(source)).unwrap();
 
         // Start an undo transaction to verify rollback returns the arena.
         mgr.begin_undo();
-        mgr.set_rw(va, 0x1000, false)
+        mgr.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("mapping succeeds by allocating extension arena");
         assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas during tx");
         assert_eq!(
@@ -4042,7 +4041,7 @@ mod tests {
             (ext_base.0, host_arena1.as_mut_ptr()),
         ];
         // Rollback transaction: extension arena should be returned to source.
-        unsafe { mgr.rollback_undo(&resolver[..]) };
+        unsafe { mgr.rollback_undo(&resolver[..], Some(&mut source)) };
         assert_eq!(mgr.pool_stats().3, 1, "pool reports 1 arena after rollback");
         assert_eq!(
             returned.lock().unwrap().as_slice(),
@@ -4052,7 +4051,7 @@ mod tests {
 
         // Put the arena back into available for the real mapping.
         available.lock().unwrap().push(ext_base);
-        mgr.set_rw(va, 0x1000, false)
+        mgr.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("mapping succeeds with extension arena");
         assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
         assert_eq!(
@@ -4089,14 +4088,13 @@ mod tests {
         let ext_base = Gpa(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
-        let source = TestArenaSource {
+        let mut source = TestArenaSource {
             id: TableArenaSourceId(ext_base),
             available: Arc::clone(&available),
             returned: Arc::clone(&returned),
         };
-        mgr.set_arena_source(Box::new(source)).unwrap();
 
-        mgr.set_rw(va, 0x1000, false)
+        mgr.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("mapping succeeds with extension arena");
         assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
 
@@ -4122,22 +4120,21 @@ mod tests {
         let ext_base = Gpa(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
-        let source = TestArenaSource {
+        let mut source = TestArenaSource {
             id: TableArenaSourceId(ext_base),
             available: Arc::clone(&available),
             returned: Arc::clone(&returned),
         };
-        mgr.set_arena_source(Box::new(source)).unwrap();
 
         mgr.begin_undo();
-        mgr.set_rw(va, 0x1000, false)
+        mgr.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("mapping succeeds with extension arena");
         assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
 
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         // Missing ext_base in resolver
         let resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
-        unsafe { mgr.rollback_undo(&resolver[..]) };
+        unsafe { mgr.rollback_undo(&resolver[..], Some(&mut source)) };
         // Confirm arena was still returned despite host error
         assert_eq!(returned.lock().unwrap().as_slice(), &[ext_base]);
         assert_eq!(mgr.pool_stats().3, 1, "pool reports 1 arena after rollback");
@@ -4158,14 +4155,13 @@ mod tests {
         let ext_base = Gpa(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
-        let source = TestArenaSource {
+        let mut source = TestArenaSource {
             id: TableArenaSourceId(ext_base),
             available: Arc::clone(&available),
             returned: Arc::clone(&returned),
         };
-        mgr.set_arena_source(Box::new(source)).unwrap();
 
-        mgr.set_rw(va, 0x1000, false)
+        mgr.set_rw(va, 0x1000, false, Some(&mut source))
             .expect("mapping succeeds with extension arena");
 
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
@@ -4218,26 +4214,24 @@ mod tests {
 
         let parent_available = Arc::new(Mutex::new(vec![ext2_base, ext1_base]));
         let parent_returned = Arc::new(Mutex::new(Vec::new()));
-        let parent_source = TestArenaSource {
+        let mut parent_source = TestArenaSource {
             id: TableArenaSourceId(ext1_base),
             available: Arc::clone(&parent_available),
             returned: Arc::clone(&parent_returned),
         };
-        parent.set_arena_source(Box::new(parent_source)).unwrap();
 
         // Grow parent to 2 arenas (1 extension arena)
         let va1 = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
         parent
-            .set_rw(va1, 0x1000, false)
+            .set_rw(va1, 0x1000, false, Some(&mut parent_source))
             .expect("allocates first extension arena");
         assert_eq!(parent.pool_stats().3, 2, "parent has 2 arenas");
 
         // First check with 2 arenas (1 extension arena)
         let mut child2 = parent.clone();
-        assert!(child2.arena_source().is_none(), "clone drops arena_source");
         let child_root = 0x50_0000_0000;
         assert_eq!(
-            child2.rebase(child_root).unwrap_err(),
+            child2.rebase(child_root, None).unwrap_err(),
             PageTableError::MissingArenaSource,
             "rebase without source fails with MissingArenaSource"
         );
@@ -4252,32 +4246,30 @@ mod tests {
 
         // Clone parent with two extension arenas
         let mut child = parent.clone();
-        assert!(child.arena_source().is_none(), "clone drops arena_source");
 
         // Rebasing child without a source returns MissingArenaSource
         assert_eq!(
-            child.rebase(child_root).unwrap_err(),
+            child.rebase(child_root, None).unwrap_err(),
             PageTableError::MissingArenaSource,
             "rebasing 3-arena manager without source returns MissingArenaSource"
         );
 
-        // Install a child source with 2 fresh slots
+        // Prepare a child source with 2 fresh slots
         let child_ext1 = Gpa(0xd0_0000_0000);
         let child_ext2 = Gpa(0xe0_0000_0000);
         let child_available = Arc::new(Mutex::new(vec![child_ext2, child_ext1]));
         let child_returned = Arc::new(Mutex::new(Vec::new()));
-        let child_source = TestArenaSource {
+        let mut child_source = TestArenaSource {
             id: TableArenaSourceId(child_ext1),
             available: Arc::clone(&child_available),
             returned: Arc::clone(&child_returned),
         };
-        child.set_arena_source(Box::new(child_source)).unwrap();
 
         let parent_avail_count_before = parent_available.lock().unwrap().len();
 
         // Rebase child
         child
-            .rebase(child_root)
+            .rebase(child_root, Some(&mut child_source))
             .expect("rebase succeeds with child source");
 
         // Verify child took two fresh slots from child source
@@ -4296,49 +4288,5 @@ mod tests {
         assert_eq!(child.base(), child_root, "child rebased root");
         assert_eq!(child.arenas[1].base, child_ext1.0, "child rebased arena 1");
         assert_eq!(child.arenas[2].base, child_ext2.0, "child rebased arena 2");
-    }
-
-    #[test]
-    fn installing_source_bound_to_another_lease_errors() {
-        use carrick_guest_mem::Gpa;
-        use std::sync::{Arc, Mutex};
-
-        let mut mgr = hvpatch_manager();
-        let ext_a = Gpa(0xb0_0000_0000);
-        let ext_b = Gpa(0xc0_0000_0000);
-        let available_a = Arc::new(Mutex::new(vec![ext_a]));
-        let returned_a = Arc::new(Mutex::new(Vec::new()));
-        let source_a1 = TestArenaSource {
-            id: TableArenaSourceId(ext_a),
-            available: Arc::clone(&available_a),
-            returned: Arc::clone(&returned_a),
-        };
-        let source_a2 = TestArenaSource {
-            id: TableArenaSourceId(ext_a),
-            available: Arc::clone(&available_a),
-            returned: Arc::clone(&returned_a),
-        };
-        let available_b = Arc::new(Mutex::new(vec![ext_b]));
-        let returned_b = Arc::new(Mutex::new(Vec::new()));
-        let source_b = TestArenaSource {
-            id: TableArenaSourceId(ext_b),
-            available: available_b,
-            returned: returned_b,
-        };
-
-        // First install succeeds.
-        mgr.set_arena_source(Box::new(source_a1))
-            .expect("first install succeeds");
-
-        // Re-installing a source with the SAME identity is a no-op (Ok(())).
-        mgr.set_arena_source(Box::new(source_a2))
-            .expect("re-installing source with same identity is a no-op");
-
-        // Installing a source with a DIFFERENT identity returns ConflictingArenaSource.
-        assert_eq!(
-            mgr.set_arena_source(Box::new(source_b)).unwrap_err(),
-            PageTableError::ConflictingArenaSource,
-            "installing conflicting source returns ConflictingArenaSource"
-        );
     }
 }

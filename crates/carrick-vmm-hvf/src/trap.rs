@@ -897,9 +897,9 @@ mod foreign_mm_tests {
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
         );
-        tables.rebase(root).expect("rebase foreign test root");
+        tables.rebase(root, None).expect("rebase foreign test root");
         tables
-            .map_aliased(TEST_VA, data_ipa, data_len as u64, false)
+            .map_aliased(TEST_VA, data_ipa, data_len as u64, false, None)
             .expect("map foreign test leaf");
 
         let table_bytes = tables.as_bytes().to_vec();
@@ -987,7 +987,7 @@ mod foreign_mm_tests {
         };
         let state = MmAccessState::for_foreign_read_test(
             binding,
-            Arc::new(parking_lot::Mutex::new(Some(tables))),
+            carrick_aarch64::Stage1Authority::new_with_manager(Some(tables)),
             Arc::new(MemoryProtections::default()),
             Arc::new(parking_lot::Mutex::new(inventory)),
             &snapshot,
@@ -1113,11 +1113,8 @@ mod foreign_mm_tests {
     fn foreign_cow_fingerprint(installed: &InstalledMm) -> (Vec<u8>, String, Vec<(u64, u64)>) {
         let tables = installed.state.page_tables_authority();
         let stage1 = tables
-            .lock()
-            .as_ref()
-            .expect("foreign COW page tables")
-            .as_bytes()
-            .to_vec();
+            .with_manager(|mgr| mgr.as_bytes().to_vec())
+            .expect("foreign COW page tables");
         let inventory = format!("{:?}", *installed.state.frame_inventory.ledger.lock());
         let owners = global_frame_host_owners().lock().keys().copied().collect();
         (stage1, inventory, owners)
@@ -1309,19 +1306,16 @@ mod foreign_mm_tests {
             .expect("mint authenticated RX ptrace text plan");
         let page_tables = child.state.page_tables_authority();
         const AP_MASK: u64 = 0b11 << 6;
-        let before_ap = carrick_mem::page_table::terminal_descriptor(
-            page_tables
-                .lock()
-                .as_ref()
-                .expect("RX page tables")
-                .debug_walk(TEST_VA),
-        ) & AP_MASK;
-        let before_ipa = page_tables
-            .lock()
-            .as_ref()
-            .expect("RX page tables")
-            .translate_retained_output(TEST_VA)
-            .expect("RX source translation");
+        let (before_ap, before_ipa) = page_tables
+            .with_manager(|tables| {
+                let ap = carrick_mem::page_table::terminal_descriptor(tables.debug_walk(TEST_VA))
+                    & AP_MASK;
+                let ipa = tables
+                    .translate_retained_output(TEST_VA)
+                    .expect("RX source translation");
+                (ap, ipa)
+            })
+            .expect("RX page tables");
         assert!(
             alias_registry().lock().iter().any(|alias| {
                 TEST_VA.checked_sub(alias.start).is_some_and(|offset| {
@@ -1345,13 +1339,12 @@ mod foreign_mm_tests {
                 deadline,
             )
             .expect("RX ptrace text must break COW without writable-fault arming");
-        let after_ap = carrick_mem::page_table::terminal_descriptor(
-            page_tables
-                .lock()
-                .as_ref()
-                .expect("post-COW RX page tables")
-                .debug_walk(TEST_VA),
-        ) & AP_MASK;
+        let after_ap = page_tables
+            .with_manager(|mgr| {
+                carrick_mem::page_table::terminal_descriptor(mgr.debug_walk(TEST_VA))
+            })
+            .expect("post-COW RX page tables")
+            & AP_MASK;
         assert_eq!(
             after_ap, before_ap,
             "a same-IPA alias at another semantic VA must not widen RX stage-1 AP",
@@ -1376,10 +1369,8 @@ mod foreign_mm_tests {
         );
         assert_eq!(
             page_tables
-                .lock()
-                .as_ref()
-                .expect("post-COW RX page tables")
-                .translate_retained_output(neighbor_va),
+                .with_manager(|mgr| mgr.translate_retained_output(neighbor_va))
+                .expect("post-COW RX page tables"),
             Some(cow.physical_base().raw() + 0x800),
             "the neighboring address in the repointed leaf must resolve into the private owner",
         );
@@ -1488,10 +1479,8 @@ mod foreign_mm_tests {
             .expect("mint two-leaf ptrace text plan");
         let page_tables = child.state.page_tables_authority();
         let before_second_leaf = page_tables
-            .lock()
-            .as_ref()
-            .expect("short-alias RX page tables")
-            .translate_retained_output(TEST_VA + 0x1000);
+            .with_manager(|tables| tables.translate_retained_output(TEST_VA + 0x1000))
+            .expect("short-alias RX page tables");
         let before = foreign_cow_fingerprint(&child);
         let mut invalidator = TestInvalidator {
             expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
@@ -1523,10 +1512,8 @@ mod foreign_mm_tests {
         assert_eq!(foreign_cow_fingerprint(&child), before);
         assert_eq!(
             page_tables
-                .lock()
-                .as_ref()
-                .expect("rejected RX page tables")
-                .translate_retained_output(TEST_VA + 0x1000),
+                .with_manager(|mgr| mgr.translate_retained_output(TEST_VA + 0x1000))
+                .expect("rejected RX page tables"),
             before_second_leaf,
             "the second source leaf must remain unchanged on rejection",
         );
@@ -2038,16 +2025,26 @@ mod foreign_mm_tests {
                 .owner()
                 .clone();
             let page_tables = child.state.page_tables_authority();
-            let mut tables = page_tables.lock();
-            let tables = tables.as_mut().unwrap();
-            tables
-                .repoint_preserving_attributes(TEST_VA + 0x1000, 0x9900_0000_0000, 0x1000)
+            page_tables
+                .edit(
+                    || Err(TrapError::Hypervisor("manager must be present".to_owned())),
+                    |editor| {
+                        editor
+                            .repoint_preserving_attributes(
+                                TEST_VA + 0x1000,
+                                0x9900_0000_0000,
+                                0x1000,
+                            )
+                            .unwrap();
+                        unsafe {
+                            editor
+                                .sync_to_host((editor.base(), table_owner.as_ptr()))
+                                .unwrap()
+                        };
+                        Ok::<(), TrapError>(())
+                    },
+                )
                 .unwrap();
-            unsafe {
-                tables
-                    .sync_to_host((tables.base(), table_owner.as_ptr()))
-                    .unwrap()
-            };
         }
 
         // An 8 KiB write from TEST_VA crosses the 4 KiB leaf boundary into the discontinuous leaf
@@ -2177,16 +2174,22 @@ mod foreign_mm_tests {
                 .owner()
                 .clone();
             let page_tables = child.state.page_tables_authority();
-            let mut tables = page_tables.lock();
-            let tables = tables.as_mut().unwrap();
-            tables
-                .map_aliased(alias_va, cow.physical_base().raw(), 0x1000, true)
-                .expect("map stage-1 alias outside compound span");
-            unsafe {
-                tables
-                    .sync_to_host((tables.base(), table_owner.as_ptr()))
-                    .unwrap()
-            };
+            page_tables
+                .edit(
+                    || Err(TrapError::Hypervisor("manager must be present".to_owned())),
+                    |editor| {
+                        editor
+                            .map_aliased(alias_va, cow.physical_base().raw(), 0x1000, true)
+                            .expect("map stage-1 alias outside compound span");
+                        unsafe {
+                            editor
+                                .sync_to_host((editor.base(), table_owner.as_ptr()))
+                                .unwrap()
+                        };
+                        Ok::<(), TrapError>(())
+                    },
+                )
+                .unwrap();
         }
 
         // Prove prepare_write rejects the alias specifically because semantic authority is
@@ -2579,7 +2582,7 @@ mod foreign_mm_tests {
             ..snapshot.clone()
         };
         let replacement_state = MmAccessState::new(
-            Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
@@ -3054,7 +3057,7 @@ mod foreign_mm_tests {
             drop_order: None,
         });
         let prepared_mm_access = MmAccessState::new(
-            Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             task_mm
                 .inventory
@@ -3103,23 +3106,23 @@ mod foreign_mm_tests {
             cow_authority_identity: None,
             child_token_verifier,
         };
-        let runtime_page_tables = Arc::new(parking_lot::Mutex::new(Some(
+        let runtime_page_tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(
             crate::page_table::PageTableManager::new(
                 carrick_mem::memory::stage1_hvpatch_page_tables(),
                 stage1_root.raw(),
             ),
-        )));
+        ));
         let runtime = registration
             .runtime_task_state(
-                Arc::clone(&runtime_page_tables),
+                runtime_page_tables.clone(),
                 Arc::new(MemoryProtections::default()),
             )
             .expect("materialize executable copied child runtime state");
         let preserved_prepared_mm = Arc::ptr_eq(&runtime.mm_access, &prepared_mm_access);
-        let live_page_tables_bound = Arc::ptr_eq(
-            &runtime.mm_access.page_tables_authority(),
-            &runtime_page_tables,
-        );
+        let live_page_tables_bound = runtime
+            .mm_access
+            .page_tables_authority()
+            .shares_exact_authority(&runtime_page_tables);
         let runtime_cow = runtime.mm_access.cow_runtime.read().clone();
         let exact_cow_mm = runtime_cow.as_ref().map(|binding| binding.identity.mm);
         registration
@@ -3229,7 +3232,7 @@ mod foreign_mm_tests {
             drop_order: None,
         });
         let prepared_mm_access = MmAccessState::new(
-            Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             task_mm
                 .inventory
@@ -3287,10 +3290,11 @@ mod foreign_mm_tests {
             .set_prot_none(
                 crate::memory::LINUX_MMAP_BASE,
                 crate::memory::mmap_arena_size() as usize,
+                None,
             )
             .expect("reserve sparse arena");
         manager
-            .rebase(stage1_root.raw())
+            .rebase(stage1_root.raw(), None)
             .expect("rebase to stage1_root");
         let ext_base = carrick_guest_mem::Gpa(0xb0_0000_0000);
         let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
@@ -3300,34 +3304,42 @@ mod foreign_mm_tests {
             available: std::sync::Arc::clone(&available),
             returned: std::sync::Arc::clone(&returned),
         };
-        manager.set_arena_source(Box::new(source)).unwrap();
-        assert_eq!(manager.pool_stats().3, 1, "starts with 1 primary arena");
+        let runtime_page_tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
+        runtime_page_tables
+            .install_source(Box::new(source))
+            .unwrap();
+        assert_eq!(
+            runtime_page_tables.pool_stats().map(|s| s.3),
+            Some(1),
+            "starts with 1 primary arena"
+        );
 
-        let runtime_page_tables = Arc::new(parking_lot::Mutex::new(Some(manager)));
         let runtime = registration
-            .runtime_task_state(
-                Arc::clone(&runtime_page_tables),
-                Arc::new(MemoryProtections::default()),
-            )
+            .runtime_task_state(runtime_page_tables, Arc::new(MemoryProtections::default()))
             .expect("materialize executable copied child runtime state");
 
         let pt_auth = runtime.page_tables_authority();
-        let mut pt_guard = pt_auth.lock();
-        let pt = pt_guard.as_mut().expect("page table manager");
-
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut block = crate::memory::LINUX_MMAP_BASE + 64 * TWO_MIB;
-        while pt.pool_stats().3 < 2 {
-            pt.set_rw(block + 0x1000, 0x1000, false)
-                .expect("mapping succeeds");
-            block += TWO_MIB;
-        }
-        assert_eq!(pt.pool_stats().3, 2, "grew to 2 arenas past 448 tables");
+        pt_auth
+            .edit(
+                || Err(TrapError::Hypervisor("manager must be present".to_owned())),
+                |editor| {
+                    while editor.pool_stats().3 < 2 {
+                        editor
+                            .set_rw(block + 0x1000, 0x1000, false)
+                            .expect("mapping succeeds");
+                        block += TWO_MIB;
+                    }
+                    assert_eq!(editor.pool_stats().3, 2, "grew to 2 arenas past 448 tables");
+                    Ok::<(), TrapError>(())
+                },
+            )
+            .unwrap();
         assert!(
             available.lock().unwrap().is_empty(),
             "source arena was taken"
         );
-        drop(pt_guard);
         *task_mm.inventory.lock() = HvpatchTaskInventoryAuthority::Retired;
     }
 
@@ -3369,7 +3381,7 @@ mod foreign_mm_tests {
             drop_order: None,
         });
         let prepared_mm_access = MmAccessState::new(
-            Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             task_mm
                 .inventory
@@ -3427,10 +3439,11 @@ mod foreign_mm_tests {
             .set_prot_none(
                 crate::memory::LINUX_MMAP_BASE,
                 crate::memory::mmap_arena_size() as usize,
+                None,
             )
             .expect("reserve sparse arena");
         manager
-            .rebase(stage1_root.raw())
+            .rebase(stage1_root.raw(), None)
             .expect("rebase to stage1_root");
         let ext_base = carrick_guest_mem::Gpa(0xc0_0000_0000);
         let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
@@ -3440,14 +3453,13 @@ mod foreign_mm_tests {
             available: std::sync::Arc::clone(&available),
             returned: std::sync::Arc::clone(&returned),
         };
-        manager.set_arena_source(Box::new(source)).unwrap();
+        let runtime_page_tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
+        runtime_page_tables
+            .install_source(Box::new(source))
+            .unwrap();
 
-        let runtime_page_tables = Arc::new(parking_lot::Mutex::new(Some(manager)));
         let mut runtime = registration
-            .runtime_task_state(
-                Arc::clone(&runtime_page_tables),
-                Arc::new(MemoryProtections::default()),
-            )
+            .runtime_task_state(runtime_page_tables, Arc::new(MemoryProtections::default()))
             .expect("materialize executable copied child runtime state");
 
         let mut primary_host = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
@@ -3474,22 +3486,29 @@ mod foreign_mm_tests {
             let runtime = runtime_send.0;
             let primary_host_ptr = primary_host_addr as *mut u8;
             let pt_auth = runtime.page_tables_authority();
-            let mut pt_guard = pt_auth.lock();
-            let pt = pt_guard.as_mut().expect("page table manager");
 
             const TWO_MIB: u64 = 2 * 1024 * 1024;
             let mut block = crate::memory::LINUX_MMAP_BASE + 64 * TWO_MIB;
-            while pt.pool_stats().3 < 2 {
-                pt.set_rw(block + 0x1000, 0x1000, false)
-                    .expect("mapping succeeds");
-                block += TWO_MIB;
-            }
-            assert_eq!(pt.pool_stats().3, 2, "manager grew to 2 arenas");
+            pt_auth
+                .edit(
+                    || Err(TrapError::Hypervisor("manager must be present".to_owned())),
+                    |editor| {
+                        while editor.pool_stats().3 < 2 {
+                            editor
+                                .set_rw(block + 0x1000, 0x1000, false)
+                                .expect("mapping succeeds");
+                            block += TWO_MIB;
+                        }
+                        assert_eq!(editor.pool_stats().3, 2, "manager grew to 2 arenas");
 
-            let page_table_resolver =
-                runtime.page_table_resolver(pt.base(), Some(primary_host_ptr));
-            // SAFETY: primary_host and ext_host are valid for the test duration.
-            unsafe { pt.sync_to_host(page_table_resolver).unwrap() };
+                        let page_table_resolver =
+                            runtime.page_table_resolver(editor.base(), Some(primary_host_ptr));
+                        // SAFETY: primary_host and ext_host are valid for the test duration.
+                        unsafe { editor.sync_to_host(page_table_resolver).unwrap() };
+                        Ok::<(), TrapError>(())
+                    },
+                )
+                .unwrap();
             done_tx.send(()).unwrap();
         }
         let worker =
@@ -3548,7 +3567,7 @@ mod foreign_mm_tests {
             drop_order: None,
         });
         let prepared_mm_access = MmAccessState::new(
-            Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             task_mm
                 .inventory
@@ -3606,10 +3625,11 @@ mod foreign_mm_tests {
             .set_prot_none(
                 crate::memory::LINUX_MMAP_BASE,
                 crate::memory::mmap_arena_size() as usize,
+                None,
             )
             .expect("reserve sparse arena");
         parent_manager
-            .rebase(stage1_root.raw())
+            .rebase(stage1_root.raw(), None)
             .expect("rebase to stage1_root");
         let ext_base = carrick_guest_mem::Gpa(0xd0_0000_0000);
         let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
@@ -3619,26 +3639,33 @@ mod foreign_mm_tests {
             available: std::sync::Arc::clone(&available),
             returned: std::sync::Arc::clone(&returned),
         };
-        parent_manager.set_arena_source(Box::new(source)).unwrap();
+        let parent_authority =
+            carrick_aarch64::Stage1Authority::new_with_manager(Some(parent_manager));
+        parent_authority.install_source(Box::new(source)).unwrap();
 
         // Grow parent page tables to 2 arenas by mapping enough blocks.
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut block = crate::memory::LINUX_MMAP_BASE + 64 * TWO_MIB;
         let mut mapped_vas = Vec::new();
-        while parent_manager.pool_stats().3 < 2 {
-            let va = block + 0x1000;
-            parent_manager
-                .set_rw(va, 0x1000, false)
-                .expect("mapping succeeds");
-            mapped_vas.push(va);
-            block += TWO_MIB;
-        }
-        assert_eq!(parent_manager.pool_stats().3, 2, "parent grew to 2 arenas");
+        parent_authority
+            .edit(
+                || Err(TrapError::Hypervisor("parent manager present".to_owned())),
+                |editor| {
+                    while editor.pool_stats().3 < 2 {
+                        let va = block + 0x1000;
+                        editor.set_rw(va, 0x1000, false).expect("mapping succeeds");
+                        mapped_vas.push(va);
+                        block += TWO_MIB;
+                    }
+                    assert_eq!(editor.pool_stats().3, 2, "parent grew to 2 arenas");
+                    Ok::<(), TrapError>(())
+                },
+            )
+            .unwrap();
 
-        let parent_runtime_page_tables = Arc::new(parking_lot::Mutex::new(Some(parent_manager)));
         let mut parent_runtime = registration
             .runtime_task_state(
-                Arc::clone(&parent_runtime_page_tables),
+                parent_authority.clone(),
                 Arc::new(MemoryProtections::default()),
             )
             .expect("materialize parent runtime state");
@@ -3665,21 +3692,18 @@ mod foreign_mm_tests {
 
         // Prepare child page tables (cloned and rebased for child root slot)
         let child_root_base = 0x8800_0080_0000_u64;
-        let mut child_page_tables = parent_runtime_page_tables.lock().as_ref().unwrap().clone();
+        let mut child_page_tables = parent_authority.snapshot_image().unwrap();
         child_page_tables.declare_offline_private_image();
         let child_ext_base = carrick_guest_mem::Gpa(0xe0_0000_0000);
         let child_available = std::sync::Arc::new(std::sync::Mutex::new(vec![child_ext_base]));
         let child_returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let child_source = TestArenaSource {
+        let mut child_source = TestArenaSource {
             id: carrick_mem::page_table::TableArenaSourceId(Gpa(child_root_base)),
             available: child_available,
             returned: child_returned,
         };
         child_page_tables
-            .set_arena_source(Box::new(child_source))
-            .unwrap();
-        child_page_tables
-            .rebase(child_root_base)
+            .rebase(child_root_base, Some(&mut child_source))
             .expect("rebase child page tables");
 
         let request = carrick_hal::ProcessForkRequest {
@@ -4252,7 +4276,7 @@ mod foreign_mm_tests {
             pending_exec_stage2_cleanup: None,
             shared_process_mm: false,
             mm_access: MmAccessState::new(
-                Arc::new(parking_lot::Mutex::new(None)),
+                carrick_aarch64::Stage1Authority::new(),
                 Arc::new(MemoryProtections::default()),
                 parent_inventory,
                 Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
@@ -4303,10 +4327,10 @@ mod foreign_mm_tests {
                 crate::memory::LINUX_PAGE_TABLES_BASE,
             );
             child_page_tables
-                .map_aliased(vvar_ipa, translated_ipa, vvar_len, false)
+                .map_aliased(vvar_ipa, translated_ipa, vvar_len, false, None)
                 .expect("map child vvar translation");
             child_page_tables
-                .rebase(root_slot_base)
+                .rebase(root_slot_base, None)
                 .expect("rebase child page tables");
             child_page_tables
         };
@@ -4499,9 +4523,9 @@ mod foreign_mm_tests {
             .cloned()
             .expect("prepared child deferred COW publications");
         let child_page_tables_authority =
-            Arc::new(parking_lot::Mutex::new(Some(child_page_tables)));
+            carrick_aarch64::Stage1Authority::new_with_manager(Some(child_page_tables));
         let child_state = MmAccessState::new(
-            Arc::clone(&child_page_tables_authority),
+            child_page_tables_authority.clone(),
             Arc::new(MemoryProtections::default()),
             Arc::clone(&child_inventory),
             child_cow_armed,
@@ -4563,11 +4587,8 @@ mod foreign_mm_tests {
         const AP_USER_RO: u64 = 0b11 << 6;
         assert_eq!(
             child_page_tables_authority
-                .lock()
-                .as_ref()
-                .expect("prepared child page tables")
-                .debug_walk(generation_address)[3]
-                & AP_MASK,
+                .with_manager(|pt| pt.debug_walk(generation_address)[3] & AP_MASK)
+                .expect("prepared child page tables"),
             AP_USER_RO,
             "prepared child vvar leaf must begin guest read-only",
         );
@@ -4642,11 +4663,8 @@ mod foreign_mm_tests {
         );
         assert_eq!(
             child_page_tables_authority
-                .lock()
-                .as_ref()
-                .expect("refreshed child page tables")
-                .debug_walk(generation_address)[3]
-                & AP_MASK,
+                .with_manager(|pt| pt.debug_walk(generation_address)[3] & AP_MASK)
+                .expect("refreshed child page tables"),
             AP_USER_RO,
             "privileged internal COW must preserve the guest read-only AP",
         );
@@ -4688,12 +4706,10 @@ mod foreign_mm_tests {
         );
         let grandchild_root_slot = root_slot_base + root_slot_size;
         let mut grandchild_page_tables = child_page_tables_authority
-            .lock()
-            .as_ref()
-            .expect("refreshed child page tables")
-            .clone();
+            .snapshot_image()
+            .expect("refreshed child page tables");
         grandchild_page_tables
-            .rebase(grandchild_root_slot)
+            .rebase(grandchild_root_slot, None)
             .expect("rebase refreshed child page tables for grandchild");
         let grandchild_plan = child_task
             .build_process_plan(
@@ -5708,7 +5724,7 @@ mod foreign_mm_tests {
             ),
         };
         let state = MmAccessState::new(
-            Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             ledger,
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
@@ -5787,7 +5803,7 @@ mod foreign_mm_tests {
         };
         let make_state = || {
             MmAccessState::new(
-                Arc::new(parking_lot::Mutex::new(None)),
+                carrick_aarch64::Stage1Authority::new(),
                 Arc::new(MemoryProtections::default()),
                 Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
                 Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
@@ -6225,7 +6241,7 @@ mod foreign_mm_tests {
             pending_exec_stage2_cleanup: None,
             shared_process_mm: false,
             mm_access: MmAccessState::new(
-                Arc::new(parking_lot::Mutex::new(None)),
+                carrick_aarch64::Stage1Authority::new(),
                 Arc::new(MemoryProtections::default()),
                 parent_inventory,
                 Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
@@ -6276,16 +6292,16 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         child_pt
-            .map_aliased(0x0040_0000, parent_rx_ipa, 0x4000, false)
+            .map_aliased(0x0040_0000, parent_rx_ipa, 0x4000, false, None)
             .expect("map child user aliased rx");
         child_pt
-            .map_aliased(0x0060_0000, parent_rw_ipa, 0x4000, true)
+            .map_aliased(0x0060_0000, parent_rw_ipa, 0x4000, true, None)
             .expect("map child user aliased rw");
         child_pt
-            .map_aliased(0x0080_0000, parent_cow_ipa, 0x4000, false)
+            .map_aliased(0x0080_0000, parent_cow_ipa, 0x4000, false, None)
             .expect("map child user aliased cow");
         child_pt
-            .rebase(root_slot_base)
+            .rebase(root_slot_base, None)
             .expect("rebase child page tables");
 
         let cow_ranges = vec![carrick_aarch64::vmm::ForkCowRange {
@@ -6599,7 +6615,7 @@ mod foreign_mm_tests {
         let expected_pt_bytes = child_pt.as_bytes()[..40].to_vec();
         let child_task_state = backend_state
             .runtime_task_state(
-                Arc::new(parking_lot::Mutex::new(Some(child_pt))),
+                carrick_aarch64::Stage1Authority::new_with_manager(Some(child_pt)),
                 Arc::new(MemoryProtections::default()),
             )
             .expect("materialize child runtime task state");
@@ -6778,7 +6794,7 @@ mod foreign_mm_tests {
             ..HvpatchFrameInventory::default()
         };
         let stale_mm_access = MmAccessState::new(
-            Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             Arc::new(parking_lot::Mutex::new(stale_inventory)),
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
@@ -7088,9 +7104,9 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables
-            .map_aliased(va, key.0, key.1, false)
+            .map_aliased(va, key.0, key.1, false, None)
             .expect("stage-1 mapping");
-        *task.page_tables_authority().lock() = Some(tables);
+        task.page_tables_authority().set_manager(tables);
         let selected = task
             .mapping_for_range_in(&custody, va + 0x1000, 16)
             .expect("own live mapping");
@@ -7184,9 +7200,9 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables
-            .map_aliased(va, extent_base, size as u64, false)
+            .map_aliased(va, extent_base, size as u64, false, None)
             .expect("stage-1 mapping");
-        *task.page_tables_authority().lock() = Some(tables);
+        task.page_tables_authority().set_manager(tables);
 
         let repoint_va = 0x6001_030000_u64;
         let repoint_len = 0x1000;
@@ -7320,18 +7336,18 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables_a
-            .map_aliased(va, key_a.0, key_a.1, false)
+            .map_aliased(va, key_a.0, key_a.1, false, None)
             .expect("stage-1 mapping a");
-        *task_a.page_tables_authority().lock() = Some(tables_a);
+        task_a.page_tables_authority().set_manager(tables_a);
 
         let mut tables_b = crate::page_table::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables_b
-            .map_aliased(va, key_b.0, key_b.1, false)
+            .map_aliased(va, key_b.0, key_b.1, false, None)
             .expect("stage-1 mapping b");
-        *task_b.page_tables_authority().lock() = Some(tables_b);
+        task_b.page_tables_authority().set_manager(tables_b);
 
         let sel_a = task_a
             .mapping_for_range_in(&custody, va + 0x1000, 16)
@@ -7403,9 +7419,15 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables
-            .map_aliased(va, key.0 + 0x2000, key.1.saturating_sub(0x2000), false)
+            .map_aliased(
+                va,
+                key.0 + 0x2000,
+                key.1.saturating_sub(0x2000),
+                false,
+                None,
+            )
             .expect("stage-1 mapping with offset mismatch");
-        *task.page_tables_authority().lock() = Some(tables);
+        task.page_tables_authority().set_manager(tables);
 
         assert!(
             task.mapping_for_range_in(&custody, va, 16).is_none(),
@@ -7458,9 +7480,9 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables
-            .map_aliased(va, key.0, key.1, false)
+            .map_aliased(va, key.0, key.1, false, None)
             .expect("stage-1 mapping");
-        *task.page_tables_authority().lock() = Some(tables);
+        task.page_tables_authority().set_manager(tables);
 
         assert!(
             task.mapping_for_range_in(&custody, va, 16).is_none(),
@@ -7527,9 +7549,9 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables
-            .map_aliased(va, key.0, key.1, false)
+            .map_aliased(va, key.0, key.1, false, None)
             .expect("stage-1 mapping");
-        *task.page_tables_authority().lock() = Some(tables);
+        task.page_tables_authority().set_manager(tables);
 
         assert!(task.mapping_for_range_in(&custody, va, size).is_some());
         assert!(task.mapping_for_range_in(&custody, va, 1).is_some());
@@ -7623,9 +7645,9 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables
-            .map_aliased(va, key.0, key.1, false)
+            .map_aliased(va, key.0, key.1, false, None)
             .expect("stage-1 mapping");
-        *task.page_tables_authority().lock() = Some(tables);
+        task.page_tables_authority().set_manager(tables);
 
         let selected_stage1 = task
             .mapping_for_range_in(&custody, va + 0x1000, 16)
@@ -7652,9 +7674,9 @@ mod foreign_mm_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         page_tables
-            .map_aliased(semantic_va, key.0, key.1, false)
+            .map_aliased(semantic_va, key.0, key.1, false, None)
             .expect("publish live COW source stage-1 compound");
-        *task.page_tables_authority().lock() = Some(page_tables);
+        task.page_tables_authority().set_manager(page_tables);
         task.mappings.push(HvfMappedRegion {
             start: semantic_va,
             ipa: key.0 + key.1,
@@ -9398,7 +9420,7 @@ mod task_only_carrier_directory_tests {
         };
         let mut runtime = registration
             .runtime_task_state(
-                Arc::new(parking_lot::Mutex::new(None)),
+                carrick_aarch64::Stage1Authority::new(),
                 Arc::new(MemoryProtections::default()),
             )
             .unwrap();
@@ -9421,7 +9443,7 @@ mod task_only_carrier_directory_tests {
 
         let reloaded = registration
             .runtime_task_state(
-                Arc::new(parking_lot::Mutex::new(None)),
+                carrick_aarch64::Stage1Authority::new(),
                 Arc::new(MemoryProtections::default()),
             )
             .unwrap();
@@ -11217,7 +11239,7 @@ mod task_only_carrier_directory_tests {
         let cow_armed = Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
         let cow_deferred_publications = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let inherited = MmAccessState::new(
-            Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             Arc::new(MemoryProtections::default()),
             Arc::clone(&ledger),
             Arc::clone(&cow_armed),
@@ -23396,7 +23418,7 @@ mod carrier_vm_custody_tests {
             .expect("structural root-slot owner");
         let identity = *owner.retained.record_identity.lock();
         let mm_access = super::MmAccessState::new(
-            std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             std::sync::Arc::new(super::MemoryProtections::default()),
             std::sync::Arc::new(parking_lot::Mutex::new(
                 super::HvpatchFrameInventory::default(),
@@ -23533,7 +23555,7 @@ mod carrier_vm_custody_tests {
             .expect("pinned structural root-slot owner");
         let identity = *owner.retained.record_identity.lock();
         let mm_access = super::MmAccessState::new(
-            std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             std::sync::Arc::new(super::MemoryProtections::default()),
             std::sync::Arc::new(parking_lot::Mutex::new(
                 super::HvpatchFrameInventory::default(),
@@ -24188,9 +24210,7 @@ struct RetiredMmRootStage2 {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct MmAccessState {
     identity: parking_lot::RwLock<Option<(carrick_hal::ForeignMmId, CarrierForeignMmBinding)>>,
-    page_tables: parking_lot::RwLock<
-        std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
-    >,
+    page_tables: parking_lot::RwLock<carrick_aarch64::Stage1Authority>,
     protections: std::sync::Arc<MemoryProtections>,
     frame_inventory: HvpatchFrameInventoryState,
     cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
@@ -24226,9 +24246,7 @@ struct MmCowRuntimeBinding {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MmAccessState {
     fn new(
-        page_tables: std::sync::Arc<
-            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
-        >,
+        page_tables: carrick_aarch64::Stage1Authority,
         protections: std::sync::Arc<MemoryProtections>,
         frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
         cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
@@ -24262,9 +24280,7 @@ impl MmAccessState {
     #[cfg(test)]
     fn for_foreign_read_test(
         binding: CarrierForeignMmBinding,
-        page_tables: std::sync::Arc<
-            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
-        >,
+        page_tables: carrick_aarch64::Stage1Authority,
         protections: std::sync::Arc<MemoryProtections>,
         frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
         snapshot: &dyn carrick_hal::ForeignMmSnapshot,
@@ -24290,35 +24306,23 @@ impl MmAccessState {
         *self.identity.write() = Some((mm, binding));
     }
 
-    fn page_tables_authority(
-        &self,
-    ) -> std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>> {
-        std::sync::Arc::clone(&self.page_tables.read())
+    fn page_tables_authority(&self) -> carrick_aarch64::Stage1Authority {
+        self.page_tables.read().clone()
     }
 
-    fn bind_page_tables_authority(
-        &self,
-        page_tables: std::sync::Arc<
-            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
-        >,
-    ) {
-        // Binding is a pointer swap and nothing else. An earlier version moved
-        // the manager out of the previous authority when this task state held
-        // its last reference; that made a rebind steal the shared authority's
-        // manager out from under sibling task states that had not rebound yet
-        // (three-thread core dumps lost two threads). Ownership transitions
-        // belong to the engine's exec/fork paths, never to a bind.
+    fn bind_page_tables_authority(&self, page_tables: carrick_aarch64::Stage1Authority) {
         let previous = {
             let mut slot = self.page_tables.write();
-            std::mem::replace(&mut *slot, std::sync::Arc::clone(&page_tables))
+            std::mem::replace(&mut *slot, page_tables.clone())
         };
-        if cow_refusal_diagnostics_enabled() && !std::sync::Arc::ptr_eq(&previous, &page_tables) {
-            let old_root = previous.lock().as_ref().map(|manager| manager.base());
-            let new_root = page_tables.lock().as_ref().map(|manager| manager.base());
+        page_tables.adopt_unshared_predecessor(&previous);
+        if cow_refusal_diagnostics_enabled() && !previous.shares_exact_authority(&page_tables) {
+            let old_root = previous.root_base();
+            let new_root = page_tables.root_base();
             record_cow_diagnostic_event(CowDiagnosticEvent::PageTableBind {
                 mm_access: self as *const Self as usize,
-                old_authority: std::sync::Arc::as_ptr(&previous) as usize,
-                new_authority: std::sync::Arc::as_ptr(&page_tables) as usize,
+                old_authority: previous.authority_id() as usize,
+                new_authority: page_tables.authority_id() as usize,
                 old_root,
                 new_root,
             });
@@ -24981,23 +24985,22 @@ fn attest_foreign_identity_write_receipt(
         return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
     }
     let page_tables_authority = lease.state.page_tables_authority();
-    let (ipa, guest_writable) = {
-        let tables = page_tables_authority
-            .try_lock_until(deadline)
-            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
-        let tables = tables
-            .as_ref()
-            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
-        let ipa = tables
-            .translate_retained_output(page_va)
-            .ok_or(carrick_hal::ForeignMmTransportError::Translation(va))?;
-        // The live leaf's access permissions ARE the guest's own write
-        // authority; only user-RW qualifies for the identity lane.
-        const AP_MASK: u64 = 0b11 << 6;
-        const AP_USER_RW: u64 = 0b01 << 6;
-        let leaf = tables.debug_walk(page_va)[3];
-        (ipa, leaf & AP_MASK == AP_USER_RW)
-    };
+    let (ipa, guest_writable) = page_tables_authority.try_with_manager_until(
+        deadline,
+        carrick_hal::ForeignMmTransportError::TimedOut,
+        carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
+        |tables| {
+            let ipa = tables
+                .translate_retained_output(page_va)
+                .ok_or(carrick_hal::ForeignMmTransportError::Translation(va))?;
+            // The live leaf's access permissions ARE the guest's own write
+            // authority; only user-RW qualifies for the identity lane.
+            const AP_MASK: u64 = 0b11 << 6;
+            const AP_USER_RW: u64 = 0b01 << 6;
+            let leaf = tables.debug_walk(page_va)[3];
+            Ok((ipa, leaf & AP_MASK == AP_USER_RW))
+        },
+    )?;
     if !guest_writable
         || lease
             .state
@@ -25166,40 +25169,39 @@ fn perform_foreign_cow_transaction(
         return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
     }
     let page_tables_authority = lease.state.page_tables_authority();
-    let old_ipa = {
-        let tables = page_tables_authority
-            .try_lock_until(deadline)
-            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
-        let tables = tables
-            .as_ref()
-            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
-        let old_ipa = tables
-            .translate_retained_output(span.va)
-            .ok_or(carrick_hal::ForeignMmTransportError::Translation(va))?;
-        let old_physical_ipa = align_down(old_ipa, CowArmedRanges::COMPOUND_SIZE);
-        let mut source_va = span.va;
-        loop {
-            let expected_ipa = old_ipa
-                .checked_add(source_va.saturating_sub(span.va))
-                .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
-            let observed_ipa = tables
-                .translate_retained_output(source_va)
-                .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
-            if observed_ipa != expected_ipa
-                || align_down(observed_ipa, CowArmedRanges::COMPOUND_SIZE) != old_physical_ipa
-            {
-                return Err(carrick_hal::ForeignMmTransportError::OwnerStale);
+    let old_ipa = page_tables_authority.try_with_manager_until(
+        deadline,
+        carrick_hal::ForeignMmTransportError::TimedOut,
+        carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
+        |tables| {
+            let old_ipa = tables
+                .translate_retained_output(span.va)
+                .ok_or(carrick_hal::ForeignMmTransportError::Translation(va))?;
+            let old_physical_ipa = align_down(old_ipa, CowArmedRanges::COMPOUND_SIZE);
+            let mut source_va = span.va;
+            loop {
+                let expected_ipa = old_ipa
+                    .checked_add(source_va.saturating_sub(span.va))
+                    .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+                let observed_ipa = tables
+                    .translate_retained_output(source_va)
+                    .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+                if observed_ipa != expected_ipa
+                    || align_down(observed_ipa, CowArmedRanges::COMPOUND_SIZE) != old_physical_ipa
+                {
+                    return Err(carrick_hal::ForeignMmTransportError::OwnerStale);
+                }
+                let next_leaf = (source_va & !0xfff_u64)
+                    .checked_add(0x1000)
+                    .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
+                if next_leaf >= span_end {
+                    break;
+                }
+                source_va = next_leaf;
             }
-            let next_leaf = (source_va & !0xfff_u64)
-                .checked_add(0x1000)
-                .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
-            if next_leaf >= span_end {
-                break;
-            }
-            source_va = next_leaf;
-        }
-        old_ipa
-    };
+            Ok(old_ipa)
+        },
+    )?;
     let old_physical_ipa = align_down(old_ipa, CowArmedRanges::COMPOUND_SIZE);
     let old_extent = lease_guard
         .backing
@@ -25250,21 +25252,20 @@ fn perform_foreign_cow_transaction(
         runtime.container_root,
         old_physical_ipa,
     );
-    let retain_old_compound = {
-        let tables = page_tables_authority
-            .try_lock_until(deadline)
-            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
-        let tables = tables
-            .as_ref()
-            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
-        cow_source_has_retained_projection(
-            span,
-            old_ipa,
-            old_physical_ipa,
-            &retention_aliases,
-            |candidate| tables.translate_retained_output(candidate),
-        )
-    };
+    let retain_old_compound = page_tables_authority.try_with_manager_until(
+        deadline,
+        carrick_hal::ForeignMmTransportError::TimedOut,
+        carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
+        |tables| {
+            Ok(cow_source_has_retained_projection(
+                span,
+                old_ipa,
+                old_physical_ipa,
+                &retention_aliases,
+                |candidate| tables.translate_retained_output(candidate),
+            ))
+        },
+    )?;
     let split_shape = {
         let inventory = lease
             .state
@@ -25401,94 +25402,86 @@ fn perform_foreign_cow_transaction(
     };
     let mut recycled = lease.state.cow_rollback_scratch.lock().take();
     let mut rollback = None;
-    let page_table_result = (|| {
-        let mut tables = page_tables_authority
-            .try_lock_until(deadline)
-            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
-        let tables = tables
-            .as_mut()
-            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
-        rollback = Some(HvfVmState::rollback_pre_image(&mut recycled, tables));
-        HvfVmState::refresh_stage1_exclusivity(tables);
-        tables
-            .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
-            .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-        let span_end = span.va.saturating_add(span.len as u64);
-        let mut page_va = span.va & !0xfff;
-        while page_va < span_end {
-            if source_guest_writable && !lease.state.protections.range_write_denied(page_va, 1) {
-                tables
-                    .set_writable_preserving_attributes(page_va, 0x1000)
-                    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-            } else if executable_authorized {
-                // The repointed leaf keeps the source VMA's execute bit; the
-                // fork arm only withdraws write.
-                tables
-                    .set_fork_readonly(page_va, 0x1000)
-                    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-            }
-            page_va = page_va.saturating_add(0x1000);
-        }
-        unsafe { tables.sync_to_host(resolve_page_table_host) }
-            .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-        // Authenticate the exact live leaves before the TLBI publishes this
-        // foreign COW.  Ptrace text authority permits the host copy; it must
-        // never grant the guest write access that the source VMA did not have.
-        const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
-        const AP_MASK: u64 = 0b11 << 6;
-        const AP_USER_RW: u64 = 0b01 << 6;
-        const AP_USER_RO: u64 = 0b11 << 6;
-        let pre_image = rollback
-            .as_ref()
-            .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-        let mut page_va = span.va & !0xfff;
-        while page_va < span_end {
-            let shadow = tables.debug_walk(page_va);
-            let live = unsafe { tables.debug_walk_host(resolve_page_table_host, page_va) }
+    let page_table_result = page_tables_authority.try_edit_until(
+        deadline,
+        carrick_hal::ForeignMmTransportError::TimedOut,
+        carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
+        || Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable),
+        |tables| {
+            rollback = Some(HvfVmState::rollback_pre_image(
+                &mut recycled,
+                tables.manager,
+            ));
+            HvfVmState::refresh_stage1_exclusivity(tables.manager);
+            tables
+                .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
                 .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-            let expected_ipa = new_ipa
-                .checked_add(page_va.saturating_sub(span.va))
-                .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-            let expected_ap = if source_guest_writable
-                && !lease.state.protections.range_write_denied(page_va, 1)
-            {
-                AP_USER_RW
-            } else if executable_authorized {
-                AP_USER_RO
-            } else {
-                pre_image.debug_walk(page_va)[3] & AP_MASK
-            };
-            if shadow != live
-                || live[3] & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
-                || live[3] & AP_MASK != expected_ap
-            {
-                return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+            let span_end = span.va.saturating_add(span.len as u64);
+            let mut page_va = span.va & !0xfff;
+            while page_va < span_end {
+                if source_guest_writable && !lease.state.protections.range_write_denied(page_va, 1)
+                {
+                    tables
+                        .set_writable_preserving_attributes(page_va, 0x1000)
+                        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                } else if executable_authorized {
+                    // The repointed leaf keeps the source VMA's execute bit; the
+                    // fork arm only withdraws write.
+                    tables
+                        .set_fork_readonly(page_va, 0x1000)
+                        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                }
+                page_va = page_va.saturating_add(0x1000);
             }
-            page_va = page_va.saturating_add(0x1000);
-        }
-        foreign_cow_failpoint(&lease.state, 3)?;
-        Ok::<(), carrick_hal::ForeignMmTransportError>(())
-    })();
+            unsafe { tables.sync_to_host(resolve_page_table_host) }
+                .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+            // Authenticate the exact live leaves before the TLBI publishes this
+            // foreign COW.  Ptrace text authority permits the host copy; it must
+            // never grant the guest write access that the source VMA did not have.
+            const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+            const AP_MASK: u64 = 0b11 << 6;
+            const AP_USER_RW: u64 = 0b01 << 6;
+            const AP_USER_RO: u64 = 0b11 << 6;
+            let pre_image = rollback
+                .as_ref()
+                .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+            let mut page_va = span.va & !0xfff;
+            while page_va < span_end {
+                let shadow = tables.debug_walk(page_va);
+                let live = unsafe { tables.debug_walk_host(resolve_page_table_host, page_va) }
+                    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                let expected_ipa = new_ipa
+                    .checked_add(page_va.saturating_sub(span.va))
+                    .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                let expected_ap = if source_guest_writable
+                    && !lease.state.protections.range_write_denied(page_va, 1)
+                {
+                    AP_USER_RW
+                } else if executable_authorized {
+                    AP_USER_RO
+                } else {
+                    pre_image.debug_walk(page_va)[3] & AP_MASK
+                };
+                if shadow != live
+                    || live[3] & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
+                    || live[3] & AP_MASK != expected_ap
+                {
+                    return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+                }
+                page_va = page_va.saturating_add(0x1000);
+            }
+            foreign_cow_failpoint(&lease.state, 3)?;
+            Ok::<(), carrick_hal::ForeignMmTransportError>(())
+        },
+    );
     let binding = carrick_hal::ForeignMmBinding::for_aarch64(
         requested.binding.asid,
         requested.binding.stage1_root,
     );
     if let Err(error) = page_table_result {
-        if let Some(mut snapshot) = rollback.take() {
-            let recycled_manager = {
-                let mut tables = page_tables_authority.lock();
-                if let Some(live) = tables.as_mut() {
-                    let source_before = u32::from(live.has_arena_source());
-                    snapshot.adopt_live_extension_state(live);
-                    carrick_observability::probes::stage1_arena_replace(
-                        8,
-                        source_before,
-                        u32::from(snapshot.has_arena_source()),
-                        0,
-                    );
-                }
-                unsafe { snapshot.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
-                tables.replace(snapshot)
+        if let Some(snapshot) = rollback.take() {
+            let recycled_manager = unsafe {
+                page_tables_authority.restore_image_and_host(snapshot, 8, resolve_page_table_host)
             };
             *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
             if invalidator
@@ -25502,22 +25495,10 @@ fn perform_foreign_cow_transaction(
         }
         return Err(error);
     }
-    let mut rollback = rollback.unwrap_or_else(|| std::process::abort());
+    let rollback = rollback.unwrap_or_else(|| std::process::abort());
     if let Err(error) = invalidator.invalidate_exact_asid(binding, deadline) {
-        let recycled_manager = {
-            let mut tables = page_tables_authority.lock();
-            if let Some(live) = tables.as_mut() {
-                let source_before = u32::from(live.has_arena_source());
-                rollback.adopt_live_extension_state(live);
-                carrick_observability::probes::stage1_arena_replace(
-                    9,
-                    source_before,
-                    u32::from(rollback.has_arena_source()),
-                    0,
-                );
-            }
-            unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
-            tables.replace(rollback)
+        let recycled_manager = unsafe {
+            page_tables_authority.restore_image_and_host(rollback, 9, resolve_page_table_host)
         };
         *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
         if invalidator
@@ -25529,20 +25510,8 @@ fn perform_foreign_cow_transaction(
         return Err(error);
     }
     if let Err(error) = foreign_cow_failpoint(&lease.state, 4) {
-        let recycled_manager = {
-            let mut tables = page_tables_authority.lock();
-            if let Some(live) = tables.as_mut() {
-                let source_before = u32::from(live.has_arena_source());
-                rollback.adopt_live_extension_state(live);
-                carrick_observability::probes::stage1_arena_replace(
-                    10,
-                    source_before,
-                    u32::from(rollback.has_arena_source()),
-                    0,
-                );
-            }
-            unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
-            tables.replace(rollback)
+        let recycled_manager = unsafe {
+            page_tables_authority.restore_image_and_host(rollback, 10, resolve_page_table_host)
         };
         *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
         if invalidator
@@ -25589,8 +25558,9 @@ fn perform_foreign_cow_transaction(
     if !owner_is_live {
         std::process::abort();
     }
-    let (apply_receipt, kernel_proof, authenticated_owner_generation) =
-        match runtime.authority.apply_foreign_cow(
+    let (apply_receipt, kernel_proof, authenticated_owner_generation) = match runtime
+        .authority
+        .apply_foreign_cow(
             commit,
             carrick_guest_mem::GuestVa(span.va),
             std::num::NonZeroUsize::new(span.len).unwrap_or_else(|| std::process::abort()),
@@ -25599,39 +25569,27 @@ fn perform_foreign_cow_transaction(
             carrick_guest_mem::Gpa(new_physical_ipa),
             cow_length,
         ) {
-            Ok(publication) => publication,
-            Err(_error) => {
-                let mut rollback = lease
-                    .state
-                    .cow_rollback_scratch
-                    .lock()
-                    .take()
-                    .unwrap_or_else(|| std::process::abort());
-                let recycled_manager = {
-                    let mut tables = page_tables_authority.lock();
-                    if let Some(live) = tables.as_mut() {
-                        let source_before = u32::from(live.has_arena_source());
-                        rollback.adopt_live_extension_state(live);
-                        carrick_observability::probes::stage1_arena_replace(
-                            11,
-                            source_before,
-                            u32::from(rollback.has_arena_source()),
-                            0,
-                        );
-                    }
-                    unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
-                    tables.replace(rollback)
-                };
-                *lease.state.cow_rollback_scratch.lock() = recycled_manager;
-                if invalidator
-                    .invalidate_exact_asid(binding, deadline)
-                    .is_err()
-                {
-                    std::process::abort();
-                }
-                return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+        Ok(publication) => publication,
+        Err(_error) => {
+            let rollback = lease
+                .state
+                .cow_rollback_scratch
+                .lock()
+                .take()
+                .unwrap_or_else(|| std::process::abort());
+            let recycled_manager = unsafe {
+                page_tables_authority.restore_image_and_host(rollback, 11, resolve_page_table_host)
+            };
+            *lease.state.cow_rollback_scratch.lock() = recycled_manager;
+            if invalidator
+                .invalidate_exact_asid(binding, deadline)
+                .is_err()
+            {
+                std::process::abort();
             }
-        };
+            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+        }
+    };
     if authenticated_owner_generation != owner_generation_token {
         std::process::abort();
     }
@@ -26322,7 +26280,7 @@ pub mod foreign_cow_test_support {
                 }
             }
             let state = MmAccessState::new(
-                std::sync::Arc::new(parking_lot::Mutex::new(Some(tables))),
+                carrick_aarch64::Stage1Authority::new_with_manager(Some(tables)),
                 std::sync::Arc::new(MemoryProtections::default()),
                 std::sync::Arc::new(parking_lot::Mutex::new(ledger)),
                 std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
@@ -26406,27 +26364,29 @@ pub mod foreign_cow_test_support {
         }
 
         pub fn set_source_stage1_writable_for_test(&self) -> Result<(), String> {
-            let page_tables = self.state.page_tables_authority();
-            let mut page_tables = page_tables.lock();
-            page_tables
-                .as_mut()
-                .ok_or_else(|| "production carrier page tables are absent".to_owned())?
-                .set_writable_preserving_attributes(TEST_VA, 0x1000)
-                .map_err(|error| format!("make production carrier source leaf writable: {error:?}"))
-                .map(|_| ())
+            self.state.page_tables_authority().edit(
+                || Err("production carrier page tables are absent".to_owned()),
+                |editor| {
+                    editor
+                        .set_writable_preserving_attributes(TEST_VA, 0x1000)
+                        .map_err(|error| {
+                            format!("make production carrier source leaf writable: {error:?}")
+                        })
+                        .map(|_| ())
+                },
+            )
         }
 
         pub fn source_direct_store_would_fault_for_test(&self) -> Result<bool, String> {
             const AP_MASK: u64 = 0b11 << 6;
             const AP_USER_RW: u64 = 0b01 << 6;
-            let tables = self.state.page_tables_authority();
-            let tables = tables.lock();
-            let leaf = carrick_mem::page_table::terminal_descriptor(
-                tables
-                    .as_ref()
-                    .ok_or_else(|| "production carrier page tables are absent".to_owned())?
-                    .debug_walk(TEST_VA),
-            );
+            let leaf = self
+                .state
+                .page_tables_authority()
+                .with_manager(|tables| {
+                    carrick_mem::page_table::terminal_descriptor(tables.debug_walk(TEST_VA))
+                })
+                .ok_or_else(|| "production carrier page tables are absent".to_owned())?;
             Ok(leaf & AP_MASK != AP_USER_RW)
         }
 
@@ -26472,10 +26432,10 @@ pub mod foreign_cow_test_support {
             carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables
-            .rebase(stage1_root.0)
+            .rebase(stage1_root.0, None)
             .map_err(|error| format!("rebase carrier fixture page tables: {error:?}"))?;
         tables
-            .map_aliased(TEST_VA, data_ipa.0, OWNER_LEN, false)
+            .map_aliased(TEST_VA, data_ipa.0, OWNER_LEN, false, None)
             .map_err(|error| format!("map carrier fixture COW leaf: {error:?}"))?;
         Ok(tables)
     }
@@ -27000,14 +26960,12 @@ impl HvfTaskState {
     pub(crate) fn runtime_authorities_match(
         &self,
         mm_access: &std::sync::Arc<MmAccessState>,
-        page_tables: &std::sync::Arc<
-            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
-        >,
+        page_tables: &carrick_aarch64::Stage1Authority,
         protections: &std::sync::Arc<MemoryProtections>,
     ) -> bool {
         std::sync::Arc::ptr_eq(&self.mm_access, mm_access)
             && carrick_aarch64::Aarch64TaskRuntimeProjection {
-                page_tables: std::sync::Arc::clone(page_tables),
+                page_tables: page_tables.clone(),
                 protections: std::sync::Arc::clone(protections),
                 process_asid: None,
             }
@@ -27140,7 +27098,7 @@ impl HvfTaskState {
         let custody_identity = custody as *const CarrierVmCustody as usize;
         let mm_access_identity = std::sync::Arc::as_ptr(&self.mm_access) as usize;
         let page_tables_authority = self.page_tables_authority();
-        let page_tables_identity = std::sync::Arc::as_ptr(&page_tables_authority) as usize;
+        let page_tables_identity = page_tables_authority.authority_id() as usize;
         let page_table_host = self
             .mapping_for_range_in(
                 custody,
@@ -27148,9 +27106,8 @@ impl HvfTaskState {
                 carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
             )
             .map(|mapping| mapping.host_addr);
-        let (page_table_root, stage1_rows) = {
-            let page_tables = page_tables_authority.lock();
-            if let Some(manager) = page_tables.as_ref() {
+        let (page_table_root, stage1_rows) = page_tables_authority
+            .with_manager(|manager| {
                 let mut rows = Vec::with_capacity(4);
                 let mut va = compound_va;
                 while va < compound_end {
@@ -27173,10 +27130,8 @@ impl HvfTaskState {
                     va = va.saturating_add(PAGE_SIZE);
                 }
                 (Some(manager.base()), rows)
-            } else {
-                (None, Vec::new())
-            }
-        };
+            })
+            .unwrap_or((None, Vec::new()));
         eprintln!(
             "[COW-REFUSAL] input_va={semantic_va:#x} input_ipa={ipa:#x} compound_va={compound_va:#x} physical={physical_ipa:#x}+{:#x} custody={custody_identity:#x} mm_access={mm_access_identity:#x} page_tables={page_tables_identity:#x} root={page_table_root:#x?} mm_root_slot={:?} cow_identity={:?}",
             CowArmedRanges::COMPOUND_SIZE,
@@ -27709,7 +27664,9 @@ impl HvfTaskState {
     }
 
     fn translate_va_for_cow(&self, va: u64) -> Option<u64> {
-        self.page_tables_authority().lock().as_ref()?.translate(va)
+        self.page_tables_authority()
+            .with_manager(|m| m.translate(va))
+            .flatten()
     }
 
     fn mapping_for_range_in(
@@ -27855,7 +27812,7 @@ impl HvfTaskState {
     }
 
     fn neutral() -> Self {
-        let page_tables = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let page_tables = carrick_aarch64::Stage1Authority::new();
         let protections = std::sync::Arc::new(MemoryProtections::default());
         let frame_inventory =
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
@@ -27917,7 +27874,7 @@ impl HvfTaskState {
             && protections.executable.is_empty()
             && protections.bus_fault.is_empty()
             && protections.mutable_shared_backing.is_empty()
-            && self.page_tables_authority().lock().is_none()
+            && self.page_tables_authority().is_none()
             && self.last_syscall_nr.is_none()
             && self.last_syscall_orig_x0 == 0
             && !self.persistent_vm_lifecycle
@@ -28083,7 +28040,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
 ) -> HvfTaskState {
     let cow_authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
         std::sync::Arc::new(task_only_carrier_directory_tests::TestCowAuthority);
-    let page_tables = std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let page_tables = carrick_aarch64::Stage1Authority::new();
     let protections = std::sync::Arc::new(MemoryProtections::default());
     let frame_inventory =
         std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
@@ -28174,7 +28131,7 @@ pub(crate) fn hvpatch_task_state_test_identity(
         mm_root_slot: state.mm_root_slot,
         first_mapping: state.mappings.first().map_or(0, |mapping| mapping.start),
         linux_tid: state.cow_identity.map_or(0, |identity| identity.linux_tid),
-        page_tables: std::sync::Arc::as_ptr(&state.page_tables_authority()) as usize,
+        page_tables: state.page_tables_authority().authority_id() as usize,
         frame_inventory: std::sync::Arc::as_ptr(&state.frame_inventory.ledger) as usize,
         cow_authority: authority,
         mm_access: std::sync::Arc::as_ptr(&state.mm_access) as usize,
@@ -30226,10 +30183,10 @@ fn sparse_mmap_stage1_error(
     manager: &carrick_mem::page_table::PageTableManager,
     span: &str,
     error: carrick_mem::page_table::PageTableError,
+    source: bool,
 ) -> TrapError {
     let (in_use, free, capacity, arenas) = manager.pool_stats();
     let (multi_vcpu, exclusive, reclaim_pending) = manager.coalesce_policy();
-    let source = manager.has_arena_source();
     TrapError::Hypervisor(format!(
         "plan sparse HVPatch mmap {span} stage-1 output: {error:?} \
          (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
@@ -30453,9 +30410,7 @@ impl HvpatchTaskOnlyBackendState {
 
     pub(crate) fn runtime_task_state(
         &self,
-        page_tables: std::sync::Arc<
-            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
-        >,
+        page_tables: carrick_aarch64::Stage1Authority,
         protections: std::sync::Arc<MemoryProtections>,
     ) -> Result<HvfTaskState, TrapError> {
         self.registration
@@ -32677,9 +32632,7 @@ impl HvpatchTaskRegistration {
 
     fn runtime_task_state(
         &self,
-        page_tables: std::sync::Arc<
-            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
-        >,
+        page_tables: carrick_aarch64::Stage1Authority,
         protections: std::sync::Arc<MemoryProtections>,
     ) -> Result<HvfTaskState, TrapError> {
         let task_mm = self
@@ -32716,7 +32669,7 @@ impl HvpatchTaskRegistration {
             let mut slot = task_mm.mm_access.lock();
             std::sync::Arc::clone(slot.get_or_insert_with(|| {
                 let access = MmAccessState::new(
-                    std::sync::Arc::clone(&page_tables),
+                    page_tables.clone(),
                     std::sync::Arc::clone(&protections),
                     std::sync::Arc::clone(&ledger),
                     std::sync::Arc::clone(&cow_armed),
@@ -32750,7 +32703,7 @@ impl HvpatchTaskRegistration {
                 access
             }))
         };
-        mm_access.bind_page_tables_authority(std::sync::Arc::clone(&page_tables));
+        mm_access.bind_page_tables_authority(page_tables.clone());
         mm_access.bind_cow_runtime(MmCowRuntimeBinding {
             authority: std::sync::Arc::clone(&cow_authority),
             identity: cow_identity,
@@ -33894,7 +33847,7 @@ fn prepare_global_exec_plan(
         }
     }
     let root = global.mappings[table_index].ipa_start;
-    page_tables.rebase(root).map_err(|error| {
+    page_tables.rebase(root, None).map_err(|error| {
         TrapError::Hypervisor(format!("rebase HVPatch exec page tables: {error:?}"))
     })?;
     for mapping in global
@@ -33910,6 +33863,7 @@ fn prepare_global_exec_plan(
                 mapping.guest_start,
                 mapping.ipa_start,
                 mapping.mapped_size,
+                None,
             )
         } else {
             page_tables.map_aliased(
@@ -33917,6 +33871,7 @@ fn prepare_global_exec_plan(
                 mapping.ipa_start,
                 mapping.mapped_size,
                 mapping.perms.write,
+                None,
             )
         };
         remap.map_err(|error| {
@@ -33930,6 +33885,7 @@ fn prepare_global_exec_plan(
         .set_prot_none(
             crate::memory::LINUX_MMAP_BASE,
             crate::memory::mmap_arena_size() as usize,
+            None,
         )
         .map_err(|error| {
             TrapError::Hypervisor(format!("reserve sparse HVPatch mmap arena: {error:?}"))
@@ -33999,7 +33955,7 @@ fn reapply_global_exec_readonly_spans(
             ))
         })?;
         page_tables
-            .set_readonly(span.start, len, span.exec)
+            .set_readonly(span.start, len, span.exec, None)
             .map_err(|error| {
                 TrapError::Hypervisor(format!(
                     "restore HVPatch exec read-only span at 0x{:x}: {error:?}",
@@ -35583,44 +35539,29 @@ impl HvfVmState {
     }
 
     pub(crate) fn page_tables_snapshot(&self) -> Option<crate::page_table::PageTableManager> {
-        self.page_tables_authority().lock().clone()
+        self.page_tables_authority().snapshot_image()
     }
 
     pub(crate) fn bind_stage1_page_tables(
         &mut self,
-        page_tables: std::sync::Arc<
-            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
-        >,
+        page_tables: carrick_aarch64::Stage1Authority,
     ) {
-        {
-            let guard = page_tables.lock();
-            let present = guard.is_some();
-            let has_source = guard.as_ref().is_some_and(|m| m.has_arena_source());
-            let arenas = guard.as_ref().map_or(0, |m| m.pool_stats().3);
-            carrick_observability::probes::stage1_arena_bind(
-                std::sync::Arc::as_ptr(&page_tables) as u64,
-                u32::from(present),
-                u32::from(has_source),
-                arenas,
-            );
-            tracing::debug!(
-                target: "carrick::stage1_arena",
-                authority = std::sync::Arc::as_ptr(&page_tables) as usize,
-                present,
-                has_source,
-                arenas,
-                "bind stage-1 page tables"
-            );
-        }
+        page_tables.emit_bind_probe();
+        tracing::debug!(
+            target: "carrick::stage1_arena",
+            authority = page_tables.authority_id() as usize,
+            present = page_tables.is_present(),
+            has_source = page_tables.has_source(),
+            arenas = page_tables.pool_stats().map_or(0, |s| s.3),
+            "bind stage-1 page tables"
+        );
         self.mm_access.bind_page_tables_authority(page_tables);
     }
 
     pub(crate) fn task_runtime_authorities_match(
         &self,
         mm_access: &std::sync::Arc<MmAccessState>,
-        page_tables: &std::sync::Arc<
-            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
-        >,
+        page_tables: &carrick_aarch64::Stage1Authority,
         protections: &std::sync::Arc<MemoryProtections>,
     ) -> bool {
         self.task
@@ -36305,7 +36246,7 @@ impl HvfVmState {
                 pending_exec_stage2_cleanup: None,
                 shared_process_mm: false,
                 mm_access: MmAccessState::new(
-                    std::sync::Arc::new(parking_lot::Mutex::new(None)),
+                    carrick_aarch64::Stage1Authority::new(),
                     std::sync::Arc::new(MemoryProtections::default()),
                     std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
                     std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
@@ -37431,7 +37372,7 @@ impl HvfVmState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("sparse HVPatch mmap has no page-table backing".to_owned())
             })?;
-        if self.page_tables_authority().lock().is_none() {
+        if self.page_tables_authority().is_none() {
             return Err(TrapError::Hypervisor(
                 "sparse HVPatch mmap page tables are absent".to_owned(),
             ));
@@ -37634,87 +37575,103 @@ impl HvfVmState {
         let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
         // Journal this transaction's descriptor pre-images rather than
         // cloning the whole 1.75 MiB table region (see `begin_undo`).
-        let publication = (|| {
+        let publication = {
             let page_tables_authority = self.page_tables_authority();
-            let mut page_tables = page_tables_authority.lock();
-            let manager = page_tables.as_mut().ok_or_else(|| {
-                TrapError::Hypervisor("sparse HVPatch mmap page tables are absent".to_owned())
-            })?;
-            manager.begin_undo();
-            Self::refresh_stage1_exclusivity(manager);
-            let aligned_start = align_up(start, TWO_MIB)?.min(end);
-            if start < aligned_start {
-                manager
-                    .map_private_aliased(start, semantic_ipa, aligned_start - start, false)
-                    .map_err(|error| sparse_mmap_stage1_error(manager, "leading", error))?;
-            }
-            let aligned_len = (end - aligned_start) / TWO_MIB * TWO_MIB;
-            if aligned_len != 0 {
-                manager
-                    .map_private_aliased(
-                        aligned_start,
-                        semantic_ipa + (aligned_start - start),
-                        aligned_len,
-                        false,
-                    )
-                    .map_err(|error| sparse_mmap_stage1_error(manager, "bulk", error))?;
-            }
-            let tail_start = aligned_start + aligned_len;
-            if tail_start < end {
-                manager
-                    .map_private_aliased(
-                        tail_start,
-                        semantic_ipa + (tail_start - start),
-                        end - tail_start,
-                        false,
-                    )
-                    .map_err(|error| sparse_mmap_stage1_error(manager, "trailing", error))?;
-            }
-            manager
-                .set_prot_none(start, semantic_len)
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "keep sparse HVPatch mmap stage-1 invalid: {error:?}"
-                    ))
-                })?;
-            self.publish_stage1_extension_arenas(manager)?;
-            let page_table_resolver =
-                self.page_table_resolver(manager.base(), Some(page_table_host));
-            unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|e| {
-                TrapError::Hypervisor(format!("sparse HVPatch mmap sync_to_host failed: {e:?}"))
-            })?;
-            let mut page = start;
-            while page < end {
-                let expected_ipa = semantic_ipa + (page - start);
-                let shadow = manager.debug_walk(page);
-                let live =
-                    unsafe { manager.debug_walk_host(page_table_resolver, page) }.map_err(|e| {
-                        TrapError::Hypervisor(format!(
-                            "sparse HVPatch mmap debug_walk_host failed: {e:?}"
+            let has_source = page_tables_authority.has_source();
+            page_tables_authority
+                .edit(
+                    || {
+                        Err(TrapError::Hypervisor(
+                            "sparse HVPatch mmap page tables are absent".to_owned(),
                         ))
-                    })?;
-                let leaf = carrick_mem::page_table::terminal_descriptor(live);
-                if shadow != live
-                    || manager.translate(page).is_some()
-                    || manager.translate_retained_output(page) != Some(expected_ipa)
-                    || leaf & VALID != 0
-                    || leaf & AP_MASK != AP_USER_RO
-                    || leaf & NON_GLOBAL == 0
-                {
-                    return Err(TrapError::Hypervisor(format!(
-                        "sparse HVPatch mmap publication failed at VA 0x{page:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
-                    )));
-                }
-                page = page.saturating_add(PAGE_SIZE);
-            }
-            Ok::<(), TrapError>(())
-        })();
+                    },
+                    |editor| -> Result<(), TrapError> {
+                        editor.begin_undo();
+                        Self::refresh_stage1_exclusivity(editor.manager);
+                        let aligned_start = align_up(start, TWO_MIB)?.min(end);
+                        if start < aligned_start {
+                            editor
+                                .map_private_aliased(start, semantic_ipa, aligned_start - start, false)
+                                .map_err(|error| {
+                                    sparse_mmap_stage1_error(editor.manager, "leading", error, has_source)
+                                })?;
+                        }
+                        let aligned_len = (end - aligned_start) / TWO_MIB * TWO_MIB;
+                        if aligned_len != 0 {
+                            editor
+                                .map_private_aliased(
+                                    aligned_start,
+                                    semantic_ipa + (aligned_start - start),
+                                    aligned_len,
+                                    false,
+                                )
+                                .map_err(|error| {
+                                    sparse_mmap_stage1_error(editor.manager, "bulk", error, has_source)
+                                })?;
+                        }
+                        let tail_start = aligned_start + aligned_len;
+                        if tail_start < end {
+                            editor
+                                .map_private_aliased(
+                                    tail_start,
+                                    semantic_ipa + (tail_start - start),
+                                    end - tail_start,
+                                    false,
+                                )
+                                .map_err(|error| {
+                                    sparse_mmap_stage1_error(editor.manager, "trailing", error, has_source)
+                                })?;
+                        }
+                        editor
+                            .set_prot_none(start, semantic_len)
+                            .map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "keep sparse HVPatch mmap stage-1 invalid: {error:?}"
+                                ))
+                            })?;
+                        self.publish_stage1_extension_arenas(editor.manager)?;
+                        let page_table_resolver =
+                            self.page_table_resolver(editor.base(), Some(page_table_host));
+                        unsafe { editor.sync_to_host(page_table_resolver) }.map_err(|e| {
+                            TrapError::Hypervisor(format!(
+                                "sparse HVPatch mmap sync_to_host failed: {e:?}"
+                            ))
+                        })?;
+                        let mut page = start;
+                        while page < end {
+                            let expected_ipa = semantic_ipa + (page - start);
+                            let shadow = editor.debug_walk(page);
+                            let live = unsafe {
+                                editor.debug_walk_host(page_table_resolver, page)
+                            }
+                            .map_err(|e| {
+                                TrapError::Hypervisor(format!(
+                                    "sparse HVPatch mmap debug_walk_host failed: {e:?}"
+                                ))
+                            })?;
+                            let leaf = carrick_mem::page_table::terminal_descriptor(live);
+                            if shadow != live
+                                || editor.translate(page).is_some()
+                                || editor.translate_retained_output(page) != Some(expected_ipa)
+                                || leaf & VALID != 0
+                                || leaf & AP_MASK != AP_USER_RO
+                                || leaf & NON_GLOBAL == 0
+                            {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "sparse HVPatch mmap publication failed at VA 0x{page:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
+                                )));
+                            }
+                            page = page.saturating_add(PAGE_SIZE);
+                        }
+                        Ok(())
+                    },
+                )
+        };
         if let Err(error) = publication {
-            {
-                let page_tables_authority = self.page_tables_authority();
-                let mut page_tables = page_tables_authority.lock();
-                if let Some(manager) = page_tables.as_mut() {
-                    let manager_base = manager.base();
+            let _ = self.page_tables_authority().edit(
+                || Err(()),
+                |editor| {
+                    let manager_base = editor.base();
                     let page_table_resolver = |base: u64| {
                         (base == manager_base)
                             .then_some(page_table_host)
@@ -37728,9 +37685,10 @@ impl HvfVmState {
                     // SAFETY: the COW quiesce and topology guards remain held,
                     // so no vCPU can walk or edit this mm while the journalled
                     // pre-images are replayed into its live backing.
-                    unsafe { manager.rollback_undo(page_table_resolver) };
-                }
-            }
+                    unsafe { editor.rollback_undo(page_table_resolver) };
+                    Ok::<(), ()>(())
+                },
+            );
             if let Err(flush_error) = flush_stage1() {
                 eprintln!(
                     "carrick: FATAL: sparse HVPatch mmap rollback TLBI failed: {flush_error}"
@@ -37744,13 +37702,13 @@ impl HvfVmState {
             return Err(error);
         }
         // Publication succeeded: the journalled pre-images are no longer needed.
-        {
-            let page_tables_authority = self.page_tables_authority();
-            let mut page_tables = page_tables_authority.lock();
-            if let Some(manager) = page_tables.as_mut() {
-                manager.commit_undo();
-            }
-        }
+        let _ = self.page_tables_authority().edit(
+            || Err(()),
+            |editor| {
+                editor.commit_undo();
+                Ok::<(), ()>(())
+            },
+        );
         if let Err(error) = flush_stage1() {
             eprintln!("carrick: FATAL: sparse HVPatch mmap TLBI failed: {error}");
             std::process::abort();
@@ -37940,9 +37898,8 @@ impl HvfVmState {
         let page_va = align_down(va, PAGE_SIZE);
         let retained_ipa = self
             .page_tables_authority()
-            .lock()
-            .as_ref()
-            .and_then(|manager| manager.translate_retained_output(page_va));
+            .with_manager(|manager| manager.translate_retained_output(page_va))
+            .flatten();
         let Some(retained_ipa) = retained_ipa else {
             return Ok(None);
         };
@@ -37975,9 +37932,8 @@ impl HvfVmState {
         // Another sibling may have repaired the leaf while this thread waited.
         let retained_ipa = self
             .page_tables_authority()
-            .lock()
-            .as_ref()
-            .and_then(|manager| manager.translate_retained_output(page_va));
+            .with_manager(|manager| manager.translate_retained_output(page_va))
+            .flatten();
         let Some(retained_ipa) = retained_ipa else {
             return Ok(None);
         };
@@ -38023,9 +37979,8 @@ impl HvfVmState {
         while probe < span_end {
             let retained = self
                 .page_tables_authority()
-                .lock()
-                .as_ref()
-                .and_then(|manager| manager.translate_retained_output(probe));
+                .with_manager(|manager| manager.translate_retained_output(probe))
+                .flatten();
             let needs_materialization = retained.is_some_and(|ipa| {
                 self.physical_cow_source(probe, ipa).is_none()
                     || self.retained_output_lacks_exclusive_claim(ipa)
@@ -38132,76 +38087,81 @@ impl HvfVmState {
 
         // Journal this transaction's descriptor pre-images rather than
         // cloning the whole 1.75 MiB table region (see `begin_undo`).
-        let publication = (|| {
+        let publication = {
             let page_tables_authority = self.page_tables_authority();
-            let mut page_tables = page_tables_authority.lock();
-            let manager = page_tables.as_mut().ok_or_else(|| {
-                TrapError::Hypervisor("HVPatch retained reuse page tables are absent".to_owned())
-            })?;
-            manager.begin_undo();
-            Self::refresh_stage1_exclusivity(manager);
-            manager
-                .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "repoint HVPatch retained reuse leaves: {error:?}"
-                    ))
-                })?;
-            // `PtOp::Invalidate` intentionally preserves AP. A retired overlay
-            // may therefore carry invalid+RW attributes, while the deferred
-            // PROT_NONE publication is required to authenticate invalid+RO.
-            // Normalize the unpublished leaves to fork-RO/nG now; a later RW
-            // protect changes AP while preserving the exact fresh IPA.
-            manager
-                .set_fork_readonly(page_va, span_len)
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "restrict HVPatch retained reuse leaves: {error:?}"
-                    ))
-                })?;
-            self.publish_stage1_extension_arenas(manager)?;
-            let page_table_resolver =
-                self.page_table_resolver(manager.base(), Some(page_table_host));
-            unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|e| {
-                TrapError::Hypervisor(format!("retained reuse sync_to_host failed: {e:?}"))
-            })?;
-            let mut current = page_va;
-            while current < span_end {
-                let expected_ipa = new_ipa.checked_add(current - page_va).ok_or_else(|| {
-                    TrapError::Hypervisor("retained reuse leaf IPA overflow".to_owned())
-                })?;
-                let shadow = manager.debug_walk(current);
-                let live = unsafe { manager.debug_walk_host(page_table_resolver, current) }
-                    .map_err(|e| {
-                        TrapError::Hypervisor(format!(
-                            "retained reuse debug_walk_host failed: {e:?}"
+            page_tables_authority
+                .edit(
+                    || {
+                        Err(TrapError::Hypervisor(
+                            "HVPatch retained reuse page tables are absent".to_owned(),
                         ))
-                    })?;
-                if shadow != live {
-                    return Err(TrapError::Hypervisor(format!(
-                        "HVPatch retained reuse shadow/live mismatch at VA 0x{current:x}"
-                    )));
-                }
-                let leaf = live[3];
-                if leaf & VALID != 0
-                    || leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
-                    || leaf & AP_MASK != AP_USER_RO
-                    || leaf & NON_GLOBAL == 0
-                {
-                    return Err(TrapError::Hypervisor(format!(
-                        "HVPatch retained reuse leaf authentication failed at VA 0x{current:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
-                    )));
-                }
-                current = current.saturating_add(PAGE_SIZE);
-            }
-            Ok::<(), TrapError>(())
-        })();
+                    },
+                    |editor| -> Result<(), TrapError> {
+                        editor.begin_undo();
+                        Self::refresh_stage1_exclusivity(editor.manager);
+                        editor
+                            .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
+                            .map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "repoint HVPatch retained reuse leaves: {error:?}"
+                                ))
+                            })?;
+                        // `PtOp::Invalidate` intentionally preserves AP. A retired overlay
+                        // may therefore carry invalid+RW attributes, while the deferred
+                        // PROT_NONE publication is required to authenticate invalid+RO.
+                        // Normalize the unpublished leaves to fork-RO/nG now; a later RW
+                        // protect changes AP while preserving the exact fresh IPA.
+                        editor
+                            .set_fork_readonly(page_va, span_len)
+                            .map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "restrict HVPatch retained reuse leaves: {error:?}"
+                                ))
+                            })?;
+                        self.publish_stage1_extension_arenas(editor.manager)?;
+                        let page_table_resolver =
+                            self.page_table_resolver(editor.base(), Some(page_table_host));
+                        unsafe { editor.sync_to_host(page_table_resolver) }.map_err(|e| {
+                            TrapError::Hypervisor(format!("retained reuse sync_to_host failed: {e:?}"))
+                        })?;
+                        let mut current = page_va;
+                        while current < span_end {
+                            let expected_ipa = new_ipa.checked_add(current - page_va).ok_or_else(|| {
+                                TrapError::Hypervisor("retained reuse leaf IPA overflow".to_owned())
+                            })?;
+                            let shadow = editor.debug_walk(current);
+                            let live = unsafe { editor.debug_walk_host(page_table_resolver, current) }
+                                .map_err(|e| {
+                                    TrapError::Hypervisor(format!(
+                                        "retained reuse debug_walk_host failed: {e:?}"
+                                    ))
+                                })?;
+                            if shadow != live {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "HVPatch retained reuse shadow/live mismatch at VA 0x{current:x}"
+                                )));
+                            }
+                            let leaf = live[3];
+                            if leaf & VALID != 0
+                                || leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
+                                || leaf & AP_MASK != AP_USER_RO
+                                || leaf & NON_GLOBAL == 0
+                            {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "HVPatch retained reuse leaf authentication failed at VA 0x{current:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
+                                )));
+                            }
+                            current = current.saturating_add(PAGE_SIZE);
+                        }
+                        Ok::<(), TrapError>(())
+                    },
+                )
+        };
         if let Err(error) = publication {
-            {
-                let page_tables_authority = self.page_tables_authority();
-                let mut page_tables = page_tables_authority.lock();
-                if let Some(manager) = page_tables.as_mut() {
-                    let manager_base = manager.base();
+            let _ = self.page_tables_authority().edit(
+                || Err(()),
+                |editor| {
+                    let manager_base = editor.base();
                     let page_table_resolver = |base: u64| {
                         (base == manager_base)
                             .then_some(page_table_host)
@@ -38213,9 +38173,10 @@ impl HvfVmState {
                             })
                     };
                     // SAFETY: the COW quiesce and topology guards remain held.
-                    unsafe { manager.rollback_undo(page_table_resolver) };
-                }
-            }
+                    unsafe { editor.rollback_undo(page_table_resolver) };
+                    Ok::<(), ()>(())
+                },
+            );
             if let Err(flush_error) = flush_stage1() {
                 eprintln!("carrick: FATAL: retained reuse rollback TLBI failed: {flush_error}");
                 std::process::abort();
@@ -38227,13 +38188,13 @@ impl HvfVmState {
             return Err(error);
         }
         // Publication succeeded: the journalled pre-images are no longer needed.
-        {
-            let page_tables_authority = self.page_tables_authority();
-            let mut page_tables = page_tables_authority.lock();
-            if let Some(manager) = page_tables.as_mut() {
-                manager.commit_undo();
-            }
-        }
+        let _ = self.page_tables_authority().edit(
+            || Err(()),
+            |editor| {
+                editor.commit_undo();
+                Ok::<(), ()>(())
+            },
+        );
         if let Err(error) = flush_stage1() {
             eprintln!("carrick: FATAL: retained reuse stage-1 TLBI failed: {error}");
             std::process::abort();
@@ -38509,13 +38470,20 @@ impl HvfTaskState {
                 mapping_owner_generation
             };
 
-        if let Some(tables) = self.page_tables_authority().lock().as_mut() {
-            tables
-                .map_aliased(va, target_ipa, len as u64, true)
-                .map_err(|e| {
-                    TrapError::Hypervisor(format!("repoint shared leaf pt edit: {e:?}"))
-                })?;
-        }
+        self.page_tables_authority().edit(
+            || {
+                Err(TrapError::Hypervisor(
+                    "repoint shared leaf stage-1 tables are absent".to_owned(),
+                ))
+            },
+            |tables| {
+                tables
+                    .map_aliased(va, target_ipa, len as u64, true)
+                    .map_err(|e| {
+                        TrapError::Hypervisor(format!("repoint shared leaf pt edit: {e:?}"))
+                    })
+            },
+        )?;
 
         let shared_key_offset = shared_key_offset.saturating_add(semantic_offset);
         let sharing = GuestMappingSharing::GlobalShared;
@@ -38563,7 +38531,9 @@ impl HvfTaskState {
     /// address carrick `hv_vm_map`'d). `None` if unmapped. Used to disambiguate
     /// overlapping high-VA alias regions in `mapping_for_range[_mut]`.
     pub(crate) fn translate_va(&self, va: u64) -> Option<u64> {
-        self.page_tables_authority().lock().as_ref()?.translate(va)
+        self.page_tables_authority()
+            .with_manager(|manager| manager.translate(va))
+            .flatten()
     }
 
     fn live_stage1_names_writable_private_mapping(
@@ -38597,26 +38567,31 @@ impl HvfTaskState {
                 TrapError::Hypervisor("HVPatch winner PTE page-table backing is absent".to_owned())
             })?;
         let page_tables_authority = self.page_tables_authority();
-        let page_tables = page_tables_authority.lock();
-        let manager = page_tables.as_ref().ok_or_else(|| {
-            TrapError::Hypervisor("HVPatch winner PTE manager is absent".to_owned())
-        })?;
-        let shadow = manager.debug_walk(page_va);
-        let page_table_resolver = self.page_table_resolver(manager.base(), Some(page_table_host));
-        let live =
-            unsafe { manager.debug_walk_host(page_table_resolver, page_va) }.map_err(|e| {
-                TrapError::Hypervisor(format!("HVPatch winner PTE debug_walk_host failed: {e:?}"))
-            })?;
-        if shadow != live {
-            return Err(TrapError::Hypervisor(format!(
-                "HVPatch winner PTE shadow/live mismatch at VA 0x{page_va:x}: shadow={shadow:x?} live={live:x?}"
-            )));
-        }
-        let leaf = live[3];
-        Ok(leaf & VALID_PAGE == VALID_PAGE
-            && leaf & NON_GLOBAL != 0
-            && leaf & AP_MASK == AP_USER_RW
-            && leaf & PA_MASK_4KIB == expected_ipa & PA_MASK_4KIB)
+        page_tables_authority
+            .with_manager(|manager| -> Result<bool, TrapError> {
+                let shadow = manager.debug_walk(page_va);
+                let page_table_resolver =
+                    self.page_table_resolver(manager.base(), Some(page_table_host));
+                let live = unsafe { manager.debug_walk_host(page_table_resolver, page_va) }
+                    .map_err(|e| {
+                        TrapError::Hypervisor(format!(
+                            "HVPatch winner PTE debug_walk_host failed: {e:?}"
+                        ))
+                    })?;
+                if shadow != live {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch winner PTE shadow/live mismatch at VA 0x{page_va:x}: shadow={shadow:x?} live={live:x?}"
+                    )));
+                }
+                let leaf = live[3];
+                Ok(leaf & VALID_PAGE == VALID_PAGE
+                    && leaf & NON_GLOBAL != 0
+                    && leaf & AP_MASK == AP_USER_RW
+                    && leaf & PA_MASK_4KIB == expected_ipa & PA_MASK_4KIB)
+            })
+            .ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch winner PTE manager is absent".to_owned())
+            })?
     }
 
     fn perform_frame_cow(
@@ -38801,21 +38776,24 @@ impl HvfTaskState {
         );
         let retain_old_compound = {
             let page_tables_authority = self.page_tables_authority();
-            let page_tables = page_tables_authority.lock();
-            let manager = page_tables.as_ref().ok_or_else(|| {
-                carrick_observability::probes::stage1_arena_absent(
-                    1,
-                    std::sync::Arc::as_ptr(&page_tables_authority) as u64,
-                );
-                TrapError::Hypervisor("HVPatch COW page-table manager is absent".to_owned())
-            })?;
-            cow_source_has_retained_projection(
-                span,
-                old_ipa,
-                old_physical_ipa,
-                &retention_aliases,
-                |va| manager.translate_retained_output(va),
-            )
+            let retain = page_tables_authority.with_manager(|manager| {
+                cow_source_has_retained_projection(
+                    span,
+                    old_ipa,
+                    old_physical_ipa,
+                    &retention_aliases,
+                    |va| manager.translate_retained_output(va),
+                )
+            });
+            match retain {
+                Some(retain) => retain,
+                None => {
+                    page_tables_authority.emit_absent_probe(1);
+                    return Err(TrapError::Hypervisor(
+                        "HVPatch COW page-table manager is absent".to_owned(),
+                    ));
+                }
+            }
         };
         let CowInventorySplitShape {
             old_key: old_inventory_key,
@@ -39048,7 +39026,7 @@ impl HvfTaskState {
         // Journal this transaction's descriptor pre-images rather than
         // cloning the whole 1.75 MiB table region (see `begin_undo`).
         let mut preserved_protection_receipt = None;
-        let page_table_result = (|| {
+        let page_table_result = {
             const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
             const AP_MASK: u64 = 0b11 << 6;
             const AP_USER_RW: u64 = 0b01 << 6;
@@ -39056,146 +39034,146 @@ impl HvfTaskState {
             const TYPE_TABLE_OR_PAGE: u64 = 0b11;
             const NON_GLOBAL: u64 = 1 << 11;
             let page_tables_authority = self.page_tables_authority();
-            let mut page_tables = page_tables_authority.lock();
-            let manager = page_tables.as_mut().ok_or_else(|| {
-                carrick_observability::probes::stage1_arena_absent(
-                    2,
-                    std::sync::Arc::as_ptr(&page_tables_authority) as u64,
-                );
-                TrapError::Hypervisor("HVPatch COW page-table manager is absent".to_owned())
-            })?;
-            // The transaction can fail after one or more descriptors were
-            // written to both the manager shadow and live backing, so it needs
-            // a rollback log; the manager's `dirty` list is not one, because
-            // `sync_to_host` drains the NEW edits. `begin_undo` journals the
-            // pre-image of every descriptor this transaction writes.
-            manager.begin_undo();
-            // The leaf authentication below needs the AP bits each page held
-            // BEFORE this transaction, which it used to read by walking a full
-            // cloned pre-image. The span is a single 16 KiB compound, so
-            // capturing just those bits is exact and costs a handful of walks
-            // instead of a 1.75 MiB copy.
-            let mut pre_edit_ap: std::collections::BTreeMap<u64, u64> =
-                std::collections::BTreeMap::new();
-            {
-                let span_end = span.va.saturating_add(span.len as u64);
-                let mut probe_va = span.va & !(PAGE_SIZE - 1);
-                while probe_va < span_end {
-                    pre_edit_ap.insert(probe_va, manager.debug_walk(probe_va)[3] & AP_MASK);
-                    probe_va = probe_va.saturating_add(PAGE_SIZE);
-                }
-            }
-            HvfVmState::refresh_stage1_exclusivity(manager);
-            if span.kernel_only {
-                manager
-                    .map_kernel_aliased(span.va, new_ipa, span.len as u64)
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "publish kernel-only HVPatch COW stage-1 leaf: {error:?}"
+            page_tables_authority
+                .edit(
+                    || {
+                        page_tables_authority.emit_absent_probe(2);
+                        Err(TrapError::Hypervisor(
+                            "HVPatch COW page-table manager is absent".to_owned(),
                         ))
-                    })?;
-            } else {
-                manager
-                    .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "repoint HVPatch COW stage-1 compound: {error:?}"
-                        ))
-                    })?;
-                let span_end = span.va.saturating_add(span.len as u64);
-                let mut page_va = span.va & !(PAGE_SIZE - 1);
-                while page_va < span_end {
-                    if source_guest_writable && !self.protections.range_write_denied(page_va, 1) {
-                        manager
-                            .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
-                            .map_err(|error| {
+                    },
+                    |manager| -> Result<(), TrapError> {
+                        // The transaction can fail after one or more descriptors were
+                        // written to both the manager shadow and live backing, so it needs
+                        // a rollback log; the manager's `dirty` list is not one, because
+                        // `sync_to_host` drains the NEW edits. `begin_undo` journals the
+                        // pre-image of every descriptor this transaction writes.
+                        manager.begin_undo();
+                        // The leaf authentication below needs the AP bits each page held
+                        // BEFORE this transaction, which it used to read by walking a full
+                        // cloned pre-image. The span is a single 16 KiB compound, so
+                        // capturing just those bits is exact and costs a handful of walks
+                        // instead of a 1.75 MiB copy.
+                        let mut pre_edit_ap: std::collections::BTreeMap<u64, u64> =
+                            std::collections::BTreeMap::new();
+                        {
+                            let span_end = span.va.saturating_add(span.len as u64);
+                            let mut probe_va = span.va & !(PAGE_SIZE - 1);
+                            while probe_va < span_end {
+                                pre_edit_ap.insert(probe_va, manager.debug_walk(probe_va)[3] & AP_MASK);
+                                probe_va = probe_va.saturating_add(PAGE_SIZE);
+                            }
+                        }
+                        HvfVmState::refresh_stage1_exclusivity(manager.manager);
+                        if span.kernel_only {
+                            manager
+                                .map_kernel_aliased(span.va, new_ipa, span.len as u64)
+                                .map_err(|error| {
+                                    TrapError::Hypervisor(format!(
+                                        "publish kernel-only HVPatch COW stage-1 leaf: {error:?}"
+                                    ))
+                                })?;
+                        } else {
+                            manager
+                                .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
+                                .map_err(|error| {
+                                    TrapError::Hypervisor(format!(
+                                        "repoint HVPatch COW stage-1 compound: {error:?}"
+                                    ))
+                                })?;
+                            let span_end = span.va.saturating_add(span.len as u64);
+                            let mut page_va = span.va & !(PAGE_SIZE - 1);
+                            while page_va < span_end {
+                                if source_guest_writable && !self.protections.range_write_denied(page_va, 1) {
+                                    manager
+                                        .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
+                                        .map_err(|error| {
+                                            TrapError::Hypervisor(format!(
+                                                "grant HVPatch COW semantic page write: {error:?}"
+                                            ))
+                                        })?;
+                                }
+                                page_va = page_va.saturating_add(PAGE_SIZE);
+                            }
+                        }
+                        self.publish_stage1_extension_arenas(manager.manager)?;
+                        let page_table_resolver =
+                            self.page_table_resolver(manager.base(), Some(page_table_host));
+                        unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|e| {
+                            TrapError::Hypervisor(format!("HVPatch COW sync_to_host failed: {e:?}"))
+                        })?;
+
+                        // A semantic fork result is not structural proof.  Before the
+                        // stage-1 TLBI publishes this transaction, authenticate the exact
+                        // descriptors the hardware walker will consume: the manager shadow
+                        // and live backing must agree, every 4 KiB leaf in this 16 KiB COW
+                        // compound must name the new global frame IPA, and its AP bits must
+                        // match the EL1-only/user regime.  Fail closed while the old armed
+                        // leaf is still live on any mismatch.
+                        let span_end = span.va.saturating_add(span.len as u64);
+                        let mut page_va = span.va & !(PAGE_SIZE - 1);
+                        while page_va < span_end {
+                            let expected_ipa = new_ipa.checked_add(page_va - span.va).ok_or_else(|| {
+                                TrapError::Hypervisor("HVPatch COW leaf IPA overflow".to_owned())
+                            })?;
+                            let shadow = manager.debug_walk(page_va);
+                            let live = unsafe {
+                                manager.debug_walk_host(page_table_resolver, page_va)
+                            }
+                            .map_err(|e| {
                                 TrapError::Hypervisor(format!(
-                                    "grant HVPatch COW semantic page write: {error:?}"
+                                    "HVPatch COW debug_walk_host failed: {e:?}"
                                 ))
                             })?;
-                    }
-                    page_va = page_va.saturating_add(PAGE_SIZE);
-                }
-            }
-            self.publish_stage1_extension_arenas(manager)?;
-            let page_table_resolver =
-                self.page_table_resolver(manager.base(), Some(page_table_host));
-            unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|e| {
-                TrapError::Hypervisor(format!("HVPatch COW sync_to_host failed: {e:?}"))
-            })?;
-
-            // A semantic fork result is not structural proof.  Before the
-            // stage-1 TLBI publishes this transaction, authenticate the exact
-            // descriptors the hardware walker will consume: the manager shadow
-            // and live backing must agree, every 4 KiB leaf in this 16 KiB COW
-            // compound must name the new global frame IPA, and its AP bits must
-            // match the EL1-only/user regime.  Fail closed while the old armed
-            // range and inventory reservation are still intact.
-            let span_end = span.va.checked_add(span.len as u64).ok_or_else(|| {
-                TrapError::Hypervisor("HVPatch COW stage-1 span overflow".to_owned())
-            })?;
-            let mut page_va = span.va;
-            while page_va < span_end {
-                let shadow = manager.debug_walk(page_va);
-                let live = unsafe { manager.debug_walk_host(page_table_resolver, page_va) }
-                    .map_err(|e| {
-                        TrapError::Hypervisor(format!("HVPatch COW debug_walk_host failed: {e:?}"))
-                    })?;
-                if shadow != live {
-                    return Err(TrapError::Hypervisor(format!(
-                        "HVPatch COW stage-1 shadow/live mismatch at VA 0x{page_va:x}: shadow={shadow:x?} live={live:x?}"
-                    )));
-                }
-                let leaf = live[3];
-                let page_is_valid = leaf & VALID != 0;
-                let page_should_be_writable =
-                    source_guest_writable && !self.protections.range_write_denied(page_va, 1);
-                let expected_ap = if span.kernel_only {
-                    0
-                } else if page_should_be_writable {
-                    AP_USER_RW
-                } else {
-                    pre_edit_ap.get(&page_va).copied().ok_or_else(|| {
-                        TrapError::Hypervisor(format!(
-                            "HVPatch COW pre-edit AP bits are absent for VA 0x{page_va:x}"
-                        ))
-                    })?
-                };
-                let expected_ipa = new_ipa
-                    .checked_add(page_va.checked_sub(span.va).ok_or_else(|| {
-                        TrapError::Hypervisor("HVPatch COW page offset underflow".to_owned())
-                    })?)
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor("HVPatch COW leaf IPA overflow".to_owned())
-                    })?;
-                if leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
-                    || (page_is_valid
-                        && (leaf & 0b11 != TYPE_TABLE_OR_PAGE
-                            || leaf & AP_MASK != expected_ap
-                            || (!span.kernel_only && leaf & NON_GLOBAL == 0)))
-                {
-                    return Err(TrapError::Hypervisor(format!(
-                        "HVPatch COW stage-1 leaf authentication failed at VA 0x{page_va:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}"
-                    )));
-                }
-                if page_va == receipt_va && frame_cow_preserves_guest_protection(intent) {
-                    preserved_protection_receipt =
-                        Some((page_va, leaf, expected_ipa, leaf & AP_MASK));
-                } else if page_va == receipt_va {
-                    crate::probes::pt_alias_receipt(page_va, leaf, expected_ipa, expected_ap, 2);
-                }
-                // Reuse the durable descriptor-walk probe so a signed live
-                // capture can bind the COW receipt to the exact published PTE.
-                crate::probes::pt_alias_walk(page_va, live, 1 << 3);
-                page_va = page_va.saturating_add(PAGE_SIZE);
-            }
-            Ok::<(), TrapError>(())
-        })();
+                            if shadow != live {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "HVPatch COW shadow/live mismatch at VA 0x{page_va:x}"
+                                )));
+                            }
+                            let leaf = live[3];
+                            let page_is_valid = leaf & VALID != 0;
+                            let expected_ap = if span.kernel_only {
+                                0
+                            } else if source_guest_writable
+                                && !self.protections.range_write_denied(page_va, 1)
+                            {
+                                AP_USER_RW
+                            } else {
+                                pre_edit_ap.get(&page_va).copied().ok_or_else(|| {
+                                    TrapError::Hypervisor(format!(
+                                        "HVPatch COW pre-edit AP bits are absent for VA 0x{page_va:x}"
+                                    ))
+                                })?
+                            };
+                            if leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
+                                || (page_is_valid
+                                    && (leaf & 0b11 != TYPE_TABLE_OR_PAGE
+                                        || leaf & AP_MASK != expected_ap
+                                        || (!span.kernel_only && leaf & NON_GLOBAL == 0)))
+                            {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "HVPatch COW stage-1 leaf authentication failed at VA 0x{page_va:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}"
+                                )));
+                            }
+                            if page_va == receipt_va && frame_cow_preserves_guest_protection(intent) {
+                                preserved_protection_receipt =
+                                    Some((page_va, leaf, expected_ipa, leaf & AP_MASK));
+                            } else if page_va == receipt_va {
+                                crate::probes::pt_alias_receipt(page_va, leaf, expected_ipa, expected_ap, 2);
+                            }
+                            // Reuse the durable descriptor-walk probe so a signed live
+                            // capture can bind the COW receipt to the exact published PTE.
+                            crate::probes::pt_alias_walk(page_va, live, 1 << 3);
+                            page_va = page_va.saturating_add(PAGE_SIZE);
+                        }
+                        Ok(())
+                    },
+                )
+        };
         if let Err(error) = page_table_result {
-            {
-                let page_tables_authority = self.page_tables_authority();
-                let mut page_tables = page_tables_authority.lock();
-                if let Some(manager) = page_tables.as_mut() {
+            let _ = self.page_tables_authority().edit(
+                || Err(()),
+                |manager| {
                     let manager_base = manager.base();
                     let page_table_resolver = |base: u64| {
                         (base == manager_base)
@@ -39211,8 +39189,9 @@ impl HvfTaskState {
                     // no vCPU can walk or edit this mm while the journalled
                     // pre-images are replayed into its live backing.
                     unsafe { manager.rollback_undo(page_table_resolver) };
-                }
-            }
+                    Ok::<(), ()>(())
+                },
+            );
             if let Err(flush_error) = flush_stage1() {
                 eprintln!(
                     "carrick: FATAL: HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
@@ -39227,13 +39206,13 @@ impl HvfTaskState {
             return Err(error);
         }
         // Publication succeeded: the journalled pre-images are no longer needed.
-        {
-            let page_tables_authority = self.page_tables_authority();
-            let mut page_tables = page_tables_authority.lock();
-            if let Some(manager) = page_tables.as_mut() {
+        let _ = self.page_tables_authority().edit(
+            || Err(()),
+            |manager| {
                 manager.commit_undo();
-            }
-        }
+                Ok::<(), ()>(())
+            },
+        );
         if let Err(error) = flush_stage1() {
             eprintln!("carrick: FATAL: HVPatch COW stage-1 TLBI failed: {error}");
             std::process::abort();
@@ -39699,9 +39678,8 @@ impl HvfVmState {
                 {
                     match self
                         .page_tables_authority()
-                        .lock()
-                        .as_ref()
-                        .and_then(|manager| manager.translate_retained_output(current))
+                        .with_manager(|manager| manager.translate_retained_output(current))
+                        .flatten()
                     {
                         Some(ipa) => {
                             // The retired-reuse materializer serves UNMAPPED
@@ -39929,73 +39907,82 @@ impl HvfVmState {
         };
 
         let page_tables_authority = self.page_tables_authority();
-        let page_tables = page_tables_authority.lock();
-        let manager = page_tables.as_ref().ok_or_else(|| {
-            TrapError::Hypervisor("deferred COW protection has no page-table manager".to_owned())
-        })?;
-        let page_table_resolver = self.page_table_resolver(manager.base(), Some(page_table_host));
-        let mut authenticated = Vec::with_capacity(pending.len());
-        for receipt in pending {
-            let receipt_end = receipt.va.checked_add(receipt.len as u64).ok_or_else(|| {
-                TrapError::Hypervisor("deferred COW receipt range overflow".to_owned())
-            })?;
-            let overlap_start = receipt.va.max(va);
-            let overlap_end = receipt_end.min(end);
-            if !overlap_start.is_multiple_of(PAGE_SIZE) || !overlap_end.is_multiple_of(PAGE_SIZE) {
-                return Err(TrapError::Hypervisor(format!(
-                    "deferred COW receipt/protection is not page aligned: receipt=0x{:x}..0x{receipt_end:x} protection=0x{va:x}..0x{end:x}",
-                    receipt.va
-                )));
-            }
-            let mut page = overlap_start;
-            let mut first_leaf = None;
-            while page < overlap_end {
-                let expected_ipa = receipt
-                    .expected_ipa
-                    .checked_add(page - receipt.va)
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor("deferred COW receipt IPA range overflow".to_owned())
+        let authenticated = page_tables_authority
+            .with_manager(|manager| -> Result<Vec<PendingFrameCowPublication>, TrapError> {
+                let page_table_resolver =
+                    self.page_table_resolver(manager.base(), Some(page_table_host));
+                let mut authenticated = Vec::with_capacity(pending.len());
+                for receipt in pending {
+                    let receipt_end = receipt.va.checked_add(receipt.len as u64).ok_or_else(|| {
+                        TrapError::Hypervisor("deferred COW receipt range overflow".to_owned())
                     })?;
-                let shadow = manager.debug_walk(page);
-                let live =
-                    unsafe { manager.debug_walk_host(page_table_resolver, page) }.map_err(|e| {
-                        TrapError::Hypervisor(format!("deferred COW debug_walk_host failed: {e:?}"))
-                    })?;
-                let leaf = carrick_mem::page_table::terminal_descriptor(live);
-                let translated = if must_be_valid {
-                    manager.translate(page)
-                } else {
-                    manager.translate_retained_output(page)
-                };
-                let expected_ap = if armed_covers(page) {
-                    AP_USER_RO
-                } else {
-                    expected_ap
-                };
-                if shadow != live
-                    || !deferred_cow_leaf_authenticates(
-                        leaf,
-                        translated,
-                        expected_ipa,
-                        expected_ap,
-                        must_be_valid,
-                        prot_flags.contains(carrick_abi::LinuxProtFlags::EXEC),
-                    )
-                {
-                    return Err(TrapError::Hypervisor(format!(
-                        "deferred COW protection authentication failed at VA 0x{page:x}: leaf=0x{leaf:x} translated={translated:x?} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x} valid={must_be_valid} receipt=0x{:x}+0x{:x}",
-                        receipt.va, receipt.len
-                    )));
+                    let overlap_start = receipt.va.max(va);
+                    let overlap_end = receipt_end.min(end);
+                    if !overlap_start.is_multiple_of(PAGE_SIZE)
+                        || !overlap_end.is_multiple_of(PAGE_SIZE)
+                    {
+                        return Err(TrapError::Hypervisor(format!(
+                            "deferred COW receipt/protection is not page aligned: receipt=0x{:x}..0x{receipt_end:x} protection=0x{va:x}..0x{end:x}",
+                            receipt.va
+                        )));
+                    }
+                    let mut page = overlap_start;
+                    let mut first_leaf = None;
+                    while page < overlap_end {
+                        let expected_ipa = receipt
+                            .expected_ipa
+                            .checked_add(page - receipt.va)
+                            .ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "deferred COW receipt IPA range overflow".to_owned(),
+                                )
+                            })?;
+                        let shadow = manager.debug_walk(page);
+                        let live = unsafe { manager.debug_walk_host(page_table_resolver, page) }
+                            .map_err(|e| {
+                                TrapError::Hypervisor(format!(
+                                    "deferred COW debug_walk_host failed: {e:?}"
+                                ))
+                            })?;
+                        let leaf = carrick_mem::page_table::terminal_descriptor(live);
+                        let translated = if must_be_valid {
+                            manager.translate(page)
+                        } else {
+                            manager.translate_retained_output(page)
+                        };
+                        let expected_ap = if armed_covers(page) {
+                            AP_USER_RO
+                        } else {
+                            expected_ap
+                        };
+                        if shadow != live
+                            || !deferred_cow_leaf_authenticates(
+                                leaf,
+                                translated,
+                                expected_ipa,
+                                expected_ap,
+                                must_be_valid,
+                                prot_flags.contains(carrick_abi::LinuxProtFlags::EXEC),
+                            )
+                        {
+                            return Err(TrapError::Hypervisor(format!(
+                                "deferred COW protection authentication failed at VA 0x{page:x}: leaf=0x{leaf:x} translated={translated:x?} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x} valid={must_be_valid} receipt=0x{:x}+0x{:x}",
+                                receipt.va, receipt.len
+                            )));
+                        }
+                        first_leaf.get_or_insert((page, leaf, expected_ipa));
+                        page = page.saturating_add(PAGE_SIZE);
+                    }
+                    if let Some((page, leaf, expected_ipa)) = first_leaf {
+                        crate::probes::pt_alias_receipt(page, leaf, expected_ipa, expected_ap, phase);
+                    }
+                    authenticated.push(receipt);
                 }
-                first_leaf.get_or_insert((page, leaf, expected_ipa));
-                page = page.saturating_add(PAGE_SIZE);
-            }
-            if let Some((page, leaf, expected_ipa)) = first_leaf {
-                crate::probes::pt_alias_receipt(page, leaf, expected_ipa, expected_ap, phase);
-            }
-            authenticated.push(receipt);
-        }
-        drop(page_tables);
+                Ok(authenticated)
+            })
+            .ok_or_else(|| {
+                TrapError::Hypervisor("deferred COW protection has no page-table manager".to_owned())
+            })??;
 
         let mut receipts = self.cow_deferred_publications.lock();
         let mut remaining = Vec::with_capacity(receipts.len());
@@ -41063,9 +41050,8 @@ impl HvfVmState {
             // physical fragment independently.
             let retained_ipa = self
                 .page_tables_authority()
-                .lock()
-                .as_ref()
-                .and_then(|manager| manager.translate_retained_output(chunk_va));
+                .with_manager(|manager| manager.translate_retained_output(chunk_va))
+                .flatten();
             // A partial munmap can carve this 4 KiB Linux page out of a live
             // 16 KiB private frame while preserving the invalid leaf's output
             // IPA. Reusing that page does not pass through `add_alias`, so
@@ -42956,9 +42942,7 @@ impl HvfTaskState {
         let projection_ranges = std::sync::Arc::clone(request.projection_plan());
         let parent_extension_bases = self
             .page_tables_authority()
-            .lock()
-            .as_ref()
-            .map(|pt| pt.extension_arena_bases())
+            .with_manager(|pt| pt.extension_arena_bases())
             .unwrap_or_default();
         for index in order {
             let mapping = &source_mappings[index];
@@ -43059,9 +43043,7 @@ impl HvfTaskState {
                     let expected_ipa = mapping.physical_ipa + frame_offset;
                     let walk = self
                         .page_tables_authority()
-                        .lock()
-                        .as_ref()
-                        .map(|manager| manager.debug_walk(debug_va));
+                        .with_manager(|manager| manager.debug_walk(debug_va));
                     if let Some(w) = walk {
                         let leaf_pa = w[3] & 0x0000_FFFF_FFFF_F000;
                         eprintln!(
@@ -43376,6 +43358,7 @@ impl HvfTaskState {
                     mapping.start,
                     ipa,
                     mapping.end.saturating_sub(mapping.start),
+                    None,
                 )
             } else {
                 page_tables.map_aliased(
@@ -43383,6 +43366,7 @@ impl HvfTaskState {
                     ipa,
                     mapping.end.saturating_sub(mapping.start),
                     mapping.guest_writable,
+                    None,
                 )
             };
             mapped.map_err(|error| {
@@ -43392,7 +43376,7 @@ impl HvfTaskState {
                 // refused permission to sweep.
                 let (in_use, free, capacity, arenas) = page_tables.pool_stats();
                 let (multi_vcpu, exclusive, reclaim_pending) = page_tables.coalesce_policy();
-                let source = page_tables.has_arena_source();
+                let source = self.page_tables_authority().has_source();
                 TrapError::Hypervisor(format!(
                     "map hvpatch child VA 0x{:x} to global/root-slot IPA 0x{ipa:x}: {error:?} \
                      (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
@@ -44441,7 +44425,7 @@ impl HvfVmState {
             })?;
         let process_transaction = process_reservation.transaction();
         let mm_access = MmAccessState::new(
-            std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             plan.protections,
             plan.frame_inventory,
             plan.cow_armed,
@@ -45143,7 +45127,7 @@ impl HvfVmState {
         let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
         let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         self.mm_access = MmAccessState::new(
-            std::sync::Arc::new(parking_lot::Mutex::new(exec_page_tables)),
+            carrick_aarch64::Stage1Authority::new_with_manager(exec_page_tables),
             protections,
             self.frame_inventory.shared_ledger(),
             cow_armed,
@@ -48165,7 +48149,7 @@ mod frame_inventory_backend_tests {
         );
 
         let access = MmAccessState::new(
-            std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            carrick_aarch64::Stage1Authority::new(),
             std::sync::Arc::new(MemoryProtections::default()),
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
@@ -49223,7 +49207,7 @@ mod frame_inventory_backend_tests {
         );
         assert!(
             !manager
-                .set_readonly(0x20_4000, 0x4000, false)
+                .set_readonly(0x20_4000, 0x4000, false, None)
                 .unwrap()
                 .changed,
             "root exec must preserve the ELF read-only span"
@@ -52316,22 +52300,24 @@ mod frame_inventory_backend_tests {
         let owner = HvfTaskState::neutral();
         let sibling_mm_access = std::sync::Arc::clone(&owner.mm_access);
         let before = std::sync::Arc::as_ptr(&owner.mm_access);
-        let page_tables = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let page_tables = carrick_aarch64::Stage1Authority::new();
 
         owner
             .mm_access
-            .bind_page_tables_authority(std::sync::Arc::clone(&page_tables));
+            .bind_page_tables_authority(page_tables.clone());
 
         assert_eq!(std::sync::Arc::as_ptr(&owner.mm_access), before);
         assert!(std::sync::Arc::ptr_eq(&owner.mm_access, &sibling_mm_access));
-        assert!(std::sync::Arc::ptr_eq(
-            &owner.page_tables_authority(),
-            &page_tables
-        ));
-        assert!(std::sync::Arc::ptr_eq(
-            &sibling_mm_access.page_tables_authority(),
-            &page_tables
-        ));
+        assert!(
+            owner
+                .page_tables_authority()
+                .shares_exact_authority(&page_tables)
+        );
+        assert!(
+            sibling_mm_access
+                .page_tables_authority()
+                .shares_exact_authority(&page_tables)
+        );
         assert!(owner.runtime_authorities_match(
             &sibling_mm_access,
             &page_tables,
@@ -52339,7 +52325,7 @@ mod frame_inventory_backend_tests {
         ));
 
         let distinct_state = MmAccessState::new(
-            std::sync::Arc::clone(&page_tables),
+            page_tables.clone(),
             std::sync::Arc::clone(&owner.protections),
             owner.frame_inventory.shared_ledger(),
             std::sync::Arc::clone(&owner.cow_armed),
@@ -52351,6 +52337,30 @@ mod frame_inventory_backend_tests {
         );
     }
 
+    #[test]
+    fn bind_page_tables_authority_migrates_live_manager_when_new_authority_empty() {
+        let owner = HvfTaskState::neutral();
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let manager = crate::page_table::PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        let old_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
+        owner
+            .mm_access
+            .bind_page_tables_authority(old_authority.clone());
+        drop(old_authority);
+
+        let new_authority = carrick_aarch64::Stage1Authority::new();
+        owner
+            .mm_access
+            .bind_page_tables_authority(new_authority.clone());
+
+        assert!(
+            new_authority.is_present(),
+            "live manager must be migrated into empty new authority"
+        );
+    }
     #[derive(Debug)]
     struct BindTestArenaSource(carrick_mem::page_table::TableArenaSourceId);
 
@@ -52365,36 +52375,81 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
-    fn bind_page_tables_authority_preserves_shared_previous_authority() {
+    fn bind_page_tables_authority_adopts_extension_state_when_both_present() {
         let owner = HvfTaskState::neutral();
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let mut old_mgr = crate::page_table::PageTableManager::new(
+        let old_mgr = crate::page_table::PageTableManager::new(
             bytes.clone(),
             carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
         );
         let stage1_root = carrick_guest_mem::Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
         let source = BindTestArenaSource(carrick_mem::page_table::TableArenaSourceId(stage1_root));
-        old_mgr.set_arena_source(Box::new(source)).unwrap();
-
-        let shared_authority = std::sync::Arc::new(parking_lot::Mutex::new(Some(old_mgr)));
-        let parent_clone = std::sync::Arc::clone(&shared_authority);
+        let old_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(old_mgr));
+        old_authority.install_source(Box::new(source)).unwrap();
+        assert!(old_authority.has_source());
 
         owner
             .mm_access
-            .bind_page_tables_authority(std::sync::Arc::clone(&shared_authority));
+            .bind_page_tables_authority(old_authority.clone());
+        drop(old_authority);
 
-        let new_authority = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let new_mgr = crate::page_table::PageTableManager::new(
+            bytes,
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        let new_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(new_mgr));
+        assert!(!new_authority.has_source());
+
         owner
             .mm_access
-            .bind_page_tables_authority(std::sync::Arc::clone(&new_authority));
+            .bind_page_tables_authority(new_authority.clone());
 
-        let parent_guard = parent_clone.lock();
-        let parent_mgr = parent_guard
-            .as_ref()
-            .expect("parent manager must not be stolen");
         assert!(
-            parent_mgr.has_arena_source(),
+            new_authority.has_source(),
+            "new manager must have adopted the arena source"
+        );
+    }
+
+    #[test]
+    fn bind_page_tables_authority_preserves_shared_previous_authority() {
+        let owner = HvfTaskState::neutral();
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let old_mgr = crate::page_table::PageTableManager::new(
+            bytes.clone(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        let stage1_root = carrick_guest_mem::Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let source = BindTestArenaSource(carrick_mem::page_table::TableArenaSourceId(stage1_root));
+        let shared_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(old_mgr));
+        shared_authority.install_source(Box::new(source)).unwrap();
+        shared_authority.share_with_vfork_child();
+
+        let parent_clone = shared_authority.clone();
+
+        owner
+            .mm_access
+            .bind_page_tables_authority(shared_authority.clone());
+
+        let new_authority = carrick_aarch64::Stage1Authority::new();
+        owner
+            .mm_access
+            .bind_page_tables_authority(new_authority.clone());
+
+        assert!(
+            parent_clone.has_source(),
             "parent manager must retain its arena source"
+        );
+        assert!(
+            parent_clone.is_present(),
+            "parent manager must not be stolen"
+        );
+        assert!(
+            !new_authority.has_source(),
+            "new authority must not adopt arena source from shared predecessor"
+        );
+        assert!(
+            new_authority.is_none(),
+            "new authority must not adopt manager from shared predecessor"
         );
     }
 
@@ -53317,10 +53372,10 @@ mod memory_protection_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         page_tables
-            .set_rw(va, 0x1000, false)
+            .set_rw(va, 0x1000, false, None)
             .expect("publish writable leaf");
         page_tables
-            .set_prot_none(va, 0x1000)
+            .set_prot_none(va, 0x1000, None)
             .expect("invalidate leaf while retaining its output and attributes");
 
         let leaf = carrick_mem::page_table::terminal_descriptor(page_tables.debug_walk(va));
@@ -53352,7 +53407,7 @@ mod memory_protection_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
         );
         page_tables
-            .set_rw(va, 0x1000, false)
+            .set_rw(va, 0x1000, false, None)
             .expect("publish writable non-executable leaf");
 
         let leaf = carrick_mem::page_table::terminal_descriptor(page_tables.debug_walk(va));
@@ -54448,7 +54503,7 @@ mod tag_strip_tests {
             carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
         );
         tables
-            .map_aliased(va, ipa, 0x20_000, true)
+            .map_aliased(va, ipa, 0x20_000, true, None)
             .expect("rebase merged writable load region");
 
         reapply_global_exec_readonly_spans(
@@ -54464,21 +54519,21 @@ mod tag_strip_tests {
         assert_eq!(tables.translate(va + 0x4000), Some(ipa + 0x4000));
         assert!(
             !tables
-                .set_readonly(va + 0x4000, 0x1000, false)
+                .set_readonly(va + 0x4000, 0x1000, false, None)
                 .expect("span is already read-only")
                 .changed,
             "reapplying the same read-only protection must be a no-op"
         );
         assert!(
             !tables
-                .set_rw(va + 0x3000, 0x1000, true)
+                .set_rw(va + 0x3000, 0x1000, true, None)
                 .expect("prefix remains writable")
                 .changed,
             "the page before the span must retain the merged mapping's RWX attributes"
         );
         assert!(
             !tables
-                .set_rw(va + 0x6000, 0x1000, true)
+                .set_rw(va + 0x6000, 0x1000, true, None)
                 .expect("suffix remains writable")
                 .changed,
             "the page after the span must retain the merged mapping's RWX attributes"
