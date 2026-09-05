@@ -631,19 +631,9 @@ pub const OUT_OF_PROCESS_PROBES: &[&str] = &["execfromthread", "vforkexecthread"
 /// Complete arm64 baseline mismatch inventory. Every shard derives its local
 /// subset from these global lists so adding a probe cannot silently orphan a
 /// known gap when the deterministic modulo partition moves.
-pub const MUSL_BASELINE_GAPS: &[&str] = &[
-    // Stage-1 extension table arenas have no stage-2 backing (guest exit 139;
-    // cpython-compile test_compiler_recursion_limit). Red on purpose until the
-    // pt-backing fix lands.
-    "pagetablegrow",
-];
+pub const MUSL_BASELINE_GAPS: &[&str] = &[];
 
-pub const GNU_BASELINE_GAPS: &[&str] = &[
-    // Stage-1 extension table arenas have no stage-2 backing (guest exit 139;
-    // cpython-compile test_compiler_recursion_limit). Red on purpose until the
-    // pt-backing fix lands.
-    "pagetablegrow",
-];
+pub const GNU_BASELINE_GAPS: &[&str] = &[];
 
 pub fn needs_live_oracle(probe: &str) -> bool {
     LIVE_ORACLE_PROBES.contains(&probe)
