@@ -836,3 +836,37 @@ branch: shards 0 and 1 green, shard 2 green except the not-yet-built
 remaining failure is the main-stack growth segfault tracked by
 `stackgrowmain`. Cost of the growth path on the hot mmap loop is not yet
 measured on a quiet host; it is the next A/B once the host is idle.
+
+## 2026-09-05: page-table growth has no stage-2 backing (cpython-compile crash root cause)
+
+`cpython-compile`'s `test_compiler_recursion_limit` was NOT stack growth
+(`stackgrowmain` MATCHes; isolated compiles raise RecursionError at every
+depth). Under regrtest it hits
+
+    mmap refused: ... sparse HVPatch mmap publication failed at VA 0x602e600000: leaf=0x0 expected_ipa=0x9b86200000
+
+and in the full suite it segfaults. Attribution, read from the code:
+
+- `Stage1MmTableArenaSource::take_arena` hands the `PageTableManager` a free
+  2 MiB root-slot IPA and nothing else. The primary arena is an
+  `HvfMappedRegion` with a structural owner published by the exec path; an
+  extension arena has no host allocation, no `hv_vm_map`, no mapping row.
+- Every `page_table_resolver` in `trap.rs` resolves the extension base through
+  `host_ptr`, which finds no mapping. `PageTableManager::sync_to_host`
+  silently skips dirty words whose arena does not resolve, so the descriptors
+  never reach the guest: either the walker takes a stage-2 abort (guest
+  SIGSEGV) or the shadow-vs-live check refuses the mmap (ENOMEM).
+- No probe forced growth past 448 tables, so the shard gate was green.
+
+Red-first probe `pagetablegrow` (3000 scattered 4 KiB `MAP_FIXED` pages at
+2 MiB strides): exits 139 with no output on main `41296092b`. Cross-compiled
+locally (`cargo build --target aarch64-unknown-linux-musl` works without Docker
+for libc-only probes). Worker `pt-backing` (worktree `agy-pt-backing-sep05`,
+brief `scratchpad/brief-pt-backing.md`) is publishing extension arenas with the
+root slot's backing shape, failing `sync_to_host` closed on an unresolved arena,
+and covering fork rebase and exec release.
+
+Also landed: foreign-mm zero-fill for non-resident readable pages (`213ddbcf6`,
+`processvmsparse` MATCH both lanes). LTP `process_vm_readv03` still TBROKs
+(131072 requested, 18368 returned) — a further short-read class to attribute on
+the rebuilt main.
