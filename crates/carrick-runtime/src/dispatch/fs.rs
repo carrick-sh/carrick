@@ -2725,12 +2725,13 @@ impl SyscallDispatcher {
             }
         }
 
-        // FIFO (named pipe): open the REAL host FIFO in NON-BLOCKING mode and
-        // model it as a HostPipe. A blocking host open of a writer-less
-        // O_RDONLY FIFO would wedge the single dispatcher thread; opening
-        // O_NONBLOCK returns immediately and the guest's blocking read/write
-        // then parks on the kqueue WaitOnFds path (with the dispatcher lock
-        // released). An O_RDWR FIFO is bidirectional (e.g. LTP select01).
+        // FIFO (named pipe): Linux named FIFO open handshake.
+        // A blocking open waits for peer presence (O_RDONLY waits for a writer,
+        // O_WRONLY waits for a reader; O_RDWR never blocks).
+        // Blocking is handled by parking on the level-triggered presence pipes in
+        // fifo_beacon via WaitOnFds with the dispatcher lock released, and
+        // re-dispatching openat on readiness. Signal interruption yields EINTR
+        // or restarts under SA_RESTART.
         if self.fs.rootfs_vfs.overlay.may_have_fifo_nodes()
             && let Ok(md) = self.layered_metadata(&path)
             && md.kind == RootFsEntryKind::Fifo
@@ -2741,30 +2742,78 @@ impl SyscallDispatcher {
             }
             // Linux O_ACCMODE is 0=RDONLY, 1=WRONLY, 2=RDWR.
             let access_idx = (access & LINUX_O_ACCMODE) as u32;
-            let mut host_fd_opt = self
+            let is_nonblock = open_flags.contains(LinuxOpenFlags::NONBLOCK);
+
+            let id = self.fs.rootfs_vfs.overlay.fifo_identity(&path);
+            let Some(id) = id else {
+                return Ok(DispatchOutcome::errno(linux_errno::ENXIO));
+            };
+
+            let host_fd_opt = self
                 .fs
                 .rootfs_vfs
                 .overlay
                 .open_fifo_nonblock(&path, access_idx);
-            if host_fd_opt.is_none() && !open_flags.contains(LinuxOpenFlags::NONBLOCK) {
-                // A blocking open (most commonly O_WRONLY waiting for a reader).
-                // Wait briefly in a retry loop until the reader appears or timeout.
-                for _ in 0..500 {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    host_fd_opt = self
-                        .fs
-                        .rootfs_vfs
-                        .overlay
-                        .open_fifo_nonblock(&path, access_idx);
-                    if host_fd_opt.is_some() {
-                        break;
-                    }
+
+            // Determine if this open must block waiting for a peer:
+            // - O_RDWR (access_idx == 2) never blocks.
+            // - O_NONBLOCK never blocks (O_RDONLY succeeds, O_WRONLY without reader -> ENXIO).
+            // - O_RDONLY (access_idx == 0) blocks if no writer is currently present.
+            // - O_WRONLY (access_idx == 1) blocks if host open failed (no reader on host).
+            if !is_nonblock && access_idx == 0 {
+                // Blocking reader: host nonblocking open succeeded (host_fd_opt is Some),
+                // but Linux requires waiting until at least one writer is present.
+                let Some(host_fd) = host_fd_opt else {
+                    return Ok(DispatchOutcome::errno(linux_errno::ENXIO));
+                };
+                if !crate::dispatch::fifo_beacon::is_writer_present(id) {
+                    // Register the opened host read fd as a parked reader:
+                    // 1. Keeps the host read fd open across the park so macOS counts it
+                    //    and any concurrent O_WRONLY open succeeds on host.
+                    // 2. Asserts readers_present in fifo_beacon so writers wake.
+                    crate::dispatch::net::set_host_nonblocking(host_fd);
+                    let writers_present_read_fd =
+                        crate::dispatch::fifo_beacon::writers_present_read_fd(id)
+                            .ok_or(linux_errno::EIO)?;
+                    let token =
+                        crate::dispatch::fifo_beacon::ParkedOpenerToken::new_reader(host_fd, id);
+                    // When the wait finishes or is interrupted, the WaitFdGuard drops the token,
+                    // unregistering the parked reader from fifo_beacon and closing host_fd.
+                    // On readiness, the runtime re-dispatches openat from scratch and re-opens
+                    // the host FIFO.
+                    return Ok(DispatchOutcome::WaitOnFds {
+                        fds: WaitFds::anchored_parked_opener(
+                            writers_present_read_fd,
+                            libc::POLLIN,
+                            token,
+                        ),
+                        timeout: None,
+                        on_timeout: 0,
+                        sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
+                    });
                 }
+            } else if !is_nonblock && access_idx == 1 && host_fd_opt.is_none() {
+                // Blocking writer without reader on host: park until a reader arrives.
+                let (readers_present_read_fd, token) =
+                    crate::dispatch::fifo_beacon::ParkedOpenerToken::new_writer(id)
+                        .ok_or(linux_errno::EIO)?;
+                return Ok(DispatchOutcome::WaitOnFds {
+                    fds: WaitFds::anchored_parked_opener(
+                        readers_present_read_fd,
+                        libc::POLLIN,
+                        token,
+                    ),
+                    timeout: None,
+                    on_timeout: 0,
+                    sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
+                });
             }
+
             match host_fd_opt {
                 Some(host_fd) => {
                     // Track this FIFO end for kernel-backed writer-close EOF
-                    // readiness (macOS won't report it — see dispatch::fifo_beacon).
+                    // readiness (macOS won't report it — see dispatch::fifo_beacon)
+                    // and peer presence.
                     crate::dispatch::fifo_beacon::register_open(host_fd, access_idx);
                     crate::dispatch::net::set_host_nonblocking(host_fd);
                     let description = OpenDescription::HostPipe {

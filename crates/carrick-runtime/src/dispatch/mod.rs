@@ -791,7 +791,10 @@ pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
 use fd_table::*;
 
 #[derive(Debug, Clone)]
-pub struct WaitFdGuard(#[allow(dead_code)] HostFdRef);
+pub(crate) enum WaitFdGuard {
+    HostFd(#[allow(dead_code)] HostFdRef),
+    ParkedOpener(#[allow(dead_code)] crate::dispatch::fifo_beacon::ParkedOpenerToken),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InternalWaitKind {
@@ -892,10 +895,22 @@ impl WaitFds {
         match owner {
             Some(owner) => Self {
                 fds: vec![crate::io_wait::WaitFd::anchored(fd, events)],
-                guards: vec![WaitFdGuard(owner)],
+                guards: vec![WaitFdGuard::HostFd(owner)],
                 authority: WaitFdAuthority::Missing,
             },
             None => Self::raw_one(fd, events),
+        }
+    }
+
+    pub(in crate::dispatch) fn anchored_parked_opener(
+        fd: i32,
+        events: i16,
+        token: crate::dispatch::fifo_beacon::ParkedOpenerToken,
+    ) -> Self {
+        Self {
+            fds: vec![crate::io_wait::WaitFd::anchored(fd, events)],
+            guards: vec![WaitFdGuard::ParkedOpener(token)],
+            authority: WaitFdAuthority::Missing,
         }
     }
 
@@ -3500,6 +3515,7 @@ impl Drop for AutoCloseFd {
 
 fn write_all_host_fd(fd: i32, mut bytes: &[u8]) -> Result<(), crate::linux_abi::LinuxErrno> {
     while !bytes.is_empty() {
+        // BLOCKING-IO-OK: core dump publication writes to an unshared temporary host file
         let rc = unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
