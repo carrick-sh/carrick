@@ -13267,7 +13267,10 @@ impl SyscallDispatcher {
             } else {
                 0
             };
-            Ok(this.install_fd(description, fd_flags))
+            // `install_fd` builds the description common state with empty
+            // status flags; the FAN_NONBLOCK mirror must reach
+            // `common().status_flags()`, which is what `read` consults.
+            Ok(this.install_fd_with_status_flags(description, status_flags, fd_flags))
         }
 
         fn fanotify_mark(this, cx, fanotify_fd: Fd, flags: u64, mask: u64, dirfd: Fd, pathname: GuestPtr) {
