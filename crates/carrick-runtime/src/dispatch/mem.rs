@@ -4850,7 +4850,6 @@ impl SyscallDispatcher {
             let file_lowering_eligible = map_sharing == MmapSharing::Private
                 && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && !map_flags.contains(LinuxMmapFlags::GROWSDOWN)
-                && !prot_flags.contains(LinuxProtFlags::EXEC)
                 && mmap_file_backed_lowering_enabled()
                 && this.open_file(fd.0).is_some_and(|open_file| {
                     open_file
@@ -4905,8 +4904,8 @@ impl SyscallDispatcher {
             // snapshot path below, each exclusion for a named reason:
             //   * Private only (a Shared mapping's stores must reach the file);
             //   * no GROWSDOWN (stack-shaped file maps stay on the audited path);
-            //   * no PROT_EXEC request (executable content must flow through
-            //     the write path's W^X/translation-invalidation metadata);
+            //   * PROT_EXEC admitted (stage-2 is RWX on the frame and stage-1
+            //     carries the guest UXN/AP permission, cleared on protect_range);
             //   * `OpenDescription::HostFile` only (in-memory VFS contents
             //     have no host object to map; chardevs keep their zero-fill);
             //   * a non-alias VA (alias IPAs publish via `MapHostAlias`, whose
