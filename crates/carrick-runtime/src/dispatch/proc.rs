@@ -4917,25 +4917,25 @@ impl SyscallDispatcher {
                         if ri >= remote.len() || li >= local.len() {
                             break;
                         }
+                        // Transaction granularity is the REMOTE side only: one
+                        // foreign read per remote page (or chunk), scattered
+                        // into however many local iovecs it covers. Cutting the
+                        // read at every local iovec boundary made a 1 KiB read
+                        // into 1024 snapshot+transport round trips for LTP
+                        // process_vm_readv03's one-byte local iovecs, and each
+                        // round trip carries a wall-clock deadline that a loaded
+                        // host turns into a short read.
                         let rem_remote = remote[ri].iov_len - ro;
-                        let rem_local = local[li].iov_len - lo;
-
                         let remote_va_raw = match remote[ri].iov_base.checked_add(ro) {
                             Some(va) => va,
                             None => break,
                         };
-                        let local_va_raw = match local[li].iov_base.checked_add(lo) {
-                            Some(va) => va,
-                            None => break,
-                        };
-
                         let page_rem_remote = PAGE_SIZE - (remote_va_raw % PAGE_SIZE);
-                        let page_rem_local = PAGE_SIZE - (local_va_raw % PAGE_SIZE);
-
+                        let local_left: u64 = (local[li].iov_len - lo)
+                            + local[li + 1..].iter().map(|iov| iov.iov_len).sum::<u64>();
                         let want = rem_remote
-                            .min(rem_local)
                             .min(page_rem_remote)
-                            .min(page_rem_local)
+                            .min(local_left)
                             .min(CHUNK_SIZE as u64);
                         let want_len = want as usize;
                         if want_len == 0 {
@@ -4943,8 +4943,6 @@ impl SyscallDispatcher {
                         }
 
                         let remote_va = carrick_guest_mem::GuestVa(remote_va_raw);
-                        let local_va = local_va_raw;
-
                         let range = match foreign.read_range(remote_va, want_len) {
                             Ok(Some(r)) => r,
                             _ => break,
@@ -4960,13 +4958,38 @@ impl SyscallDispatcher {
                             Err(_) => break,
                         }
 
-                        if cx.memory.write_bytes(local_va, read_buf).is_err() {
+                        // Scatter the chunk across local iovecs; a local fault
+                        // ends the transfer with the exact delivered prefix.
+                        let mut delivered = 0u64;
+                        let mut local_fault = false;
+                        while delivered < want && li < local.len() {
+                            if lo >= local[li].iov_len {
+                                li += 1;
+                                lo = 0;
+                                continue;
+                            }
+                            let Some(local_va) = local[li].iov_base.checked_add(lo) else {
+                                local_fault = true;
+                                break;
+                            };
+                            // Page-bounded local writes keep a mid-iovec local
+                            // fault reporting the exact delivered prefix.
+                            let take = (local[li].iov_len - lo)
+                                .min(want - delivered)
+                                .min(PAGE_SIZE - (local_va % PAGE_SIZE));
+                            let slice = &read_buf[delivered as usize..(delivered + take) as usize];
+                            if cx.memory.write_bytes(local_va, slice).is_err() {
+                                local_fault = true;
+                                break;
+                            }
+                            delivered += take;
+                            lo += take;
+                        }
+                        copied += delivered;
+                        ro += delivered;
+                        if local_fault || delivered < want {
                             break;
                         }
-
-                        copied += want;
-                        ro += want;
-                        lo += want;
                     }
 
                     if copied == 0 {
@@ -5669,6 +5692,12 @@ mod kernel_process_dispatch_tests {
         payload: Vec<u8>,
     }
 
+    thread_local! {
+        /// Foreign-read transactions issued on this test thread; dispatch is
+        /// synchronous, so a test reads it right after its syscall.
+        static FOREIGN_READ_TRANSACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     #[derive(Debug)]
     struct ProcessVmReadReceipt {
         bytes: usize,
@@ -5699,6 +5728,7 @@ mod kernel_process_dispatch_tests {
             dst: &mut [u8],
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
+            FOREIGN_READ_TRANSACTIONS.with(|count| count.set(count.get() + 1));
             if va.0 < TARGET_VA || self.payload.is_empty() {
                 return Err(ForeignMmTransportError::Translation(va));
             }
@@ -6213,6 +6243,47 @@ mod kernel_process_dispatch_tests {
         assert_eq!(
             memory.read_bytes(LOCAL_BUF + 4096, 4096).unwrap(),
             vec![0; 4096]
+        );
+    }
+
+    /// LTP `process_vm_readv03` at `local_iovecs=1024`: one 1 KiB remote
+    /// range scattered into 1024 one-byte local iovecs. Linux copies per
+    /// remote page; carrick used to open one foreign-read transaction per
+    /// LOCAL iovec (two backend snapshots plus a 50 ms-deadline transport
+    /// round trip each), so a loaded host turned the 959th byte into a
+    /// short read. The scatter must cost one transaction per remote page.
+    #[test]
+    fn process_vm_readv_scatter_reads_once_per_remote_page() {
+        const LOCAL_IOVS_1024: u64 = 0x8000;
+        const LOCAL_BUF_1024: u64 = 0xC000;
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_090);
+        let target = process_vm_target_with_pages(&root, 61_091, 1);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0xF000]);
+        for i in 0..1024u64 {
+            write_iovec(&mut memory, LOCAL_IOVS_1024 + i * 16, LOCAL_BUF_1024 + i, 1);
+        }
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 1024);
+        FOREIGN_READ_TRANSACTIONS.with(|count| count.set(0));
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOVS_1024, 1024, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::Returned { value: 1024 },
+        );
+        let read_bytes = memory.read_bytes(LOCAL_BUF_1024, 1024).unwrap();
+        let expected = (0..1024).map(|i| b"PEER"[i % 4]).collect::<Vec<_>>();
+        assert_eq!(read_bytes, expected);
+        let transactions = FOREIGN_READ_TRANSACTIONS.with(|count| count.get());
+        assert_eq!(
+            transactions, 1,
+            "a 1 KiB remote range inside one page must be one foreign-read transaction"
         );
     }
 
