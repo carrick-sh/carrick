@@ -672,3 +672,18 @@ attached the source only in a unit test: no production manager grows, so
 the mechanism was default-off. Sent back to wire every HVPatch manager
 (root, exec, fork child with its own slots) before it can be gated with
 `cpython-compile`.
+
+## Oracle-privilege pass over the broken-on-both-sides LTP rows
+
+Docker-only check of the five rows that matched as broken on both sides,
+default caps vs `--privileged`: `fanotify01` (312/312), `fanotify06`
+(18/18), `vhangup02` and `clock_settime03` pass privileged; `semctl06`
+fails identically (semop EACCES) either way and is a genuine LTP-vs-kernel
+failure, not a carrick gap. Exact grants replaced `--privileged`:
+`vhangup02` needs `CAP_SYS_TTY_CONFIG` (now in the manifest and the
+override table; MATCH 1/1 both sides, `eb1849dfb`), `clock_settime03`'s
+row was stale and refills to MATCH under the `CAP_SYS_TIME` it already
+declared. `fanotify01`/`fanotify06` need a loop block device
+(`tst_device: Failed to acquire device`), which neither Docker's default
+container nor carrick provides; they stay matched-broken until carrick has
+a block-device story, and are not mis-filed as runtime gaps.
