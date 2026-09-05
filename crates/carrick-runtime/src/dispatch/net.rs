@@ -858,6 +858,15 @@ pub(super) struct HostPollTarget {
     pub(super) readiness_pipe: bool,
 }
 
+/// Everything a send path needs from the socket description, read once.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::dispatch) struct SocketSendView {
+    pub(in crate::dispatch) host_fd: HostFd,
+    pub(in crate::dispatch) family: i32,
+    pub(in crate::dispatch) cork_enabled: bool,
+    pub(in crate::dispatch) has_pending_cork: bool,
+}
+
 impl SyscallDispatcher {
     /// Whether `fd` is a pollable target for `epoll_ctl(ADD)`. The kernel
     /// returns EPERM when adding an fd whose file has no `->poll` op — regular
@@ -2204,6 +2213,36 @@ impl SyscallDispatcher {
     }
 
     /// Pull a (host_fd, family) pair out of the dispatcher's fd table.
+    /// One description read for everything a send needs: the host fd, the
+    /// family, and the cork state. `go-net_http` once went from a 53.8 s MATCH
+    /// to a 540 s truncation when a send path took the description lock three
+    /// times per call, so cork bookkeeping must not add a second acquisition
+    /// to the common (uncorked) path.
+    pub(in crate::dispatch) fn host_socket_send_view(
+        &self,
+        fd: i32,
+    ) -> Result<SocketSendView, LinuxErrno> {
+        let Some(open_file) = self.open_file(fd) else {
+            return Err(LINUX_EBADF);
+        };
+        let open = open_file.description.read().ok_or(LINUX_ENOTSOCK)?;
+        match &*open {
+            OpenDescription::HostSocket {
+                host_fd,
+                family,
+                cork_enabled,
+                cork_buffer,
+                ..
+            } => Ok(SocketSendView {
+                host_fd: host_fd.view(),
+                family: *family,
+                cork_enabled: *cork_enabled,
+                has_pending_cork: !cork_buffer.is_empty(),
+            }),
+            _ => Err(LINUX_ENOTSOCK),
+        }
+    }
+
     pub(in crate::dispatch) fn host_socket_lookup(
         &self,
         fd: i32,
@@ -8477,7 +8516,8 @@ impl SyscallDispatcher {
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     }
                 }
-            let (host_fd, family) = this.host_socket_lookup(fd)?;
+            let send_view = this.host_socket_send_view(fd)?;
+            let (host_fd, family) = (send_view.host_fd, send_view.family);
             // Zero-copy when the whole buffer is one contiguous mapped region
             // (send straight out of guest memory); otherwise snapshot it. The
             // pointer is resolved per dispatch — blocking_io's op is FnOnce and an
@@ -8619,19 +8659,9 @@ impl SyscallDispatcher {
             // shows an AF_UNIX SOCK_DGRAM send with MSG_MORE going out at once.
             let is_msg_more = carrick_abi::LinuxMsgFlags::from_bits_retain(flags)
                 .contains(carrick_abi::LinuxMsgFlags::MORE)
-                && this
-                    .socket_guest_domain_type_and_protocol(fd)
-                    .is_some_and(|(family, _, _)| {
-                        family == LINUX_AF_INET || family == LINUX_AF_INET6
-                    });
-            let (is_cork_enabled, has_pending_cork) = if let Some(open_file) = this.open_file(fd)
-                && let Some(open) = open_file.description.read()
-                && let OpenDescription::HostSocket { cork_enabled, cork_buffer, .. } = &*open
-            {
-                (*cork_enabled, !cork_buffer.is_empty())
-            } else {
-                (false, false)
-            };
+                && matches!(send_view.family, LINUX_AF_INET | LINUX_AF_INET6);
+            let (is_cork_enabled, has_pending_cork) =
+                (send_view.cork_enabled, send_view.has_pending_cork);
 
             if is_cork_enabled || is_msg_more {
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
@@ -9900,11 +9930,14 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
         }
-        let (host_fd, family) = if is_netlink {
-            (HostFd(-1), LINUX_AF_NETLINK)
+        let send_view = if is_netlink {
+            None
         } else {
-            self.host_socket_lookup(fd)?
+            Some(self.host_socket_send_view(fd)?)
         };
+        let (host_fd, family) = send_view.map_or((HostFd(-1), LINUX_AF_NETLINK), |view| {
+            (view.host_fd, view.family)
+        });
         let msg = read_linux_msghdr(memory, msg_addr)?;
         let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
         // Pack iovecs into a single contiguous send. Simple and avoids
@@ -9941,21 +9974,10 @@ impl SyscallDispatcher {
         // MSG_MORE corks only the IP transports; see the sendto arm.
         let is_msg_more = carrick_abi::LinuxMsgFlags::from_bits_retain(flags)
             .contains(carrick_abi::LinuxMsgFlags::MORE)
-            && self
-                .socket_guest_domain_type_and_protocol(fd)
-                .is_some_and(|(family, _, _)| family == LINUX_AF_INET || family == LINUX_AF_INET6);
-        let (is_cork_enabled, has_pending_cork) = if let Some(open_file) = self.open_file(fd)
-            && let Some(open) = open_file.description.read()
-            && let OpenDescription::HostSocket {
-                cork_enabled,
-                cork_buffer,
-                ..
-            } = &*open
-        {
-            (*cork_enabled, !cork_buffer.is_empty())
-        } else {
-            (false, false)
-        };
+            && matches!(family, LINUX_AF_INET | LINUX_AF_INET6);
+        let (is_cork_enabled, has_pending_cork) = send_view.map_or((false, false), |view| {
+            (view.cork_enabled, view.has_pending_cork)
+        });
 
         if is_cork_enabled || is_msg_more {
             let data_len = data.len();

@@ -3,11 +3,11 @@
   "counts": {
     "inspect_misc": 145,
     "create_install": 71,
-    "slot_description_mutation": 21,
-    "read_attempt": 13,
+    "slot_description_mutation": 25,
+    "read_attempt": 14,
     "write_attempt": 22,
     "lifecycle": 39,
-    "stream_transfer": 16,
+    "stream_transfer": 20,
     "mapping_ring": 12,
     "epoll_wait": 33
   },
@@ -4117,6 +4117,105 @@
       "scope_kind": "test_or_definition",
       "enclosing_function": "external_peer_root_has_no_init_wait_edge_and_retains_only_stdio_files",
       "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 2253,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read().ok_or(LINUX_ENOTSOCK)?;",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "host_socket_send_view",
+      "migration_family": "stream_transfer"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9137,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "setsockopt",
+      "migration_family": "slot_description_mutation"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9185,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "setsockopt",
+      "migration_family": "slot_description_mutation"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9237,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "setsockopt",
+      "migration_family": "slot_description_mutation"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9256,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "setsockopt",
+      "migration_family": "slot_description_mutation"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9902,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(open) = open_file.description.read()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "sendmsg_inner",
+      "migration_family": "stream_transfer"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 9985,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "sendmsg_inner",
+      "migration_family": "stream_transfer"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 10006,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "sendmsg_inner",
+      "migration_family": "stream_transfer"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 10253,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(open) = open_file.description.read()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "recvmsg_inner",
+      "migration_family": "read_attempt"
     }
   ]
 }
