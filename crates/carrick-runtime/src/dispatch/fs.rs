@@ -48,6 +48,9 @@
 //! and `xattr`.
 use super::*;
 use crate::linux_abi::{LINUX_ENOSPC, LINUX_ENXIO, LINUX_SEEK_DATA, LINUX_SEEK_HOLE};
+use crate::vfs::PtyRole;
+
+const LINUX_TIOCSIG: u64 = 0x40045436;
 
 fn resolve_tiocspgrp(
     context: &crate::kernel::KernelContext,
@@ -6275,8 +6278,29 @@ impl SyscallDispatcher {
                         return if *is_read_end && pty.is_none() && !*bidirectional {
                             DispatchOutcome::errno(LINUX_EBADF)
                         } else {
-                            write_host_pipe_owned(
-                                bytes.to_vec(),
+                            let (bytes_to_write, consumed_count) = if let Some(PtyRole {
+                                index,
+                                is_master: true,
+                            }) = pty
+                            {
+                                let orig_len = bytes.len();
+                                let forwarded = crate::kernel::tty::process_master_write(
+                                    crate::kernel::tty::TtyKey::Pty(*index),
+                                    host_fd.raw(),
+                                    bytes,
+                                );
+                                let consumed = orig_len - forwarded.len();
+                                (forwarded, consumed)
+                            } else {
+                                (bytes.to_vec(), 0)
+                            };
+                            if bytes_to_write.is_empty() && consumed_count > 0 {
+                                return DispatchOutcome::Returned {
+                                    value: consumed_count as i64,
+                                };
+                            }
+                            let res = write_host_pipe_owned(
+                                bytes_to_write,
                                 HostPipeWriteTarget {
                                     host_fd: host_fd.raw(),
                                     host_fd_owner: Some(host_fd.clone()),
@@ -6296,7 +6320,21 @@ impl SyscallDispatcher {
                                         .map(WaitFdAuthority::logical)
                                         .unwrap_or_else(|| std::process::abort()),
                                 },
-                            )
+                            );
+                            match res {
+                                DispatchOutcome::Returned { value } => DispatchOutcome::Returned {
+                                    value: value + consumed_count as i64,
+                                },
+                                other => {
+                                    if consumed_count > 0 {
+                                        DispatchOutcome::Returned {
+                                            value: consumed_count as i64,
+                                        }
+                                    } else {
+                                        other
+                                    }
+                                }
+                            }
                         };
                     }
                     OpenDescription::HostSocket { host_fd, .. } => {
@@ -8840,21 +8878,6 @@ impl SyscallDispatcher {
             // passing through to the host fd (real macOS pty). Return early so the
             // stdio-gated arms below never run for pty fds.
             if let Some((role, host_fd)) = this.pty_info(fd.0) {
-                let controls_controlling_tty = matches!(
-                    ioctl_request,
-                    LINUX_TIOCGPGRP
-                        | LINUX_TIOCSPGRP
-                        | LINUX_TIOCGSID
-                        | LINUX_TIOCNOTTY
-                );
-                if controls_controlling_tty
-                    && this.pty_table().lock().controlling() != Some(role.index)
-                {
-                    // Carrick currently models exactly the launch terminal.
-                    // Never grant authority over another allocated pty merely
-                    // because its host fd also happens to be a tty.
-                    return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
-                }
                 return Ok(match ioctl_request {
                     // TIOCGPTN is a MASTER-only ioctl: it returns the pts index
                     // of the master's slave. On a slave it is ENOTTY — which is
@@ -8977,17 +9000,29 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_TIOCGPGRP => {
-                        match cx.kernel.kernel().tty_foreground_process_group(cx.kernel) {
+                        let session = cx.kernel.task().session();
+                        let group_res = crate::kernel::tty::foreground_process_group(
+                            crate::kernel::tty::TtyKey::Pty(role.index),
+                            session,
+                        )
+                        .or_else(|_| {
+                            if this.pty_table().lock().controlling() == Some(role.index) {
+                                cx.kernel.kernel().tty_foreground_process_group(cx.kernel).map_err(|_| LINUX_ENOTTY)
+                            } else {
+                                Err(LINUX_ENOTTY)
+                            }
+                        });
+                        match group_res {
                             Ok(group) => match crate::namespace::pid::process_group_to_ns_for(
                                 cx.kernel,
                                 group,
                             )
-                                .and_then(|group| i32::try_from(group).ok())
+                            .and_then(|group| i32::try_from(group).ok())
                             {
                                 Some(group) => write_packed(&mut *cx.memory, arg, &group.to_le_bytes()),
                                 None => DispatchOutcome::errno(LINUX_ESRCH),
                             },
-                            Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
+                            Err(errno) => DispatchOutcome::errno(errno),
                         }
                     }
                     LINUX_TIOCSPGRP => {
@@ -9002,52 +9037,125 @@ impl SyscallDispatcher {
                             Ok(group) => group,
                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         };
-                        match cx.kernel.kernel().tty_set_foreground_process_group(cx.kernel, group) {
+                        let session = cx.kernel.task().session();
+                        let res = crate::kernel::tty::set_foreground_process_group(
+                            crate::kernel::tty::TtyKey::Pty(role.index),
+                            session,
+                            group,
+                        );
+                        if this.pty_table().lock().controlling() == Some(role.index) {
+                            let _ = cx.kernel.kernel().tty_set_foreground_process_group(cx.kernel, group);
+                        }
+                        match res {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
-                            Err(crate::kernel::TtyControlError::NotControlling) => DispatchOutcome::errno(LINUX_ENOTTY),
-                            Err(crate::kernel::TtyControlError::Permission) => DispatchOutcome::errno(LINUX_EPERM),
+                            Err(errno) => {
+                                if this.pty_table().lock().controlling() == Some(role.index) {
+                                    match cx.kernel.kernel().tty_set_foreground_process_group(cx.kernel, group) {
+                                        Ok(()) => DispatchOutcome::Returned { value: 0 },
+                                        Err(crate::kernel::TtyControlError::NotControlling) => DispatchOutcome::errno(LINUX_ENOTTY),
+                                        Err(crate::kernel::TtyControlError::Permission) => DispatchOutcome::errno(LINUX_EPERM),
+                                    }
+                                } else {
+                                    DispatchOutcome::errno(errno)
+                                }
+                            }
                         }
                     }
                     LINUX_TIOCSCTTY => {
                         if role.is_master {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        if cx.kernel.task().session().raw() != cx.kernel.task().key().id.raw() {
+                        let session = cx.kernel.task().session();
+                        if session.raw() != cx.kernel.task().key().id.raw() {
                             return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
-                        // Note: controlling index is set regardless of whether tty_acquire succeeds or fails.
-                        crate::vfs::devpts::set_controlling_index(
-                            this.pty_table(),
-                            Some(role.index),
-                        );
-                        match cx
-                            .kernel
-                            .kernel()
-                            .tty_acquire(cx.kernel, arg != 0)
-                        {
-                            Ok(()) => DispatchOutcome::Returned { value: 0 },
-                            Err(_) => DispatchOutcome::Returned { value: 0 },
+                        let force = arg != 0;
+                        let group = cx.kernel.task().process_group();
+                        match crate::kernel::tty::attach_pty(
+                            role.index,
+                            cx.kernel.kernel(),
+                            cx.kernel.container().id(),
+                            session,
+                            group,
+                            force,
+                        ) {
+                            Ok(()) => {
+                                crate::vfs::devpts::set_controlling_index(
+                                    this.pty_table(),
+                                    Some(role.index),
+                                );
+                                let _ = cx.kernel.kernel().tty_acquire(cx.kernel, force);
+                                DispatchOutcome::Returned { value: 0 }
+                            }
+                            Err(errno) => DispatchOutcome::errno(errno),
                         }
                     }
                     LINUX_TIOCGSID => {
-                        match cx.kernel.kernel().tty_session(cx.kernel) {
+                        let session_res = crate::kernel::tty::session(crate::kernel::tty::TtyKey::Pty(role.index))
+                            .ok_or(LINUX_ENOTTY)
+                            .or_else(|_| {
+                                if this.pty_table().lock().controlling() == Some(role.index) {
+                                    cx.kernel.kernel().tty_session(cx.kernel).map_err(|_| LINUX_ENOTTY)
+                                } else {
+                                    Err(LINUX_ENOTTY)
+                                }
+                            });
+                        match session_res {
                             Ok(session) => match crate::namespace::pid::session_to_ns_for(
                                 cx.kernel,
                                 session,
                             )
-                                .and_then(|session| i32::try_from(session).ok())
+                            .and_then(|session| i32::try_from(session).ok())
                             {
                                 Some(session) => write_packed(&mut *cx.memory, arg, &session.to_le_bytes()),
                                 None => DispatchOutcome::errno(LINUX_ESRCH),
                             },
-                            Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
+                            Err(errno) => DispatchOutcome::errno(errno),
                         }
                     }
                     LINUX_TIOCNOTTY => {
-                        crate::vfs::devpts::set_controlling_index(this.pty_table(), None);
-                        match cx.kernel.kernel().tty_detach(cx.kernel) {
-                            Ok(()) => DispatchOutcome::Returned { value: 0 },
-                            Err(_) => DispatchOutcome::Returned { value: 0 },
+                        if this.pty_table().lock().controlling() == Some(role.index) {
+                            crate::vfs::devpts::set_controlling_index(this.pty_table(), None);
+                            let _ = cx.kernel.kernel().tty_detach(cx.kernel);
+                        }
+                        crate::kernel::tty::detach_if_session(
+                            crate::kernel::tty::TtyKey::Pty(role.index),
+                            cx.kernel.task().session(),
+                        );
+                        DispatchOutcome::Returned { value: 0 }
+                    }
+                    LINUX_TIOCSIG => {
+                        let mut buf = [0u8; 4];
+                        match cx.memory.read_bytes(arg, 4) {
+                            Ok(b) => buf.copy_from_slice(&b),
+                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                        }
+                        let signum = i32::from_le_bytes(buf);
+                        if signum <= 0 || signum > 64 {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        let session = cx.kernel.task().session();
+                        match crate::kernel::tty::session(crate::kernel::tty::TtyKey::Pty(role.index)) {
+                            Some(s) if s == session => {
+                                crate::kernel::tty::route_foreground_signal_to_tty(
+                                    crate::kernel::tty::TtyKey::Pty(role.index),
+                                    signum,
+                                );
+                                DispatchOutcome::Returned { value: 0 }
+                            }
+                            _ => {
+                                if this.pty_table().lock().controlling() == Some(role.index)
+                                    && cx.kernel.kernel().tty_session(cx.kernel).is_ok_and(|s| s == session)
+                                {
+                                    crate::kernel::tty::route_foreground_signal_to_tty(
+                                        crate::kernel::tty::TtyKey::Launch,
+                                        signum,
+                                    );
+                                    DispatchOutcome::Returned { value: 0 }
+                                } else {
+                                    DispatchOutcome::errno(LINUX_ENOTTY)
+                                }
+                            }
                         }
                     }
                     LINUX_FIONREAD => {
@@ -9401,6 +9509,29 @@ impl SyscallDispatcher {
                             Err(crate::kernel::TtyControlError::NotControlling) => DispatchOutcome::errno(LINUX_ENOTTY),
                             Err(crate::kernel::TtyControlError::Permission) => DispatchOutcome::errno(LINUX_EPERM),
                         }
+                    }
+                    Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
+                    Err(errno) => DispatchOutcome::errno(errno),
+                },
+                LINUX_TIOCSIG => match this.tty_ioctl_fd_kind(fd.0) {
+                    Ok(TtyFdKind::Stdio) => {
+                        let mut buf = [0u8; 4];
+                        match cx.memory.read_bytes(arg, 4) {
+                            Ok(b) => buf.copy_from_slice(&b),
+                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                        }
+                        let signum = i32::from_le_bytes(buf);
+                        if signum <= 0 || signum > 64 {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        if cx.kernel.kernel().tty_session(cx.kernel).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
+                        }
+                        crate::kernel::tty::route_foreground_signal_to_tty(
+                            crate::kernel::tty::TtyKey::Launch,
+                            signum,
+                        );
+                        DispatchOutcome::Returned { value: 0 }
                     }
                     Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
                     Err(errno) => DispatchOutcome::errno(errno),
@@ -13969,30 +14100,56 @@ impl SyscallDispatcher {
                             if *is_read_end && pty.is_none() && !*bidirectional {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             }
-                            // A broken pipe (read end closed) → EPIPE AND a
-                            // SIGPIPE on the writer (write05).
-                            let out = write_host_pipe_owned(
-                                bytes,
-                                HostPipeWriteTarget {
-                                    host_fd: host_fd.raw(),
-                                    host_fd_owner: Some(host_fd.clone()),
-                                    nonblocking,
-                                    write_kind: *write_kind,
-                                    pipe_state: this.host_pipe_capacity_state(
-                                        base,
-                                        *pipe_id,
-                                        *is_read_end,
-                                        *bidirectional,
-                                        host_fd.raw(),
-                                    ),
-                                    tid: cx.tid(),
-                                    sigpipe_on_epipe: true,
-                                    authority: this
-                                        .captured_slot_authority(fd)
-                                        .map(WaitFdAuthority::logical)
-                                        .unwrap_or_else(|| std::process::abort()),
-                                },
-                            );
+                            let (bytes_to_write, consumed_count) = if let Some(PtyRole { index, is_master: true }) = pty {
+                                let orig_len = bytes.len();
+                                let forwarded = crate::kernel::tty::process_master_write(
+                                    crate::kernel::tty::TtyKey::Pty(*index),
+                                    host_fd.raw(),
+                                    &bytes,
+                                );
+                                let consumed = orig_len - forwarded.len();
+                                (forwarded, consumed)
+                            } else {
+                                (bytes, 0)
+                            };
+                            let out = if bytes_to_write.is_empty() && consumed_count > 0 {
+                                DispatchOutcome::Returned { value: consumed_count as i64 }
+                            } else {
+                                let res = write_host_pipe_owned(
+                                    bytes_to_write,
+                                    HostPipeWriteTarget {
+                                        host_fd: host_fd.raw(),
+                                        host_fd_owner: Some(host_fd.clone()),
+                                        nonblocking,
+                                        write_kind: *write_kind,
+                                        pipe_state: this.host_pipe_capacity_state(
+                                            base,
+                                            *pipe_id,
+                                            *is_read_end,
+                                            *bidirectional,
+                                            host_fd.raw(),
+                                        ),
+                                        tid: cx.tid(),
+                                        sigpipe_on_epipe: true,
+                                        authority: this
+                                            .captured_slot_authority(fd)
+                                            .map(WaitFdAuthority::logical)
+                                            .unwrap_or_else(|| std::process::abort()),
+                                    },
+                                );
+                                match res {
+                                    DispatchOutcome::Returned { value } => {
+                                        DispatchOutcome::Returned { value: value + consumed_count as i64 }
+                                    }
+                                    other => {
+                                        if consumed_count > 0 {
+                                            DispatchOutcome::Returned { value: consumed_count as i64 }
+                                        } else {
+                                            other
+                                        }
+                                    }
+                                }
+                            };
                             // Signal-driven I/O: a write that added bytes makes the
                             // pipe's read end readable — the FASYNC readiness edge.
                             // Deliver the read end's owner signal (default SIGIO)
@@ -14539,28 +14696,56 @@ impl SyscallDispatcher {
                                 if *is_read_end && pty.is_none() && !*bidirectional {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 }
-                                outcome = write_host_pipe_owned(
-                                    bytes,
-                                    HostPipeWriteTarget {
-                                        host_fd: host_fd.raw(),
-                                        host_fd_owner: Some(host_fd.clone()),
-                                        nonblocking,
-                                        write_kind: *write_kind,
-                                        pipe_state: this.host_pipe_capacity_state(
-                                            base,
-                                            *pipe_id,
-                                            *is_read_end,
-                                            *bidirectional,
-                                            host_fd.raw(),
-                                        ),
-                                        tid: cx.tid(),
-                                        sigpipe_on_epipe: true,
-                                        authority: this
-                                            .captured_slot_authority(fd)
-                                            .map(WaitFdAuthority::logical)
-                                            .unwrap_or_else(|| std::process::abort()),
-                                    },
-                                );
+                                let (bytes_to_write, consumed_count) = if let Some(PtyRole { index, is_master: true }) = pty {
+                                    let orig_len = bytes.len();
+                                    let forwarded = crate::kernel::tty::process_master_write(
+                                        crate::kernel::tty::TtyKey::Pty(*index),
+                                        host_fd.raw(),
+                                        &bytes,
+                                    );
+                                    let consumed = orig_len - forwarded.len();
+                                    (forwarded, consumed)
+                                } else {
+                                    (bytes, 0)
+                                };
+                                outcome = if bytes_to_write.is_empty() && consumed_count > 0 {
+                                    DispatchOutcome::Returned { value: consumed_count as i64 }
+                                } else {
+                                    let res = write_host_pipe_owned(
+                                        bytes_to_write,
+                                        HostPipeWriteTarget {
+                                            host_fd: host_fd.raw(),
+                                            host_fd_owner: Some(host_fd.clone()),
+                                            nonblocking,
+                                            write_kind: *write_kind,
+                                            pipe_state: this.host_pipe_capacity_state(
+                                                base,
+                                                *pipe_id,
+                                                *is_read_end,
+                                                *bidirectional,
+                                                host_fd.raw(),
+                                            ),
+                                            tid: cx.tid(),
+                                            sigpipe_on_epipe: true,
+                                            authority: this
+                                                .captured_slot_authority(fd)
+                                                .map(WaitFdAuthority::logical)
+                                                .unwrap_or_else(|| std::process::abort()),
+                                        },
+                                    );
+                                    match res {
+                                        DispatchOutcome::Returned { value } => {
+                                            DispatchOutcome::Returned { value: value + consumed_count as i64 }
+                                        }
+                                        other => {
+                                            if consumed_count > 0 {
+                                                DispatchOutcome::Returned { value: consumed_count as i64 }
+                                            } else {
+                                                other
+                                            }
+                                        }
+                                    }
+                                };
                                 writeback = None;
                             }
                             OpenDescription::HostSocket { host_fd, .. } => {
