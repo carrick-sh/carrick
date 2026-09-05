@@ -15,6 +15,8 @@
 //! 12. F_ADD_SEALS on the O_RDONLY reopened memfd fails with EPERM.
 //! 13. write(2) on the O_RDONLY reopened memfd fails with EBADF.
 //! 14. Reopening memfd via /proc/self/fd/N with O_RDWR allows F_ADD_SEALS.
+//! 15. A write-sealed memfd still re-opens O_RDWR|O_CREAT|O_TRUNC and shrinks to 0.
+//! 16. A shrink-sealed memfd refuses that O_TRUNC re-open with EPERM.
 //!
 //! Expected Linux output:
 //!   getfl_nonblock_set=true
@@ -50,6 +52,7 @@ const MFD_ALLOW_SEALING: libc::c_uint = 0x0002;
 const F_ADD_SEALS: libc::c_int = 1033;
 const F_GET_SEALS: libc::c_int = 1034;
 const F_SEAL_SEAL: i32 = 0x0001;
+const F_SEAL_SHRINK: i32 = 0x0002;
 const F_SEAL_GROW: i32 = 0x0004;
 const F_SEAL_WRITE: i32 = 0x0008;
 
@@ -218,6 +221,49 @@ fn main() {
             libc::close(fd_mem);
         }
 
+        // Case D: seals gate what a /proc/self/fd re-open may DO, not whether
+        // it opens. F_SEAL_WRITE still admits O_RDWR|O_CREAT|O_TRUNC and the
+        // truncation shrinks the file (LTP memfd_create01 test_seal_write ->
+        // CHECK_MFD_SHRINKABLE); F_SEAL_SHRINK refuses that same open with
+        // EPERM (CHECK_MFD_NON_SHRINKABLE).
+        let mut write_sealed_reopen_trunc_ok = false;
+        let mut write_sealed_reopen_trunc_shrinks = false;
+        let mut shrink_sealed_reopen_trunc_eperm = false;
+        let fd_ws = sys_memfd_create("probe_write_sealed", MFD_ALLOW_SEALING);
+        if fd_ws >= 0 {
+            let _ = libc::ftruncate(fd_ws, 8192);
+            let _ = libc::fcntl(fd_ws, F_ADD_SEALS, F_SEAL_WRITE);
+            let path = format!("/proc/self/fd/{fd_ws}\0");
+            let fd_t = libc::open(
+                path.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+                0o600,
+            );
+            write_sealed_reopen_trunc_ok = fd_t >= 0;
+            if fd_t >= 0 {
+                let mut st: libc::stat = std::mem::zeroed();
+                write_sealed_reopen_trunc_shrinks = libc::fstat(fd_ws, &mut st) == 0 && st.st_size == 0;
+                libc::close(fd_t);
+            }
+            libc::close(fd_ws);
+        }
+        let fd_ss = sys_memfd_create("probe_shrink_sealed", MFD_ALLOW_SEALING);
+        if fd_ss >= 0 {
+            let _ = libc::ftruncate(fd_ss, 8192);
+            let _ = libc::fcntl(fd_ss, F_ADD_SEALS, F_SEAL_SHRINK);
+            let path = format!("/proc/self/fd/{fd_ss}\0");
+            let fd_t = libc::open(
+                path.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+                0o600,
+            );
+            shrink_sealed_reopen_trunc_eperm = fd_t == -1 && errno() == libc::EPERM;
+            if fd_t >= 0 {
+                libc::close(fd_t);
+            }
+            libc::close(fd_ss);
+        }
+
         report!(
             getfl_nonblock_set = getfl_nonblock_set,
             getfl_default_clear = getfl_default_clear,
@@ -233,6 +279,9 @@ fn main() {
             reopen_rdonly_add_seals_eperm = reopen_rdonly_add_seals_eperm,
             reopen_rdonly_write_ebadf = reopen_rdonly_write_ebadf,
             reopen_rdwr_add_seals_ok = reopen_rdwr_add_seals_ok,
+            write_sealed_reopen_trunc_ok = write_sealed_reopen_trunc_ok,
+            write_sealed_reopen_trunc_shrinks = write_sealed_reopen_trunc_shrinks,
+            shrink_sealed_reopen_trunc_eperm = shrink_sealed_reopen_trunc_eperm,
         );
 
         libc::alarm(0);

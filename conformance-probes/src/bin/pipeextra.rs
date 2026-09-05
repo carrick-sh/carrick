@@ -16,7 +16,7 @@
 //!     and return -1/EINVAL on the pipe2 call; the assertion accepts that
 //!     path too. (pipe2_03)
 //!   * `FIONREAD` ioctl reports the readable byte count on a written-but-
-//!     unread pipe; a non-blocking write past the pipe buffer returns
+//!     unread pipe, from the read end AND from the write end (pipe12); a non-blocking write past the pipe buffer returns
 //!     -1/EAGAIN; the readable byte count matches what was actually
 //!     written.
 //!   * A read from a pipe whose write end is closed and that is empty
@@ -133,6 +133,11 @@ fn case_fionread_and_nonblock_write() {
         let mut readable: libc::c_int = 0;
         let ioctl_rc = libc::ioctl(rd, libc::FIONREAD, &mut readable);
         let fionread_matches = ioctl_rc == 0 && readable as isize == n;
+        // Linux answers FIONREAD on the WRITE end too, with the same queued
+        // byte count (LTP pipe12 asks fds[1] after filling the pipe).
+        let mut readable_from_writer: libc::c_int = -1;
+        let writer_ioctl_rc = libc::ioctl(wr, libc::FIONREAD, &mut readable_from_writer);
+        let fionread_write_end_matches = writer_ioctl_rc == 0 && readable_from_writer as isize == n;
 
         // Fill the pipe to its capacity, then verify a non-blocking write
         // EAGAINs. We use a sizable buffer and a bounded loop so the test
@@ -153,6 +158,7 @@ fn case_fionread_and_nonblock_write() {
         report!(
             pipe_setup_rc_zero = rc == 0,
             pipe_fionread_matches_written = fionread_matches,
+            pipe_fionread_write_end_matches_written = fionread_write_end_matches,
             pipe_nonblock_fills = filled,
             pipe_nonblock_write_eagains_when_full = got_eagain,
         );
