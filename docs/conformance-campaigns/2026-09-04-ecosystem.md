@@ -1196,3 +1196,33 @@ Two more instances of the same class, same method (attached carrier CPU ranking)
   threads. CPython's `_posixsubprocess` lists `/proc/self/fd` on every spawn.
   Fix shape: lazy fields, so the opened node's renderer pulls only what it
   reads. Brief: `scratchpad/brief-lazy-proc-context.md`.
+
+## 2026-09-05 late: mmap materialization is eager (file-backed 670x, anonymous 24x)
+
+Microbench, `python:3.12-slim`, one binary, Docker on the same image:
+
+| guest op | carrick | Docker | ratio |
+|---|---|---|---|
+| `mmap(MAP_PRIVATE, fd)` of a 6 MiB file + `munmap` | 1347 µs | 2.0 µs | 670x |
+| same, fresh VA each time (kept mapped) | 1478 µs | 2.1 µs | 700x |
+| `munmap` of one of those | 114 µs | 4.4 µs | 26x |
+| anonymous `mmap` 1 MiB + `munmap` | 58 µs | 2.4 µs | 24x |
+| `pread` 64 KiB | 9.4 µs | 1.8 µs | 5x |
+
+Attached carrier CPU ranking on the file loop: 37% `write_guest_bytes`, 23%
+host `pread`, 19% `__bzero`, 21% a 6 MiB `vec![0; len]`: the dispatcher's
+eager snapshot path reads the whole file and copies it into guest memory
+page by page (1,617 `write_guest_bytes` and 3,235 `ensure_sparse_mmap_backing`
+calls per 6 MiB mmap). The lazy page-cache view (`materialize_private_file_backing`,
+Move-3 E1) IS attempted every time (pid-provider counts: 200 candidates, 200
+backend entries, 0 `overlay_shared_file_view`) and refuses inside the backend
+after the whole-range hole walk (323,400 `mapping_for_range` calls for 200
+mmaps = one full pass each), i.e. at the `alias_overlaps` scan, which also
+walks EVERY alias in the registry per mmap. `ensure_sparse_mmap_backing`
+runs before the view is attempted. Anonymous mmap spends its time in
+`zero_anonymous_reuse` → `ensure_frame_cow_write` → `zero_guest_backing`
+(bzero): a reused arena range is scrubbed eagerly at mmap time instead of
+being re-materialized zero on first touch. Every exec of a dynamic binary
+maps its libraries this way; this is most of the 3.7 ms spawn fixed cost.
+Brief: `scratchpad/brief-mmap-lazy.md` (dispatch after the stage-1 authority
+lands; same files).
