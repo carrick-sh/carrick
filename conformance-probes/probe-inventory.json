@@ -539,6 +539,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "fdsemantics": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "fdstat": {
     "class": "conformance",
     "excluded": false,
