@@ -409,10 +409,12 @@ pub(crate) fn write_pipe(
             return DispatchOutcome::errno(LINUX_EPIPE);
         }
 
-        if is_interrupted() {
-            break;
-        }
-
+        // A pending signal is consulted only where this write would WAIT.
+        // Checking it before the copy made a write with room return EINTR
+        // with nothing written: `sigunblockpending` unblocks two signals,
+        // the first handler's pipe write ran with the second still pending
+        // and lost its byte. Linux never interrupts a write that can
+        // complete immediately.
         let capacity = state.capacity;
         let available = capacity.saturating_sub(state.buffer.len());
 
@@ -422,6 +424,12 @@ pub(crate) fn write_pipe(
         if written == 0 && (available == 0 || (length <= PIPE_BUF && available < length)) {
             if nonblocking {
                 return DispatchOutcome::errno(LINUX_EAGAIN);
+            }
+            // Entering the sleep with a signal already pending is the one
+            // place a write with nothing written answers EINTR (the BSD
+            // `PCATCH`-on-entry rule).
+            if is_interrupted() {
+                return DispatchOutcome::errno(LINUX_EINTR);
             }
             let Some(host_fd) = pipe.write_poll_fd_locked(&state) else {
                 return DispatchOutcome::errno(LINUX_EMFILE);
@@ -687,6 +695,20 @@ mod tests {
         // Pipe is full; write interrupted immediately must return EINTR, not 0.
         let out = write_pipe(b"blocked", &pipe, 0, 4, authority, || true);
         assert_eq!(out, DispatchOutcome::errno(LINUX_EINTR));
+    }
+
+    #[test]
+    fn in_memory_pipe_write_with_room_ignores_pending_interrupt() {
+        let pipe = Arc::new(PipeInner::new_connected(13, 4096));
+        let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);
+        // Room for the whole write: a pending signal must not turn it into
+        // EINTR (a signal handler writing one wake-up byte while a second
+        // signal is pending is exactly this case).
+        assert_eq!(
+            write_pipe(b"x", &pipe, 0, 4, authority.clone(), || true),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(pipe.buffered_bytes(), 1);
     }
 
     #[test]
