@@ -614,6 +614,14 @@ impl GuestMemory for ProtectionTrackingMemory {
         Ok(())
     }
 
+    fn translate_va(&self, va: u64) -> Option<u64> {
+        self.active_aliases
+            .iter()
+            .rev()
+            .find(|(start, _, l)| va >= *start && va < *start + *l as u64)
+            .map(|(start, target_ipa, _)| target_ipa + (va - start))
+    }
+
     fn repoint_private(
         &mut self,
         address: u64,
@@ -8359,6 +8367,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
             row_file_offset: 0,
         }),
     });
+    memory.active_aliases.push((base, base, 4 * PAGE as usize));
 
     let src = base + PAGE;
     let dst = base + 3 * PAGE;
@@ -8547,6 +8556,7 @@ fn shared_file_fixed_mremap_repoint_failure_lowers_to_enomem() {
             row_file_offset: 0,
         }),
     });
+    memory.active_aliases.push((base, base, 4 * PAGE as usize));
 
     let src = base + PAGE;
     let dst = base + 3 * PAGE;
