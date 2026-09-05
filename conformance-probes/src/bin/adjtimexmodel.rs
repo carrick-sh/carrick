@@ -108,7 +108,7 @@ fn main() {
     let mut tx: libc::timex = unsafe { core::mem::zeroed() };
     tx.modes = ADJ_FREQUENCY;
     tx.freq = 35_000_000;
-    let (rc, err) = clock_adjtime_call(&mut tx);
+    let (rc, _) = clock_adjtime_call(&mut tx);
     // Linux clamps an oversized freq to MAXFREQ rather than refusing it.
     report!(oversized_freq_accepted = rc >= 0);
 
@@ -121,7 +121,7 @@ fn main() {
     let mut tx: libc::timex = unsafe { core::mem::zeroed() };
     tx.modes = ADJ_STATUS;
     tx.status = 1 << 20;
-    let (rc, err) = clock_adjtime_call(&mut tx);
+    let (rc, _) = clock_adjtime_call(&mut tx);
     // Undefined status bits are ignored, not refused.
     report!(unknown_status_bits_accepted = rc >= 0);
 
@@ -134,13 +134,13 @@ fn main() {
 
     let mut tx: libc::timex = unsafe { core::mem::zeroed() };
     tx.modes = ADJ_MICRO | ADJ_NANO;
-    let (rc, err) = clock_adjtime_call(&mut tx);
-    report!(micro_nano_exclusive_einval = rc == -1 && err == libc::EINVAL);
+    let (rc, _) = clock_adjtime_call(&mut tx);
+    report!(micro_nano_together_accepted = rc >= 0);
 
     let mut tx: libc::timex = unsafe { core::mem::zeroed() };
     tx.modes = ADJ_TAI | ADJ_TIMECONST;
-    let (rc, err) = clock_adjtime_call(&mut tx);
-    report!(tai_timeconst_exclusive_einval = rc == -1 && err == libc::EINVAL);
+    let (rc, _) = clock_adjtime_call(&mut tx);
+    report!(tai_timeconst_together_accepted = rc >= 0);
 
     let mut tx: libc::timex = unsafe { core::mem::zeroed() };
     tx.modes = ADJ_OFFSET_SINGLESHOT_FLAG_ONLY;
