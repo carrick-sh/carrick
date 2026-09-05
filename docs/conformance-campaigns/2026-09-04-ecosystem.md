@@ -998,3 +998,29 @@ then inotify09/msgstress01/shmctl05 under 4x. Attributions so far:
   capture into "which task is parked in which syscall" plus per-syscall wall;
   worth promoting into `carrick trace` as a profile. Caveat learned: nanosleep
   and exit_group emit no service-end record, so their "parks" are artifacts.
+
+## 2026-09-05 (late night): fifth arena-source leak — the vfork child's exec
+
+Worker `arena-race` (brief: enumerate every manager construction/swap) found
+the residual: a `posix_spawn`/vfork (`CLONE_VM`) child still SHARES its
+parent's page-table authority when it execs, and `replace_page_tables`
+`take()`d the manager out of that shared authority and retired its extension
+arenas. The parent was left with an empty slot ("HVPatch COW page-table
+manager is absent" — concurrent_futures' spawn-context test) or rebuilt a
+manager without a source on its next edit (the `-v` regrtest case: `-v` runs
+`uname` through subprocess, which is posix_spawn). dash's `sh -c` vforks too,
+which is why the exec-path probe and CPython under the harness both hit it.
+Fix `ffe723778`: a shared authority (`Arc::strong_count > 1`) is left alone
+and the child gets a fresh authority and deferred source.
+
+Live on `3f3d715b9`: `-v` recursion case SUCCESS 3/3 with zero refusals,
+`pagetablegrow` through `/bin/sh -c` 3000/3000, concurrent_futures past the
+former abort with no absent-manager refusal. Instrument that found it:
+`stage1-arena-absent` naming the empty authority + the bind/install history
+of that pointer in `hvpatch-stage1-arena.d`.
+
+Rule (now in memory): a `PageTableManager` slot is per-mm and may be shared by
+a vfork child until exec; NO path may take, clone-replace, or retire through a
+shared authority. The five leaks were: exec pending-only install, engine-local
+deferral vs sibling lazy build, foreign-COW/fork-COW rollback clones,
+rolled-back fork clone, and the vfork child's exec stealing the parent's slot.
