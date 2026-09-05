@@ -10532,7 +10532,7 @@ impl SyscallDispatcher {
                             FileContents::HostBacked { fd } => {
                                 use std::os::fd::AsRawFd;
                                 if offset < 0 {
-                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                    return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                                 }
                                 let host_whence = match whence {
                                     LINUX_SEEK_DATA => 4,
@@ -10552,7 +10552,7 @@ impl SyscallDispatcher {
                             }
                             FileContents::Dense(_) | FileContents::RootFsBacked { .. } => {
                                 if offset < 0 {
-                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                    return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                                 }
                                 let file_size = contents.len();
                                 if (offset as usize) >= file_size {
@@ -10577,7 +10577,7 @@ impl SyscallDispatcher {
                 } => {
                     if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
                         if offset < 0 {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                         }
                         let file_size = contents.len();
                         if (offset as usize) >= file_size {
@@ -10600,7 +10600,7 @@ impl SyscallDispatcher {
                 } => {
                     if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
                         if offset < 0 {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                         }
                         let file_size = contents.read().len();
                         if (offset as usize) >= file_size {

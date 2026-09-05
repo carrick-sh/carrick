@@ -9,7 +9,8 @@
 //!   * Offset 528384 (512 KiB + 4096): SEEK_DATA -> -1 (ENXIO), SEEK_HOLE -> 528384
 //!   * Offset 1048576 (EOF): SEEK_DATA -> -1 (ENXIO), SEEK_HOLE -> -1 (ENXIO)
 //!   * Offset 1048577 (past EOF): SEEK_DATA -> -1 (ENXIO), SEEK_HOLE -> -1 (ENXIO)
-//!   * Offset -1 (negative): SEEK_DATA -> -1 (EINVAL), SEEK_HOLE -> -1 (EINVAL)
+//!   * Offset -1 (negative): SEEK_DATA/SEEK_HOLE fail; the errno is reported
+//!     as a number so the oracle, not an assumption, names it
 //! - Pipe descriptor:
 //!   * SEEK_DATA -> -1 (ESPIPE)
 //!   * SEEK_HOLE -> -1 (ESPIPE)
@@ -99,8 +100,10 @@ fn main() {
             seek_hole_eof_enxio = heof == -1 && heof_err == libc::ENXIO,
             seek_data_past_eof_enxio = dpast == -1 && dpast_err == libc::ENXIO,
             seek_hole_past_eof_enxio = hpast == -1 && hpast_err == libc::ENXIO,
-            seek_data_negative_einval = dneg == -1 && dneg_err == libc::EINVAL,
-            seek_hole_negative_einval = hneg == -1 && hneg_err == libc::EINVAL,
+            seek_data_negative_fails = dneg == -1,
+            seek_data_negative_errno = dneg_err,
+            seek_hole_negative_fails = hneg == -1,
+            seek_hole_negative_errno = hneg_err,
             pipe_seek_data_espipe = pdata == -1 && pdata_err == libc::ESPIPE,
             pipe_seek_hole_espipe = phole == -1 && phole_err == libc::ESPIPE,
         );
