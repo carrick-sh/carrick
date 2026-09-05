@@ -498,11 +498,38 @@ pub fn const_resolver<F: Fn(u64) -> Option<*const u8>>(f: F) -> ConstFnResolver<
     ConstFnResolver(f)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct TableArena {
     base: u64,
     bytes: Vec<u8>,
     next_free: u64,
+    capacity: usize,
+}
+
+impl Clone for TableArena {
+    fn clone(&self) -> Self {
+        let mut bytes = Vec::with_capacity(self.capacity);
+        let prefix_len = (self.next_free as usize).min(self.bytes.len());
+        bytes.extend_from_slice(&self.bytes[..prefix_len]);
+        Self {
+            base: self.base,
+            bytes,
+            next_free: self.next_free,
+            capacity: self.capacity,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.base = source.base;
+        self.next_free = source.next_free;
+        self.capacity = source.capacity;
+        self.bytes.clear();
+        if self.bytes.capacity() < source.capacity {
+            self.bytes.reserve(source.capacity);
+        }
+        let prefix_len = (source.next_free as usize).min(source.bytes.len());
+        self.bytes.extend_from_slice(&source.bytes[..prefix_len]);
+    }
 }
 
 pub struct PageTableManager {
@@ -589,7 +616,7 @@ impl Clone for PageTableManager {
 }
 
 impl PageTableManager {
-    pub fn new(bytes: Vec<u8>, base: u64) -> Self {
+    pub fn new(mut bytes: Vec<u8>, base: u64) -> Self {
         let next_free = discover_next_free_spare(&bytes);
         let asid_scoped_leaves = terminal_descriptor(walk_descriptors(
             &bytes,
@@ -597,11 +624,15 @@ impl PageTableManager {
             crate::memory::LINUX_NULL_GUARD_END,
         )) & NON_GLOBAL
             != 0;
+        let capacity = bytes.len();
+        let next_free = next_free.min(capacity as u64);
+        bytes.truncate(next_free as usize);
         Self {
             arenas: vec![TableArena {
                 base,
                 bytes,
                 next_free,
+                capacity,
             }],
             asid_scoped_leaves,
             free_tables: Vec::new(),
@@ -625,6 +656,11 @@ impl PageTableManager {
     /// Guest-physical base addresses of all extension arenas attached to this manager.
     pub fn extension_arena_bases(&self) -> Vec<u64> {
         self.arenas[1..].iter().map(|a| a.base).collect()
+    }
+
+    /// Sum of the populated table bytes (`next_free`) across all arenas.
+    pub fn copied_bytes(&self) -> u64 {
+        self.arenas.iter().map(|a| a.next_free).sum()
     }
 
     /// Pop all extension arenas. Returns the bases of the retired extension
@@ -671,7 +707,7 @@ impl PageTableManager {
         if !new_base.is_multiple_of(PT_PAGE) {
             return Err(PageTableError::BadAddress);
         }
-        let Some(last_byte) = new_base.checked_add(self.arenas[0].bytes.len() as u64 - 1) else {
+        let Some(last_byte) = new_base.checked_add(self.arenas[0].capacity as u64 - 1) else {
             return Err(PageTableError::BadAddress);
         };
         if last_byte & !(PA_MASK_TABLE | (PT_PAGE - 1)) != 0 {
@@ -857,7 +893,11 @@ impl PageTableManager {
     /// Used by the boot-time ELF read-only-span pass, which edits the pristine
     /// `stage1_identity_page_tables` image before it is mapped into the guest.
     pub fn into_bytes(mut self) -> Vec<u8> {
-        self.arenas.remove(0).bytes
+        let mut primary = self.arenas.remove(0);
+        if primary.bytes.len() < primary.capacity {
+            primary.bytes.resize(primary.capacity, 0);
+        }
+        primary.bytes
     }
 
     fn read_desc(&self, loc: TableLocation) -> u64 {
@@ -988,6 +1028,7 @@ impl PageTableManager {
         for (i, &next_free) in journal.arena_next_frees.iter().enumerate() {
             if i < self.arenas.len() {
                 self.arenas[i].next_free = next_free;
+                self.arenas[i].bytes.truncate(next_free as usize);
             }
         }
         self.free_tables = journal.free_tables;
@@ -1015,8 +1056,9 @@ impl PageTableManager {
 
         for arena in &self.arenas {
             if let Some(host) = resolver.host_ptr_for_base(arena.base) {
+                let prefix_len = (arena.next_free as usize).min(arena.bytes.len());
                 unsafe {
-                    std::ptr::copy_nonoverlapping(arena.bytes.as_ptr(), host, arena.bytes.len());
+                    std::ptr::copy_nonoverlapping(arena.bytes.as_ptr(), host, prefix_len);
                 }
             }
         }
@@ -1037,11 +1079,11 @@ impl PageTableManager {
     /// Spare sub-table pool occupancy for diagnostics/tracing:
     /// `(in_use, free_list, capacity, arenas)` pages.
     pub fn pool_stats(&self) -> (u32, u32, u32, u32) {
-        let primary_capacity = (self.arenas[0].bytes.len() as u64 - SPARE_START_OFFSET) / PT_PAGE;
+        let primary_capacity = (self.arenas[0].capacity as u64 - SPARE_START_OFFSET) / PT_PAGE;
         let primary_bumped = (self.arenas[0].next_free - SPARE_START_OFFSET) / PT_PAGE;
         let ext_capacity: u64 = self.arenas[1..]
             .iter()
-            .map(|a| a.bytes.len() as u64 / PT_PAGE)
+            .map(|a| a.capacity as u64 / PT_PAGE)
             .sum();
         let ext_bumped: u64 = self.arenas[1..].iter().map(|a| a.next_free / PT_PAGE).sum();
         let capacity = primary_capacity + ext_capacity;
@@ -1067,10 +1109,13 @@ impl PageTableManager {
             if self.arenas.iter().any(|mine| mine.base == arena.base) {
                 continue;
             }
+            let mut bytes = Vec::with_capacity(arena.capacity);
+            bytes.resize(PT_PAGE as usize, 0);
             self.arenas.push(TableArena {
                 base: arena.base,
-                bytes: vec![0u8; arena.bytes.len()],
+                bytes,
                 next_free: PT_PAGE,
+                capacity: arena.capacity,
             });
         }
     }
@@ -1249,15 +1294,23 @@ impl PageTableManager {
         if let Some(pa) = self.free_tables.pop() {
             return Ok(pa);
         }
-        if self.arenas[0].next_free + PT_PAGE <= self.arenas[0].bytes.len() as u64 {
+        if self.arenas[0].next_free + PT_PAGE <= self.arenas[0].capacity as u64 {
             let off = self.arenas[0].next_free;
             self.arenas[0].next_free += PT_PAGE;
+            let needed = self.arenas[0].next_free as usize;
+            if self.arenas[0].bytes.len() < needed {
+                self.arenas[0].bytes.resize(needed, 0);
+            }
             return Ok(self.arenas[0].base + off);
         }
         for arena in &mut self.arenas[1..] {
-            if arena.next_free + PT_PAGE <= arena.bytes.len() as u64 {
+            if arena.next_free + PT_PAGE <= arena.capacity as u64 {
                 let off = arena.next_free;
                 arena.next_free += PT_PAGE;
+                let needed = arena.next_free as usize;
+                if arena.bytes.len() < needed {
+                    arena.bytes.resize(needed, 0);
+                }
                 return Ok(arena.base + off);
             }
         }
@@ -1270,10 +1323,14 @@ impl PageTableManager {
             && let Some(gpa) = source.take_arena()
         {
             let base = gpa.0;
+            let capacity = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
+            let mut bytes = Vec::with_capacity(capacity);
+            bytes.resize(PT_PAGE as usize, 0);
             let arena = TableArena {
                 base,
-                bytes: vec![0u8; crate::memory::LINUX_PAGE_TABLES_SIZE as usize],
+                bytes,
                 next_free: PT_PAGE,
+                capacity,
             };
             self.arenas.push(arena);
             return Ok(base);
@@ -2142,7 +2199,7 @@ impl PageTableManager {
     pub fn spare_tables_available(&self) -> u64 {
         let mut tail = 0u64;
         for arena in &self.arenas {
-            tail += (arena.bytes.len() as u64).saturating_sub(arena.next_free) / PT_PAGE;
+            tail += (arena.capacity as u64).saturating_sub(arena.next_free) / PT_PAGE;
         }
         self.free_tables.len() as u64 + tail
     }
@@ -2452,7 +2509,7 @@ mod tests {
                 "prefix of {length} edit(s): coalesce policy state diverged"
             );
             assert_eq!(
-                &host[..],
+                &host[..oracle.as_bytes().len()],
                 oracle.as_bytes(),
                 "prefix of {length} edit(s): host backing was not restored to the pre-image"
             );
@@ -2577,17 +2634,59 @@ mod tests {
             .expect("split a block so the source has allocator state to carry");
 
         let mut recycled = manager();
-        let capacity_before = recycled.as_bytes().len();
+        let capacity_before = recycled.arenas[0].capacity;
+        let buf_cap_before = recycled.arenas[0].bytes.capacity();
         recycled.clone_from(&source);
 
         let fresh = source.clone();
         assert_eq!(recycled.as_bytes(), fresh.as_bytes());
         assert_eq!(recycled.base(), fresh.base());
         assert_eq!(recycled.pool_stats(), fresh.pool_stats());
-        assert_eq!(
-            recycled.as_bytes().len(),
-            capacity_before,
+        assert_eq!(recycled.arenas[0].capacity, capacity_before);
+        assert!(
+            recycled.arenas[0].bytes.capacity() >= buf_cap_before,
             "both managers cover the same region, so no reallocation is needed"
+        );
+    }
+
+    #[test]
+    fn clone_copies_only_populated_prefix_and_preserves_capacity() {
+        let mut source = manager();
+        source
+            .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true, None)
+            .expect("split a block so the source has allocator state to carry");
+
+        let populated = source.copied_bytes();
+        assert!(
+            populated < source.arenas[0].capacity as u64,
+            "source should only be partially populated: populated={populated} vs cap={}",
+            source.arenas[0].capacity
+        );
+        assert_eq!(source.arenas[0].bytes.len(), populated as usize);
+
+        // pa_to_loc within populated range succeeds; right at next_free fails closed
+        assert!(
+            source
+                .pa_to_loc(source.base() + populated - PT_PAGE)
+                .is_ok()
+        );
+        assert_eq!(
+            source.pa_to_loc(source.base() + populated).unwrap_err(),
+            PageTableError::BadAddress
+        );
+
+        let cloned = source.clone();
+        assert_eq!(cloned.copied_bytes(), populated);
+        assert_eq!(cloned.arenas[0].bytes.len(), populated as usize);
+        assert_eq!(cloned.arenas[0].capacity, source.arenas[0].capacity);
+        assert!(
+            cloned.arenas[0].bytes.capacity() >= source.arenas[0].capacity,
+            "cloned arena must preserve full allocation capacity"
+        );
+        assert_eq!(
+            cloned.pa_to_loc(cloned.base() + populated).unwrap_err(),
+            PageTableError::BadAddress,
+            "clone must also fail closed beyond populated prefix"
         );
     }
 
@@ -3517,11 +3616,15 @@ mod tests {
     #[test]
     fn quiesced_snapshot_restore_replaces_every_live_table_byte() {
         let snapshot = manager();
-        let mut live = vec![0xa5; snapshot.as_bytes().len()];
+        let mut live = vec![0xa5; snapshot.arenas[0].capacity];
 
         unsafe { snapshot.restore_quiesced_snapshot_to_host((snapshot.base(), live.as_mut_ptr())) };
 
-        assert_eq!(live, snapshot.as_bytes());
+        assert_eq!(&live[..snapshot.as_bytes().len()], snapshot.as_bytes());
+        assert!(
+            live[snapshot.as_bytes().len()..].iter().all(|&b| b == 0xa5),
+            "unpopulated tail should be untouched"
+        );
     }
 
     #[test]
@@ -4239,8 +4342,9 @@ mod tests {
         // Add a second extension arena to parent so parent has 3 arenas (2 extension arenas)
         parent.arenas.push(TableArena {
             base: ext2_base.0,
-            bytes: vec![0u8; LINUX_PAGE_TABLES_SIZE as usize],
+            bytes: vec![0u8; SPARE_START_OFFSET as usize],
             next_free: SPARE_START_OFFSET,
+            capacity: LINUX_PAGE_TABLES_SIZE as usize,
         });
         assert_eq!(parent.pool_stats().3, 3, "parent has 3 arenas");
 
