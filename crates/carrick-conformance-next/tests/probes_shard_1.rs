@@ -19,7 +19,7 @@ use common::SHARD_1_PROBES;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_1_PROBE_COUNT: usize = 142;
+const CACHED_SHARD_1_PROBE_COUNT: usize = 140;
 
 /// Shard 1 subset of baseline expected oracle mismatches for musl.
 pub const MUSL_SHARD_1_EXPECTED_GAPS: &[&str] = common::MUSL_BASELINE_GAPS;

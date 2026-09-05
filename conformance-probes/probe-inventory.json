@@ -2184,6 +2184,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "socketpartialsend": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "sockoptdomainproto": {
     "class": "conformance",
     "excluded": false,
