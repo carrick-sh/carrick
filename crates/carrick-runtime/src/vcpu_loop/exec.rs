@@ -1838,6 +1838,28 @@ where
                     asid: binding.asid.raw(),
                 },
             );
+            // The exec rebuild starts a fresh stage-1 manager for the
+            // replacement mm; its extension arenas must be leased against the
+            // REPLACEMENT lease (the old source belongs to the retired mm and
+            // would return live slots at that mm's teardown). Without this the
+            // exec'd process could never grow past one arena — pagetablegrow
+            // through `/bin/sh -c` died at 87 mappings, and CPython's
+            // recursion-limit compile hit `OutOfTables (arenas=1)`.
+            let arena_source = process
+                .mm_resources()
+                .table_arena_source(committed_context.task().key())
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "committed HVPatch exec has no replacement table arena lease: {error}"
+                    ))
+                })?;
+            engine
+                .install_stage1_table_arena_source(arena_source)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "install replacement HVPatch table arena source: {error}"
+                    ))
+                })?;
             #[cfg(test)]
             self.fail_exec_terminal_context_for_test(
                 ExecTerminalContextFailpoint::InventoryActivation,

@@ -25100,9 +25100,12 @@ fn perform_foreign_cow_transaction(
         requested.binding.stage1_root,
     );
     if let Err(error) = page_table_result {
-        if let Some(snapshot) = rollback.take() {
+        if let Some(mut snapshot) = rollback.take() {
             let recycled_manager = {
                 let mut tables = page_tables_authority.lock();
+                if let Some(live) = tables.as_mut() {
+                    snapshot.adopt_live_extension_state(live);
+                }
                 unsafe { snapshot.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
                 tables.replace(snapshot)
             };
@@ -25118,10 +25121,13 @@ fn perform_foreign_cow_transaction(
         }
         return Err(error);
     }
-    let rollback = rollback.unwrap_or_else(|| std::process::abort());
+    let mut rollback = rollback.unwrap_or_else(|| std::process::abort());
     if let Err(error) = invalidator.invalidate_exact_asid(binding, deadline) {
         let recycled_manager = {
             let mut tables = page_tables_authority.lock();
+            if let Some(live) = tables.as_mut() {
+                rollback.adopt_live_extension_state(live);
+            }
             unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
             tables.replace(rollback)
         };
@@ -25137,6 +25143,9 @@ fn perform_foreign_cow_transaction(
     if let Err(error) = foreign_cow_failpoint(&lease.state, 4) {
         let recycled_manager = {
             let mut tables = page_tables_authority.lock();
+            if let Some(live) = tables.as_mut() {
+                rollback.adopt_live_extension_state(live);
+            }
             unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
             tables.replace(rollback)
         };
@@ -29790,10 +29799,11 @@ fn sparse_mmap_stage1_error(
 ) -> TrapError {
     let (in_use, free, capacity, arenas) = manager.pool_stats();
     let (multi_vcpu, exclusive, reclaim_pending) = manager.coalesce_policy();
+    let source = manager.has_arena_source();
     TrapError::Hypervisor(format!(
         "plan sparse HVPatch mmap {span} stage-1 output: {error:?} \
-         (in_use={in_use} free={free} capacity={capacity} arenas={arenas} multi_vcpu={multi_vcpu} \
-         exclusive={exclusive} reclaim_pending={reclaim_pending})"
+         (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
+         multi_vcpu={multi_vcpu} exclusive={exclusive} reclaim_pending={reclaim_pending})"
     ))
 }
 
@@ -42820,10 +42830,11 @@ impl HvfTaskState {
                 // refused permission to sweep.
                 let (in_use, free, capacity, arenas) = page_tables.pool_stats();
                 let (multi_vcpu, exclusive, reclaim_pending) = page_tables.coalesce_policy();
+                let source = page_tables.has_arena_source();
                 TrapError::Hypervisor(format!(
                     "map hvpatch child VA 0x{:x} to global/root-slot IPA 0x{ipa:x}: {error:?} \
-                     (in_use={in_use} free={free} capacity={capacity} arenas={arenas} multi_vcpu={multi_vcpu} \
-                     exclusive={exclusive} reclaim_pending={reclaim_pending})",
+                     (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
+                     multi_vcpu={multi_vcpu} exclusive={exclusive} reclaim_pending={reclaim_pending})",
                     mapping.start
                 ))
             })?;
