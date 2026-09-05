@@ -1849,6 +1849,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "ptyisig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "ptypair": {
     "class": "conformance",
     "excluded": false,

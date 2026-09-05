@@ -758,7 +758,7 @@ fn forward_input_bytes(
 
 #[derive(Default)]
 struct RelayLineDiscipline {
-    literal_next: bool,
+    inner: crate::kernel::tty::LineDiscipline,
 }
 
 impl RelayLineDiscipline {
@@ -768,52 +768,14 @@ impl RelayLineDiscipline {
         slave_fd: RawFd,
         pending_echo: &mut VecDeque<u8>,
     ) -> Vec<u8> {
-        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(slave_fd, &mut termios) } != 0
-            || termios.c_lflag & libc::ISIG == 0
-        {
-            return bytes.to_vec();
-        }
-        let controls = [
-            (termios.c_cc[libc::VINTR], crate::linux_abi::LINUX_SIGINT),
-            (termios.c_cc[libc::VQUIT], crate::linux_abi::LINUX_SIGQUIT),
-            (termios.c_cc[libc::VSUSP], crate::linux_abi::LINUX_SIGTSTP),
-        ];
-        let mut forwarded = Vec::with_capacity(bytes.len());
-        for byte in bytes {
-            if self.literal_next {
-                forwarded.push(*byte);
-                self.literal_next = false;
-                continue;
-            }
-            if termios.c_lflag & (libc::ICANON | libc::IEXTEN) == (libc::ICANON | libc::IEXTEN)
-                && termios.c_cc[libc::VLNEXT] != 0xff
-                && *byte == termios.c_cc[libc::VLNEXT]
-            {
-                // Preserve VLNEXT itself so the host line discipline quotes
-                // the following byte; suppress only Carrick's parallel signal
-                // recognition for that following byte.
-                forwarded.push(*byte);
-                self.literal_next = true;
-                continue;
-            }
-            if let Some((_, signal)) = controls
-                .iter()
-                .find(|(control, _)| *control != 0xff && byte == control)
-            {
-                if termios.c_lflag & libc::NOFLSH == 0 {
-                    forwarded.clear();
-                    unsafe {
-                        libc::tcflush(slave_fd, libc::TCIOFLUSH);
-                    }
-                }
-                pending_echo.extend(signal_control_echo(&termios, *byte));
-                crate::kernel::tty::route_foreground_signal(*signal);
-            } else {
-                forwarded.push(*byte);
-            }
-        }
-        forwarded
+        self.inner.route_control_input(
+            bytes,
+            slave_fd,
+            crate::kernel::tty::TtyKey::Launch,
+            |_signal, byte, termios| {
+                pending_echo.extend(signal_control_echo(termios, byte));
+            },
+        )
     }
 }
 

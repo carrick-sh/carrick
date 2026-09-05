@@ -224,8 +224,8 @@ fn test_shard_0_inventory() {
     selected_names.sort();
     assert_eq!(
         selected_names.len(),
-        466,
-        "expected exactly 466 conformance generic probes in inventory"
+        467,
+        "expected exactly 467 conformance generic probes in inventory"
     );
 
     let derived_shard_0: Vec<&str> = selected_names

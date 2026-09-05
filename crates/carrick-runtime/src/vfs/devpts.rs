@@ -100,6 +100,7 @@ impl PtyTable {
         if self.controlling_index == Some(n) {
             self.controlling_index = None;
         }
+        crate::kernel::tty::detach(crate::kernel::tty::TtyKey::Pty(n));
     }
 
     /// Remove entry `n` only if `pid` opened it. A forked child that closes
@@ -111,6 +112,7 @@ impl PtyTable {
             if self.controlling_index == Some(n) {
                 self.controlling_index = None;
             }
+            crate::kernel::tty::detach(crate::kernel::tty::TtyKey::Pty(n));
         }
     }
 }
