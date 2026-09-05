@@ -309,7 +309,6 @@ pub struct DebugFileTableRow {
     pub next_fd: i32,
     pub stdio_cloexec: [bool; 3],
     pub closed_stdio: [bool; 3],
-    pub splice_pushback_description_ids: Vec<u64>,
     pub epoll_index_fds: Vec<i32>,
 }
 
@@ -785,11 +784,6 @@ impl KernelDebugSnapshot {
                         next_fd: row.next_fd,
                         stdio_cloexec: row.stdio_cloexec,
                         closed_stdio: row.closed_stdio,
-                        splice_pushback_description_ids: row
-                            .splice_pushback_description_ids
-                            .iter()
-                            .map(|id| id.raw())
-                            .collect(),
                         epoll_index_fds: row.epoll_index_fds.iter().map(|fd| fd.raw()).collect(),
                     })
                     .collect()

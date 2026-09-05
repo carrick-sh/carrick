@@ -5,11 +5,11 @@
     "create_install": 63,
     "epoll_wait": 17,
     "inspect_misc": 123,
-    "lifecycle": 7,
+    "lifecycle": 6,
     "mapping_ring": 5,
     "read_attempt": 9,
     "slot_description_mutation": 11,
-    "stream_transfer": 15,
+    "stream_transfer": 11,
     "write_attempt": 15
   }
 }

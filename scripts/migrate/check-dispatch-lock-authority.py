@@ -63,7 +63,6 @@ FILE_TABLE_INTERNAL_FIELDS = frozenset(
         "stdio_cloexec",
         "closed_stdio",
         "fd_open_paths",
-        "splice_pushback",
         "epoll_fds",
     }
 )

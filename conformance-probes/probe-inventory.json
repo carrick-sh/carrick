@@ -1789,6 +1789,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "ptyexitrescue": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "ptyfionbio": {
     "class": "conformance",
     "excluded": false,

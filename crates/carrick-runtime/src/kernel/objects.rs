@@ -946,6 +946,7 @@ pub(crate) struct DescriptionCommon {
     /// `memfd_create(2)`/`F_ADD_SEALS` seal set. `None` = this description does
     /// not support sealing (`F_GET_SEALS`/`F_ADD_SEALS` → `EINVAL`).
     seals: Arc<Mutex<Option<u32>>>,
+    splice_pushback: Mutex<crate::dispatch::SplicePushback>,
 }
 
 impl DescriptionCommon {
@@ -958,6 +959,7 @@ impl DescriptionCommon {
             secretmem: AtomicBool::new(false),
             owner: Mutex::new(CapturedAsyncIoOwner::default()),
             seals: Arc::new(Mutex::new(None)),
+            splice_pushback: Mutex::new(crate::dispatch::SplicePushback::default()),
         }
     }
 
@@ -970,6 +972,7 @@ impl DescriptionCommon {
             secretmem: AtomicBool::new(false),
             owner: Mutex::new(CapturedAsyncIoOwner::default()),
             seals,
+            splice_pushback: Mutex::new(crate::dispatch::SplicePushback::default()),
         }
     }
 
@@ -1056,6 +1059,14 @@ impl DescriptionCommon {
 
     pub(crate) fn set_seals(&self, seals: Option<u32>) {
         *self.seals.lock() = seals;
+    }
+
+    pub(crate) fn splice_pushback(&self) -> &Mutex<crate::dispatch::SplicePushback> {
+        &self.splice_pushback
+    }
+
+    pub(crate) fn clear_splice_pushback(&self) {
+        *self.splice_pushback.lock() = crate::dispatch::SplicePushback::default();
     }
 }
 
@@ -1309,6 +1320,10 @@ impl FileDescription {
         self.common.fd_refs()
     }
 
+    pub(crate) fn clear_splice_pushback(&self) {
+        self.common.clear_splice_pushback();
+    }
+
     pub fn add_epoll_interest(
         self: &Arc<Self>,
         target: &Arc<Self>,
@@ -1539,7 +1554,6 @@ pub(super) struct FileTableStateSnapshot {
     pub(super) stdio_cloexec: [bool; 3],
     pub(super) closed_stdio: [bool; 3],
     pub(super) fd_open_paths: Vec<(FileSlotNumber, String)>,
-    pub(super) splice_pushback_description_ids: Vec<FileDescriptionId>,
     pub(super) epoll_fds: Vec<FileSlotNumber>,
 }
 
@@ -1717,7 +1731,6 @@ pub struct FileTable {
     stdio_cloexec: Mutex<[bool; 3]>,
     closed_stdio: Mutex<[bool; 3]>,
     fd_open_paths: RwLock<HashMap<i32, String>>,
-    splice_pushback: Mutex<HashMap<FileDescriptionId, Arc<Mutex<crate::dispatch::SplicePushback>>>>,
     epoll_fds: RwLock<BTreeSet<i32>>,
     epoll_wake_registry: crate::dispatch::EpollWakeRegistry,
     functional_gate: Arc<FileTableFunctionalGate>,
@@ -1735,7 +1748,6 @@ impl FileTable {
             stdio_cloexec: Mutex::new([false; 3]),
             closed_stdio: Mutex::new([false; 3]),
             fd_open_paths: RwLock::new(HashMap::new()),
-            splice_pushback: Mutex::new(HashMap::new()),
             epoll_fds: RwLock::new(BTreeSet::new()),
             epoll_wake_registry: crate::dispatch::new_epoll_wake_registry(),
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
@@ -1758,7 +1770,6 @@ impl FileTable {
             stdio_cloexec: Mutex::new(*parent.stdio_cloexec.lock()),
             closed_stdio: Mutex::new(*parent.closed_stdio.lock()),
             fd_open_paths: RwLock::new(parent.fd_open_paths.read().clone()),
-            splice_pushback: Mutex::new(parent.splice_pushback.lock().clone()),
             epoll_fds: RwLock::new(parent.epoll_fds.read().clone()),
             epoll_wake_registry,
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
@@ -1797,20 +1808,6 @@ impl FileTable {
             .iter()
             .filter_map(|(fd, path)| open_files.contains_key(fd).then_some((*fd, path.clone())))
             .collect();
-        let surviving_descriptions = open_files
-            .values()
-            .map(|slot| slot.description.id())
-            .collect::<BTreeSet<_>>();
-        let splice_pushback = caller
-            .splice_pushback
-            .lock()
-            .iter()
-            .filter_map(|(description, pushback)| {
-                surviving_descriptions
-                    .contains(description)
-                    .then_some((*description, Arc::clone(pushback)))
-            })
-            .collect();
         let epoll_fds = caller
             .epoll_fds
             .read()
@@ -1825,7 +1822,6 @@ impl FileTable {
             stdio_cloexec: Mutex::new([false; 3]),
             closed_stdio: Mutex::new(closed_stdio),
             fd_open_paths: RwLock::new(fd_open_paths),
-            splice_pushback: Mutex::new(splice_pushback),
             epoll_fds: RwLock::new(epoll_fds),
             epoll_wake_registry,
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
@@ -2038,15 +2034,6 @@ impl FileTable {
         }
     }
 
-    pub(crate) fn lock_splice_pushback(
-        &self,
-    ) -> FileTableMutexGuard<
-        '_,
-        HashMap<FileDescriptionId, Arc<Mutex<crate::dispatch::SplicePushback>>>,
-    > {
-        self.mutex_write(&self.splice_pushback)
-    }
-
     pub(crate) fn read_epoll_fds(&self) -> RwLockReadGuard<'_, BTreeSet<i32>> {
         self.epoll_fds.read()
     }
@@ -2126,7 +2113,6 @@ impl FileTable {
         let stdio_cloexec = *self.stdio_cloexec.try_lock_until(deadline)?;
         let closed_stdio = *self.closed_stdio.try_lock_until(deadline)?;
         let fd_open_paths = self.fd_open_paths.try_read_until(deadline)?;
-        let splice_pushback = self.splice_pushback.try_lock_until(deadline)?;
         let epoll_fds = self.epoll_fds.try_read_until(deadline)?;
 
         let to_number = |fd| FileSlotNumber::for_open_fd(fd).ok();
@@ -2145,9 +2131,6 @@ impl FileTable {
             numbers.sort_unstable();
             Some(numbers)
         };
-        let mut splice_pushback_description_ids =
-            splice_pushback.keys().copied().collect::<Vec<_>>();
-        splice_pushback_description_ids.sort_unstable();
 
         Some(FileTableStateSnapshot {
             revision,
@@ -2157,7 +2140,6 @@ impl FileTable {
             stdio_cloexec,
             closed_stdio,
             fd_open_paths: paths,
-            splice_pushback_description_ids,
             epoll_fds: sorted_numbers(epoll_fds.iter().copied().collect())?,
         })
     }
@@ -9081,7 +9063,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_copies_splice_index_while_sharing_description_pushback_cell() {
+    fn fork_shares_description_pushback_cell() {
         let ids = ObjectIdRegistry::new();
         let parent = FileTable::new(ids.file_table_id().expect("parent table ID"));
         let description = Arc::new(FileDescription::regular(
@@ -9092,20 +9074,16 @@ mod tests {
             Arc::clone(&description),
             false,
         );
-        let queue = Arc::new(Mutex::new(crate::dispatch::SplicePushback::default()));
-        parent
-            .splice_pushback
-            .lock()
-            .insert(description.id(), Arc::clone(&queue));
 
         let child = FileTable::for_fork_copy(ids.file_table_id().expect("child table ID"), &parent);
-        let child_queue = child
-            .splice_pushback
-            .lock()
-            .get(&description.id())
-            .cloned()
-            .expect("child pushback cell");
-        assert!(Arc::ptr_eq(&queue, &child_queue));
+        let child_slot = child
+            .slot(FileSlotNumber::for_open_fd(3).expect("fd"))
+            .expect("child slot");
+        assert!(Arc::ptr_eq(&description, &child_slot.description));
+        assert!(std::ptr::eq(
+            description.common().splice_pushback(),
+            child_slot.description.common().splice_pushback()
+        ));
     }
 
     #[test]
