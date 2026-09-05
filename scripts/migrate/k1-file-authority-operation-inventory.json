@@ -9857,7 +9857,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/proc.rs",
-      "line": 6663,
+      "line": 6812,
       "categories": [
         "mapping"
       ],
@@ -13701,7 +13701,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 805,
+      "line": 827,
       "categories": [
         "mapping"
       ],
@@ -13710,7 +13710,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 916,
+      "line": 938,
       "categories": [
         "mapping"
       ],
@@ -13719,7 +13719,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 928,
+      "line": 950,
       "categories": [
         "mapping"
       ],
@@ -13728,7 +13728,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 984,
+      "line": 1007,
       "categories": [
         "mapping"
       ],
@@ -13737,7 +13737,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1577,
+      "line": 1609,
       "categories": [
         "mapping"
       ],
@@ -13746,7 +13746,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1590,
+      "line": 1622,
       "categories": [
         "mapping"
       ],
@@ -13755,7 +13755,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1602,
+      "line": 1634,
       "categories": [
         "mapping"
       ],
@@ -13764,7 +13764,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1603,
+      "line": 1635,
       "categories": [
         "mapping"
       ],
@@ -13773,7 +13773,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1634,
+      "line": 1666,
       "categories": [
         "mapping"
       ],
@@ -13782,7 +13782,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1692,
+      "line": 1724,
       "categories": [
         "mapping"
       ],
@@ -13791,25 +13791,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1714,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping: carrick_hal::MappingId,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1725,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".field(\"mapping\", &self.mapping)",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1742,
+      "line": 1746,
       "categories": [
         "mapping"
       ],
@@ -13822,12 +13804,30 @@
       "categories": [
         "mapping"
       ],
+      "text": ".field(\"mapping\", &self.mapping)",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "line": 1774,
+      "categories": [
+        "mapping"
+      ],
       "text": "mapping: carrick_hal::MappingId,",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1784,
+      "line": 1789,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping: carrick_hal::MappingId,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "line": 1816,
       "categories": [
         "mapping"
       ],
@@ -13836,7 +13836,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1785,
+      "line": 1817,
       "categories": [
         "mapping"
       ],
@@ -13845,7 +13845,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1829,
+      "line": 1861,
       "categories": [
         "mapping"
       ],
@@ -13854,7 +13854,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1830,
+      "line": 1862,
       "categories": [
         "mapping"
       ],
@@ -13863,7 +13863,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1933,
+      "line": 1965,
       "categories": [
         "mapping"
       ],
@@ -13872,7 +13872,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1938,
+      "line": 1970,
       "categories": [
         "mapping"
       ],
@@ -13881,7 +13881,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1941,
+      "line": 1973,
       "categories": [
         "mapping"
       ],
@@ -13890,7 +13890,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 1982,
+      "line": 2014,
       "categories": [
         "mapping"
       ],
@@ -13899,7 +13899,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2059,
+      "line": 2091,
       "categories": [
         "mapping"
       ],
@@ -13908,7 +13908,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2092,
+      "line": 2124,
       "categories": [
         "mapping"
       ],
@@ -13917,7 +13917,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2136,
+      "line": 2168,
       "categories": [
         "mapping"
       ],
@@ -13926,7 +13926,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2151,
+      "line": 2183,
       "categories": [
         "mapping"
       ],
@@ -13935,7 +13935,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2315,
+      "line": 2347,
       "categories": [
         "mapping"
       ],
@@ -13944,7 +13944,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2323,
+      "line": 2355,
       "categories": [
         "mapping"
       ],
@@ -13953,29 +13953,11 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2337,
+      "line": 2369,
       "categories": [
         "mapping"
       ],
       "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2345,
-      "categories": [
-        "mapping"
-      ],
-      "text": "(mapping, frame, revision)",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2375,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let (mapping, frame, inventory_revision) =",
       "scope_kind": "test_or_definition"
     },
     {
@@ -13984,39 +13966,12 @@
       "categories": [
         "mapping"
       ],
-      "text": "backend.bind_inventory_mapping(mapping, inventory_revision);",
+      "text": "(mapping, frame, revision)",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2387,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2399,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2413,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2546,
+      "line": 2407,
       "categories": [
         "mapping"
       ],
@@ -14025,7 +13980,16 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2556,
+      "line": 2409,
+      "categories": [
+        "mapping"
+      ],
+      "text": "backend.bind_inventory_mapping(mapping, inventory_revision);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "line": 2419,
       "categories": [
         "mapping"
       ],
@@ -14034,7 +13998,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 2570,
+      "line": 2431,
       "categories": [
         "mapping"
       ],
@@ -14043,7 +14007,43 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3460,
+      "line": 2445,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "line": 2578,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let (mapping, frame, inventory_revision) =",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "line": 2588,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "line": 2602,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
+      "line": 3492,
       "categories": [
         "mapping"
       ],
@@ -14052,7 +14052,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3470,
+      "line": 3502,
       "categories": [
         "mapping"
       ],
@@ -14061,7 +14061,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3484,
+      "line": 3516,
       "categories": [
         "mapping"
       ],
@@ -14070,7 +14070,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3506,
+      "line": 3538,
       "categories": [
         "mapping"
       ],
@@ -14079,7 +14079,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3527,
+      "line": 3559,
       "categories": [
         "mapping"
       ],
@@ -14088,7 +14088,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3542,
+      "line": 3574,
       "categories": [
         "mapping"
       ],
@@ -14097,7 +14097,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3569,
+      "line": 3601,
       "categories": [
         "mapping"
       ],
@@ -14106,7 +14106,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3579,
+      "line": 3611,
       "categories": [
         "mapping"
       ],
@@ -14115,7 +14115,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3593,
+      "line": 3625,
       "categories": [
         "mapping"
       ],
@@ -14124,7 +14124,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/mm_access.rs",
-      "line": 3610,
+      "line": 3642,
       "categories": [
         "mapping"
       ],
