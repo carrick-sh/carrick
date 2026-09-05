@@ -1,0 +1,6 @@
+4c604c2acbae09b7
+all_scattered_mappings_succeed=true
+mappings_read_back_zero=true
+mappings_hold_written_byte=true
+unmap_all_ok=true
+remap_after_unmap_ok=true
