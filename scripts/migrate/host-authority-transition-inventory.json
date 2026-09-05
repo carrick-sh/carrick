@@ -13153,18 +13153,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:3698 in `bootstrap_one_task_binding`, the host result from `std::process::id` determines the guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:3703 in `bootstrap_one_task_binding`, the host result from `std::process::id` determines the guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`.",
     "review_id": "HA-000495",
     "source": {
-      "byte_end": 140769,
-      "byte_start": 140753,
+      "byte_end": 141077,
+      "byte_start": 141061,
       "column": 38,
       "column_end": 54,
       "column_start": 38,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3698,
-      "line_end": 3698,
-      "line_start": 3698
+      "line": 3703,
+      "line_end": 3703,
+      "line_start": 3703
     }
   },
   {
@@ -13180,18 +13180,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:5320 in `reset_one_task_kernel_binding_for_current_process`, the host result from `std::process::id` determines the guest fork-child identity in the one-task adapter used by `reset_one_task_kernel_binding_for_current_process`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:5325 in `reset_one_task_kernel_binding_for_current_process`, the host result from `std::process::id` determines the guest fork-child identity in the one-task adapter used by `reset_one_task_kernel_binding_for_current_process`.",
     "review_id": "HA-000496",
     "source": {
-      "byte_end": 202952,
-      "byte_start": 202936,
+      "byte_end": 203260,
+      "byte_start": 203244,
       "column": 42,
       "column_end": 58,
       "column_start": 42,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5320,
-      "line_end": 5320,
-      "line_start": 5320
+      "line": 5325,
+      "line_end": 5325,
+      "line_start": 5325
     }
   },
   {
@@ -13207,18 +13207,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:5804 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:5809 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
     "review_id": "HA-000497",
     "source": {
-      "byte_end": 224340,
-      "byte_start": 224324,
+      "byte_end": 224648,
+      "byte_start": 224632,
       "column": 32,
       "column_end": 48,
       "column_start": 32,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5804,
-      "line_end": 5804,
-      "line_start": 5804
+      "line": 5809,
+      "line_end": 5809,
+      "line_start": 5809
     }
   },
   {
@@ -13234,18 +13234,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:7729 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:7734 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 309211,
-      "byte_start": 309195,
+      "byte_end": 309519,
+      "byte_start": 309503,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7729,
-      "line_end": 7729,
-      "line_start": 7729
+      "line": 7734,
+      "line_end": 7734,
+      "line_start": 7734
     }
   },
   {
@@ -13261,18 +13261,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:7927 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:7932 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 317067,
-      "byte_start": 317051,
+      "byte_end": 317375,
+      "byte_start": 317359,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7927,
-      "line_end": 7927,
-      "line_start": 7927
+      "line": 7932,
+      "line_end": 7932,
+      "line_start": 7932
     }
   },
   {
