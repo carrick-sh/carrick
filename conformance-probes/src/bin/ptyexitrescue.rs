@@ -60,6 +60,10 @@ unsafe fn open_pty_pair() -> Option<(i32, i32)> {
         return None;
     }
     tio.c_lflag &= !((libc::ICANON | libc::ECHO) as libc::tcflag_t);
+    // Raw output too: the line discipline's ONLCR would otherwise turn the
+    // payload's trailing '\n' into "\r\n" on the master side (the first
+    // Docker bless read `payload_intact=false` on Linux for exactly that).
+    tio.c_oflag &= !(libc::OPOST as libc::tcflag_t);
     if libc::tcsetattr(slave, libc::TCSANOW, &tio) != 0 {
         libc::close(slave);
         libc::close(master);
