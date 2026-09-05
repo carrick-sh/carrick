@@ -15,6 +15,15 @@ use std::collections::BTreeMap;
 
 pub struct RegrtestParser;
 
+/// Determinant of every cached regrtest oracle. The cache stores PARSED
+/// outcomes, not the raw transcript, so a parser that recognises more (or
+/// different) assertion lines silently disagrees with every committed row: the
+/// timed/multiline extension surfaced 21 phantom `cpython-subprocess`
+/// regressions whose oracle ids were merely `absent` under the old parse. Bump
+/// this whenever the recognised id set or outcome mapping changes; the key
+/// change forces a deliberate `--refresh-oracle` instead of a false verdict.
+pub const PARSER_FINGERPRINT: &str = "regrtest-v2-timed-multiline";
+
 const LINE: &str = r"^(?:\d+(?:\.\d+)?s )?(\S+) \(([\w.]+)\)(?: \[\d+\])? \.\.\.(?: (.*))?$";
 const HEADER_LINE: &str = r"^(?:\d+(?:\.\d+)?s )?(\S+) \(([\w.]+)\)(?: \[\d+\])?$";
 const CONT_LINE: &str = r"^.* \.\.\.(?: (.*))?$";
