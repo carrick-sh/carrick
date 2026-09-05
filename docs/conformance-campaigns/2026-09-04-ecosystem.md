@@ -1283,3 +1283,10 @@ include the harness launch shape (`sh -c 'base64 -d > /tmp/p && … && /tmp/p'`)
 and a fork+exec (`sh -c '/bin/true'`). Workers `mmap-lazy` and
 `fork-table-copy` branched from the broken base; their fork/exec
 measurements are void until they rebase.
+- **Gate on the fixed main** (`696d0db59`): shards 0 and 2 green, shard 1
+  red on `futexforkrequeue` only (requeue/wake counts and a timeout under
+  the gate's load; 3/3 MATCH standalone). The oracle expects zero timeouts,
+  so this is a load-sensitive verdict, not a match-by-luck: measured under
+  identical synthetic load on the fixed main and on the pre-Stage1Authority
+  binary to decide whether it is a regression or a pre-existing
+  wall-clock-vs-scheduling flaw in the wake path (results below).
