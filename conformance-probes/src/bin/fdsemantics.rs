@@ -11,6 +11,10 @@
 //! 8. memfd_create with MFD_ALLOW_SEALING starts with 0 seals.
 //! 9. memfd_create with MFD_ALLOW_SEALING allows adding F_SEAL_WRITE.
 //! 10. Adding F_SEAL_SEAL blocks subsequent F_ADD_SEALS with EPERM.
+//! 11. Reopening memfd via /proc/self/fd/N with O_RDONLY shares seals.
+//! 12. F_ADD_SEALS on the O_RDONLY reopened memfd fails with EPERM.
+//! 13. write(2) on the O_RDONLY reopened memfd fails with EBADF.
+//! 14. Reopening memfd via /proc/self/fd/N with O_RDWR allows F_ADD_SEALS.
 //!
 //! Expected Linux output:
 //!   getfl_nonblock_set=true
@@ -23,6 +27,10 @@
 //!   allowseal_get_seals_zero=true
 //!   allowseal_add_write_ok=true
 //!   allowseal_add_after_seal_seal_eperm=true
+//!   reopen_rdonly_get_seals_shared=true
+//!   reopen_rdonly_add_seals_eperm=true
+//!   reopen_rdonly_write_ebadf=true
+//!   reopen_rdwr_add_seals_ok=true
 
 use conformance_probes::{errno, report, spawn_blocked_child};
 use std::ffi::CString;
@@ -46,7 +54,7 @@ const F_SEAL_GROW: i32 = 0x0004;
 const F_SEAL_WRITE: i32 = 0x0008;
 
 unsafe fn sys_pidfd_open(pid: libc::pid_t, flags: libc::c_uint) -> libc::c_int {
-    libc::syscall(SYS_PIDFD_OPEN, pid as libc::c_long, flags as libc::c_long) as libc::c_int
+    libc::syscall(SYS_PIDFD_OPEN as _, pid as libc::c_long, flags as libc::c_long) as libc::c_int
 }
 
 unsafe fn sys_memfd_create(name: &str, flags: libc::c_uint) -> libc::c_int {
@@ -54,7 +62,7 @@ unsafe fn sys_memfd_create(name: &str, flags: libc::c_uint) -> libc::c_int {
         return -1;
     };
     libc::syscall(
-        SYS_MEMFD_CREATE,
+        SYS_MEMFD_CREATE as _,
         c.as_ptr(),
         flags as libc::c_ulong,
     ) as libc::c_int
@@ -165,6 +173,51 @@ fn main() {
             libc::close(fd_allow);
         }
 
+        // Case C: reopening memfd via /proc/self/fd/<fd>
+        let fd_mem = sys_memfd_create("probe_reopen", MFD_ALLOW_SEALING);
+        let mut reopen_rdonly_get_seals_shared = false;
+        let mut reopen_rdonly_add_seals_eperm = false;
+        let mut reopen_rdonly_write_ebadf = false;
+        let mut reopen_rdwr_add_seals_ok = false;
+        if fd_mem >= 0 {
+            // Add F_SEAL_GROW to original memfd
+            let _ = libc::fcntl(fd_mem, F_ADD_SEALS, F_SEAL_GROW);
+
+            // Re-open with O_RDONLY through /proc/self/fd/<fd_mem>
+            let path_ro = format!("/proc/self/fd/{fd_mem}\0");
+            let fd_ro = libc::open(path_ro.as_ptr() as *const libc::c_char, libc::O_RDONLY);
+            if fd_ro >= 0 {
+                // 1. Seals visible through re-opened fd equal original
+                let ro_seals = libc::fcntl(fd_ro, F_GET_SEALS);
+                reopen_rdonly_get_seals_shared = ro_seals == F_SEAL_GROW;
+
+                // 2. F_ADD_SEALS on O_RDONLY fd must fail with EPERM
+                let rc_add = libc::fcntl(fd_ro, F_ADD_SEALS, F_SEAL_WRITE);
+                reopen_rdonly_add_seals_eperm = rc_add == -1 && errno() == libc::EPERM;
+
+                // 3. write on O_RDONLY fd must fail with EBADF
+                let byte = [0x42u8];
+                let rc_write = libc::write(fd_ro, byte.as_ptr() as *const libc::c_void, 1);
+                reopen_rdonly_write_ebadf = rc_write == -1 && errno() == libc::EBADF;
+
+                // 4. Re-open with O_RDWR through /proc/self/fd/<fd_ro>
+                let path_rw = format!("/proc/self/fd/{fd_ro}\0");
+                let fd_rw = libc::open(path_rw.as_ptr() as *const libc::c_char, libc::O_RDWR);
+                if fd_rw >= 0 {
+                    // F_ADD_SEALS on O_RDWR fd succeeds
+                    let rc_rw_add = libc::fcntl(fd_rw, F_ADD_SEALS, F_SEAL_WRITE);
+                    let rw_seals = libc::fcntl(fd_rw, F_GET_SEALS);
+                    reopen_rdwr_add_seals_ok =
+                        rc_rw_add == 0 && rw_seals == (F_SEAL_GROW | F_SEAL_WRITE);
+                    libc::close(fd_rw);
+                }
+
+                libc::close(fd_ro);
+            }
+
+            libc::close(fd_mem);
+        }
+
         report!(
             getfl_nonblock_set = getfl_nonblock_set,
             getfl_default_clear = getfl_default_clear,
@@ -176,6 +229,10 @@ fn main() {
             allowseal_get_seals_zero = allowseal_get_seals_zero,
             allowseal_add_write_ok = allowseal_add_write_ok,
             allowseal_add_after_seal_seal_eperm = allowseal_add_after_seal_seal_eperm,
+            reopen_rdonly_get_seals_shared = reopen_rdonly_get_seals_shared,
+            reopen_rdonly_add_seals_eperm = reopen_rdonly_add_seals_eperm,
+            reopen_rdonly_write_ebadf = reopen_rdonly_write_ebadf,
+            reopen_rdwr_add_seals_ok = reopen_rdwr_add_seals_ok,
         );
 
         libc::alarm(0);
