@@ -4955,7 +4955,17 @@ impl SyscallDispatcher {
                                     break;
                                 }
                             }
-                            Err(_) => break,
+                            Err(error) => {
+                                tracing::debug!(
+                                    target: "carrick::process_vm",
+                                    remote_va = format_args!("{remote_va_raw:#x}"),
+                                    len = want_len,
+                                    copied,
+                                    %error,
+                                    "process_vm_readv foreign read faulted"
+                                );
+                                break;
+                            }
                         }
 
                         // Scatter the chunk across local iovecs; a local fault
@@ -4978,7 +4988,15 @@ impl SyscallDispatcher {
                                 .min(want - delivered)
                                 .min(PAGE_SIZE - (local_va % PAGE_SIZE));
                             let slice = &read_buf[delivered as usize..(delivered + take) as usize];
-                            if cx.memory.write_bytes(local_va, slice).is_err() {
+                            if let Err(error) = cx.memory.write_bytes(local_va, slice) {
+                                tracing::debug!(
+                                    target: "carrick::process_vm",
+                                    local_va = format_args!("{local_va:#x}"),
+                                    len = slice.len(),
+                                    copied = copied + delivered,
+                                    %error,
+                                    "process_vm_readv local scatter write faulted"
+                                );
                                 local_fault = true;
                                 break;
                             }
@@ -5696,6 +5714,11 @@ mod kernel_process_dispatch_tests {
         /// Foreign-read transactions issued on this test thread; dispatch is
         /// synchronous, so a test reads it right after its syscall.
         static FOREIGN_READ_TRANSACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Lease retains issued on this test thread.
+        static FOREIGN_LEASE_RETAINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// When set, the next lease read reports `LeaseStale` once (the target's
+        /// frame inventory moved under the retained lease) and clears itself.
+        static FOREIGN_LEASE_STALE_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     #[derive(Debug)]
@@ -5729,6 +5752,9 @@ mod kernel_process_dispatch_tests {
             _deadline: Instant,
         ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
             FOREIGN_READ_TRANSACTIONS.with(|count| count.set(count.get() + 1));
+            if FOREIGN_LEASE_STALE_ONCE.with(|stale| stale.replace(false)) {
+                return Err(ForeignMmTransportError::LeaseStale);
+            }
             if va.0 < TARGET_VA || self.payload.is_empty() {
                 return Err(ForeignMmTransportError::Translation(va));
             }
@@ -5752,6 +5778,7 @@ mod kernel_process_dispatch_tests {
             _snapshot: &dyn ForeignMmSnapshot,
             _deadline: Instant,
         ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
+            FOREIGN_LEASE_RETAINS.with(|count| count.set(count.get() + 1));
             Ok(Arc::new(ProcessVmReadLease {
                 payload: self.payload.clone(),
             }))
@@ -6284,6 +6311,57 @@ mod kernel_process_dispatch_tests {
         assert_eq!(
             transactions, 1,
             "a 1 KiB remote range inside one page must be one foreign-read transaction"
+        );
+    }
+
+    /// A lease retained at token time can predate the target's frame
+    /// inventory: LTP process_vm_readv03's parent scatters into heap pages it
+    /// still shares COW with the child, and its own host-side writes republish
+    /// those frames, bumping the CHILD's inventory revision mid-syscall. The
+    /// carrier lease then refuses every later chunk. The binding is not stale,
+    /// the lease is: the runtime must retain again and finish the read.
+    #[test]
+    fn process_vm_readv_re_retains_a_stale_lease() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_092);
+        let target = process_vm_target_with_pages(&root, 61_093, 2);
+        let root = refreshed(&root);
+        let target_pid = target.task().key().id.raw();
+        let expected = (0..8192).map(|i| b"PEER"[i % 4]).collect::<Vec<_>>();
+        let run = |dispatcher: &mut SyscallDispatcher, stale: bool| {
+            let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+            write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 8192);
+            write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 8192);
+            FOREIGN_LEASE_RETAINS.with(|count| count.set(0));
+            FOREIGN_LEASE_STALE_ONCE.with(|flag| flag.set(stale));
+            let outcome = dispatch_with_lease(
+                dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [target_pid as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            );
+            let bytes = memory.read_bytes(LOCAL_BUF, 8192).unwrap();
+            (
+                outcome,
+                bytes,
+                FOREIGN_LEASE_RETAINS.with(|count| count.get()),
+            )
+        };
+        let (baseline, bytes, baseline_retains) = run(&mut dispatcher, false);
+        assert_eq!(baseline, DispatchOutcome::Returned { value: 8192 });
+        assert_eq!(bytes, expected);
+        let (outcome, bytes, retains) = run(&mut dispatcher, true);
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned { value: 8192 },
+            "a stale lease must be retained again, not reported as a short read"
+        );
+        assert_eq!(bytes, expected);
+        assert_eq!(
+            retains,
+            baseline_retains + 1,
+            "exactly one extra retain replaces the stale lease"
         );
     }
 

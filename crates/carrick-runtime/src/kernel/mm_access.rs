@@ -34,7 +34,10 @@ pub struct MmToken {
     kernel: Arc<Kernel>,
     mm: Arc<Mm>,
     snapshot: MmBackendSnapshot,
-    foreign_lease: Option<carrick_hal::ForeignMmLeaseEndpoint>,
+    /// Carrier read lease. Replaced in place when the carrier reports it
+    /// stale (the target's frame inventory moved after the retain), so every
+    /// later chunk of the same token reuses the fresh lease.
+    foreign_lease: Arc<parking_lot::RwLock<Option<carrick_hal::ForeignMmLeaseEndpoint>>>,
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
     foreign_mutation: Option<crate::dispatch::mm_mutation::ForeignMmMutationAuthority>,
 }
@@ -566,11 +569,20 @@ impl MmAccessAuthority {
         }
 
         let deadline = Instant::now() + Self::OVERALL_DEADLINE;
-        let lease = mm
+        let token_lease = mm
             .token
             .foreign_lease
-            .as_ref()
+            .read()
+            .clone()
             .ok_or(MmAccessError::MissingForeignTransport(mm.mm_id()))?;
+        // A lease retained when the token was minted can predate the target's
+        // current frame inventory (a sibling breaking COW on a frame it shares
+        // with the target republishes that frame and bumps the target's
+        // inventory revision — LTP process_vm_readv03's parent does exactly
+        // that to its own heap mid-syscall). The carrier reports that as
+        // `LeaseStale`; the binding is intact, so retain again and retry.
+        let mut lease = token_lease;
+        let mut stale_retains = 0usize;
         let live = RetainedMmLiveAuthority {
             mm: Arc::clone(&mm.token.mm),
         };
@@ -591,6 +603,15 @@ impl MmAccessAuthority {
             let receipt = match lease.read(&live, &snapshot, range.start, dst, deadline) {
                 Ok(receipt) => receipt,
                 Err(carrick_hal::ForeignMmTransportError::Retry) => continue,
+                Err(carrick_hal::ForeignMmTransportError::LeaseStale) => {
+                    stale_retains += 1;
+                    if stale_retains > Self::MAX_ATTEMPTS {
+                        return Err(MmAccessError::ForeignReadRetryExhausted);
+                    }
+                    lease = retain_foreign_lease(&mm.token.mm, &snapshot, deadline)?;
+                    *mm.token.foreign_lease.write() = Some(lease.clone());
+                    continue;
+                }
                 Err(carrick_hal::ForeignMmTransportError::TimedOut) => {
                     return Err(MmAccessError::ForeignReadTimedOut);
                 }
@@ -712,7 +733,8 @@ impl MmAccessAuthority {
         let deadline = Instant::now() + Self::OVERALL_DEADLINE;
         let lease = token
             .foreign_lease
-            .as_ref()
+            .read()
+            .clone()
             .ok_or(MmAccessError::MissingForeignTransport(token.mm_id()))?;
         let before = snapshot_backend(&token.mm, deadline)?;
         validate_snapshot_vmas(&before)?;
@@ -938,7 +960,8 @@ impl MmAccessAuthority {
         let lease = range
             .token
             .foreign_lease
-            .as_ref()
+            .read()
+            .clone()
             .ok_or(MmAccessError::MissingForeignTransport(mm.id()))?;
         let live = RetainedMmLiveAuthority { mm: Arc::clone(mm) };
         let prepared = if let Some(plan) = executable_plan {
@@ -1274,6 +1297,24 @@ impl Kernel {
     }
 }
 
+/// Retain a carrier read lease for `mm` against `projected`, the snapshot the
+/// caller just validated. Used at token mint and again whenever the carrier
+/// reports the retained lease stale.
+fn retain_foreign_lease(
+    mm: &Arc<Mm>,
+    projected: &ProjectedForeignMmSnapshot,
+    deadline: Instant,
+) -> Result<carrick_hal::ForeignMmLeaseEndpoint, MmAccessError> {
+    let permit = ForeignEndpointPermit { _private: () };
+    let endpoint = mm
+        .foreign_mm_endpoint(&permit, deadline)
+        .ok_or(MmAccessError::ForeignReadTimedOut)?
+        .ok_or(MmAccessError::MissingForeignTransport(mm.id()))?;
+    endpoint
+        .retain(projected, deadline)
+        .map_err(MmAccessError::ForeignTransport)
+}
+
 fn snapshot_token(
     task: TaskKey,
     kernel: Arc<Kernel>,
@@ -1284,17 +1325,8 @@ fn snapshot_token(
     let snapshot = snapshot_backend(&mm, deadline)?;
     validate_snapshot_vmas(&snapshot)?;
     let foreign_lease = if retain_foreign {
-        let permit = ForeignEndpointPermit { _private: () };
-        let endpoint = mm
-            .foreign_mm_endpoint(&permit, deadline)
-            .ok_or(MmAccessError::ForeignReadTimedOut)?
-            .ok_or(MmAccessError::MissingForeignTransport(mm.id()))?;
         let projected = ProjectedForeignMmSnapshot::from_backend(mm.id(), &snapshot)?;
-        Some(
-            endpoint
-                .retain(&projected, deadline)
-                .map_err(MmAccessError::ForeignTransport)?,
-        )
+        Some(retain_foreign_lease(&mm, &projected, deadline)?)
     } else {
         let permit = ForeignEndpointPermit { _private: () };
         mm.foreign_mm_endpoint(&permit, deadline)
@@ -1319,7 +1351,7 @@ fn snapshot_token(
         kernel,
         mm,
         snapshot,
-        foreign_lease,
+        foreign_lease: Arc::new(parking_lot::RwLock::new(foreign_lease)),
         foreign_mutation,
     })
 }

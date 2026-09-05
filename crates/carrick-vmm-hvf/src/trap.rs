@@ -25191,7 +25191,21 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             .try_lock_until(deadline)
             .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
         if requested != inner.retained {
-            return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
+            let retained = &inner.retained;
+            tracing::debug!(
+                target: "carrick::foreign_mm",
+                mm = requested.mm != retained.mm,
+                binding = requested.binding != retained.binding,
+                backend_revision = requested.backend_revision != retained.backend_revision,
+                vma_revision = requested.vma_revision != retained.vma_revision,
+                frame_inventory_revision =
+                    requested.frame_inventory_revision != retained.frame_inventory_revision,
+                mapping_ids = requested.mapping_ids != retained.mapping_ids,
+                executable_ranges = requested.executable_ranges != retained.executable_ranges,
+                readable_ranges = requested.readable_ranges != retained.readable_ranges,
+                "foreign read lease snapshot drifted from the retained one (fields that differ)"
+            );
+            return Err(carrick_hal::ForeignMmTransportError::LeaseStale);
         }
         let _read_coordinator = self
             .state
@@ -25321,8 +25335,10 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             .inner
             .try_lock_until(deadline)
             .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
+        if requested != inner.retained {
+            return Err(carrick_hal::ForeignMmTransportError::LeaseStale);
+        }
         if !live_snapshot_matches(authority, &requested, deadline)?
-            || requested != inner.retained
             || cow.mm() != requested.mm
             || cow.backend_revision() != requested.backend_revision
             || cow.vma_revision() != requested.vma_revision
