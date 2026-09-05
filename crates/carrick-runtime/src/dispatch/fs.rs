@@ -10461,6 +10461,11 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                 };
+                // Linux answers ENXIO for a negative SEEK_DATA/SEEK_HOLE offset
+                // (oracle `seekholemap`); macOS would say EINVAL, so decide here.
+                if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset < 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_ENXIO));
+                }
                 let r = match (unsafe {
                     libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence)
                 })
