@@ -255,6 +255,12 @@ impl Stage1MmLease {
         self.root_slot
     }
 
+    pub(crate) fn root_slot_base(&self) -> carrick_guest_mem::Gpa {
+        self.root_slot
+            .map(|s| carrick_guest_mem::Gpa(s.base()))
+            .unwrap_or_else(|| self.state.binding().stage1_root.gpa())
+    }
+
     pub(crate) fn table_arena_source(
         self: &Arc<Self>,
         pool: Stage1MmPool,
@@ -489,6 +495,10 @@ pub(crate) struct Stage1MmTableArenaSource {
 }
 
 impl carrick_mem::page_table::TableArenaSource for Stage1MmTableArenaSource {
+    fn id(&self) -> carrick_mem::page_table::TableArenaSourceId {
+        carrick_mem::page_table::TableArenaSourceId(self.lease.root_slot_base())
+    }
+
     fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
         let mut inner = self.pool.inner.lock();
         let slot = inner.free_root_slots.pop_first()?;

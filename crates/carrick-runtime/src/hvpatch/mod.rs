@@ -447,6 +447,15 @@ pub(crate) struct PublishedProcessExec {
     receipt: mm_resources::ExecMmCommitReceipt,
 }
 
+impl PublishedProcessExec {
+    pub(crate) fn replacement_lease(&self) -> &std::sync::Arc<stage1_mm::Stage1MmLease> {
+        match &self.receipt {
+            mm_resources::ExecMmCommitReceipt::Retained { replacement, .. }
+            | mm_resources::ExecMmCommitReceipt::Retired { replacement, .. } => replacement,
+        }
+    }
+}
+
 pub(crate) struct CommittedProcessExec {
     transition: crate::kernel::exec::CommittedExecTransition,
     replacement_mm: std::sync::Arc<Stage1MmLease>,
@@ -761,6 +770,13 @@ impl ProcessContext {
 
     pub(crate) fn mm_resources(&self) -> &std::sync::Arc<MmResources> {
         &self.resources
+    }
+
+    pub(crate) fn table_arena_source_for_lease(
+        &self,
+        lease: &std::sync::Arc<stage1_mm::Stage1MmLease>,
+    ) -> Box<dyn carrick_mem::page_table::TableArenaSource> {
+        self.resources.table_arena_source_for_lease(lease)
     }
 
     pub(crate) fn owns_final_mm_edge(&self, task: crate::kernel::TaskKey) -> Result<bool, String> {
@@ -1594,6 +1610,16 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
             table
                 .publish_root(root_context.task().key())
                 .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            let root_source = table
+                .table_arena_source(root_context.task().key())
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            engine
+                .install_stage1_table_arena_source(root_source)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "install HVPatch root table arena source: {error}"
+                    ))
+                })?;
             let prepared = ProcessContext::new(
                 Arc::clone(&table),
                 root_context.task_binding(),

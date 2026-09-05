@@ -4263,8 +4263,6 @@ struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     pending_terminal_retirement: Option<crate::hvpatch::PendingAddressSpaceRetirement>,
     pending_terminal_inventory: Option<(Arc<crate::kernel::Kernel>, crate::kernel::MmId)>,
     external_exec: Option<crate::kernel::control::ExecWork>,
-    pending_table_arena_source: Option<Box<dyn carrick_mem::page_table::TableArenaSource>>,
-    table_arena_source_installed: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7160,19 +7158,6 @@ where
         {
             self.phase = HvpatchProductionPhase::Complete;
             return Ok(executor::ExecutorExit::Exited);
-        }
-        if let Some(source) = self.pending_table_arena_source.take() {
-            if self.table_arena_source_installed {
-                return Err(ProductionHvpatchPollError::Runtime(
-                    RuntimeError::Configuration(
-                        "second attempt to install stage-1 table arena source".to_owned(),
-                    ),
-                ));
-            }
-            engine
-                .install_stage1_table_arena_source(source)
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            self.table_arena_source_installed = true;
         }
         if self.state.guest_execution.is_none() {
             drop(self.registration_wait.take());
@@ -10470,8 +10455,6 @@ where
     let stage1_mm = process
         .stage1_mm_lease()
         .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
-    let pool = process.mm_resources().pool();
-    let arena_source = stage1_mm.table_arena_source(pool);
     let production = ProductionHvpatchLoopJob {
         kernel,
         state,
@@ -10495,8 +10478,6 @@ where
         pending_terminal_retirement: None,
         pending_terminal_inventory: None,
         external_exec: None,
-        pending_table_arena_source: Some(arena_source),
-        table_arena_source_installed: false,
     };
     let job = HvpatchLoopJob::production(production, injected_lease);
     let quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
@@ -12446,8 +12427,6 @@ mod tests {
                 pending_terminal_retirement: None,
                 pending_terminal_inventory: None,
                 external_exec: None,
-                pending_table_arena_source: None,
-                table_arena_source_installed: true,
             };
             let mut memory = Memory::default();
             memory.0.insert(0x1000, 11_i32.to_le_bytes().to_vec());
@@ -13518,8 +13497,6 @@ mod tests {
             pending_terminal_retirement: None,
             pending_terminal_inventory: None,
             external_exec: None,
-            pending_table_arena_source: None,
-            table_arena_source_installed: true,
         };
         let root_quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
             Box::new(HvpatchLoopJob::production(
@@ -15589,8 +15566,6 @@ mod tests {
             pending_terminal_retirement: None,
             pending_terminal_inventory: None,
             external_exec: None,
-            pending_table_arena_source: None,
-            table_arena_source_installed: true,
         };
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut parent_submission = executor::ExecutorSubmissionContext {
@@ -15853,8 +15828,6 @@ mod tests {
                 pending_terminal_retirement: None,
                 pending_terminal_inventory: None,
                 external_exec: None,
-                pending_table_arena_source: None,
-                table_arena_source_installed: true,
             };
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
@@ -16083,8 +16056,6 @@ mod tests {
                 pending_terminal_retirement: None,
                 pending_terminal_inventory: None,
                 external_exec: None,
-                pending_table_arena_source: None,
-                table_arena_source_installed: true,
             };
             let need_resched = std::sync::atomic::AtomicBool::new(false);
             let mut submission = executor::ExecutorSubmissionContext {
@@ -16323,8 +16294,6 @@ mod tests {
             pending_terminal_retirement: None,
             pending_terminal_inventory: None,
             external_exec: None,
-            pending_table_arena_source: None,
-            table_arena_source_installed: true,
         };
         let need_resched = std::sync::atomic::AtomicBool::new(false);
         let mut submission = executor::ExecutorSubmissionContext {
@@ -16538,8 +16507,6 @@ mod tests {
             pending_terminal_retirement: None,
             pending_terminal_inventory: None,
             external_exec,
-            pending_table_arena_source: None,
-            table_arena_source_installed: true,
         }
     }
 
@@ -18462,23 +18429,12 @@ mod tests {
         );
     }
 
-    #[derive(Debug)]
-    struct DummyTestArenaSource;
-    impl carrick_mem::page_table::TableArenaSource for DummyTestArenaSource {
-        fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
-            None
-        }
-        fn return_arena(&mut self, _base: carrick_guest_mem::Gpa) {}
-    }
-
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn production_hvpatch_job_installs_table_arena_source_on_first_poll_and_rejects_second() {
-        let (kernel, context, state) = typed_completion_fixture(79_001, SyscallDispatcher::new());
-        let mut job =
-            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
-        job.pending_table_arena_source = Some(Box::new(DummyTestArenaSource));
-        job.table_arena_source_installed = false;
+    fn two_task_mm_thread_sibling_sharing_manager_does_not_error() {
+        let (kernel, context, state1) = typed_completion_fixture(79_001, SyscallDispatcher::new());
+        let mut job1 =
+            suffix_failure_test_job(&kernel, state1, HvpatchProductionPhase::Resident, None);
 
         let mut engine = CrashCaptureTestEngine::default();
         let scheduler = kernel
@@ -18497,22 +18453,20 @@ mod tests {
         };
         let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
 
+        // Task 1 of the MM runs and polls.
+        let _ = job1.poll_with_engine(&mut engine, &mut control);
+
+        // Task 2 (thread sibling in the same MM) runs and polls with the same engine.
+        // Under the old first-poll install, task 2 attempted a second install of the arena source
+        // on the shared manager and panicked/errored with "stage-1 table arena source is already installed".
+        // Now, arena sources are MM properties installed at MM creation, so sibling task polling does not error.
+        let (_, _, state2) = typed_completion_fixture(79_002, SyscallDispatcher::new());
+        let mut job2 =
+            suffix_failure_test_job(&kernel, state2, HvpatchProductionPhase::Resident, None);
+        let _ = job2.poll_with_engine(&mut engine, &mut control);
+
+        // Neither task panicked or attempted a redundant arena source installation.
         assert_eq!(engine.installed_table_arena_sources, 0);
-        assert!(job.pending_table_arena_source.is_some());
-        assert!(!job.table_arena_source_installed);
-
-        let _ = job.poll_with_engine(&mut engine, &mut control);
-        assert_eq!(engine.installed_table_arena_sources, 1);
-        assert!(job.pending_table_arena_source.is_none());
-        assert!(job.table_arena_source_installed);
-
-        job.pending_table_arena_source = Some(Box::new(DummyTestArenaSource));
-        let err = job.poll_with_engine(&mut engine, &mut control).unwrap_err();
-        let err_str = format!("{err:?}");
-        assert!(
-            err_str.contains("second attempt to install stage-1 table arena source"),
-            "expected duplicate install error, got: {err_str}"
-        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

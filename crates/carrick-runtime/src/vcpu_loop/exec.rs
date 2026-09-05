@@ -1572,6 +1572,19 @@ where
             )
             .map(Some);
         }
+        if let (Some(process), RuntimePublishedExec::Hvpatch(published)) =
+            (kernel.hvpatch_process.as_ref(), &published_kernel_exec)
+        {
+            let source = process.table_arena_source_for_lease(published.replacement_lease());
+            if let Err(error) = engine.install_stage1_table_arena_source(source) {
+                return Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("install replacement HVPatch table arena source: {error}"),
+                )
+                .map(Some);
+            }
+        }
         backend_publication_gate.record_engine_replaced();
         // `execve_into` has released every stage-2/frame lock. Topology
         // serialization must also be released before runtime takes its
