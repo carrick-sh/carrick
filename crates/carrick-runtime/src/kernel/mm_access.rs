@@ -1018,6 +1018,7 @@ struct ProjectedForeignMmSnapshot {
     frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision,
     mapping_ids: Vec<carrick_hal::MappingId>,
     executable_ranges: Vec<carrick_hal::ForeignExecutableRange>,
+    readable_ranges: Vec<carrick_hal::ForeignReadableRange>,
 }
 
 impl ProjectedForeignMmSnapshot {
@@ -1057,6 +1058,14 @@ impl ProjectedForeignMmSnapshot {
                     carrick_hal::ForeignExecutableRange::from_kernel_projection(vma.start, vma.end)
                 })
                 .collect(),
+            readable_ranges: snapshot
+                .vmas
+                .iter()
+                .filter(|vma| vma.access.readable && vma.access.kernel_visible)
+                .filter_map(|vma| {
+                    carrick_hal::ForeignReadableRange::from_kernel_projection(vma.start, vma.end)
+                })
+                .collect(),
         })
     }
 }
@@ -1083,6 +1092,10 @@ impl carrick_hal::ForeignMmSnapshot for ProjectedForeignMmSnapshot {
 
     fn executable_ranges(&self) -> &[carrick_hal::ForeignExecutableRange] {
         &self.executable_ranges
+    }
+
+    fn readable_ranges(&self) -> &[carrick_hal::ForeignReadableRange] {
+        &self.readable_ranges
     }
 }
 
