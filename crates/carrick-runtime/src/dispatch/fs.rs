@@ -11837,18 +11837,16 @@ impl SyscallDispatcher {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
                 | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. }
-                | OpenDescription::PipeReader { .. } => LINUX_EBADF,
-                OpenDescription::HostPipe {
-                    is_read_end,
-                    pty,
-                    bidirectional,
-                    ..
-                } if *is_read_end && pty.is_none() && !*bidirectional => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
-                OpenDescription::PipeWriter { .. }
+                // A pipe end is ESPIPE for pwrite/pread regardless of its
+                // direction: Linux refuses positional I/O on an unseekable
+                // description before it looks at the open mode (oracle line
+                // `pwrite_pipe_read_end_espipe` in `pipeextra`).
+                OpenDescription::PipeReader { .. }
+                | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
