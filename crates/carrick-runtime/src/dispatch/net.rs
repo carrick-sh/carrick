@@ -8079,12 +8079,40 @@ impl SyscallDispatcher {
                 match this.layered_metadata(parent) {
                     Ok(md) if md.kind == RootFsEntryKind::Directory => {}
                     Ok(_) => return Ok(DispatchOutcome::errno(LINUX_ENOTDIR)),
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    Err(errno) => {
+                        tracing::debug!(
+                            target: "carrick::unix",
+                            guest_path = %gp,
+                            resolved,
+                            parent,
+                            ?errno,
+                            "AF_UNIX connect: parent directory lookup failed"
+                        );
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
                 }
                 match this.layered_metadata(&resolved) {
                     Ok(md) if md.kind == RootFsEntryKind::Socket => {}
-                    Ok(_) => return Ok(DispatchOutcome::errno(linux_errno::ECONNREFUSED)),
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    Ok(md) => {
+                        tracing::debug!(
+                            target: "carrick::unix",
+                            guest_path = %gp,
+                            resolved,
+                            kind = ?md.kind,
+                            "AF_UNIX connect: path is not a socket node"
+                        );
+                        return Ok(DispatchOutcome::errno(linux_errno::ECONNREFUSED));
+                    }
+                    Err(errno) => {
+                        tracing::debug!(
+                            target: "carrick::unix",
+                            guest_path = %gp,
+                            resolved,
+                            ?errno,
+                            "AF_UNIX connect: socket node lookup failed"
+                        );
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
                 }
             }
             // connect(2) has no per-call non-blocking flag, so put the host socket

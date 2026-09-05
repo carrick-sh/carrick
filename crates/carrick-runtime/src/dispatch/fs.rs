@@ -9125,6 +9125,12 @@ impl SyscallDispatcher {
                         DispatchOutcome::Returned { value: 0 }
                     }
                     LINUX_TIOCSIG => {
+                        // TIOCSIG is a pty MASTER ioctl; on the slave Linux answers
+                        // ENOTTY and delivers nothing (oracle `ptyisig` line
+                        // `tiocsig_delivered_sigint` from the slave is false).
+                        if !role.is_master {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
+                        }
                         let mut buf = [0u8; 4];
                         match cx.memory.read_bytes(arg, 4) {
                             Ok(b) => buf.copy_from_slice(&b),
