@@ -408,16 +408,18 @@ struct TaskOnlyRuntimeProjectionSlot {
     projection: parking_lot::Mutex<Option<carrick_aarch64::Aarch64TaskRuntimeProjection>>,
 }
 
-type TaskOnlyRuntimeAuthorities = (
-    Arc<parking_lot::Mutex<Option<carrick_mem::page_table::PageTableManager>>>,
-    Arc<MemoryProtections>,
-);
+type TaskOnlyRuntimeAuthorities = (carrick_aarch64::Stage1Authority, Arc<MemoryProtections>);
 
 impl TaskOnlyRuntimeProjectionSlot {
     fn new(projection: carrick_aarch64::Aarch64TaskRuntimeProjection) -> Self {
         Self {
             projection: parking_lot::Mutex::new(Some(projection)),
         }
+    }
+
+    #[allow(dead_code)]
+    fn is_loaded(&self) -> bool {
+        self.projection.lock().is_none()
     }
 
     fn take(&self) -> Result<carrick_aarch64::Aarch64TaskRuntimeProjection, TrapError> {
@@ -446,7 +448,7 @@ impl TaskOnlyRuntimeProjectionSlot {
             TrapError::Hypervisor("HVPatch task runtime projection is loaded".to_owned())
         })?;
         Ok((
-            Arc::clone(&projection.page_tables),
+            projection.page_tables.clone(),
             Arc::clone(&projection.protections),
         ))
     }
@@ -618,7 +620,7 @@ impl Drop for HvpatchTaskOnlyEngineState {
 pub struct HvpatchPreparedTaskOnlyEngineState {
     carrier: HvpatchPreparedCarrierTaskState,
     snapshot: Aarch64VcpuSnapshot,
-    page_tables: Arc<parking_lot::Mutex<Option<carrick_mem::page_table::PageTableManager>>>,
+    page_tables: carrick_aarch64::Stage1Authority,
     protections: Arc<MemoryProtections>,
     process_asid: Option<u16>,
     _not_send: std::marker::PhantomData<*const ()>,
@@ -773,6 +775,7 @@ pub fn materialize_hvpatch_shared_process_without_vcpu(
 ) -> Result<HvpatchPreparedTaskOnlyEngineState, TrapError> {
     let _no_executor_allocation = TaskOnlyNoExecutorAllocationGuard::capture();
     let parts = spec.into_task_only_parts();
+    parts.page_tables.share_with_vfork_child();
     let carrier =
         HvpatchPreparedCarrierTaskState::shared_process(identity, shared_kernel_mm, parts.builder)?;
     #[cfg(test)]
@@ -862,12 +865,12 @@ fn validate_task_only_runtime_projection(
     }
     const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
     let root = cpu.ttbr0 & TTBR_ROOT_MASK;
-    if let Some(manager) = projection.page_tables.lock().as_ref()
-        && manager.base() != root
+    if let Some(base) = projection.page_tables.root_base()
+        && base != root
     {
         return Err(TrapError::Hypervisor(format!(
             "HVPatch task projection manager root 0x{:x} does not match CPU TTBR root 0x{root:x}",
-            manager.base()
+            base
         )));
     }
     Ok(())
@@ -1385,12 +1388,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     type SiblingBuilder = ThreadSpec;
     type ProcessBuilder = ProcessSpec;
 
-    fn bind_stage1_page_tables(
-        &mut self,
-        page_tables: std::sync::Arc<
-            parking_lot::Mutex<Option<carrick_mem::page_table::PageTableManager>>,
-        >,
-    ) {
+    fn bind_stage1_page_tables(&mut self, page_tables: carrick_aarch64::Stage1Authority) {
         self.state.bind_stage1_page_tables(page_tables);
     }
 
@@ -1968,10 +1966,10 @@ mod task_only_materializer_tests {
             initial_root,
         );
         if root != initial_root {
-            manager.rebase(root).expect("rebase test manager");
+            manager.rebase(root, None).expect("rebase test manager");
         }
         carrick_aarch64::Aarch64TaskRuntimeProjection {
-            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(Some(manager))),
+            page_tables: carrick_aarch64::Stage1Authority::new_with_manager(Some(manager)),
             protections: std::sync::Arc::new(
                 carrick_guest_mem::protections::MemoryProtections::default(),
             ),
@@ -1983,7 +1981,7 @@ mod task_only_materializer_tests {
     fn task_only_runtime_projection_clones_the_exact_mm_authorities() {
         let root = 0x9a_0000_0000;
         let projection = runtime_projection(root, 2);
-        let expected_page_tables = std::sync::Arc::clone(&projection.page_tables);
+        let expected_page_tables = projection.page_tables.clone();
         let expected_protections = std::sync::Arc::clone(&projection.protections);
         let slot = super::TaskOnlyRuntimeProjectionSlot::new(projection);
 
@@ -1994,14 +1992,8 @@ mod task_only_materializer_tests {
             .clone_authorities()
             .expect("clone second runtime authorities");
 
-        assert!(std::sync::Arc::ptr_eq(
-            &expected_page_tables,
-            &first_page_tables
-        ));
-        assert!(std::sync::Arc::ptr_eq(
-            &first_page_tables,
-            &second_page_tables
-        ));
+        assert!(expected_page_tables.shares_exact_authority(&first_page_tables));
+        assert!(first_page_tables.shares_exact_authority(&second_page_tables));
         assert!(std::sync::Arc::ptr_eq(
             &expected_protections,
             &first_protections
@@ -2010,13 +2002,7 @@ mod task_only_materializer_tests {
             &first_protections,
             &second_protections
         ));
-        assert_eq!(
-            second_page_tables
-                .lock()
-                .as_ref()
-                .map(|manager| manager.base()),
-            Some(root),
-        );
+        assert_eq!(second_page_tables.root_base(), Some(root));
     }
 
     #[test]
@@ -2026,13 +2012,7 @@ mod task_only_materializer_tests {
         let slot = super::TaskOnlyRuntimeProjectionSlot::new(runtime_projection(old_root, 1));
 
         let old = slot.take().expect("take predecessor projection");
-        assert_eq!(
-            old.page_tables
-                .lock()
-                .as_ref()
-                .map(|manager| manager.base()),
-            Some(old_root)
-        );
+        assert_eq!(old.page_tables.root_base(), Some(old_root));
         assert!(slot.take().is_err(), "a loaded projection is non-cloneable");
 
         let replacement = runtime_projection(replacement_root, 2);
@@ -2045,14 +2025,7 @@ mod task_only_materializer_tests {
 
         let reloaded = slot.take().expect("reload replacement projection");
         assert_eq!(reloaded.process_asid, Some(2));
-        assert_eq!(
-            reloaded
-                .page_tables
-                .lock()
-                .as_ref()
-                .map(|manager| manager.base()),
-            Some(replacement_root)
-        );
+        assert_eq!(reloaded.page_tables.root_base(), Some(replacement_root));
         assert!(std::sync::Arc::ptr_eq(
             &reloaded.protections,
             &replacement_protections
@@ -2176,14 +2149,7 @@ mod task_only_materializer_tests {
             .take()
             .expect("preflight mismatch must not consume task projection");
         assert_eq!(retained.process_asid, Some(2));
-        assert_eq!(
-            retained
-                .page_tables
-                .lock()
-                .as_ref()
-                .map(|manager| manager.base()),
-            Some(root)
-        );
+        assert_eq!(retained.page_tables.root_base(), Some(root));
     }
 
     #[test]

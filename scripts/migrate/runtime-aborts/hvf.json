@@ -313,7 +313,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 3,
-      "fingerprint": "2498923168649eaab02c374e758caff1946051ad86578c46d47c2b9698147fa0",
+      "fingerprint": "fd8b9f349cea114fc193920096aa29bea2a93db8d7b18f2c813682a830eb55e7",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Stage-1 TLB invalidation failed during frame COW rollback, leaving hardware TLBs with inconsistent stage-1 translations. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
@@ -583,7 +583,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::materialize_retired_reuse",
       "ordinal_in_function": 1,
-      "fingerprint": "4110a1e03299da777dfc67df49e47e33cc2bb889d047365d6ace45729aa5b3b6",
+      "fingerprint": "310ed89c7ed26aa67d952971a8bb4c8d2777d68b7cf713acb1e1c2e7f81725c4",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Stage-1 TLB invalidation failed during retained-reuse rollback, leaving stale stage-1 translations in the hardware TLB. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
@@ -637,7 +637,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::materialize_sparse_mmap_extent",
       "ordinal_in_function": 1,
-      "fingerprint": "0d909a78db4893858ada7361fd0a6ce96fa4ae4e028c9583787a183d65d8fa34",
+      "fingerprint": "5da92fa8d5757caefb221d9117b0a52baf7bce52a7abae34018aafe6a8e287d8",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Stage-1 TLB invalidation failed during sparse mmap rollback, leaving stale stage-1 translations cached in hardware vCPU TLB. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
@@ -952,7 +952,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 1,
-      "fingerprint": "f5b674e512b0d5a2c5a6787a346ba69503afda5b43fc2157db768febc5a2e017",
+      "fingerprint": "7972265dc4923c68b8e1e6323d6c7019b1f96c05ac29c07ae403157377fcfe0f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Stage-1 TLB invalidation failed during foreign COW page-table error rollback, leaving hardware TLBs with inconsistent stage-1 translations."
@@ -961,7 +961,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 2,
-      "fingerprint": "2bc1cb74b630fb45a74cb3d3f1674275cf9eddc9e741b332c66758ff1cf7c0ff",
+      "fingerprint": "fe35f4f9d8ff1bdbf1baa295b38cfb01c319380975dde0ccbca698fb14b87f56",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Missing page-table rollback pre-image after successful page-table modification leaves foreign COW transaction in an unrecoverable state."
@@ -970,7 +970,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 3,
-      "fingerprint": "02afc0b8277af2a88f9bd42701a369f43be4e7ea147aa0002932b29e19c52d90",
+      "fingerprint": "1f706ba1d9a4ca27184ba548a9d0243d0bdf4fb04e4181d34d90931ca5eb99ab",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Stage-1 TLB invalidation failed during foreign COW invalidation-error rollback, leaving hardware TLBs with inconsistent stage-1 translations."
@@ -979,7 +979,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 4,
-      "fingerprint": "275ed1a85dcb96f20036481c99d0004f8508633a47f1fd79682f77f0f19add30",
+      "fingerprint": "4901b85b69f1dc4d1ed054b872d09fa5f73d3a1af262925ef0801dbcf57c11bc",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Stage-1 TLB invalidation failed during foreign COW failpoint rollback, leaving hardware TLBs with inconsistent stage-1 translations."
@@ -1015,7 +1015,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 8,
-      "fingerprint": "1fbc3a408cbc4bfff4613b931dec611986a8a78858c7ddff80dc66730ad21ec2",
+      "fingerprint": "20440e8c9098c9c8b44c3d96e54c90bb1c65f5544f553227cb47a721d8c18858",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::cow_token",
       "rationale": "Zero length in armed foreign COW span violates non-zero span length invariants during kernel publication."
@@ -1024,7 +1024,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 9,
-      "fingerprint": "1fbc3a408cbc4bfff4613b931dec611986a8a78858c7ddff80dc66730ad21ec2",
+      "fingerprint": "20440e8c9098c9c8b44c3d96e54c90bb1c65f5544f553227cb47a721d8c18858",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Missing rollback pre-image in scratch storage during foreign COW kernel publication failure prevents restoring original page tables."
@@ -1033,7 +1033,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 10,
-      "fingerprint": "1fbc3a408cbc4bfff4613b931dec611986a8a78858c7ddff80dc66730ad21ec2",
+      "fingerprint": "20440e8c9098c9c8b44c3d96e54c90bb1c65f5544f553227cb47a721d8c18858",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Stage-1 TLB invalidation failed during foreign COW publication-error rollback, leaving hardware TLBs with inconsistent stage-1 translations."
@@ -1123,7 +1123,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvpatchTaskRegistration::runtime_task_state",
       "ordinal_in_function": 1,
-      "fingerprint": "e74763f15bf536ebf840916809f40d565dba9f9b9e69b1ad562313f00671238e",
+      "fingerprint": "71af894d122d887f82195376ce6117edca8756fffa9454c12b5adf5a101fea71",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Installing a consumed prepared root-stage-2 authority into the live task MM failed during activation; continuing would activate stage-1 without its authenticated structural lifetime owner."
@@ -1132,7 +1132,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvpatchTaskRegistration::runtime_task_state",
       "ordinal_in_function": 2,
-      "fingerprint": "e74763f15bf536ebf840916809f40d565dba9f9b9e69b1ad562313f00671238e",
+      "fingerprint": "71af894d122d887f82195376ce6117edca8756fffa9454c12b5adf5a101fea71",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Installing a task mapping's authenticated structural owner into the live MM failed during activation, so stage-1 and structural stage-2 lifetime authority no longer form one coherent task state."

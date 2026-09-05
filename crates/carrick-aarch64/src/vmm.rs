@@ -465,11 +465,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// translation/physical-COW paths.  A backend retaining a second optional
     /// manager can otherwise publish through stale/absent authority immediately
     /// after fork.
-    fn bind_stage1_page_tables(
-        &mut self,
-        _page_tables: Arc<parking_lot::Mutex<Option<PageTableManager>>>,
-    ) {
-    }
+    fn bind_stage1_page_tables(&mut self, _page_tables: crate::stage1_authority::Stage1Authority) {}
 
     /// Ensure any stage-1 extension table arenas in `manager` have real stage-2 backing
     /// before `sync_to_host` publishes descriptor stores to them.

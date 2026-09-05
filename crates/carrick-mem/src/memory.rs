@@ -1784,7 +1784,7 @@ impl AddressSpace {
                 // never block boot. OutOfTables is likewise skipped: the spare
                 // pool comfortably covers real images, and a pathological one
                 // degrades to the historical (writable) behaviour.
-                let _ = mgr.set_readonly(start, len, span.exec);
+                let _ = mgr.set_readonly(start, len, span.exec, None);
             }
             mgr.into_bytes()
         };
@@ -2787,7 +2787,7 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     let mut mgr = crate::page_table::PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
     mgr.set_multi_vcpu(true);
     let heap_size = usize::try_from(LINUX_HEAP_SIZE).unwrap_or_else(|_| std::process::abort());
-    if mgr.set_prot_none(LINUX_HEAP_BASE, heap_size).is_err() {
+    if mgr.set_prot_none(LINUX_HEAP_BASE, heap_size, None).is_err() {
         std::process::abort();
     }
     mgr.into_bytes()

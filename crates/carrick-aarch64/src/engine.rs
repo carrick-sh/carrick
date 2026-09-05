@@ -37,7 +37,8 @@ use carrick_hal::{
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::page_table::{PageTableApplyOutcome, PageTableError, PageTableManager};
-use parking_lot::Mutex;
+
+pub use crate::stage1_authority::{ShareState, Stage1Authority, Stage1Editor};
 
 use crate::vmm::{Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, FrameCowWriteIntent};
 
@@ -63,6 +64,7 @@ pub fn reserve_hvpatch_process_apertures(
         carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
         (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE
             + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE) as usize,
+        None,
     )
 }
 
@@ -85,9 +87,6 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// direct case and to expose `current_pc` on a non-syscall kick. (x86 calls
     /// this `pending_resume_pc`.)
     pending_resume_pc: Option<u64>,
-    /// See [`DeferredArenaSource`]: applied by whichever engine over this
-    /// authority builds the manager first (lazy edit or exec rebuild).
-    pending_arena_source: DeferredArenaSource,
 
     /// Linux syscall number (x8) of the most recent trapped `svc`. Feeds the
     /// loop's SA_RESTART decision (`last_syscall_nr()`). `None` before the first
@@ -131,11 +130,9 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     pending_guest_run_receipt_ns: u64,
 
     // ── shared memory state (the X86EngineCore parallels) ──
-    /// Live stage-1 page-table editor over the guest's own translation tables at
-    /// `LINUX_PAGE_TABLES_BASE`. Built lazily on first protect/unmap edit; reset
-    /// to a fresh `None` on fork, shared (`Arc` clone) across `CLONE_THREAD`
-    /// siblings. The codec is the SHARED `carrick_mem` [`PageTableManager`].
-    page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    /// Live stage-1 page-table authority over the guest's own translation tables at
+    /// `LINUX_PAGE_TABLES_BASE` and extension arena source.
+    page_tables: Stage1Authority,
 
     /// Process-wide PROT_NONE ranges; the EFAULT gate on every syscall-buffer
     /// access. SHARED by `CLONE_THREAD` siblings (`Arc` clone), COW'd on fork.
@@ -161,7 +158,6 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
 pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     vm: V,
     pending_resume_pc: Option<u64>,
-    pending_arena_source: DeferredArenaSource,
     last_syscall_nr: Option<u64>,
     last_syscall_orig_x0: u64,
     last_fault_esr: u64,
@@ -171,7 +167,7 @@ pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     mm_generation: u64,
     asid_generation: u64,
     pending_guest_run_receipt_ns: u64,
-    page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    page_tables: Stage1Authority,
     protections: Arc<MemoryProtections>,
     pending_process_fork: Option<ParentForkCowRollback>,
     pt_snapshot_scratch: Option<PageTableManager>,
@@ -183,7 +179,7 @@ pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
 /// projection returned by the live engine rather than retaining immutable
 /// construction-time clones.
 pub struct Aarch64TaskRuntimeProjection {
-    pub page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    pub page_tables: Stage1Authority,
     pub protections: Arc<MemoryProtections>,
     pub process_asid: Option<u16>,
 }
@@ -194,10 +190,11 @@ impl Aarch64TaskRuntimeProjection {
     /// substitute for the carrier-owned state shared by CLONE_VM tasks.
     pub fn shares_exact_mm_authority(
         &self,
-        page_tables: &Arc<Mutex<Option<PageTableManager>>>,
+        page_tables: &Stage1Authority,
         protections: &Arc<MemoryProtections>,
     ) -> bool {
-        Arc::ptr_eq(&self.page_tables, page_tables) && Arc::ptr_eq(&self.protections, protections)
+        self.page_tables.shares_exact_authority(page_tables)
+            && Arc::ptr_eq(&self.protections, protections)
     }
 }
 unsafe impl<V: Aarch64Vmm> Send for Aarch64TaskEngineState<V> {}
@@ -227,18 +224,17 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     pub fn from_injected_task_only_backend(
         mut vm: V,
         vcpu: V::Vcpu,
-        page_tables: Arc<Mutex<Option<PageTableManager>>>,
+        page_tables: Stage1Authority,
         protections: Arc<MemoryProtections>,
         process_asid: Option<u16>,
         mm_generation: u64,
         asid_generation: u64,
     ) -> Self {
-        vm.bind_stage1_page_tables(Arc::clone(&page_tables));
+        vm.bind_stage1_page_tables(page_tables.clone());
         Self {
             vm,
             vcpu,
             pending_resume_pc: None,
-            pending_arena_source: Arc::new(Mutex::new(None)),
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
@@ -310,12 +306,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             )));
         }
         let root = ttbr & TTBR_ROOT_MASK;
-        if let Some(manager) = self.page_tables.lock().as_ref()
-            && manager.base() != root
+        if let Some(base) = self.page_tables.root_base()
+            && base != root
         {
             return Err(TrapError::Hypervisor(format!(
-                "loaded HVPatch page-table manager root 0x{:x} does not match TTBR root 0x{root:x}",
-                manager.base()
+                "loaded HVPatch page-table manager root 0x{base:x} does not match TTBR root 0x{root:x}"
             )));
         }
         Ok(())
@@ -353,7 +348,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc,
-            pending_arena_source,
             last_syscall_nr,
             last_syscall_orig_x0,
             last_fault_esr,
@@ -372,7 +366,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             Aarch64TaskEngineState {
                 vm,
                 pending_resume_pc,
-                pending_arena_source,
                 last_syscall_nr,
                 last_syscall_orig_x0,
                 last_fault_esr,
@@ -395,7 +388,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let Aarch64TaskEngineState {
             vm,
             pending_resume_pc,
-            pending_arena_source,
             last_syscall_nr,
             last_syscall_orig_x0,
             last_fault_esr,
@@ -414,7 +406,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc,
-            pending_arena_source,
             last_syscall_nr,
             last_syscall_orig_x0,
             last_fault_esr,
@@ -604,34 +595,13 @@ fn seed_heap_unmapped(protections: &MemoryProtections) {
 /// arena source.
 #[cfg(test)]
 pub(crate) fn replace_page_tables_authority(
-    page_tables: &mut Arc<Mutex<Option<PageTableManager>>>,
-    pending_arena_source: &mut DeferredArenaSource,
-    mut manager: Option<PageTableManager>,
+    page_tables: &mut Stage1Authority,
+    manager: Option<PageTableManager>,
     mut retire_old: impl FnMut(&mut PageTableManager) -> Result<(), TrapError>,
-    mut bind_new: impl FnMut(Arc<Mutex<Option<PageTableManager>>>),
+    mut bind_new: impl FnMut(Stage1Authority),
 ) -> Result<(), TrapError> {
-    let is_shared = Arc::strong_count(page_tables) > 1;
-    let old_mgr = if !is_shared {
-        page_tables.lock().take()
-    } else {
-        None
-    };
-    if let Some(mut old) = old_mgr {
-        retire_old(&mut old)?;
-    }
-    if is_shared {
-        *pending_arena_source = Arc::new(Mutex::new(None));
-    }
-    if let (Some(manager), Some(source)) = (manager.as_mut(), pending_arena_source.lock().take()) {
-        carrick_observability::probes::stage1_arena_install(5, 1, 0, 0);
-        manager.set_arena_source(source).map_err(|error| {
-            TrapError::Hypervisor(format!(
-                "apply deferred stage-1 table arena source on rebuild: {error:?}"
-            ))
-        })?;
-    }
-    let new_authority = Arc::new(Mutex::new(manager));
-    bind_new(Arc::clone(&new_authority));
+    let new_authority = page_tables.replace_for_exec(|| Ok(manager), |old| retire_old(old))?;
+    bind_new(new_authority.clone());
     *page_tables = new_authority;
     Ok(())
 }
@@ -668,8 +638,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// the spawning thread's `page_tables`/`protections` via the (later) sibling
     /// constructor.
     pub fn from_parts(mut vm: V, vcpu: V::Vcpu) -> Self {
-        let page_tables = Arc::new(Mutex::new(None));
-        vm.bind_stage1_page_tables(Arc::clone(&page_tables));
+        let page_tables = Stage1Authority::new();
+        vm.bind_stage1_page_tables(page_tables.clone());
         // Adopt the backend's protections authority when it exposes one
         // (`exec_protections` is the backend's live task authority, not an
         // exec-only value). Creating a separate engine-side Arc here split the
@@ -690,7 +660,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             vm,
             vcpu,
             pending_resume_pc: None,
-            pending_arena_source: Arc::new(Mutex::new(None)),
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
@@ -761,47 +730,21 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         self.is_forked_child
     }
 
-    /// The shared stage-1 page-table editor handle (cloned across `CLONE_THREAD`
-    /// siblings, reset on fork).
-    pub fn page_tables(&self) -> &Arc<Mutex<Option<PageTableManager>>> {
+    /// The shared stage-1 page-table authority handle.
+    pub fn page_tables(&self) -> &Stage1Authority {
         &self.page_tables
     }
 
     /// Replace this mm's stage-1 manager without splitting the engine/backend
     /// authority.  The HVPatch backend resolves permission faults itself, so
-    /// every fresh `Arc` must be rebound before the stopped vCPU can resume.
-    fn replace_page_tables(
-        &mut self,
-        mut manager: Option<PageTableManager>,
-    ) -> Result<(), TrapError> {
-        let is_shared = Arc::strong_count(&self.page_tables) > 1;
-        let old_mgr = if !is_shared {
-            self.page_tables.lock().take()
-        } else {
-            None
-        };
-        if let Some(mut old) = old_mgr {
-            self.vm.retire_stage1_extension_arenas(&mut old)?;
-        }
-        if is_shared {
-            self.pending_arena_source = Arc::new(Mutex::new(None));
-        }
-        if let (Some(manager), Some(source)) =
-            (manager.as_mut(), self.pending_arena_source.lock().take())
-        {
-            carrick_observability::probes::stage1_arena_install(5, 1, 0, 0);
-            // A source installed before this rebuild belongs to the new
-            // manager. `set_arena_source` refuses a different lease, which is
-            // an invariant violation the exec must fail on, not swallow.
-            manager.set_arena_source(source).map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "apply deferred stage-1 table arena source on rebuild: {error:?}"
-                ))
-            })?;
-        }
-        let page_tables = Arc::new(Mutex::new(manager));
-        self.vm.bind_stage1_page_tables(Arc::clone(&page_tables));
-        self.page_tables = page_tables;
+    /// every fresh authority must be rebound before the stopped vCPU can resume.
+    fn replace_page_tables(&mut self, manager: Option<PageTableManager>) -> Result<(), TrapError> {
+        let new_authority = self.page_tables.replace_for_exec(
+            || Ok(manager),
+            |old| self.vm.retire_stage1_extension_arenas(old),
+        )?;
+        self.vm.bind_stage1_page_tables(new_authority.clone());
+        self.page_tables = new_authority;
         Ok(())
     }
 
@@ -812,24 +755,22 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     }
 
     /// Like [`from_parts`](Self::from_parts) but ADOPTS the spawning thread's
-    /// page-table editor + PROT_NONE bookkeeping — used to make a
-    /// `clone(CLONE_THREAD)` sibling SHARE its parent's stage-1 manager (same VM,
+    /// page-table authority + PROT_NONE bookkeeping — used to make a
+    /// `clone(CLONE_THREAD)` sibling SHARE its parent's stage-1 authority (same VM,
     /// same backing) and PROT_NONE set. On KVM the PROT_NONE set itself lives in
     /// the backend `GuestRam` (shared via `from_shared_windows`), so this `Arc`
-    /// is the engine-side mirror; the page-table `Arc` is the load-bearing share.
+    /// is the engine-side mirror; the page-table authority is the load-bearing share.
     pub fn from_parts_with_shared(
         mut vm: V,
         vcpu: V::Vcpu,
-        page_tables: Arc<Mutex<Option<PageTableManager>>>,
+        page_tables: Stage1Authority,
         protections: Arc<MemoryProtections>,
-        pending_arena_source: DeferredArenaSource,
     ) -> Self {
-        vm.bind_stage1_page_tables(Arc::clone(&page_tables));
+        vm.bind_stage1_page_tables(page_tables.clone());
         Self {
             vm,
             vcpu,
             pending_resume_pc: None,
-            pending_arena_source,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
@@ -897,7 +838,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// TTBR0 root — the same construction `pt_edit_locked` performs lazily on
     /// the first edit. Fails (rather than guessing) when the root or its
     /// backing is not readable yet.
-    fn build_page_tables_manager_from_live(&mut self) -> Result<PageTableManager, MemoryError> {
+    fn build_page_tables_manager_from_live(&self) -> Result<PageTableManager, MemoryError> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
@@ -924,7 +865,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     fn pt_edit_locked(
         &mut self,
-        edit: impl FnOnce(&mut PageTableManager) -> Result<PageTableApplyOutcome, PageTableError>,
+        edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<PageTableApplyOutcome, MemoryError> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
@@ -937,155 +878,92 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .vm
             .host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
-        // `Arc::strong_count > 1` ⟺ a `clone(CLONE_THREAD)` sibling shares THIS
-        // page-table manager (the spec clones the Arc into each sibling engine);
-        // `== 1` ⟺ this is the SOLE vCPU over the backing. Coalescing reclaims
-        // spare sub-tables into the pool — a break-before-make table↔block flip
-        // plus a page free, unsafe only if another vCPU holds a stale walk-cache
-        // reference to the freed page. So coalesce is safe iff the edit is
-        // EXCLUSIVE. The single-vCPU case is provably exclusive here, so re-enable
-        // coalescing then (the OutOfTables→ENOMEM-under-churn fix for a
-        // single-threaded guest). The multi-vCPU case stays conservative HERE,
-        // and deliberately so: safety is not the only question. Eager coalescing
-        // asks whether the scan is WORTH it, and a busy multi-vCPU guest holds
-        // most of the 440-table pool legitimately, so the 512-descriptor scans
-        // run on every edit and reclaim almost nothing — measured at
-        // `go-net_http` 50 s -> over 200 s when exclusivity was allowed to relax
-        // this flag. Whether freeing a table for REUSE is safe is the separate
-        // question `stage1_exclusive` answers, and it gates only the last-resort
-        // sweep in `alloc_table`, which is what actually keeps a churning guest
-        // off OutOfTables.
-        //
-        // Measure the count BEFORE the local `pt` clone below — the clone adds a
-        // reference, so `strong_count(&pt)` is 2 for a SOLE vCPU and `> 1` is
-        // ALWAYS true, leaving the sole-vCPU reclaim DEAD and leaking the 440-page
-        // table pool under single-threaded mmap churn (CPython multiprocessing's
-        // 400+ SemLock map/unmap cycles exhausted it: "stage-1 page-table pool
-        // exhausted"). `strong_count(&self.page_tables)` == the live engine count.
-        let unsafe_to_coalesce = Arc::strong_count(&self.page_tables) > 1;
-        // Exclusivity is passed separately and deliberately does NOT relax
-        // `unsafe_to_coalesce`. Letting it enable EAGER coalescing/reclaim took
-        // `go-net_http` from 50 s to over 200 s: a busy guest legitimately holds
-        // most of the 440-table pool, so the 512-descriptor scans ran on every
-        // edit and reclaimed almost nothing. Exclusivity gates only the
-        // last-resort sweep inside `alloc_table`, which is what actually keeps a
-        // churning guest off `OutOfTables`.
+        let page_tables = self.page_tables.clone();
+        let engines = page_tables.engines();
+        let unsafe_to_coalesce = page_tables.is_shared_with_vfork_child() || engines > 1;
         let stage1_exclusive = carrick_hal::stage1_exclusive::current_thread_edits_exclusively();
-        let pt = Arc::clone(&self.page_tables);
-        let mut guard = pt.lock();
-        if guard.is_none() {
-            // Build from the live guest backing (the boot tables) on first edit —
-            // nothing else writes the tables before this, so it matches the image.
-            let bytes = self
-                .vm
-                .read_gpa(pt_base, size)
-                .map_err(|_| MemoryError::HostMap("read live page tables".to_string()))?;
-            // Build through this engine's `GuestArch` MMU codec.
-            use carrick_hal::PageTableCodec as _;
-            let mut manager =
-                <<Self as ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::new_manager(
-                    bytes, pt_base,
-                );
-            if let Some(source) = self.pending_arena_source.lock().take() {
-                carrick_observability::probes::stage1_arena_install(
-                    4,
-                    1,
-                    0,
-                    Arc::as_ptr(&pt) as u64,
-                );
-                manager.set_arena_source(source).map_err(|error| {
-                    MemoryError::HostMap(format!(
-                        "apply deferred stage-1 table arena source: {error:?}"
-                    ))
-                })?;
-            } else {
-                carrick_observability::probes::stage1_arena_install(
-                    4,
-                    0,
-                    0,
-                    Arc::as_ptr(&pt) as u64,
-                );
-            }
-            *guard = Some(manager);
-        }
-        // INVARIANT: populated just above if it was `None` (so the else is dead);
-        // a returned Err keeps us clear of the workspace's expect/panic deny lints.
-        let Some(mgr) = guard.as_mut() else {
-            return Err(MemoryError::HostMap(
-                "page-table manager unexpectedly absent".to_string(),
-            ));
+
+        let live_mgr = if page_tables.is_none() {
+            Some(self.build_page_tables_manager_from_live()?)
+        } else {
+            None
         };
-        if mgr.base() != pt_base {
-            return Err(MemoryError::HostMap(format!(
-                "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
-                mgr.base()
-            )));
-        }
-        mgr.set_multi_vcpu(unsafe_to_coalesce);
-        mgr.set_stage1_exclusive(stage1_exclusive);
-        let outcome: PageTableApplyOutcome = match edit(mgr) {
-            Ok(res) => res,
-            Err(PageTableError::OutOfTables) => {
-                // Report the pool's own numbers. "Exhausted" alone cannot
-                // distinguish a genuinely huge address space from the reclaim
-                // leak, and `in_use` rising monotonically toward `capacity`
-                // while `free` stays at 0 IS the leak's signature.
-                let (in_use, free, capacity, arenas) = mgr.pool_stats();
-                let source = mgr.has_arena_source();
-                let engines = Arc::strong_count(&self.page_tables);
-                let pmr = stage1_exclusive;
-                return Err(MemoryError::HostMap(format!(
-                    "stage-1 page-table pool exhausted \
-                     (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
-                     reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
-                )));
-            }
-            Err(PageTableError::BadAddress) => {
-                return Err(MemoryError::OutOfBounds {
-                    address: 0,
-                    length: 0,
-                });
-            }
-            Err(PageTableError::MissingArenaSource) => {
-                return Err(MemoryError::HostMap(
-                    "stage-1 page-table manager has no arena source".to_owned(),
-                ));
-            }
-            Err(PageTableError::ConflictingArenaSource) => {
-                return Err(MemoryError::HostMap(
-                    "stage-1 page-table manager conflicting arena source".to_owned(),
-                ));
-            }
-            Err(PageTableError::UnresolvedArena(base)) => {
-                return Err(MemoryError::HostMap(format!(
-                    "stage-1 page-table manager unresolved arena 0x{base:x}",
-                )));
-            }
-        };
-        if outcome.changed {
-            self.vm
-                .publish_stage1_extension_arenas(mgr)
-                .map_err(|error| {
-                    MemoryError::HostMap(format!(
-                        "publish stage-1 extension arenas failed: {error:?}"
-                    ))
-                })?;
-            // SAFETY: `host` backs the live page-table region for the whole process
-            // lifetime; the manager writes only 8-byte-aligned descriptor slots
-            // within `[host, host + size)`.
-            unsafe {
-                mgr.sync_to_host(|base| {
-                    self.vm
-                        .host_ptr(base, size)
-                        .or_else(|| (base == pt_base).then_some(host))
-                })
-            }
-            .map_err(|error| {
-                MemoryError::HostMap(format!(
-                    "sync stage-1 page tables to host failed: {error:?}"
-                ))
-            })?;
-        }
+        let mut outcome = PageTableApplyOutcome::default();
+        let edit_res: Result<(), MemoryError> = page_tables.edit(
+            || live_mgr.ok_or_else(|| MemoryError::HostMap("stage-1 manager absent".to_string())),
+            |editor| {
+                if editor.base() != pt_base {
+                    return Err(MemoryError::HostMap(format!(
+                        "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
+                        editor.base()
+                    )));
+                }
+                editor.set_multi_vcpu(unsafe_to_coalesce);
+                editor.set_stage1_exclusive(stage1_exclusive);
+                match edit(editor) {
+                    Ok(res) => {
+                        outcome = res;
+                        if outcome.changed {
+                            self.vm
+                                .publish_stage1_extension_arenas(editor.manager)
+                                .map_err(|error| {
+                                    MemoryError::HostMap(format!(
+                                        "publish stage-1 extension arenas failed: {error:?}"
+                                    ))
+                                })?;
+                            // SAFETY: `host` backs the live page-table region for the whole process
+                            // lifetime; the manager writes only 8-byte-aligned descriptor slots
+                            // within `[host, host + size)`.
+                            unsafe {
+                                editor.sync_to_host(|base| {
+                                    self.vm
+                                        .host_ptr(base, size)
+                                        .or_else(|| (base == pt_base).then_some(host))
+                                })
+                            }
+                            .map_err(|error| {
+                                MemoryError::HostMap(format!(
+                                    "sync stage-1 page tables to host failed: {error:?}"
+                                ))
+                            })?;
+                        }
+                        Ok(())
+                    }
+                    Err(PageTableError::OutOfTables) => {
+                        let (in_use, free, capacity, arenas) = editor.pool_stats();
+                        let source = editor.has_arena_source();
+                        let pmr = stage1_exclusive;
+                        Err(MemoryError::HostMap(format!(
+                            "stage-1 page-table pool exhausted \
+                             (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
+                             reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
+                        )))
+                    }
+                    Err(PageTableError::BadAddress) => {
+                        Err(MemoryError::OutOfBounds {
+                            address: 0,
+                            length: 0,
+                        })
+                    }
+                    Err(PageTableError::MissingArenaSource) => {
+                        Err(MemoryError::HostMap(
+                            "stage-1 page-table manager has no arena source".to_owned(),
+                        ))
+                    }
+                    Err(PageTableError::ConflictingArenaSource) => {
+                        Err(MemoryError::HostMap(
+                            "stage-1 page-table manager conflicting arena source".to_owned(),
+                        ))
+                    }
+                    Err(PageTableError::UnresolvedArena(base)) => {
+                        Err(MemoryError::HostMap(format!(
+                            "stage-1 page-table manager unresolved arena 0x{base:x}",
+                        )))
+                    }
+                }
+            },
+        );
+        edit_res?;
         Ok(outcome)
     }
 
@@ -1093,7 +971,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// not publish a new guest-visible translation.
     fn pt_edit(
         &mut self,
-        edit: impl FnOnce(&mut PageTableManager) -> Result<PageTableApplyOutcome, PageTableError>,
+        edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<(), MemoryError> {
         self.pt_edit_locked(edit).map(|_outcome| ())
     }
@@ -1116,7 +994,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// re-invented.
     fn pt_edit_and_flush(
         &mut self,
-        edit: impl FnOnce(&mut PageTableManager) -> Result<PageTableApplyOutcome, PageTableError>,
+        edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<(), MemoryError> {
         let outcome = self.pt_edit_locked(edit)?;
         if !outcome.flush_required {
@@ -1145,33 +1023,35 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .vm
             .host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_owned()))?;
-        let guard = self.page_tables.lock();
-        let Some(manager) = guard.as_ref() else {
-            return Err(MemoryError::HostMap(
-                "page-table manager unexpectedly absent".to_owned(),
-            ));
-        };
-        if manager.base() != pt_base {
-            return Err(MemoryError::HostMap(format!(
-                "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
-                manager.base()
-            )));
-        }
-        // SAFETY: `host_ptr` resolved the complete live page-table mapping at
-        // `pt_base`, and the manager's base/length were checked above.
-        unsafe {
-            manager.debug_walk_host(
-                |base| {
-                    self.vm
-                        .host_ptr(base, size)
-                        .or_else(|| (base == pt_base).then_some(host))
-                },
-                va,
-            )
-        }
-        .map_err(|error| {
-            MemoryError::HostMap(format!("debug walk stage-1 page tables failed: {error:?}"))
-        })
+        self.page_tables
+            .with_manager(|manager| {
+                if manager.base() != pt_base {
+                    return Err(MemoryError::HostMap(format!(
+                        "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
+                        manager.base()
+                    )));
+                }
+                // SAFETY: `host_ptr` resolved the complete live page-table mapping at
+                // `pt_base`, and the manager's base/length were checked above.
+                unsafe {
+                    manager.debug_walk_host(
+                        |base| {
+                            self.vm
+                                .host_ptr(base, size)
+                                .or_else(|| (base == pt_base).then_some(host))
+                        },
+                        va,
+                    )
+                }
+                .map_err(|error| {
+                    MemoryError::HostMap(format!(
+                        "debug walk stage-1 page tables failed: {error:?}"
+                    ))
+                })
+            })
+            .ok_or_else(|| {
+                MemoryError::HostMap("page-table manager unexpectedly absent".to_owned())
+            })?
     }
 
     /// Flush the stale stage-1 TLB after a host page-descriptor edit by running the
@@ -1492,7 +1372,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // parent vCPU is deliberately reclaimed while its TID output is written,
         // so a redundant TTBR0 read from that parked vCPU would fail even though
         // the target stack is already materialized.
-        let editor_present = self.page_tables.lock().is_some();
+        let editor_present = self.page_tables.is_present();
         ensure_sparse_page_table_editor(editor_present, || {
             self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
         })?;
@@ -1520,8 +1400,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         if !carrick_mem::memory::needs_stage1_translation(raw, len as u64) {
             return Some(Gpa(raw));
         }
-        let guard = self.page_tables.lock();
-        guard.as_ref()?.translate(raw).map(Gpa)
+        self.page_tables
+            .with_manager(|mgr| mgr.translate(raw))
+            .flatten()
+            .map(Gpa)
     }
 
     /// One page-bounded VA→IPA segment of a syscall buffer. Page bounding is
@@ -1837,16 +1719,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // IPA. Passing the VA made both parent and child fall through to their
         // separate process-private FutexTables even though the frame receipt was
         // shared. A 4-byte-aligned futex word cannot cross a 4 KiB page.
-        let guard = self.page_tables.lock();
-        let Some(page_tables) = guard.as_ref() else {
+        let backing_gpa = self
+            .page_tables
+            .with_manager(|page_tables| shared_futex_backing_gpa(page_tables, guest_addr));
+        let Some(backing_gpa) = backing_gpa.flatten() else {
             if debug {
-                eprintln!("[FUTEXDBG] va={guest_addr:#x} REFUSED: no live stage-1 page tables");
-            }
-            return None;
-        };
-        let Some(backing_gpa) = shared_futex_backing_gpa(page_tables, guest_addr) else {
-            if debug {
-                eprintln!("[FUTEXDBG] va={guest_addr:#x} REFUSED: stage-1 walk has no leaf");
+                eprintln!("[FUTEXDBG] va={guest_addr:#x} REFUSED: no leaf or no live tables");
             }
             return None;
         };
@@ -1888,7 +1766,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }
         // Same editor precondition as `ensure_sparse_mmap_backing`: a fresh
         // materialization needs the software stage-1 editor.
-        let editor_present = self.page_tables.lock().is_some();
+        let editor_present = self.page_tables.is_present();
         ensure_sparse_page_table_editor(editor_present, || {
             self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
         })?;
@@ -1920,8 +1798,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // pt_edit_AND_FLUSH: a guest can `mprotect` an ALREADY-TOUCHED page (e.g.
         // RELRO RW→RO), so the stale stage-1 TLB entry must be invalidated for the
         // new protection to take effect.
-        self.pt_edit_and_flush(|mgr| {
-            apply_stage1_protection_edit(mgr, address, len, prot, &armed_cow)
+        self.pt_edit_and_flush(|editor| {
+            editor.apply_protection_edit(address, len, prot, &armed_cow)
         })?;
         self.vm
             .observe_frame_cow_protection(address, len, prot)
@@ -2012,9 +1890,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // with ENOMEM despite the frame being live.
         let overlay_ipa = self
             .page_tables
-            .lock()
-            .as_ref()
-            .and_then(|manager| manager.translate(overlay_slot_va))
+            .with_manager(|manager| manager.translate(overlay_slot_va))
+            .flatten()
             .ok_or_else(|| {
                 RepointPrivateError::clean(MemoryError::OutOfBounds {
                     address: overlay_slot_va,
@@ -2089,11 +1966,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn translate_va(&self, va: u64) -> Option<u64> {
-        let page_tables = self.page_tables.lock();
-        page_tables.as_ref().and_then(|mgr| mgr.translate(va))
+        self.page_tables
+            .with_manager(|mgr| mgr.translate(va))
+            .flatten()
     }
 }
 
+#[cfg(test)]
 fn apply_stage1_protection_edit(
     mgr: &mut PageTableManager,
     address: u64,
@@ -2101,19 +1980,12 @@ fn apply_stage1_protection_edit(
     prot: u64,
     armed_cow: &[crate::vmm::ForkCowRange],
 ) -> Result<PageTableApplyOutcome, PageTableError> {
-    use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
-    let exec = prot & LINUX_PROT_EXEC != 0;
-    let mut outcome = if prot & LINUX_PROT_WRITE != 0 {
-        mgr.set_rw(address, len, exec)?
-    } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
-        mgr.set_readonly(address, len, exec)?
-    } else {
-        mgr.set_prot_none(address, len)?
+    let mut source: Option<Box<dyn carrick_mem::page_table::TableArenaSource>> = None;
+    let mut editor = crate::stage1_authority::Stage1Editor {
+        manager: mgr,
+        arena_source: &mut source,
     };
-    for range in armed_cow {
-        outcome |= mgr.set_readonly(range.va, range.len, exec)?;
-    }
-    Ok(outcome)
+    editor.apply_protection_edit(address, len, prot, armed_cow)
 }
 
 impl<V: Aarch64Vmm> CurrentMmMemory for Aarch64EngineCore<V> {}
@@ -2567,35 +2439,24 @@ fn signal_interrupted_pc_for_live_level(
 /// the backend supplies how to build a sibling VM/vCPU from `builder`; the SEEDED
 /// register snapshot + the SHARED page-table editor / PROT_NONE set ride along so
 /// the new vCPU runs in the SAME guest address space on the SAME VM.
-/// A stage-1 table arena source handed to an address space before its manager
-/// exists. SHARED by every engine over the same page-table authority (the
-/// spawning vCPU and its `CLONE_THREAD` siblings), because the manager is
-/// built lazily by whichever engine edits first: an engine-local deferral let
-/// a sibling build a manager that could never grow (CPython's compile
-/// recursion test refused every mmap in roughly half its runs).
-pub type DeferredArenaSource =
-    Arc<Mutex<Option<Box<dyn carrick_mem::page_table::TableArenaSource>>>>;
-
 pub struct Aarch64SiblingSpec<V: Aarch64Vmm> {
     builder: V::SiblingBuilder,
     snapshot: Aarch64VcpuSnapshot,
-    /// The parent's live stage-1 page-table editor, SHARED (Arc clone): a
+    /// The parent's live stage-1 page-table authority, SHARED (Arc clone): a
     /// `clone(CLONE_THREAD)` sibling runs on the SAME VM with the SAME page-table
-    /// backing, so its `mmap`/`mprotect` edits must go through the SAME manager.
-    page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    /// backing, so its `mmap`/`mprotect` edits must go through the SAME authority.
+    page_tables: Stage1Authority,
     /// The parent's PROT_NONE bookkeeping, SHARED (Arc clone). On KVM the
     /// load-bearing share is inside the backend `GuestRam` (via
     /// `from_shared_windows`); this is the engine-side mirror.
     protections: Arc<MemoryProtections>,
-    /// The parent's deferred arena source, SHARED (Arc clone).
-    pending_arena_source: DeferredArenaSource,
     process_asid: Option<u16>,
 }
 
 pub struct Aarch64ProcessSpec<V: Aarch64Vmm> {
     builder: V::ProcessBuilder,
     snapshot: Aarch64VcpuSnapshot,
-    page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    page_tables: Stage1Authority,
     protections: Arc<MemoryProtections>,
     process_asid: u16,
 }
@@ -2603,16 +2464,15 @@ pub struct Aarch64ProcessSpec<V: Aarch64Vmm> {
 pub struct Aarch64SiblingTaskOnlyParts<V: Aarch64Vmm> {
     pub builder: V::SiblingBuilder,
     pub snapshot: Aarch64VcpuSnapshot,
-    pub page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    pub page_tables: Stage1Authority,
     pub protections: Arc<MemoryProtections>,
-    pub pending_arena_source: DeferredArenaSource,
     pub process_asid: Option<u16>,
 }
 
 pub struct Aarch64ProcessTaskOnlyParts<V: Aarch64Vmm> {
     pub builder: V::ProcessBuilder,
     pub snapshot: Aarch64VcpuSnapshot,
-    pub page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    pub page_tables: Stage1Authority,
     pub protections: Arc<MemoryProtections>,
     pub process_asid: u16,
 }
@@ -2623,7 +2483,6 @@ impl<V: Aarch64Vmm> Aarch64SiblingSpec<V> {
             builder: self.builder,
             snapshot: self.snapshot,
             page_tables: self.page_tables,
-            pending_arena_source: self.pending_arena_source,
             protections: self.protections,
             process_asid: self.process_asid,
         }
@@ -2765,43 +2624,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         &mut self,
         source: Box<dyn carrick_mem::page_table::TableArenaSource>,
     ) -> Result<(), TrapError> {
-        let page_tables = Arc::clone(&self.page_tables);
-        let authority = Arc::as_ptr(&page_tables) as u64;
-        let mut page_tables = page_tables.lock();
-        match page_tables.as_mut() {
-            Some(manager) => {
-                carrick_observability::probes::stage1_arena_install(1, 1, 0, authority);
-                manager.set_arena_source(source).map_err(|error| {
-                    TrapError::Hypervisor(format!("set stage-1 table arena source: {error:?}"))
-                })
-            }
-            // No manager yet. When the live tables are already readable (an
-            // exec rebuild, or a root whose boot tables are in place) build the
-            // manager NOW and attach the source to it: the slot is shared with
-            // the VMM state and with any successor engine over the same mm, and
-            // whichever of them builds the manager first would otherwise do so
-            // without this engine's deferred source (pagetablegrow through
-            // `/bin/sh -c` died at 87 mappings with `source=false`). Only when
-            // the tables are not readable yet (bring-up order) is the source
-            // kept for the lazy build.
-            None => match self.build_page_tables_manager_from_live() {
-                Ok(mut manager) => {
-                    carrick_observability::probes::stage1_arena_install(2, 1, 0, authority);
-                    manager.set_arena_source(source).map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "set stage-1 table arena source on eager build: {error:?}"
-                        ))
-                    })?;
-                    *page_tables = Some(manager);
-                    Ok(())
-                }
-                Err(_) => {
-                    carrick_observability::probes::stage1_arena_install(3, 0, 1, authority);
-                    *self.pending_arena_source.lock() = Some(source);
-                    Ok(())
-                }
-            },
-        }
+        let page_tables = self.page_tables.clone();
+        page_tables.install_source_with_eager_builder(source, || {
+            self.build_page_tables_manager_from_live()
+        })
     }
 
     fn resolve_frame_cow_fault(
@@ -2927,7 +2753,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn prepare_core_snapshot(&mut self) -> Result<(), TrapError> {
-        if self.page_tables.lock().is_none() {
+        if self.page_tables.is_none() {
             // Persistent exec intentionally defers the software observer until
             // the first edit. Core capture needs a read-only live walk even if
             // this process never called mmap/mprotect after exec. The no-op
@@ -3033,7 +2859,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 })?;
                 self.vm.retire_initial_mmap_arena()?;
             }
-            self.pt_edit_and_flush(reserve_hvpatch_process_apertures)
+            self.pt_edit_and_flush(|editor| editor.reserve_hvpatch_process_apertures())
                 .map_err(|error| {
                     TrapError::Hypervisor(format!(
                         "reserve hvpatch root-slot/global-frame apertures: {error}"
@@ -3155,7 +2981,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // no mmap/mprotect edit has already done so. The no-op edit publishes
         // nothing and performs no TLBI.
         let stage_started = std::time::Instant::now();
-        let page_tables_absent = self.page_tables.lock().is_none();
+        let page_tables_absent = self.page_tables.is_none();
         if page_tables_absent {
             self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
                 .map_err(|error| {
@@ -3205,7 +3031,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         );
 
         let stage_started = std::time::Instant::now();
-        let mut page_tables = self.page_tables.lock().clone().ok_or_else(|| {
+        let mut page_tables = self.page_tables.snapshot_image().ok_or_else(|| {
             TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
         })?;
         // Complete pre-transaction image, taken into the recycled buffer when a
@@ -3244,6 +3070,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 * (1 + u64::from(parent_page_tables_snapshot.is_some())),
         );
 
+        let mut child_source = request.table_arena_source.take();
         // Prepare the child's independent stage-1 graph read-only while it is
         // still offline. A failure here cannot affect the parent. This closes
         // the interval in which the old implementation had already armed the
@@ -3251,7 +3078,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         for range in &cow_ranges {
             if range.kernel_only {
                 page_tables
-                    .set_kernel_readonly(range.va, range.len, range.executable)
+                    .set_kernel_readonly(
+                        range.va,
+                        range.len,
+                        range.executable,
+                        child_source.as_deref_mut(),
+                    )
                     .map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "prepare hvpatch child kernel fork leaves read-only: {error:?}"
@@ -3259,7 +3091,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     })?;
             } else {
                 page_tables
-                    .set_fork_readonly(range.va, range.len)
+                    .set_fork_readonly(range.va, range.len, child_source.as_deref_mut())
                     .map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "prepare hvpatch child private fork leaves read-only: {error:?}"
@@ -3269,15 +3101,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
 
         let stage_started = std::time::Instant::now();
-        if let Some(source) = request.table_arena_source.take() {
-            page_tables.set_arena_source(source).map_err(|error| {
-                TrapError::Hypervisor(format!("set child arena source: {error:?}"))
-            })?;
-        }
         let child_root = request.child_ttbr0 & ((1_u64 << 48) - 1);
-        page_tables.rebase(child_root).map_err(|error| {
-            TrapError::Hypervisor(format!("rebase child page tables: {error:?}"))
-        })?;
+        page_tables
+            .rebase(child_root, child_source.as_deref_mut())
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("rebase child page tables: {error:?}"))
+            })?;
         emit_stage(
             HvpatchForkProcessSpecStagePhase::PageTablesRebase,
             stage_started,
@@ -3286,6 +3115,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let builder = self
             .vm
             .build_process_builder(request, &mut page_tables, &cow_ranges)?;
+        let child_authority = Stage1Authority::new_with_manager(Some(page_tables));
+        if let Some(source) = child_source {
+            child_authority.install_source(source).map_err(|error| {
+                TrapError::Hypervisor(format!("set child arena source: {error:?}"))
+            })?;
+        }
         let stage_started = std::time::Instant::now();
         let protections = Arc::new(MemoryProtections::from_snapshot(
             self.protections.snapshot_all(),
@@ -3315,7 +3150,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let spec = Aarch64ProcessSpec {
             builder,
             snapshot,
-            page_tables: Arc::new(Mutex::new(Some(page_tables))),
+            page_tables: child_authority,
             protections,
             process_asid: child_asid,
         };
@@ -3375,9 +3210,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     const AP_PRIV_RO: u64 = 0b10 << 6;
                     let expected_ipa = self
                         .page_tables
-                        .lock()
-                        .as_ref()
-                        .and_then(|manager| manager.translate(range.va));
+                        .with_manager(|manager| manager.translate(range.va))
+                        .flatten();
                     if let Some(expected_ipa) = expected_ipa {
                         if leaf & VALID == 0 {
                             return Err(TrapError::Hypervisor(format!(
@@ -3417,21 +3251,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })();
 
             if let Err(error) = publish_parent {
-                let rollback_result = self.pt_edit_and_flush(|manager| {
+                let rollback_result = self.pt_edit_and_flush(|editor| {
                     // Restore the pre-fork image but keep the live manager's
                     // arena source and adopted extension arenas: a clone
                     // carries neither, and a parent that lost them could
                     // never grow again (see `adopt_live_extension_state`).
-                    let mut restored = parent_page_tables_snapshot.clone();
-                    let before = u32::from(manager.has_arena_source());
-                    restored.adopt_live_extension_state(manager);
-                    carrick_observability::probes::stage1_arena_replace(
-                        7,
-                        before,
-                        u32::from(restored.has_arena_source()),
-                        0,
-                    );
-                    *manager = restored;
+                    editor.restore_image(parent_page_tables_snapshot.clone(), 7, 0);
                     Ok(PageTableApplyOutcome::new(true, true))
                 });
                 if let Err(rollback_error) = rollback_result {
@@ -3478,13 +3303,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
         // A fresh process: its source was installed on the child tables by
         // `build_process_spec`, so no deferral is inherited from the parent.
-        let mut engine = Self::from_parts_with_shared(
-            vm,
-            vcpu,
-            spec.page_tables,
-            spec.protections,
-            Arc::new(Mutex::new(None)),
-        );
+        let mut engine = Self::from_parts_with_shared(vm, vcpu, spec.page_tables, spec.protections);
         engine.process_asid = Some(spec.process_asid);
         Ok(engine)
     }
@@ -3505,17 +3324,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             return Ok(());
         };
         let mut restored = Some(rollback.page_tables);
-        self.pt_edit_and_flush(|manager| {
+        self.pt_edit_and_flush(|editor| {
             // The pre-fork image is a clone: carry the live manager's arena
             // source and adopted extension arenas over, or the parent could
             // never grow again after a refused fork (CPython's `-v` uname
             // fork lost the root's source this way).
-            if let Some(mut image) = restored.take() {
-                let before = u32::from(manager.has_arena_source());
-                image.adopt_live_extension_state(manager);
-                let after = u32::from(image.has_arena_source());
-                carrick_observability::probes::stage1_arena_replace(6, before, after, 0);
-                *manager = image;
+            if let Some(image) = restored.take() {
+                editor.restore_image(image, 6, 0);
             }
             Ok(PageTableApplyOutcome::new(true, true))
         })
@@ -3707,13 +3522,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         Ok(Aarch64SiblingSpec {
             builder,
             snapshot,
-            // Share the SAME page-table editor (Arc clone): the sibling edits the
+            // Share the SAME page-table authority: the sibling edits the
             // SAME backing through the SAME manager.
-            page_tables: Arc::clone(&self.page_tables),
+            page_tables: self.page_tables.clone(),
             // Share the SAME PROT_NONE bookkeeping (engine-side mirror; the backing
             // share lives in the backend `GuestRam`).
             protections: Arc::clone(&self.protections),
-            pending_arena_source: Arc::clone(&self.pending_arena_source),
             process_asid: self.process_asid,
         })
     }
@@ -3726,14 +3540,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // its EL0-trampoline thread-start so a brand-new vCPU eret's into EL0 at the
         // post-clone instruction.
         vcpu.restore_thread_start(&spec.snapshot)?;
-        // SHARE the spawning thread's page-table editor + PROT_NONE set.
-        let mut engine = Self::from_parts_with_shared(
-            vm,
-            vcpu,
-            spec.page_tables,
-            spec.protections,
-            spec.pending_arena_source,
-        );
+        spec.page_tables.increment_engine_count();
+        // SHARE the spawning thread's page-table authority + PROT_NONE set.
+        let mut engine = Self::from_parts_with_shared(vm, vcpu, spec.page_tables, spec.protections);
         engine.process_asid = spec.process_asid;
         Ok(engine)
     }
@@ -4414,7 +4223,7 @@ mod tests {
         let guest_va = carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
         let backing_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
         manager
-            .map_aliased(guest_va, backing_ipa, 0x4000, true)
+            .map_aliased(guest_va, backing_ipa, 0x4000, true, None)
             .expect("map high shared-file alias into a global frame");
 
         let resolved = shared_futex_backing_gpa(&manager, guest_va + 4)
@@ -4523,7 +4332,7 @@ mod tests {
         let edit_len: usize = 4 * PAGE_SIZE as usize; // 4 pages in edit: [0..4)
         let total_mapped_len: u64 = 5 * PAGE_SIZE; // 5th page is neighbor [4..5)
 
-        mgr.map_private_aliased(base_va, base_ipa, total_mapped_len, true)
+        mgr.map_private_aliased(base_va, base_ipa, total_mapped_len, true, None)
             .expect("map initial non-identity pages");
 
         let cow_range_stale_exec = crate::vmm::ForkCowRange {
@@ -4620,7 +4429,7 @@ mod tests {
         let bytes = carrick_mem::memory::stage1_hvpatch_page_tables();
         let mut mgr = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
 
-        mgr.map_private_aliased(base_va, base_ipa, total_mapped_len, true)
+        mgr.map_private_aliased(base_va, base_ipa, total_mapped_len, true, None)
             .expect("map initial non-identity pages");
 
         let cow_range_stale_nonexec = crate::vmm::ForkCowRange {
@@ -4724,27 +4533,23 @@ mod tests {
     #[test]
     fn replace_page_tables_authority_preserves_parent_manager_and_source_when_shared() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let mut manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
         let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x1000));
-        manager
-            .set_arena_source(Box::new(DummyArenaSource(source_id)))
-            .expect("set arena source on parent manager");
-        assert!(manager.has_arena_source());
+        let parent_authority = Stage1Authority::new_with_manager(Some(manager));
+        parent_authority
+            .install_source(Box::new(DummyArenaSource(source_id)))
+            .expect("set arena source on parent authority");
+        assert!(parent_authority.has_source());
 
-        let parent_tables = Arc::new(Mutex::new(Some(manager)));
-        let mut child_tables = Arc::clone(&parent_tables);
-        assert_eq!(Arc::strong_count(&child_tables), 2);
-
-        let parent_pending = Arc::new(Mutex::new(Some(Box::new(DummyArenaSource(source_id))
-            as Box<dyn carrick_mem::page_table::TableArenaSource>)));
-        let mut child_pending = Arc::clone(&parent_pending);
-        assert_eq!(Arc::strong_count(&child_pending), 2);
+        // When shared with vfork child
+        parent_authority.share_with_vfork_child();
+        let mut child_authority = parent_authority.clone();
+        assert!(child_authority.is_shared_with_vfork_child());
 
         let mut retired = false;
         let mut bound = false;
         replace_page_tables_authority(
-            &mut child_tables,
-            &mut child_pending,
+            &mut child_authority,
             None,
             |_| {
                 retired = true;
@@ -4763,40 +4568,34 @@ mod tests {
         assert!(bound, "must bind fresh child authority");
 
         // Parent tables and source must be completely preserved.
-        let parent_guard = parent_tables.lock();
-        let parent_mgr = parent_guard
-            .as_ref()
-            .expect("parent manager must not be stolen");
         assert!(
-            parent_mgr.has_arena_source(),
+            parent_authority.is_present(),
+            "parent manager must not be stolen"
+        );
+        assert!(
+            parent_authority.has_source(),
             "parent must retain its arena source"
         );
-        drop(parent_guard);
-
-        // Parent pending source must not be stolen.
         assert!(
-            parent_pending.lock().is_some(),
-            "parent pending source must not be stolen"
+            parent_authority.is_exclusive(),
+            "parent must be restored to Exclusive after child exec"
         );
 
-        // Child must have detached to a distinct authority and empty pending source.
-        assert!(!Arc::ptr_eq(&parent_tables, &child_tables));
-        assert!(!Arc::ptr_eq(&parent_pending, &child_pending));
-        assert!(child_pending.lock().is_none());
+        // Child must have detached to a distinct authority and have no source.
+        assert!(!parent_authority.shares_exact_authority(&child_authority));
+        assert!(!child_authority.has_source());
     }
 
     #[test]
     fn replace_page_tables_authority_retires_old_when_unshared() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
         let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-        let mut tables = Arc::new(Mutex::new(Some(manager)));
-        assert_eq!(Arc::strong_count(&tables), 1);
-        let mut pending = Arc::new(Mutex::new(None));
+        let mut authority = Stage1Authority::new_with_manager(Some(manager));
+        assert!(authority.is_exclusive());
 
         let mut retired = false;
         replace_page_tables_authority(
-            &mut tables,
-            &mut pending,
+            &mut authority,
             None,
             |_| {
                 retired = true;
@@ -4807,5 +4606,160 @@ mod tests {
         .expect("replace page tables authority");
 
         assert!(retired, "must retire old manager when solely owned");
+    }
+
+    #[test]
+    fn stage1_authority_source_survives_snapshot_image() {
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x2000));
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        authority
+            .install_source(Box::new(DummyArenaSource(source_id)))
+            .expect("install source");
+        assert!(authority.has_source());
+
+        let snapshot = authority.snapshot_image().expect("snapshot present");
+        assert!(authority.has_source());
+        assert_eq!(snapshot.base(), carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+    }
+
+    #[test]
+    fn stage1_authority_source_survives_rollback() {
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x3000));
+        let authority = Stage1Authority::new_with_manager(Some(manager));
+        authority
+            .install_source(Box::new(DummyArenaSource(source_id)))
+            .expect("install source");
+
+        let snapshot = authority.snapshot_image().expect("snapshot");
+        authority
+            .edit(
+                || unreachable!(),
+                |editor| {
+                    assert!(editor.has_arena_source());
+                    editor.restore_image(snapshot, 6, 0);
+                    assert!(editor.has_arena_source());
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("edit");
+
+        assert!(authority.has_source());
+    }
+
+    #[test]
+    fn stage1_authority_source_survives_exec_while_shared() {
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x4000));
+        let parent = Stage1Authority::new_with_manager(Some(manager));
+        parent
+            .install_source(Box::new(DummyArenaSource(source_id)))
+            .expect("install source");
+        parent.share_with_vfork_child();
+
+        let mut child = parent.clone();
+        let mut retired = false;
+        let new_child = child
+            .replace_for_exec(
+                || Ok::<Option<PageTableManager>, ()>(None),
+                |_| {
+                    retired = true;
+                    Ok(())
+                },
+            )
+            .expect("replace_for_exec");
+
+        assert!(!retired);
+        assert!(parent.has_source());
+        assert!(parent.is_exclusive());
+        assert!(!new_child.has_source());
+    }
+
+    #[test]
+    fn stage1_authority_sibling_lazy_build_sees_source() {
+        let authority = Stage1Authority::new();
+        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x5000));
+        authority
+            .install_source(Box::new(DummyArenaSource(source_id)))
+            .expect("deferred install");
+        assert!(authority.is_none());
+        assert!(authority.has_source());
+
+        let sibling = authority.clone();
+        sibling.increment_engine_count();
+        assert_eq!(sibling.engines(), 2);
+
+        sibling
+            .edit(
+                || {
+                    let bytes = carrick_mem::memory::stage1_identity_page_tables();
+                    Ok::<PageTableManager, PageTableError>(PageTableManager::new(
+                        bytes,
+                        carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+                    ))
+                },
+                |editor| {
+                    assert!(editor.has_arena_source());
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("lazy build on sibling edit");
+
+        assert!(authority.is_present());
+        assert!(authority.has_source());
+        assert!(sibling.has_source());
+    }
+
+    #[test]
+    fn stage1_authority_deferred_install_on_one_clone_then_build_on_another() {
+        let clone1 = Stage1Authority::new();
+        let clone2 = clone1.clone();
+
+        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x6000));
+        clone1
+            .install_source(Box::new(DummyArenaSource(source_id)))
+            .expect("install on clone1");
+
+        assert!(clone2.has_source());
+        assert!(clone2.is_none());
+
+        clone2
+            .edit(
+                || {
+                    let bytes = carrick_mem::memory::stage1_identity_page_tables();
+                    Ok::<PageTableManager, PageTableError>(PageTableManager::new(
+                        bytes,
+                        carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+                    ))
+                },
+                |editor| {
+                    assert!(editor.has_arena_source());
+                    Ok::<(), PageTableError>(())
+                },
+            )
+            .expect("edit on clone2");
+
+        assert!(clone1.is_present());
+        assert!(clone1.has_source());
+    }
+
+    #[test]
+    fn stage1_authority_conflicting_lease_rejection() {
+        let authority = Stage1Authority::new();
+        let source_id1 =
+            carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x7000));
+        let source_id2 =
+            carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x8000));
+
+        authority
+            .install_source(Box::new(DummyArenaSource(source_id1)))
+            .expect("install first source");
+
+        let res = authority.install_source(Box::new(DummyArenaSource(source_id2)));
+        assert_eq!(res.unwrap_err(), PageTableError::ConflictingArenaSource);
     }
 }
