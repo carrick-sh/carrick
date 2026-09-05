@@ -1,0 +1,9 @@
+6d916e4cf73946ab
+onlydir_on_dir_ok=true
+onlydir_on_file_enotdir=true
+dont_follow_open_no_event=true
+follow_open_event_regular=true
+ondir_dir_open_event_directory=true
+no_ondir_dir_open_silent=true
+flush_rc_zero=true
+flush_removes_marks=true
