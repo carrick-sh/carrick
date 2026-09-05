@@ -144,6 +144,7 @@ pub(crate) enum SharedFileFixedMremapError {
 /// what carrick rewrote it to.
 #[derive(Clone, Copy, Debug)]
 struct MmapRequest {
+    pid: i32,
     addr: u64,
     length: u64,
     prot: u64,
@@ -175,6 +176,7 @@ impl MmapRequest {
         cause: std::fmt::Arguments<'_>,
     ) -> DispatchOutcome {
         let Self {
+            pid,
             addr,
             length,
             prot,
@@ -186,6 +188,7 @@ impl MmapRequest {
             MmapRefusal::Spec(reason) => {
                 tracing::debug!(
                     target: "carrick::mmap",
+                    pid,
                     reason,
                     errno = errno.get(),
                     addr = format_args!("{addr:#x}"),
@@ -201,6 +204,7 @@ impl MmapRequest {
             MmapRefusal::Internal(reason) => {
                 tracing::warn!(
                     target: "carrick::mmap",
+                    pid,
                     reason,
                     errno = errno.get(),
                     addr = format_args!("{addr:#x}"),
@@ -3812,7 +3816,9 @@ impl SyscallDispatcher {
             // The exact request, for `MmapRequest::refused`. Captured before
             // MAP_FIXED_NOREPLACE normalization and page rounding so a refusal
             // reports the guest's own arguments, not carrick's rewrite of them.
+            let pid = cx.kernel.task().key().id.raw();
             let request = MmapRequest {
+                pid,
                 addr: requested_raw,
                 length,
                 prot,

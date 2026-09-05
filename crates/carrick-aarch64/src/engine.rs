@@ -596,6 +596,46 @@ fn seed_heap_unmapped(protections: &MemoryProtections) {
     }
 }
 
+/// Pure transition for replacing an engine's stage-1 page-table authority.
+/// When `page_tables` is shared (`Arc::strong_count > 1`, e.g. after a
+/// `CLONE_VM` / `vfork` before child's `execve`), the existing authority
+/// belongs to the other threads/processes. Taking its manager or retiring
+/// its extension arenas would strip the parent's live address space and
+/// arena source.
+#[cfg(test)]
+pub(crate) fn replace_page_tables_authority(
+    page_tables: &mut Arc<Mutex<Option<PageTableManager>>>,
+    pending_arena_source: &mut DeferredArenaSource,
+    mut manager: Option<PageTableManager>,
+    mut retire_old: impl FnMut(&mut PageTableManager) -> Result<(), TrapError>,
+    mut bind_new: impl FnMut(Arc<Mutex<Option<PageTableManager>>>),
+) -> Result<(), TrapError> {
+    let is_shared = Arc::strong_count(page_tables) > 1;
+    let old_mgr = if !is_shared {
+        page_tables.lock().take()
+    } else {
+        None
+    };
+    if let Some(mut old) = old_mgr {
+        retire_old(&mut old)?;
+    }
+    if is_shared {
+        *pending_arena_source = Arc::new(Mutex::new(None));
+    }
+    if let (Some(manager), Some(source)) = (manager.as_mut(), pending_arena_source.lock().take()) {
+        carrick_observability::probes::stage1_arena_install(5, 1, 0, 0);
+        manager.set_arena_source(source).map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "apply deferred stage-1 table arena source on rebuild: {error:?}"
+            ))
+        })?;
+    }
+    let new_authority = Arc::new(Mutex::new(manager));
+    bind_new(Arc::clone(&new_authority));
+    *page_tables = new_authority;
+    Ok(())
+}
+
 impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     fn validate_task_metadata(&self, state: &Aarch64TaskCpuStateV1) -> Result<(), TrapError> {
         if state.mm_generation != self.mm_generation
@@ -734,9 +774,17 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &mut self,
         mut manager: Option<PageTableManager>,
     ) -> Result<(), TrapError> {
-        let old_mgr = self.page_tables.lock().take();
+        let is_shared = Arc::strong_count(&self.page_tables) > 1;
+        let old_mgr = if !is_shared {
+            self.page_tables.lock().take()
+        } else {
+            None
+        };
         if let Some(mut old) = old_mgr {
             self.vm.retire_stage1_extension_arenas(&mut old)?;
+        }
+        if is_shared {
+            self.pending_arena_source = Arc::new(Mutex::new(None));
         }
         if let (Some(manager), Some(source)) =
             (manager.as_mut(), self.pending_arena_source.lock().take())
@@ -950,6 +998,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         "apply deferred stage-1 table arena source: {error:?}"
                     ))
                 })?;
+            } else {
+                carrick_observability::probes::stage1_arena_install(
+                    4,
+                    0,
+                    0,
+                    Arc::as_ptr(&pt) as u64,
+                );
             }
             *guard = Some(manager);
         }
@@ -976,11 +1031,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 // leak, and `in_use` rising monotonically toward `capacity`
                 // while `free` stays at 0 IS the leak's signature.
                 let (in_use, free, capacity, arenas) = mgr.pool_stats();
+                let source = mgr.has_arena_source();
                 let engines = Arc::strong_count(&self.page_tables);
                 let pmr = stage1_exclusive;
                 return Err(MemoryError::HostMap(format!(
                     "stage-1 page-table pool exhausted \
-                     (in_use={in_use} free={free} capacity={capacity} arenas={arenas} \
+                     (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
                      reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
                 )));
             }
@@ -4651,5 +4707,105 @@ mod tests {
             neighbor_before, neighbor_after,
             "neighbor page outside edit range must be unchanged"
         );
+    }
+
+    #[derive(Debug)]
+    struct DummyArenaSource(carrick_mem::page_table::TableArenaSourceId);
+    impl carrick_mem::page_table::TableArenaSource for DummyArenaSource {
+        fn id(&self) -> carrick_mem::page_table::TableArenaSourceId {
+            self.0
+        }
+        fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
+            None
+        }
+        fn return_arena(&mut self, _base: carrick_guest_mem::Gpa) {}
+    }
+
+    #[test]
+    fn replace_page_tables_authority_preserves_parent_manager_and_source_when_shared() {
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let mut manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x1000));
+        manager
+            .set_arena_source(Box::new(DummyArenaSource(source_id)))
+            .expect("set arena source on parent manager");
+        assert!(manager.has_arena_source());
+
+        let parent_tables = Arc::new(Mutex::new(Some(manager)));
+        let mut child_tables = Arc::clone(&parent_tables);
+        assert_eq!(Arc::strong_count(&child_tables), 2);
+
+        let parent_pending = Arc::new(Mutex::new(Some(Box::new(DummyArenaSource(source_id))
+            as Box<dyn carrick_mem::page_table::TableArenaSource>)));
+        let mut child_pending = Arc::clone(&parent_pending);
+        assert_eq!(Arc::strong_count(&child_pending), 2);
+
+        let mut retired = false;
+        let mut bound = false;
+        replace_page_tables_authority(
+            &mut child_tables,
+            &mut child_pending,
+            None,
+            |_| {
+                retired = true;
+                Ok(())
+            },
+            |_| {
+                bound = true;
+            },
+        )
+        .expect("replace page tables authority");
+
+        assert!(
+            !retired,
+            "must not retire parent's extension arenas when shared"
+        );
+        assert!(bound, "must bind fresh child authority");
+
+        // Parent tables and source must be completely preserved.
+        let parent_guard = parent_tables.lock();
+        let parent_mgr = parent_guard
+            .as_ref()
+            .expect("parent manager must not be stolen");
+        assert!(
+            parent_mgr.has_arena_source(),
+            "parent must retain its arena source"
+        );
+        drop(parent_guard);
+
+        // Parent pending source must not be stolen.
+        assert!(
+            parent_pending.lock().is_some(),
+            "parent pending source must not be stolen"
+        );
+
+        // Child must have detached to a distinct authority and empty pending source.
+        assert!(!Arc::ptr_eq(&parent_tables, &child_tables));
+        assert!(!Arc::ptr_eq(&parent_pending, &child_pending));
+        assert!(child_pending.lock().is_none());
+    }
+
+    #[test]
+    fn replace_page_tables_authority_retires_old_when_unshared() {
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let mut tables = Arc::new(Mutex::new(Some(manager)));
+        assert_eq!(Arc::strong_count(&tables), 1);
+        let mut pending = Arc::new(Mutex::new(None));
+
+        let mut retired = false;
+        replace_page_tables_authority(
+            &mut tables,
+            &mut pending,
+            None,
+            |_| {
+                retired = true;
+                Ok(())
+            },
+            |_| {},
+        )
+        .expect("replace page tables authority");
+
+        assert!(retired, "must retire old manager when solely owned");
     }
 }
