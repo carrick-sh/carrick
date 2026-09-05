@@ -266,6 +266,12 @@ pub struct SyntheticProcContext {
     pub sysvipc_msg: String,
 }
 
+impl SyntheticProcContext {
+    pub fn as_open_context(&self) -> OpenContext<'_> {
+        OpenContext::from(self)
+    }
+}
+
 /// The three writable user-namespace map files (only the `self/` forms; writing
 /// another live process's map needs a parent relationship carrick does not yet
 /// model — design §4.3). Phase 1 supports the self-map case, which is what
@@ -589,12 +595,13 @@ fn host_sysctl_u64(name: &str) -> Option<u64> {
     }
 }
 
-fn context_guest_hostname(ctx: &SyntheticProcContext) -> String {
-    if ctx.guest_hostname.is_empty() {
-        crate::execute::guest_hostname()
-    } else {
-        ctx.guest_hostname.clone()
+fn context_guest_hostname(ctx: &OpenContext<'_>) -> String {
+    if let Some(hostname) = ctx.guest_hostname() {
+        if !hostname.is_empty() {
+            return hostname.to_string();
+        }
     }
+    crate::execute::guest_hostname()
 }
 
 /// A sysctl leaf value: a fixed byte string or a per-read generator.
@@ -932,18 +939,18 @@ fn sysctl_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
 ///
 /// Without a kernel graph one Linux process IS one host process, so the host
 /// pid and its namespace translation are both genuinely this caller.
-fn context_self_pid(ctx: &SyntheticProcContext) -> u32 {
+fn context_self_pid(ctx: &OpenContext<'_>) -> u32 {
     ctx.identity
         .map_or_else(crate::namespace::pid::self_ns_pid, |identity| identity.pid)
 }
 
 /// A numeric `/proc/<self-pid>/<rest>` is the same object as `/proc/self/<rest>`.
 /// Rewrite it so the literal `/proc/self/*` renderers (which hold the live
-/// `SyntheticProcContext`) serve it too — keeping `ls /proc/<pid>` consistent
+/// `OpenContext`) serve it too — keeping `ls /proc/<pid>` consistent
 /// with what `open()` resolves for the self process. Any OTHER pid is a peer and
 /// must fall through to `synthetic_proc_pid_file`; see [`context_self_pid`] for
 /// why "self" cannot be recognised from a host-process identity here.
-fn normalize_self_pid_path<'a>(path: &'a str, ctx: &SyntheticProcContext) -> Cow<'a, str> {
+fn normalize_self_pid_path<'a>(path: &'a str, ctx: &OpenContext<'_>) -> Cow<'a, str> {
     if let Some(rest) = path.strip_prefix("/proc/")
         && let Some((pid, sub)) = rest.split_once('/')
         && !pid.is_empty()
@@ -964,17 +971,18 @@ fn normalize_self_pid_path<'a>(path: &'a str, ctx: &SyntheticProcContext) -> Cow
 /// this host process is the only Linux process there is) and every pid that
 /// reached this renderer resolves to the single-process cell — the liveness
 /// gate upstream already rejected pids with no process behind them.
-fn pid_oom_score_adj(ctx: &SyntheticProcContext, pid: u32) -> Option<i32> {
-    if let Some(value) = ctx.oom_score_adj.get(&pid) {
-        return Some(*value);
+fn pid_oom_score_adj(ctx: &OpenContext<'_>, pid: u32) -> Option<i32> {
+    if let Some(map) = ctx.oom_score_adj() {
+        if let Some(value) = map.get(&pid) {
+            return Some(*value);
+        }
+        return map.is_empty().then(single_process_oom_score_adj);
     }
-    ctx.oom_score_adj
-        .is_empty()
-        .then(single_process_oom_score_adj)
+    Some(single_process_oom_score_adj())
 }
 
 /// `oom_score_adj` for the calling process (`pid` = `None`) or an explicit pid.
-fn context_oom_score_adj(ctx: &SyntheticProcContext, pid: Option<u32>) -> i32 {
+fn context_oom_score_adj(ctx: &OpenContext<'_>, pid: Option<u32>) -> i32 {
     pid.or_else(|| ctx.identity.as_ref().map(|identity| identity.pid))
         .and_then(|pid| pid_oom_score_adj(ctx, pid))
         .unwrap_or_else(single_process_oom_score_adj)
@@ -1038,7 +1046,7 @@ pub(crate) fn is_proc_self_pagemap_path(path: &str, self_pid: u32) -> bool {
 /// used to get wrong by opening `/proc/424242/mem` successfully.
 pub(crate) fn proc_foreign_live_memory_open_errno(
     path: &str,
-    ctx: &SyntheticProcContext,
+    ctx: &OpenContext<'_>,
 ) -> Option<crate::linux_abi::LinuxErrno> {
     let mid = path.strip_prefix("/proc/").and_then(|rest| {
         rest.strip_suffix("/mem")
@@ -1052,14 +1060,14 @@ pub(crate) fn proc_foreign_live_memory_open_errno(
     }
     // Without a kernel graph this lane cannot enumerate peers at all; leave its
     // behaviour to the mature host-process path rather than inventing a refusal.
-    ctx.processes.as_ref()?;
+    ctx.processes()?;
     Some(match graph_process(mid, ctx) {
         Some(_) => crate::linux_abi::LINUX_EACCES,
         None => LINUX_ENOENT,
     })
 }
 
-pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
+pub(crate) fn synthetic_file_for_open(path: &str, ctx: &OpenContext<'_>) -> Option<Vec<u8>> {
     let normalized = normalize_self_pid_path(path, ctx);
     let path = normalized.as_ref();
     // The CALLER's own `/proc/<pid>/mem` and `/proc/<pid>/pagemap` are live
@@ -1087,18 +1095,21 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/partitions" => Some(synthetic_proc_partitions().to_vec()),
         "/proc/stat" => Some(synthetic_proc_stat()),
         "/proc/swaps" => Some(synthetic_proc_swaps().to_vec()),
-        "/proc/sysvipc/shm" => Some(ctx.sysvipc_shm.as_bytes().to_vec()),
-        "/proc/sysvipc/sem" => Some(ctx.sysvipc_sem.as_bytes().to_vec()),
-        "/proc/sysvipc/msg" => Some(ctx.sysvipc_msg.as_bytes().to_vec()),
+        "/proc/sysvipc/shm" => Some(ctx.sysvipc_shm().unwrap_or("").as_bytes().to_vec()),
+        "/proc/sysvipc/sem" => Some(ctx.sysvipc_sem().unwrap_or("").as_bytes().to_vec()),
+        "/proc/sysvipc/msg" => Some(ctx.sysvipc_msg().unwrap_or("").as_bytes().to_vec()),
         "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
         "/proc/version" => Some(synthetic_proc_version().to_vec()),
         "/proc/vmstat" => Some(synthetic_proc_vmstat().to_vec()),
-        "/proc/self/auxv" => Some(synthetic_proc_self_auxv(&ctx.auxv)),
+        "/proc/self/auxv" => Some(synthetic_proc_self_auxv(ctx.auxv().unwrap_or(&[]))),
         "/proc/self/autogroup" => Some(b"/autogroup-0 nice 0\n".to_vec()),
         "/proc/self/cgroup" => Some(b"0::/\n".to_vec()),
-        "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(&ctx.argv, &ctx.executable_path)),
+        "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(
+            ctx.argv().unwrap_or(&[]),
+            ctx.executable_path().unwrap_or(""),
+        )),
         "/proc/self/comm" => Some(synthetic_proc_self_comm(ctx).into_bytes()),
-        "/proc/self/environ" => Some(synthetic_proc_self_environ(&ctx.environ)),
+        "/proc/self/environ" => Some(synthetic_proc_self_environ(ctx.environ().unwrap_or(&[]))),
         "/proc/self/io" => Some(synthetic_proc_self_io().to_vec()),
         "/proc/self/limits" => Some(synthetic_proc_self_limits().to_vec()),
         // The audit loginuid/sessionid "unset" sentinel ((uint32)-1), no newline.
@@ -1132,9 +1143,21 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         // identity namespace these read as `0 0 4294967295` / `allow`, matching
         // observed `docker run` (docs/namespaces-design.md §1.2, §4.3). Writable
         // — see ProcVfs::open + the write(2) handler.
-        "/proc/self/uid_map" => Some(ctx.creds_ns.user.uid_map_text().into_bytes()),
-        "/proc/self/gid_map" => Some(ctx.creds_ns.user.gid_map_text().into_bytes()),
-        "/proc/self/setgroups" => Some(ctx.creds_ns.user.setgroups_text().as_bytes().to_vec()),
+        "/proc/self/uid_map" => Some(
+            ctx.creds_ns()
+                .map(|c| c.user.uid_map_text().into_bytes())
+                .unwrap_or_default(),
+        ),
+        "/proc/self/gid_map" => Some(
+            ctx.creds_ns()
+                .map(|c| c.user.gid_map_text().into_bytes())
+                .unwrap_or_default(),
+        ),
+        "/proc/self/setgroups" => Some(
+            ctx.creds_ns()
+                .map(|c| c.user.setgroups_text().as_bytes().to_vec())
+                .unwrap_or_default(),
+        ),
         _ => {
             if path == "/proc/sys/kernel/hostname" {
                 return Some(format!("{}\n", context_guest_hostname(ctx)).into_bytes());
@@ -1156,10 +1179,14 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
     }
 }
 
+pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
+    synthetic_file_for_open(path, &OpenContext::from(ctx))
+}
+
 /// The `<f>` of a `/proc/net/<f>`, `/proc/self/net/<f>`, `/proc/thread-self/net/<f>`
 /// or `/proc/<pid>/net/<f>` path — the namespace-correct net paths every tool
 /// reaches all resolve to the same per-file renderer. `None` otherwise.
-fn proc_net_basename<'a>(path: &'a str, ctx: &SyntheticProcContext) -> Option<&'a str> {
+fn proc_net_basename<'a>(path: &'a str, ctx: &OpenContext<'_>) -> Option<&'a str> {
     if let Some(name) = path.strip_prefix("/proc/net/") {
         return (!name.contains('/')).then_some(name);
     }
@@ -1169,7 +1196,7 @@ fn proc_net_basename<'a>(path: &'a str, ctx: &SyntheticProcContext) -> Option<&'
         return None;
     }
     if pid.bytes().all(|byte| byte.is_ascii_digit())
-        && ctx.processes.is_some()
+        && ctx.processes().is_some()
         && !proc_pid_component_is_live(pid, ctx)
     {
         return None;
@@ -1250,10 +1277,7 @@ fn proc_net_entries() -> Vec<DirEnt> {
 /// one carrier process, so a numeric component is live only when the calling
 /// container's process snapshot names it. The host process table remains the
 /// fallback solely on lanes without a kernel graph.
-fn proc_net_dir_entries_with_context(
-    path: &str,
-    ctx: &SyntheticProcContext,
-) -> Option<Vec<DirEnt>> {
+fn proc_net_dir_entries_with_context(path: &str, ctx: &OpenContext<'_>) -> Option<Vec<DirEnt>> {
     if path == "/proc/net" {
         return Some(proc_net_entries());
     }
@@ -1262,7 +1286,7 @@ fn proc_net_dir_entries_with_context(
     if component.is_empty() || component.contains('/') {
         return None;
     }
-    if ctx.processes.is_some() {
+    if ctx.processes().is_some() {
         proc_pid_component_is_live(component, ctx).then(proc_net_entries)
     } else {
         proc_net_dir_entries(path)
@@ -1503,14 +1527,14 @@ fn synthetic_proc_net_file(
     synthetic_proc_net_file_from_model(name, &model)
 }
 
-fn synthetic_proc_net_file_for_context(
-    name: &str,
-    context: &SyntheticProcContext,
-) -> Option<Vec<u8>> {
-    context.network_model.as_ref().map_or_else(
-        || synthetic_proc_net_file(name, &context.network),
-        |model| synthetic_proc_net_file_from_model(name, model),
-    )
+fn synthetic_proc_net_file_for_context(name: &str, context: &OpenContext<'_>) -> Option<Vec<u8>> {
+    if let Some(model) = context.network_model() {
+        synthetic_proc_net_file_from_model(name, model)
+    } else if let Some(network) = context.network() {
+        synthetic_proc_net_file(name, network)
+    } else {
+        synthetic_proc_net_file(name, &carrick_spec::NetworkNamespaceSpec::default())
+    }
 }
 
 fn synthetic_proc_net_file_from_model(
@@ -1891,7 +1915,7 @@ enum GraphProcess<'a> {
 ///
 /// A lane that publishes no graph leaves `processes` `None`, and the caller
 /// falls back to the host process table.
-fn graph_process<'a>(component: &str, ctx: &'a SyntheticProcContext) -> Option<GraphProcess<'a>> {
+fn graph_process<'a>(component: &str, ctx: &'a OpenContext<'_>) -> Option<GraphProcess<'a>> {
     let identity = ctx.identity?;
     if matches!(component, "self" | "thread-self" | "curproc" | "this") {
         return Some(GraphProcess::Reader);
@@ -1901,15 +1925,12 @@ fn graph_process<'a>(component: &str, ctx: &'a SyntheticProcContext) -> Option<G
         return Some(GraphProcess::Reader);
     }
     if let Some(peer) = ctx
-        .processes
-        .as_ref()?
-        .iter()
-        .find(|process| process.pid == pid)
+        .processes()
+        .and_then(|processes| processes.iter().find(|process| process.pid == pid))
     {
         return Some(GraphProcess::Peer(peer));
     }
-    ctx.zombies
-        .as_ref()
+    ctx.zombies()
         .is_some_and(|zombies| zombies.iter().any(|zombie| zombie.pid == pid))
         .then_some(GraphProcess::Zombie)
 }
@@ -1932,10 +1953,7 @@ fn proc_pid_path_component<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
 /// only the reader's. The tids come from the graph's own per-task thread
 /// claims; Darwin's thread table describes the whole carrier on this lane and
 /// would list every process's threads under every pid.
-fn proc_task_dir_entries_with_context(
-    path: &str,
-    ctx: &SyntheticProcContext,
-) -> Option<Vec<DirEnt>> {
+fn proc_task_dir_entries_with_context(path: &str, ctx: &OpenContext<'_>) -> Option<Vec<DirEnt>> {
     let component = proc_pid_path_component(path, "/task")?;
     let tids = graph_process_tids(component, ctx)?;
     Some(proc_task_dir_entries_from_tids(
@@ -1945,12 +1963,11 @@ fn proc_task_dir_entries_with_context(
 
 /// The tids of the process a `/proc/<pid>…` component names, per the kernel
 /// task graph. `None` when no such process exists.
-fn graph_process_tids(component: &str, ctx: &SyntheticProcContext) -> Option<Vec<u32>> {
+fn graph_process_tids(component: &str, ctx: &OpenContext<'_>) -> Option<Vec<u32>> {
     Some(match graph_process(component, ctx)? {
         GraphProcess::Reader => {
             let identity = ctx.identity?;
-            ctx.threads
-                .as_ref()
+            ctx.threads()
                 .map(|threads| threads.iter().map(|thread| thread.tid).collect())
                 .unwrap_or_else(|| vec![identity.tid])
         }
@@ -1972,7 +1989,7 @@ fn graph_process_tids(component: &str, ctx: &SyntheticProcContext) -> Option<Vec
 /// numeric.
 fn proc_task_tid_dir_entries_with_context(
     path: &str,
-    ctx: &SyntheticProcContext,
+    ctx: &OpenContext<'_>,
 ) -> Option<Vec<DirEnt>> {
     let path = path.strip_suffix('/').unwrap_or(path);
     let (pid_comp, tid_comp) = path.strip_prefix("/proc/")?.split_once("/task/")?;
@@ -2097,17 +2114,14 @@ fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     proc_pid_dir_entries_for_known_process(path, host_pid == std::process::id())
 }
 
-fn proc_pid_dir_entries_with_context(
-    path: &str,
-    ctx: &SyntheticProcContext,
-) -> Option<Vec<DirEnt>> {
+fn proc_pid_dir_entries_with_context(path: &str, ctx: &OpenContext<'_>) -> Option<Vec<DirEnt>> {
     let component = proc_pid_path_component(path, "")?;
     match graph_process(component, ctx) {
         Some(GraphProcess::Reader) => proc_pid_dir_entries_for_known_process(path, true),
         Some(GraphProcess::Peer(_) | GraphProcess::Zombie) => {
             proc_pid_dir_entries_for_known_process(path, false)
         }
-        None if ctx.processes.is_some() => None,
+        None if ctx.processes().is_some() => None,
         // No kernel graph on this lane: the host process table is still the
         // authority, one Linux process being one host process there.
         None => proc_pid_dir_entries(path),
@@ -2121,8 +2135,8 @@ fn proc_pid_dir_entries_with_context(
 /// This is the same authority [`graph_process`] provides, exposed as a bare
 /// predicate for the subtrees that only need "does this process exist" and not
 /// the process record itself.
-pub(crate) fn proc_pid_component_is_live(component: &str, ctx: &SyntheticProcContext) -> bool {
-    if ctx.processes.is_some() {
+pub(crate) fn proc_pid_component_is_live(component: &str, ctx: &OpenContext<'_>) -> bool {
+    if ctx.processes().is_some() {
         graph_process(component, ctx).is_some()
     } else {
         graph_process(component, ctx).is_some() || proc_live_pid(component).is_some()
@@ -2152,7 +2166,7 @@ fn proc_ns_path_parts(path: &str) -> Option<(&str, &str)> {
 /// bug is invisible with a single guest process, since pid 1 IS the caller;
 /// it needs a live peer, which is exactly the identity-domain shape
 /// `docs/identity-and-scope-domains.md` describes.
-fn proc_ns_dir_entries_with_context(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<DirEnt>> {
+fn proc_ns_dir_entries_with_context(path: &str, ctx: &OpenContext<'_>) -> Option<Vec<DirEnt>> {
     let (component, leaf) = proc_ns_path_parts(path)?;
     if leaf != "ns" || !proc_pid_component_is_live(component, ctx) {
         return None;
@@ -2183,7 +2197,8 @@ pub(crate) fn proc_ns_link_target_with_context(
 ) -> Option<String> {
     let (component, leaf) = proc_ns_path_parts(path)?;
     let ns_type = leaf.strip_prefix("ns/")?;
-    if !proc_pid_component_is_live(component, ctx) {
+    let open_ctx = OpenContext::from(ctx);
+    if !proc_pid_component_is_live(component, &open_ctx) {
         return None;
     }
     PROC_NS_TYPES
@@ -2211,7 +2226,8 @@ pub(crate) fn proc_ns_link_type_with_context<'a>(
 ) -> Option<&'a str> {
     let (component, leaf) = proc_ns_path_parts(path)?;
     let ns_type = leaf.strip_prefix("ns/")?;
-    if !proc_pid_component_is_live(component, ctx) {
+    let open_ctx = OpenContext::from(ctx);
+    if !proc_pid_component_is_live(component, &open_ctx) {
         return None;
     }
     ns_type_inode(ns_type).map(|_| ns_type)
@@ -2226,7 +2242,10 @@ pub(crate) fn proc_ns_link_type_with_context<'a>(
 /// context at `stat`/`access` time, so it consults this first, exactly as it
 /// already consults [`synthetic_file`] for the per-pid FILES. Non-directory and
 /// non-`/proc` paths return `None` and fall through unchanged.
-pub(crate) fn synthetic_dir_entries(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<DirEnt>> {
+pub(crate) fn synthetic_dir_entries_for_open(
+    path: &str,
+    ctx: &OpenContext<'_>,
+) -> Option<Vec<DirEnt>> {
     if path == "/proc" {
         return Some(proc_top_level_entries(ctx));
     }
@@ -2235,6 +2254,10 @@ pub(crate) fn synthetic_dir_entries(path: &str, ctx: &SyntheticProcContext) -> O
         .or_else(|| proc_pid_dir_entries_with_context(path, ctx))
         .or_else(|| proc_ns_dir_entries_with_context(path, ctx))
         .or_else(|| proc_net_dir_entries_with_context(path, ctx))
+}
+
+pub(crate) fn synthetic_dir_entries(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<DirEnt>> {
+    synthetic_dir_entries_for_open(path, &OpenContext::from(ctx))
 }
 
 /// The `/proc` top-level listing: `.`/`..`, the self aliases, every synthetic
@@ -2248,7 +2271,7 @@ pub(crate) fn synthetic_dir_entries(path: &str, ctx: &SyntheticProcContext) -> O
 /// carrier once and `ls /proc | grep <peer>` found nothing while
 /// `cat /proc/<peer>/stat` worked. Zombies are listed too — Linux keeps an
 /// unreaped process's directory present, which is what lets `ps` show a `Z`.
-fn proc_top_level_entries(ctx: &SyntheticProcContext) -> Vec<DirEnt> {
+fn proc_top_level_entries(ctx: &OpenContext<'_>) -> Vec<DirEnt> {
     let mut entries = vec![
         DirEnt {
             name: ".".to_string(),
@@ -2304,9 +2327,9 @@ fn proc_top_level_entries(ctx: &SyntheticProcContext) -> Vec<DirEnt> {
         });
     }
     let mut pids: Vec<u32> = Vec::new();
-    if let Some(processes) = ctx.processes.as_ref() {
+    if let Some(processes) = ctx.processes() {
         pids.extend(processes.iter().map(|process| process.pid));
-        if let Some(zombies) = ctx.zombies.as_ref() {
+        if let Some(zombies) = ctx.zombies() {
             pids.extend(zombies.iter().map(|zombie| zombie.pid));
         }
         if let Some(identity) = ctx.identity {
@@ -2374,48 +2397,6 @@ impl Default for ProcVfs {
     }
 }
 
-fn synthetic_proc_context_from_open(ctx: &OpenContext<'_>) -> SyntheticProcContext {
-    SyntheticProcContext {
-        oom_score_adj: ctx.oom_score_adj.cloned().unwrap_or_default(),
-        creds_ns: ctx.creds_ns.cloned().unwrap_or_default(),
-        executable_path: ctx.executable_path.unwrap_or("").to_owned(),
-        argv: ctx.argv.unwrap_or(&[]).to_vec(),
-        task_comm: ctx.task_comm.unwrap_or("").to_owned(),
-        timerslack_ns: ctx.timerslack_ns,
-        guest_arch: ctx.guest_arch,
-        guest_hostname: ctx.guest_hostname.unwrap_or("").to_owned(),
-        environ: ctx.environ.unwrap_or(&[]).to_vec(),
-        open_fds: ctx.open_fds.unwrap_or(&[]).to_vec(),
-        network: ctx.network.cloned().unwrap_or_default(),
-        network_model: ctx.network_model.cloned(),
-        runtime_endpoint_container: ctx.runtime_endpoint_container,
-        auxv: ctx.auxv.unwrap_or(&[]).to_vec(),
-        address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
-        locked_memory: ctx.locked_memory.unwrap_or(&[]).to_vec(),
-        brk_current: ctx.brk_current,
-        mmap_next: ctx.mmap_next,
-        heap_base: ctx.heap_base,
-        native_guest_va: ctx.native_guest_va,
-        ruid: ctx.ruid,
-        euid: ctx.euid,
-        suid: ctx.suid,
-        rgid: ctx.rgid,
-        egid: ctx.egid,
-        sgid: ctx.sgid,
-        groups: ctx.groups.unwrap_or(&[]).to_vec(),
-        sig_ignored: ctx.sig_ignored,
-        sig_caught: ctx.sig_caught,
-        sig_shdpnd: ctx.sig_shdpnd,
-        identity: ctx.identity,
-        processes: ctx.processes.map(|processes| processes.to_vec()),
-        threads: ctx.threads.map(|threads| threads.to_vec()),
-        zombies: ctx.zombies.map(|zombies| zombies.to_vec()),
-        sysvipc_shm: ctx.sysvipc_shm.unwrap_or("").to_owned(),
-        sysvipc_sem: ctx.sysvipc_sem.unwrap_or("").to_owned(),
-        sysvipc_msg: ctx.sysvipc_msg.unwrap_or("").to_owned(),
-    }
-}
-
 impl Vfs for ProcVfs {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
         if path == "/proc"
@@ -2479,7 +2460,7 @@ impl Vfs for ProcVfs {
                         && pid.bytes().all(|b| b.is_ascii_digit())
                         && matches!(rest, "oom_score" | "oom_adj" | "oom_score_adj")
                 });
-        if !liveness_scoped && synthetic_file(path, &SyntheticProcContext::default()).is_some() {
+        if !liveness_scoped && synthetic_file_for_open(path, &OpenContext::default()).is_some() {
             return Ok(Metadata {
                 kind: EntryKind::File,
                 mode: 0o444,
@@ -2521,7 +2502,7 @@ impl Vfs for ProcVfs {
 
     fn readdir(&self, path: &str) -> Result<Vec<super::DirEnt>, VfsError> {
         if path == "/proc" {
-            return Ok(proc_top_level_entries(&SyntheticProcContext::default()));
+            return Ok(proc_top_level_entries(&OpenContext::default()));
         }
         if path == "/proc/sysvipc" {
             return Ok(vec![
@@ -2574,16 +2555,13 @@ impl Vfs for ProcVfs {
         flags: OpenFlags,
         ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
-        let synth_ctx = std::cell::OnceCell::new();
         // Opening the /proc directory itself: serve our synthetic listing
         // (`.`/`..`, `self`, the representative top-level files, and every
         // guest process pid) so `getdents64` / `ls /proc` and `ps` enumerate.
         // Without this branch the open falls through to the (empty) rootfs
         // `/proc` directory and `readdir` is never reached. Mirrors `DevVfs`.
         if path == "/proc" {
-            let entries = proc_top_level_entries(
-                synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
-            );
+            let entries = proc_top_level_entries(ctx);
             return Ok(VfsHandle::Directory {
                 path: "/proc".to_string(),
                 entries,
@@ -2604,7 +2582,7 @@ impl Vfs for ProcVfs {
                     kind: EntryKind::Directory,
                 },
             ];
-            entries.extend(ctx.open_fds.unwrap_or(&[]).iter().map(|fd| DirEnt {
+            entries.extend(ctx.open_fds().unwrap_or(&[]).iter().map(|fd| DirEnt {
                 name: fd.to_string(),
                 kind: EntryKind::Symlink,
             }));
@@ -2627,7 +2605,7 @@ impl Vfs for ProcVfs {
                     kind: EntryKind::Directory,
                 },
             ];
-            entries.extend(ctx.open_fds.unwrap_or(&[]).iter().map(|fd| DirEnt {
+            entries.extend(ctx.open_fds().unwrap_or(&[]).iter().map(|fd| DirEnt {
                 name: fd.to_string(),
                 kind: EntryKind::File,
             }));
@@ -2638,19 +2616,9 @@ impl Vfs for ProcVfs {
             });
         }
         if let Some(entries) = sysctl_dir_entries(path)
-            .or_else(|| {
-                proc_net_dir_entries_with_context(
-                    path,
-                    synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
-                )
-            })
+            .or_else(|| proc_net_dir_entries_with_context(path, ctx))
             .or_else(|| proc_ns_dir_entries(path))
-            .or_else(|| {
-                synthetic_dir_entries(
-                    path,
-                    synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
-                )
-            })
+            .or_else(|| synthetic_dir_entries_for_open(path, ctx))
             .or_else(|| proc_task_dir_entries(path, ctx.runtime_endpoint_container))
             .or_else(|| proc_task_tid_dir_entries(path, ctx.runtime_endpoint_container))
         {
@@ -2663,16 +2631,10 @@ impl Vfs for ProcVfs {
         // A PEER's `/proc/<pid>/{mem,pagemap}` fails here rather than falling
         // through to a generic errno, and above all rather than being served
         // from THIS caller's address space.
-        if let Some(errno) = proc_foreign_live_memory_open_errno(
-            path,
-            synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
-        ) {
+        if let Some(errno) = proc_foreign_live_memory_open_errno(path, ctx) {
             return Err(errno);
         }
-        let Some(contents) = synthetic_file(
-            path,
-            synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
-        ) else {
+        let Some(contents) = synthetic_file_for_open(path, ctx) else {
             return Err(crate::linux_abi::LINUX_ENOSYS);
         };
         // The user-namespace map files and the rw tunables (oom_score_adj/…)
@@ -2696,21 +2658,17 @@ impl Vfs for ProcVfs {
     }
 }
 
-fn synthetic_proc_maps(ctx: &SyntheticProcContext) -> String {
-    if let Some(regions) = ctx.address_space_regions.as_deref() {
-        return render_proc_maps_from_regions(
-            regions,
-            &ctx.executable_path,
-            ctx.brk_current,
-            ctx.mmap_next,
-        );
+fn synthetic_proc_maps(ctx: &OpenContext<'_>) -> String {
+    let exe = ctx.executable_path().unwrap_or("");
+    if let Some(regions) = ctx.address_space_regions() {
+        return render_proc_maps_from_regions(regions, exe, ctx.brk_current(), ctx.mmap_next());
     }
     format!(
         "0000000000400000-0000000000410000 r-xp 00000000 00:00 0 {executable_path}\n\
          {heap_base:016x}-{heap_end:016x} rw-p 00000000 00:00 0 [heap]\n\
          {mmap_base:016x}-{mmap_end:016x} rwxp 00000000 00:00 0 [carrick-mmap]\n\
          0000007fffe00000-0000008000000000 rw-p 00000000 00:00 0 [stack]\n",
-        executable_path = ctx.executable_path,
+        executable_path = exe,
         heap_base = LINUX_HEAP_BASE,
         heap_end = LINUX_HEAP_BASE + LINUX_HEAP_SIZE,
         mmap_base = LINUX_MMAP_BASE,
@@ -3009,24 +2967,27 @@ fn cpus_allowed_list(ncpu: usize) -> String {
 /// region). `None` when there is no usable VMA snapshot. VmSize sums this
 /// list and the native VmRSS measurement walks the SAME list, so the pair is
 /// coherent by construction (resident-within-spans ≤ total-span bytes).
-fn guest_vm_ranges(ctx: &SyntheticProcContext) -> Option<Vec<(u64, u64)>> {
-    let regions = ctx.address_space_regions.as_deref()?;
+fn guest_vm_ranges(ctx: &OpenContext<'_>) -> Option<Vec<(u64, u64)>> {
+    let regions = ctx.address_space_regions()?;
     let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 1);
     let mut snapshot_has_heap_region = false;
+    let brk_current = ctx.brk_current();
+    let mmap_next = ctx.mmap_next();
+    let heap_base = ctx.heap_base();
     for r in regions {
         let mut end = r.end;
-        if r.start == LINUX_HEAP_BASE && ctx.brk_current > r.start && ctx.brk_current <= r.end {
-            end = ctx.brk_current;
-        } else if r.start == LINUX_MMAP_BASE && ctx.mmap_next > r.start && ctx.mmap_next <= r.end {
-            end = ctx.mmap_next;
+        if r.start == LINUX_HEAP_BASE && brk_current > r.start && brk_current <= r.end {
+            end = brk_current;
+        } else if r.start == LINUX_MMAP_BASE && mmap_next > r.start && mmap_next <= r.end {
+            end = mmap_next;
         }
-        if ctx.heap_base != 0 && r.start == ctx.heap_base {
+        if heap_base != 0 && r.start == heap_base {
             snapshot_has_heap_region = true;
         }
         ranges.push((r.start, end));
     }
-    if !snapshot_has_heap_region && ctx.heap_base != 0 && ctx.brk_current > ctx.heap_base {
-        ranges.push((ctx.heap_base, ctx.brk_current));
+    if !snapshot_has_heap_region && heap_base != 0 && brk_current > heap_base {
+        ranges.push((heap_base, brk_current));
     }
     // An empty/zero snapshot (no regions captured on this backend) is unusable;
     // the caller falls back to the host-virtual-size estimate so VmSize is
@@ -3068,18 +3029,17 @@ fn guest_committed_vm_kb(ranges: Option<&[(u64, u64)]>, host_virtual_bytes: u64)
     }
 }
 
-fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
+fn synthetic_proc_self_status(ctx: &OpenContext<'_>) -> String {
     let comm = context_task_comm(ctx);
-    let sigign_hex = ctx.sig_ignored;
-    let sigcgt_hex = ctx.sig_caught;
-    let shdpnd_hex = ctx.sig_shdpnd;
+    let sigign_hex = ctx.sig_ignored();
+    let sigcgt_hex = ctx.sig_caught();
+    let shdpnd_hex = ctx.sig_shdpnd();
     // Live thread count for the `Threads:` line — CPython reads this to decide
     // whether os.fork() must emit the multi-threaded-fork DeprecationWarning
     // (test_threading.test_*_after_fork). Was hardcoded 1, so a guest with live
     // worker threads looked single-threaded and the warning never fired.
     let nthreads = ctx
-        .threads
-        .as_ref()
+        .threads()
         .map_or_else(
             || {
                 ctx.runtime_endpoint_container
@@ -3087,7 +3047,7 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
                     .unwrap_or_default()
                     .len()
             },
-            Vec::len,
+            |threads| threads.len(),
         )
         .max(1);
     let ncpu = crate::host_facts::logical_cpu_count();
@@ -3153,20 +3113,20 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
         },
         |identity| identity.ppid,
     );
-    let groups = if ctx.groups.is_empty() {
-        String::new()
-    } else {
-        ctx.groups
+    let groups = match ctx.groups() {
+        Some(grps) if !grps.is_empty() => grps
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" "),
+        _ => String::new(),
     };
     // Capabilities: report the modeled set (Docker default 00000000a80425fb,
     // or a full set inside a freshly-created user namespace), NOT the all-zero
     // set — capability-probing tools (apt/dpkg/setpriv) refuse to proceed if
     // they think they hold nothing (docs/namespaces-design.md §4.4).
-    let cap_lines = ctx.creds_ns.caps.status_lines();
+    let default_creds = crate::namespace::process::ProcessCredsNs::default();
+    let cap_lines = ctx.creds_ns().unwrap_or(&default_creds).caps.status_lines();
     let locked_kb = locked_memory_kb(ctx);
     format!(
         "Name:\t{comm}\n\
@@ -3255,28 +3215,30 @@ fn synthetic_proc_self_environ(environ: &[Vec<u8>]) -> Vec<u8> {
     bytes
 }
 
-fn context_task_comm(ctx: &SyntheticProcContext) -> String {
-    if ctx.task_comm.is_empty() {
-        return process_short_name(&ctx.executable_path);
+fn context_task_comm(ctx: &OpenContext<'_>) -> String {
+    if let Some(comm) = ctx.task_comm() {
+        if !comm.is_empty() {
+            return comm.to_string();
+        }
     }
-    ctx.task_comm.clone()
+    process_short_name(ctx.executable_path().unwrap_or(""))
 }
 
-fn context_timerslack_ns(ctx: &SyntheticProcContext) -> u64 {
+fn context_timerslack_ns(ctx: &OpenContext<'_>) -> u64 {
     if ctx.timerslack_ns == 0 {
         return LINUX_DEFAULT_TIMERSLACK_NS;
     }
     ctx.timerslack_ns
 }
 
-fn synthetic_proc_self_comm(ctx: &SyntheticProcContext) -> String {
+fn synthetic_proc_self_comm(ctx: &OpenContext<'_>) -> String {
     let mut comm = context_task_comm(ctx);
     comm.push('\n');
     comm
 }
 
-fn synthetic_proc_self_stat(ctx: &SyntheticProcContext) -> String {
-    let comm = process_short_name(&ctx.executable_path);
+fn synthetic_proc_self_stat(ctx: &OpenContext<'_>) -> String {
+    let comm = process_short_name(ctx.executable_path().unwrap_or(""));
     let identity = ctx.identity;
     let pid = identity.map_or_else(std::process::id, |identity| identity.pid);
     let ppid = identity.map_or_else(
@@ -3294,7 +3256,7 @@ fn synthetic_proc_self_stat(ctx: &SyntheticProcContext) -> String {
             )
         },
     );
-    let (nthreads, state) = match ctx.threads.as_ref() {
+    let (nthreads, state) = match ctx.threads() {
         Some(threads) => (
             threads.len().max(1),
             threads
@@ -3430,8 +3392,9 @@ fn synthetic_self_thread_and_peer_stat_use_published_logical_cpu() {
         }]),
         ..SyntheticProcContext::default()
     };
+    let open_ctx = ctx.as_open_context();
     let ticks = |path| {
-        let line = String::from_utf8(synthetic_file(path, &ctx).unwrap()).unwrap();
+        let line = String::from_utf8(synthetic_file_for_open(path, &open_ctx).unwrap()).unwrap();
         let fields: Vec<_> = line.split_whitespace().collect();
         (
             fields[13].parse::<u64>().unwrap(),
@@ -3489,7 +3452,7 @@ fn synthetic_proc_pid_file(
     pid: u32,
     rest: &str,
     self_comm: &str,
-    ctx: &SyntheticProcContext,
+    ctx: &OpenContext<'_>,
 ) -> Option<Vec<u8>> {
     if let Some(task_rest) = rest.strip_prefix("task/") {
         if let Some((tid_str, file)) = task_rest.split_once('/')
@@ -3508,8 +3471,7 @@ fn synthetic_proc_pid_file(
     // rather than reporting a fabricated 0.
     if matches!(rest, "oom_score" | "oom_adj" | "oom_score_adj") {
         let known = pid_oom_score_adj(ctx, pid).or_else(|| {
-            ctx.zombies
-                .as_ref()
+            ctx.zombies()
                 .is_some_and(|zombies| zombies.iter().any(|zombie| zombie.pid == pid))
                 .then_some(0)
         })?;
@@ -3521,7 +3483,7 @@ fn synthetic_proc_pid_file(
         });
     }
 
-    if let Some(threads) = ctx.threads.as_ref()
+    if let Some(threads) = ctx.threads()
         && let Some(thread) = threads.iter().find(|thread| thread.tid == pid)
     {
         let identity = ctx.identity?;
@@ -3567,7 +3529,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{count}\n",
         }
     }
 
-    if let Some(zombies) = ctx.zombies.as_ref()
+    if let Some(zombies) = ctx.zombies()
         && let Some(zombie) = zombies.iter().find(|zombie| zombie.pid == pid)
     {
         let name = if zombie.comm.is_empty() {
@@ -3612,7 +3574,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
     // Ordered after the thread arm so a tid of the READER's own task — which
     // can numerically equal a peer's pid only if the graph is inconsistent —
     // still resolves through the richer per-thread snapshot.
-    if let Some(processes) = ctx.processes.as_ref()
+    if let Some(processes) = ctx.processes()
         && let Some(process) = processes
             .iter()
             .find(|process| process.pid == pid || process.tids.contains(&pid))
@@ -3677,7 +3639,7 @@ Threads:\t{threads}\n",
     // point means the id was neither the reader, one of its threads, a live
     // peer, nor a zombie; never reinterpret the same raw number through the
     // carrier's host process/thread/run-state tables.
-    if ctx.processes.is_some() {
+    if ctx.processes().is_some() {
         return None;
     }
 
@@ -4066,19 +4028,22 @@ fn synthetic_proc_self_mountinfo() -> &'static [u8] {
 28 26 0:28 / /dev/shm rw,nosuid,nodev - tmpfs shm rw\n"
 }
 
-fn locked_memory_kb(ctx: &SyntheticProcContext) -> u64 {
-    ctx.locked_memory
-        .iter()
-        .map(|range| range.len() as u64)
-        .sum::<u64>()
+fn locked_memory_kb(ctx: &OpenContext<'_>) -> u64 {
+    ctx.locked_memory()
+        .map(|ranges| ranges.iter().map(|range| range.len() as u64).sum::<u64>())
+        .unwrap_or(0)
         / 1024
 }
 
-fn locked_memory_overlap_kb(ctx: &SyntheticProcContext, start: u64, end: u64) -> u64 {
-    ctx.locked_memory
-        .iter()
-        .map(|range| range.overlap_bytes(start, end))
-        .sum::<u64>()
+fn locked_memory_overlap_kb(ctx: &OpenContext<'_>, start: u64, end: u64) -> u64 {
+    ctx.locked_memory()
+        .map(|ranges| {
+            ranges
+                .iter()
+                .map(|range| range.overlap_bytes(start, end))
+                .sum::<u64>()
+        })
+        .unwrap_or(0)
         / 1024
 }
 
@@ -4127,7 +4092,7 @@ fn maps_line_range(line: &str) -> Option<(u64, u64)> {
 /// `/proc/self/smaps`: each maps line followed by the standard kB-labeled
 /// per-region fields (proc(5)). Built from the same maps rendering so the VMA
 /// list always agrees with `/proc/self/maps`.
-fn synthetic_proc_smaps(ctx: &SyntheticProcContext) -> String {
+fn synthetic_proc_smaps(ctx: &OpenContext<'_>) -> String {
     let maps = synthetic_proc_maps(ctx);
     let mut out = String::new();
     for line in maps.lines() {
@@ -4147,7 +4112,7 @@ fn synthetic_proc_smaps(ctx: &SyntheticProcContext) -> String {
 
 /// `/proc/self/smaps_rollup`: a `[rollup]` header line + aggregate fields.
 /// Rss/Pss approximated from host RSS; labels/order per proc(5).
-fn synthetic_proc_smaps_rollup(ctx: &SyntheticProcContext) -> String {
+fn synthetic_proc_smaps_rollup(ctx: &OpenContext<'_>) -> String {
     let host = crate::host_proc::self_resource_usage().unwrap_or_default();
     let rss_kb = host.resident_bytes / 1024;
     let locked_kb = locked_memory_kb(ctx);
@@ -4240,6 +4205,17 @@ fn per_thread_comm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proc_foreign_live_memory_open_errno(
+        path: &str,
+        ctx: &SyntheticProcContext,
+    ) -> Option<crate::linux_abi::LinuxErrno> {
+        super::proc_foreign_live_memory_open_errno(path, &ctx.as_open_context())
+    }
+
+    fn proc_top_level_entries(ctx: &SyntheticProcContext) -> Vec<DirEnt> {
+        super::proc_top_level_entries(&ctx.as_open_context())
+    }
 
     /// `/proc/uptime` field 1 must be > 0 on the FIRST read, and must agree with
     /// `clock_gettime(CLOCK_BOOTTIME)`.
@@ -4420,7 +4396,7 @@ mod tests {
                 user_cpu_us: 0,
                 system_cpu_us: 0,
             }),
-            threads: Some(&threads),
+            threads: crate::vfs::LazyField::from_slice(&threads),
             ..OpenContext::default()
         };
         let opened = v
@@ -4628,8 +4604,8 @@ mod tests {
                     ..Default::default()
                 },
                 &OpenContext {
-                    executable_path: Some("/usr/bin/test-exe"),
-                    argv: Some(&argv),
+                    executable_path: crate::vfs::LazyField::from_borrowed_str("/usr/bin/test-exe"),
+                    argv: crate::vfs::LazyField::from_slice(&argv),
                     ..Default::default()
                 },
             )
@@ -5304,7 +5280,7 @@ mod tests {
         // open() lists one symlink per fd from the context snapshot.
         let fds = [0i32, 1, 2, 7];
         let ctx = OpenContext {
-            open_fds: Some(&fds),
+            open_fds: crate::vfs::LazyField::from_slice(&fds),
             ..Default::default()
         };
         let h = v
@@ -5347,7 +5323,7 @@ mod tests {
         );
         let fds = [0i32, 1, 2, 9];
         let ctx = OpenContext {
-            open_fds: Some(&fds),
+            open_fds: crate::vfs::LazyField::from_slice(&fds),
             ..Default::default()
         };
         let h = v
@@ -5379,7 +5355,7 @@ mod tests {
     fn proc_sys_hostname_uses_open_context_hostname() {
         let v = ProcVfs::new();
         let ctx = OpenContext {
-            guest_hostname: Some("api-host"),
+            guest_hostname: crate::vfs::LazyField::from_borrowed_str("api-host"),
             ..Default::default()
         };
         let h = v
@@ -5802,13 +5778,14 @@ mod tests {
         );
         let _cleanup = RunStateCleanup(carrier_pid);
         let ctx = peer_dir_ctx();
+        let open_ctx = ctx.as_open_context();
         let component = carrier_pid.to_string();
         let path = format!("/proc/{component}");
 
-        let leaked_directory = proc_pid_dir_entries_with_context(&path, &ctx).is_some();
-        let leaked_liveness = proc_pid_component_is_live(&component, &ctx);
+        let leaked_directory = proc_pid_dir_entries_with_context(&path, &open_ctx).is_some();
+        let leaked_liveness = proc_pid_component_is_live(&component, &open_ctx);
         let leaked_file =
-            synthetic_proc_pid_file(carrier_pid as u32, "stat", "carrier", &ctx).is_some();
+            synthetic_proc_pid_file(carrier_pid as u32, "stat", "carrier", &open_ctx).is_some();
         assert_eq!(
             (leaked_directory, leaked_liveness, leaked_file),
             (false, false, false),
@@ -5945,12 +5922,7 @@ mod tests {
             "a raw pid absent from this container must not inherit host liveness"
         );
 
-        let open_ctx = OpenContext {
-            identity: ctx.identity,
-            processes: ctx.processes.as_deref(),
-            zombies: ctx.zombies.as_deref(),
-            ..OpenContext::default()
-        };
+        let open_ctx = ctx.as_open_context();
         let opened = ProcVfs::new()
             .open(
                 "/proc/7/net",
@@ -6038,7 +6010,7 @@ mod tests {
             }]),
             ..SyntheticProcContext::default()
         };
-        let stat = synthetic_proc_pid_file(pid, "stat", "parent", &ctx)
+        let stat = synthetic_proc_pid_file(pid, "stat", "parent", &ctx.as_open_context())
             .expect("an authoritative logical zombie must have a proc stat");
         let stat = String::from_utf8(stat).unwrap();
         assert!(
@@ -6181,5 +6153,74 @@ mod tests {
             assert_eq!(v.lookup(&child_task_path), Err(LINUX_ENOENT));
             assert_eq!(v.readdir(&child_task_path), Err(LINUX_ENOTDIR));
         });
+    }
+
+    #[test]
+    fn open_proc_self_fd_does_not_evaluate_heavy_providers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fds_called = AtomicUsize::new(0);
+        let ipc_called = AtomicUsize::new(0);
+        let mem_called = AtomicUsize::new(0);
+        let threads_called = AtomicUsize::new(0);
+
+        let fds_provider = || {
+            fds_called.fetch_add(1, Ordering::Relaxed);
+            Some(std::borrow::Cow::Owned(vec![0, 1, 2]))
+        };
+        let ipc_provider = || {
+            ipc_called.fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        let mem_provider = || {
+            mem_called.fetch_add(1, Ordering::Relaxed);
+            crate::vfs::OpenContextMemorySnapshot::default()
+        };
+        let threads_provider = || {
+            threads_called.fetch_add(1, Ordering::Relaxed);
+            None
+        };
+
+        let ctx = OpenContext {
+            open_fds: crate::vfs::LazyField::new(&fds_provider),
+            sysvipc_msg: crate::vfs::LazyField::new(&ipc_provider),
+            mem: crate::vfs::LazyField::new(&mem_provider),
+            threads: crate::vfs::LazyField::new(&threads_provider),
+            ..OpenContext::default()
+        };
+
+        let proc_vfs = ProcVfs::new();
+        let handle = proc_vfs
+            .open(
+                "/proc/self/fd",
+                OpenFlags {
+                    read: true,
+                    directory: true,
+                    ..OpenFlags::default()
+                },
+                &ctx,
+            )
+            .expect("open /proc/self/fd");
+
+        assert!(matches!(handle, VfsHandle::Directory { .. }));
+        assert_eq!(
+            fds_called.load(Ordering::Relaxed),
+            1,
+            "open_fds must be evaluated for /proc/self/fd"
+        );
+        assert_eq!(
+            ipc_called.load(Ordering::Relaxed),
+            0,
+            "sysvipc must NOT be evaluated"
+        );
+        assert_eq!(
+            mem_called.load(Ordering::Relaxed),
+            0,
+            "memory snapshot must NOT be evaluated"
+        );
+        assert_eq!(
+            threads_called.load(Ordering::Relaxed),
+            0,
+            "threads must NOT be evaluated"
+        );
     }
 }

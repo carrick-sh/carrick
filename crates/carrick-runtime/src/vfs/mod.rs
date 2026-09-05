@@ -424,44 +424,113 @@ impl Eq for VfsHandle {}
 /// (e.g. `/proc/self/maps` reflecting the loaded address space).
 /// Threading this through `Vfs::open` keeps the trait independent of
 /// the dispatcher's internal struct.
-#[derive(Default)]
-pub struct OpenContext<'a> {
-    pub executable_path: Option<&'a str>,
-    pub argv: Option<&'a [String]>,
-    /// Current process comm as recorded by `prctl(PR_SET_NAME)`.
-    pub task_comm: Option<&'a str>,
-    /// Current `prctl(PR_SET_TIMERSLACK)` value in nanoseconds.
-    pub timerslack_ns: u64,
-    /// The ISA this guest reports about itself, so `/proc/cpuinfo` agrees with
-    /// `uname(2)` for x86_64 guests. See [`GuestReportedArch`].
-    pub guest_arch: GuestReportedArch,
-    /// The guest UTS hostname, for `/proc/sys/kernel/hostname`.
-    pub guest_hostname: Option<&'a str>,
-    /// Guest environment (`KEY=VALUE`, opaque bytes) for `/proc/self/environ`.
-    pub environ: Option<&'a [Vec<u8>]>,
-    /// The guest's currently-open fd numbers, for the `/proc/self/fd` directory
-    /// listing. A snapshot — the listing only needs the numbers, not live state.
-    pub open_fds: Option<&'a [i32]>,
-    /// The active Linux-visible network namespace model, for `/proc/net/*`.
-    pub network: Option<&'a carrick_spec::NetworkNamespaceSpec>,
-    /// Exact task/container namespace snapshot. Internal because embedders
-    /// supply namespace state through `Container`, not VFS open contexts.
-    pub(crate) network_model: Option<&'a crate::network::model::LinuxNetworkModel>,
-    /// Exact container owner for legacy thread-registry fallback rendering.
-    /// HVPatch normally supplies a complete `threads` snapshot instead.
-    pub(crate) runtime_endpoint_container: Option<carrick_hal::ContainerId>,
-    /// The serialized ELF auxv byte image, for `/proc/self/auxv`.
-    pub auxv: Option<&'a [u8]>,
-    pub address_space_regions: Option<&'a [ProcMapsEntry]>,
-    pub locked_memory: Option<&'a [GuestMemoryRange]>,
+use std::borrow::Cow;
+use std::cell::OnceCell;
+
+pub enum LazyProvider<'a, T> {
+    Ref(&'a (dyn Fn() -> T + 'a)),
+    Boxed(Box<dyn Fn() -> T + 'a>),
+}
+
+pub struct LazyField<'a, T> {
+    cell: OnceCell<T>,
+    provider: Option<LazyProvider<'a, T>>,
+}
+
+impl<'a, T> Default for LazyField<'a, T> {
+    fn default() -> Self {
+        Self {
+            cell: OnceCell::new(),
+            provider: None,
+        }
+    }
+}
+
+impl<'a, T: std::fmt::Debug> std::fmt::Debug for LazyField<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyField")
+            .field("cell", &self.cell)
+            .finish()
+    }
+}
+
+impl<'a, T> LazyField<'a, T> {
+    pub fn new(provider: &'a (dyn Fn() -> T + 'a)) -> Self {
+        Self {
+            cell: OnceCell::new(),
+            provider: Some(LazyProvider::Ref(provider)),
+        }
+    }
+
+    pub fn new_boxed(provider: Box<dyn Fn() -> T + 'a>) -> Self {
+        Self {
+            cell: OnceCell::new(),
+            provider: Some(LazyProvider::Boxed(provider)),
+        }
+    }
+
+    pub fn from_value(value: T) -> Self {
+        let cell = OnceCell::new();
+        let _ = cell.set(value);
+        Self {
+            cell,
+            provider: None,
+        }
+    }
+
+    pub fn get(&self) -> Option<&T> {
+        if let Some(val) = self.cell.get() {
+            return Some(val);
+        }
+        if let Some(ref provider) = self.provider {
+            let val = match provider {
+                LazyProvider::Ref(f) => f(),
+                LazyProvider::Boxed(f) => f(),
+            };
+            let _ = self.cell.set(val);
+            return self.cell.get();
+        }
+        None
+    }
+}
+
+impl<'a, T> From<T> for LazyField<'a, T> {
+    fn from(val: T) -> Self {
+        Self::from_value(val)
+    }
+}
+
+impl<'a> LazyField<'a, Option<Cow<'a, str>>> {
+    pub fn from_borrowed_str(s: &'a str) -> Self {
+        Self::from_value(Some(Cow::Borrowed(s)))
+    }
+}
+
+impl<'a, T: Clone> LazyField<'a, Option<Cow<'a, [T]>>> {
+    pub fn from_slice(s: &'a [T]) -> Self {
+        Self::from_value(Some(Cow::Borrowed(s)))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OpenContextMemorySnapshot<'a> {
+    pub auxv: Cow<'a, [u8]>,
+    pub address_space_regions: Option<Cow<'a, [ProcMapsEntry]>>,
+    pub locked_memory: Cow<'a, [GuestMemoryRange]>,
     pub brk_current: u64,
     pub mmap_next: u64,
-    /// The memory layout's heap (brk arena) base. With `brk_current` it names
-    /// the brk-grown heap span for VmSize/VmRSS when the VMA snapshot carries
-    /// no heap region (the native backend maps its heap lazily). 0 = unknown.
     pub heap_base: u64,
-    /// True when guest virtual addresses ARE host virtual addresses (the
-    /// native exec backend), enabling measured VmRSS over the guest's VMAs.
+}
+
+/// Live dispatcher state that some VFS mounts need at `open` time
+/// (e.g. `/proc/self/maps` reflecting the loaded address space).
+/// Threading this through `Vfs::open` keeps the trait independent of
+/// the dispatcher's internal struct. Fields that are expensive to compute
+/// are held lazily behind [`LazyField`] providers.
+#[derive(Default)]
+pub struct OpenContext<'a> {
+    pub timerslack_ns: u64,
+    pub guest_arch: GuestReportedArch,
     pub native_guest_va: bool,
     pub ruid: NsUid,
     pub euid: NsUid,
@@ -469,30 +538,196 @@ pub struct OpenContext<'a> {
     pub rgid: NsGid,
     pub egid: NsGid,
     pub sgid: NsGid,
-    pub groups: Option<&'a [NsGid]>,
-    /// Signal-disposition masks for `/proc/<pid>/status` (bit `signum-1`):
-    /// ignored (SigIgn), caught/handled (SigCgt), shared-pending (ShdPnd).
-    pub sig_ignored: u64,
-    pub sig_caught: u64,
-    pub sig_shdpnd: u64,
+    pub runtime_endpoint_container: Option<carrick_hal::ContainerId>,
     pub identity: Option<SyntheticProcIdentity>,
-    /// Every live process's `oom_score_adj` keyed by Linux pid — see
-    /// [`SyntheticProcContext::oom_score_adj`]. `None` on a lane with no kernel
-    /// graph, where one Linux process is one host process.
-    pub oom_score_adj: Option<&'a std::collections::BTreeMap<u32, i32>>,
-    /// The calling process's capability sets and user-namespace view — see
-    /// [`SyntheticProcContext::creds_ns`]. `None` only in tests that build a
-    /// bare context; the dispatcher always supplies the caller's task state.
-    pub creds_ns: Option<&'a crate::namespace::process::ProcessCredsNs>,
-    /// Every live Linux process from the kernel graph — see
-    /// [`SyntheticProcContext::processes`]. `None` on a lane with no kernel
-    /// graph, where one Linux process is one host process.
-    pub processes: Option<&'a [SyntheticProcProcess]>,
-    pub threads: Option<&'a [SyntheticProcThread]>,
-    pub zombies: Option<&'a [SyntheticProcZombie]>,
-    pub sysvipc_shm: Option<&'a str>,
-    pub sysvipc_sem: Option<&'a str>,
-    pub sysvipc_msg: Option<&'a str>,
+
+    pub executable_path: LazyField<'a, Option<Cow<'a, str>>>,
+    pub argv: LazyField<'a, Option<Cow<'a, [String]>>>,
+    pub task_comm: LazyField<'a, Option<Cow<'a, str>>>,
+    pub guest_hostname: LazyField<'a, Option<Cow<'a, str>>>,
+    pub environ: LazyField<'a, Option<Cow<'a, [Vec<u8>]>>>,
+    pub open_fds: LazyField<'a, Option<Cow<'a, [i32]>>>,
+    pub network: LazyField<'a, Option<Cow<'a, carrick_spec::NetworkNamespaceSpec>>>,
+    pub(crate) network_model: LazyField<'a, Option<crate::network::model::LinuxNetworkModel>>,
+    pub groups: LazyField<'a, Option<Cow<'a, [NsGid]>>>,
+    pub signals: LazyField<'a, (u64, u64, u64)>,
+    pub oom_score_adj: LazyField<'a, Option<Cow<'a, std::collections::BTreeMap<u32, i32>>>>,
+    pub creds_ns: LazyField<'a, Option<crate::namespace::process::ProcessCredsNs>>,
+    pub processes: LazyField<'a, Option<Cow<'a, [SyntheticProcProcess]>>>,
+    pub threads: LazyField<'a, Option<Cow<'a, [SyntheticProcThread]>>>,
+    pub zombies: LazyField<'a, Option<Cow<'a, [SyntheticProcZombie]>>>,
+    pub sysvipc_shm: LazyField<'a, Option<Cow<'a, str>>>,
+    pub sysvipc_sem: LazyField<'a, Option<Cow<'a, str>>>,
+    pub sysvipc_msg: LazyField<'a, Option<Cow<'a, str>>>,
+    pub mem: LazyField<'a, OpenContextMemorySnapshot<'a>>,
+}
+
+impl<'a> OpenContext<'a> {
+    pub fn executable_path(&self) -> Option<&str> {
+        self.executable_path.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn argv(&self) -> Option<&[String]> {
+        self.argv.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn task_comm(&self) -> Option<&str> {
+        self.task_comm.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn guest_hostname(&self) -> Option<&str> {
+        self.guest_hostname.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn environ(&self) -> Option<&[Vec<u8>]> {
+        self.environ.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn open_fds(&self) -> Option<&[i32]> {
+        self.open_fds.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn network(&self) -> Option<&carrick_spec::NetworkNamespaceSpec> {
+        self.network.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub(crate) fn network_model(&self) -> Option<&crate::network::model::LinuxNetworkModel> {
+        self.network_model.get().and_then(|opt| opt.as_ref())
+    }
+
+    pub fn groups(&self) -> Option<&[NsGid]> {
+        self.groups.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn sig_ignored(&self) -> u64 {
+        self.signals.get().map(|s| s.0).unwrap_or(0)
+    }
+
+    pub fn sig_caught(&self) -> u64 {
+        self.signals.get().map(|s| s.1).unwrap_or(0)
+    }
+
+    pub fn sig_shdpnd(&self) -> u64 {
+        self.signals.get().map(|s| s.2).unwrap_or(0)
+    }
+
+    pub fn oom_score_adj(&self) -> Option<&std::collections::BTreeMap<u32, i32>> {
+        self.oom_score_adj.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn creds_ns(&self) -> Option<&crate::namespace::process::ProcessCredsNs> {
+        self.creds_ns.get().and_then(|opt| opt.as_ref())
+    }
+
+    pub fn processes(&self) -> Option<&[SyntheticProcProcess]> {
+        self.processes.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn threads(&self) -> Option<&[SyntheticProcThread]> {
+        self.threads.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn zombies(&self) -> Option<&[SyntheticProcZombie]> {
+        self.zombies.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn sysvipc_shm(&self) -> Option<&str> {
+        self.sysvipc_shm.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn sysvipc_sem(&self) -> Option<&str> {
+        self.sysvipc_sem.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn sysvipc_msg(&self) -> Option<&str> {
+        self.sysvipc_msg.get().and_then(|opt| opt.as_deref())
+    }
+
+    pub fn auxv(&self) -> Option<&[u8]> {
+        self.mem.get().map(|m| m.auxv.as_ref())
+    }
+
+    pub fn address_space_regions(&self) -> Option<&[ProcMapsEntry]> {
+        self.mem
+            .get()
+            .and_then(|m| m.address_space_regions.as_deref())
+    }
+
+    pub fn locked_memory(&self) -> Option<&[GuestMemoryRange]> {
+        self.mem.get().map(|m| m.locked_memory.as_ref())
+    }
+
+    pub fn brk_current(&self) -> u64 {
+        self.mem.get().map(|m| m.brk_current).unwrap_or(0)
+    }
+
+    pub fn mmap_next(&self) -> u64 {
+        self.mem.get().map(|m| m.mmap_next).unwrap_or(0)
+    }
+
+    pub fn heap_base(&self) -> u64 {
+        self.mem.get().map(|m| m.heap_base).unwrap_or(0)
+    }
+
+    pub fn with_open_fds(mut self, fds: &'a [i32]) -> Self {
+        self.open_fds = LazyField::from_slice(fds);
+        self
+    }
+}
+
+impl<'a> std::fmt::Debug for OpenContext<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenContext")
+            .field("timerslack_ns", &self.timerslack_ns)
+            .field("guest_arch", &self.guest_arch)
+            .field("ruid", &self.ruid)
+            .field("euid", &self.euid)
+            .finish()
+    }
+}
+
+impl<'a> From<&'a SyntheticProcContext> for OpenContext<'a> {
+    fn from(ctx: &'a SyntheticProcContext) -> Self {
+        OpenContext {
+            timerslack_ns: ctx.timerslack_ns,
+            guest_arch: ctx.guest_arch,
+            native_guest_va: ctx.native_guest_va,
+            ruid: ctx.ruid,
+            euid: ctx.euid,
+            suid: ctx.suid,
+            rgid: ctx.rgid,
+            egid: ctx.egid,
+            sgid: ctx.sgid,
+            runtime_endpoint_container: ctx.runtime_endpoint_container,
+            identity: ctx.identity,
+            executable_path: LazyField::from_value(Some(Cow::Borrowed(&ctx.executable_path))),
+            argv: LazyField::from_value(Some(Cow::Borrowed(&ctx.argv))),
+            task_comm: LazyField::from_value(Some(Cow::Borrowed(&ctx.task_comm))),
+            guest_hostname: LazyField::from_value(Some(Cow::Borrowed(&ctx.guest_hostname))),
+            environ: LazyField::from_value(Some(Cow::Borrowed(&ctx.environ))),
+            open_fds: LazyField::from_value(Some(Cow::Borrowed(&ctx.open_fds))),
+            network: LazyField::from_value(Some(Cow::Borrowed(&ctx.network))),
+            network_model: LazyField::from_value(ctx.network_model.clone()),
+            groups: LazyField::from_value(Some(Cow::Borrowed(&ctx.groups))),
+            signals: LazyField::from_value((ctx.sig_ignored, ctx.sig_caught, ctx.sig_shdpnd)),
+            oom_score_adj: LazyField::from_value(Some(Cow::Borrowed(&ctx.oom_score_adj))),
+            creds_ns: LazyField::from_value(Some(ctx.creds_ns.clone())),
+            processes: LazyField::from_value(ctx.processes.as_deref().map(Cow::Borrowed)),
+            threads: LazyField::from_value(ctx.threads.as_deref().map(Cow::Borrowed)),
+            zombies: LazyField::from_value(ctx.zombies.as_deref().map(Cow::Borrowed)),
+            sysvipc_shm: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_shm))),
+            sysvipc_sem: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_sem))),
+            sysvipc_msg: LazyField::from_value(Some(Cow::Borrowed(&ctx.sysvipc_msg))),
+            mem: LazyField::from_value(OpenContextMemorySnapshot {
+                auxv: Cow::Borrowed(&ctx.auxv),
+                address_space_regions: ctx.address_space_regions.as_deref().map(Cow::Borrowed),
+                locked_memory: Cow::Borrowed(&ctx.locked_memory),
+                brk_current: ctx.brk_current,
+                mmap_next: ctx.mmap_next,
+                heap_base: ctx.heap_base,
+            }),
+        }
+    }
 }
 
 /// One mount's view of the filesystem: path metadata ([`lookup`](Vfs::lookup),

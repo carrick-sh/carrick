@@ -4400,126 +4400,152 @@ impl SyscallDispatcher {
         let Some(m) = self.fs.vfs_mounts.resolve(path) else {
             return VfsOpenAttempt::FallThrough;
         };
-        // `/proc` and other synthetic mounts render address-space state. Hold
-        // alias exclusion across the complete snapshot so it cannot describe
-        // stale VMA metadata while a host replacement is installing.
         // Build the OpenContext only after a mount claims the path. Rootfs and
         // overlay fallthrough opens are the hot path and do not need proc, fd,
         // signal, or memory snapshots for VFS mounts.
-        let proc = self.proc.lock();
-        let exec_path = proc.executable_path.clone();
-        let argv = proc.argv.clone();
-        let task_comm = linux_task_name_to_string(&proc.task_name);
-        let timerslack_ns = proc.timerslack;
-        let env = proc.env.clone();
-        let guest_arch = proc.reported_arch();
-        drop(proc);
-        let guest_hostname = context.task().uts_ns().nodename();
-        let net_ns = context.task().net_ns();
-        let network_model = net_ns.view();
-        let open_fds = self.open_fd_numbers();
-        let mem = self.mem_snapshot();
-        let mut address_space_regions = mem.address_space_regions.clone();
-        if !mem.dynamic_maps.is_empty() {
-            match &mut address_space_regions {
-                Some(regions) => regions.extend(mem.dynamic_maps.clone()),
-                None => address_space_regions = Some(mem.dynamic_maps.clone()),
-            }
-        }
+        let (timerslack_ns, guest_arch, exec_path, argv, task_comm, env) = {
+            let proc = self.proc.lock();
+            (
+                proc.timerslack,
+                proc.reported_arch(),
+                proc.executable_path.clone(),
+                proc.argv.clone(),
+                linux_task_name_to_string(&proc.task_name),
+                proc.env.clone(),
+            )
+        };
         let creds = self.cred_snapshot();
-        let groups = self.current_groups();
-        let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);
-        let (sig_ignored, sig_caught, sig_shdpnd) =
-            (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
-        let sysvipc_shm = self.sysvipc_shm_table();
-        let sysvipc_sem = self.sysvipc_sem_table();
-        let sysvipc_msg = self.sysvipc_msg_table();
-        let proc_threads = self.synthetic_proc_threads(context, registry);
-        // See `synthetic_proc_context`: the kernel graph is the only authority
-        // that can distinguish two Linux processes sharing this Darwin process.
-        let proc_oom_score_adj = self.hvpatch_process().map(|process| {
-            process
-                .kernel_graph()
-                .registry()
-                .oom_score_adj_by_pid_for_container(context.container().id())
-                .into_iter()
-                .filter_map(|(pid, value)| {
-                    crate::namespace::pid::kernel_to_ns_for(context, pid).map(|pid| (pid, value))
-                })
-                .collect()
-        });
-        // The caller's own capabilities and user-namespace view; `/proc/self`'s
-        // `status`, `uid_map`, `gid_map` and `setgroups` render from this.
-        let proc_creds_ns = context.task().creds_ns();
-        let proc_processes =
-            Self::synthetic_proc_processes(context, self.hvpatch_process().as_ref());
-        let proc_zombies = self.hvpatch_process().map(|process| {
-            process
-                .kernel_graph()
-                .registry()
-                .zombies_for_container(context.container().id())
-                .into_iter()
-                .filter_map(|zombie| {
-                    let to_ns = |raw: i32| {
-                        u32::try_from(raw)
-                            .ok()
-                            .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
-                    };
-                    Some(crate::vfs::SyntheticProcZombie {
-                        pid: to_ns(zombie.key.id.raw())?,
-                        ppid: zombie
-                            .parent
-                            .and_then(|parent| to_ns(parent.id.raw()))
-                            .unwrap_or(1),
-                        pgrp: zombie.namespace_process_group,
-                        session: zombie.namespace_session,
-                        comm: zombie.diagnostic_name,
-                        user_cpu_us: u64::try_from(zombie.rusage.user_time.as_micros())
-                            .unwrap_or(u64::MAX),
-                        system_cpu_us: u64::try_from(zombie.rusage.system_time.as_micros())
-                            .unwrap_or(u64::MAX),
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
+        let native_guest_va = self.page_geometry().native_geometry().is_some();
+        let runtime_endpoint_container = Some(context.container().id());
+        let identity = self.synthetic_proc_identity(context);
+
+        let exec_path_provider = || Some(std::borrow::Cow::Borrowed(exec_path.as_str()));
+        let argv_provider = || Some(std::borrow::Cow::Borrowed(argv.as_slice()));
+        let task_comm_provider = || Some(std::borrow::Cow::Borrowed(task_comm.as_str()));
+        let environ_provider = || Some(std::borrow::Cow::Borrowed(env.as_slice()));
+        let guest_hostname_provider =
+            || Some(std::borrow::Cow::Owned(context.task().uts_ns().nodename()));
+        let open_fds_provider = || Some(std::borrow::Cow::Owned(self.open_fd_numbers()));
+        let network_provider = || Some(std::borrow::Cow::Borrowed(&self.network.spec));
+        let network_model_provider = || Some(context.task().net_ns().view().as_ref().clone());
+        let groups_provider = || Some(std::borrow::Cow::Owned(self.current_groups()));
+        let signals_provider = || {
+            let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);
+            (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw())
+        };
+        let oom_score_adj_provider = || {
+            self.hvpatch_process().map(|process| {
+                std::borrow::Cow::Owned(
+                    process
+                        .kernel_graph()
+                        .registry()
+                        .oom_score_adj_by_pid_for_container(context.container().id())
+                        .into_iter()
+                        .filter_map(|(pid, value)| {
+                            crate::namespace::pid::kernel_to_ns_for(context, pid)
+                                .map(|pid| (pid, value))
+                        })
+                        .collect(),
+                )
+            })
+        };
+        let creds_ns_provider = || Some(context.task().creds_ns());
+        let processes_provider = || {
+            Self::synthetic_proc_processes(context, self.hvpatch_process().as_ref())
+                .map(std::borrow::Cow::Owned)
+        };
+        let threads_provider = || {
+            self.synthetic_proc_threads(context, registry)
+                .map(std::borrow::Cow::Owned)
+        };
+        let zombies_provider = || {
+            self.hvpatch_process().map(|process| {
+                std::borrow::Cow::Owned(
+                    process
+                        .kernel_graph()
+                        .registry()
+                        .zombies_for_container(context.container().id())
+                        .into_iter()
+                        .filter_map(|zombie| {
+                            let to_ns = |raw: i32| {
+                                u32::try_from(raw).ok().and_then(|raw| {
+                                    crate::namespace::pid::kernel_to_ns_for(context, raw)
+                                })
+                            };
+                            Some(crate::vfs::SyntheticProcZombie {
+                                pid: to_ns(zombie.key.id.raw())?,
+                                ppid: zombie
+                                    .parent
+                                    .and_then(|parent| to_ns(parent.id.raw()))
+                                    .unwrap_or(1),
+                                pgrp: zombie.namespace_process_group,
+                                session: zombie.namespace_session,
+                                comm: zombie.diagnostic_name,
+                                user_cpu_us: u64::try_from(zombie.rusage.user_time.as_micros())
+                                    .unwrap_or(u64::MAX),
+                                system_cpu_us: u64::try_from(zombie.rusage.system_time.as_micros())
+                                    .unwrap_or(u64::MAX),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+        };
+        let sysvipc_shm_provider = || Some(std::borrow::Cow::Owned(self.sysvipc_shm_table()));
+        let sysvipc_sem_provider = || Some(std::borrow::Cow::Owned(self.sysvipc_sem_table()));
+        let sysvipc_msg_provider = || Some(std::borrow::Cow::Owned(self.sysvipc_msg_table()));
+        // /proc and other synthetic mounts render address-space state. Hold
+        // alias exclusion across the complete snapshot so it cannot describe
+        // stale VMA metadata while a host replacement is installing.
+        let mem_provider = || {
+            let mem = self.mem_snapshot();
+            let mut address_space_regions = mem.address_space_regions.clone();
+            if !mem.dynamic_maps.is_empty() {
+                match &mut address_space_regions {
+                    Some(regions) => regions.extend(mem.dynamic_maps.clone()),
+                    None => address_space_regions = Some(mem.dynamic_maps.clone()),
+                }
+            }
+            crate::vfs::OpenContextMemorySnapshot {
+                auxv: std::borrow::Cow::Owned(mem.linux_auxv_image.clone()),
+                address_space_regions: address_space_regions.map(std::borrow::Cow::Owned),
+                locked_memory: std::borrow::Cow::Owned(mem.locked_ranges.clone()),
+                brk_current: mem.brk_current,
+                mmap_next: mem.mmap_next,
+                heap_base: mem.layout.heap_base,
+            }
+        };
         let ctx = crate::vfs::OpenContext {
-            executable_path: Some(exec_path.as_str()),
-            argv: Some(argv.as_slice()),
-            task_comm: Some(task_comm.as_str()),
             timerslack_ns,
             guest_arch,
-            guest_hostname: Some(guest_hostname.as_str()),
-            environ: Some(env.as_slice()),
-            open_fds: Some(open_fds.as_slice()),
-            network: Some(&self.network.spec),
-            network_model: Some(&network_model),
-            runtime_endpoint_container: Some(context.container().id()),
-            auxv: Some(mem.linux_auxv_image.as_slice()),
-            address_space_regions: address_space_regions.as_deref(),
-            locked_memory: Some(mem.locked_ranges.as_slice()),
-            brk_current: mem.brk_current,
-            mmap_next: mem.mmap_next,
-            heap_base: mem.layout.heap_base,
-            native_guest_va: self.page_geometry().native_geometry().is_some(),
+            native_guest_va,
             ruid: creds.ruid,
             euid: creds.euid,
             suid: creds.suid,
             rgid: creds.rgid,
             egid: creds.egid,
             sgid: creds.sgid,
-            groups: Some(groups.as_slice()),
-            sig_ignored,
-            sig_caught,
-            sig_shdpnd,
-            identity: self.synthetic_proc_identity(context),
-            oom_score_adj: proc_oom_score_adj.as_ref(),
-            creds_ns: Some(&proc_creds_ns),
-            processes: proc_processes.as_deref(),
-            threads: proc_threads.as_deref(),
-            zombies: proc_zombies.as_deref(),
-            sysvipc_shm: Some(sysvipc_shm.as_str()),
-            sysvipc_sem: Some(sysvipc_sem.as_str()),
-            sysvipc_msg: Some(sysvipc_msg.as_str()),
+            runtime_endpoint_container,
+            identity,
+            executable_path: crate::vfs::LazyField::new(&exec_path_provider),
+            argv: crate::vfs::LazyField::new(&argv_provider),
+            task_comm: crate::vfs::LazyField::new(&task_comm_provider),
+            guest_hostname: crate::vfs::LazyField::new(&guest_hostname_provider),
+            environ: crate::vfs::LazyField::new(&environ_provider),
+            open_fds: crate::vfs::LazyField::new(&open_fds_provider),
+            network: crate::vfs::LazyField::new(&network_provider),
+            network_model: crate::vfs::LazyField::new(&network_model_provider),
+            groups: crate::vfs::LazyField::new(&groups_provider),
+            signals: crate::vfs::LazyField::new(&signals_provider),
+            oom_score_adj: crate::vfs::LazyField::new(&oom_score_adj_provider),
+            creds_ns: crate::vfs::LazyField::new(&creds_ns_provider),
+            processes: crate::vfs::LazyField::new(&processes_provider),
+            threads: crate::vfs::LazyField::new(&threads_provider),
+            zombies: crate::vfs::LazyField::new(&zombies_provider),
+            sysvipc_shm: crate::vfs::LazyField::new(&sysvipc_shm_provider),
+            sysvipc_sem: crate::vfs::LazyField::new(&sysvipc_sem_provider),
+            sysvipc_msg: crate::vfs::LazyField::new(&sysvipc_msg_provider),
+            mem: crate::vfs::LazyField::new(&mem_provider),
         };
         let open_flags = LinuxOpenFlags::from_bits_retain(flags);
         let vfs_flags = crate::vfs::OpenFlags {
