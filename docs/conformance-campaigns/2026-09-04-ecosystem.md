@@ -1305,3 +1305,21 @@ measurements are void until they rebase.
   fd-based mutation invalidates; red-first rows added to the `dentrycache`
   probe. The `open+close` residual (17 µs vs 1.2 on Linux) is the host
   `openat` itself and is the cap-std retirement's target (round 3).
+
+## 2026-09-05 late night: fork copies only populated tables (worker fork-table-copy)
+
+Two review rounds. Round 1 found the populated prefix recorded only at
+publish, so growth after publish left stale descriptors in a recycled root
+slot for its next occupant (silent corruption); round 2 records the prefix
+on every host sync through the resolver (`record_populated_prefix`, a
+`fetch_max` on the pooled slot handle) with a red-then-green sequence test.
+Director receipt on the branch binary, `hvpatch-phase4-fork-process-spec-stages.d`
+over the 1-page fork loop: phase 2 "parent table clone" 3.5 MiB / 0.19–0.24 ms
+→ 128–256 KiB / 4–9 µs; phase 7 "table publish" 2 MiB / ~100 µs → ~110 KiB /
+7–8 µs; process-spec total ~0.45 → 0.15–0.21 ms. Wall-clock ms/op is not
+citable tonight (two workers compiling; main measured 2.1–3.6 ms against its
+own 0.62 ms of the afternoon), so the byte counts are the evidence and the
+quiet-host number follows. Fork/COW probes MATCH; `sh -c '/bin/true'` rc=0.
+Open from the worker: `AliasRegistry::private_owned_containing_physical`
+can panic on a reversed `BTreeMap` range when the scope's widest recorded
+physical size is smaller than the query length; guard to land on main.
