@@ -614,3 +614,14 @@ shards). Interleaved A/B, three reps each, same host load:
 Still 4x/7x/50x the oracle; the untouched case is pure dispatch cost and is
 the next attribution target. Receipts: `perf-ab-mmap-cost.txt`,
 `conformance-probes-mmap-cost.log`. Landed as `ea55f4028..c89dec3c2`.
+
+The first harness pass on the lever binary read `cpython-call` at 34x and
+`cpython-mmap` at 7.4x against ledger values of 20x and 4.2x, taken while two
+Antigravity workers were compiling (load 9 on a 10-core host). An interleaved
+A/B of `test_call` wall time between a pre-lever build (`ecb026784`) and the
+lever build under that same load reads 4.92 s vs 4.61 s (three reps each,
+lever faster every pair), so the levers did not regress the call-heavy
+suite; the harness numbers were load. Quiet-host ledger refresh still owed.
+`cpython-compile` still crashes on page-table exhaustion (pt-pool worker in
+flight); `concurrent_futures` completed 232/237 with five timing-sensitive
+failures under that load.
