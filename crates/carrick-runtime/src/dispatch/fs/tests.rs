@@ -2408,6 +2408,79 @@ fn staged_splice_pipe_bytes_are_visible_to_read() {
     assert_eq!(dispatcher.staged_splice_pipe_bytes(read_fd), 4);
 }
 
+#[test]
+fn staged_splice_bytes_on_shared_description_survives_draining_table() {
+    let mut host_fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+    for host_fd in host_fds {
+        assert_ne!(
+            unsafe { libc::fcntl(host_fd, libc::F_SETFL, libc::O_NONBLOCK) },
+            -1
+        );
+    }
+
+    let dispatcher = SyscallDispatcher::new();
+    let read_open = OpenFile::from_open_description_with_status_flags(
+        Arc::new(RwLock::new(OpenDescription::HostPipe {
+            host_fd: HostFdRef::new(host_fds[0]),
+            is_read_end: true,
+            pipe_id: 44,
+            base: OpenDescriptionBase::new(0),
+            pty: None,
+            bidirectional: false,
+            write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
+        })),
+        LINUX_O_RDONLY,
+        0,
+    );
+    let write_open = OpenFile::from_open_description_with_status_flags(
+        Arc::new(RwLock::new(OpenDescription::HostPipe {
+            host_fd: HostFdRef::new(host_fds[1]),
+            is_read_end: false,
+            pipe_id: 44,
+            base: OpenDescriptionBase::new(0),
+            pty: None,
+            bidirectional: false,
+            write_kind: HostWriteKind::PipeLike,
+            stdio_stream: None,
+        })),
+        LINUX_O_WRONLY,
+        0,
+    );
+    let (read_fd, _write_fd) = dispatcher
+        .install_fd_pair_at_or_above(3, read_open, write_open)
+        .expect("install host pipe pair");
+
+    let desc_id = dispatcher.open_file(read_fd).unwrap().description.id();
+
+    let ids = crate::kernel::ObjectIdRegistry::new();
+    let child_table = Arc::new(crate::kernel::FileTable::new(
+        ids.file_table_id().expect("child table id"),
+    ));
+    child_table.install(
+        crate::kernel::FileSlotNumber::for_open_fd(3).expect("fd"),
+        dispatcher.open_file(read_fd).unwrap().description,
+        false,
+    );
+
+    child_table.drain_functional_refs();
+
+    crate::dispatch::resources::with_dirty_retiring_resources_for_executor_test(
+        Arc::clone(&child_table),
+        || {
+            dispatcher.stage_splice_bytes_for_description(desc_id, b"rescued".to_vec());
+        },
+    );
+
+    let host_read = dispatcher.host_pipe_read_fd(read_fd).expect("host read fd");
+    let bytes = dispatcher
+        .take_splice_pipe_bytes(read_fd, host_read, None, 7, false)
+        .expect("take staged bytes")
+        .expect("staged bytes available");
+    assert_eq!(bytes, b"rescued");
+}
+
 /// `splice(2)` from a host-backed file into a pipe must BOTH advance the
 /// source's kernel offset when `off_in` is NULL AND return a SHORT count
 /// bounded by the destination pipe. `write(2)` may block until every byte

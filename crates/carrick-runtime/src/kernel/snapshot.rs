@@ -164,7 +164,6 @@ pub struct FileTableSnapshotRow {
     pub next_fd: i32,
     pub stdio_cloexec: [bool; 3],
     pub closed_stdio: [bool; 3],
-    pub splice_pushback_description_ids: Vec<FileDescriptionId>,
     pub epoll_index_fds: Vec<FileSlotNumber>,
 }
 
@@ -598,7 +597,6 @@ impl Kernel {
                 next_fd: observed.next_fd,
                 stdio_cloexec: observed.stdio_cloexec,
                 closed_stdio: observed.closed_stdio,
-                splice_pushback_description_ids: observed.splice_pushback_description_ids,
                 epoll_index_fds: observed.epoll_fds,
             });
             for (number, slot) in observed.slots {
@@ -1592,16 +1590,6 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
             {
                 return invariant("mm io_uring mapping layout or VMA join is invalid");
             }
-        }
-    }
-    for table in &snapshot.file_tables {
-        if has_duplicates(&table.splice_pushback_description_ids)
-            || table
-                .splice_pushback_description_ids
-                .iter()
-                .any(|description| !descriptions.contains(description))
-        {
-            return invariant("file-table subordinate description join is missing");
         }
     }
     let epoll_interests_by_description = snapshot

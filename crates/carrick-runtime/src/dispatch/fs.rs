@@ -5370,15 +5370,53 @@ impl SyscallDispatcher {
                 && *other_pipe_id == pipe_id
             {
                 return host_pipe_readable_bytes(host_fd.raw()).ok().unwrap_or(0)
-                    + self.staged_splice_description_bytes(other.description.id());
+                    + other.description.common().splice_pushback().lock().len();
             }
         }
         0
     }
 
+    pub(crate) fn find_file_description(
+        &self,
+        target_id: crate::kernel::FileDescriptionId,
+    ) -> Option<Arc<crate::kernel::FileDescription>> {
+        let find_in_table = |files: &crate::kernel::FileTable| {
+            for slot in files.read_open_files().values() {
+                if slot.description.id() == target_id {
+                    return Some(Arc::clone(&slot.description));
+                }
+            }
+            None
+        };
+        if let Some(files) = resources::files() {
+            if let Some(desc) = find_in_table(&files) {
+                return Some(desc);
+            }
+        }
+        let kernel = Arc::clone(self.kernel_binding.read().kernel());
+        for task_id in kernel.registry().task_ids() {
+            if let Some(task) = kernel.registry().task(task_id) {
+                for thread in task.threads() {
+                    if let Ok(context) = kernel.context(task_id, thread.key().tid) {
+                        if let Some(desc) = find_in_table(&context.resources().files()) {
+                            return Some(desc);
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            if let Some(desc) = find_in_table(&self.captured_file_table()) {
+                return Some(desc);
+            }
+        }
+        None
+    }
+
     pub(super) fn staged_splice_pipe_bytes(&self, guest_fd: i32) -> usize {
         self.open_file(guest_fd).map_or(0, |file| {
-            self.staged_splice_description_bytes(file.description.id())
+            file.description.common().splice_pushback().lock().len()
         })
     }
 
@@ -5386,22 +5424,23 @@ impl SyscallDispatcher {
         &self,
         description: crate::kernel::FileDescriptionId,
     ) -> usize {
-        let queue = self
-            .captured_file_table()
-            .lock_splice_pushback()
-            .get(&description)
-            .cloned();
-        queue.map_or(0, |queue| queue.lock().len())
+        self.find_file_description(description)
+            .map_or(0, |desc| desc.common().splice_pushback().lock().len())
     }
 
     pub(in crate::dispatch) fn discard_splice_pushback_if_final(&self, guest_fd: i32) {
-        let Some(description) = self.open_file(guest_fd).map(|file| file.description) else {
+        let Some(file) = self.open_file(guest_fd) else {
             return;
         };
-        if description.fd_ref_count() == 1 {
-            self.captured_file_table()
-                .lock_splice_pushback()
-                .remove(&description.id());
+        if file.description.fd_ref_count() == 1
+            && !file
+                .description
+                .common()
+                .splice_pushback()
+                .lock()
+                .is_empty()
+        {
+            file.description.clear_splice_pushback();
         }
     }
 
@@ -6037,22 +6076,11 @@ impl SyscallDispatcher {
         guest_fd: i32,
         count: usize,
     ) -> Result<Vec<u8>, DispatchError> {
-        let description = self
+        let file = self
             .open_file(guest_fd)
-            .ok_or(DispatchError::Errno(LINUX_EBADF))?
-            .description;
-        let files = self.captured_file_table();
-        let mut staged = files.lock_splice_pushback();
-        let Some(queue) = staged.get(&description.id()).cloned() else {
-            return Ok(Vec::new());
-        };
-        let mut queue = queue.lock();
+            .ok_or(DispatchError::Errno(LINUX_EBADF))?;
+        let mut queue = file.description.common().splice_pushback().lock();
         let bytes = queue.take_vec(count);
-        let empty = queue.is_empty();
-        drop(queue);
-        if empty {
-            staged.remove(&description.id());
-        }
         Ok(bytes)
     }
 
@@ -6067,30 +6095,27 @@ impl SyscallDispatcher {
         if bytes.is_empty() {
             return;
         }
-        let files = self.captured_file_table();
-        let queue = files
-            .lock_splice_pushback()
-            .entry(description)
-            .or_insert_with(|| Arc::new(Mutex::new(SplicePushback::default())))
-            .clone();
-        queue.lock().push_back_owned(bytes);
-        self.notify_inmem_epoll();
+        if let Some(desc) = self.find_file_description(description) {
+            desc.common()
+                .splice_pushback()
+                .lock()
+                .push_back_owned(bytes);
+            self.notify_inmem_epoll();
+        }
     }
 
     pub(super) fn stage_splice_pipe_bytes_owned(&self, guest_fd: i32, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
-        let Some(description) = self.open_file(guest_fd).map(|file| file.description) else {
+        let Some(file) = self.open_file(guest_fd) else {
             return;
         };
-        let files = self.captured_file_table();
-        let queue = files
-            .lock_splice_pushback()
-            .entry(description.id())
-            .or_insert_with(|| Arc::new(Mutex::new(SplicePushback::default())))
-            .clone();
-        queue.lock().push_back_owned(bytes);
+        file.description
+            .common()
+            .splice_pushback()
+            .lock()
+            .push_back_owned(bytes);
         // The payload is userspace-resident rather than in the host pipe, so a
         // host kqueue/poll edge cannot announce it. Wake epoll instances to
         // force their level-readiness recompute.
@@ -6158,16 +6183,14 @@ impl SyscallDispatcher {
         if bytes.is_empty() {
             return;
         }
-        let Some(description) = self.open_file(guest_fd).map(|file| file.description) else {
+        let Some(file) = self.open_file(guest_fd) else {
             return;
         };
-        let files = self.captured_file_table();
-        let queue = files
-            .lock_splice_pushback()
-            .entry(description.id())
-            .or_insert_with(|| Arc::new(Mutex::new(SplicePushback::default())))
-            .clone();
-        queue.lock().push_front(bytes);
+        file.description
+            .common()
+            .splice_pushback()
+            .lock()
+            .push_front(bytes);
     }
 
     fn write_output_fd(
