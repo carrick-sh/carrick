@@ -4968,6 +4968,7 @@ bitflags! {
         const NANO = LINUX_STA_NANO;
         const MODE = LINUX_STA_MODE;
         const CLK = LINUX_STA_CLK;
+        const RONLY = LINUX_STA_RONLY;
     }
 
     /// `splice`/`vmsplice`/`tee` flag bits. The full set IS the supported set
