@@ -1034,15 +1034,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 1877431,
-        "byte_start": 1877419,
+        "byte_end": 1878425,
+        "byte_start": 1878413,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 44863,
-        "line_end": 44863,
-        "line_start": 44863
+        "line": 44879,
+        "line_end": 44879,
+        "line_start": 44879
       }
     },
     {
@@ -1055,15 +1055,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 1880062,
-        "byte_start": 1880050,
+        "byte_end": 1881056,
+        "byte_start": 1881044,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 44909,
-        "line_end": 44909,
-        "line_start": 44909
+        "line": 44925,
+        "line_end": 44925,
+        "line_start": 44925
       }
     },
     {
@@ -1076,15 +1076,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 1882379,
-        "byte_start": 1882367,
+        "byte_end": 1883373,
+        "byte_start": 1883361,
         "column": 25,
         "column_end": 37,
         "column_start": 25,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 44950,
-        "line_end": 44950,
-        "line_start": 44950
+        "line": 44966,
+        "line_end": 44966,
+        "line_start": 44966
       }
     },
     {
@@ -12678,9 +12678,9 @@
       }
     }
   ],
-  "rows_sha256": "c648f3b26051f2f0118a3621e561f8cf2b7b69afb769081e3201423ebe182d68",
+  "rows_sha256": "a65abcbe45ffba5068215972ee3167a1ab565ba36d71bab6b9d40833978001bd",
   "schema": 1,
-  "source_head": "213ddbcf62324b240b4883a19ac80aabe2c2ce57",
+  "source_head": "5cc2396437b09a0fd33303255d7deb5ba90fd601",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
