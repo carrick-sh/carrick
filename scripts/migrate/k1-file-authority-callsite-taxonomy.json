@@ -3702,7 +3702,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 6632,
+      "line": 6634,
       "categories": [
         "description_guard"
       ],
@@ -3713,7 +3713,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/tests.rs",
-      "line": 6862,
+      "line": 6864,
       "categories": [
         "description_backing"
       ],
