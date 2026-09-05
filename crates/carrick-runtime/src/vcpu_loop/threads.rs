@@ -391,11 +391,6 @@ fn publish_persistent_sibling_stop_with(
     kernel: &Kernel,
 ) -> Result<(), RuntimeError> {
     let removed = registry.remove_all_except(keeper);
-    if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
-        eprintln!(
-            "SIGDBG sibling-stop registry={registry:p} keeper={keeper:?} removed={removed:?}"
-        );
-    }
     kicker.kick_all_except(keeper);
     futex.notify_signal_pending();
     platform_futex.notify_signal_pending();
