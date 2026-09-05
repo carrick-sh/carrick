@@ -771,3 +771,14 @@ before its rebase); re-installing the same lease's source is a no-op, a
 different lease is the error. This is the identity-and-scope class
 (`docs/identity-and-scope-domains.md`): a rule that is true while one task
 exists and wrong the instant a second appears.
+
+Parked: branch `agy/overlay-owner-sep05` (worktree kept) carries
+`3214d3da4`, which keys guest reads/writes on the semantic VA and makes
+`mmapcluster`/`mapfixedfork` MATCH on the in-memory rootfs, but regresses
+`coredumpfile`'s sibling-thread capture (four lines). Three worker turns
+across two conversations produced no fix (each died on transport with the
+tree untouched or only a compile fix). The likely cause is the core writer
+handing already-translated (IPA) addresses to the read path that now
+insists on semantic VAs; the fix belongs with whoever next touches the
+core writer. Main keeps the pre-existing in-memory-lane `mmapcluster`
+underflow until then; `--fs host` (the shard gate's lane) is unaffected.
