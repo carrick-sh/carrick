@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "description": "Reviewed inventory of classified production raw lock acquisitions (fail-closed, shrink-only)",
-  "total_count": 106,
+  "total_count": 101,
   "category_counts": {
     "proc": 57,
     "pty_table": 10,
@@ -58,7 +58,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::proc_self_fd_tty_link::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 6470,
+      "line": 6477,
       "item": "DispatchError::proc_self_fd_tty_link",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -67,7 +67,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 8901,
+      "line": 8908,
       "item": "SyscallDispatcher::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -76,25 +76,16 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#2",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 9009,
+      "line": 9478,
       "item": "SyscallDispatcher::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
       "ordinal": 2
     },
     {
-      "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#3",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 9046,
-      "item": "SyscallDispatcher::ioctl",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 3
-    },
-    {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::readlinkat::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 15041,
+      "line": 15048,
       "item": "SyscallDispatcher::readlinkat",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -924,54 +915,13 @@
       "ordinal": 6
     },
     {
-      "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#4",
+      "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::pty_is_controlling::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 9052,
-      "item": "SyscallDispatcher::ioctl",
+      "line": 5083,
+      "item": "DispatchError::pty_is_controlling",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
-      "ordinal": 4,
-      "rationale": "(ISIG line discipline on guest ptys: foreground pgrp / controlling tty checks, 2026-09-06)"
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#5",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 9097,
-      "item": "SyscallDispatcher::ioctl",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 5,
-      "rationale": "(ISIG line discipline on guest ptys: foreground pgrp / controlling tty checks, 2026-09-06)"
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#6",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 9117,
-      "item": "SyscallDispatcher::ioctl",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 6,
-      "rationale": "(ISIG line discipline on guest ptys: foreground pgrp / controlling tty checks, 2026-09-06)"
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#7",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 9153,
-      "item": "SyscallDispatcher::ioctl",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 7,
-      "rationale": "(ISIG line discipline on guest ptys: foreground pgrp / controlling tty checks, 2026-09-06)"
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#8",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 9471,
-      "item": "SyscallDispatcher::ioctl",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 8,
-      "rationale": "(ISIG line discipline on guest ptys: foreground pgrp / controlling tty checks, 2026-09-06)"
+      "ordinal": 1
     }
   ]
 }
