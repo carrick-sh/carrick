@@ -1482,6 +1482,68 @@ impl OpenDescription {
         };
         Some(label)
     }
+
+    pub(super) fn rename_path(&mut self, resolved_old: &str, resolved_new: &str) {
+        match self {
+            Self::Directory {
+                path,
+                metadata,
+                listing,
+                ..
+            } => {
+                if *path == resolved_old {
+                    *path = resolved_new.to_string();
+                    metadata.path = Path::new(resolved_new).to_path_buf();
+                    *listing = DirListing::Pending;
+                } else if path.starts_with(resolved_old)
+                    && path.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                {
+                    let rest = &path[resolved_old.len() + 1..];
+                    let updated = format!("{resolved_new}/{rest}");
+                    *path = updated.clone();
+                    metadata.path = Path::new(&updated).to_path_buf();
+                    *listing = DirListing::Pending;
+                }
+            }
+            Self::File { path, metadata, .. } => {
+                if *path == resolved_old {
+                    *path = resolved_new.to_string();
+                    metadata.path = Path::new(resolved_new).to_path_buf();
+                } else if path.starts_with(resolved_old)
+                    && path.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                {
+                    let rest = &path[resolved_old.len() + 1..];
+                    let updated = format!("{resolved_new}/{rest}");
+                    *path = updated.clone();
+                    metadata.path = Path::new(&updated).to_path_buf();
+                }
+            }
+            Self::HostFile { metadata, .. } => {
+                let path_str = metadata.path.to_string_lossy().into_owned();
+                if path_str == resolved_old {
+                    metadata.path = Path::new(resolved_new).to_path_buf();
+                } else if path_str.starts_with(resolved_old)
+                    && path_str.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                {
+                    let rest = &path_str[resolved_old.len() + 1..];
+                    metadata.path = Path::new(&format!("{resolved_new}/{rest}")).to_path_buf();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl super::SyscallDispatcher {
+    pub(in crate::dispatch) fn rename_open_paths(&self, resolved_old: &str, resolved_new: &str) {
+        let file_table = self.captured_file_table();
+        for (_, open_file) in file_table.read_open_files().iter() {
+            if let Some(mut desc) = open_file.description.write() {
+                desc.rename_path(resolved_old, resolved_new);
+            }
+        }
+        file_table.rename_fd_open_paths(resolved_old, resolved_new);
+    }
 }
 
 pub(super) type OpenDescriptionRef = Arc<RwLock<OpenDescription>>;

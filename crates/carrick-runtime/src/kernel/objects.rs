@@ -2008,6 +2008,20 @@ impl FileTable {
         self.rw_write(&self.fd_open_paths)
     }
 
+    pub(crate) fn rename_fd_open_paths(&self, resolved_old: &str, resolved_new: &str) {
+        let mut fd_open_paths = self.write_fd_open_paths();
+        for (_, open_path) in fd_open_paths.iter_mut() {
+            if *open_path == resolved_old {
+                *open_path = resolved_new.to_string();
+            } else if open_path.starts_with(resolved_old)
+                && open_path.as_bytes().get(resolved_old.len()) == Some(&b'/')
+            {
+                let rest = &open_path[resolved_old.len() + 1..];
+                *open_path = format!("{resolved_new}/{rest}");
+            }
+        }
+    }
+
     pub(crate) fn lock_splice_pushback(
         &self,
     ) -> FileTableMutexGuard<
