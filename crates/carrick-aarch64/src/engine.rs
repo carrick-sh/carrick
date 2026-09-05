@@ -3066,8 +3066,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         emit_stage(
             HvpatchForkProcessSpecStagePhase::ParentPageTablesClone,
             stage_started,
-            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE
-                * (1 + u64::from(parent_page_tables_snapshot.is_some())),
+            page_tables.copied_bytes() * (1 + u64::from(parent_page_tables_snapshot.is_some())),
         );
 
         let mut child_source = request.table_arena_source.take();

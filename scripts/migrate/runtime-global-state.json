@@ -1578,6 +1578,22 @@
       "rationale": "Environment variable CARRICK_FRAME_POOL read in is_frame_pool_enabled::CARRICK_FRAME_POOL (crates/carrick-vmm-hvf/src/frame_pool.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/frame_pool.rs",
+      "symbol": "is_root_slot_pool_enabled::CARRICK_ROOT_SLOT_POOL",
+      "fingerprint": "7fd693af34888c9fe6d407eac1fff9b71e701ad1760849ef1bbfe5c9f9e9d4f4",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_ROOT_SLOT_POOL read in is_root_slot_pool_enabled::CARRICK_ROOT_SLOT_POOL (crates/carrick-vmm-hvf/src/frame_pool.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/frame_pool.rs",
+      "symbol": "root_slot_pool_size::CARRICK_ROOT_SLOT_POOL_SIZE",
+      "fingerprint": "d3be615fc4863fba445162e2bcd6477f4ef5cd031ef1af0a288dda839a2f5242",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_ROOT_SLOT_POOL_SIZE read in root_slot_pool_size::CARRICK_ROOT_SLOT_POOL_SIZE (crates/carrick-vmm-hvf/src/frame_pool.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
       "symbol": "INSTALLED",

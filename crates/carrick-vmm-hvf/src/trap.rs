@@ -13418,6 +13418,7 @@ impl GlobalFrameOwnerEntry {
 pub(crate) enum GlobalFrameBacking {
     Owned(crate::host_mapping::OwnedHostMapping),
     Pooled(crate::frame_pool::PooledFrameHandle),
+    PooledRoot(crate::frame_pool::PooledRootSlotHandle),
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -13426,6 +13427,7 @@ impl GlobalFrameBacking {
         match self {
             Self::Owned(mapping) => mapping.as_ptr(),
             Self::Pooled(handle) => handle.as_mut_ptr(),
+            Self::PooledRoot(handle) => handle.as_mut_ptr(),
         }
     }
 
@@ -13433,6 +13435,7 @@ impl GlobalFrameBacking {
         match self {
             Self::Owned(mapping) => mapping.len(),
             Self::Pooled(handle) => handle.len(),
+            Self::PooledRoot(handle) => handle.len(),
         }
     }
 }
@@ -13456,6 +13459,13 @@ impl GlobalFrameSharedMapping {
     fn from_pooled(handle: crate::frame_pool::PooledFrameHandle) -> Self {
         Self {
             backing: GlobalFrameBacking::Pooled(handle),
+            logical_pin_count: parking_lot::Mutex::new(0),
+        }
+    }
+
+    fn from_pooled_root(handle: crate::frame_pool::PooledRootSlotHandle) -> Self {
+        Self {
+            backing: GlobalFrameBacking::PooledRoot(handle),
             logical_pin_count: parking_lot::Mutex::new(0),
         }
     }
@@ -14104,9 +14114,6 @@ fn transfer_global_frame_stage2_lease_to_custody(
                 ))
             })?,
         };
-        #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
-        let backend_map_installed = lease.mapped;
-        #[cfg(any(test, feature = "foreign-cow-test-support"))]
         let backend_map_installed = lease.backend_map_installed;
         custody
             .register_stage2_record(CarrierStage2RecordSpec {
@@ -14528,6 +14535,77 @@ impl StructuralBackingOwner {
             physical_ipa,
             physical_size,
         }))
+    }
+
+    pub(crate) fn new_pooled_root_in(
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        handle: crate::frame_pool::PooledRootSlotHandle,
+        mut stage2_lease: GlobalFrameStage2Lease,
+        perms: u64,
+        epoch: StructuralEpoch,
+        physical_ipa: u64,
+        physical_size: usize,
+    ) -> Result<std::sync::Arc<Self>, TrapError> {
+        if handle.len() != physical_size
+            || handle.as_mut_ptr().is_null()
+            || physical_size == 0
+            || physical_ipa.checked_add(physical_size as u64).is_none()
+            || epoch.raw() == 0
+        {
+            stage2_lease.try_retire().map_err(|rollback| {
+                TrapError::Hypervisor(format!(
+                    "invalid pooled root structural backing owner and explicit lease rollback failed: {rollback}"
+                ))
+            })?;
+            return Err(TrapError::Hypervisor(format!(
+                "invalid pooled root structural backing owner identity: epoch={:?} ipa=0x{:x} len={}",
+                epoch, physical_ipa, physical_size
+            )));
+        }
+        let (lease_base, lease_len) = stage2_lease.key();
+        if lease_base != physical_ipa || lease_len != physical_size as u64 {
+            stage2_lease.try_retire().map_err(|rollback| {
+                TrapError::Hypervisor(format!(
+                    "mismatched pooled root structural backing owner and explicit lease rollback failed: {rollback}"
+                ))
+            })?;
+            return Err(TrapError::Hypervisor(format!(
+                "structural stage-2 lease ({lease_base:#x}, {lease_len:#x}) does not match physical extent ({physical_ipa:#x}, {physical_size:#x})"
+            )));
+        }
+        let host_addr = handle.as_mut_ptr() as usize;
+        let identity = transfer_global_frame_stage2_lease_to_custody(
+            custody,
+            stage2_lease,
+            host_addr,
+            perms,
+            Some(CarrierLogicalOwner {
+                id: epoch.raw(),
+                generation: epoch.raw(),
+            }),
+        )?;
+        let retained = std::sync::Arc::new(StructuralBackingCustodyEntry {
+            mapping: std::sync::Arc::new(GlobalFrameSharedMapping::from_pooled_root(handle)),
+            record_identity: parking_lot::Mutex::new(identity),
+            owner_retired: std::sync::atomic::AtomicBool::new(false),
+        });
+        custody
+            .structural_backings
+            .lock()
+            .insert(identity.record_id, std::sync::Arc::clone(&retained));
+        Ok(std::sync::Arc::new(Self {
+            custody: std::sync::Arc::downgrade(custody),
+            retained,
+            epoch,
+            physical_ipa,
+            physical_size,
+        }))
+    }
+
+    pub(crate) fn record_populated_prefix(&self, prefix: usize) {
+        if let GlobalFrameBacking::PooledRoot(ref handle) = self.retained.mapping.backing {
+            handle.record_populated_prefix(prefix);
+        }
     }
 
     pub(crate) fn ptr(&self) -> *mut u8 {
@@ -20206,6 +20284,7 @@ pub(crate) struct CarrierVmCustody {
     pending_global_frame_detached_retries:
         parking_lot::Mutex<PendingGlobalFrameRetirementQueue<CarrierStage2RecordId>>,
     frame_pool: parking_lot::Mutex<CarrierFramePoolState>,
+    root_slot_pool: parking_lot::Mutex<CarrierRootSlotPoolState>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -20214,6 +20293,15 @@ pub(crate) enum CarrierFramePoolState {
     #[default]
     Uninitialized,
     Active(std::sync::Arc<crate::frame_pool::PreMappedFramePool>),
+    Failed,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) enum CarrierRootSlotPoolState {
+    #[default]
+    Uninitialized,
+    Active(std::sync::Arc<crate::frame_pool::PreMappedRootSlotPool>),
     Failed,
 }
 
@@ -20252,6 +20340,7 @@ impl CarrierVmCustody {
                 PendingGlobalFrameRetirementQueue::default(),
             ),
             frame_pool: parking_lot::Mutex::new(CarrierFramePoolState::Uninitialized),
+            root_slot_pool: parking_lot::Mutex::new(CarrierRootSlotPoolState::Uninitialized),
         }
     }
 
@@ -20437,6 +20526,12 @@ impl CarrierVmCustody {
                 ) {
                     pool.forget_backend_mapping();
                 }
+                if let CarrierRootSlotPoolState::Active(pool) = std::mem::replace(
+                    &mut *self.root_slot_pool.lock(),
+                    CarrierRootSlotPoolState::Uninitialized,
+                ) {
+                    pool.forget_backend_mapping();
+                }
                 state.lifecycle = CarrierVmLifecycle::Vacant;
                 Ok(())
             }
@@ -20485,10 +20580,53 @@ impl CarrierVmCustody {
         }
     }
 
+    pub(crate) fn root_slot_pool(
+        &self,
+    ) -> Option<std::sync::Arc<crate::frame_pool::PreMappedRootSlotPool>> {
+        if !crate::frame_pool::is_root_slot_pool_enabled() {
+            return None;
+        }
+        // Lock hierarchy: always read state lifecycle first without holding root_slot_pool,
+        // so commit_destroy (which takes state then root_slot_pool) never deadlocks with us.
+        let state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => drop(state),
+            _ => return None,
+        }
+        let mut guard = self.root_slot_pool.lock();
+        match &*guard {
+            CarrierRootSlotPoolState::Active(pool) => Some(std::sync::Arc::clone(pool)),
+            CarrierRootSlotPoolState::Failed => None,
+            CarrierRootSlotPoolState::Uninitialized => {
+                match crate::frame_pool::PreMappedRootSlotPool::try_new() {
+                    Ok(pool) => {
+                        let pool = std::sync::Arc::new(pool);
+                        *guard = CarrierRootSlotPoolState::Active(std::sync::Arc::clone(&pool));
+                        Some(pool)
+                    }
+                    Err(error) => {
+                        *guard = CarrierRootSlotPoolState::Failed;
+                        eprintln!(
+                            "carrick: root slot pool unavailable: {error}; stage-1 root slots use per-fork mappings"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn is_pooled_ipa(&self, ipa: u64) -> bool {
-        match &*self.frame_pool.lock() {
+        let in_frame_pool = match &*self.frame_pool.lock() {
             CarrierFramePoolState::Active(pool) => pool.contains_ipa(ipa),
             CarrierFramePoolState::Uninitialized | CarrierFramePoolState::Failed => false,
+        };
+        if in_frame_pool {
+            return true;
+        }
+        match &*self.root_slot_pool.lock() {
+            CarrierRootSlotPoolState::Active(pool) => pool.contains_ipa(ipa),
+            CarrierRootSlotPoolState::Uninitialized | CarrierRootSlotPoolState::Failed => false,
         }
     }
 
@@ -20498,6 +20636,15 @@ impl CarrierVmCustody {
         pool: std::sync::Arc<crate::frame_pool::PreMappedFramePool>,
     ) {
         *self.frame_pool.lock() = CarrierFramePoolState::Active(pool);
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn install_root_slot_pool(
+        &self,
+        pool: std::sync::Arc<crate::frame_pool::PreMappedRootSlotPool>,
+    ) {
+        *self.root_slot_pool.lock() = CarrierRootSlotPoolState::Active(pool);
     }
 
     pub(crate) fn live_generation(&self) -> Option<CarrierVmGeneration> {
@@ -24425,6 +24572,15 @@ impl MmAccessState {
                 "stage-1 root structural owner identity drifted before retirement".to_owned(),
             ));
         }
+
+        let copied_bytes = self
+            .page_tables
+            .read()
+            .with_manager(|m| m.copied_bytes())
+            .unwrap_or(0);
+        authority
+            .owner
+            .record_populated_prefix(copied_bytes as usize);
 
         authority
             .owner
@@ -28939,7 +29095,6 @@ pub(crate) struct GlobalFrameStage2Lease {
     release_ipa: bool,
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     drop_backing_audit: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
-    #[cfg(any(test, feature = "foreign-cow-test-support"))]
     backend_map_installed: bool,
 }
 
@@ -28955,7 +29110,6 @@ impl GlobalFrameStage2Lease {
             release_ipa: true,
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             drop_backing_audit: None,
-            #[cfg(any(test, feature = "foreign-cow-test-support"))]
             backend_map_installed: false,
         })
     }
@@ -28969,7 +29123,7 @@ impl GlobalFrameStage2Lease {
         self.length
     }
 
-    fn fixed(base: u64, length: u64) -> Self {
+    pub(crate) fn fixed(base: u64, length: u64) -> Self {
         Self {
             base,
             length,
@@ -28978,17 +29132,18 @@ impl GlobalFrameStage2Lease {
             release_ipa: false,
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             drop_backing_audit: None,
-            #[cfg(any(test, feature = "foreign-cow-test-support"))]
             backend_map_installed: false,
         }
     }
 
     pub(crate) fn mark_mapped(&mut self) {
         self.mapped = true;
-        #[cfg(any(test, feature = "foreign-cow-test-support"))]
-        {
-            self.backend_map_installed = true;
-        }
+        self.backend_map_installed = true;
+    }
+
+    pub(crate) fn mark_pre_mapped(&mut self) {
+        self.mapped = true;
+        self.backend_map_installed = false;
     }
 
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -29009,10 +29164,7 @@ impl GlobalFrameStage2Lease {
     /// release, which `Drop` then does.
     pub(crate) fn forget_backend_mapping(&mut self) {
         self.mapped = false;
-        #[cfg(any(test, feature = "foreign-cow-test-support"))]
-        {
-            self.backend_map_installed = false;
-        }
+        self.backend_map_installed = false;
     }
 
     #[allow(dead_code)]
@@ -29027,9 +29179,6 @@ impl GlobalFrameStage2Lease {
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
-        #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
-        let unmap_backend = self.mapped;
-        #[cfg(any(test, feature = "foreign-cow-test-support"))]
         let unmap_backend = self.backend_map_installed;
         if unmap_backend {
             let size = usize::try_from(self.length).map_err(|_| {
@@ -29043,10 +29192,7 @@ impl GlobalFrameStage2Lease {
                 )));
             }
             self.mapped = false;
-            #[cfg(any(test, feature = "foreign-cow-test-support"))]
-            {
-                self.backend_map_installed = false;
-            }
+            self.backend_map_installed = false;
         }
         if self.release_ipa {
             release_global_frame_ipa(self.base, self.length)?;
@@ -29621,6 +29767,9 @@ enum ProcessMappingHost {
         structural_owner: Option<std::sync::Arc<StructuralBackingOwner>>,
     },
     Owned(crate::host_mapping::OwnedHostMapping),
+    PooledRootSlot {
+        handle: crate::frame_pool::PooledRootSlotHandle,
+    },
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -29630,13 +29779,14 @@ impl ProcessMappingHost {
         match self {
             Self::Borrowed { pointer, .. } => *pointer,
             Self::Owned(mapping) => mapping.as_ptr(),
+            Self::PooledRootSlot { handle } => handle.as_mut_ptr(),
         }
     }
 
     #[allow(dead_code)]
     fn into_owned(self) -> Option<crate::host_mapping::OwnedHostMapping> {
         match self {
-            Self::Borrowed { .. } => None,
+            Self::Borrowed { .. } | Self::PooledRootSlot { .. } => None,
             Self::Owned(mapping) => Some(mapping),
         }
     }
@@ -43268,15 +43418,48 @@ impl HvfTaskState {
                     ));
                 }
             };
-            let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                mapping.physical_size,
-                host_kind,
-            )
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "allocate HVPatch child per-mm kernel backing: {error}"
-                ))
-            })?;
+            let host = if disposition == ForkMappingDisposition::IndependentPageTables
+                && mapping.physical_size == crate::frame_pool::ROOT_SLOT_SIZE
+            {
+                if let Some(pool) = carrier_foreign_mm_transport.custody.root_slot_pool() {
+                    if let Some(handle) = pool.allocate_slot_at(physical_ipa) {
+                        ProcessMappingHost::PooledRootSlot { handle }
+                    } else {
+                        let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                            mapping.physical_size,
+                            host_kind,
+                        )
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "allocate HVPatch child per-mm kernel backing: {error}"
+                            ))
+                        })?;
+                        ProcessMappingHost::Owned(owned)
+                    }
+                } else {
+                    let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                        mapping.physical_size,
+                        host_kind,
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "allocate HVPatch child per-mm kernel backing: {error}"
+                        ))
+                    })?;
+                    ProcessMappingHost::Owned(owned)
+                }
+            } else {
+                let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    mapping.physical_size,
+                    host_kind,
+                )
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "allocate HVPatch child per-mm kernel backing: {error}"
+                    ))
+                })?;
+                ProcessMappingHost::Owned(owned)
+            };
             if disposition == ForkMappingDisposition::IndependentGuestZeroed {
                 // Seed with the parent's frame, THEN zero the wiped window.
                 // `physical_size` can exceed the semantic span, and the extra
@@ -43286,7 +43469,7 @@ impl HvfTaskState {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         mapping.physical_host_addr,
-                        host.as_ptr(),
+                        host.ptr(),
                         mapping.physical_size,
                     );
                 }
@@ -43319,7 +43502,7 @@ impl HvfTaskState {
                     // SAFETY: bounds-checked against `physical_size` above, and
                     // `host` is this child's freshly allocated frame.
                     unsafe {
-                        std::ptr::write_bytes(host.as_ptr().add(frame_offset), 0, len);
+                        std::ptr::write_bytes(host.ptr().add(frame_offset), 0, len);
                     }
                 }
             }
@@ -43331,7 +43514,7 @@ impl HvfTaskState {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         mapping.physical_host_addr,
-                        host.as_ptr(),
+                        host.ptr(),
                         mapping.physical_size,
                     );
                 }
@@ -43375,22 +43558,22 @@ impl HvfTaskState {
                 // legitimately huge address space from a pool the child clone was
                 // refused permission to sweep.
                 let (in_use, free, capacity, arenas) = page_tables.pool_stats();
-                let (multi_vcpu, exclusive, reclaim_pending) = page_tables.coalesce_policy();
+                let (multi_vcpu, exclusive, reclaim_policy) = page_tables.coalesce_policy();
                 let source = self.page_tables_authority().has_source();
                 TrapError::Hypervisor(format!(
                     "map hvpatch child VA 0x{:x} to global/root-slot IPA 0x{ipa:x}: {error:?} \
                      (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
-                     multi_vcpu={multi_vcpu} exclusive={exclusive} reclaim_pending={reclaim_pending})",
+                     multi_vcpu={multi_vcpu} exclusive={exclusive} reclaim_pending={reclaim_policy})",
                     mapping.start
                 ))
             })?;
-            let physical_host_addr = host.as_ptr();
+            let physical_host_addr = host.ptr();
             let inventory_backing = HvfVmState::private_backing_identity();
             mappings.push(ProcessMappingDesc {
                 start: mapping.start,
                 ipa,
                 end: mapping.end,
-                host: ProcessMappingHost::Owned(host),
+                host,
                 size: mapping.size,
                 physical_ipa,
                 physical_host_addr,
@@ -43569,23 +43752,44 @@ impl HvfTaskState {
         const TWO_MIB: usize = 2 * 1024 * 1024;
         let child_extension_bases = page_tables.extension_arena_bases();
         for base in &child_extension_bases {
-            let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                TWO_MIB,
-                crate::host_mapping::HostMappingKind::PerMmKernelState,
-            )
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "allocate HVPatch child extension page-table backing: {error}"
-                ))
-            })?;
-            let physical_host_addr = host.as_ptr();
+            let (host, physical_host_addr) =
+                if let Some(pool) = carrier_foreign_mm_transport.custody.root_slot_pool() {
+                    if let Some(handle) = pool.allocate_slot_at(*base) {
+                        let ptr = handle.as_mut_ptr();
+                        (ProcessMappingHost::PooledRootSlot { handle }, ptr)
+                    } else {
+                        let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                            TWO_MIB,
+                            crate::host_mapping::HostMappingKind::PerMmKernelState,
+                        )
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "allocate HVPatch child extension page-table backing: {error}"
+                            ))
+                        })?;
+                        let ptr = owned.as_ptr();
+                        (ProcessMappingHost::Owned(owned), ptr)
+                    }
+                } else {
+                    let owned = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                        TWO_MIB,
+                        crate::host_mapping::HostMappingKind::PerMmKernelState,
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "allocate HVPatch child extension page-table backing: {error}"
+                        ))
+                    })?;
+                    let ptr = owned.as_ptr();
+                    (ProcessMappingHost::Owned(owned), ptr)
+                };
             let inventory_backing = HvfVmState::private_backing_identity();
             let stage2_lease = Some(GlobalFrameStage2Lease::fixed(*base, TWO_MIB as u64));
             mappings.push(ProcessMappingDesc {
                 start: *base,
                 ipa: *base,
                 end: *base + TWO_MIB as u64,
-                host: ProcessMappingHost::Owned(host),
+                host,
                 size: TWO_MIB,
                 physical_ipa: *base,
                 physical_host_addr,
@@ -43622,6 +43826,12 @@ impl HvfTaskState {
                 .map(|m| m.physical_host_addr)
         };
         unsafe { page_tables.restore_quiesced_snapshot_to_host(page_table_resolver) };
+        let copied_bytes = page_tables.copied_bytes();
+        for mapping in &mappings {
+            if let ProcessMappingHost::PooledRootSlot { ref handle } = mapping.host {
+                handle.record_populated_prefix(copied_bytes as usize);
+            }
+        }
 
         for (va, expected_ipa, expected_ap, expected_non_global) in child_pte_receipts {
             let shadow = page_tables.debug_walk(va);
@@ -43650,7 +43860,7 @@ impl HvfTaskState {
             }
             crate::probes::pt_alias_receipt(va, live_leaf, expected_ipa, expected_ap, 1);
         }
-        let table_bytes_len = ((child_extension_bases.len() + 1) * TWO_MIB) as u64;
+        let table_bytes_len = page_tables.copied_bytes();
         emit_stage(
             HvpatchForkProcessSpecStagePhase::TablePublish,
             stage_started,
@@ -43793,7 +44003,11 @@ impl HvfVmState {
                 .physical_host_addr
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
-            if process_mapping_needs_stage2_install(mapping.inherited_frame) {
+            if matches!(mapping.host, ProcessMappingHost::PooledRootSlot { .. }) {
+                if let Some(lease) = mapping.stage2_lease.as_mut() {
+                    lease.mark_pre_mapped();
+                }
+            } else if process_mapping_needs_stage2_install(mapping.inherited_frame) {
                 let rc = unsafe {
                     inventory_hv_vm_map(
                         mapping.physical_host_addr.cast(),
@@ -43892,6 +44106,12 @@ impl HvfVmState {
                                 mapping.physical_ipa, mapping.physical_size
                             )));
                         }
+                        (_, ProcessMappingHost::PooledRootSlot { .. }) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) cannot have pooled root backing",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
                     }
                 } else {
                     match mapping.host {
@@ -43906,6 +44126,37 @@ impl HvfVmState {
                             let owner = StructuralBackingOwner::new_in(
                                 &plan.carrier_foreign_mm_transport.custody,
                                 host,
+                                lease,
+                                u64::from(mapping.perms),
+                                epoch,
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                            )?;
+                            let owner_generation = epoch.raw();
+                            structural_identities.push(owner.record_identity());
+                            structural_owners.insert(
+                                (mapping.physical_ipa, mapping.physical_size),
+                                std::sync::Arc::clone(&owner),
+                            );
+                            (
+                                None,
+                                Some(owner),
+                                None,
+                                owner_generation,
+                                GlobalFrameOwnerRole::Borrowed,
+                            )
+                        }
+                        ProcessMappingHost::PooledRootSlot { handle } => {
+                            let epoch = next_structural_epoch()?;
+                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
+                                TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                ))
+                            })?;
+                            let owner = StructuralBackingOwner::new_pooled_root_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                handle,
                                 lease,
                                 u64::from(mapping.perms),
                                 epoch,
@@ -44216,7 +44467,11 @@ impl HvfVmState {
                 .physical_host_addr
                 .wrapping_add(semantic_physical_offset);
             let needs_child_alias_authority = process_mapping_needs_child_alias_authority(&mapping);
-            if process_mapping_needs_stage2_install(mapping.inherited_frame) {
+            if matches!(mapping.host, ProcessMappingHost::PooledRootSlot { .. }) {
+                if let Some(lease) = mapping.stage2_lease.as_mut() {
+                    lease.mark_pre_mapped();
+                }
+            } else if process_mapping_needs_stage2_install(mapping.inherited_frame) {
                 let rc = unsafe {
                     inventory_hv_vm_map(
                         mapping.physical_host_addr.cast(),
@@ -44303,6 +44558,12 @@ impl HvfVmState {
                                 mapping.physical_ipa, mapping.physical_size
                             )));
                         }
+                        (_, ProcessMappingHost::PooledRootSlot { .. }) => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch reusable global-frame mapping at IPA ({:#x}, {:#x}) cannot have pooled root backing",
+                                mapping.physical_ipa, mapping.physical_size
+                            )));
+                        }
                     }
                 } else {
                     match mapping.host {
@@ -44317,6 +44578,31 @@ impl HvfVmState {
                             let owner = StructuralBackingOwner::new_in(
                                 &plan.carrier_foreign_mm_transport.custody,
                                 host,
+                                lease,
+                                u64::from(mapping.perms),
+                                epoch,
+                                mapping.physical_ipa,
+                                mapping.physical_size,
+                            )?;
+                            let owner_generation = epoch.raw();
+                            structural_identities.push(owner.record_identity());
+                            structural_owners.insert(
+                                (mapping.physical_ipa, mapping.physical_size),
+                                std::sync::Arc::clone(&owner),
+                            );
+                            (None, Some(owner), None, owner_generation)
+                        }
+                        ProcessMappingHost::PooledRootSlot { handle } => {
+                            let epoch = next_structural_epoch()?;
+                            let lease = mapping.stage2_lease.take().ok_or_else(|| {
+                                TrapError::Hypervisor(format!(
+                                    "structural mapping at IPA 0x{:x} missing stage-2 lease",
+                                    mapping.physical_ipa
+                                ))
+                            })?;
+                            let owner = StructuralBackingOwner::new_pooled_root_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                handle,
                                 lease,
                                 u64::from(mapping.perms),
                                 epoch,
