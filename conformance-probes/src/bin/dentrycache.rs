@@ -32,6 +32,17 @@ fn stat_mode_and_size(path: &str) -> Result<(u32, u64), i32> {
     }
 }
 
+fn stat_full(path: &str) -> Result<libc::stat, i32> {
+    let c = CString::new(path).unwrap();
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::stat(c.as_ptr(), &mut st) };
+    if rc == 0 {
+        Ok(st)
+    } else {
+        Err(errno())
+    }
+}
+
 fn lstat_mode(path: &str) -> Result<u32, i32> {
     let c = CString::new(path).unwrap();
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -225,6 +236,180 @@ fn main() {
         println!("readlink_reg_errno={}", errno());
     } else {
         println!("readlink_reg_errno=0");
+    }
+
+    // 13. FD-based mutations and hard links
+    let mutfile = format!("{dir}/mutfile");
+    let c_mutfile = CString::new(mutfile.clone()).unwrap();
+
+    // 13a. write 5 bytes via open("w"), flush, stat
+    let fd1 = unsafe {
+        libc::open(
+            c_mutfile.as_ptr(),
+            libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR,
+            0o644,
+        )
+    };
+    assert!(fd1 >= 0);
+    let _ = unsafe { libc::write(fd1, b"hello".as_ptr() as *const _, 5) };
+    match stat_full(&mutfile) {
+        Ok(st) => println!("fd_write5_size={}", st.st_size),
+        Err(e) => println!("fd_write5_size=ERR:{e}"),
+    }
+
+    // 13b. write 6 more, flush, stat -> expected size 11
+    let _ = unsafe { libc::write(fd1, b" world".as_ptr() as *const _, 6) };
+    match stat_full(&mutfile) {
+        Ok(st) => println!("fd_write6_more_size={}", st.st_size),
+        Err(e) => println!("fd_write6_more_size=ERR:{e}"),
+    }
+
+    // 13c. truncate(p, 3), stat -> expected size 3
+    let tr_rc = unsafe { libc::truncate(c_mutfile.as_ptr(), 3) };
+    assert_eq!(tr_rc, 0);
+    match stat_full(&mutfile) {
+        Ok(st) => println!("truncate3_size={}", st.st_size),
+        Err(e) => println!("truncate3_size=ERR:{e}"),
+    }
+
+    // 13d. ftruncate(fd, 1), stat -> expected size 1
+    let ftr_rc = unsafe { libc::ftruncate(fd1, 1) };
+    assert_eq!(ftr_rc, 0);
+    match stat_full(&mutfile) {
+        Ok(st) => println!("ftruncate1_size={}", st.st_size),
+        Err(e) => println!("ftruncate1_size=ERR:{e}"),
+    }
+
+    // 13e. link(p, ln), stat(p).st_nlink -> expected 2
+    let mutfile_link = format!("{dir}/mutfile_link");
+    let c_mutfile_link = CString::new(mutfile_link.clone()).unwrap();
+    let ln_rc = unsafe { libc::link(c_mutfile.as_ptr(), c_mutfile_link.as_ptr()) };
+    assert_eq!(ln_rc, 0);
+    match stat_full(&mutfile) {
+        Ok(st) => println!("link_nlink={}", st.st_nlink),
+        Err(e) => println!("link_nlink=ERR:{e}"),
+    }
+
+    // 13f. O_APPEND fd write 3 bytes, close, stat -> expected size 4 (1 + 3)
+    let fd_app = unsafe { libc::open(c_mutfile.as_ptr(), libc::O_WRONLY | libc::O_APPEND) };
+    assert!(fd_app >= 0);
+    let _ = unsafe { libc::write(fd_app, b"abc".as_ptr() as *const _, 3) };
+    unsafe { libc::close(fd_app) };
+    match stat_full(&mutfile) {
+        Ok(st) => println!("append3_size={}", st.st_size),
+        Err(e) => println!("append3_size=ERR:{e}"),
+    }
+
+    // 13g. pwrite: write 4 bytes at offset 10 -> expected size 14
+    let _ = unsafe { libc::pwrite(fd1, b"test".as_ptr() as *const _, 4, 10) };
+    match stat_full(&mutfile) {
+        Ok(st) => println!("pwrite_size={}", st.st_size),
+        Err(e) => println!("pwrite_size=ERR:{e}"),
+    }
+
+    // 13h. writev: write 2 vectors of 3 bytes at current offset -> expected size 20 (14 + 6)
+    unsafe { libc::lseek(fd1, 0, libc::SEEK_END) };
+    let iov = [
+        libc::iovec {
+            iov_base: b"foo".as_ptr() as *mut _,
+            iov_len: 3,
+        },
+        libc::iovec {
+            iov_base: b"bar".as_ptr() as *mut _,
+            iov_len: 3,
+        },
+    ];
+    let _ = unsafe { libc::writev(fd1, iov.as_ptr(), 2) };
+    match stat_full(&mutfile) {
+        Ok(st) => println!("writev_size={}", st.st_size),
+        Err(e) => println!("writev_size=ERR:{e}"),
+    }
+
+    // 13i. fchmod: fchmod(fd1, 0o600) -> stat mode expected 0o600
+    let _ = unsafe { libc::fchmod(fd1, 0o600) };
+    match stat_full(&mutfile) {
+        Ok(st) => println!("fchmod_mode={:#o}", st.st_mode as u32 & 0o777),
+        Err(e) => println!("fchmod_mode=ERR:{e}"),
+    }
+
+    // 13j. fchown: fchown(fd1, 1000, 1000) -> stat uid/gid expected 1000/1000
+    let _ = unsafe { libc::fchown(fd1, 1000, 1000) };
+    match stat_full(&mutfile) {
+        Ok(st) => {
+            println!("fchown_uid={}", st.st_uid);
+            println!("fchown_gid={}", st.st_gid);
+        }
+        Err(e) => {
+            println!("fchown_uid=ERR:{e}");
+            println!("fchown_gid=ERR:{e}");
+        }
+    }
+
+    // 13k. futimens: set mtime seconds to 123456789
+    let times = [
+        libc::timespec {
+            tv_sec: 100000000,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: 123456789,
+            tv_nsec: 0,
+        },
+    ];
+    let _ = unsafe { libc::futimens(fd1, times.as_ptr()) };
+    match stat_full(&mutfile) {
+        Ok(st) => println!("futimens_mtime={}", st.st_mtime),
+        Err(e) => println!("futimens_mtime=ERR:{e}"),
+    }
+
+    // 13l. fallocate: extend size to 4096
+    let _ = unsafe { libc::fallocate(fd1, 0, 0, 4096) };
+    match stat_full(&mutfile) {
+        Ok(st) => println!("fallocate_size={}", st.st_size),
+        Err(e) => println!("fallocate_size=ERR:{e}"),
+    }
+    unsafe { libc::close(fd1) };
+
+    // 13m. write through the second hard link, stat the original name
+    let fd_link2 = unsafe { libc::open(c_mutfile_link.as_ptr(), libc::O_WRONLY | libc::O_TRUNC) };
+    assert!(fd_link2 >= 0);
+    let _ = unsafe { libc::write(fd_link2, b"hardlink".as_ptr() as *const _, 8) };
+    unsafe { libc::close(fd_link2) };
+    match stat_full(&mutfile) {
+        Ok(st) => {
+            println!("hardlink_write_other_name_size={}", st.st_size);
+            println!("hardlink_write_other_name_nlink={}", st.st_nlink);
+        }
+        Err(e) => {
+            println!("hardlink_write_other_name_size=ERR:{e}");
+            println!("hardlink_write_other_name_nlink=ERR:{e}");
+        }
+    }
+
+    // 13n. write through an fd opened BEFORE a rename of the file
+    let before_rename = format!("{dir}/before_rename");
+    let after_rename = format!("{dir}/after_rename");
+    let c_before = CString::new(before_rename.clone()).unwrap();
+    let c_after = CString::new(after_rename.clone()).unwrap();
+    let fd_rn = unsafe {
+        libc::open(
+            c_before.as_ptr(),
+            libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR,
+            0o644,
+        )
+    };
+    assert!(fd_rn >= 0);
+    let _ = unsafe { libc::write(fd_rn, b"init".as_ptr() as *const _, 4) };
+    let _ = stat_full(&before_rename);
+
+    let _ = unsafe { libc::rename(c_before.as_ptr(), c_after.as_ptr()) };
+
+    let _ = unsafe { libc::write(fd_rn, b"+more".as_ptr() as *const _, 5) };
+    unsafe { libc::close(fd_rn) };
+
+    match stat_full(&after_rename) {
+        Ok(st) => println!("write_after_rename_size={}", st.st_size),
+        Err(e) => println!("write_after_rename_size=ERR:{e}"),
     }
 
     // Cleanup

@@ -7,6 +7,35 @@
 //!
 //! Shared mounts (e.g. bind mounts) revalidate via `fstatat` through the
 //! cached parent dirfd and are never negative-cached.
+//!
+//! # Inode Coherence Model
+//!
+//! The cache separates directory topology (dentries) from file metadata (inodes):
+//! - **Dentries** map `(parent_dentry_id, name) -> PositiveDentry / NegativeDentry`.
+//!   A positive dentry records the entry's identity `(dev, ino, kind, symlink_target)`.
+//!   Multiple dentries can point to the same `(dev, ino)` (hard links).
+//! - **Inodes** map `(dev, ino) -> InodeRecord { mode, uid, gid, size, atime, mtime, ctime, nlink }`.
+//!
+//! Mutations update or invalidate the cache as follows:
+//! - **Update in place**:
+//!   - Directory generation bumps (`bump_dir_generation`): updates `dir_gen` in place to
+//!     invalidate negative lookups in that directory without evicting positive dentries.
+//!   - Directory renames: updates `dirs` path table and bumps child directory generation.
+//!   - In-memory file mutations (`update_inode`): Carrick owns the in-memory buffer, so
+//!     stat attributes (size, mode) can be updated in place in `inodes`.
+//! - **Invalidate**:
+//!   - Host file descriptor mutations (`write`, `pwrite`, `writev`, `pwritev`, `ftruncate`,
+//!     `fallocate`, `futimens`, `fchmod`, `fchown`): invalidate `(dev, ino)` in `inodes` and
+//!     clear fast-path stat entries. The next `stat` performs a single `fstatat` to reload
+//!     authoritative host metadata (exact APFS nanosecond timestamps, sizes, mode).
+//!   - Hard link creation (`link`, `linkat`): creates the new dentry and invalidates the
+//!     source `(dev, ino)` in `inodes`, so both the source and the new link observe the
+//!     updated `st_nlink` and content.
+//!   - Unlink / Rmdir (`unlink`, `unlinkat`, `rmdir`): evicts the dentry (recording a negative
+//!     dentry for private rootfs) and invalidates `(dev, ino)` in `inodes` so remaining hard
+//!     link aliases observe decremented `st_nlink`.
+//!   - Path mutations (`truncate`, `chmod`, `chown`, `utimes`): invalidate the target path's
+//!     dentry and inode record.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -37,6 +66,14 @@ pub struct PositiveDentry {
     pub kind: RootFsEntryKind,
     pub ino: u64,
     pub dev: u64,
+    pub symlink_target: Option<String>,
+    pub parent_gen: u64,
+    pub dir_gen: Option<Arc<AtomicU64>>,
+    pub is_lower: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InodeRecord {
     pub mode: u32,
     pub uid: NsUid,
     pub gid: NsGid,
@@ -45,25 +82,21 @@ pub struct PositiveDentry {
     pub mtime: (i64, i64),
     pub ctime: (i64, i64),
     pub nlink: u32,
-    pub symlink_target: Option<String>,
-    pub parent_gen: u64,
-    pub dir_gen: Option<Arc<AtomicU64>>,
-    pub is_lower: bool,
 }
 
 impl PositiveDentry {
-    pub fn to_real_stat(&self) -> RealStat {
+    pub fn to_real_stat(&self, record: &InodeRecord) -> RealStat {
         RealStat {
             kind: self.kind,
             ino: self.ino,
-            nlink: self.nlink,
-            mode: self.mode,
-            uid: self.uid,
-            gid: self.gid,
-            size: self.size,
-            atime: self.atime,
-            mtime: self.mtime,
-            ctime: self.ctime,
+            nlink: record.nlink,
+            mode: record.mode,
+            uid: record.uid,
+            gid: record.gid,
+            size: record.size,
+            atime: record.atime,
+            mtime: record.mtime,
+            ctime: record.ctime,
         }
     }
 }
@@ -115,6 +148,7 @@ pub struct DentryCache {
     is_shared: bool,
     fast_path: RwLock<FastPathCache>,
     entries: RwLock<HashMap<(DentryId, String), DentryNode>>,
+    inodes: RwLock<HashMap<(u64, u64), InodeRecord>>,
     dirs: RwLock<HashMap<DentryId, DirEntry>>,
     path_to_dir_id: RwLock<HashMap<String, DentryId>>,
 }
@@ -151,6 +185,7 @@ impl DentryCache {
             is_shared,
             fast_path: RwLock::new(FastPathCache::default()),
             entries: RwLock::new(HashMap::new()),
+            inodes: RwLock::new(HashMap::new()),
             dirs: RwLock::new(dirs),
             path_to_dir_id: RwLock::new(path_to_dir_id),
         }
@@ -173,6 +208,7 @@ impl DentryCache {
             let mut dirs = self.dirs.write();
             let mut path_to_dir_id = self.path_to_dir_id.write();
             entries.clear();
+            self.inodes.write().clear();
             dirs.clear();
             path_to_dir_id.clear();
             let root_gen = Arc::new(AtomicU64::new(1));
@@ -253,12 +289,24 @@ impl DentryCache {
                     if stat_map.len() >= FAST_PATH_CAP {
                         stat_map.clear();
                     }
-                    stat_map.insert(
-                        norm_path.to_string(),
-                        res.as_ref()
-                            .map(|r| r.dentry.to_real_stat())
-                            .map_err(|e| *e),
-                    );
+                    match &res {
+                        Ok(r) => {
+                            if let Some(record) = self
+                                .inodes
+                                .read()
+                                .get(&(r.dentry.dev, r.dentry.ino))
+                                .copied()
+                            {
+                                stat_map.insert(
+                                    norm_path.to_string(),
+                                    Ok(r.dentry.to_real_stat(&record)),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            stat_map.insert(norm_path.to_string(), Err(*e));
+                        }
+                    }
                 }
             }
         }
@@ -306,6 +354,17 @@ impl DentryCache {
             } else {
                 (0, 1, 0o755)
             };
+            let record = InodeRecord {
+                mode: if mode == 0 { 0o755 } else { mode },
+                uid: NsUid::ROOT,
+                gid: NsGid::ROOT,
+                size: 4096,
+                atime: (0, 0),
+                mtime: (0, 0),
+                ctime: (0, 0),
+                nlink: 2,
+            };
+            self.inodes.write().insert((dev, ino), record);
 
             return Ok(ResolvedDentry {
                 dentry: PositiveDentry {
@@ -313,14 +372,6 @@ impl DentryCache {
                     kind: RootFsEntryKind::Directory,
                     ino,
                     dev,
-                    mode: if mode == 0 { 0o755 } else { mode },
-                    uid: NsUid::ROOT,
-                    gid: NsGid::ROOT,
-                    size: 4096,
-                    atime: (0, 0),
-                    mtime: (0, 0),
-                    ctime: (0, 0),
-                    nlink: 2,
                     symlink_target: None,
                     parent_gen: 1,
                     dir_gen: Some(root_gen),
@@ -430,16 +481,55 @@ impl DentryCache {
                                     )
                                 } == 0;
                                 if ok && st.st_ino == pos.ino {
-                                    let mut refreshed = pos.clone();
-                                    refreshed.size = st.st_size as u64;
-                                    refreshed.nlink = st.st_nlink as u32;
-                                    refreshed.atime =
-                                        (st.st_atime, carrick_portable::stat_atime_nsec(&st));
-                                    refreshed.mtime =
-                                        (st.st_mtime, carrick_portable::stat_mtime_nsec(&st));
-                                    refreshed.ctime =
-                                        (st.st_ctime, carrick_portable::stat_ctime_nsec(&st));
-                                    Some(refreshed)
+                                    let child_path = if current_dir_path == "/" {
+                                        format!("/{}", name)
+                                    } else {
+                                        format!(
+                                            "{}/{}",
+                                            current_dir_path.trim_end_matches('/'),
+                                            name
+                                        )
+                                    };
+                                    let (mode, uid, gid) = if !backend.serves_plain_metadata() {
+                                        if let Some(rs) = backend.real_stat(&child_path, false) {
+                                            (rs.mode, rs.uid, rs.gid)
+                                        } else {
+                                            (
+                                                st.st_mode as u32 & 0o7777,
+                                                NsUid(st.st_uid),
+                                                NsGid(st.st_gid),
+                                            )
+                                        }
+                                    } else {
+                                        (
+                                            st.st_mode as u32 & 0o7777,
+                                            NsUid(st.st_uid),
+                                            NsGid(st.st_gid),
+                                        )
+                                    };
+                                    let record = InodeRecord {
+                                        mode,
+                                        uid,
+                                        gid,
+                                        size: st.st_size as u64,
+                                        atime: (
+                                            st.st_atime,
+                                            carrick_portable::stat_atime_nsec(&st),
+                                        ),
+                                        mtime: (
+                                            st.st_mtime,
+                                            carrick_portable::stat_mtime_nsec(&st),
+                                        ),
+                                        ctime: (
+                                            st.st_ctime,
+                                            carrick_portable::stat_ctime_nsec(&st),
+                                        ),
+                                        nlink: st.st_nlink as u32,
+                                    };
+                                    self.inodes
+                                        .write()
+                                        .insert((st.st_dev as u64, st.st_ino), record);
+                                    Some(pos)
                                 } else {
                                     self.entries.write().remove(&(current_id, name.clone()));
                                     None
@@ -663,11 +753,7 @@ impl DentryCache {
             } else {
                 (NsUid(st.st_uid), NsGid(st.st_gid))
             };
-            let pos = PositiveDentry {
-                id: None,
-                kind: RootFsEntryKind::Symlink,
-                ino: st.st_ino,
-                dev: st.st_dev as u64,
+            let record = InodeRecord {
                 mode: st.st_mode as u32 & 0o7777,
                 uid,
                 gid,
@@ -676,6 +762,15 @@ impl DentryCache {
                 mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
                 ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
                 nlink: st.st_nlink as u32,
+            };
+            self.inodes
+                .write()
+                .insert((st.st_dev as u64, st.st_ino), record);
+            let pos = PositiveDentry {
+                id: None,
+                kind: RootFsEntryKind::Symlink,
+                ino: st.st_ino,
+                dev: st.st_dev as u64,
                 symlink_target: Some(target),
                 parent_gen: parent_dir_gen,
                 dir_gen: None,
@@ -733,11 +828,7 @@ impl DentryCache {
                     NsGid(st.st_gid),
                 )
             };
-            let pos = PositiveDentry {
-                id: Some(new_dir_id),
-                kind: RootFsEntryKind::Directory,
-                ino: st.st_ino,
-                dev: st.st_dev as u64,
+            let record = InodeRecord {
                 mode,
                 uid,
                 gid,
@@ -746,6 +837,15 @@ impl DentryCache {
                 mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
                 ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
                 nlink: st.st_nlink as u32,
+            };
+            self.inodes
+                .write()
+                .insert((st.st_dev as u64, st.st_ino), record);
+            let pos = PositiveDentry {
+                id: Some(new_dir_id),
+                kind: RootFsEntryKind::Directory,
+                ino: st.st_ino,
+                dev: st.st_dev as u64,
                 symlink_target: None,
                 parent_gen: parent_dir_gen,
                 dir_gen: Some(child_dir_gen),
@@ -784,11 +884,7 @@ impl DentryCache {
             };
             (kind, mode, NsUid(st.st_uid), NsGid(st.st_gid))
         };
-        let pos = PositiveDentry {
-            id: None,
-            kind,
-            ino: st.st_ino,
-            dev: st.st_dev as u64,
+        let record = InodeRecord {
             mode,
             uid,
             gid,
@@ -797,6 +893,15 @@ impl DentryCache {
             mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
             ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
             nlink: st.st_nlink as u32,
+        };
+        self.inodes
+            .write()
+            .insert((st.st_dev as u64, st.st_ino), record);
+        let pos = PositiveDentry {
+            id: None,
+            kind,
+            ino: st.st_ino,
+            dev: st.st_dev as u64,
             symlink_target: None,
             parent_gen: parent_dir_gen,
             dir_gen: None,
@@ -887,11 +992,7 @@ impl DentryCache {
             } else {
                 (None, None)
             };
-            let pos = PositiveDentry {
-                id: dir_id,
-                kind: rs.kind,
-                ino: rs.ino,
-                dev: 0,
+            let record = InodeRecord {
                 mode: rs.mode,
                 uid: rs.uid,
                 gid: rs.gid,
@@ -900,6 +1001,13 @@ impl DentryCache {
                 mtime: rs.mtime,
                 ctime: rs.ctime,
                 nlink: rs.nlink,
+            };
+            self.inodes.write().insert((0, rs.ino), record);
+            let pos = PositiveDentry {
+                id: dir_id,
+                kind: rs.kind,
+                ino: rs.ino,
+                dev: 0,
                 symlink_target,
                 parent_gen: parent_dir_gen,
                 dir_gen: child_dir_gen,
@@ -982,11 +1090,7 @@ impl DentryCache {
                 } else {
                     (None, None)
                 };
-                let pos = PositiveDentry {
-                    id: dir_id,
-                    kind: md.kind,
-                    ino,
-                    dev,
+                let record = InodeRecord {
                     mode,
                     uid,
                     gid,
@@ -995,6 +1099,13 @@ impl DentryCache {
                     mtime,
                     ctime,
                     nlink,
+                };
+                self.inodes.write().insert((dev, ino), record);
+                let pos = PositiveDentry {
+                    id: dir_id,
+                    kind: md.kind,
+                    ino,
+                    dev,
                     symlink_target,
                     parent_gen: parent_dir_gen,
                     dir_gen: child_dir_gen,
@@ -1050,7 +1161,20 @@ impl DentryCache {
         if requires_dir && resolved.dentry.kind != RootFsEntryKind::Directory {
             return Err(LINUX_ENOTDIR);
         }
-        Ok(resolved.dentry.to_real_stat())
+        let record = self.get_or_refresh_inode(&resolved, backend, rootfs)?;
+        let st = resolved.dentry.to_real_stat(&record);
+        if !self.is_shared {
+            let mut fp = self.fast_path.write();
+            let map = if effective_follow {
+                &mut fp.stat_follow
+            } else {
+                &mut fp.stat_nofollow
+            };
+            if map.len() < FAST_PATH_CAP {
+                map.insert(norm_path.to_string(), Ok(st));
+            }
+        }
+        Ok(st)
     }
 
     /// Readlink for `path` via the dentry cache.
@@ -1100,8 +1224,116 @@ impl DentryCache {
                 .unwrap_or(libc::ENOENT);
             return Err(crate::host_to_linux_errno(err));
         }
+        let record = self.get_or_refresh_inode(&resolved, backend, rootfs)?;
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        Ok((fd, resolved.dentry.to_real_stat(), resolved.canonical_path))
+        Ok((
+            fd,
+            resolved.dentry.to_real_stat(&record),
+            resolved.canonical_path,
+        ))
+    }
+
+    /// Get cached inode record or refresh it from disk/backend.
+    pub fn get_or_refresh_inode(
+        &self,
+        resolved: &ResolvedDentry,
+        backend: &dyn FsBackend,
+        rootfs: Option<&RootFs>,
+    ) -> Result<InodeRecord, LinuxErrno> {
+        let key = (resolved.dentry.dev, resolved.dentry.ino);
+        if let Some(record) = self.inodes.read().get(&key).copied() {
+            return Ok(record);
+        }
+        self.refresh_inode(resolved, backend, rootfs)
+    }
+
+    fn refresh_inode(
+        &self,
+        resolved: &ResolvedDentry,
+        backend: &dyn FsBackend,
+        rootfs: Option<&RootFs>,
+    ) -> Result<InodeRecord, LinuxErrno> {
+        let key = (resolved.dentry.dev, resolved.dentry.ino);
+
+        // 1. Try fstatat via parent_dir_fd if available
+        if let Some(parent_fd) = &resolved.parent_dir_fd {
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    parent_fd.as_raw_fd(),
+                    resolved.leaf_name_c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc == 0 {
+                let (mode, uid, gid) = if !backend.serves_plain_metadata() {
+                    if let Some(rs) = backend.real_stat(&resolved.canonical_path, false) {
+                        (rs.mode, rs.uid, rs.gid)
+                    } else {
+                        (
+                            st.st_mode as u32 & 0o7777,
+                            NsUid(st.st_uid),
+                            NsGid(st.st_gid),
+                        )
+                    }
+                } else {
+                    (
+                        st.st_mode as u32 & 0o7777,
+                        NsUid(st.st_uid),
+                        NsGid(st.st_gid),
+                    )
+                };
+                let record = InodeRecord {
+                    mode,
+                    uid,
+                    gid,
+                    size: st.st_size as u64,
+                    atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
+                    mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
+                    ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
+                    nlink: st.st_nlink as u32,
+                };
+                self.inodes.write().insert(key, record);
+                return Ok(record);
+            }
+        }
+
+        // 2. Try backend real_stat
+        if let Some(rs) = backend.real_stat(&resolved.canonical_path, false) {
+            let record = InodeRecord {
+                mode: rs.mode,
+                uid: rs.uid,
+                gid: rs.gid,
+                size: rs.size,
+                atime: rs.atime,
+                mtime: rs.mtime,
+                ctime: rs.ctime,
+                nlink: rs.nlink,
+            };
+            self.inodes.write().insert(key, record);
+            return Ok(record);
+        }
+
+        // 3. Try rootfs
+        if let Some(rf) = rootfs {
+            if let Some(rs) = rf.immutable_real_stat(&resolved.canonical_path, false) {
+                let record = InodeRecord {
+                    mode: rs.mode,
+                    uid: rs.uid,
+                    gid: rs.gid,
+                    size: rs.size,
+                    atime: rs.atime,
+                    mtime: rs.mtime,
+                    ctime: rs.ctime,
+                    nlink: rs.nlink,
+                };
+                self.inodes.write().insert(key, record);
+                return Ok(record);
+            }
+        }
+
+        Err(LINUX_ENOENT)
     }
 
     fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
@@ -1132,7 +1364,11 @@ impl DentryCache {
         if let Some((parent_path, name)) = Self::split_parent_and_name(path)
             && let Some(parent_id) = self.find_parent_dir_id(parent_path)
         {
-            self.entries.write().remove(&(parent_id, name.to_string()));
+            let mut entries = self.entries.write();
+            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
+            {
+                self.inodes.write().remove(&(pos.dev, pos.ino));
+            }
         }
     }
 
@@ -1143,7 +1379,10 @@ impl DentryCache {
             && let Some(parent_id) = self.find_parent_dir_id(parent_path)
         {
             let mut entries = self.entries.write();
-            entries.remove(&(parent_id, name.to_string()));
+            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
+            {
+                self.inodes.write().remove(&(pos.dev, pos.ino));
+            }
             if !self.is_shared {
                 let dirs = self.dirs.read();
                 if let Some(d) = dirs.get(&parent_id) {
@@ -1175,7 +1414,10 @@ impl DentryCache {
                 }
             }
             let mut entries = self.entries.write();
-            entries.remove(&(parent_id, name.to_string()));
+            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
+            {
+                self.inodes.write().remove(&(pos.dev, pos.ino));
+            }
             if !self.is_shared {
                 let dirs = self.dirs.read();
                 if let Some(d) = dirs.get(&parent_id) {
@@ -1185,6 +1427,31 @@ impl DentryCache {
                         DentryNode::Negative(NegativeDentry { parent_gen }),
                     );
                 }
+            }
+        }
+    }
+
+    /// Invalidate the cached inode record for `(dev, ino)`.
+    pub fn invalidate_inode(&self, dev: u64, ino: u64) {
+        self.bump_mutation();
+        self.inodes.write().remove(&(dev, ino));
+    }
+
+    /// Update the cached inode record in place (e.g. for in-memory file mutations).
+    pub fn update_inode(&self, dev: u64, ino: u64, record: InodeRecord) {
+        self.bump_mutation();
+        self.inodes.write().insert((dev, ino), record);
+    }
+
+    /// Invalidate the inode record corresponding to `path` while retaining dentry structure.
+    pub fn invalidate_path_inode(&self, path: &str) {
+        self.bump_mutation();
+        if let Some((parent_path, name)) = Self::split_parent_and_name(path)
+            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
+        {
+            let entries = self.entries.read();
+            if let Some(DentryNode::Positive(pos)) = entries.get(&(parent_id, name.to_string())) {
+                self.inodes.write().remove(&(pos.dev, pos.ino));
             }
         }
     }
@@ -1446,5 +1713,72 @@ mod tests {
         assert_eq!(path_deep, "/usr/local/bin/python3.12");
         assert_eq!(st_deep.size, 9);
         drop(fd_deep);
+    }
+
+    #[test]
+    fn test_dentry_cache_inode_invalidation_and_hard_links() {
+        let tmp = tempdir().unwrap();
+        let upper_dir =
+            cap_std::fs::Dir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap();
+        let backend = HostFsBackend::from_existing_dir(upper_dir);
+        let cache = DentryCache::new(false);
+
+        // 1. Create file with 5 bytes
+        let file_path = tmp.path().join("foo.txt");
+        fs::write(&file_path, b"hello").unwrap();
+
+        let st1 = cache
+            .stat("/foo.txt", true, &backend, None)
+            .expect("stat foo.txt");
+        assert_eq!(st1.size, 5);
+        assert_eq!(st1.nlink, 1);
+
+        use std::os::unix::fs::MetadataExt;
+        let meta1 = fs::metadata(&file_path).unwrap();
+
+        // 2. Invalidate inode, simulate fd-based write of 6 more bytes (total 11)
+        cache.invalidate_inode(meta1.dev(), meta1.ino());
+        fs::write(&file_path, b"hello world").unwrap();
+
+        let st2 = cache
+            .stat("/foo.txt", true, &backend, None)
+            .expect("stat foo.txt after fd write");
+        assert_eq!(st2.size, 11);
+        assert_eq!(st2.ino, st1.ino);
+
+        // 3. Hard link: link /foo.txt -> /ln.txt
+        let link_path = tmp.path().join("ln.txt");
+        fs::hard_link(&file_path, &link_path).unwrap();
+        cache.notify_create("/ln.txt");
+        cache.invalidate_path_inode("/foo.txt");
+
+        // Both /foo.txt and /ln.txt must observe nlink == 2 and size == 11
+        let st_foo = cache
+            .stat("/foo.txt", true, &backend, None)
+            .expect("stat foo after link");
+        assert_eq!(st_foo.nlink, 2);
+        assert_eq!(st_foo.size, 11);
+
+        let st_ln = cache
+            .stat("/ln.txt", true, &backend, None)
+            .expect("stat ln after link");
+        assert_eq!(st_ln.nlink, 2);
+        assert_eq!(st_ln.size, 11);
+        assert_eq!(st_ln.ino, st_foo.ino);
+
+        // 4. Invalidate inode, write 3 bytes to file via hard link
+        cache.invalidate_inode(meta1.dev(), meta1.ino());
+        fs::write(&link_path, b"abc").unwrap();
+
+        // Both aliases must observe the updated size 3
+        let st_ln2 = cache
+            .stat("/ln.txt", true, &backend, None)
+            .expect("stat ln after write");
+        assert_eq!(st_ln2.size, 3);
+
+        let st_foo2 = cache
+            .stat("/foo.txt", true, &backend, None)
+            .expect("stat foo after write to ln");
+        assert_eq!(st_foo2.size, 3);
     }
 }

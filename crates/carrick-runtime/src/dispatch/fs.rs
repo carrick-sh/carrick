@@ -1571,6 +1571,17 @@ enum FicloneFs {
 }
 
 impl SyscallDispatcher {
+    #[inline]
+    pub(crate) fn invalidate_dentry_host_fd(&self, raw_fd: i32) {
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+            self.fs
+                .rootfs_vfs
+                .dentry_cache
+                .invalidate_inode(st.st_dev as u64, st.st_ino as u64);
+        }
+    }
+
     fn record_fd_open_path(&self, fd: i32, path: String) {
         #[cfg(test)]
         FD_OPEN_PATH_INSERTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2611,6 +2622,7 @@ impl SyscallDispatcher {
                                         use std::os::fd::AsRawFd;
                                         unsafe { libc::ftruncate(owned.as_raw_fd(), 0) };
                                         new_metadata.size = 0;
+                                        self.invalidate_dentry_host_fd(owned.as_raw_fd());
                                     }
                                     let new_desc = OpenDescription::File {
                                         base: OpenDescriptionBase::new(0),
@@ -3236,6 +3248,10 @@ impl SyscallDispatcher {
                 writable,
             }) => {
                 debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
+                if want_trunc {
+                    self.invalidate_dentry_host_fd(host_fd);
+                    self.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
+                }
                 OpenDescription::HostFile {
                     host_fd: HostFdRef::new(host_fd),
                     metadata,
@@ -3329,6 +3345,7 @@ impl SyscallDispatcher {
                     self.fs.rootfs_vfs.dentry_cache.notify_create(&path);
                     if want_trunc {
                         self.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
+                        self.invalidate_dentry_host_fd(host_fd);
                     }
                     debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
                     // A backend that created with the host umask (or could not
@@ -6940,6 +6957,7 @@ impl SyscallDispatcher {
                     if !p.is_empty() && !p.starts_with("/__carrick_") {
                         self.fs.rootfs_vfs.dentry_cache.invalidate_path(&p);
                     }
+                    self.invalidate_dentry_host_fd(host_fd.raw());
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
@@ -7789,16 +7807,22 @@ impl SyscallDispatcher {
         uid: Option<carrick_abi::NsUid>,
         gid: Option<carrick_abi::NsGid>,
     ) -> DispatchOutcome {
-        let path = self
+        let (path, raw_host_fd) = self
             .open_file(fd)
             .and_then(|of| match of.description.read().as_deref() {
+                Some(OpenDescription::HostFile {
+                    metadata, host_fd, ..
+                }) => Some((
+                    Some(metadata.path.to_string_lossy().into_owned()),
+                    Some(host_fd.raw()),
+                )),
                 Some(
-                    OpenDescription::HostFile { metadata, .. }
-                    | OpenDescription::File { metadata, .. }
+                    OpenDescription::File { metadata, .. }
                     | OpenDescription::Directory { metadata, .. },
-                ) => Some(metadata.path.to_string_lossy().into_owned()),
+                ) => Some((Some(metadata.path.to_string_lossy().into_owned()), None)),
                 _ => None,
-            });
+            })
+            .unwrap_or((None, None));
         if let Some(path) = path {
             if let Some(errno) = self.chown_permission_errno(uid, gid) {
                 return DispatchOutcome::errno(errno);
@@ -7813,6 +7837,9 @@ impl SyscallDispatcher {
             }
             self.clear_setid_on_chown(&path);
             self.dnotify_attrib(context, &path);
+        }
+        if let Some(raw_fd) = raw_host_fd {
+            self.invalidate_dentry_host_fd(raw_fd);
         }
         DispatchOutcome::Returned { value: 0 }
     }
@@ -10225,14 +10252,16 @@ impl SyscallDispatcher {
                             {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
-                            if new_size > st.st_size as u64
-                                && let Err(errno) = (unsafe {
+                            if new_size > st.st_size as u64 {
+                                if let Err(errno) = (unsafe {
                                     libc::ftruncate(host_fd.raw(), new_size as libc::off_t)
                                 })
                                 .host_syscall_errno()
                                 {
                                     return Ok(DispatchOutcome::errno(errno));
                                 }
+                                this.invalidate_dentry_host_fd(host_fd.raw());
+                            }
                         }
                         writeback = None;
                         outcome = DispatchOutcome::Returned { value: 0 };
@@ -10241,6 +10270,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EROFS));
                     }
                     OpenDescription::InMemoryFile {
+                        path,
                         contents,
                         writable,
                         max_size,
@@ -10255,6 +10285,7 @@ impl SyscallDispatcher {
                         let mut data = contents.write();
                         if (new_size as usize) > data.len() {
                             data.resize(new_size as usize, 0);
+                            this.fs.rootfs_vfs.dentry_cache.invalidate_path(path);
                         }
                         writeback = None;
                         outcome = DispatchOutcome::Returned { value: 0 };
@@ -10273,6 +10304,7 @@ impl SyscallDispatcher {
                     .rootfs_vfs
                     .overlay
                     .set_file_contents(&path, contents);
+                this.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
             }
             Ok(outcome)
 
@@ -10347,6 +10379,7 @@ impl SyscallDispatcher {
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
                     OpenDescription::InMemoryFile {
+                        path,
                         contents,
                         offset,
                         writable,
@@ -10369,6 +10402,7 @@ impl SyscallDispatcher {
                                 *offset = new_len;
                             }
                         }
+                        this.fs.rootfs_vfs.dentry_cache.invalidate_path(path);
                         writeback = None;
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
@@ -10387,6 +10421,7 @@ impl SyscallDispatcher {
                         {
                             return Ok(DispatchOutcome::errno(errno));
                         }
+                        this.invalidate_dentry_host_fd(host_fd.raw());
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     OpenDescription::SyntheticFile { .. } => {
@@ -10406,6 +10441,7 @@ impl SyscallDispatcher {
                     .rootfs_vfs
                     .overlay
                     .set_file_contents(&path, contents);
+                this.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
             }
             Ok(outcome)
 
@@ -12168,6 +12204,9 @@ impl SyscallDispatcher {
                     }
                 };
                 let n = n.host_syscall_errno()?;
+                if n > 0 {
+                    this.invalidate_dentry_host_fd(host_fd.raw());
+                }
                 return Ok(DispatchOutcome::Returned { value: n as i64 });
             }
             // In-memory File (memfd / O_TMPFILE fallback): positional write into
@@ -12180,6 +12219,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 if let OpenDescription::InMemoryFile {
+                    path,
                     contents,
                     writable,
                     max_size,
@@ -12206,6 +12246,7 @@ impl SyscallDispatcher {
                         data.resize(end, 0);
                     }
                     data[write_at..end].copy_from_slice(&bytes);
+                    this.fs.rootfs_vfs.dentry_cache.invalidate_path(path);
                     return Ok(DispatchOutcome::Returned {
                         value: bytes.len() as i64,
                     });
@@ -12247,6 +12288,7 @@ impl SyscallDispatcher {
                             .rootfs_vfs
                             .overlay
                             .write_file_range(&path, write_at, &bytes, final_size);
+                        this.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
                     }
                     return Ok(DispatchOutcome::Returned {
                         value: bytes.len() as i64,
@@ -12485,6 +12527,9 @@ impl SyscallDispatcher {
                     };
                     restore_offset(saved_offset);
                     let n = n.host_syscall_errno()?;
+                    if n > 0 {
+                        this.invalidate_dentry_host_fd(hfd);
+                    }
                     return Ok(DispatchOutcome::Returned { value: n as i64 });
                 }
                 let mut total = 0i64;
@@ -12516,6 +12561,9 @@ impl SyscallDispatcher {
                     }
                 }
                 restore_offset(saved_offset);
+                if total > 0 {
+                    this.invalidate_dentry_host_fd(hfd);
+                }
                 return Ok(DispatchOutcome::Returned { value: total });
             }
             let errno = match &*open {
@@ -14432,7 +14480,7 @@ impl SyscallDispatcher {
                             }
                             // libc::write to the real fd: advances the
                             // kernel offset and is visible across fork.
-                            return Ok(write_host_pipe_owned(
+                            let out = write_host_pipe_owned(
                                 bytes,
                                 HostPipeWriteTarget {
                                     host_fd: host_fd.raw(),
@@ -14447,9 +14495,14 @@ impl SyscallDispatcher {
                                         .map(WaitFdAuthority::logical)
                                         .unwrap_or_else(|| std::process::abort()),
                                 },
-                            ));
+                            );
+                            if let DispatchOutcome::Returned { value } = out && value > 0 {
+                                this.invalidate_dentry_host_fd(host_fd.raw());
+                            }
+                            return Ok(out);
                         }
                         OpenDescription::InMemoryFile {
+                            path,
                             contents,
                             offset,
                             writable,
@@ -14485,6 +14538,7 @@ impl SyscallDispatcher {
                             }
                             data[write_offset..end].copy_from_slice(&bytes);
                             *offset = end;
+                            this.fs.rootfs_vfs.dentry_cache.invalidate_path(path);
                             outcome = DispatchOutcome::Returned {
                                 value: bytes.len() as i64,
                             };
@@ -14634,6 +14688,7 @@ impl SyscallDispatcher {
                         .rootfs_vfs
                         .overlay
                         .write_file_range(&path, offset, &bytes, final_size);
+                    this.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
                 }
                 return Ok(outcome);
             }
@@ -14776,6 +14831,9 @@ impl SyscallDispatcher {
                             .unwrap_or_else(|| std::process::abort()),
                     },
                 );
+                if let DispatchOutcome::Returned { value } = outcome && value > 0 {
+                    this.invalidate_dentry_host_fd(target.host_fd);
+                }
                 return if target.sigpipe_on_epipe {
                     Ok(this.raise_sigpipe_on_epipe(cx, outcome))
                 } else {
@@ -15008,9 +15066,13 @@ impl SyscallDispatcher {
                                             .unwrap_or_else(|| std::process::abort()),
                                     },
                                 );
+                                if let DispatchOutcome::Returned { value } = outcome && value > 0 {
+                                    this.invalidate_dentry_host_fd(host_fd.raw());
+                                }
                                 writeback = None;
                             }
                             OpenDescription::InMemoryFile {
+                                path,
                                 contents,
                                 offset,
                                 writable,
@@ -15042,6 +15104,7 @@ impl SyscallDispatcher {
                                 }
                                 data[write_offset..end].copy_from_slice(&bytes);
                                 *offset = end;
+                                this.fs.rootfs_vfs.dentry_cache.invalidate_path(path);
                                 outcome = DispatchOutcome::Returned {
                                     value: bytes.len() as i64,
                                 };
@@ -15099,6 +15162,7 @@ impl SyscallDispatcher {
                             .rootfs_vfs
                             .overlay
                             .write_file_range(&path, offset, &bytes, final_size);
+                        this.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
                     }
                     let DispatchOutcome::Returned { value } = outcome else {
                         // EAGAIN/EPIPE on this iovec. writev(2) is atomic across
@@ -15981,6 +16045,10 @@ impl SyscallDispatcher {
                         .rootfs_vfs
                         .dentry_cache
                         .notify_create(&resolved_new);
+                    this.fs
+                        .rootfs_vfs
+                        .dentry_cache
+                        .invalidate_path_inode(&src);
                     this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -16011,6 +16079,10 @@ impl SyscallDispatcher {
                                 .rootfs_vfs
                                 .dentry_cache
                                 .notify_create(&resolved_new);
+                            this.fs
+                                .rootfs_vfs
+                                .dentry_cache
+                                .invalidate_path_inode(&src);
                             this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
                             Ok(DispatchOutcome::Returned { value: 0 })
                         }
