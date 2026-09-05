@@ -2299,6 +2299,22 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn frame_pool_provider_and_stub_keep_two_scalar_shape() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__frame__pool__hit(_: u32, _: u64) {}",
+            "fn hvpatch__frame__pool__miss(_: u32, _: u64) {}",
+            "stub!(hvpatch_frame_pool_hit(site: u32, ipa: u64));",
+            "stub!(hvpatch_frame_pool_miss(site: u32, ipa: u64));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing frame pool ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
     fn exec_backing_provider_and_stub_keep_the_same_typed_shape() {
         let source = include_str!("probes.rs");
         for declaration in [
@@ -4837,6 +4853,12 @@ mod real {
         /// Byte-copy authentication computed only when this probe is enabled.
         /// Args: old FrameId/IPA, source/destination FNV-1a, exact byte length.
         fn hvpatch__frame__cow__copy(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// HVPatch frame pool allocation hit.
+        /// Args: site (0 = COW, 1 = sparse mmap), allocated physical IPA.
+        fn hvpatch__frame__pool__hit(_: u32, _: u64) {}
+        /// HVPatch frame pool allocation miss (fallback taken).
+        /// Args: site (0 = COW, 1 = sparse mmap), target physical IPA.
+        fn hvpatch__frame__pool__miss(_: u32, _: u64) {}
         /// Fork-time shared-frame identity: child PID, forking TID, child mm,
         /// child ASID, and sharing kind (0=private COW, 1=Linux shared).
         fn hvpatch__fork__frame__identity(_: i32, _: i32, _: u64, _: u32, _: u32) {}
@@ -6051,6 +6073,16 @@ mod real {
             fnv1a(dest),
             source.len() as u64
         ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_frame_pool_hit(site: u32, ipa: u64) {
+        carrick_usdt::hvpatch__frame__pool__hit!(|| (site, ipa));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_frame_pool_miss(site: u32, ipa: u64) {
+        carrick_usdt::hvpatch__frame__pool__miss!(|| (site, ipa));
     }
 
     #[inline(never)]
@@ -7884,6 +7916,8 @@ mod stub {
     stub!(hvpatch_frame_cow(event: super::HvpatchFrameCow));
     stub!(hvpatch_frame_cow_trigger(event: super::HvpatchFrameCowTrigger));
     stub!(hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]));
+    stub!(hvpatch_frame_pool_hit(site: u32, ipa: u64));
+    stub!(hvpatch_frame_pool_miss(site: u32, ipa: u64));
     stub!(hvpatch_fork_frame_share(event: super::HvpatchForkFrameShare));
     stub!(hvpatch_global_frame_stage2(event: super::HvpatchGlobalFrameStage2));
     stub!(hvpatch_global_frame_owner_miss(ipa: u64, length: u64, host_addr: u64, owner_host_addr: u64));

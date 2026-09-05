@@ -1562,6 +1562,22 @@
       "rationale": "Test-only fixture or lock platform::run::CARRICK_SOURCE_COMMIT in crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs scoped strictly to test harness execution."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/frame_pool.rs",
+      "symbol": "frame_pool_size::CARRICK_FRAME_POOL_SIZE",
+      "fingerprint": "a24e83c0a15cc888cda027755071c3d8e4cee630f04253ed01b1eafb8231c584",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FRAME_POOL_SIZE read in frame_pool_size::CARRICK_FRAME_POOL_SIZE (crates/carrick-vmm-hvf/src/frame_pool.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/frame_pool.rs",
+      "symbol": "is_frame_pool_enabled::CARRICK_FRAME_POOL",
+      "fingerprint": "d5c3d5f992514057789610065cffe5cc61e6853bf4559332b533fa1303057231",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FRAME_POOL read in is_frame_pool_enabled::CARRICK_FRAME_POOL (crates/carrick-vmm-hvf/src/frame_pool.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
       "symbol": "INSTALLED",

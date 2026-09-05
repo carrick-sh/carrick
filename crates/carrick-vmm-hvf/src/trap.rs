@@ -13393,8 +13393,32 @@ impl GlobalFrameOwnerEntry {
 /// after another thread completed the final `munmap`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
+pub(crate) enum GlobalFrameBacking {
+    Owned(crate::host_mapping::OwnedHostMapping),
+    Pooled(crate::frame_pool::PooledFrameHandle),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GlobalFrameBacking {
+    pub(crate) fn as_ptr(&self) -> *mut u8 {
+        match self {
+            Self::Owned(mapping) => mapping.as_ptr(),
+            Self::Pooled(handle) => handle.as_mut_ptr(),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Owned(mapping) => mapping.len(),
+            Self::Pooled(handle) => handle.len(),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
 struct GlobalFrameSharedMapping {
-    mapping: crate::host_mapping::OwnedHostMapping,
+    backing: GlobalFrameBacking,
     logical_pin_count: parking_lot::Mutex<u64>,
 }
 
@@ -13402,7 +13426,14 @@ struct GlobalFrameSharedMapping {
 impl GlobalFrameSharedMapping {
     fn new(mapping: crate::host_mapping::OwnedHostMapping) -> Self {
         Self {
-            mapping,
+            backing: GlobalFrameBacking::Owned(mapping),
+            logical_pin_count: parking_lot::Mutex::new(0),
+        }
+    }
+
+    fn from_pooled(handle: crate::frame_pool::PooledFrameHandle) -> Self {
+        Self {
+            backing: GlobalFrameBacking::Pooled(handle),
             logical_pin_count: parking_lot::Mutex::new(0),
         }
     }
@@ -13515,7 +13546,7 @@ impl GlobalFrameHostOwner {
     }
 
     pub(crate) fn host_addr(&self) -> usize {
-        self.mapping.mapping.as_ptr() as usize
+        self.mapping.backing.as_ptr() as usize
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -13530,7 +13561,7 @@ impl GlobalFrameHostOwner {
     }
 
     pub(crate) fn length(&self) -> u64 {
-        self.mapping.mapping.len() as u64
+        self.mapping.backing.len() as u64
     }
 
     pub(crate) fn perms(&self) -> u64 {
@@ -13538,7 +13569,7 @@ impl GlobalFrameHostOwner {
     }
 
     pub(crate) fn ptr(&self) -> *mut u8 {
-        self.mapping.mapping.as_ptr()
+        self.mapping.backing.as_ptr()
     }
 
     pub(crate) fn as_ptr(&self) -> *mut u8 {
@@ -13546,7 +13577,7 @@ impl GlobalFrameHostOwner {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.mapping.mapping.len()
+        self.mapping.backing.len()
     }
 
     #[allow(dead_code)]
@@ -14195,6 +14226,79 @@ fn register_global_frame_host_owner_in_using(
     Ok(generation)
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn register_pooled_global_frame_host_owner_in(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    handle: crate::frame_pool::PooledFrameHandle,
+    perms: u64,
+) -> Result<u64, TrapError> {
+    let key = (handle.ipa(), handle.len() as u64);
+    let host_addr = handle.as_mut_ptr() as usize;
+    let vm_generation = custody.setup_generation().ok_or_else(|| {
+        TrapError::Hypervisor(
+            "pooled global frame owner registration has no creating/live carrier VM".to_owned(),
+        )
+    })?;
+    let logical_owner = custody.allocate_logical_owner().map_err(|error| {
+        TrapError::Hypervisor(format!(
+            "allocate carrier-local global frame owner identity: {error:?}"
+        ))
+    })?;
+    let record_identity = custody
+        .register_stage2_record(CarrierStage2RecordSpec {
+            vm_generation,
+            ipa: key.0,
+            len: handle.len(),
+            host_addr,
+            mapped: true,
+            backend_map_installed: false,
+            release_ipa: false,
+            perms,
+            logical_owner: Some(logical_owner),
+        })
+        .map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "register pooled global frame record into carrier custody: {error:?}"
+            ))
+        })?;
+    let generation = record_identity
+        .logical_owner
+        .map_or(0, |owner| owner.generation);
+    let owner = std::sync::Arc::new(GlobalFrameHostOwner::from_record(
+        std::sync::Arc::new(GlobalFrameSharedMapping::from_pooled(handle)),
+        std::sync::Arc::clone(custody),
+        record_identity,
+    ));
+    let mut owners = custody.global_frame_host_owners.lock();
+    if owners.contains_key(&key) {
+        drop(owners);
+        let outcome =
+            custody.retire_stage2_record_using(record_identity, unmap_global_frame_stage2_record);
+        match outcome {
+            CarrierStage2RetireOutcome::RetiredUnmapped
+            | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                if finalize_global_frame_owner_record(custody, &owner).is_err() {
+                    retain_pending_global_frame_owner(custody, owner);
+                }
+            }
+            CarrierStage2RetireOutcome::DeferredActivePins
+            | CarrierStage2RetireOutcome::RetryPending(_)
+            | CarrierStage2RetireOutcome::NotFound
+            | CarrierStage2RetireOutcome::OwnerIdentityMismatch
+            | CarrierStage2RetireOutcome::OwnerGenerationMismatch
+            | CarrierStage2RetireOutcome::VmGenerationMismatch => {
+                retain_pending_global_frame_owner(custody, owner);
+            }
+        }
+        return Err(TrapError::Hypervisor(format!(
+            "pooled global frame host owner collision at IPA 0x{:x} size {}",
+            key.0, key.1
+        )));
+    }
+    owners.insert(key, GlobalFrameOwnerEntry::Live(owner));
+    Ok(generation)
+}
+
 /// Publish the host backing owner for a prepared exec mapping and stamp its
 /// live generation directly onto the region state.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -14405,11 +14509,11 @@ impl StructuralBackingOwner {
     }
 
     pub(crate) fn ptr(&self) -> *mut u8 {
-        self.retained.mapping.mapping.as_ptr()
+        self.retained.mapping.backing.as_ptr()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.retained.mapping.mapping.len()
+        self.retained.mapping.backing.len()
     }
 
     pub(crate) fn epoch(&self) -> StructuralEpoch {
@@ -18477,6 +18581,7 @@ impl PendingCarrierVmCreation {
             });
         }
         record_vm_resident();
+        let _ = self.custody.frame_pool();
         // `CARRIER_VM_LIVE` is published by `create_vm_with_admission` now, at
         // the moment the VM actually exists; publishing it here left a window
         // in which a VM was live but `carrier_vm_live()` still said no.
@@ -19239,14 +19344,14 @@ struct CowArmedSpan {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Debug, Default)]
-struct CowArmedRanges {
+pub(crate) struct CowArmedRanges {
     ranges: Vec<carrick_aarch64::vmm::ForkCowRange>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CowArmedRanges {
-    const COMPOUND_SIZE: u64 = 16 * 1024;
-    const PAGE_SIZE: u64 = 4 * 1024;
+    pub(crate) const COMPOUND_SIZE: u64 = 16 * 1024;
+    pub(crate) const PAGE_SIZE: u64 = 4 * 1024;
 
     fn arm(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
         self.ranges.extend_from_slice(ranges);
@@ -20078,6 +20183,16 @@ pub(crate) struct CarrierVmCustody {
         parking_lot::Mutex<PendingGlobalFrameRetirementQueue<((u64, u64), u64)>>,
     pending_global_frame_detached_retries:
         parking_lot::Mutex<PendingGlobalFrameRetirementQueue<CarrierStage2RecordId>>,
+    frame_pool: parking_lot::Mutex<CarrierFramePoolState>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) enum CarrierFramePoolState {
+    #[default]
+    Uninitialized,
+    Active(std::sync::Arc<crate::frame_pool::PreMappedFramePool>),
+    Failed,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -20114,6 +20229,7 @@ impl CarrierVmCustody {
             pending_global_frame_detached_retries: parking_lot::Mutex::new(
                 PendingGlobalFrameRetirementQueue::default(),
             ),
+            frame_pool: parking_lot::Mutex::new(CarrierFramePoolState::Uninitialized),
         }
     }
 
@@ -20293,6 +20409,12 @@ impl CarrierVmCustody {
                     record.snapshot.terminalized_by_vm_destroy = true;
                     record.unmap_in_flight = false;
                 }
+                if let CarrierFramePoolState::Active(pool) = std::mem::replace(
+                    &mut *self.frame_pool.lock(),
+                    CarrierFramePoolState::Uninitialized,
+                ) {
+                    pool.forget_backend_mapping();
+                }
                 state.lifecycle = CarrierVmLifecycle::Vacant;
                 Ok(())
             }
@@ -20303,6 +20425,57 @@ impl CarrierVmCustody {
                 Err(CarrierVmCustodyError::LifecycleConflict)
             }
         }
+    }
+
+    pub(crate) fn frame_pool(
+        &self,
+    ) -> Option<std::sync::Arc<crate::frame_pool::PreMappedFramePool>> {
+        if !crate::frame_pool::is_frame_pool_enabled() {
+            return None;
+        }
+        // Lock hierarchy: always read state lifecycle first without holding frame_pool,
+        // so commit_destroy (which takes state then frame_pool) never deadlocks with us.
+        let state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Creating(_) | CarrierVmLifecycle::Live(_) => drop(state),
+            _ => return None,
+        }
+        let mut guard = self.frame_pool.lock();
+        match &*guard {
+            CarrierFramePoolState::Active(pool) => Some(std::sync::Arc::clone(pool)),
+            CarrierFramePoolState::Failed => None,
+            CarrierFramePoolState::Uninitialized => {
+                match crate::frame_pool::PreMappedFramePool::try_new() {
+                    Ok(pool) => {
+                        let pool = std::sync::Arc::new(pool);
+                        *guard = CarrierFramePoolState::Active(std::sync::Arc::clone(&pool));
+                        Some(pool)
+                    }
+                    Err(error) => {
+                        *guard = CarrierFramePoolState::Failed;
+                        eprintln!(
+                            "carrick: frame pool unavailable: {error}; COW/sparse faults use per-fault mappings"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn is_pooled_ipa(&self, ipa: u64) -> bool {
+        match &*self.frame_pool.lock() {
+            CarrierFramePoolState::Active(pool) => pool.contains_ipa(ipa),
+            CarrierFramePoolState::Uninitialized | CarrierFramePoolState::Failed => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_frame_pool(
+        &self,
+        pool: std::sync::Arc<crate::frame_pool::PreMappedFramePool>,
+    ) {
+        *self.frame_pool.lock() = CarrierFramePoolState::Active(pool);
     }
 
     pub(crate) fn live_generation(&self) -> Option<CarrierVmGeneration> {
@@ -22707,6 +22880,35 @@ mod carrier_vm_custody_tests {
                 custody.begin_create().is_ok(),
                 "{stage} did not restore Vacant"
             );
+        }
+    }
+
+    #[test]
+    fn frame_pool_and_commit_destroy_concurrent_lock_order() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        for _ in 0..50 {
+            let (custody, generation) = live_custody();
+            let fixture_pool = Arc::new(crate::frame_pool::PreMappedFramePool::new_test_fixture(4));
+            custody.install_frame_pool(fixture_pool);
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_worker = Arc::clone(&stop);
+            let custody_worker = Arc::clone(&custody);
+
+            let worker = thread::spawn(move || {
+                while !stop_worker.load(Ordering::Acquire) {
+                    let _ = custody_worker.frame_pool();
+                }
+            });
+
+            custody.begin_destroy(generation).expect("begin destroy");
+            custody.commit_destroy(generation).expect("commit destroy");
+
+            stop.store(true, Ordering::Release);
+            worker.join().expect("worker thread join without deadlock");
         }
     }
 
@@ -28786,7 +28988,7 @@ pub(crate) struct GlobalFrameStage2Lease {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl GlobalFrameStage2Lease {
-    fn reserve(length: u64, alignment: u64) -> Result<Self, TrapError> {
+    pub(crate) fn reserve(length: u64, alignment: u64) -> Result<Self, TrapError> {
         let length = align_up(length, CowArmedRanges::COMPOUND_SIZE)?;
         Ok(Self {
             base: reserve_global_frame_ipa_aligned(length, alignment)?,
@@ -28799,6 +29001,15 @@ impl GlobalFrameStage2Lease {
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
             backend_map_installed: false,
         })
+    }
+
+    pub(crate) fn base(&self) -> u64 {
+        self.base
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn length(&self) -> u64 {
+        self.length
     }
 
     fn fixed(base: u64, length: u64) -> Self {
@@ -28815,7 +29026,7 @@ impl GlobalFrameStage2Lease {
         }
     }
 
-    fn mark_mapped(&mut self) {
+    pub(crate) fn mark_mapped(&mut self) {
         self.mapped = true;
         #[cfg(any(test, feature = "foreign-cow-test-support"))]
         {
@@ -28839,7 +29050,7 @@ impl GlobalFrameStage2Lease {
     /// destroy takes the whole VM's stage-2 with it, so that call would fail
     /// against a destroyed VM. The IPA reservation is still this lease's to
     /// release, which `Drop` then does.
-    fn forget_backend_mapping(&mut self) {
+    pub(crate) fn forget_backend_mapping(&mut self) {
         self.mapped = false;
         #[cfg(any(test, feature = "foreign-cow-test-support"))]
         {
@@ -34222,6 +34433,9 @@ impl HvfVmState {
         {
             return Ok(());
         }
+        if custody.is_pooled_ipa(ipa) {
+            return Ok(());
+        }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
         let rc = unsafe { inventory_hv_vm_unmap(ipa, size) };
         if rc != 0 {
@@ -37240,99 +37454,156 @@ impl HvfVmState {
         )?;
         let physical_size =
             usize::try_from(physical_len).map_err(|_| TrapError::MappingTooLarge(physical_len))?;
-        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-            physical_size,
-            crate::host_mapping::HostMappingKind::PrivateAnon,
-        )
-        .map_err(|error| {
-            TrapError::Hypervisor(format!("allocate sparse HVPatch mmap backing: {error}"))
-        })?;
-        let physical_host = host_mapping.as_ptr();
-        let semantic_host = unsafe { physical_host.add(physical_offset as usize) };
-        // A file view replaces whole 16 KiB host pages of the anonymous
-        // backing with a read-only page-cache view BEFORE stage-2 sees the
-        // range: the physical host bytes under a live `hv_vm_map` are never
-        // remapped. Congruence (`start ≡ offset mod 16 KiB`, enforced by the
-        // driver) makes the host page containing `start` the host page
-        // containing the file page at `offset`.
-        let (stage2_perms, inventory_backing, page_granular_arm) = match backing {
-            SparseExtentBacking::Anon => (
-                applevisor::memory::MemPerms::ReadWriteExec,
-                Self::private_backing_identity(),
-                false,
-            ),
-            SparseExtentBacking::FileView {
-                fd,
-                offset,
-                view_len,
-            } => {
-                let delta = start & (HVF_PAGE_SIZE - 1);
-                if offset & (HVF_PAGE_SIZE - 1) != delta {
-                    return Err(TrapError::Hypervisor(format!(
-                        "private file view VA 0x{start:x} not congruent with offset 0x{offset:x}"
-                    )));
-                }
-                let host_at = physical_offset - delta;
-                let view_len = view_len.min(end - start);
-                let view_host_len =
-                    align_up(delta + view_len, HVF_PAGE_SIZE)?.min(physical_len - host_at);
-                let view_host_size = usize::try_from(view_host_len)
-                    .map_err(|_| TrapError::MappingTooLarge(view_host_len))?;
-                let file_offset = libc::off_t::try_from(offset - delta).map_err(|_| {
-                    TrapError::Hypervisor(format!("private file view offset 0x{offset:x} overflow"))
-                })?;
-                host_mapping
-                    .overlay_shared_file_view(
-                        usize::try_from(host_at)
-                            .map_err(|_| TrapError::MappingTooLarge(host_at))?,
-                        fd,
-                        file_offset,
-                        view_host_size,
-                    )
-                    .map_err(|error| {
+        let custody = self.carrier_vm_custody();
+        let can_pool = physical_len == CowArmedRanges::COMPOUND_SIZE
+            && physical_offset == 0
+            && matches!(backing, SparseExtentBacking::Anon);
+        let pooled_handle = if can_pool {
+            custody.frame_pool().and_then(|p| p.allocate_compound())
+        } else {
+            None
+        };
+
+        let (
+            physical_host,
+            semantic_host,
+            physical_ipa,
+            semantic_ipa,
+            stage2_perms,
+            inventory_backing,
+            page_granular_arm,
+            owner_generation,
+        ) = if let Some(handle) = pooled_handle {
+            let host_ptr = handle.as_mut_ptr();
+            let ipa = handle.ipa();
+            carrick_observability::probes::hvpatch_frame_pool_hit(1, ipa);
+            let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+            let inventory_backing = Self::private_backing_identity();
+            let page_granular_arm = false;
+            let owner_generation = register_pooled_global_frame_host_owner_in(
+                &custody,
+                handle,
+                u64::from(stage2_perms),
+            )?;
+            (
+                host_ptr,
+                host_ptr,
+                ipa,
+                ipa,
+                stage2_perms,
+                inventory_backing,
+                page_granular_arm,
+                owner_generation,
+            )
+        } else {
+            if can_pool {
+                carrick_observability::probes::hvpatch_frame_pool_miss(1, 0);
+            }
+            let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                physical_size,
+                crate::host_mapping::HostMappingKind::PrivateAnon,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("allocate sparse HVPatch mmap backing: {error}"))
+            })?;
+            let physical_host = host_mapping.as_ptr();
+            let semantic_host = unsafe { physical_host.add(physical_offset as usize) };
+            // A file view replaces whole 16 KiB host pages of the anonymous
+            // backing with a read-only page-cache view BEFORE stage-2 sees the
+            // range: the physical host bytes under a live `hv_vm_map` are never
+            // remapped. Congruence (`start ≡ offset mod 16 KiB`, enforced by the
+            // driver) makes the host page containing `start` the host page
+            // containing the file page at `offset`.
+            let (stage2_perms, inventory_backing, page_granular_arm) = match backing {
+                SparseExtentBacking::Anon => (
+                    applevisor::memory::MemPerms::ReadWriteExec,
+                    Self::private_backing_identity(),
+                    false,
+                ),
+                SparseExtentBacking::FileView {
+                    fd,
+                    offset,
+                    view_len,
+                } => {
+                    let delta = start & (HVF_PAGE_SIZE - 1);
+                    if offset & (HVF_PAGE_SIZE - 1) != delta {
+                        return Err(TrapError::Hypervisor(format!(
+                            "private file view VA 0x{start:x} not congruent with offset 0x{offset:x}"
+                        )));
+                    }
+                    let host_at = physical_offset - delta;
+                    let view_len = view_len.min(end - start);
+                    let view_host_len =
+                        align_up(delta + view_len, HVF_PAGE_SIZE)?.min(physical_len - host_at);
+                    let view_host_size = usize::try_from(view_host_len)
+                        .map_err(|_| TrapError::MappingTooLarge(view_host_len))?;
+                    let file_offset = libc::off_t::try_from(offset - delta).map_err(|_| {
                         TrapError::Hypervisor(format!(
-                            "overlay private file view at VA 0x{start:x}: {error}"
+                            "private file view offset 0x{offset:x} overflow"
                         ))
                     })?;
-                // The view is host `PROT_READ`; a stage-2 write permission
-                // would let a stray guest store fault the CARRIER instead of
-                // the guest. Guest stores never reach stage-2 anyway: every
-                // page is armed and the stage-1 leaf is read-only until the
-                // frame COW moves it to private backing. Host writes route
-                // through `ensure_frame_cow_write`, which sees the arm.
-                (
-                    applevisor::memory::MemPerms::ReadExec,
-                    Self::private_file_view_backing_identity(),
-                    true,
+                    host_mapping
+                        .overlay_shared_file_view(
+                            usize::try_from(host_at)
+                                .map_err(|_| TrapError::MappingTooLarge(host_at))?,
+                            fd,
+                            file_offset,
+                            view_host_size,
+                        )
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "overlay private file view at VA 0x{start:x}: {error}"
+                            ))
+                        })?;
+                    // The view is host `PROT_READ`; a stage-2 write permission
+                    // would let a stray guest store fault the CARRIER instead of
+                    // the guest. Guest stores never reach stage-2 anyway: every
+                    // page is armed and the stage-1 leaf is read-only until the
+                    // frame COW moves it to private backing. Host writes route
+                    // through `ensure_frame_cow_write`, which sees the arm.
+                    (
+                        applevisor::memory::MemPerms::ReadExec,
+                        Self::private_file_view_backing_identity(),
+                        true,
+                    )
+                }
+            };
+            let mut lease = GlobalFrameStage2Lease::reserve(physical_len, TWO_MIB)?;
+            let physical_ipa = lease.base;
+            let semantic_ipa = physical_ipa
+                .checked_add(physical_offset)
+                .ok_or_else(|| TrapError::Hypervisor("sparse mmap IPA overflow".to_owned()))?;
+            let map_result = unsafe {
+                inventory_hv_vm_map(
+                    physical_host.cast(),
+                    physical_ipa,
+                    physical_size,
+                    u64::from(stage2_perms),
                 )
+            };
+            if map_result != 0 {
+                return Err(TrapError::Hypervisor(format!(
+                    "map sparse HVPatch mmap IPA 0x{physical_ipa:x}: 0x{map_result:x}"
+                )));
             }
-        };
-        let mut lease = GlobalFrameStage2Lease::reserve(physical_len, TWO_MIB)?;
-        let physical_ipa = lease.base;
-        let semantic_ipa = physical_ipa
-            .checked_add(physical_offset)
-            .ok_or_else(|| TrapError::Hypervisor("sparse mmap IPA overflow".to_owned()))?;
-        let map_result = unsafe {
-            inventory_hv_vm_map(
-                physical_host.cast(),
-                physical_ipa,
-                physical_size,
+            lease.mark_mapped();
+            let owner_generation = register_global_frame_host_owner_in(
+                &custody,
+                lease,
+                host_mapping,
                 u64::from(stage2_perms),
+            )?;
+            (
+                physical_host,
+                semantic_host,
+                physical_ipa,
+                semantic_ipa,
+                stage2_perms,
+                inventory_backing,
+                page_granular_arm,
+                owner_generation,
             )
         };
-        if map_result != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "map sparse HVPatch mmap IPA 0x{physical_ipa:x}: 0x{map_result:x}"
-            )));
-        }
-        lease.mark_mapped();
-        let custody = self.carrier_vm_custody();
-        let owner_generation = register_global_frame_host_owner_in(
-            &custody,
-            lease,
-            host_mapping,
-            u64::from(stage2_perms),
-        )?;
         let mut owner_rollback = GlobalFrameOwnerRollback::new(custody);
         owner_rollback.record((physical_ipa, physical_len));
 
@@ -38608,67 +38879,110 @@ impl HvfTaskState {
             .map_err(|error| {
                 TrapError::Hypervisor(format!("reserve frame COW inventory: {error}"))
             })?;
-        let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-            CowArmedRanges::COMPOUND_SIZE as usize,
-            crate::host_mapping::HostMappingKind::FrameCow,
-        )
-        .map_err(|error| TrapError::Hypervisor(format!("allocate frame COW backing: {error}")))?;
-        let new_host_ptr = new_host.as_ptr();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                old_host,
-                new_host_ptr,
-                CowArmedRanges::COMPOUND_SIZE as usize,
+        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+        let pooled = custody.frame_pool().and_then(|p| p.allocate_compound());
+        let (new_host_ptr, new_physical_ipa, owner_generation) = if let Some(handle) = pooled {
+            let host_ptr = handle.as_mut_ptr();
+            let physical_ipa = handle.ipa();
+            carrick_observability::probes::hvpatch_frame_pool_hit(0, physical_ipa);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    old_host,
+                    host_ptr,
+                    CowArmedRanges::COMPOUND_SIZE as usize,
+                );
+            }
+            let source = unsafe {
+                std::slice::from_raw_parts(
+                    old_host.cast_const(),
+                    CowArmedRanges::COMPOUND_SIZE as usize,
+                )
+            };
+            let destination = unsafe {
+                std::slice::from_raw_parts(
+                    host_ptr.cast_const(),
+                    CowArmedRanges::COMPOUND_SIZE as usize,
+                )
+            };
+            crate::probes::hvpatch_frame_cow_copy(
+                old_frame.raw(),
+                old_physical_ipa,
+                source,
+                destination,
             );
-        }
-        let source = unsafe {
-            std::slice::from_raw_parts(
-                old_host.cast_const(),
+            drop(old_source);
+            let owner_generation = register_pooled_global_frame_host_owner_in(
+                custody,
+                handle,
+                u64::from(stage2_perms),
+            )?;
+            (host_ptr, physical_ipa, owner_generation)
+        } else {
+            carrick_observability::probes::hvpatch_frame_pool_miss(0, 0);
+            let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
                 CowArmedRanges::COMPOUND_SIZE as usize,
+                crate::host_mapping::HostMappingKind::FrameCow,
             )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("allocate frame COW backing: {error}"))
+            })?;
+            let new_host_ptr = new_host.as_ptr();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    old_host,
+                    new_host_ptr,
+                    CowArmedRanges::COMPOUND_SIZE as usize,
+                );
+            }
+            let source = unsafe {
+                std::slice::from_raw_parts(
+                    old_host.cast_const(),
+                    CowArmedRanges::COMPOUND_SIZE as usize,
+                )
+            };
+            let destination = unsafe {
+                std::slice::from_raw_parts(
+                    new_host_ptr.cast_const(),
+                    CowArmedRanges::COMPOUND_SIZE as usize,
+                )
+            };
+            crate::probes::hvpatch_frame_cow_copy(
+                old_frame.raw(),
+                old_physical_ipa,
+                source,
+                destination,
+            );
+            drop(old_source);
+            let mut new_lease = GlobalFrameStage2Lease::reserve(
+                CowArmedRanges::COMPOUND_SIZE,
+                CowArmedRanges::COMPOUND_SIZE,
+            )?;
+            let new_physical_ipa = new_lease.base;
+            let map_result = unsafe {
+                inventory_hv_vm_map(
+                    new_host_ptr.cast(),
+                    new_physical_ipa,
+                    CowArmedRanges::COMPOUND_SIZE as usize,
+                    u64::from(stage2_perms),
+                )
+            };
+            if map_result != 0 {
+                return Err(TrapError::Hypervisor(format!(
+                    "map frame COW IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
+                )));
+            }
+            new_lease.mark_mapped();
+            let owner_generation = register_global_frame_host_owner_in(
+                custody,
+                new_lease,
+                new_host,
+                u64::from(stage2_perms),
+            )?;
+            (new_host_ptr, new_physical_ipa, owner_generation)
         };
-        let destination = unsafe {
-            std::slice::from_raw_parts(
-                new_host_ptr.cast_const(),
-                CowArmedRanges::COMPOUND_SIZE as usize,
-            )
-        };
-        crate::probes::hvpatch_frame_cow_copy(
-            old_frame.raw(),
-            old_physical_ipa,
-            source,
-            destination,
-        );
-        drop(old_source);
-        let mut new_lease = GlobalFrameStage2Lease::reserve(
-            CowArmedRanges::COMPOUND_SIZE,
-            CowArmedRanges::COMPOUND_SIZE,
-        )?;
-        let new_physical_ipa = new_lease.base;
         let new_ipa = new_physical_ipa
             .checked_add(old_offset)
             .ok_or_else(|| TrapError::Hypervisor("HVPatch COW semantic IPA overflow".to_owned()))?;
-        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
-        let map_result = unsafe {
-            inventory_hv_vm_map(
-                new_host_ptr.cast(),
-                new_physical_ipa,
-                CowArmedRanges::COMPOUND_SIZE as usize,
-                u64::from(stage2_perms),
-            )
-        };
-        if map_result != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "map frame COW IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
-            )));
-        }
-        new_lease.mark_mapped();
-        let owner_generation = register_global_frame_host_owner_in(
-            custody,
-            new_lease,
-            new_host,
-            u64::from(stage2_perms),
-        )?;
 
         let backing = HvfVmState::private_backing_identity();
         let split = match HvfVmState::stage_cow_inventory_split(
@@ -45997,7 +46311,7 @@ fn unsigned_executable_maps_hv_denied_to_entitlement() {
 /// own logical publication; VM/vCPU replay calls this only to reinstall the
 /// same physical extent and must still treat every nonzero result as failure.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn inventory_hv_vm_map(
+pub(crate) unsafe fn inventory_hv_vm_map(
     host: *mut std::ffi::c_void,
     ipa: u64,
     size: usize,
