@@ -2431,12 +2431,14 @@ impl SyscallDispatcher {
                             ReopenAction::ByPath(path.clone())
                         } else {
                             let is_memfd = shared_seals.lock().is_some();
+                            // `F_SEAL_WRITE` does not refuse the open: Linux
+                            // hands back a writable description whose write(2)
+                            // and shared writable mmap then fail. Only the
+                            // resize seals decide an `O_TRUNC` (LTP
+                            // `memfd_create01` `test_seal_write` shrinks a
+                            // write-sealed memfd through exactly this open).
                             let err = if is_writable {
-                                if let Some(seals) = *shared_seals.lock()
-                                    && seals & carrick_abi::LinuxMemfdSeals::WRITE.bits() != 0
-                                {
-                                    Some(LINUX_EPERM)
-                                } else if !is_memfd && !*writable {
+                                if !is_memfd && !*writable {
                                     Some(LINUX_EACCES)
                                 } else if flags & LINUX_O_TRUNC != 0 && contents.len() != 0 {
                                     if let Err(errno) = memfd_seal_resize_check(
@@ -9402,7 +9404,13 @@ impl SyscallDispatcher {
                     // guest sees the kernel's actual queued-byte count.
                     let available: i32 = match this.open_file(fd.0).as_ref() {
                         Some(open_file) => match open_file.description.read().as_deref() {
-                            Some(OpenDescription::PipeReader { pipe, .. }) => {
+                            // Linux answers FIONREAD on EITHER end of a pipe
+                            // with the queued byte count (LTP `pipe12` asks the
+                            // write end after filling the pipe).
+                            Some(
+                                OpenDescription::PipeReader { pipe, .. }
+                                | OpenDescription::PipeWriter { pipe, .. },
+                            ) => {
                                 let len = pipe.buffered_bytes();
                                 i32::try_from(len).unwrap_or(i32::MAX)
                             }
