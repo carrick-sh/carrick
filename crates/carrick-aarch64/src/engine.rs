@@ -915,6 +915,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     length: 0,
                 });
             }
+            Err(PageTableError::MissingArenaSource) => {
+                return Err(MemoryError::HostMap(
+                    "stage-1 page-table manager has no arena source".to_owned(),
+                ));
+            }
         };
         if outcome.changed {
             // SAFETY: `host` backs the live page-table region for the whole process
@@ -2587,6 +2592,23 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         vm.refresh_vcpu_after_frame_cow(vcpu)
     }
 
+    fn install_stage1_table_arena_source(
+        &mut self,
+        source: Box<dyn carrick_mem::page_table::TableArenaSource>,
+    ) -> Result<(), TrapError> {
+        let mut page_tables = self.page_tables.lock();
+        let manager = page_tables.as_mut().ok_or_else(|| {
+            TrapError::Hypervisor("no stage-1 manager bound on engine".to_owned())
+        })?;
+        if manager.arena_source().is_some() {
+            return Err(TrapError::Hypervisor(
+                "stage-1 table arena source is already installed".to_owned(),
+            ));
+        }
+        manager.set_arena_source(source);
+        Ok(())
+    }
+
     fn resolve_frame_cow_fault(
         &mut self,
         syndrome: u64,
@@ -2903,7 +2925,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn build_process_spec(
         &mut self,
-        request: ProcessForkRequest,
+        mut request: ProcessForkRequest,
     ) -> Result<Self::ProcessSpec, TrapError> {
         use carrick_observability::probes::{
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
@@ -3052,6 +3074,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
 
         let stage_started = std::time::Instant::now();
+        if let Some(source) = request.table_arena_source.take() {
+            page_tables.set_arena_source(source);
+        }
         let child_root = request.child_ttbr0 & ((1_u64 << 48) - 1);
         page_tables.rebase(child_root).map_err(|error| {
             TrapError::Hypervisor(format!("rebase child page tables: {error:?}"))

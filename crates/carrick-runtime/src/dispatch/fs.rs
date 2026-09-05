@@ -11837,12 +11837,18 @@ impl SyscallDispatcher {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
                 | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::PipeReader { .. } => LINUX_EBADF,
+                OpenDescription::HostPipe {
+                    is_read_end,
+                    pty,
+                    bidirectional,
+                    ..
+                } if *is_read_end && pty.is_none() && !*bidirectional => LINUX_EBADF,
                 OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
-                OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
+                OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }

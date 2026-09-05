@@ -1529,7 +1529,7 @@ pub fn validate_fork_projection(ranges: &[ForkProjectionRange]) -> Result<(), Fo
 /// Complete AArch64 input for materializing a logical process inside one
 /// persistent backend VM. The root-slot fields describe the current HVPatch
 /// execution adapter; other backends retain the default unsupported method.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ProcessForkRequest {
     pub entry: GuestEntryRegs,
     pub child_ttbr0: u64,
@@ -1538,6 +1538,7 @@ pub struct ProcessForkRequest {
     pub plan: ForkProjectionPlan,
     pub child_tid: ThreadId,
     pub forking_tid: ThreadId,
+    pub table_arena_source: Option<Box<dyn carrick_mem::page_table::TableArenaSource>>,
 }
 
 impl ProcessForkRequest {
@@ -2280,6 +2281,17 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
 
     fn activate_exec_inventory(&mut self) -> Result<(), TrapError> {
         Ok(())
+    }
+
+    /// Install an arena source providing additional 2 MiB root slots when the
+    /// primary stage-1 arena is exhausted.
+    fn install_stage1_table_arena_source(
+        &mut self,
+        _source: Box<dyn carrick_mem::page_table::TableArenaSource>,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "threaded backend has no stage-1 manager to install arena source".to_owned(),
+        ))
     }
     /// The guest CPU ISA this engine runs. Fixed per process (the guest ISA
     /// equals the host ISA), so it is an associated type — monomorphized per

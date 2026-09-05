@@ -3094,6 +3094,346 @@ mod foreign_mm_tests {
         );
     }
 
+    #[derive(Debug)]
+    struct TestArenaSource {
+        available: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
+        returned: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
+    }
+
+    impl carrick_mem::page_table::TableArenaSource for TestArenaSource {
+        fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
+            self.available.lock().unwrap().pop()
+        }
+        fn return_arena(&mut self, base: carrick_guest_mem::Gpa) {
+            self.returned.lock().unwrap().push(base);
+        }
+    }
+
+    #[test]
+    fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let mm = NonZeroU64::new(2).unwrap();
+        let asid = NonZeroU16::new(5).unwrap();
+        let stage1_root = Gpa(0x8800_0020_0000);
+        let transaction =
+            carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(701).unwrap());
+        let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x44; 32]),
+            transaction,
+            NonZeroU64::new(1).unwrap(),
+            0,
+            Vec::new(),
+        );
+        let task_mm = Arc::new(HvpatchTaskMmAuthority {
+            mappings: Vec::new(),
+            foreign_mm_transport: Some(Arc::clone(&transport)),
+            mm_root_slot: Some((stage1_root.raw(), 0x20_0000)),
+            mm_root_stage2: parking_lot::Mutex::new(None),
+            container_root: ContainerRootToken::from_raw(1),
+            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::Active {
+                ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+                receipt,
+                retirement: None,
+            }),
+            kernel_mm: parking_lot::Mutex::new(Some(mm)),
+            cow_armed: Some(Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()))),
+            cow_deferred_publications: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+            mm_access: parking_lot::Mutex::new(None),
+            pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
+            pending_receipts: parking_lot::Mutex::new(Vec::new()),
+            alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
+            drop_order: None,
+        });
+        let prepared_mm_access = MmAccessState::new(
+            Arc::new(parking_lot::Mutex::new(None)),
+            Arc::new(MemoryProtections::default()),
+            task_mm
+                .inventory
+                .lock()
+                .shared_runtime_ledger()
+                .expect("prepared child inventory ledger"),
+            Arc::clone(task_mm.cow_armed.as_ref().expect("prepared COW arms")),
+            Arc::clone(
+                task_mm
+                    .cow_deferred_publications
+                    .as_ref()
+                    .expect("prepared COW publications"),
+            ),
+        );
+        *task_mm.mm_access.lock() = Some(Arc::clone(&prepared_mm_access));
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let (_, child_token_verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        let registration = HvpatchTaskRegistration {
+            directory,
+            key: HvpatchCarrierTaskStateKey {
+                directory_instance: NonZeroU64::new(1).unwrap(),
+                task_serial: 102,
+                thread_serial: 102,
+                execution_generation: 1,
+                nonce: NonZeroU64::new(1).unwrap(),
+            },
+            expected_identity: HvpatchCarrierTaskIdentity {
+                task_serial: 102,
+                thread_serial: 102,
+                execution_generation: 1,
+                linux_pid: 102,
+                linux_tid: 102,
+                asid: asid.get(),
+            },
+            foreign_mm_registration: None,
+            task_mm: Some(Arc::clone(&task_mm)),
+            cow_authority: Some(Arc::new(
+                super::task_only_carrier_directory_tests::TestCowAuthority,
+            )),
+            cow_identity: Some(carrick_hal::FrameCowIdentity {
+                linux_pid: 102,
+                linux_tid: 102,
+                mm: mm.get(),
+                asid: asid.get(),
+            }),
+            cow_authority_identity: None,
+            child_token_verifier,
+        };
+
+        let mut manager = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        manager
+            .set_prot_none(
+                crate::memory::LINUX_MMAP_BASE,
+                crate::memory::mmap_arena_size() as usize,
+            )
+            .expect("reserve sparse arena");
+        manager
+            .rebase(stage1_root.raw())
+            .expect("rebase to stage1_root");
+        let ext_base = carrick_guest_mem::Gpa(0xb0_0000_0000);
+        let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
+        let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let source = TestArenaSource {
+            available: std::sync::Arc::clone(&available),
+            returned: std::sync::Arc::clone(&returned),
+        };
+        manager.set_arena_source(Box::new(source));
+        assert_eq!(manager.pool_stats().3, 1, "starts with 1 primary arena");
+
+        let runtime_page_tables = Arc::new(parking_lot::Mutex::new(Some(manager)));
+        let runtime = registration
+            .runtime_task_state(
+                Arc::clone(&runtime_page_tables),
+                Arc::new(MemoryProtections::default()),
+            )
+            .expect("materialize executable copied child runtime state");
+
+        let pt_auth = runtime.page_tables_authority();
+        let mut pt_guard = pt_auth.lock();
+        let pt = pt_guard.as_mut().expect("page table manager");
+
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut block = crate::memory::LINUX_MMAP_BASE + 64 * TWO_MIB;
+        while pt.pool_stats().3 < 2 {
+            pt.set_rw(block + 0x1000, 0x1000, false)
+                .expect("mapping succeeds");
+            block += TWO_MIB;
+        }
+        assert_eq!(pt.pool_stats().3, 2, "grew to 2 arenas past 448 tables");
+        assert!(
+            available.lock().unwrap().is_empty(),
+            "source arena was taken"
+        );
+        drop(pt_guard);
+        *task_mm.inventory.lock() = HvpatchTaskInventoryAuthority::Retired;
+    }
+
+    #[test]
+    fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
+        let mm = NonZeroU64::new(3).unwrap();
+        let asid = NonZeroU16::new(6).unwrap();
+        let stage1_root = Gpa(0x8800_0040_0000);
+        let transaction =
+            carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(702).unwrap());
+        let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x45; 32]),
+            transaction,
+            NonZeroU64::new(1).unwrap(),
+            0,
+            Vec::new(),
+        );
+        let task_mm = Arc::new(HvpatchTaskMmAuthority {
+            mappings: Vec::new(),
+            foreign_mm_transport: Some(Arc::clone(&transport)),
+            mm_root_slot: Some((stage1_root.raw(), 0x20_0000)),
+            mm_root_stage2: parking_lot::Mutex::new(None),
+            container_root: ContainerRootToken::from_raw(1),
+            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::Active {
+                ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+                receipt,
+                retirement: None,
+            }),
+            kernel_mm: parking_lot::Mutex::new(Some(mm)),
+            cow_armed: Some(Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()))),
+            cow_deferred_publications: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+            mm_access: parking_lot::Mutex::new(None),
+            pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
+            pending_receipts: parking_lot::Mutex::new(Vec::new()),
+            alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
+            drop_order: None,
+        });
+        let prepared_mm_access = MmAccessState::new(
+            Arc::new(parking_lot::Mutex::new(None)),
+            Arc::new(MemoryProtections::default()),
+            task_mm
+                .inventory
+                .lock()
+                .shared_runtime_ledger()
+                .expect("prepared child inventory ledger"),
+            Arc::clone(task_mm.cow_armed.as_ref().expect("prepared COW arms")),
+            Arc::clone(
+                task_mm
+                    .cow_deferred_publications
+                    .as_ref()
+                    .expect("prepared COW publications"),
+            ),
+        );
+        *task_mm.mm_access.lock() = Some(Arc::clone(&prepared_mm_access));
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let (_, child_token_verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        let registration = HvpatchTaskRegistration {
+            directory,
+            key: HvpatchCarrierTaskStateKey {
+                directory_instance: NonZeroU64::new(1).unwrap(),
+                task_serial: 103,
+                thread_serial: 103,
+                execution_generation: 1,
+                nonce: NonZeroU64::new(1).unwrap(),
+            },
+            expected_identity: HvpatchCarrierTaskIdentity {
+                task_serial: 103,
+                thread_serial: 103,
+                execution_generation: 1,
+                linux_pid: 103,
+                linux_tid: 103,
+                asid: asid.get(),
+            },
+            foreign_mm_registration: None,
+            task_mm: Some(Arc::clone(&task_mm)),
+            cow_authority: Some(Arc::new(
+                super::task_only_carrier_directory_tests::TestCowAuthority,
+            )),
+            cow_identity: Some(carrick_hal::FrameCowIdentity {
+                linux_pid: 103,
+                linux_tid: 103,
+                mm: mm.get(),
+                asid: asid.get(),
+            }),
+            cow_authority_identity: None,
+            child_token_verifier,
+        };
+
+        let mut manager = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        manager
+            .set_prot_none(
+                crate::memory::LINUX_MMAP_BASE,
+                crate::memory::mmap_arena_size() as usize,
+            )
+            .expect("reserve sparse arena");
+        manager
+            .rebase(stage1_root.raw())
+            .expect("rebase to stage1_root");
+        let ext_base = carrick_guest_mem::Gpa(0xc0_0000_0000);
+        let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
+        let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let source = TestArenaSource {
+            available: std::sync::Arc::clone(&available),
+            returned: std::sync::Arc::clone(&returned),
+        };
+        manager.set_arena_source(Box::new(source));
+
+        let runtime_page_tables = Arc::new(parking_lot::Mutex::new(Some(manager)));
+        let mut runtime = registration
+            .runtime_task_state(
+                Arc::clone(&runtime_page_tables),
+                Arc::new(MemoryProtections::default()),
+            )
+            .expect("materialize executable copied child runtime state");
+
+        let mut primary_host = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
+        let mut ext_host = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
+        let mut ext_region = crate::trap::thread_sibling_tests::mapped_region(
+            ext_base.0,
+            ext_base.0 + carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+            ext_base.0,
+        );
+        ext_region.host_addr = ext_host.as_mut_ptr();
+        runtime.mappings.push(ext_region);
+
+        // Run sync_to_host under the manager lock with a bounded wait to detect self-deadlock.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        struct SendTaskState(HvfTaskState);
+        unsafe impl Send for SendTaskState {}
+        let runtime_send = SendTaskState(runtime);
+        let primary_host_addr = primary_host.as_mut_ptr() as usize;
+        fn run_sync_worker(
+            runtime_send: SendTaskState,
+            primary_host_addr: usize,
+            done_tx: std::sync::mpsc::Sender<()>,
+        ) {
+            let runtime = runtime_send.0;
+            let primary_host_ptr = primary_host_addr as *mut u8;
+            let pt_auth = runtime.page_tables_authority();
+            let mut pt_guard = pt_auth.lock();
+            let pt = pt_guard.as_mut().expect("page table manager");
+
+            const TWO_MIB: u64 = 2 * 1024 * 1024;
+            let mut block = crate::memory::LINUX_MMAP_BASE + 64 * TWO_MIB;
+            while pt.pool_stats().3 < 2 {
+                pt.set_rw(block + 0x1000, 0x1000, false)
+                    .expect("mapping succeeds");
+                block += TWO_MIB;
+            }
+            assert_eq!(pt.pool_stats().3, 2, "manager grew to 2 arenas");
+
+            let manager_base = pt.base();
+            let page_table_resolver = |base: u64| {
+                (base == manager_base)
+                    .then_some(primary_host_ptr)
+                    .or_else(|| {
+                        runtime.host_ptr_for_ipa(
+                            base,
+                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                        )
+                    })
+            };
+            // SAFETY: primary_host and ext_host are valid for the test duration.
+            unsafe { pt.sync_to_host(page_table_resolver) };
+            done_tx.send(()).unwrap();
+        }
+        let worker =
+            std::thread::spawn(move || run_sync_worker(runtime_send, primary_host_addr, done_tx));
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("sync_to_host under manager lock must not deadlock");
+        worker.join().unwrap();
+
+        // Verify that ext_host received synced descriptors from the extension arena.
+        assert!(
+            ext_host.iter().any(|&b| b != 0),
+            "extension arena host memory was written by sync_to_host"
+        );
+
+        *task_mm.inventory.lock() = HvpatchTaskInventoryAuthority::Retired;
+    }
+
     #[test]
     fn initial_carrier_control_mapping_keeps_direct_unmap_owner() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
@@ -3642,6 +3982,7 @@ mod foreign_mm_tests {
             },
             child_tid: carrick_hal::ThreadId::synthetic_for_tests(871),
             forking_tid: carrick_hal::ThreadId::synthetic_for_tests(870),
+            table_arena_source: None,
         };
         let make_child_page_tables = |translated_ipa| {
             let mut child_page_tables = crate::page_table::PageTableManager::new(
@@ -4052,6 +4393,7 @@ mod foreign_mm_tests {
                     },
                     child_tid: carrick_hal::ThreadId::synthetic_for_tests(872),
                     forking_tid: carrick_hal::ThreadId::synthetic_for_tests(871),
+                    table_arena_source: None,
                 },
                 &mut grandchild_page_tables,
                 &cow_ranges,
@@ -5608,6 +5950,7 @@ mod foreign_mm_tests {
             },
             child_tid: carrick_hal::ThreadId::synthetic_for_tests(102),
             forking_tid: carrick_hal::ThreadId::synthetic_for_tests(101),
+            table_arena_source: None,
         };
 
         let mut child_pt = crate::page_table::PageTableManager::new(
@@ -26006,13 +26349,12 @@ impl HvfTaskState {
                     let live = page_table_host.map(|host| unsafe {
                         manager.debug_walk_host(
                             |base| {
-                                self.mapping_for_range_in(
-                                    custody,
-                                    base,
-                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                                )
-                                .map(|mapping| mapping.host_addr)
-                                .or_else(|| (base == manager.base()).then_some(host))
+                                (base == manager.base()).then_some(host).or_else(|| {
+                                    self.host_ptr_for_ipa(
+                                        base,
+                                        carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                                    )
+                                })
                             },
                             va,
                         )
@@ -26419,6 +26761,12 @@ impl HvfTaskState {
         }
         self.report_physical_cow_source_refusal(custody, semantic_va, ipa);
         None
+    }
+
+    pub(crate) fn host_ptr_for_ipa(&self, ipa: u64, len: usize) -> Option<*mut u8> {
+        let mapping = HvfVmState::mapping_for_ipa_range(&self.mappings, ipa, len.max(1))?;
+        let offset = usize::try_from(ipa.saturating_sub(mapping.ipa)).ok()?;
+        Some(unsafe { mapping.host_addr.add(offset) })
     }
 
     fn translate_va_for_cow(&self, va: u64) -> Option<u64> {
@@ -36301,9 +36649,11 @@ impl HvfVmState {
                 })?;
             let manager_base = manager.base();
             let page_table_resolver = |base: u64| {
-                self.mapping_for_range(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
-                    .map(|mapping| mapping.host_addr)
-                    .or_else(|| (base == manager_base).then_some(page_table_host))
+                (base == manager_base)
+                    .then_some(page_table_host)
+                    .or_else(|| {
+                        self.host_ptr(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+                    })
             };
             unsafe { manager.sync_to_host(page_table_resolver) };
             let mut page = start;
@@ -36334,12 +36684,14 @@ impl HvfVmState {
                 if let Some(manager) = page_tables.as_mut() {
                     let manager_base = manager.base();
                     let page_table_resolver = |base: u64| {
-                        self.mapping_for_range(
-                            base,
-                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                        )
-                        .map(|mapping| mapping.host_addr)
-                        .or_else(|| (base == manager_base).then_some(page_table_host))
+                        (base == manager_base)
+                            .then_some(page_table_host)
+                            .or_else(|| {
+                                self.host_ptr(
+                                    base,
+                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                                )
+                            })
                     };
                     // SAFETY: the COW quiesce and topology guards remain held,
                     // so no vCPU can walk or edit this mm while the journalled
@@ -36777,9 +37129,11 @@ impl HvfVmState {
                 })?;
             let manager_base = manager.base();
             let page_table_resolver = |base: u64| {
-                self.mapping_for_range(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
-                    .map(|mapping| mapping.host_addr)
-                    .or_else(|| (base == manager_base).then_some(page_table_host))
+                (base == manager_base)
+                    .then_some(page_table_host)
+                    .or_else(|| {
+                        self.host_ptr(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+                    })
             };
             unsafe { manager.sync_to_host(page_table_resolver) };
             let mut current = page_va;
@@ -36815,12 +37169,14 @@ impl HvfVmState {
                 if let Some(manager) = page_tables.as_mut() {
                     let manager_base = manager.base();
                     let page_table_resolver = |base: u64| {
-                        self.mapping_for_range(
-                            base,
-                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                        )
-                        .map(|mapping| mapping.host_addr)
-                        .or_else(|| (base == manager_base).then_some(page_table_host))
+                        (base == manager_base)
+                            .then_some(page_table_host)
+                            .or_else(|| {
+                                self.host_ptr(
+                                    base,
+                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                                )
+                            })
                     };
                     // SAFETY: the COW quiesce and topology guards remain held.
                     unsafe { manager.rollback_undo(page_table_resolver) };
@@ -37215,13 +37571,14 @@ impl HvfTaskState {
         let live = unsafe {
             manager.debug_walk_host(
                 |base| {
-                    self.mapping_for_range_in(
-                        custody,
-                        base,
-                        carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                    )
-                    .map(|mapping| mapping.host_addr)
-                    .or_else(|| (base == manager.base()).then_some(page_table_host))
+                    (base == manager.base())
+                        .then_some(page_table_host)
+                        .or_else(|| {
+                            self.host_ptr_for_ipa(
+                                base,
+                                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                            )
+                        })
                 },
                 page_va,
             )
@@ -37687,13 +38044,14 @@ impl HvfTaskState {
             }
             let manager_base = manager.base();
             let page_table_resolver = |base: u64| {
-                self.mapping_for_range_in(
-                    custody,
-                    base,
-                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                )
-                .map(|mapping| mapping.host_addr)
-                .or_else(|| (base == manager_base).then_some(page_table_host))
+                (base == manager_base)
+                    .then_some(page_table_host)
+                    .or_else(|| {
+                        self.host_ptr_for_ipa(
+                            base,
+                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                        )
+                    })
             };
             unsafe { manager.sync_to_host(page_table_resolver) };
 
@@ -37768,13 +38126,14 @@ impl HvfTaskState {
                 if let Some(manager) = page_tables.as_mut() {
                     let manager_base = manager.base();
                     let page_table_resolver = |base: u64| {
-                        self.mapping_for_range_in(
-                            custody,
-                            base,
-                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                        )
-                        .map(|mapping| mapping.host_addr)
-                        .or_else(|| (base == manager_base).then_some(page_table_host))
+                        (base == manager_base)
+                            .then_some(page_table_host)
+                            .or_else(|| {
+                                self.host_ptr_for_ipa(
+                                    base,
+                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                                )
+                            })
                     };
                     // SAFETY: the COW quiesce and topology guards remain held;
                     // no vCPU can walk or edit this mm while the journalled
@@ -38482,9 +38841,11 @@ impl HvfVmState {
         })?;
         let manager_base = manager.base();
         let page_table_resolver = |base: u64| {
-            self.mapping_for_range(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
-                .map(|mapping| mapping.host_addr)
-                .or_else(|| (base == manager_base).then_some(page_table_host))
+            (base == manager_base)
+                .then_some(page_table_host)
+                .or_else(|| {
+                    self.host_ptr(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+                })
         };
         let mut authenticated = Vec::with_capacity(pending.len());
         for receipt in pending {
@@ -42143,8 +42504,18 @@ impl HvfTaskState {
             carrick_mem::page_table::const_resolver(|base: u64| -> Option<*const u8> {
                 mappings
                     .iter()
-                    .find(|m| m.ipa == base)
-                    .map(|m| m.host.ptr().cast_const())
+                    .find(|m| {
+                        let end = m.ipa.checked_add(m.size as u64);
+                        base >= m.ipa
+                            && end.is_some_and(|limit| {
+                                base.saturating_add(carrick_mem::memory::LINUX_PAGE_TABLES_SIZE)
+                                    <= limit
+                            })
+                    })
+                    .and_then(|m| {
+                        let offset = usize::try_from(base.saturating_sub(m.ipa)).ok()?;
+                        Some(unsafe { m.host.ptr().add(offset).cast_const() })
+                    })
                     .or_else(|| (base == page_tables.base()).then_some(table_host_ptr))
             });
         for (va, expected_ipa, expected_ap, expected_non_global) in child_pte_receipts {
