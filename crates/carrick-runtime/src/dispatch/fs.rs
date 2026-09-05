@@ -12201,18 +12201,14 @@ impl SyscallDispatcher {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
                 | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. }
-                | OpenDescription::PipeReader { .. } => LINUX_EBADF,
-                OpenDescription::HostPipe {
-                    is_read_end,
-                    pty,
-                    bidirectional,
-                    ..
-                } if *is_read_end && pty.is_none() && !*bidirectional => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
-                OpenDescription::PipeWriter { .. }
+                // Same rule as `pwrite64`: any pipe end is ESPIPE for positional
+                // I/O (oracle `pipeblockedge` line `pwritev2_pipe_espipe`).
+                OpenDescription::PipeReader { .. }
+                | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
