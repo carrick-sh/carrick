@@ -2038,10 +2038,6 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(status_flags),
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
-                peer_cred: None,
-                cork_buffer: Vec::new(),
-                cork_dest_addr: None,
-                cork_enabled: false,
             })),
             status_flags,
             fd_flags,
@@ -2157,10 +2153,6 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(LINUX_O_RDWR),
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
-                peer_cred: None,
-                cork_buffer: Vec::new(),
-                cork_dest_addr: None,
-                cork_enabled: false,
             }
         } else if kind == libc::S_IFIFO {
             // A pipe end. Probe its direction so reads/writes route correctly;
@@ -2222,25 +2214,17 @@ impl SyscallDispatcher {
         &self,
         fd: i32,
     ) -> Result<SocketSendView, LinuxErrno> {
-        let Some(open_file) = self.open_file(fd) else {
-            return Err(LINUX_EBADF);
-        };
-        let open = open_file.description.read().ok_or(LINUX_ENOTSOCK)?;
-        match &*open {
-            OpenDescription::HostSocket {
-                host_fd,
-                family,
-                cork_enabled,
-                cork_buffer,
-                ..
-            } => Ok(SocketSendView {
-                host_fd: host_fd.view(),
-                family: *family,
-                cork_enabled: *cork_enabled,
-                has_pending_cork: !cork_buffer.is_empty(),
-            }),
-            _ => Err(LINUX_ENOTSOCK),
-        }
+        let (host_fd, family) = self.host_socket_lookup(fd)?;
+        let (cork_enabled, has_pending_cork) = self.open_file(fd).map_or((false, false), |of| {
+            let cork = of.description.common().cork();
+            (cork.enabled, !cork.buffer.is_empty())
+        });
+        Ok(SocketSendView {
+            host_fd,
+            family,
+            cork_enabled,
+            has_pending_cork,
+        })
     }
 
     pub(in crate::dispatch) fn host_socket_lookup(
@@ -2471,11 +2455,7 @@ impl SyscallDispatcher {
     /// still answers in the guest's domain rather than leaking the host's.
     fn peer_ucred(&self, fd: i32) -> (u32, u32, u32) {
         if let Some(open_file) = self.open_file(fd)
-            && let Some(open) = open_file.description.read()
-            && let OpenDescription::HostSocket {
-                peer_cred: Some(cred),
-                ..
-            } = &*open
+            && let Some(cred) = open_file.description.common().peer_cred()
         {
             return (cred.pid.0 as u32, cred.uid.raw(), cred.gid.raw());
         }
@@ -2487,11 +2467,8 @@ impl SyscallDispatcher {
         fd: i32,
         cred: crate::dispatch::fd_table::SocketPeerCred,
     ) {
-        if let Some(open_file) = self.open_file(fd)
-            && let Some(mut open) = open_file.description.write()
-            && let OpenDescription::HostSocket { peer_cred, .. } = &mut *open
-        {
-            *peer_cred = Some(cred);
+        if let Some(open_file) = self.open_file(fd) {
+            open_file.description.common().set_peer_cred(Some(cred));
         }
     }
 
@@ -2994,14 +2971,13 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(status_flags),
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
-                peer_cred,
-                cork_buffer: Vec::new(),
-                cork_dest_addr: None,
-                cork_enabled: false,
             })),
             status_flags,
             fd_flags,
         );
+        if peer_cred.is_some() {
+            open_file.description.common().set_peer_cred(peer_cred);
+        }
         let linux_fd = match self.install_fd_at_or_above(3, open_file) {
             Ok(fd) => fd,
             Err(_) => {
@@ -4833,10 +4809,6 @@ mod netlink_readiness_tests {
                     protocol: 0,
                     mcast_memberships: Vec::new(),
                     synthetic_recv: VecDeque::new(),
-                    peer_cred: None,
-                    cork_buffer: Vec::new(),
-                    cork_dest_addr: None,
-                    cork_enabled: false,
                 })),
                 LINUX_O_RDWR,
                 0,
@@ -7515,14 +7487,11 @@ impl SyscallDispatcher {
                     base: OpenDescriptionBase::new(status_flags),
                     mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
-                    peer_cred: Some(my_cred),
-                    cork_buffer: Vec::new(),
-                    cork_dest_addr: None,
-                    cork_enabled: false,
                 })),
                 status_flags,
                 fd_flags,
             );
+            first.description.common().set_peer_cred(Some(my_cred));
             let second = OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: HostFdRef::new(host_fds[1]),
@@ -7532,14 +7501,11 @@ impl SyscallDispatcher {
                     base: OpenDescriptionBase::new(status_flags),
                     mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
-                    peer_cred: Some(my_cred),
-                    cork_buffer: Vec::new(),
-                    cork_dest_addr: None,
-                    cork_enabled: false,
                 })),
                 status_flags,
                 fd_flags,
             );
+            second.description.common().set_peer_cred(Some(my_cred));
             let (read_fd, write_fd) = match this.install_fd_pair_at_or_above(3, first, second) {
                 Ok(pair) => pair,
                 Err(_) => {
@@ -8643,37 +8609,20 @@ impl SyscallDispatcher {
 
             if is_cork_enabled || is_msg_more {
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, len) };
-                if let Some(open_file) = this.open_file(fd)
-                    && let Some(mut open) = open_file.description.write()
-                    && let OpenDescription::HostSocket {
-                        cork_buffer,
-                        cork_dest_addr,
-                        ..
-                    } = &mut *open
-                {
-                    cork_buffer.extend_from_slice(data);
-                    if cork_dest_addr.is_none() && let Some(ref addr) = host_addr {
-                        *cork_dest_addr = Some(addr.clone());
-                    }
+                if let Some(open_file) = this.open_file(fd) {
+                    open_file
+                        .description
+                        .common()
+                        .cork()
+                        .stage(data, host_addr.as_deref());
                 }
                 return Ok(DispatchOutcome::Returned { value: len as i64 });
             }
 
             let pending_cork_data = if has_pending_cork {
-                if let Some(open_file) = this.open_file(fd)
-                    && let Some(mut open) = open_file.description.write()
-                    && let OpenDescription::HostSocket {
-                        cork_buffer,
-                        cork_dest_addr,
-                        ..
-                    } = &mut *open
-                {
-                    let buf = std::mem::take(cork_buffer);
-                    let dest = cork_dest_addr.take();
-                    Some((buf, dest))
-                } else {
-                    None
-                }
+                this.open_file(fd).and_then(|open_file| {
+                    open_file.description.common().cork().take()
+                })
             } else {
                 None
             };
@@ -9105,35 +9054,25 @@ impl SyscallDispatcher {
                 };
                 let v = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
                 if let Some(open_file) = this.open_file(fd)
-                    && let Some(mut open) = open_file.description.write()
-                    && let OpenDescription::HostSocket {
-                        host_fd,
-                        cork_buffer,
-                        cork_dest_addr,
-                        cork_enabled,
-                        ..
-                    } = &mut *open
+                    && let Some((flushed, dest)) =
+                        open_file.description.common().cork().set_enabled(v != 0)
                 {
-                    *cork_enabled = v != 0;
-                    if !*cork_enabled && !cork_buffer.is_empty() {
-                        let dest_ptr = cork_dest_addr
-                            .as_ref()
-                            .map_or(core::ptr::null(), |a| a.as_ptr().cast());
-                        let dest_len = cork_dest_addr
-                            .as_ref()
-                            .map_or(0, |a| a.len() as libc::socklen_t);
-                        let send_flags = libc::MSG_DONTWAIT;
-                        unsafe {
-                            libc::sendto(
-                                host_fd.raw(),
-                                cork_buffer.as_ptr().cast(),
-                                cork_buffer.len(),
-                                send_flags,
-                                dest_ptr,
-                                dest_len,
-                            );
-                        }
-                        cork_buffer.clear();
+                    let dest_ptr = dest
+                        .as_ref()
+                        .map_or(core::ptr::null(), |a| a.as_ptr().cast());
+                    let dest_len = dest
+                        .as_ref()
+                        .map_or(0, |a| a.len() as libc::socklen_t);
+                    let send_flags = libc::MSG_DONTWAIT;
+                    unsafe {
+                        libc::sendto(
+                            host_fd.get(),
+                            flushed.as_ptr().cast(),
+                            flushed.len(),
+                            send_flags,
+                            dest_ptr,
+                            dest_len,
+                        );
                     }
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -9658,11 +9597,12 @@ impl SyscallDispatcher {
                 || (level == crate::linux_abi::LINUX_SOL_TCP
                     && optname == crate::linux_abi::LINUX_TCP_CORK)
             {
-                let enabled = if let Some(open_file) = this.open_file(fd)
-                    && let Some(open) = open_file.description.read()
-                    && let OpenDescription::HostSocket { cork_enabled, .. } = &*open
-                {
-                    if *cork_enabled { 1i32 } else { 0i32 }
+                let enabled = if let Some(open_file) = this.open_file(fd) {
+                    if open_file.description.common().cork().enabled {
+                        1i32
+                    } else {
+                        0i32
+                    }
                 } else {
                     0i32
                 };
@@ -9952,20 +9892,12 @@ impl SyscallDispatcher {
 
         if is_cork_enabled || is_msg_more {
             let data_len = data.len();
-            if let Some(open_file) = self.open_file(fd)
-                && let Some(mut open) = open_file.description.write()
-                && let OpenDescription::HostSocket {
-                    cork_buffer,
-                    cork_dest_addr,
-                    ..
-                } = &mut *open
-            {
-                cork_buffer.extend_from_slice(&data);
-                if cork_dest_addr.is_none()
-                    && let Some(ref addr) = host_addr
-                {
-                    *cork_dest_addr = Some(addr.clone());
-                }
+            if let Some(open_file) = self.open_file(fd) {
+                open_file
+                    .description
+                    .common()
+                    .cork()
+                    .stage(&data, host_addr.as_deref());
             }
             return Ok(DispatchOutcome::Returned {
                 value: data_len as i64,
@@ -9973,20 +9905,8 @@ impl SyscallDispatcher {
         }
 
         let pending_cork_data = if has_pending_cork {
-            if let Some(open_file) = self.open_file(fd)
-                && let Some(mut open) = open_file.description.write()
-                && let OpenDescription::HostSocket {
-                    cork_buffer,
-                    cork_dest_addr,
-                    ..
-                } = &mut *open
-            {
-                let buf = std::mem::take(cork_buffer);
-                let dest = cork_dest_addr.take();
-                Some((buf, dest))
-            } else {
-                None
-            }
+            self.open_file(fd)
+                .and_then(|open_file| open_file.description.common().cork().take())
         } else {
             None
         };
@@ -10202,14 +10122,8 @@ impl SyscallDispatcher {
         if unsent.is_empty() {
             return;
         }
-        if let Some(open_file) = self.open_file(fd)
-            && let Some(mut open) = open_file.description.write()
-            && let OpenDescription::HostSocket { cork_buffer, .. } = &mut *open
-        {
-            let mut restored = Vec::with_capacity(unsent.len() + cork_buffer.len());
-            restored.extend_from_slice(unsent);
-            restored.append(cork_buffer);
-            *cork_buffer = restored;
+        if let Some(open_file) = self.open_file(fd) {
+            open_file.description.common().cork().restore_prefix(unsent);
         }
     }
 

@@ -56,17 +56,10 @@ use crate::linux_abi::{
 };
 use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
-use super::abi_args::NsPid;
 use super::{EpollKqueue, Fd, GuestPtr, HostFd, inode_for_path, linux_mode};
-use carrick_abi::{NsGid, NsUid};
 
 /// Peer credentials recorded at connect/accept/socketpair time for an AF_UNIX socket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SocketPeerCred {
-    pub(crate) pid: NsPid,
-    pub(crate) uid: NsUid,
-    pub(crate) gid: NsGid,
-}
+pub(crate) use crate::kernel::SocketPeerCred;
 
 #[derive(Debug, Clone)]
 pub(super) struct EpollInterest {
@@ -1193,10 +1186,6 @@ pub(super) enum OpenDescription {
         /// empty because Linux does not copy listener memberships across accept.
         mcast_memberships: Vec<SocketMulticastMembership>,
         synthetic_recv: VecDeque<(Vec<u8>, Vec<u8>)>,
-        peer_cred: Option<SocketPeerCred>,
-        cork_buffer: Vec<u8>,
-        cork_dest_addr: Option<Vec<u8>>,
-        cork_enabled: bool,
     },
     /// A regular file backed by a REAL macOS file descriptor into the
     /// `--fs host` overlay scratch. Unlike `File` (which caches bytes
@@ -1275,16 +1264,7 @@ pub(super) enum OpenDescription {
 
 impl Drop for OpenDescription {
     fn drop(&mut self) {
-        if let Self::HostSocket {
-            host_fd,
-            cork_buffer,
-            ..
-        } = self
-        {
-            // Linux discards a still-corked datagram on the last close
-            // (`socketcredmore` oracle: `msg_more_then_close_flushes=false`);
-            // only a plain send or a cork release emits it.
-            cork_buffer.clear();
+        if let Self::HostSocket { host_fd, .. } = self {
             crate::dispatch::net::support::unregister_unix_listener(host_fd.raw());
         }
     }
