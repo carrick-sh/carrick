@@ -2888,10 +2888,10 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `forkprotectexec` adds child `mprotect` execute-permission changes over
 /// inherited COW pages; `fifoopenmatrix` adds the FIFO open
 /// handshake/EINTR/SA_RESTART matrix.
-/// The authoritative inventory contains 510 probe sources: 483 conformance
-/// sources (460 generic, 23 dedicated), 26 performance sources, and one helper.
-/// Both libc lanes therefore gate 966 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 510;
+/// The authoritative inventory contains 511 probe sources: 484 conformance
+/// sources (461 generic, 23 dedicated), 26 performance sources, and one helper.
+/// Both libc lanes therefore gate 968 conformance rows.
+const PROBE_SOURCE_COUNT: usize = 511;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -3142,7 +3142,7 @@ fn probe_needs_unconfined(name: &str) -> bool {
 /// for `CAP_SYS_TIME`). The harness passes `--cap-add <CAP>` to both
 /// `carrick run` and `docker run` so the probe exercises the syscall rather
 /// than getting rejected at capability validation on either side.
-const SYS_TIME_PROBES: &[&str] = &["clocksettimevdso"];
+const SYS_TIME_PROBES: &[&str] = &["adjtimexmodel", "clocksettimevdso"];
 /// `fanotify_init(2)` needs `CAP_SYS_ADMIN`; Docker's default cap set drops
 /// it, so an unprivileged oracle fails the group creation and the probe's
 /// fanotify lines would be vacuous on both sides.
@@ -4647,9 +4647,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 460);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 483);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 966);
+    assert_eq!(generic.len(), 461);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 484);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 968);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
@@ -4765,6 +4765,7 @@ fn clone_files_probes_run_without_container_seccomp() {
 #[test]
 fn clock_settime_probe_is_granted_cap_sys_time_on_both_sides() {
     assert_eq!(probe_capabilities("clocksettimevdso"), ["SYS_TIME"]);
+    assert_eq!(probe_capabilities("adjtimexmodel"), ["SYS_TIME"]);
     assert_eq!(probe_capabilities("pipeblockedge"), ["SYS_ADMIN"]);
     assert_eq!(probe_capabilities("fanotifyondir"), ["SYS_ADMIN"]);
     assert!(probe_capabilities("futexrealtime").is_empty());
