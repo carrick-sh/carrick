@@ -2446,30 +2446,6 @@ impl SyscallDispatcher {
         }
     }
 
-    /// The guest's `(type, protocol)` for `fd` in ONE lock acquisition.
-    ///
-    /// `recvmsg` needs both — the protocol to spot an SCTP stream, the type to
-    /// decide whether MSG_TRUNC can apply — and asking separately took the open
-    /// description's lock three times per read. That cost nothing measurable
-    /// single-threaded (`go-net_http` stays at ~49 s) but lock contention
-    /// amplifies superlinearly, and the suite went from a 53.8 s MATCH to a
-    /// 540 s truncation under 8-worker gate load.
-    fn socket_guest_type_and_protocol(&self, fd: i32) -> Option<(i32, i32)> {
-        let open_file = self.open_file(fd)?;
-        let open = open_file.description.read()?;
-        match &*open {
-            OpenDescription::HostSocket {
-                type_, protocol, ..
-            } => Some((*type_, *protocol)),
-            OpenDescription::Netlink {
-                sock_type,
-                protocol,
-                ..
-            } => Some((*sock_type, *protocol)),
-            _ => None,
-        }
-    }
-
     fn socket_guest_domain_type_and_protocol(&self, fd: i32) -> Option<(i32, i32, i32)> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read()?;
@@ -10175,9 +10151,9 @@ impl SyscallDispatcher {
         // when a read consumes the END of one. Its TCP backing has neither
         // property, so cap the read at the current boundary and answer EOR from
         // the recorded one.
-        let (guest_type, guest_protocol) = match self.socket_guest_type_and_protocol(fd) {
-            Some(pair) => (Some(pair.0), Some(pair.1)),
-            None => (None, None),
+        let (_, guest_type, guest_protocol) = match self.socket_guest_domain_type_and_protocol(fd) {
+            Some(triple) => (Some(triple.0), Some(triple.1), Some(triple.2)),
+            None => (None, None, None),
         };
         let is_sctp_stream = guest_protocol == Some(LINUX_IPPROTO_SCTP);
         let sctp_peek = flags & LinuxMsgFlags::PEEK.bits() != 0;

@@ -6468,70 +6468,7 @@ impl SyscallDispatcher {
                     let rest = &cwd[resolved_old.len() + 1..];
                     self.set_cwd(&format!("{resolved_new}/{rest}"));
                 }
-                let file_table = self.captured_file_table();
-                for (_, open_file) in file_table.read_open_files().iter() {
-                    if let Some(mut desc) = open_file.description.write() {
-                        match &mut *desc {
-                            OpenDescription::Directory {
-                                path,
-                                metadata,
-                                listing,
-                                ..
-                            } => {
-                                if *path == resolved_old {
-                                    *path = resolved_new.clone();
-                                    metadata.path = Path::new(&resolved_new).to_path_buf();
-                                    *listing = DirListing::Pending;
-                                } else if path.starts_with(&resolved_old)
-                                    && path.as_bytes().get(resolved_old.len()) == Some(&b'/')
-                                {
-                                    let rest = &path[resolved_old.len() + 1..];
-                                    let updated = format!("{resolved_new}/{rest}");
-                                    *path = updated.clone();
-                                    metadata.path = Path::new(&updated).to_path_buf();
-                                    *listing = DirListing::Pending;
-                                }
-                            }
-                            OpenDescription::File { path, metadata, .. } => {
-                                if *path == resolved_old {
-                                    *path = resolved_new.clone();
-                                    metadata.path = Path::new(&resolved_new).to_path_buf();
-                                } else if path.starts_with(&resolved_old)
-                                    && path.as_bytes().get(resolved_old.len()) == Some(&b'/')
-                                {
-                                    let rest = &path[resolved_old.len() + 1..];
-                                    let updated = format!("{resolved_new}/{rest}");
-                                    *path = updated.clone();
-                                    metadata.path = Path::new(&updated).to_path_buf();
-                                }
-                            }
-                            OpenDescription::HostFile { metadata, .. } => {
-                                let path_str = metadata.path.to_string_lossy().into_owned();
-                                if path_str == resolved_old {
-                                    metadata.path = Path::new(&resolved_new).to_path_buf();
-                                } else if path_str.starts_with(&resolved_old)
-                                    && path_str.as_bytes().get(resolved_old.len()) == Some(&b'/')
-                                {
-                                    let rest = &path_str[resolved_old.len() + 1..];
-                                    metadata.path =
-                                        Path::new(&format!("{resolved_new}/{rest}")).to_path_buf();
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                let mut fd_open_paths = file_table.write_fd_open_paths();
-                for (_, open_path) in fd_open_paths.iter_mut() {
-                    if *open_path == resolved_old {
-                        *open_path = resolved_new.clone();
-                    } else if open_path.starts_with(&resolved_old)
-                        && open_path.as_bytes().get(resolved_old.len()) == Some(&b'/')
-                    {
-                        let rest = &open_path[resolved_old.len() + 1..];
-                        *open_path = format!("{resolved_new}/{rest}");
-                    }
-                }
+                self.rename_open_paths(&resolved_old, &resolved_new);
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             Err(errno) => Ok(DispatchOutcome::errno(errno)),
