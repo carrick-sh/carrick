@@ -188,7 +188,29 @@ pub enum PageTableError {
     MissingArenaSource,
     /// A conflicting `TableArenaSource` bound to another lease is already installed.
     ConflictingArenaSource,
+    /// Host backing pointer for the page-table arena at base IPA was unresolved.
+    UnresolvedArena(u64),
 }
+
+impl core::fmt::Display for PageTableError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::OutOfTables => write!(f, "out of page tables"),
+            Self::BadAddress => write!(f, "bad address"),
+            Self::MissingArenaSource => write!(f, "missing arena source"),
+            Self::ConflictingArenaSource => write!(f, "conflicting arena source"),
+            Self::UnresolvedArena(base) => {
+                write!(
+                    f,
+                    "unresolved stage-1 arena host backing at IPA {:#x}",
+                    base
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PageTableError {}
 
 /// Per-level table index for `va` (4 KiB granule, 40-bit IPA).
 pub fn indices(va: u64) -> [usize; 4] {
@@ -622,6 +644,26 @@ impl PageTableManager {
         self.arena_source.as_deref()
     }
 
+    /// Guest-physical base addresses of all extension arenas attached to this manager.
+    pub fn extension_arena_bases(&self) -> Vec<u64> {
+        self.arenas[1..].iter().map(|a| a.base).collect()
+    }
+
+    /// Pop all extension arenas and return them to the installed arena source.
+    /// Returns the bases of the retired extension arenas so callers can unmap them.
+    pub fn retire_extension_arenas(&mut self) -> Vec<u64> {
+        let mut bases = Vec::new();
+        while self.arenas.len() > 1 {
+            if let Some(arena) = self.arenas.pop() {
+                bases.push(arena.base);
+                if let Some(source) = self.arena_source.as_mut() {
+                    source.return_arena(carrick_guest_mem::Gpa(arena.base));
+                }
+            }
+        }
+        bases
+    }
+
     fn total_pages(&self) -> usize {
         self.arenas
             .iter()
@@ -886,7 +928,10 @@ impl PageTableManager {
     ///
     /// # Safety
     /// The resolver must return valid, writable mappings for the touched arenas.
-    pub unsafe fn sync_to_host(&mut self, resolver: impl HostArenaResolver) {
+    pub unsafe fn sync_to_host(
+        &mut self,
+        resolver: impl HostArenaResolver,
+    ) -> Result<(), PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
         for (loc, is_ptr) in self.dirty.drain(..) {
             let arena = &self.arenas[loc.arena];
@@ -898,16 +943,18 @@ impl PageTableManager {
                 // visible before the pointer that exposes them.
                 fence(Ordering::SeqCst);
             }
-            if let Some(host) = resolver.host_ptr_for_base(arena.base) {
-                // Offsets are 8-byte aligned (index*8), so this is a single atomic
-                // store the guest walker observes whole.
-                unsafe {
-                    let slot = host.add(loc.offset) as *mut AtomicU64;
-                    (*slot).store(v, Ordering::SeqCst);
-                }
+            let host = resolver
+                .host_ptr_for_base(arena.base)
+                .ok_or(PageTableError::UnresolvedArena(arena.base))?;
+            // Offsets are 8-byte aligned (index*8), so this is a single atomic
+            // store the guest walker observes whole.
+            unsafe {
+                let slot = host.add(loc.offset) as *mut AtomicU64;
+                (*slot).store(v, Ordering::SeqCst);
             }
         }
         fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Open an undo journal covering every descriptor edit from here until
@@ -1079,7 +1126,11 @@ impl PageTableManager {
     ///
     /// # Safety
     /// `resolver` must return readable mappings for all arenas walked.
-    pub unsafe fn debug_walk_host(&self, resolver: impl HostArenaResolver, va: u64) -> [u64; 4] {
+    pub unsafe fn debug_walk_host(
+        &self,
+        resolver: impl HostArenaResolver,
+        va: u64,
+    ) -> Result<[u64; 4], PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering};
 
         let idx = indices(va);
@@ -1089,9 +1140,9 @@ impl PageTableManager {
         #[allow(clippy::needless_range_loop)]
         for level in 0..4_usize {
             let off = table_off + idx[level] * 8;
-            let Some(host) = resolver.host_const_ptr_for_base(current_base) else {
-                break;
-            };
+            let host = resolver
+                .host_const_ptr_for_base(current_base)
+                .ok_or(PageTableError::UnresolvedArena(current_base))?;
             let desc = unsafe {
                 let slot = host.add(off).cast::<AtomicU64>();
                 (*slot).load(Ordering::Acquire)
@@ -1114,7 +1165,7 @@ impl PageTableManager {
                 Err(_) => break,
             }
         }
-        out
+        Ok(out)
     }
 
     /// Translate a guest VA to its stage-1 output address (the IPA carrick handed
@@ -2352,7 +2403,9 @@ mod tests {
             let mut host = journalled.as_bytes().to_vec();
             // SAFETY: `host` is a writable buffer of exactly the region length
             // and no guest is running against this test-local manager.
-            unsafe { journalled.rollback_undo((journalled.base(), host.as_mut_ptr())) };
+            unsafe {
+                journalled.rollback_undo((journalled.base(), host.as_mut_ptr()));
+            };
 
             assert!(
                 !journalled.undo_is_open(),
@@ -3925,7 +3978,7 @@ mod tests {
             "page in extension arena translated"
         );
 
-        unsafe { mgr.sync_to_host(&resolver[..]) };
+        unsafe { mgr.sync_to_host(&resolver[..]).unwrap() };
         assert_ne!(
             host_arena0,
             vec![0u8; LINUX_PAGE_TABLES_SIZE as usize],
@@ -3936,6 +3989,136 @@ mod tests {
             vec![0u8; LINUX_PAGE_TABLES_SIZE as usize],
             "host arena 1 written"
         );
+    }
+
+    #[test]
+    fn sync_to_host_errors_on_unresolved_arena() {
+        use crate::memory::LINUX_PAGE_TABLES_SIZE;
+        use carrick_guest_mem::Gpa;
+        use std::sync::{Arc, Mutex};
+
+        let mut mgr = hvpatch_manager();
+        exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
+        let va = next_block + 0x1000;
+
+        let ext_base = Gpa(0xb0_0000_0000);
+        let available = Arc::new(Mutex::new(vec![ext_base]));
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let source = TestArenaSource {
+            id: TableArenaSourceId(ext_base),
+            available: Arc::clone(&available),
+            returned: Arc::clone(&returned),
+        };
+        mgr.set_arena_source(Box::new(source)).unwrap();
+
+        mgr.set_rw(va, 0x1000, false)
+            .expect("mapping succeeds with extension arena");
+        assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
+
+        let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        // Only provide host mapping for root arena, omitting ext_base!
+        let resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
+        let res = unsafe { mgr.sync_to_host(&resolver[..]) };
+        assert_eq!(res, Err(PageTableError::UnresolvedArena(ext_base.0)));
+    }
+
+    #[test]
+    fn rollback_undo_returns_arena_when_resolver_missing_extension() {
+        use crate::memory::LINUX_PAGE_TABLES_SIZE;
+        use carrick_guest_mem::Gpa;
+        use std::sync::{Arc, Mutex};
+
+        let mut mgr = hvpatch_manager();
+        exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
+        let va = next_block + 0x1000;
+
+        let ext_base = Gpa(0xb0_0000_0000);
+        let available = Arc::new(Mutex::new(vec![ext_base]));
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let source = TestArenaSource {
+            id: TableArenaSourceId(ext_base),
+            available: Arc::clone(&available),
+            returned: Arc::clone(&returned),
+        };
+        mgr.set_arena_source(Box::new(source)).unwrap();
+
+        mgr.begin_undo();
+        mgr.set_rw(va, 0x1000, false)
+            .expect("mapping succeeds with extension arena");
+        assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
+
+        let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        // Missing ext_base in resolver
+        let resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
+        unsafe { mgr.rollback_undo(&resolver[..]) };
+        // Confirm arena was still returned despite host error
+        assert_eq!(returned.lock().unwrap().as_slice(), &[ext_base]);
+        assert_eq!(mgr.pool_stats().3, 1, "pool reports 1 arena after rollback");
+    }
+
+    #[test]
+    fn debug_walk_host_errors_on_unresolved_arena() {
+        use crate::memory::LINUX_PAGE_TABLES_SIZE;
+        use carrick_guest_mem::Gpa;
+        use std::sync::{Arc, Mutex};
+
+        let mut mgr = hvpatch_manager();
+        exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
+        let va = next_block + 0x1000;
+
+        let ext_base = Gpa(0xb0_0000_0000);
+        let available = Arc::new(Mutex::new(vec![ext_base]));
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let source = TestArenaSource {
+            id: TableArenaSourceId(ext_base),
+            available: Arc::clone(&available),
+            returned: Arc::clone(&returned),
+        };
+        mgr.set_arena_source(Box::new(source)).unwrap();
+
+        mgr.set_rw(va, 0x1000, false)
+            .expect("mapping succeeds with extension arena");
+
+        let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        let full_resolver = [
+            (mgr.base(), host_arena0.as_mut_ptr()),
+            (ext_base.0, host_arena1.as_mut_ptr()),
+        ];
+        unsafe {
+            mgr.restore_quiesced_snapshot_to_host(&full_resolver[..]);
+        };
+
+        // Const resolver missing ext_base:
+        let partial_resolver =
+            crate::page_table::const_resolver(|base: u64| -> Option<*const u8> {
+                if base == mgr.base() {
+                    Some(host_arena0.as_ptr())
+                } else {
+                    None
+                }
+            });
+        let res = unsafe { mgr.debug_walk_host(partial_resolver, va) };
+        assert_eq!(res, Err(PageTableError::UnresolvedArena(ext_base.0)));
+
+        // Const resolver with ext_base succeeds:
+        let good_resolver = crate::page_table::const_resolver(|base: u64| -> Option<*const u8> {
+            if base == mgr.base() {
+                Some(host_arena0.as_ptr())
+            } else if base == ext_base.0 {
+                Some(host_arena1.as_ptr())
+            } else {
+                None
+            }
+        });
+        let walk = unsafe { mgr.debug_walk_host(good_resolver, va).unwrap() };
+        assert_eq!(walk, mgr.debug_walk(va));
     }
 
     #[test]

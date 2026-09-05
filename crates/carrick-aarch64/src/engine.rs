@@ -736,6 +736,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &mut self,
         mut manager: Option<PageTableManager>,
     ) -> Result<(), TrapError> {
+        let old_mgr = self.page_tables.lock().take();
+        if let Some(mut old) = old_mgr {
+            self.vm.retire_stage1_extension_arenas(&mut old)?;
+        }
         if let (Some(manager), Some(source)) = (manager.as_mut(), self.pending_arena_source.take())
         {
             // A source installed before this rebuild belongs to the new
@@ -960,8 +964,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     "stage-1 page-table manager conflicting arena source".to_owned(),
                 ));
             }
+            Err(PageTableError::UnresolvedArena(base)) => {
+                return Err(MemoryError::HostMap(format!(
+                    "stage-1 page-table manager unresolved arena 0x{base:x}",
+                )));
+            }
         };
         if outcome.changed {
+            self.vm
+                .publish_stage1_extension_arenas(mgr)
+                .map_err(|error| {
+                    MemoryError::HostMap(format!(
+                        "publish stage-1 extension arenas failed: {error:?}"
+                    ))
+                })?;
             // SAFETY: `host` backs the live page-table region for the whole process
             // lifetime; the manager writes only 8-byte-aligned descriptor slots
             // within `[host, host + size)`.
@@ -971,7 +987,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         .host_ptr(base, size)
                         .or_else(|| (base == pt_base).then_some(host))
                 })
-            };
+            }
+            .map_err(|error| {
+                MemoryError::HostMap(format!(
+                    "sync stage-1 page tables to host failed: {error:?}"
+                ))
+            })?;
         }
         Ok(outcome)
     }
@@ -1046,7 +1067,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
         // SAFETY: `host_ptr` resolved the complete live page-table mapping at
         // `pt_base`, and the manager's base/length were checked above.
-        Ok(unsafe {
+        unsafe {
             manager.debug_walk_host(
                 |base| {
                     self.vm
@@ -1055,6 +1076,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 },
                 va,
             )
+        }
+        .map_err(|error| {
+            MemoryError::HostMap(format!("debug walk stage-1 page tables failed: {error:?}"))
         })
     }
 

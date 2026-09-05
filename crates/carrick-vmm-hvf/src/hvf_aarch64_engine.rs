@@ -1394,6 +1394,20 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.bind_stage1_page_tables(page_tables);
     }
 
+    fn publish_stage1_extension_arenas(
+        &mut self,
+        manager: &carrick_mem::page_table::PageTableManager,
+    ) -> Result<(), TrapError> {
+        self.state.publish_stage1_extension_arenas(manager)
+    }
+
+    fn retire_stage1_extension_arenas(
+        &mut self,
+        manager: &mut carrick_mem::page_table::PageTableManager,
+    ) -> Result<(), TrapError> {
+        self.state.retire_stage1_extension_arenas(manager)
+    }
+
     // ── memory windows + stage-2 ──
 
     fn map_stage2(
