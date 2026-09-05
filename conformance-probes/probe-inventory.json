@@ -19,6 +19,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "adjtimexmodel": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "adjtimexstate": {
     "class": "conformance",
     "excluded": false,
