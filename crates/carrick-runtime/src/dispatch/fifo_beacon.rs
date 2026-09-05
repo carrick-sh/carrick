@@ -164,6 +164,8 @@ struct State {
     read_ends: HashMap<i32, (u64, u64)>,
     /// parked writer token_id → FIFO identity.
     parked_writers: HashMap<u64, (u64, u64)>,
+    /// Next parked-writer token id; minted under this lock.
+    next_parked_writer_token: u64,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
@@ -248,14 +250,18 @@ impl ParkedOpenerToken {
     /// Create a parked writer token waiting for a reader. Asserts `writers_present`
     /// in the FIFO's beacon, and returns the `readers_present` pipe read fd to poll on.
     pub(crate) fn new_writer(id: (u64, u64)) -> Option<(i32, Self)> {
-        static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let token_id = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
         let State {
             beacons,
             parked_writers,
+            next_parked_writer_token,
             ..
         } = &mut *st;
+        // Token ids are minted under the same lock that owns the parked-writer
+        // tables, so the counter is part of `State` rather than a second
+        // process-global.
+        let token_id = *next_parked_writer_token;
+        *next_parked_writer_token += 1;
         let beacon = beacons.entry(id).or_insert_with(Beacon::new_for_identity);
         let readers_present_read_fd = beacon.readers_present.read_fd;
         if readers_present_read_fd < 0 {
