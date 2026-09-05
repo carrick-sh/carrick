@@ -266,8 +266,8 @@ def reconcile_k1_taxonomy() -> int:
 
 def main() -> int:
     steps = (
-        ("runtime-aborts fingerprints", reconcile_runtime_aborts),
         ("host-authority positions", reconcile_host_authority),
+        ("runtime-aborts fingerprints", reconcile_runtime_aborts),
         ("dispatch-lock-authority lines", reconcile_dispatch_locks),
         ("k1 operation inventory", reconcile_k1_inventory),
         ("k1 callsite taxonomy", reconcile_k1_taxonomy),
