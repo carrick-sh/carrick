@@ -22,3 +22,4 @@ __pycache__/
 # scratch / local tooling (accidentally committed in phase-2; keep on disk, out of git)
 last_1000_commits.txt
 .codex/
+conformance-probes/target
