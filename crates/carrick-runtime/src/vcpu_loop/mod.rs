@@ -1587,33 +1587,16 @@ impl HvpatchRuntimeDirectory {
     /// pump's `kick_all` reaches only live vCPU leases and its futex notify
     /// only enrolled futex waiters (the `waitrestart` hang).
     fn wake_all_tasks_for_process_signal(&self) {
-        let debug = std::env::var_os("CARRICK_SIG_DEBUG").is_some();
         let endpoints: Vec<HvpatchRuntimeEndpoint> =
             self.endpoints.lock().values().cloned().collect();
-        if debug {
-            eprintln!(
-                "SIGDBG process-wake broadcast: endpoints={}",
-                endpoints.len()
-            );
-        }
         for endpoint in endpoints {
             if endpoint.kernel.upgrade().is_none() {
                 continue;
             }
             let Ok(snapshot) = endpoint.task_binding.capture_signal_snapshot() else {
-                if debug {
-                    eprintln!("SIGDBG process-wake broadcast: stale binding skipped");
-                }
                 continue;
             };
-            let woken = snapshot.context().task().wake();
-            if debug {
-                eprintln!(
-                    "SIGDBG process-wake broadcast: task={:?} subscribed_wake={}",
-                    snapshot.context().task().key(),
-                    woken
-                );
-            }
+            snapshot.context().task().wake();
         }
     }
 
@@ -6693,13 +6676,6 @@ where
                     env,
                     ExecCompletionOrigin::GuestSyscall,
                 )?;
-                if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
-                    eprintln!(
-                        "SIGDBG execve-arm tid={:?} prepared={}",
-                        self.state.this_tid,
-                        matches!(preparation, exec::ExecvePreparation::Prepared(_)),
-                    );
-                }
                 match preparation {
                     exec::ExecvePreparation::Complete(Some(outcome)) => {
                         self.state.retire_syscall()?;
@@ -7238,15 +7214,6 @@ where
         // or touch guest state after that terminal ownership transition.
         let exec_finish =
             thread_should_finish_for_exec_replacement(&self.state.registry, self.state.this_tid);
-        if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
-            eprintln!(
-                "SIGDBG quantum-check registry={:p} tid={:?} live={} finish={exec_finish} terminal={}",
-                std::sync::Arc::as_ptr(&self.state.registry),
-                self.state.this_tid,
-                self.state.registry.is_live(self.state.this_tid),
-                self.phase.is_terminal_transition(),
-            );
-        }
         if !self.phase.is_terminal_transition() && (self.kernel.process_exiting() || exec_finish) {
             self.state.trace_hvpatch_thread_terminal(
                 carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAtLoopTop,
@@ -7764,35 +7731,38 @@ where
                 // on them, and a probe that never fires reads as "the fault did
                 // not happen". They were part of this handling before it was
                 // ported off the welded loop and stay part of it.
-                let instruction = engine
-                    .read_bytes(elr, 4)
-                    .ok()
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(u32::from_le_bytes);
-                let (base_register, base_value) = instruction.map_or((u32::MAX, 0), |word| {
-                    let index = (word >> 5) & 0x1f;
-                    let value = (index < 31)
-                        .then(|| engine.get_reg(carrick_hal::Reg::X(index)).ok())
-                        .flatten()
-                        .unwrap_or(0);
-                    (index, value)
+                // Both probes take their arguments LAZILY: the instruction
+                // fetch (a guest read, two heap allocations) and the register
+                // reads run only when a D script is attached. This branch is
+                // taken on every data abort, so eager decoding here was a
+                // per-fault allocation on the happy path.
+                crate::probes::vcpu_fault_regs_with(|| {
+                    let instruction = engine
+                        .read_bytes(elr, 4)
+                        .ok()
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u32::from_le_bytes);
+                    let (base_register, base_value) = instruction.map_or((u32::MAX, 0), |word| {
+                        let index = (word >> 5) & 0x1f;
+                        let value = (index < 31)
+                            .then(|| engine.get_reg(carrick_hal::Reg::X(index)).ok())
+                            .flatten()
+                            .unwrap_or(0);
+                        (index, value)
+                    });
+                    (
+                        syndrome,
+                        elr,
+                        far,
+                        instruction.map_or(u64::MAX, u64::from),
+                        base_register,
+                        base_value,
+                    )
                 });
-                crate::probes::vcpu_fault_regs(
-                    syndrome,
-                    elr,
-                    far,
-                    instruction.map_or(u64::MAX, u64::from),
-                    base_register,
-                    base_value,
-                );
-                crate::probes::vcpu_fault_gprs(
-                    engine.get_reg(carrick_hal::Reg::X(0)).unwrap_or(0),
-                    engine.get_reg(carrick_hal::Reg::X(1)).unwrap_or(0),
-                    engine.get_reg(carrick_hal::Reg::X(2)).unwrap_or(0),
-                    engine.get_reg(carrick_hal::Reg::X(3)).unwrap_or(0),
-                    engine.get_reg(carrick_hal::Reg::X(4)).unwrap_or(0),
-                    engine.get_reg(carrick_hal::Reg::X(5)).unwrap_or(0),
-                );
+                crate::probes::vcpu_fault_gprs_with(|| {
+                    let x = |n: u32| engine.get_reg(carrick_hal::Reg::X(n)).unwrap_or(0);
+                    (x(0), x(1), x(2), x(3), x(4), x(5))
+                });
                 if let Some((ttbr, descriptors)) = engine.diagnostic_fault_page_tables(far) {
                     crate::probes::pt_fault_walk(
                         far,
@@ -7816,22 +7786,6 @@ where
                 let Some((signum, si_code, si_addr)) = lower_el0_fault(syndrome, elr, far) else {
                     // Unclassified EL0 fault: Linux forces the default action
                     // (terminate by SIGSEGV).
-                    if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
-                        let regs: Vec<String> = (0..=30)
-                            .map(|index| {
-                                engine
-                                    .get_reg(carrick_hal::Reg::X(index))
-                                    .map_or_else(|_| "?".to_owned(), |value| format!("{value:#x}"))
-                            })
-                            .collect();
-                        eprintln!(
-                            "[FAULTDBG tid={:?} linux_tid={:?}] UNCLASSIFIED EL0 fault esr={syndrome:#x} ec={ec:#x} elr={elr:#x} far={far:#x} last_syscall={last:?} regs={regs:?} -> SIGSEGV terminate",
-                            self.state.this_tid,
-                            self.state.linux_tid,
-                            ec = (syndrome >> 26) & 0x3f,
-                            last = engine.last_syscall_nr(),
-                        );
-                    }
                     self.kernel.record_fatal_signal(FatalSignalRecord {
                         image_generation: self.state.fatal_image_generation,
                         tid: self.state.linux_tid,
@@ -7851,23 +7805,6 @@ where
                         VcpuLoopOutcome::ProcessExit(Box::new(result)),
                     ));
                 };
-                if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
-                    let base =
-                        (base_register < 31).then(|| format!("x{base_register}={base_value:#x}"));
-                    let regs: Vec<_> = (0..=12)
-                        .map(|index| {
-                            engine
-                                .get_reg(carrick_hal::Reg::X(index))
-                                .map_or_else(|_| "?".to_owned(), |value| format!("{value:#x}"))
-                        })
-                        .collect();
-                    eprintln!(
-                        "[FAULTDBG tid={:?}] classified EL0 fault esr={syndrome:#x} ec={:#x} elr={elr:#x} far={far:#x} direct={from_el0_direct} last_syscall={:?} insn={instruction:?} base={base:?} x0..x12={regs:?}",
-                        self.state.this_tid,
-                        (syndrome >> 26) & 0x3f,
-                        engine.last_syscall_nr()
-                    );
-                }
                 // Raw hardware/host faults can decode as MAPERR even when
                 // Carrick tracks a live VMA denying the access. Upgrade from the
                 // shared protection metadata (LTP mmap05 / roprotect probe).
@@ -10202,11 +10139,17 @@ where
 /// outer per-run timeout (~40s), so a real wedge aborts cleanly here rather than
 /// via the harness SIGKILL. Override with `CARRICK_MAX_WALL_MS`.
 fn trap_watchdog_wall_window() -> std::time::Duration {
-    let ms = std::env::var("CARRICK_MAX_WALL_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(30_000);
-    std::time::Duration::from_millis(ms)
+    // Read once: this sits on the watchdog checkpoint that every trap
+    // quantum passes through, and a `getenv` per checkpoint was measurable
+    // (0.6% of the arena-churn profile) for a value that never changes.
+    static WINDOW: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let ms = std::env::var("CARRICK_MAX_WALL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30_000);
+        std::time::Duration::from_millis(ms)
+    })
 }
 
 /// One progress-aware trap-watchdog checkpoint decision.
