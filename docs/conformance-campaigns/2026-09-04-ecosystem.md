@@ -1083,3 +1083,26 @@ mapping row), and a rebind heuristic that stole a shared authority's manager
   accessor brought it back to 10 (`f8f997110`) rather than raising the cap.
 - Workers in flight: `stage1-authority` (page-table ownership as a type),
   `frame-pool` (pre-mapped frames; no syscalls per COW/sparse fault).
+
+## 2026-09-05: alias-unmap landing measured, and its one regression
+
+- **`pagetablegrow` standalone: 53.8 s → 9.7 s** after the in-place alias
+  unmap (`f7c87e272`) and the O(1) extension-arena resolver.
+- **Regression caught by the probe gate, not by the worker's tests**:
+  `mincoreedge` aborted 3/3 with "alias registry changed under topology
+  lock". The planner deduped co-holders of a physical extent by sequence
+  number, but the two fragments of a split row keep the row's sequence, so
+  planning the head's unmap dropped the tail and released an extent the
+  registry still held. Fixed in `19a3fd139` (row identity = sequence plus
+  semantic start) with a sequence test that replays the probe: middle page,
+  head, tail. The worker's oracle test only ever unmapped once from a fresh
+  registry; any plan/apply pair needs a SEQUENCE test.
+- **Launch-shape trap**: `alpine /bin/sh -c 'a && b && /tmp/p'` tail-execs
+  the probe (busybox), so it runs as PID 1 and a session leader under both
+  carrick and Docker. A manual `ptyflagmatrix` run through that shape
+  "diverged" on TIOCSCTTY while the gate's shard matched; the isolated
+  two-case check and the gate agree with the oracle.
+- Frame-pool worker round 1 returned with four findings: a check-then-act
+  topology-lock bypass on the fault path (`is_fork_in_flight`), a
+  frame-pool/state lock-order inversion against VM destroy, swallowed pool
+  creation failures, and an out-of-fence test edit.
