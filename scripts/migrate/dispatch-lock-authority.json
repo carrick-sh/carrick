@@ -40,7 +40,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::dup_stdio_pty_role::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3909,
+      "line": 3958,
       "item": "DispatchError::dup_stdio_pty_role",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -49,7 +49,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::try_vfs_open::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4157,
+      "line": 4206,
       "item": "DispatchError::try_vfs_open",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -58,7 +58,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::proc_self_fd_tty_link::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 6195,
+      "line": 6244,
       "item": "DispatchError::proc_self_fd_tty_link",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -67,7 +67,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 8612,
+      "line": 8661,
       "item": "SyscallDispatcher::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -76,7 +76,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#2",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 8639,
+      "line": 8688,
       "item": "SyscallDispatcher::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -85,7 +85,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#3",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 9118,
+      "line": 9167,
       "item": "SyscallDispatcher::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -94,7 +94,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::readlinkat::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 14484,
+      "line": 14533,
       "item": "SyscallDispatcher::readlinkat",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -148,7 +148,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::DispatchOutcome::bind_hvpatch_process_exact::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5176,
+      "line": 5192,
       "item": "DispatchOutcome::bind_hvpatch_process_exact",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -157,7 +157,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::R::hvpatch_process::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5407,
+      "line": 5423,
       "item": "R::hvpatch_process",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -166,7 +166,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::SnapshotError::fork_clone_with_prepared_mm_authorized_observed::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5668,
+      "line": 5684,
       "item": "SnapshotError::fork_clone_with_prepared_mm_authorized_observed",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -175,7 +175,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::SnapshotError::event_ring_guest_pid::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5785,
+      "line": 5801,
       "item": "SnapshotError::event_ring_guest_pid",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -184,7 +184,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::String::core_process_snapshot::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6717,
+      "line": 6733,
       "item": "String::core_process_snapshot",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -193,7 +193,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::String::set_executable_path::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7175,
+      "line": 7191,
       "item": "String::set_executable_path",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -202,7 +202,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::String::enter_binfmt::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7190,
+      "line": 7206,
       "item": "String::enter_binfmt",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -211,7 +211,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::String::set_native_x86_64::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7287,
+      "line": 7303,
       "item": "String::set_native_x86_64",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -220,7 +220,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::u8::set_executable_identity::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7311,
+      "line": 7327,
       "item": "u8::set_executable_identity",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -229,7 +229,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::u8::current_exec_env::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7325,
+      "line": 7341,
       "item": "u8::current_exec_env",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -238,7 +238,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::E::close_open_file_and_free_pty::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7712,
+      "line": 7728,
       "item": "E::close_open_file_and_free_pty",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -247,7 +247,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::E::register_controlling_pty::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7910,
+      "line": 7926,
       "item": "E::register_controlling_pty",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -256,7 +256,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::E::initialize_controlling_tty_for::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7915,
+      "line": 7931,
       "item": "E::initialize_controlling_tty_for",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -265,7 +265,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::SyntheticProcContext::synthetic_proc_context_observed::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 10738,
+      "line": 10754,
       "item": "SyntheticProcContext::synthetic_proc_context_observed",
       "category": "proc",
       "expression": ".proc.lock()",
