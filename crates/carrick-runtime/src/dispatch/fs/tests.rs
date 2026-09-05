@@ -4819,8 +4819,8 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
             [r_fd, BUF_ADDR, 1, 0, 0, 0],
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_EBADF),
-        "pwrite64 on pipe read end must return EBADF"
+        DispatchOutcome::errno(LINUX_ESPIPE),
+        "pwrite64 on pipe read end must return ESPIPE"
     );
     assert_eq!(
         dispatch_call(
@@ -4829,8 +4829,8 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
             [r_fd, IOV_ADDR, 1, 0, 0, 0],
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_EBADF),
-        "pwritev on pipe read end must return EBADF"
+        DispatchOutcome::errno(LINUX_ESPIPE),
+        "pwritev on pipe read end must return ESPIPE"
     );
 
     // 3. Correct directions succeed
