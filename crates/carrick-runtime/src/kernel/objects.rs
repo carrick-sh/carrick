@@ -927,6 +927,76 @@ impl CapturedAsyncIoOwner {
 /// Reads take no description lock: every field is either an atomic or a short
 /// `Mutex`, so the hot syscall prologue (`read(2)` asks seven of these
 /// questions before a byte moves) does not serialize on the backing's `RwLock`.
+/// Peer credentials recorded at connect/accept/socketpair time for an AF_UNIX socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketPeerCred {
+    pub pid: crate::dispatch::NsPid,
+    pub uid: NsUid,
+    pub gid: NsGid,
+}
+
+/// Cork buffer and destination state for datagram coalescing (MSG_MORE / UDP_CORK / TCP_CORK).
+#[derive(Debug, Default)]
+pub struct SocketCork {
+    pub enabled: bool,
+    pub buffer: Vec<u8>,
+    pub dest: Option<Vec<u8>>,
+}
+
+impl SocketCork {
+    pub fn is_active(&self) -> bool {
+        self.enabled || !self.buffer.is_empty()
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
+    pub fn stage(&mut self, bytes: &[u8], dest: Option<&[u8]>) {
+        self.buffer.extend_from_slice(bytes);
+        if self.dest.is_none() {
+            self.dest = dest.map(<[u8]>::to_vec);
+        }
+    }
+
+    pub fn take(&mut self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        if self.buffer.is_empty() {
+            None
+        } else {
+            let buf = std::mem::take(&mut self.buffer);
+            let dest = self.dest.take();
+            Some((buf, dest))
+        }
+    }
+
+    /// Put bytes the host did not accept back AHEAD of anything corked since,
+    /// so a partial flush keeps the stream in order.
+    pub fn restore_prefix(&mut self, unsent: &[u8]) {
+        if unsent.is_empty() {
+            return;
+        }
+        let mut restored = Vec::with_capacity(unsent.len() + self.buffer.len());
+        restored.extend_from_slice(unsent);
+        restored.append(&mut self.buffer);
+        self.buffer = restored;
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        self.enabled = enabled;
+        if !enabled && !self.buffer.is_empty() {
+            let buf = std::mem::take(&mut self.buffer);
+            let dest = self.dest.take();
+            Some((buf, dest))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DescriptionCommon {
     status_flags: AtomicU64,
@@ -947,6 +1017,8 @@ pub(crate) struct DescriptionCommon {
     /// not support sealing (`F_GET_SEALS`/`F_ADD_SEALS` → `EINVAL`).
     seals: Arc<Mutex<Option<u32>>>,
     splice_pushback: Mutex<crate::dispatch::SplicePushback>,
+    peer_cred: Mutex<Option<SocketPeerCred>>,
+    cork: Mutex<SocketCork>,
 }
 
 impl DescriptionCommon {
@@ -960,6 +1032,8 @@ impl DescriptionCommon {
             owner: Mutex::new(CapturedAsyncIoOwner::default()),
             seals: Arc::new(Mutex::new(None)),
             splice_pushback: Mutex::new(crate::dispatch::SplicePushback::default()),
+            peer_cred: Mutex::new(None),
+            cork: Mutex::new(SocketCork::default()),
         }
     }
 
@@ -973,6 +1047,8 @@ impl DescriptionCommon {
             owner: Mutex::new(CapturedAsyncIoOwner::default()),
             seals,
             splice_pushback: Mutex::new(crate::dispatch::SplicePushback::default()),
+            peer_cred: Mutex::new(None),
+            cork: Mutex::new(SocketCork::default()),
         }
     }
 
@@ -1067,6 +1143,18 @@ impl DescriptionCommon {
 
     pub(crate) fn clear_splice_pushback(&self) {
         *self.splice_pushback.lock() = crate::dispatch::SplicePushback::default();
+    }
+
+    pub(crate) fn peer_cred(&self) -> Option<SocketPeerCred> {
+        *self.peer_cred.lock()
+    }
+
+    pub(crate) fn set_peer_cred(&self, cred: Option<SocketPeerCred>) {
+        *self.peer_cred.lock() = cred;
+    }
+
+    pub(crate) fn cork(&self) -> MutexGuard<'_, SocketCork> {
+        self.cork.lock()
     }
 }
 
@@ -9492,5 +9580,63 @@ mod tests {
             .resolve_slot_authority(token2)
             .expect("resolve token 2");
         assert!(Arc::ptr_eq(&resolved2, &desc2));
+    }
+
+    #[test]
+    fn socket_cork_staging_taking_and_enabling() {
+        let mut cork = SocketCork::default();
+        assert!(!cork.is_active());
+        assert!(!cork.is_enabled());
+        assert!(!cork.has_pending());
+        assert_eq!(cork.take(), None);
+
+        // Stage bytes with destination
+        cork.stage(b"hello ", Some(b"dest1"));
+        assert!(cork.is_active());
+        assert!(!cork.is_enabled());
+        assert!(cork.has_pending());
+
+        // Subsequent stage preserves existing destination
+        cork.stage(b"world", Some(b"dest2"));
+        assert_eq!(cork.dest.as_deref(), Some(&b"dest1"[..]));
+        assert_eq!(&cork.buffer, b"hello world");
+
+        // Take drains buffer and destination
+        let taken = cork.take().expect("taken");
+        assert_eq!(taken.0, b"hello world");
+        assert_eq!(taken.1.as_deref(), Some(&b"dest1"[..]));
+        assert!(!cork.is_active());
+        assert_eq!(cork.take(), None);
+
+        // Enabling and disabling with pending data flushes
+        assert_eq!(cork.set_enabled(true), None);
+        assert!(cork.is_active());
+        assert!(cork.is_enabled());
+
+        cork.stage(b"flushme", None);
+        let flushed = cork.set_enabled(false).expect("flushed");
+        assert_eq!(flushed.0, b"flushme");
+        assert_eq!(flushed.1, None);
+        assert!(!cork.is_active());
+    }
+
+    #[test]
+    fn description_common_socket_cork_and_peer_cred_accessors() {
+        let common = DescriptionCommon::new(0);
+        assert_eq!(common.peer_cred(), None);
+
+        let cred = SocketPeerCred {
+            pid: crate::dispatch::NsPid(42),
+            uid: NsUid::new(1000),
+            gid: NsGid::new(1000),
+        };
+        common.set_peer_cred(Some(cred));
+        assert_eq!(common.peer_cred(), Some(cred));
+
+        assert!(!common.cork().is_active());
+        common.cork().stage(b"data", None);
+        assert!(common.cork().has_pending());
+        let taken = common.cork().take().expect("taken");
+        assert_eq!(taken.0, b"data");
     }
 }

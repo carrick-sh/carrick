@@ -86,10 +86,10 @@ pub use objects::{
     FileDescriptionBackingSnapshot, FileSlot, FileTable, FsContext, HandlerFrameState,
     LinuxWaitStatus, Mm, ObjectGraphError, OpenDescriptionBackingSnapshot, PendingQueue,
     PendingSignal, PidfdTarget, ProcessGroup, RlimitSet, RunnerDirective, Session, Sighand,
-    SignalAuthority, SignalDequeue, SignalDisposition, SignalPendingOwner, Task, TaskKey,
-    TaskLifecycle, TaskParticipantError, TaskPendingSignals, TaskRef, TaskRusage, TaskShared,
-    TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef, ThreadResources, ThreadRunner,
-    ThreadSignalState, Zombie,
+    SignalAuthority, SignalDequeue, SignalDisposition, SignalPendingOwner, SocketCork,
+    SocketPeerCred, Task, TaskKey, TaskLifecycle, TaskParticipantError, TaskPendingSignals,
+    TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef,
+    ThreadResources, ThreadRunner, ThreadSignalState, Zombie,
 };
 #[allow(unused_imports)]
 pub(crate) use objects::{
