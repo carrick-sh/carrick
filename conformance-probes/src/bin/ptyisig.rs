@@ -26,9 +26,28 @@ extern "C" fn on_signal(signum: i32) {
     }
 }
 
+/// Read exactly `buf.len()` bytes, but never wait more than 5 s per byte: a
+/// runtime that fails to deliver a line-discipline signal must show up as a
+/// false report line, not as a wedged probe holding the gate. On timeout the
+/// remaining bytes are filled with 0xff (no signal has that number).
 fn read_exact_bytes(fd: i32, buf: &mut [u8]) {
     let mut total = 0;
     while total < buf.len() {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, 5_000) };
+        if ready < 0 && errno() == libc::EINTR {
+            continue;
+        }
+        if ready == 0 {
+            for b in &mut buf[total..] {
+                *b = 0xff;
+            }
+            return;
+        }
         let n = unsafe {
             libc::read(
                 fd,
