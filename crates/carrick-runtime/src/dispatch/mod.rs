@@ -511,6 +511,11 @@ use crate::linux_abi::{
     LINUX_SOL_UDP,
     LINUX_SS_DISABLE,
     LINUX_SS_ONSTACK,
+    LINUX_STA_DEL,
+    LINUX_STA_INS,
+    LINUX_STA_NANO,
+    LINUX_STA_RONLY,
+    LINUX_STA_UNSYNC,
     LINUX_STATX_BASIC_STATS,
     LINUX_STATX_RESERVED,
     LINUX_TASK_COMM_LEN,
@@ -537,7 +542,10 @@ use crate::linux_abi::{
     LINUX_TERMIOS_KERNEL_SIZE,
     LINUX_TERMIOS2_SIZE,
     LINUX_TFD_NONBLOCK,
+    LINUX_TIME_DEL,
     LINUX_TIME_ERROR,
+    LINUX_TIME_INS,
+    LINUX_TIME_OK,
     LINUX_TIMER_ABSTIME,
     LINUX_TIOCGPGRP,
     LINUX_TIOCGPTN,
@@ -616,7 +624,6 @@ use crate::linux_abi::{
     LinuxTimeval,
     LinuxTimex,
     LinuxTimexModes,
-    LinuxTimexStatus,
     LinuxTimezone,
     LinuxTms,
     LinuxUtsname,
@@ -10095,6 +10102,59 @@ fn linux_timeval_usec_is_valid(tv: LinuxTimeval) -> bool {
     (0..1_000_000).contains(&usec)
 }
 
+fn linux_time_state_from_status(status: i32) -> i64 {
+    if (status & LINUX_STA_UNSYNC) != 0 {
+        LINUX_TIME_ERROR
+    } else if (status & LINUX_STA_INS) != 0 {
+        LINUX_TIME_INS
+    } else if (status & LINUX_STA_DEL) != 0 {
+        LINUX_TIME_DEL
+    } else {
+        LINUX_TIME_OK
+    }
+}
+
+fn linux_timex_from_state(
+    time: LinuxTimeval,
+    state: &crate::kernel::container::AdjtimexState,
+) -> LinuxTimex {
+    LinuxTimex {
+        modes: 0,
+        _pad0: 0,
+        offset: state.offset,
+        freq: state.freq,
+        maxerror: state.maxerror,
+        esterror: state.esterror,
+        status: state.status,
+        _pad1: 0,
+        constant: state.constant,
+        precision: 1,
+        tolerance: 32_768_000,
+        time,
+        tick: state.tick,
+        ppsfreq: 0,
+        jitter: 0,
+        shift: 0,
+        _pad2: 0,
+        stabil: 0,
+        jitcnt: 0,
+        calcnt: 0,
+        errcnt: 0,
+        stbcnt: 0,
+        tai: state.tai,
+        _pad3: [0; 11],
+    }
+}
+
+fn linux_timex_time(duration: Duration, status: i32) -> LinuxTimeval {
+    let sub = if (status & LINUX_STA_NANO) != 0 {
+        i64::from(duration.subsec_nanos())
+    } else {
+        i64::from(duration.subsec_micros())
+    };
+    LinuxTimeval::new(duration.as_secs() as i64, sub)
+}
+
 fn adjtimex_bootstrap(
     clock: &crate::kernel::container::ClockDomain,
     memory: &mut impl CurrentMmMemory,
@@ -10106,15 +10166,6 @@ fn adjtimex_bootstrap(
         Err(errno) => return DispatchOutcome::Errno { errno },
     };
     let modes = LinuxTimexModes::from_bits_retain(timex.modes);
-    let mut current = LinuxTimex::new_read_state(linux_timeval_from_duration(clock.realtime_now()));
-    if timex.modes == 0 {
-        return match write_kernel_struct(memory, address, &current) {
-            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
-                value: LINUX_TIME_ERROR,
-            },
-            other => other,
-        };
-    }
     if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG)
         && !modes.contains(LinuxTimexModes::OFFSET)
     {
@@ -10126,18 +10177,59 @@ fn adjtimex_bootstrap(
             other => other,
         };
     }
-    if modes == LinuxTimexModes::OFFSET_SS_READ {
-        current.modes = timex.modes;
+    if timex.modes == 0 {
+        let state = clock.adjtimex_state();
+        let now = clock.realtime_now();
+        let time = linux_timex_time(now, state.status);
+        let current = linux_timex_from_state(time, &state);
+        let value = linux_time_state_from_status(state.status);
         return match write_kernel_struct(memory, address, &current) {
-            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
-                value: LINUX_TIME_ERROR,
-            },
+            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned { value },
+            other => other,
+        };
+    }
+    if modes == LinuxTimexModes::OFFSET_SS_READ {
+        let state = clock.adjtimex_state();
+        let now = clock.realtime_now();
+        let time = linux_timex_time(now, state.status);
+        let mut current = linux_timex_from_state(time, &state);
+        current.modes = timex.modes;
+        current.offset = 0;
+        let value = linux_time_state_from_status(state.status);
+        return match write_kernel_struct(memory, address, &current) {
+            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned { value },
             other => other,
         };
     }
     if !can_adjust {
         return DispatchOutcome::Errno { errno: LINUX_EPERM };
     }
+
+    const KNOWN_MODES: u32 = LinuxTimexModes::IDEMPOTENT_SUPPORTED.bits()
+        | LinuxTimexModes::OFFSET_SINGLESHOT_FLAG.bits();
+    if (timex.modes & !KNOWN_MODES) != 0 {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    if modes.contains(LinuxTimexModes::MICRO) && modes.contains(LinuxTimexModes::NANO) {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    if modes.contains(LinuxTimexModes::TAI) && modes.contains(LinuxTimexModes::TIMECONST) {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG)
+        && modes != LinuxTimexModes::OFFSET_SINGLESHOT
+    {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+
     if modes.contains(LinuxTimexModes::TICK) {
         let minimum = 900_000 / LINUX_CLK_TCK;
         let maximum = 1_100_000 / LINUX_CLK_TCK;
@@ -10148,33 +10240,132 @@ fn adjtimex_bootstrap(
             };
         }
     }
-
-    // Accept an idempotent restore of the state Carrick truthfully reports.
-    // Stateful PLL/FLL discipline is deliberately not claimed here: any mode
-    // that would change a value remains EPERM until ClockDomain owns a real
-    // slew/frequency model.
-    let status = LinuxTimexStatus::from_bits_retain(current.status);
-    let idempotent = LinuxTimexModes::IDEMPOTENT_SUPPORTED.contains(modes)
-        && (!modes.contains(LinuxTimexModes::OFFSET) || timex.offset == current.offset)
-        && (!modes.contains(LinuxTimexModes::FREQUENCY) || timex.freq == current.freq)
-        && (!modes.contains(LinuxTimexModes::MAXERROR) || timex.maxerror == current.maxerror)
-        && (!modes.contains(LinuxTimexModes::ESTERROR) || timex.esterror == current.esterror)
-        && (!modes.contains(LinuxTimexModes::STATUS) || timex.status == current.status)
-        && (!modes.contains(LinuxTimexModes::TIMECONST) || timex.constant == current.constant)
-        && (!modes.contains(LinuxTimexModes::TAI) || timex.constant == i64::from(current.tai))
-        && (!modes.contains(LinuxTimexModes::TICK) || timex.tick == current.tick)
-        && (!modes.contains(LinuxTimexModes::NANO) || status.contains(LinuxTimexStatus::NANO))
-        && (!modes.contains(LinuxTimexModes::MICRO) || !status.contains(LinuxTimexStatus::NANO));
-    if idempotent || (modes == LinuxTimexModes::OFFSET_SINGLESHOT && timex.offset == 0) {
-        current.modes = timex.modes;
-        return match write_kernel_struct(memory, address, &current) {
-            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned {
-                value: LINUX_TIME_ERROR,
-            },
-            other => other,
-        };
+    if modes.contains(LinuxTimexModes::FREQUENCY) {
+        let requested_freq = timex.freq;
+        if !(-32_768_000..=32_768_000).contains(&requested_freq) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
     }
-    DispatchOutcome::Errno { errno: LINUX_EPERM }
+    if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG) {
+        let requested_offset = timex.offset;
+        if !(-131_071..=131_071).contains(&requested_offset) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+    }
+    if modes.contains(LinuxTimexModes::STATUS) {
+        if (timex.status as u32 & !0xffff) != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+    }
+
+    let mut step_realtime_ns: Option<i64> = None;
+    if modes.contains(LinuxTimexModes::SETOFFSET) {
+        let is_nano = if modes.contains(LinuxTimexModes::NANO) {
+            true
+        } else if modes.contains(LinuxTimexModes::MICRO) {
+            false
+        } else {
+            (clock.adjtimex_state().status & LINUX_STA_NANO) != 0
+        };
+        let max_sub = if is_nano { 1_000_000_000 } else { 1_000_000 };
+        if timex.time.tv_usec < 0 || timex.time.tv_usec >= max_sub {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let sec_ns = match timex.time.tv_sec.checked_mul(1_000_000_000) {
+            Some(s) => s,
+            None => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+        };
+        let sub_ns = if is_nano {
+            timex.time.tv_usec
+        } else {
+            timex.time.tv_usec.saturating_mul(1_000)
+        };
+        let delta_ns = match sec_ns.checked_add(sub_ns) {
+            Some(d) => d,
+            None => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+        };
+        step_realtime_ns = Some(delta_ns);
+    } else if modes == LinuxTimexModes::OFFSET_SINGLESHOT {
+        let delta_ns = match timex.offset.checked_mul(1_000) {
+            Some(ns) => ns,
+            None => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+        };
+        step_realtime_ns = Some(delta_ns);
+    }
+
+    if let Some(delta_ns) = step_realtime_ns {
+        if let Err(errno) = clock.try_step_realtime_offset_ns(delta_ns) {
+            return DispatchOutcome::Errno { errno };
+        }
+    }
+
+    let updated_state = clock.with_adjtimex_mut(|state| {
+        if modes.contains(LinuxTimexModes::OFFSET) {
+            if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG) {
+                state.offset = 0;
+            } else {
+                state.offset = timex.offset;
+            }
+        }
+        if modes.contains(LinuxTimexModes::FREQUENCY) {
+            state.freq = timex.freq;
+        }
+        if modes.contains(LinuxTimexModes::MAXERROR) {
+            state.maxerror = timex.maxerror;
+        }
+        if modes.contains(LinuxTimexModes::ESTERROR) {
+            state.esterror = timex.esterror;
+        }
+        if modes.contains(LinuxTimexModes::STATUS) {
+            state.status = (state.status & LINUX_STA_RONLY) | (timex.status & !LINUX_STA_RONLY);
+        }
+        if modes.contains(LinuxTimexModes::NANO) {
+            state.status |= LINUX_STA_NANO;
+        }
+        if modes.contains(LinuxTimexModes::MICRO) {
+            state.status &= !LINUX_STA_NANO;
+        }
+        if modes.contains(LinuxTimexModes::TIMECONST) {
+            state.constant = timex.constant;
+        }
+        if modes.contains(LinuxTimexModes::TAI) {
+            state.tai = timex.constant as i32;
+        }
+        if modes.contains(LinuxTimexModes::TICK) {
+            state.tick = timex.tick;
+        }
+        state.clone()
+    });
+
+    let now = clock.realtime_now();
+    let time = linux_timex_time(now, updated_state.status);
+    let mut current = linux_timex_from_state(time, &updated_state);
+    current.modes = timex.modes;
+    let value = linux_time_state_from_status(updated_state.status);
+    match write_kernel_struct(memory, address, &current) {
+        DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned { value },
+        other => other,
+    }
 }
 
 fn linux_task_name_from_bytes(bytes: &[u8]) -> [u8; LINUX_TASK_COMM_LEN] {
