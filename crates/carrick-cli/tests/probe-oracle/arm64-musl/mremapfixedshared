@@ -1,0 +1,5 @@
+bf2515a19f4145aa
+fixed_move_within_shared_mapping_ok=true
+moved_page_keeps_file_offset=true
+write_through_moved_page_reaches_file=true
+move_back_ok=true
