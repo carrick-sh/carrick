@@ -2252,6 +2252,8 @@ mod hvpatch_guest_probe_abi {
             "stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));",
             "fn stage1__arena__install(_: u32, _: u32, _: u32, _: u64) {}",
             "stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));",
+            "fn stage1__arena__replace(_: u32, _: u32, _: u32, _: u64) {}",
+            "stub!(stage1_arena_replace(site: u32, source_before: u32, source_after: u32, authority: u64));",
             "fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}",
             "stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));",
         ] {
@@ -4809,6 +4811,11 @@ mod real {
         /// by the lazy edit build, 5 = applied by the exec rebuild), applied,
         /// deferred, authority pointer. Fires only at those events.
         fn stage1__arena__install(_: u32, _: u32, _: u32, _: u64) {}
+        /// The live stage-1 manager was overwritten wholesale (a rollback
+        /// image or clone). Args: site (6 = rolled-back fork, 7 = parent
+        /// fork-COW rollback, 8..=11 = foreign-COW rollback sites), manager
+        /// had a source before, has one after, authority pointer.
+        fn stage1__arena__replace(_: u32, _: u32, _: u32, _: u64) {}
         /// HVPatch frame-COW intent. Emitted immediately before identity/data.
         /// Args: 0 guest-visible, 1 backing maintenance, 2 privileged internal.
         fn hvpatch__frame__cow__intent(_: u32) {}
@@ -5957,6 +5964,12 @@ mod real {
     #[inline(never)]
     pub fn stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64) {
         carrick_usdt::stage1__arena__install!(|| (site, applied, deferred, authority));
+    }
+
+    /// See the `stage1__arena__replace` provider doc. Rollback-time only.
+    #[inline(never)]
+    pub fn stage1_arena_replace(site: u32, source_before: u32, source_after: u32, authority: u64) {
+        carrick_usdt::stage1__arena__replace!(|| (site, source_before, source_after, authority));
     }
 
     #[inline(never)]
@@ -7853,6 +7866,7 @@ mod stub {
     stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));
     stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));
     stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));
+    stub!(stage1_arena_replace(site: u32, source_before: u32, source_after: u32, authority: u64));
     stub!(hvpatch_frame_cow(event: super::HvpatchFrameCow));
     stub!(hvpatch_frame_cow_trigger(event: super::HvpatchFrameCowTrigger));
     stub!(hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]));

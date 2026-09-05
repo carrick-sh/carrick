@@ -3367,7 +3367,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     // carries neither, and a parent that lost them could
                     // never grow again (see `adopt_live_extension_state`).
                     let mut restored = parent_page_tables_snapshot.clone();
+                    let before = u32::from(manager.has_arena_source());
                     restored.adopt_live_extension_state(manager);
+                    carrick_observability::probes::stage1_arena_replace(
+                        7,
+                        before,
+                        u32::from(restored.has_arena_source()),
+                        0,
+                    );
                     *manager = restored;
                     Ok(PageTableApplyOutcome::new(true, true))
                 });
@@ -3448,7 +3455,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             // never grow again after a refused fork (CPython's `-v` uname
             // fork lost the root's source this way).
             if let Some(mut image) = restored.take() {
+                let before = u32::from(manager.has_arena_source());
                 image.adopt_live_extension_state(manager);
+                let after = u32::from(image.has_arena_source());
+                carrick_observability::probes::stage1_arena_replace(6, before, after, 0);
                 *manager = image;
             }
             Ok(PageTableApplyOutcome::new(true, true))
