@@ -150,6 +150,11 @@ const DOCKER_FLAG_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-clock_settime04", &["--cap-add", "SYS_TIME"]),
     ("ltp-settimeofday01", &["--cap-add", "SYS_TIME"]),
     ("ltp-stime01", &["--cap-add", "SYS_TIME"]),
+    // vhangup(2) needs CAP_SYS_TTY_CONFIG, which Docker's default set drops;
+    // without it the oracle reports EPERM and the row read broken on both
+    // sides for months (the under-privileged-oracle inversion). Both the
+    // native arm64 oracle and Carrick pass 1/1 with the exact capability.
+    ("ltp-vhangup02", &["--cap-add", "SYS_TTY_CONFIG"]),
     // Docker Desktop exposes the required numbered tty only to privileged
     // containers. Both frozen declarations intentionally run the same binary
     // and remain distinct suites for stable inventory identity.
