@@ -7912,7 +7912,7 @@ impl SyscallDispatcher {
             rescued.extend_from_slice(&buf[..n as usize]);
         }
         if !rescued.is_empty() {
-            self.stage_splice_bytes_for_description(description, rescued);
+            self.stage_splice_bytes_for_description(&description, rescued);
         }
     }
 

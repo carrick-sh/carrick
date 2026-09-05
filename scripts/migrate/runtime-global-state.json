@@ -661,7 +661,7 @@
       "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/pty_registry.rs",
       "symbol": "MASTERS",
-      "fingerprint": "d7f2a30d982a2018c6464651323a6b9cd6316d982618fac68d36437285257014",
+      "fingerprint": "8a60b55c4e9d38bb600887c476bf00f17de00b3bce3b509a4e8064a3e7e99c32",
       "classification": "host_kernel_object",
       "rationale": "Host devpts master registry MASTERS mapping host pts indices to master host file descriptions."
     },
