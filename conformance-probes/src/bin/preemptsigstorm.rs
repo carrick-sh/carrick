@@ -21,8 +21,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const WORKERS: usize = 4;
 const STORM_MS: u64 = 2500;
-/// Each worker must complete at least this many loop iterations (progress
-/// invariant — a wedged/livelocked thread turns this false).
+/// Each worker must complete at least this many loop iterations before the
+/// storm is allowed to stop (progress invariant — a wedged/livelocked thread
+/// never gets there and the watchdog bounds the wait; a slow host merely runs
+/// the storm longer).
 const ITER_FLOOR: u64 = 1000;
 /// Watchdog bound: the run must finish well within this (never fires on a
 /// correct host; a hang under carrick becomes a bounded DIFF, not a stuck gate).
@@ -273,6 +275,20 @@ fn main() {
     unsafe { libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut()) };
 
     sleep_wall(STORM_MS);
+    // The iteration floor is a PROGRESS invariant, not a throughput one: the
+    // storm keeps running until every worker has crossed it (a wedged or
+    // livelocked worker never does, and the watchdog turns that into a
+    // bounded DIFF). Stopping on the wall clock alone made the floor a
+    // load-sensitive throughput assertion that a contended host failed with
+    // every other line true.
+    let floor_deadline = now_ns() + (WATCHDOG_MS - STORM_MS - 2_000) * 1_000_000;
+    while ITERS
+        .iter()
+        .any(|c| c.load(Ordering::Relaxed) < ITER_FLOOR)
+        && now_ns() < floor_deadline
+    {
+        sleep_wall(10);
+    }
     STOP.store(true, Ordering::SeqCst);
     let zero = libc::itimerval {
         it_interval: libc::timeval {
