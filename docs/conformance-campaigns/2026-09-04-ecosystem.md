@@ -1290,3 +1290,18 @@ measurements are void until they rebase.
   identical synthetic load on the fixed main and on the pre-Stage1Authority
   binary to decide whether it is a regression or a pre-existing
   wall-clock-vs-scheduling flaw in the wake path (results below).
+- **futexforkrequeue under load**: 10/10 MATCH on both the fixed main and the
+  pre-Stage1Authority binary under six busy loops, so CPU load alone does not
+  reproduce the gate's miss; the gate's own concurrency (three shards plus
+  worker builds) does. Not a Stage1Authority regression. Open: reproduce with
+  concurrent guests and read the wake path for a wall-clock assumption.
+- **Dentry cache round 1** (worker dentry-cache, branch `agy/dentry-cache-sep06`):
+  stat 21.7 → 2.9 µs, ENOENT 43.9 → 2.9 µs, open+close 30.9 → 17.1 µs.
+  Rejected for landing on coherence: the positive dentry carries stat fields
+  and only path syscalls invalidate them, so `write`/`ftruncate`/`link`/
+  `O_APPEND` through a descriptor left size and nlink stale against Docker
+  (11 vs 5, 1 vs 3, 2 vs 1). Round 2: dentries map names to inode identity;
+  stat fields live in an inode record keyed by (dev, ino) that every
+  fd-based mutation invalidates; red-first rows added to the `dentrycache`
+  probe. The `open+close` residual (17 µs vs 1.2 on Linux) is the host
+  `openat` itself and is the cap-std retirement's target (round 3).
