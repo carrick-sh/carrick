@@ -1074,6 +1074,39 @@ impl PageTableManager {
         )
     }
 
+    /// Whether an arena source is attached: an `OutOfTables` with `false` here
+    /// is a process that can never grow, not one that ran out of slots.
+    #[must_use]
+    pub fn has_arena_source(&self) -> bool {
+        self.arena_source.is_some()
+    }
+
+    /// Detach the arena source (a rebuild that keeps the same mm hands it to
+    /// the replacement manager).
+    pub fn take_arena_source(&mut self) -> Option<Box<dyn TableArenaSource>> {
+        self.arena_source.take()
+    }
+
+    /// Restore a pre-transaction image over `live` without losing what the
+    /// live manager owns beyond its tables: the arena source moves over, and
+    /// every extension arena the live manager acquired after the image was
+    /// taken is adopted as an empty arena (its tables are unreachable from the
+    /// restored tree, and its stage-2 backing stays published), so a rollback
+    /// neither leaks pool slots nor leaves the process unable to grow.
+    pub fn adopt_live_extension_state(&mut self, live: &mut Self) {
+        self.arena_source = live.arena_source.take();
+        for arena in live.arenas.iter().skip(1) {
+            if self.arenas.iter().any(|mine| mine.base == arena.base) {
+                continue;
+            }
+            self.arenas.push(TableArena {
+                base: arena.base,
+                bytes: vec![0u8; arena.bytes.len()],
+                next_free: PT_PAGE,
+            });
+        }
+    }
+
     /// The three policy bits that decide whether an exhausted pool can recover:
     /// `(multi_vcpu, stage1_exclusive, reclaim_pending)`. `alloc_table`'s
     /// last-resort sweep runs only with `stage1_exclusive && reclaim_pending`,
@@ -3912,6 +3945,56 @@ mod tests {
         fn return_arena(&mut self, base: carrick_guest_mem::Gpa) {
             self.returned.lock().unwrap().push(base);
         }
+    }
+
+    /// A rollback that restores a pre-transaction image must not strip the
+    /// arena source or orphan arenas the live manager acquired meanwhile.
+    #[test]
+    fn adopting_live_extension_state_keeps_source_and_arenas() {
+        use carrick_guest_mem::Gpa;
+        use std::sync::{Arc, Mutex};
+
+        let mut live = hvpatch_manager();
+        exhaust_spare_pool(&mut live, LINUX_MMAP_BASE);
+        let ext_base = Gpa(0xb0_0000_0000);
+        let source = TestArenaSource {
+            id: TableArenaSourceId(ext_base),
+            available: Arc::new(Mutex::new(vec![ext_base])),
+            returned: Arc::new(Mutex::new(Vec::new())),
+        };
+        live.set_arena_source(Box::new(source)).unwrap();
+        let image = live.clone();
+        assert!(
+            !image.has_arena_source(),
+            "clone drops the source by design"
+        );
+
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let va = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
+        live.set_rw(va, 0x1000, false)
+            .expect("grows into the extension arena");
+        assert_eq!(live.arenas.len(), 2);
+
+        let mut restored = image;
+        restored.adopt_live_extension_state(&mut live);
+        assert!(restored.has_arena_source());
+        assert!(!live.has_arena_source());
+        assert_eq!(restored.arenas.len(), 2);
+        assert_eq!(restored.arenas[1].base, ext_base.0);
+        assert_eq!(
+            restored.arenas[1].next_free, PT_PAGE,
+            "adopted arena starts empty"
+        );
+        assert_eq!(
+            restored.translate(va),
+            None,
+            "pre-image tree does not see the live edit"
+        );
+        // The restored manager can keep growing from the adopted arena.
+        restored
+            .set_rw(va, 0x1000, false)
+            .expect("restored manager allocates");
+        assert_eq!(restored.arenas.len(), 2);
     }
 
     #[test]
