@@ -2995,7 +2995,8 @@ impl SyscallDispatcher {
                 .map(|mapping| {
                     mapping.file_page_offset
                         + (start - mapping.start) / crate::core_dump::GUEST_PAGE as u64
-                });
+                })
+                .or_else(|| fork_semantics.vmas.first().and_then(|v| v.file_page_offset));
             return Ok(proc_maps_entry_mremap_metadata(
                 first,
                 file_page_offset,
@@ -3042,7 +3043,8 @@ impl SyscallDispatcher {
             .map(|mapping| {
                 mapping.file_page_offset
                     + (start - mapping.start) / crate::core_dump::GUEST_PAGE as u64
-            });
+            })
+            .or_else(|| fork_semantics.vmas.first().and_then(|v| v.file_page_offset));
         Ok(proc_maps_entry_mremap_metadata(
             region,
             file_page_offset,
@@ -5969,6 +5971,11 @@ impl SyscallDispatcher {
                 Ok(metadata) => metadata,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
+            let is_shared_file_fixed = move_fixed
+                && !dontunmap
+                && source_metadata.sharing == ProcMapSharing::Shared
+                && this.shared_file_alias_description(old_address.0, old_size).is_some();
+
             if must_relocate {
                 // Relocation below moves a mapping by COPYING it. That is
                 // correct for a PRIVATE mapping and wrong for a shared one:
@@ -5976,7 +5983,7 @@ impl SyscallDispatcher {
                 // same bytes, and a copy silently unshares it -- the same
                 // reason the grow path refuses to move a shared mapping. Keep
                 // the honest refusal for that shape.
-                if source_metadata.sharing != ProcMapSharing::Private {
+                if source_metadata.sharing != ProcMapSharing::Private && !is_shared_file_fixed {
                     return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
                 }
                 // `MREMAP_DONTUNMAP` is defined only for private ANONYMOUS
@@ -6013,6 +6020,170 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                 }
+            }
+            if is_shared_file_fixed {
+                let Some(description) =
+                    this.shared_file_alias_description(old_address.0, old_size)
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let dup_fd = {
+                    let open = description.read();
+                    match open.as_deref().and_then(OpenDescription::shared_alias_host_fd) {
+                        Some(raw_fd) if host_fd_can_back_shared_alias(raw_fd) => {
+                            let d = unsafe { libc::dup(raw_fd) };
+                            (d >= 0).then_some(d)
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(dup_fd) = dup_fd else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let Some(ipa) = alloc_alias_ipa_for_publication(new_size, true) else {
+                    unsafe { libc::close(dup_fd) };
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let va = new_address.0;
+                let pf = source_metadata.prot;
+                let mut host_prot = 0;
+                if pf.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
+                    host_prot |= libc::PROT_READ;
+                }
+                if pf.contains(LinuxProtFlags::WRITE) {
+                    host_prot |= libc::PROT_WRITE;
+                }
+                let file_page_offset = source_metadata.file_page_offset;
+                let file_offset = file_page_offset
+                    .unwrap_or(0)
+                    .checked_mul(crate::core_dump::GUEST_PAGE as u64)
+                    .unwrap_or(0);
+                let bus_fault = (|| {
+                    let open = description.read();
+                    let file_len = open
+                        .as_deref()
+                        .and_then(OpenDescription::shared_alias_host_fd)
+                        .and_then(host_fd_file_len)?;
+                    let bus_offset = shared_file_bus_offset(file_len, file_offset, new_size, page_size)?;
+                    Some((
+                        va.checked_add(bus_offset)?,
+                        new_size.checked_sub(bus_offset)?,
+                    ))
+                })();
+                let read_only_shared_file =
+                    this.range_is_read_only_shared_file(old_address.0, old_size);
+
+                let Ok(new_len) = usize::try_from(new_size) else {
+                    unsafe { libc::close(dup_fd) };
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+
+                // MREMAP_FIXED replaces whatever was at the destination range.
+                if new_len > 0 {
+                    if this.range_is_alias_vma(va, new_size)
+                        || mmap_address_uses_alias(va, new_size, layout)
+                    {
+                        let _ = memory.unmap_alias_range(va, new_len);
+                    } else {
+                        let _ = memory.unmap_range(va, new_len);
+                    }
+                    mark_range_unmapped(memory, va, new_len);
+                    this.remove_mapping_metadata(va, new_size);
+                }
+                if this
+                    .next_mmap_address(
+                        va,
+                        new_size,
+                        pf.bits(),
+                        LINUX_MAP_FIXED,
+                        MmapGrantCongruence::Any,
+                    )
+                    .is_none()
+                {
+                    unsafe { libc::close(dup_fd) };
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+
+                // Reclaim the source range.
+                if let Ok(old_len) = usize::try_from(old_size)
+                    && old_len > 0
+                {
+                    if this.range_is_alias_vma(old_address.0, old_size)
+                        || mmap_address_uses_alias(old_address.0, old_size, layout)
+                    {
+                        let _ = memory.unmap_alias_range(old_address.0, old_len);
+                    } else {
+                        let _ = memory.unmap_range(old_address.0, old_len);
+                    }
+                    mark_range_unmapped(memory, old_address.0, old_len);
+                    this.remove_mapping_metadata(old_address.0, old_size);
+                    if source_in_arena {
+                        let mem_authority = this.mem();
+                        let mut mem = mem_authority.lock();
+                        if old_address.0.checked_add(old_size) == Some(mem.mmap_next) {
+                            let mem = &mut *mem;
+                            lower_mmap_next(
+                                &mut mem.mmap_next,
+                                &mut mem.free_regions,
+                                old_address.0,
+                            );
+                        } else {
+                            free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
+                        }
+                    }
+                }
+
+                let prot_none = pf.is_empty();
+                memory.set_mapping_protection(
+                    va,
+                    new_len,
+                    prot_none,
+                    !prot_none && !pf.contains(LinuxProtFlags::WRITE),
+                );
+
+                let Some(semantic_vmas) =
+                    source_metadata.fork_semantics.project(va, new_size)
+                else {
+                    unsafe { libc::close(dup_fd) };
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+
+                let transaction =
+                    host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                        start: va,
+                        len: new_size,
+                        prot: pf,
+                        sharing: ProcMapSharing::Shared,
+                        path: source_metadata.path.clone(),
+                        file_page_offset,
+                        droppable: source_metadata.droppable,
+                        semantic_vmas: Some(semantic_vmas),
+                        locked: None,
+                        resident: true,
+                        bus_fault,
+                        write_sealed_shared: false,
+                        read_only_shared_file,
+                        secretmem: false,
+                        writable_memfd: None,
+                        shared_file_alias: Some(Arc::clone(&description)),
+                    }));
+
+                return Ok(DispatchOutcome::MapHostAlias {
+                    success_retval: va as i64,
+                    transaction,
+                    va: GuestVa(va),
+                    ipa: Gpa(ipa),
+                    len: new_size,
+                    payload: Vec::new(),
+                    backing: HostAliasBacking::File {
+                        fd: HostAliasOwnedFd::from(unsafe { OwnedFd::from_raw_fd(dup_fd) }),
+                        offset: file_offset as libc::off_t,
+                        host_prot,
+                        sharing: HostAliasSharing::Shared,
+                    },
+                    prot: pf.bits(),
+                    prot_none: pf.is_empty(),
+                });
             }
             let shared_aperture_alloc = this.mem()
                 .lock()

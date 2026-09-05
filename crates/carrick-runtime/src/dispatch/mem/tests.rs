@@ -8238,3 +8238,286 @@ fn disabled_rlimits_bypass_vma_projection_and_locks() {
         Some((LINUX_RLIM_INFINITY, 64 * 1024 * 1024))
     );
 }
+
+#[test]
+fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
+    const SYS_MREMAP: u64 = 216;
+    const MREMAP_MAYMOVE: u64 = 0x01;
+    const MREMAP_FIXED: u64 = 0x02;
+    const PAGE: u64 = LINUX_PAGE_SIZE;
+    let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+    let dispatcher = SyscallDispatcher::new();
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1080));
+    let reporter = CompatReporter::default();
+    let mut memory = ProtectionTrackingMemory::new(base, (4 * PAGE) as usize);
+
+    use std::os::fd::IntoRawFd;
+
+    let host_file = tempfile::tempfile().expect("create tempfile");
+    let metadata = RootFsMetadata {
+        path: std::path::PathBuf::from("/tmp/test_shared_fixed.dat"),
+        kind: RootFsEntryKind::File,
+        mode: 0o644,
+        size: (4 * PAGE) as usize,
+    };
+    let open_desc = std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+        base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+        host_fd: HostFdRef::new(host_file.into_raw_fd()),
+        metadata,
+        writable: true,
+    }));
+    let description = OpenFile::from_open_description_with_status_flags(
+        open_desc,
+        crate::linux_abi::LINUX_O_RDWR,
+        0,
+    )
+    .description();
+
+    dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+        start: base,
+        len: 4 * PAGE,
+        prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        sharing: ProcMapSharing::Shared,
+        path: "/tmp/test_shared_fixed.dat".into(),
+        file_page_offset: Some(0),
+        droppable: false,
+        semantic_vmas: None,
+        locked: None,
+        resident: true,
+        bus_fault: None,
+        write_sealed_shared: false,
+        read_only_shared_file: false,
+        secretmem: false,
+        writable_memfd: None,
+        shared_file_alias: Some(Arc::clone(&description)),
+    });
+
+    let src = base + PAGE;
+    let dst = base + 3 * PAGE;
+
+    // Move page 1 to page 3.
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MREMAP,
+            SyscallArgs([src, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, dst, 0]),
+        ),
+    );
+
+    let (transaction, backing) = match outcome {
+        DispatchOutcome::MapHostAlias {
+            success_retval,
+            transaction,
+            va,
+            len,
+            backing,
+            ..
+        } => {
+            assert_eq!(success_retval, dst as i64);
+            assert_eq!(va.raw(), dst);
+            assert_eq!(len, PAGE);
+            (transaction, backing)
+        }
+        other => panic!("expected MapHostAlias, got {other:?}"),
+    };
+
+    match backing {
+        HostAliasBacking::File {
+            offset, sharing, ..
+        } => {
+            assert_eq!(offset, PAGE as libc::off_t);
+            assert_eq!(sharing, HostAliasSharing::Shared);
+        }
+        other => panic!("expected HostAliasBacking::File, got {other:?}"),
+    }
+
+    transaction
+        .with_claim_for_test(|install| {
+            dispatcher
+                .commit_host_alias_install(install)
+                .expect("publish successful host-alias install");
+        })
+        .expect("claim host-alias install");
+
+    // Verify metadata after move:
+    // Destination dst has file_page_offset == Some(1).
+    // Source src is unmapped.
+    {
+        let mem_authority = dispatcher.mem();
+        let mem = mem_authority.lock();
+        let dst_mapping = mem
+            .core_file_mappings
+            .iter()
+            .find(|m| m.start == dst && m.end == dst + PAGE)
+            .expect("dst core file mapping");
+        assert_eq!(dst_mapping.file_page_offset, 1);
+
+        assert!(
+            !mem.core_file_mappings
+                .iter()
+                .any(|m| m.start < src + PAGE && m.end > src),
+            "source range must be unmapped from core_file_mappings"
+        );
+        assert!(
+            !mem.shared_file_alias_maps
+                .iter()
+                .any(|(r, _)| r.start().raw() < src + PAGE && r.end().raw() > src),
+            "source range must be unmapped from shared_file_alias_maps"
+        );
+    }
+
+    // Reverse move: move page from dst back to src.
+    let back_outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MREMAP,
+            SyscallArgs([dst, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, src, 0]),
+        ),
+    );
+
+    let (back_transaction, back_backing) = match back_outcome {
+        DispatchOutcome::MapHostAlias {
+            success_retval,
+            transaction,
+            va,
+            len,
+            backing,
+            ..
+        } => {
+            assert_eq!(success_retval, src as i64);
+            assert_eq!(va.raw(), src);
+            assert_eq!(len, PAGE);
+            (transaction, backing)
+        }
+        other => panic!("expected MapHostAlias for move back, got {other:?}"),
+    };
+
+    match back_backing {
+        HostAliasBacking::File {
+            offset, sharing, ..
+        } => {
+            assert_eq!(offset, PAGE as libc::off_t);
+            assert_eq!(sharing, HostAliasSharing::Shared);
+        }
+        other => panic!("expected HostAliasBacking::File, got {other:?}"),
+    }
+
+    back_transaction
+        .with_claim_for_test(|install| {
+            dispatcher
+                .commit_host_alias_install(install)
+                .expect("publish successful host-alias install");
+        })
+        .expect("claim host-alias install");
+
+    {
+        let mem_authority = dispatcher.mem();
+        let mem = mem_authority.lock();
+        let src_mapping = mem
+            .core_file_mappings
+            .iter()
+            .find(|m| m.start == src && m.end == src + PAGE)
+            .expect("src core file mapping");
+        assert_eq!(src_mapping.file_page_offset, 1);
+    }
+}
+
+#[test]
+fn shared_file_fixed_mremap_rejects_missing_maymove_or_overlapping_ranges() {
+    const SYS_MREMAP: u64 = 216;
+    const MREMAP_MAYMOVE: u64 = 0x01;
+    const MREMAP_FIXED: u64 = 0x02;
+    const PAGE: u64 = LINUX_PAGE_SIZE;
+    let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+    let dispatcher = SyscallDispatcher::new();
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1081));
+    let reporter = CompatReporter::default();
+    let mut memory = ProtectionTrackingMemory::new(base, (4 * PAGE) as usize);
+
+    use std::os::fd::IntoRawFd;
+
+    let host_file = tempfile::tempfile().expect("create tempfile");
+    let metadata = RootFsMetadata {
+        path: std::path::PathBuf::from("/tmp/test_shared_fixed_err.dat"),
+        kind: RootFsEntryKind::File,
+        mode: 0o644,
+        size: (4 * PAGE) as usize,
+    };
+    let open_desc = std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+        base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+        host_fd: HostFdRef::new(host_file.into_raw_fd()),
+        metadata,
+        writable: true,
+    }));
+    let description = OpenFile::from_open_description_with_status_flags(
+        open_desc,
+        crate::linux_abi::LINUX_O_RDWR,
+        0,
+    )
+    .description();
+
+    dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+        start: base,
+        len: 4 * PAGE,
+        prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        sharing: ProcMapSharing::Shared,
+        path: "/tmp/test_shared_fixed_err.dat".into(),
+        file_page_offset: Some(0),
+        droppable: false,
+        semantic_vmas: None,
+        locked: None,
+        resident: true,
+        bus_fault: None,
+        write_sealed_shared: false,
+        read_only_shared_file: false,
+        secretmem: false,
+        writable_memfd: None,
+        shared_file_alias: Some(Arc::clone(&description)),
+    });
+
+    let src = base + PAGE;
+    let dst = base + 3 * PAGE;
+
+    // MREMAP_FIXED without MREMAP_MAYMOVE returns EINVAL.
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MREMAP,
+            SyscallArgs([src, PAGE, PAGE, MREMAP_FIXED, dst, 0]),
+        ),
+    );
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+
+    // Overlapping ranges return EINVAL.
+    let outcome_overlap = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MREMAP,
+            SyscallArgs([
+                src,
+                2 * PAGE,
+                PAGE,
+                MREMAP_MAYMOVE | MREMAP_FIXED,
+                src + PAGE,
+                0,
+            ]),
+        ),
+    );
+    assert_eq!(outcome_overlap, DispatchOutcome::errno(LINUX_EINVAL));
+}
