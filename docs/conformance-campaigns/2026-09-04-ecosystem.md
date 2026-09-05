@@ -965,3 +965,36 @@ never a bare clone.
 Also landed: seekhole worker (`22b7a8d16` + ENXIO corrections), proctask
 worker (`28ba900e2`), probes `seekholemap`/`proctaskchild`/`pipeextra`
 blessed; pwrite-on-pipe smuggled change reverted (`f99ae555b`).
+
+## 2026-09-05 (night): pathological-ratio attribution, first pass (owner priority)
+
+Ranking from the last ledger (timeouts sit on their budget, so ratios are
+floors): go-os_signal 80x (2.3 s on Docker), go-net 67x (2.7 s), ltp-setsid01
+25x (1.6 s), cpython-multiprocessing_fork 11.6x, cpython-concurrent_futures 8.1x,
+then inotify09/msgstress01/shmctl05 under 4x. Attributions so far:
+
+- **go-os_signal** hangs in `TestTerminalSignal`: a guest pty with job control
+  (`TIOCSCTTY`/`tcsetpgrp`, Ctrl-C must reach the guest foreground process
+  group). carrick's pty line discipline is the HOST's, so ISIG lands on the
+  carrier, never on the guest pgrp. A wedged carrier shows every executor idle
+  in a condvar with no runnable guest thread — a guest-visible lost signal.
+  Architectural: guest-side ISIG → guest pgrp delivery (the same family as the
+  earlier interactive job-control work). Also seen: the CLI ignores `timeout`'s
+  SIGTERM once wedged (1009 s until SIGKILL) — its own defect.
+- **go-net** crawls (58 tests in 240 s) and stops in
+  `TestGoLookupIPCNAMEOrderHostsAliasesFilesDNSMode`: "received unexpected DNS
+  query" — the hosts-file lookup misses and the resolver falls to the fake DNS
+  server; in two of three runs the single test then hangs 120 s with no output.
+  Needs the hosts-file read path (`--fs host`, stat mtime/size caching in Go's
+  hosts cache) compared against Docker before touching code.
+- **ltp-setsid01** passes standalone in 1 s: its 25x row is a harness-context
+  effect (`[blocked]`), to be re-measured in-harness on a quiet host.
+- **cpython-concurrent_futures** cannot be measured yet: on today's binary it
+  aborts at `test_max_tasks_per_child_defaults_to_spawn_context` with "HVPatch
+  COW page-table manager is absent" (2/2), while every bound authority in the
+  arena trace has a manager. A `stage1-arena-absent` probe now names the empty
+  authority at the refusal.
+- Tooling: `scratchpad/gsf_reduce.py` turns a `hvpatch-guest-syscall-flow.d`
+  capture into "which task is parked in which syscall" plus per-syscall wall;
+  worth promoting into `carrick trace` as a profile. Caveat learned: nanosleep
+  and exit_group emit no service-end record, so their "parks" are artifacts.
