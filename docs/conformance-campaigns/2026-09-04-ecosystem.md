@@ -1059,3 +1059,27 @@ Also found by the gate on this binary and fixed in `f6b48151e`: a quadratic
 page-table resolver once extension arenas exist (every edit scanned every
 mapping row), and a rebind heuristic that stole a shared authority's manager
 (coredumpfile lost two threads).
+
+## 2026-09-06 (cont.): munmap was O(aliases); tty session rules; burndown honoured
+
+- **munmap cloned and reindexed the process's alias registry twice per call**
+  (`process_visible_snapshot` + a second clone to plan retirement): three
+  `lldb` samples of the carrier at 99% CPU during `pagetablegrow` sat in
+  `AliasRegistry::reindex`. Worker `alias-unmap` (`f7c87e272`) plans from the
+  live scope-keyed indices (`by_va_start` range, `by_scope_physical_start`)
+  and removes in place with `index_remove`; a legacy-snapshot oracle test
+  proves identical planned leases and disarm spans, and a 5,000-row registry
+  unmapping one row no longer allocates proportionally. First live number
+  after the landing is recorded in the next entry.
+- **Extension-arena resolution was O(mapping rows) per edit** (`f6b48151e`):
+  the resolver now asks the structural-owner map keyed by (base, 2 MiB).
+- **Guest-pty session rules** (`13e2cc680`): TIOCNOTTY off the controlling
+  tty is ENOTTY, a leader releasing its tty hangs up the foreground group
+  (SIGHUP, SIGCONT), TIOCSCTTY refuses a leader whose session already owns a
+  tty. Found by the gate (`ptyflagmatrix`) and an isolated two-case check
+  against Docker; the ISIG landing had relaxed them.
+- **Dispatch-lock burndown**: the ISIG landing had grown `pty_table` lock
+  sites from 10 to 15 against a ceiling of 10; one `pty_is_controlling`
+  accessor brought it back to 10 (`f8f997110`) rather than raising the cap.
+- Workers in flight: `stage1-authority` (page-table ownership as a type),
+  `frame-pool` (pre-mapped frames; no syscalls per COW/sparse fault).
