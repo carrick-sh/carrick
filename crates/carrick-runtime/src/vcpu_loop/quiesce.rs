@@ -1810,6 +1810,10 @@ where
                 )));
             }
         };
+        let table_arena_source = match &prepared_mm {
+            PreparedHvpatchProcessMm::Copied(prepared) => Some(prepared.table_arena_source()),
+            PreparedHvpatchProcessMm::Shared { .. } => None,
+        };
         let (prepared_backend, cpu, child_kicker) = match ops.prepare(
             memory,
             inventory_preparation,
@@ -1825,6 +1829,7 @@ where
                 plan: prepared_dispatch_mm.fork_projection_plan(),
                 child_tid,
                 forking_tid: self.this_tid,
+                table_arena_source,
             },
             identity,
             child_mm_id.raw(),

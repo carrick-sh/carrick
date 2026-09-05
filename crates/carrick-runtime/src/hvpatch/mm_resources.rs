@@ -710,6 +710,10 @@ impl MmResources {
         self.state.lock().exec_settlement_epoch
     }
 
+    pub(crate) fn pool(&self) -> Stage1MmPool {
+        self.mm_pool.clone()
+    }
+
     /// Subscribe to the next exec-reservation settlement on this table. The
     /// callback runs on the settling thread with no `MmResources` lock held.
     pub(crate) fn subscribe_exec_settlement(

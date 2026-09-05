@@ -184,6 +184,8 @@ pub enum PageTableError {
     /// A guest VA whose translation path leaves the page-table region, or an
     /// intermediate descriptor is unexpectedly unmapped.
     BadAddress,
+    /// Extension arenas exist but no `TableArenaSource` is installed.
+    MissingArenaSource,
 }
 
 /// Per-level table index for `va` (4 KiB granule, 40-bit IPA).
@@ -348,17 +350,12 @@ impl TableLocation {
 }
 
 /// Provider of additional 2 MiB root slots when the primary stage-1 arena is exhausted.
-pub trait TableArenaSource: Send {
+pub trait TableArenaSource: std::fmt::Debug + Send {
     /// Allocate an additional 2 MiB root slot.
     fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa>;
 
     /// Return an unused root slot to the allocator.
     fn return_arena(&mut self, arena: carrick_guest_mem::Gpa);
-
-    /// Clone the source for use by a cloned `PageTableManager`.
-    fn clone_source(&self) -> Option<Box<dyn TableArenaSource>> {
-        None
-    }
 }
 
 /// Resolves the host backing pointer for a stage-1 table arena base address.
@@ -521,7 +518,7 @@ impl Clone for PageTableManager {
     fn clone(&self) -> Self {
         Self {
             arenas: self.arenas.clone(),
-            arena_source: self.arena_source.as_ref().and_then(|s| s.clone_source()),
+            arena_source: None,
             asid_scoped_leaves: self.asid_scoped_leaves,
             free_tables: self.free_tables.clone(),
             multi_vcpu: self.multi_vcpu,
@@ -538,7 +535,7 @@ impl Clone for PageTableManager {
     /// which is the entire point on the 1.75 MiB table image.
     fn clone_from(&mut self, source: &Self) {
         self.arenas.clone_from(&source.arenas);
-        self.arena_source = source.arena_source.as_ref().and_then(|s| s.clone_source());
+        self.arena_source = None;
         self.asid_scoped_leaves = source.asid_scoped_leaves;
         self.free_tables.clone_from(&source.free_tables);
         self.multi_vcpu = source.multi_vcpu;
@@ -627,6 +624,10 @@ impl PageTableManager {
             return Err(PageTableError::BadAddress);
         }
 
+        if self.arenas.len() > 1 && self.arena_source.is_none() {
+            return Err(PageTableError::MissingArenaSource);
+        }
+
         let mut new_bases = Vec::with_capacity(self.arenas.len());
         new_bases.push(new_base);
         for _ in 1..self.arenas.len() {
@@ -640,7 +641,7 @@ impl PageTableManager {
                         source.return_arena(carrick_guest_mem::Gpa(b));
                     }
                 }
-                return Err(PageTableError::BadAddress);
+                return Err(PageTableError::OutOfTables);
             };
             new_bases.push(gpa.0);
         }
@@ -3808,6 +3809,7 @@ mod tests {
         assert_eq!(err, PageTableError::OutOfTables);
     }
 
+    #[derive(Debug)]
     struct TestArenaSource {
         available: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
         returned: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
@@ -3819,12 +3821,6 @@ mod tests {
         }
         fn return_arena(&mut self, base: carrick_guest_mem::Gpa) {
             self.returned.lock().unwrap().push(base);
-        }
-        fn clone_source(&self) -> Option<Box<dyn TableArenaSource>> {
-            Some(Box::new(Self {
-                available: std::sync::Arc::clone(&self.available),
-                returned: std::sync::Arc::clone(&self.returned),
-            }))
         }
     }
 
@@ -3902,5 +3898,97 @@ mod tests {
             vec![0u8; LINUX_PAGE_TABLES_SIZE as usize],
             "host arena 1 written"
         );
+    }
+
+    #[test]
+    fn clone_with_extension_arenas_requires_child_source_for_rebase() {
+        use crate::memory::LINUX_PAGE_TABLES_SIZE;
+        use carrick_guest_mem::Gpa;
+        use std::sync::{Arc, Mutex};
+
+        let mut parent = hvpatch_manager();
+        exhaust_spare_pool(&mut parent, LINUX_MMAP_BASE);
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let ext1_base = Gpa(0xb0_0000_0000);
+        let ext2_base = Gpa(0xc0_0000_0000);
+
+        let parent_available = Arc::new(Mutex::new(vec![ext2_base, ext1_base]));
+        let parent_returned = Arc::new(Mutex::new(Vec::new()));
+        let parent_source = TestArenaSource {
+            available: Arc::clone(&parent_available),
+            returned: Arc::clone(&parent_returned),
+        };
+        parent.set_arena_source(Box::new(parent_source));
+
+        // Grow parent to 2 arenas (1 extension arena)
+        let va1 = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
+        parent
+            .set_rw(va1, 0x1000, false)
+            .expect("allocates first extension arena");
+        assert_eq!(parent.pool_stats().3, 2, "parent has 2 arenas");
+
+        // First check with 2 arenas (1 extension arena)
+        let mut child2 = parent.clone();
+        assert!(child2.arena_source().is_none(), "clone drops arena_source");
+        let child_root = 0x50_0000_0000;
+        assert_eq!(
+            child2.rebase(child_root).unwrap_err(),
+            PageTableError::MissingArenaSource,
+            "rebase without source fails with MissingArenaSource"
+        );
+
+        // Add a second extension arena to parent so parent has 3 arenas (2 extension arenas)
+        parent.arenas.push(TableArena {
+            base: ext2_base.0,
+            bytes: vec![0u8; LINUX_PAGE_TABLES_SIZE as usize],
+            next_free: SPARE_START_OFFSET,
+        });
+        assert_eq!(parent.pool_stats().3, 3, "parent has 3 arenas");
+
+        // Clone parent with two extension arenas
+        let mut child = parent.clone();
+        assert!(child.arena_source().is_none(), "clone drops arena_source");
+
+        // Rebasing child without a source returns MissingArenaSource
+        assert_eq!(
+            child.rebase(child_root).unwrap_err(),
+            PageTableError::MissingArenaSource,
+            "rebasing 3-arena manager without source returns MissingArenaSource"
+        );
+
+        // Install a child source with 2 fresh slots
+        let child_ext1 = Gpa(0xd0_0000_0000);
+        let child_ext2 = Gpa(0xe0_0000_0000);
+        let child_available = Arc::new(Mutex::new(vec![child_ext2, child_ext1]));
+        let child_returned = Arc::new(Mutex::new(Vec::new()));
+        let child_source = TestArenaSource {
+            available: Arc::clone(&child_available),
+            returned: Arc::clone(&child_returned),
+        };
+        child.set_arena_source(Box::new(child_source));
+
+        let parent_avail_count_before = parent_available.lock().unwrap().len();
+
+        // Rebase child
+        child
+            .rebase(child_root)
+            .expect("rebase succeeds with child source");
+
+        // Verify child took two fresh slots from child source
+        assert_eq!(
+            child_available.lock().unwrap().len(),
+            0,
+            "child took two fresh slots from child source"
+        );
+        // Verify parent source was untouched
+        assert_eq!(
+            parent_available.lock().unwrap().len(),
+            parent_avail_count_before,
+            "parent source was untouched by child rebase"
+        );
+        assert_eq!(child.pool_stats().3, 3, "child preserves 3 arenas");
+        assert_eq!(child.base(), child_root, "child rebased root");
+        assert_eq!(child.arenas[1].base, child_ext1.0, "child rebased arena 1");
+        assert_eq!(child.arenas[2].base, child_ext2.0, "child rebased arena 2");
     }
 }

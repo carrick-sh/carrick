@@ -255,7 +255,6 @@ impl Stage1MmLease {
         self.root_slot
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn table_arena_source(
         self: &Arc<Self>,
         pool: Stage1MmPool,
@@ -483,7 +482,6 @@ fn carrier_stage1_mm_pool() -> &'static Arc<Mutex<Stage1MmPoolInner>> {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct Stage1MmTableArenaSource {
     pool: Stage1MmPool,
@@ -509,10 +507,6 @@ impl carrick_mem::page_table::TableArenaSource for Stage1MmTableArenaSource {
             let mut inner = self.pool.inner.lock();
             inner.free_root_slots.insert(slot);
         }
-    }
-
-    fn clone_source(&self) -> Option<Box<dyn carrick_mem::page_table::TableArenaSource>> {
-        Some(Box::new(self.clone()))
     }
 }
 
@@ -849,7 +843,6 @@ impl PreparedStage1Mm {
         self.lease.root_slot()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn table_arena_source(&self) -> Box<dyn carrick_mem::page_table::TableArenaSource> {
         self.lease.table_arena_source(self.pool.clone())
     }
@@ -2186,5 +2179,51 @@ mod tests {
 
         // Primary root slot and ext2 must both be back in free_root_slots
         assert_eq!(pool.inner.lock().free_root_slots.len(), initial_free);
+    }
+
+    #[test]
+    fn child_retirement_returns_extension_slots_leaving_parent_untouched() {
+        let (pool, root_lease) =
+            Stage1MmPool::new_root_for_tests(0x8000, 64).expect("root slot pool");
+        let initial_free = pool.inner.lock().free_root_slots.len();
+
+        let mut parent_source = root_lease.table_arena_source(pool.clone());
+        let _parent_ext = parent_source.take_arena().expect("parent extension slot");
+        assert_eq!(root_lease.extension_slots().len(), 1);
+        assert_eq!(pool.inner.lock().free_root_slots.len(), initial_free - 1);
+
+        let child = pool.prepare_child().expect("child preparation");
+        assert_eq!(pool.inner.lock().free_root_slots.len(), initial_free - 2);
+
+        let mut child_source = child.table_arena_source();
+        let _child_ext = child_source.take_arena().expect("child extension slot");
+        assert_eq!(child.extension_slots().len(), 1);
+        assert_eq!(pool.inner.lock().free_root_slots.len(), initial_free - 3);
+
+        // Child retires
+        let child_lease = child.commit();
+        let child_retirement = pool.retire(&child_lease).expect("retire child");
+        child_retirement
+            .complete_for_test()
+            .expect("complete child retirement");
+
+        // Child's primary slot + extension slot returned, but parent's count remains untouched
+        assert_eq!(
+            root_lease.extension_slots().len(),
+            1,
+            "parent extension slots untouched"
+        );
+        assert_eq!(pool.inner.lock().free_root_slots.len(), initial_free - 1);
+
+        // Parent retires
+        let parent_retirement = pool.retire(&root_lease).expect("retire parent");
+        parent_retirement
+            .complete_for_test()
+            .expect("complete parent retirement");
+        assert_eq!(
+            pool.inner.lock().free_root_slots.len(),
+            initial_free,
+            "all slots returned"
+        );
     }
 }
