@@ -1,4 +1,4 @@
-60beb069fa48cd59
+5f089dd5e46ed7ae
 pipe2_nonblock_rc_zero=true
 pipe2_nonblock_read_end_nonblock=true
 pipe2_nonblock_write_end_nonblock=true
@@ -18,3 +18,8 @@ pipe_read_after_close_returns_zero=true
 pipe_epipe_setup_rc_zero=true
 pipe_write_after_rclose_rc_minus_one=true
 pipe_write_after_rclose_errno_epipe=true
+positional_setup_rc_zero=true
+pwrite_pipe_read_end_espipe=true
+pwrite_pipe_write_end_espipe=true
+pread_pipe_write_end_espipe=true
+pread_pipe_read_end_espipe=true
