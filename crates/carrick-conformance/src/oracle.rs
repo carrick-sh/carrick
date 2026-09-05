@@ -38,9 +38,22 @@ struct OracleKey<'a> {
     workdir: Option<&'a str>,
     /// which parser turns docker's raw output into the cached `SuiteResult`.
     verdict: VerdictKind,
+    /// The parser's own fingerprint, for verdict kinds whose parser has one
+    /// (`regrtest`). The cache holds parsed ids, so a parser that recognises a
+    /// different id set must miss every row it did not produce. Omitted for
+    /// the other kinds so their committed determinant bytes stay stable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parser: Option<&'static str>,
     /// Omitted for regression so its committed determinant bytes remain stable.
     #[serde(skip_serializing_if = "Option::is_none")]
     parser_profile: Option<&'a str>,
+}
+
+fn parser_fingerprint(verdict: VerdictKind) -> Option<&'static str> {
+    match verdict {
+        VerdictKind::Regrtest => Some(crate::parsers::regrtest::PARSER_FINGERPRINT),
+        VerdictKind::Gotest | VerdictKind::Tap | VerdictKind::Ltp | VerdictKind::Shell => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +97,7 @@ pub fn oracle_key_for_profile(
         env,
         workdir: suite.workdir.as_deref(),
         verdict: suite.verdict,
+        parser: parser_fingerprint(suite.verdict),
         parser_profile: profile.determinant(),
     };
     // These are plain owned/borrowed scalars and Vecs — serialization cannot
@@ -550,6 +564,23 @@ mod tests {
             r#"{"docker_platform":"linux/arm64","image":"localhost:5005/golden:1","cmd":["/bin/echo","hi"],"docker_flags":[],"entrypoint":null,"bind_mounts":[],"env":[],"workdir":null,"verdict":"shell"}"#,
             "OracleKey determinant schema changed — if intentional, re-bless the \
              committed oracle cache (--refresh-oracle) and update this golden string"
+        );
+    }
+
+    #[test]
+    fn regrtest_key_carries_the_parser_fingerprint() {
+        let mut s = base_suite();
+        s.verdict = VerdictKind::Regrtest;
+        let key = oracle_key(&s, crate::lane::DockerPlatform::LinuxArm64);
+        assert!(
+            key.contains(r#""verdict":"regrtest","parser":"regrtest-v2-timed-multiline""#),
+            "a regrtest oracle row is only valid for the parser that produced it: {key}"
+        );
+        let mut shell = base_suite();
+        shell.verdict = VerdictKind::Shell;
+        assert!(
+            !oracle_key(&shell, crate::lane::DockerPlatform::LinuxArm64).contains("\"parser\""),
+            "non-regrtest keys keep their committed bytes"
         );
     }
 
