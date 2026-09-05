@@ -847,7 +847,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 1,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
@@ -856,7 +856,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 2,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
@@ -865,7 +865,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 3,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
@@ -874,7 +874,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 4,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
@@ -883,7 +883,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 5,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
@@ -892,7 +892,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 6,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
@@ -901,7 +901,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 7,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
@@ -910,7 +910,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 8,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
@@ -919,7 +919,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 9,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
@@ -928,7 +928,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 10,
-      "fingerprint": "c5bbc52e4338769b1a8939edef90056271b7ab796fedc5df97e7d2f2add80cdf",
+      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing."
