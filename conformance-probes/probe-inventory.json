@@ -1994,6 +1994,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "seekholemap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "selectnfds": {
     "class": "conformance",
     "excluded": false,

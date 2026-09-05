@@ -2888,10 +2888,10 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `forkprotectexec` adds child `mprotect` execute-permission changes over
 /// inherited COW pages; `fifoopenmatrix` adds the FIFO open
 /// handshake/EINTR/SA_RESTART matrix.
-/// The authoritative inventory contains 514 probe sources: 487 conformance
-/// sources (464 generic, 23 dedicated), 26 performance sources, and one helper.
-/// Both libc lanes therefore gate 974 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 514;
+/// The authoritative inventory contains 515 probe sources: 488 conformance
+/// sources (465 generic, 23 dedicated), 26 performance sources, and one helper.
+/// Both libc lanes therefore gate 976 conformance rows.
+const PROBE_SOURCE_COUNT: usize = 515;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4647,9 +4647,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 464);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 487);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 974);
+    assert_eq!(generic.len(), 465);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 488);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 976);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

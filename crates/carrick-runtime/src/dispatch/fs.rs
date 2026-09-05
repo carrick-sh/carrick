@@ -47,7 +47,7 @@
 //! the Darwin `copyfile`/`fclonefileat` fast path), `access` (DAC checks),
 //! and `xattr`.
 use super::*;
-use crate::linux_abi::LINUX_ENOSPC;
+use crate::linux_abi::{LINUX_ENOSPC, LINUX_ENXIO, LINUX_SEEK_DATA, LINUX_SEEK_HOLE};
 
 fn resolve_tiocspgrp(
     context: &crate::kernel::KernelContext,
@@ -10423,7 +10423,6 @@ impl SyscallDispatcher {
         }
 
         fn lseek(this, cx, fd: Fd, offset: u64, whence: u64) {
-
             let fd: Fd = fd;
             let offset = offset as i64;
             let Some(open_file) = this.open_file(fd.0) else {
@@ -10456,15 +10455,20 @@ impl SyscallDispatcher {
                     // SEEK_DATA/SEEK_HOLE: macOS supports them but SWAPS the
                     // numbers (Linux DATA=3/HOLE=4, macOS DATA=4/HOLE=3), so
                     // translate for sparse-file hole queries (test_fs_holes).
-                    3 => 4, // LINUX_SEEK_DATA -> macOS SEEK_DATA
-                    4 => 3, // LINUX_SEEK_HOLE -> macOS SEEK_HOLE
+                    LINUX_SEEK_DATA => 4, // LINUX_SEEK_DATA -> macOS SEEK_DATA
+                    LINUX_SEEK_HOLE => 3, // LINUX_SEEK_HOLE -> macOS SEEK_HOLE
                     _ => {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                 };
-                let r =
-                    (unsafe { libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence) })
-                        .host_syscall_errno()?;
+                let r = match (unsafe {
+                    libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence)
+                })
+                .host_syscall_errno()
+                {
+                    Ok(r) => r,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
                 return Ok(DispatchOutcome::Returned { value: r as i64 });
             }
 
@@ -10486,10 +10490,14 @@ impl SyscallDispatcher {
                         LINUX_SEEK_END => libc::SEEK_END,
                         _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                     };
-                    let r = (unsafe {
+                    let r = match (unsafe {
                         libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence)
                     })
-                    .host_syscall_errno()?;
+                    .host_syscall_errno()
+                    {
+                        Ok(r) => r,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
                     return Ok(DispatchOutcome::Returned { value: r as i64 });
                 }
             }
@@ -10510,25 +10518,115 @@ impl SyscallDispatcher {
                 );
             }
 
-            let (current, end) = match &*open {
+            let (current, end) = match &mut *open {
                 OpenDescription::Closed { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
                 OpenDescription::File {
-                    contents, offset, ..
-                } => (*offset as i64, contents.len() as i64),
+                    contents,
+                    offset: file_offset,
+                    ..
+                } => {
+                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                        match contents {
+                            FileContents::HostBacked { fd } => {
+                                use std::os::fd::AsRawFd;
+                                if offset < 0 {
+                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                }
+                                let host_whence = match whence {
+                                    LINUX_SEEK_DATA => 4,
+                                    LINUX_SEEK_HOLE => 3,
+                                    _ => unreachable!(),
+                                };
+                                let r = match (unsafe {
+                                    libc::lseek(fd.as_raw_fd(), offset as libc::off_t, host_whence)
+                                })
+                                .host_syscall_errno()
+                                {
+                                    Ok(r) => r,
+                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                                };
+                                *file_offset = r as usize;
+                                return Ok(DispatchOutcome::Returned { value: r as i64 });
+                            }
+                            FileContents::Dense(_) | FileContents::RootFsBacked { .. } => {
+                                if offset < 0 {
+                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                }
+                                let file_size = contents.len();
+                                if (offset as usize) >= file_size {
+                                    return Ok(DispatchOutcome::errno(LINUX_ENXIO));
+                                }
+                                let next = if whence == LINUX_SEEK_DATA {
+                                    offset
+                                } else {
+                                    file_size as i64
+                                };
+                                *file_offset = next as usize;
+                                return Ok(DispatchOutcome::Returned { value: next });
+                            }
+                        }
+                    }
+                    (*file_offset as i64, contents.len() as i64)
+                }
                 OpenDescription::SyntheticFile {
-                    contents, offset, ..
-                } => (*offset as i64, contents.len() as i64),
+                    contents,
+                    offset: file_offset,
+                    ..
+                } => {
+                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                        if offset < 0 {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        let file_size = contents.len();
+                        if (offset as usize) >= file_size {
+                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
+                        }
+                        let next = if whence == LINUX_SEEK_DATA {
+                            offset
+                        } else {
+                            file_size as i64
+                        };
+                        *file_offset = next as usize;
+                        return Ok(DispatchOutcome::Returned { value: next });
+                    }
+                    (*file_offset as i64, contents.len() as i64)
+                }
                 OpenDescription::InMemoryFile {
-                    contents, offset, ..
-                } => (*offset as i64, contents.read().len() as i64),
+                    contents,
+                    offset: file_offset,
+                    ..
+                } => {
+                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                        if offset < 0 {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        let file_size = contents.read().len();
+                        if (offset as usize) >= file_size {
+                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
+                        }
+                        let next = if whence == LINUX_SEEK_DATA {
+                            offset
+                        } else {
+                            file_size as i64
+                        };
+                        *file_offset = next as usize;
+                        return Ok(DispatchOutcome::Returned { value: next });
+                    }
+                    (*file_offset as i64, contents.read().len() as i64)
+                }
                 OpenDescription::Directory {
                     listing, offset, ..
-                } => (
-                    *offset as i64,
-                    listing.entries().map_or(0, |entries| entries.len()) as i64,
-                ),
+                } => {
+                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    (
+                        *offset as i64,
+                        listing.entries().map_or(0, |entries| entries.len()) as i64,
+                    )
+                }
                 OpenDescription::SyntheticDevice { .. } => {
                     return match whence {
                         LINUX_SEEK_SET | LINUX_SEEK_CUR | LINUX_SEEK_END => {
@@ -12098,12 +12196,18 @@ impl SyscallDispatcher {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
                 | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::PipeReader { .. } => LINUX_EBADF,
+                OpenDescription::HostPipe {
+                    is_read_end,
+                    pty,
+                    bidirectional,
+                    ..
+                } if *is_read_end && pty.is_none() && !*bidirectional => LINUX_EBADF,
                 OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
-                OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
+                OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
