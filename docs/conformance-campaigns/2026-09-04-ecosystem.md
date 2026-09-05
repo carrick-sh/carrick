@@ -441,3 +441,25 @@ write, pwritev2 ESPIPE on pipes, blocking inotify/fanotify reads).
   accumulated module state and will be re-run under the full-module reducer
   after the pty-rescue fix lands, since the readline signature is the same
   draining-table abort.
+
+## Performance targets (from the ee40fc454 ledger; ratios are hypotheses)
+
+Aggregate over the 2,063 matched suites: Carrick 3,575 s vs oracle 2,012 s
+(1.78x), but the distribution is what matters: 299 suites sit in 2-5x
+(794 s), 28 in 5-10x (532 s) and 20 above 10x carry 1,206 s of wall on
+their own. Per AGENTS.md a pathological ratio is a correctness signal, so
+the first targets are the smallest reproducers of each family:
+
+| suite | ratio | carrick | oracle | family |
+|---|---|---|---|---|
+| ltp-munmap04 | 75.8x | 30.5 s | 0.4 s | mmap/munmap algorithm (single process) |
+| cpython-call | 20.2x | 8.3 s | 0.4 s | compute-bound CPython, no fork |
+| go-crypto | 33.1x | 13.4 s | 0.4 s | Go runtime scheduler / threads |
+| cpython-tarfile | 59.4x | 283 s | 4.8 s | fs-heavy (open/utimes/chmod amplification) |
+| go-go_types, go-go_internal_srcimporter | 31-43x | 115-192 s | 3-6 s | Go compute + fs |
+| cpython-concurrent_futures, multiprocessing_fork | budget timeouts | >600 s | 52-74 s | fork / process pools |
+
+Method: exact suite invocation under `carrick trace` (in-process libdtrace)
+for the syscall shape first, then a controlled single-variable quiet-host
+comparison per fix. Traces land under
+`target/conformance/ecosystem-sep04-receipts/perf/`.
