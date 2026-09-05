@@ -35536,6 +35536,142 @@ impl HvfVmState {
         Ok(())
     }
 
+    pub(crate) fn publish_shared_repoint(
+        &mut self,
+        va: u64,
+        target_ipa: u64,
+        len: usize,
+    ) -> Result<(), TrapError> {
+        let target_end = target_ipa.checked_add(len as u64).ok_or_else(|| {
+            TrapError::Hypervisor("shared repoint target IPA overflow".to_owned())
+        })?;
+        let (
+            mapping_ipa,
+            physical_ipa,
+            mapping_host,
+            physical_size,
+            perms,
+            mapping_owner_generation,
+            mapping_shared_key_base,
+            mapping_shared_key_offset,
+        ) = self
+            .mappings
+            .iter()
+            .rev()
+            .find(|mapping| {
+                (target_ipa >= mapping.ipa
+                    && mapping
+                        .ipa
+                        .checked_add(mapping.size as u64)
+                        .is_some_and(|end| target_end <= end))
+                    || (target_ipa >= mapping.physical_ipa
+                        && mapping
+                            .physical_ipa
+                            .checked_add(mapping.physical_size as u64)
+                            .is_some_and(|end| target_end <= end))
+            })
+            .map(|mapping| {
+                (
+                    mapping.ipa,
+                    mapping.physical_ipa,
+                    mapping.host_addr as usize,
+                    mapping.physical_size,
+                    mapping.perms,
+                    mapping
+                        .structural_owner
+                        .as_ref()
+                        .map(|owner| owner.epoch().raw())
+                        .unwrap_or(mapping.owner_generation),
+                    mapping.shared_key_base,
+                    mapping.shared_key_offset,
+                )
+            })
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "shared repoint IPA 0x{target_ipa:x} size {len} has no physical owner"
+                ))
+            })?;
+        let semantic_offset = target_ipa.checked_sub(physical_ipa).ok_or_else(|| {
+            TrapError::Hypervisor("shared repoint precedes its physical extent".to_owned())
+        })?;
+        let physical_host_addr = mapping_host
+            .checked_sub(mapping_ipa.checked_sub(physical_ipa).ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "shared repoint mapping precedes its physical extent".to_owned(),
+                )
+            })? as usize)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("shared repoint physical host underflow".to_owned())
+            })?;
+        let host_addr = physical_host_addr
+            .checked_add(semantic_offset as usize)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("shared repoint semantic host overflow".to_owned())
+            })?;
+        let inventory_backing = self
+            .frame_inventory
+            .lock()
+            .extents
+            .get(&(physical_ipa, physical_size as u64))
+            .map(|extent| extent.backing)
+            .or_else(|| (!self.persistent_vm_lifecycle).then(Self::private_backing_identity))
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "shared repoint physical IPA 0x{:x} size {} lacks frame inventory",
+                    physical_ipa, physical_size
+                ))
+            })?;
+        let owner_generation =
+            if is_reusable_global_frame_extent(physical_ipa, physical_size as u64) {
+                global_frame_host_owner_generation_in(
+                    self.custody(),
+                    physical_ipa,
+                    physical_size as u64,
+                )
+            } else {
+                mapping_owner_generation
+            };
+        let sharing = GuestMappingSharing::GlobalShared;
+        register_shared_alias(AliasBacking {
+            start: va,
+            ipa: target_ipa,
+            host_addr,
+            size: len,
+            physical_ipa,
+            physical_host_addr,
+            physical_size,
+            perms: u64::from(perms),
+            guest_writable: true,
+            sharing,
+            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
+            inventory_backing,
+            shared_key_base: mapping_shared_key_base,
+            shared_key_offset: mapping_shared_key_offset,
+            owner_generation,
+        });
+        self.mappings.push(HvfMappedRegion {
+            start: va,
+            ipa: target_ipa,
+            physical_ipa,
+            end: va.saturating_add(len as u64),
+            host_addr: host_addr as *mut u8,
+            size: len,
+            physical_size,
+            perms,
+            memory: None,
+            host_mapping: None,
+            structural_owner: None,
+            stage2_lease: None,
+            is_dynamic_alias: true,
+            sharing,
+            guest_writable: true,
+            shared_key_base: mapping_shared_key_base,
+            shared_key_offset: mapping_shared_key_offset,
+            owner_generation,
+        });
+        Ok(())
+    }
+
     pub(crate) fn apply_exec_inventory(
         &mut self,
         replacement_mm: u64,

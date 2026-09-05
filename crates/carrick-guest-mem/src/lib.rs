@@ -785,6 +785,25 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Repoint guest VA `[va, va+len)` to target stage-1 output IPA `target_ipa`.
+    /// Used for `MREMAP_FIXED` moves of pages within an existing shared extent:
+    /// the destination leaf is repointed to the existing extent's IPA for that
+    /// file offset without minting a new host mmap or stage-2 mapping.
+    fn repoint_shared_leaf(
+        &mut self,
+        _va: u64,
+        _target_ipa: u64,
+        _len: usize,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Translate guest VA `va` to its stage-1 physical address (IPA), if translated.
+    /// Default: `None` (identity or untranslated memory).
+    fn translate_va(&self, _va: u64) -> Option<u64> {
+        None
+    }
+
     /// Restore `[va, va+len)` to the boot shared aperture's identity backing
     /// after a private overlay was unmapped. This is distinct from
     /// `protect_range`: protection edits must preserve an existing non-identity
