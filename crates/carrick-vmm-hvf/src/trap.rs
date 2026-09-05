@@ -1867,7 +1867,7 @@ mod foreign_mm_tests {
         assert!(
             matches!(
                 tampered_prepare,
-                Err(carrick_hal::ForeignMmTransportError::Retry)
+                Err(carrick_hal::ForeignMmTransportError::LeaseStale)
             ),
             "tampered successor snapshot must be rejected on prepare_write: {tampered_prepare:?}"
         );
