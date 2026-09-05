@@ -2374,36 +2374,40 @@ impl SyscallDispatcher {
         let visible_self = proc_visible_self(context);
         if let Some(n) = proc_self_fd_number(&path, visible_self) {
             let Some(open_file) = self.open_file(n) else {
-                return Ok(self.duplicate_fd(n, 0, flags & LINUX_O_CLOEXEC));
+                return Ok(self.duplicate_fd(
+                    n,
+                    0,
+                    if flags & LINUX_O_CLOEXEC != 0 {
+                        LINUX_FD_CLOEXEC
+                    } else {
+                        0
+                    },
+                ));
             };
-            let mut truncated_path: Option<String> = None;
-            let mut reopen_outcome: Option<DispatchOutcome> = None;
-            if let Some(mut open) = open_file.description.write() {
-                if flags & LINUX_O_TRUNC != 0 {
-                    if let OpenDescription::File {
-                        path,
-                        contents,
-                        metadata,
-                        writable,
-                        ..
-                    } = &mut *open
-                        && *writable
-                        && contents.len() != 0
-                    {
-                        if let Err(errno) = memfd_seal_resize_check(
-                            open_file.description.common().seals(),
-                            0,
-                            contents.len(),
-                        ) {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        contents.truncate(0);
-                        metadata.size = 0;
-                        if !is_anon_overlay_path(path) {
-                            truncated_path = Some(path.clone());
-                        }
-                    }
-                }
+
+            enum ReopenAction {
+                ByPath(String),
+                CopyDescription(
+                    Box<OpenDescription>,
+                    Arc<crate::kernel::DescriptionCommon>,
+                    u64,
+                ),
+                Errno(LinuxErrno),
+                Duplicate,
+            }
+
+            let action = {
+                let Some(mut open) = open_file.description.write() else {
+                    return Ok(self.duplicate_fd(
+                        n,
+                        0,
+                        if flags & LINUX_O_CLOEXEC != 0 {
+                            LINUX_FD_CLOEXEC
+                        } else {
+                            0
+                        },
+                    ));
+                };
 
                 let accmode = flags & LINUX_O_ACCMODE;
                 let is_writable = accmode == LINUX_O_WRONLY || accmode == LINUX_O_RDWR;
@@ -2415,7 +2419,7 @@ impl SyscallDispatcher {
                     0
                 };
 
-                let new_desc_opt = match &*open {
+                match &mut *open {
                     OpenDescription::File {
                         path,
                         metadata,
@@ -2423,32 +2427,65 @@ impl SyscallDispatcher {
                         writable,
                         ..
                     } => {
-                        let is_memfd = shared_seals.lock().is_some();
-                        if is_writable {
-                            if let Some(seals) = *shared_seals.lock() {
-                                if seals & carrick_abi::LinuxMemfdSeals::WRITE.bits() != 0 {
-                                    reopen_outcome = Some(DispatchOutcome::errno(LINUX_EPERM));
-                                }
-                            }
-                            if !is_memfd && !*writable {
-                                reopen_outcome = Some(DispatchOutcome::errno(LINUX_EACCES));
-                            }
-                        }
-                        if reopen_outcome.is_none() {
-                            Some(OpenDescription::File {
-                                base: OpenDescriptionBase::new(0),
-                                path: path.clone(),
-                                metadata: metadata.clone(),
-                                contents: contents.clone(),
-                                offset: 0,
-                                writable: if is_memfd {
-                                    is_writable
-                                } else {
-                                    *writable && is_writable
-                                },
-                            })
+                        if !is_anon_overlay_path(path) {
+                            ReopenAction::ByPath(path.clone())
                         } else {
-                            None
+                            let is_memfd = shared_seals.lock().is_some();
+                            let err = if is_writable {
+                                if let Some(seals) = *shared_seals.lock()
+                                    && seals & carrick_abi::LinuxMemfdSeals::WRITE.bits() != 0
+                                {
+                                    Some(LINUX_EPERM)
+                                } else if !is_memfd && !*writable {
+                                    Some(LINUX_EACCES)
+                                } else if flags & LINUX_O_TRUNC != 0 && contents.len() != 0 {
+                                    if let Err(errno) = memfd_seal_resize_check(
+                                        open_file.description.common().seals(),
+                                        0,
+                                        contents.len(),
+                                    ) {
+                                        Some(errno)
+                                    } else {
+                                        contents.truncate(0);
+                                        metadata.size = 0;
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some(errno) = err {
+                                ReopenAction::Errno(errno)
+                            } else {
+                                let new_desc = OpenDescription::File {
+                                    base: OpenDescriptionBase::new(0),
+                                    path: path.clone(),
+                                    metadata: metadata.clone(),
+                                    contents: contents.clone(),
+                                    offset: 0,
+                                    writable: if is_memfd {
+                                        is_writable
+                                    } else {
+                                        *writable && is_writable
+                                    },
+                                };
+                                let new_common =
+                                    Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
+                                        flags & !LINUX_O_CLOEXEC,
+                                        shared_seals,
+                                    ));
+                                if is_secretmem {
+                                    new_common.set_secretmem(true);
+                                }
+                                ReopenAction::CopyDescription(
+                                    Box::new(new_desc),
+                                    new_common,
+                                    fd_flags,
+                                )
+                            }
                         }
                     }
                     OpenDescription::HostFile {
@@ -2457,16 +2494,53 @@ impl SyscallDispatcher {
                         writable,
                         ..
                     } => {
-                        if is_writable && !*writable {
-                            reopen_outcome = Some(DispatchOutcome::errno(LINUX_EACCES));
-                            None
+                        let path_str = metadata.path.to_string_lossy();
+                        if !is_anon_overlay_path(&path_str) {
+                            ReopenAction::ByPath(path_str.into_owned())
                         } else {
-                            Some(OpenDescription::HostFile {
-                                base: OpenDescriptionBase::new(0),
-                                host_fd: host_fd.clone(),
-                                metadata: metadata.clone(),
-                                writable: *writable && is_writable,
-                            })
+                            if is_writable && !*writable {
+                                ReopenAction::Errno(LINUX_EACCES)
+                            } else {
+                                let dup_fd = unsafe { libc::dup(host_fd.raw()) };
+                                if dup_fd < 0 {
+                                    ReopenAction::Errno(linux_errno::EMFILE)
+                                } else {
+                                    unsafe { libc::fcntl(dup_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                                    crate::dispatch::net::set_host_nonblocking(dup_fd);
+                                    // SAFETY: `dup_fd` is freshly duplicated and valid.
+                                    let owned = unsafe {
+                                        use std::os::fd::FromRawFd;
+                                        std::os::fd::OwnedFd::from_raw_fd(dup_fd)
+                                    };
+                                    let mut new_metadata = metadata.clone();
+                                    if flags & LINUX_O_TRUNC != 0 && is_writable {
+                                        use std::os::fd::AsRawFd;
+                                        unsafe { libc::ftruncate(owned.as_raw_fd(), 0) };
+                                        new_metadata.size = 0;
+                                    }
+                                    let new_desc = OpenDescription::File {
+                                        base: OpenDescriptionBase::new(0),
+                                        path: path_str.into_owned(),
+                                        metadata: new_metadata,
+                                        contents: FileContents::host_backed(owned),
+                                        offset: 0,
+                                        writable: *writable && is_writable,
+                                    };
+                                    let new_common =
+                                        Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
+                                            flags & !LINUX_O_CLOEXEC,
+                                            shared_seals,
+                                        ));
+                                    if is_secretmem {
+                                        new_common.set_secretmem(true);
+                                    }
+                                    ReopenAction::CopyDescription(
+                                        Box::new(new_desc),
+                                        new_common,
+                                        fd_flags,
+                                    )
+                                }
+                            }
                         }
                     }
                     OpenDescription::InMemoryFile {
@@ -2477,85 +2551,62 @@ impl SyscallDispatcher {
                         ..
                     } => {
                         if is_writable && !*writable {
-                            reopen_outcome = Some(DispatchOutcome::errno(LINUX_EACCES));
-                            None
+                            ReopenAction::Errno(LINUX_EACCES)
                         } else {
-                            Some(OpenDescription::InMemoryFile {
+                            if flags & LINUX_O_TRUNC != 0 && is_writable {
+                                contents.write().clear();
+                            }
+                            let new_desc = OpenDescription::InMemoryFile {
                                 base: OpenDescriptionBase::new(0),
                                 path: path.clone(),
                                 contents: Arc::clone(contents),
                                 offset: 0,
                                 writable: *writable && is_writable,
                                 max_size: *max_size,
-                            })
+                            };
+                            let new_common =
+                                Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
+                                    flags & !LINUX_O_CLOEXEC,
+                                    shared_seals,
+                                ));
+                            if is_secretmem {
+                                new_common.set_secretmem(true);
+                            }
+                            ReopenAction::CopyDescription(Box::new(new_desc), new_common, fd_flags)
                         }
                     }
-                    OpenDescription::SyntheticFile { path, contents, .. } => {
-                        if is_writable {
-                            reopen_outcome = Some(DispatchOutcome::errno(LINUX_EACCES));
-                            None
-                        } else {
-                            Some(OpenDescription::SyntheticFile {
-                                base: OpenDescriptionBase::new(0),
-                                path: path.clone(),
-                                contents: contents.clone(),
-                                offset: 0,
-                            })
-                        }
+                    OpenDescription::Directory { path, .. } => ReopenAction::ByPath(path.clone()),
+                    OpenDescription::SyntheticFile { path, .. } => {
+                        ReopenAction::ByPath(path.clone())
                     }
-                    OpenDescription::Directory {
-                        path,
-                        metadata,
-                        trusted_host_dir,
-                        ..
-                    } => {
-                        if is_writable {
-                            reopen_outcome = Some(DispatchOutcome::errno(LINUX_EISDIR));
-                            None
-                        } else {
-                            Some(OpenDescription::Directory {
-                                base: OpenDescriptionBase::new(0),
-                                path: path.clone(),
-                                metadata: metadata.clone(),
-                                listing: DirListing::Pending,
-                                offset: 0,
-                                trusted_host_dir: trusted_host_dir.clone(),
-                            })
-                        }
-                    }
-                    _ => None,
-                };
+                    _ => ReopenAction::Duplicate,
+                }
+            };
 
-                if let Some(outcome) = reopen_outcome {
-                    return Ok(outcome);
+            return match action {
+                ReopenAction::ByPath(target_path) => self.open_at_path_string(
+                    context,
+                    registry,
+                    LINUX_AT_FDCWD,
+                    &target_path,
+                    flags,
+                    0,
+                    reporter,
+                ),
+                ReopenAction::CopyDescription(new_desc, new_common, fd_flags) => {
+                    Ok(self.install_fd_with_common(*new_desc, new_common, fd_flags))
                 }
-                if let Some(new_description) = new_desc_opt {
-                    let new_common = Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
-                        flags & !LINUX_O_CLOEXEC,
-                        shared_seals,
-                    ));
-                    if is_secretmem {
-                        new_common.set_secretmem(true);
-                    }
-                    drop(open);
-                    if let Some(path) = truncated_path {
-                        let _ = self
-                            .fs
-                            .rootfs_vfs
-                            .overlay
-                            .set_file_contents(&path, Vec::new());
-                    }
-                    return Ok(self.install_fd_with_common(new_description, new_common, fd_flags));
-                }
-            }
-            if let Some(path) = truncated_path {
-                let _ = self
-                    .fs
-                    .rootfs_vfs
-                    .overlay
-                    .set_file_contents(&path, Vec::new());
-            }
-            return Ok(self.duplicate_fd(n, 0, flags & LINUX_O_CLOEXEC));
+                ReopenAction::Errno(errno) => Ok(DispatchOutcome::errno(errno)),
+                ReopenAction::Duplicate => Ok(self.duplicate_fd(
+                    n,
+                    0,
+                    if flags & LINUX_O_CLOEXEC != 0 {
+                        LINUX_FD_CLOEXEC
+                    } else {
+                        0
+                    },
+                )),
+            };
         }
 
         // `/proc/self/fdinfo/N` renders the fd's pos/flags/mnt_id/ino from the

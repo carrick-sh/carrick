@@ -5810,3 +5810,378 @@ fn memfd_proc_self_fd_reopen_access_mode_and_seals() {
         }
     );
 }
+
+#[test]
+fn proc_self_fd_reopen_overlay_file_write_after_reopen_visible_in_reopened() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x2000]);
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    const SYS_OPENAT: u64 = 56;
+    const SYS_CLOSE: u64 = 57;
+    const SYS_READ: u64 = 63;
+    const SYS_WRITE: u64 = 64;
+
+    // 1. Create a regular file through the overlay with O_RDWR.
+    memory.write_bytes(0x4000, b"/test_reopen.txt\0").unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_OPENAT,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            LINUX_O_CREAT | LINUX_O_RDWR,
+            0o644,
+            0,
+            0,
+        ],
+    );
+    let orig_fd = match outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("openat create failed: {other:?}"),
+    };
+    assert!(orig_fd >= 0);
+
+    // Initial write
+    memory.write_bytes(0x4100, b"initial ").unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_WRITE,
+        [orig_fd as u64, 0x4100, 8, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 8 });
+
+    // 2. Re-open read-only through /proc/self/fd/<orig_fd>.
+    let ro_path = format!("/proc/self/fd/{orig_fd}\0");
+    memory.write_bytes(0x4200, ro_path.as_bytes()).unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_OPENAT,
+        [LINUX_AT_FDCWD, 0x4200, LINUX_O_RDONLY, 0, 0, 0],
+    );
+    let ro_fd = match outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("openat /proc/self/fd failed: {other:?}"),
+    };
+    assert!(ro_fd >= 0);
+    assert_ne!(ro_fd, orig_fd);
+
+    // 3. Write through the original fd AFTER the read-only re-open.
+    memory.write_bytes(0x4300, b"subsequent").unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_WRITE,
+        [orig_fd as u64, 0x4300, 10, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 10 });
+
+    // 4. Read bytes back through the re-opened fd: must see the subsequent write!
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_READ,
+        [ro_fd as u64, 0x4400, 18, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 18 });
+    let read_bytes = memory.read_bytes(0x4400, 18).unwrap();
+    assert_eq!(read_bytes, b"initial subsequent");
+
+    // Re-opened fd is read-only, write must fail with EBADF
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_WRITE,
+        [ro_fd as u64, 0x4300, 10, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EBADF));
+
+    run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_CLOSE,
+        [orig_fd as u64, 0, 0, 0, 0, 0],
+    );
+    run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_CLOSE,
+        [ro_fd as u64, 0, 0, 0, 0, 0],
+    );
+}
+
+#[test]
+fn proc_self_fd_reopen_offsets_are_independent() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x2000]);
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    const SYS_OPENAT: u64 = 56;
+    const SYS_CLOSE: u64 = 57;
+    const SYS_LSEEK: u64 = 62;
+    const SYS_READ: u64 = 63;
+    const SYS_WRITE: u64 = 64;
+
+    // --- Part A: Regular host file ---
+    memory.write_bytes(0x4000, b"/test_offsets.txt\0").unwrap();
+    let orig_fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_OPENAT,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            LINUX_O_CREAT | LINUX_O_RDWR,
+            0o644,
+            0,
+            0,
+        ],
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("openat failed: {other:?}"),
+    };
+
+    memory.write_bytes(0x4100, b"abcdefghij").unwrap();
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_WRITE,
+            [orig_fd as u64, 0x4100, 10, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 10 },
+    );
+
+    // Seek orig_fd back to offset 0
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_LSEEK,
+            [orig_fd as u64, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 },
+    );
+
+    // Reopen through /proc/self/fd/<orig_fd>
+    let ro_path = format!("/proc/self/fd/{orig_fd}\0");
+    memory.write_bytes(0x4200, ro_path.as_bytes()).unwrap();
+    let ro_fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_OPENAT,
+        [LINUX_AT_FDCWD, 0x4200, LINUX_O_RDONLY, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("openat ro failed: {other:?}"),
+    };
+
+    // Read 3 bytes from orig_fd -> should read "abc", orig_fd offset is now 3
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_READ,
+            [orig_fd as u64, 0x4300, 3, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 3 },
+    );
+    assert_eq!(memory.read_bytes(0x4300, 3).unwrap(), b"abc");
+
+    // Read 4 bytes from ro_fd -> should read "abcd", ro_fd offset is now 4 (independent!)
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_READ,
+            [ro_fd as u64, 0x4300, 4, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 4 },
+    );
+    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), b"abcd");
+
+    // Read 3 more bytes from orig_fd -> should read "def", proving orig_fd was at 3
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_READ,
+            [orig_fd as u64, 0x4300, 3, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 3 },
+    );
+    assert_eq!(memory.read_bytes(0x4300, 3).unwrap(), b"def");
+
+    // Read 4 more bytes from ro_fd -> should read "efgh", proving ro_fd was at 4
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_READ,
+            [ro_fd as u64, 0x4300, 4, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 4 },
+    );
+    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), b"efgh");
+
+    run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_CLOSE,
+        [orig_fd as u64, 0, 0, 0, 0, 0],
+    );
+    run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_CLOSE,
+        [ro_fd as u64, 0, 0, 0, 0, 0],
+    );
+
+    // --- Part B: Anonymous O_TMPFILE host file ---
+    memory.write_bytes(0x4000, b".\0").unwrap();
+    let tmp_fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_OPENAT,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            carrick_abi::LINUX_O_TMPFILE | LINUX_O_RDWR,
+            0o600,
+            0,
+            0,
+        ],
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("openat O_TMPFILE failed: {other:?}"),
+    };
+
+    memory.write_bytes(0x4100, b"0123456789").unwrap();
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_WRITE,
+            [tmp_fd as u64, 0x4100, 10, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 10 },
+    );
+
+    // Seek tmp_fd back to 0
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_LSEEK,
+            [tmp_fd as u64, 0, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 },
+    );
+
+    // Reopen through /proc/self/fd/<tmp_fd>
+    let ro_tmp_path = format!("/proc/self/fd/{tmp_fd}\0");
+    memory.write_bytes(0x4200, ro_tmp_path.as_bytes()).unwrap();
+    let ro_tmp_fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_OPENAT,
+        [LINUX_AT_FDCWD, 0x4200, LINUX_O_RDONLY, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("openat ro tmpfile failed: {other:?}"),
+    };
+
+    // Read 3 bytes from tmp_fd -> should read "012", tmp_fd offset is now 3
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_READ,
+            [tmp_fd as u64, 0x4300, 3, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 3 },
+    );
+    assert_eq!(memory.read_bytes(0x4300, 3).unwrap(), b"012");
+
+    // Read 4 bytes from ro_tmp_fd -> should read "0123", ro_tmp_fd offset is now 4 (independent!)
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_READ,
+            [ro_tmp_fd as u64, 0x4300, 4, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 4 },
+    );
+    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), b"0123");
+
+    // Read 3 more bytes from tmp_fd -> should read "345", proving tmp_fd offset was at 3
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_READ,
+            [tmp_fd as u64, 0x4300, 3, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 3 },
+    );
+    assert_eq!(memory.read_bytes(0x4300, 3).unwrap(), b"345");
+
+    // Read 4 more bytes from ro_tmp_fd -> should read "4567", proving ro_tmp_fd offset was at 4
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            SYS_READ,
+            [ro_tmp_fd as u64, 0x4300, 4, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 4 },
+    );
+    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), b"4567");
+
+    run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_CLOSE,
+        [tmp_fd as u64, 0, 0, 0, 0, 0],
+    );
+    run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_CLOSE,
+        [ro_tmp_fd as u64, 0, 0, 0, 0, 0],
+    );
+}
