@@ -172,7 +172,7 @@
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
       "function": "SyscallDispatcher::read",
       "ordinal_in_function": 1,
-      "fingerprint": "5029fd217e9685d1ac8720a2d704b029ca1bedafb30a1daa9fb5eaf4cf3e5055",
+      "fingerprint": "12727ac4e8f39077ab6fdb8f6c1dac056531c7a38747aad05bcb5dc1b2fb4e27",
       "verdict": "typed_error_debt",
       "failure_domain": "dispatch::fs_io",
       "rationale": "Missing captured slot authority during pipe read in SyscallDispatcher::read is a normal close observation and should lower to EBADF.",
