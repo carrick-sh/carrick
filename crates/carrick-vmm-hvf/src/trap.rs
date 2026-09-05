@@ -23948,34 +23948,16 @@ impl MmAccessState {
             parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
         >,
     ) {
+        // Binding is a pointer swap and nothing else. An earlier version moved
+        // the manager out of the previous authority when this task state held
+        // its last reference; that made a rebind steal the shared authority's
+        // manager out from under sibling task states that had not rebound yet
+        // (three-thread core dumps lost two threads). Ownership transitions
+        // belong to the engine's exec/fork paths, never to a bind.
         let previous = {
             let mut slot = self.page_tables.write();
             std::mem::replace(&mut *slot, std::sync::Arc::clone(&page_tables))
         };
-        if !std::sync::Arc::ptr_eq(&previous, &page_tables) {
-            let authority = std::sync::Arc::as_ptr(&page_tables) as u64;
-            if std::sync::Arc::strong_count(&previous) == 1 {
-                let mut prev_guard = previous.lock();
-                let mut new_guard = page_tables.lock();
-                if let Some(mut old) = prev_guard.take() {
-                    if let Some(new_mgr) = new_guard.as_mut() {
-                        let before = u32::from(new_mgr.has_arena_source());
-                        new_mgr.adopt_live_extension_state(&mut old);
-                        let after = u32::from(new_mgr.has_arena_source());
-                        carrick_observability::probes::stage1_arena_replace(
-                            12, before, after, authority,
-                        );
-                        *prev_guard = Some(old);
-                    } else {
-                        let had_source = u32::from(old.has_arena_source());
-                        *new_guard = Some(old);
-                        carrick_observability::probes::stage1_arena_replace(
-                            12, 0, had_source, authority,
-                        );
-                    }
-                }
-            }
-        }
         if cow_refusal_diagnostics_enabled() && !std::sync::Arc::ptr_eq(&previous, &page_tables) {
             let old_root = previous.lock().as_ref().map(|manager| manager.base());
             let new_root = page_tables.lock().as_ref().map(|manager| manager.base());
@@ -23996,6 +23978,20 @@ impl MmAccessState {
     pub(crate) fn install_structural_owner(&self, owner: std::sync::Arc<StructuralBackingOwner>) {
         let key = (owner.physical_ipa, owner.physical_size);
         self.structural_owners.write().insert(key, owner);
+    }
+
+    /// Host pointer of the structural owner published for exactly
+    /// `(physical_ipa, physical_size)` — the O(1) lookup for a stage-1
+    /// extension arena's backing.
+    pub(crate) fn structural_owner_host_ptr(
+        &self,
+        physical_ipa: u64,
+        physical_size: usize,
+    ) -> Option<*mut u8> {
+        self.structural_owners
+            .read()
+            .get(&(physical_ipa, physical_size))
+            .map(|owner| owner.ptr())
     }
 
     fn install_mm_root_stage2_authority(
@@ -27229,9 +27225,25 @@ impl HvfTaskState {
         primary_host: Option<*mut u8>,
     ) -> impl carrick_mem::page_table::HostArenaResolver + Copy + 'a {
         move |base: u64| -> Option<*mut u8> {
-            primary_host.filter(|_| base == manager_base).or_else(|| {
-                self.host_ptr_for_ipa(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
-            })
+            primary_host
+                .filter(|_| base == manager_base)
+                // Extension arenas are published as structural owners keyed by
+                // exactly (base, 2 MiB): O(1). The mapping-row scan below is
+                // O(rows) and made every page-table edit of a process with
+                // thousands of mappings quadratic (pagetablegrow spent minutes
+                // in `live_pt_debug_walk`); it stays only as the last resort.
+                .or_else(|| {
+                    self.mm_access.structural_owner_host_ptr(
+                        base,
+                        carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                    )
+                })
+                .or_else(|| {
+                    self.host_ptr_for_ipa(
+                        base,
+                        carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                    )
+                })
         }
     }
 
@@ -51872,31 +51884,6 @@ mod frame_inventory_backend_tests {
         );
     }
 
-    #[test]
-    fn bind_page_tables_authority_migrates_live_manager_when_new_authority_empty() {
-        let owner = HvfTaskState::neutral();
-        let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let manager = crate::page_table::PageTableManager::new(
-            bytes,
-            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
-        );
-        let old_authority = std::sync::Arc::new(parking_lot::Mutex::new(Some(manager)));
-        owner
-            .mm_access
-            .bind_page_tables_authority(std::sync::Arc::clone(&old_authority));
-        drop(old_authority);
-
-        let new_authority = std::sync::Arc::new(parking_lot::Mutex::new(None));
-        owner
-            .mm_access
-            .bind_page_tables_authority(std::sync::Arc::clone(&new_authority));
-
-        assert!(
-            new_authority.lock().is_some(),
-            "live manager must be migrated into empty new authority"
-        );
-    }
-
     #[derive(Debug)]
     struct BindTestArenaSource(carrick_mem::page_table::TableArenaSourceId);
 
@@ -51908,44 +51895,6 @@ mod frame_inventory_backend_tests {
             None
         }
         fn return_arena(&mut self, _base: carrick_guest_mem::Gpa) {}
-    }
-
-    #[test]
-    fn bind_page_tables_authority_adopts_extension_state_when_both_present() {
-        let owner = HvfTaskState::neutral();
-        let bytes = carrick_mem::memory::stage1_identity_page_tables();
-        let mut old_mgr = crate::page_table::PageTableManager::new(
-            bytes.clone(),
-            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
-        );
-        let stage1_root = carrick_guest_mem::Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
-        let source = BindTestArenaSource(carrick_mem::page_table::TableArenaSourceId(stage1_root));
-        old_mgr.set_arena_source(Box::new(source)).unwrap();
-        assert!(old_mgr.has_arena_source());
-
-        let old_authority = std::sync::Arc::new(parking_lot::Mutex::new(Some(old_mgr)));
-        owner
-            .mm_access
-            .bind_page_tables_authority(std::sync::Arc::clone(&old_authority));
-        drop(old_authority);
-
-        let new_mgr = crate::page_table::PageTableManager::new(
-            bytes,
-            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
-        );
-        assert!(!new_mgr.has_arena_source());
-        let new_authority = std::sync::Arc::new(parking_lot::Mutex::new(Some(new_mgr)));
-
-        owner
-            .mm_access
-            .bind_page_tables_authority(std::sync::Arc::clone(&new_authority));
-
-        let new_guard = new_authority.lock();
-        let adopted = new_guard.as_ref().expect("new manager must be present");
-        assert!(
-            adopted.has_arena_source(),
-            "new manager must have adopted the arena source"
-        );
     }
 
     #[test]
