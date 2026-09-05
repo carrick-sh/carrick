@@ -123,6 +123,7 @@ pub(crate) struct Stage1MmLease {
     asid: AsidGeneration,
     residency: AsidResidency,
     root_slot: Option<Stage1RootSlot>,
+    extension_slots: Mutex<Vec<Stage1RootSlot>>,
     lifecycle: Mutex<Stage1MmLeaseLifecycle>,
     cow_invalidation_published: Arc<AtomicU64>,
     cow_invalidation: Mutex<CowInvalidationState>,
@@ -237,6 +238,7 @@ impl Stage1MmLease {
             asid,
             residency: AsidResidency::new(asid),
             root_slot,
+            extension_slots: Mutex::new(Vec::new()),
             lifecycle: Mutex::new(Stage1MmLeaseLifecycle::Live),
             cow_invalidation_published: Arc::new(AtomicU64::new(0)),
             cow_invalidation: Mutex::new(CowInvalidationState::default()),
@@ -251,6 +253,22 @@ impl Stage1MmLease {
 
     pub(crate) fn root_slot(&self) -> Option<Stage1RootSlot> {
         self.root_slot
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn table_arena_source(
+        self: &Arc<Self>,
+        pool: Stage1MmPool,
+    ) -> Box<dyn carrick_mem::page_table::TableArenaSource> {
+        Box::new(Stage1MmTableArenaSource {
+            pool,
+            lease: Arc::clone(self),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn extension_slots(&self) -> Vec<Stage1RootSlot> {
+        self.extension_slots.lock().clone()
     }
 
     pub(crate) fn backend(&self) -> Arc<Stage1MmBackend> {
@@ -465,6 +483,39 @@ fn carrier_stage1_mm_pool() -> &'static Arc<Mutex<Stage1MmPoolInner>> {
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub(crate) struct Stage1MmTableArenaSource {
+    pool: Stage1MmPool,
+    lease: Arc<Stage1MmLease>,
+}
+
+impl carrick_mem::page_table::TableArenaSource for Stage1MmTableArenaSource {
+    fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
+        let mut inner = self.pool.inner.lock();
+        let slot = inner.free_root_slots.pop_first()?;
+        self.lease.extension_slots.lock().push(slot);
+        Some(carrick_guest_mem::Gpa(slot.base()))
+    }
+
+    fn return_arena(&mut self, base: carrick_guest_mem::Gpa) {
+        let slot = {
+            let mut ext = self.lease.extension_slots.lock();
+            ext.iter()
+                .position(|s| s.base() == base.0)
+                .map(|pos| ext.remove(pos))
+        };
+        if let Some(slot) = slot {
+            let mut inner = self.pool.inner.lock();
+            inner.free_root_slots.insert(slot);
+        }
+    }
+
+    fn clone_source(&self) -> Option<Box<dyn carrick_mem::page_table::TableArenaSource>> {
+        Some(Box::new(self.clone()))
+    }
+}
+
 impl Stage1MmPool {
     pub(crate) fn new_root(stage1_root: u64) -> Result<(Self, Arc<Stage1MmLease>), Stage1MmError> {
         let pool = Self {
@@ -542,6 +593,9 @@ impl Stage1MmPool {
         inner.asids.release_unpublished(lease.asid)?;
         if let Some(root_slot) = lease.root_slot {
             inner.free_root_slots.insert(root_slot);
+        }
+        for slot in lease.extension_slots.lock().drain(..) {
+            inner.free_root_slots.insert(slot);
         }
         Ok(())
     }
@@ -704,6 +758,7 @@ impl PreparedStage1MmRetirement {
                 })
                 .unwrap_or_else(|_| std::process::abort())
         });
+        let extension_slots = self.lease.extension_slots.lock().drain(..).collect();
         Stage1MmRetirement {
             pool: self.pool.clone(),
             asid,
@@ -711,6 +766,7 @@ impl PreparedStage1MmRetirement {
             root_slot: self.root_slot,
             root_retirement_nonce,
             root_ticket_issued: false,
+            extension_slots,
         }
     }
 }
@@ -791,6 +847,16 @@ impl PreparedStage1Mm {
 
     pub(crate) fn root_slot(&self) -> Option<Stage1RootSlot> {
         self.lease.root_slot()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn table_arena_source(&self) -> Box<dyn carrick_mem::page_table::TableArenaSource> {
+        self.lease.table_arena_source(self.pool.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn extension_slots(&self) -> Vec<Stage1RootSlot> {
+        self.lease.extension_slots()
     }
 
     pub(crate) fn backend(&self) -> Arc<Stage1MmBackend> {
@@ -880,6 +946,7 @@ pub(crate) struct Stage1MmRetirement {
     root_slot: Option<Stage1RootSlot>,
     root_retirement_nonce: Option<u64>,
     root_ticket_issued: bool,
+    extension_slots: Vec<Stage1RootSlot>,
 }
 
 impl Stage1MmRetirement {
@@ -938,6 +1005,9 @@ impl Stage1MmRetirement {
         inner.asids.acknowledge_tlb_flush(self.asid)?;
         if let Some(root_slot) = self.root_slot {
             inner.free_root_slots.insert(root_slot);
+        }
+        for slot in self.extension_slots {
+            inner.free_root_slots.insert(slot);
         }
         Ok(())
     }
@@ -2089,5 +2159,32 @@ mod tests {
 
         // Child root slots must also be distinct
         assert_ne!(slot1, slot2, "child root slots must not collide");
+    }
+
+    #[test]
+    fn extension_slots_return_to_free_root_slots_on_retirement() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 64).expect("root slot pool");
+        let initial_free = pool.inner.lock().free_root_slots.len();
+
+        let child = pool.prepare_child().expect("child preparation");
+        assert_eq!(pool.inner.lock().free_root_slots.len(), initial_free - 1);
+
+        let mut source = child.table_arena_source();
+        let ext1 = source.take_arena().expect("extension slot 1");
+        let _ext2 = source.take_arena().expect("extension slot 2");
+        assert_eq!(pool.inner.lock().free_root_slots.len(), initial_free - 3);
+        assert_eq!(child.extension_slots().len(), 2);
+
+        // Returning ext1 directly via source
+        source.return_arena(ext1);
+        assert_eq!(pool.inner.lock().free_root_slots.len(), initial_free - 2);
+        assert_eq!(child.extension_slots().len(), 1);
+
+        let lease = child.commit();
+        let retirement = pool.retire(&lease).expect("retire");
+        retirement.complete_for_test().expect("complete");
+
+        // Primary root slot and ext2 must both be back in free_root_slots
+        assert_eq!(pool.inner.lock().free_root_slots.len(), initial_free);
     }
 }

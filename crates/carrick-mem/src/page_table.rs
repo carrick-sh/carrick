@@ -323,16 +323,153 @@ fn discover_next_free_spare(bytes: &[u8]) -> u64 {
 /// rollback pre-image, so reusing one buffer removes that host-VM churn from the
 /// COW path without weakening the snapshot (it is still the complete
 /// pre-transaction image).
-pub struct PageTableManager {
-    bytes: Vec<u8>,
-    /// PA mapped at byte offset 0 (`LINUX_PAGE_TABLES_BASE`).
+/// Location of a descriptor within a possibly multi-arena page-table structure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TableLocation {
+    pub arena: usize,
+    pub offset: usize,
+}
+
+impl TableLocation {
+    #[inline]
+    #[must_use]
+    pub const fn new(arena: usize, offset: usize) -> Self {
+        Self { arena, offset }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn entry(self, index: usize) -> Self {
+        Self {
+            arena: self.arena,
+            offset: self.offset + index * 8,
+        }
+    }
+}
+
+/// Provider of additional 2 MiB root slots when the primary stage-1 arena is exhausted.
+pub trait TableArenaSource: Send {
+    /// Allocate an additional 2 MiB root slot.
+    fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa>;
+
+    /// Return an unused root slot to the allocator.
+    fn return_arena(&mut self, arena: carrick_guest_mem::Gpa);
+
+    /// Clone the source for use by a cloned `PageTableManager`.
+    fn clone_source(&self) -> Option<Box<dyn TableArenaSource>> {
+        None
+    }
+}
+
+/// Resolves the host backing pointer for a stage-1 table arena base address.
+pub trait HostArenaResolver {
+    /// Return the writable host pointer for the arena with guest-physical base `base`.
+    fn host_ptr_for_base(&self, _base: u64) -> Option<*mut u8> {
+        None
+    }
+
+    /// Return the readable host pointer for the arena with guest-physical base `base`.
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        self.host_ptr_for_base(base).map(|p| p.cast_const())
+    }
+}
+
+impl HostArenaResolver for (u64, *mut u8) {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        (self.0 == base).then_some(self.1)
+    }
+}
+
+impl HostArenaResolver for (u64, *const u8) {
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        (self.0 == base).then_some(self.1)
+    }
+}
+
+impl<const N: usize> HostArenaResolver for [(u64, *mut u8); N] {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+}
+
+impl<const N: usize> HostArenaResolver for &[(u64, *mut u8); N] {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+}
+
+impl HostArenaResolver for &[(u64, *mut u8)] {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+}
+
+impl<const N: usize> HostArenaResolver for [(u64, *const u8); N] {
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+}
+
+impl<const N: usize> HostArenaResolver for &[(u64, *const u8); N] {
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+}
+
+impl HostArenaResolver for &[(u64, *const u8)] {
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        self.iter().find_map(|&(b, p)| (b == base).then_some(p))
+    }
+}
+
+impl<F> HostArenaResolver for F
+where
+    F: Fn(u64) -> Option<*mut u8>,
+{
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        (self)(base)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ConstFnResolver<F>(pub F);
+
+impl<F> HostArenaResolver for ConstFnResolver<F>
+where
+    F: Fn(u64) -> Option<*const u8>,
+{
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        (self.0)(base)
+    }
+}
+
+impl<F> HostArenaResolver for &ConstFnResolver<F>
+where
+    F: Fn(u64) -> Option<*const u8>,
+{
+    fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
+        (self.0)(base)
+    }
+}
+
+pub fn const_resolver<F: Fn(u64) -> Option<*const u8>>(f: F) -> ConstFnResolver<F> {
+    ConstFnResolver(f)
+}
+
+#[derive(Clone, Debug)]
+struct TableArena {
     base: u64,
+    bytes: Vec<u8>,
+    next_free: u64,
+}
+
+pub struct PageTableManager {
+    arenas: Vec<TableArena>,
+    arena_source: Option<Box<dyn TableArenaSource>>,
     /// New or rebuilt terminal descriptors must carry nG. Derived from the
     /// canonical low user leaf so a rebased/cloned HVPatch table retains its
     /// ASID-scoped construction mode without a second out-of-band authority.
     asid_scoped_leaves: bool,
-    /// Byte offset of the next free spare page (bump allocator).
-    next_free: u64,
     /// PAs of spare sub-tables freed by coalescing, reused before bumping. Only
     /// populated while single-vCPU (coalesce is gated on that), so a reused page
     /// can never be referenced by a sibling's stale walk cache.
@@ -353,34 +490,26 @@ pub struct PageTableManager {
     /// table graph on every allocation once the pool sits near its limit, which
     /// starves the vCPU badly enough to trip the sibling start gate.
     reclaim_pending: bool,
-    /// Byte offsets edited since the last sync, in write order, tagged
+    /// Descriptors edited since the last sync, in write order, tagged
     /// `is_table_pointer`. The host sync replays them as aligned atomic stores,
     /// writing a table descriptor (which exposes a sub-table to the guest's
     /// hardware walker) only AFTER its child entries are visible — the
     /// break-before-make ordering that keeps a concurrent sibling walk safe
     /// without quiescing.
-    dirty: Vec<(usize, bool)>,
+    dirty: Vec<(TableLocation, bool)>,
     /// Pre-images of every descriptor word written since [`Self::begin_undo`],
     /// in write order, with the scalar state to restore alongside them.
-    ///
-    /// A COW/mmap transaction needs a pre-transaction image to roll back to on
-    /// failure. Taking that by CLONING the manager copies the whole 1.75 MiB
-    /// table region on every transaction — on the success path too, which is
-    /// the overwhelming majority. Under a fork/exit storm that showed up as
-    /// `PageTableManager::clone`/`clone_from` and `_platform_memmove` at ~31%
-    /// of all carrier CPU, since a fork storm is a COW-fault storm. A
-    /// transaction touches a bounded set of descriptors, so journalling their
-    /// pre-images costs a word per edit and rolls back by replaying them.
     undo: Option<UndoJournal>,
 }
 
 /// Pre-transaction state captured by [`PageTableManager::begin_undo`].
 #[derive(Clone, Debug, Default)]
 struct UndoJournal {
-    /// `(byte offset, value before the write)`, in write order. Replayed in
-    /// REVERSE so repeated writes to one offset unwind to the oldest value.
-    words: Vec<(usize, u64)>,
-    next_free: u64,
+    /// `(location, value before the write)`, in write order. Replayed in
+    /// REVERSE so repeated writes to one location unwind to the oldest value.
+    words: Vec<(TableLocation, u64)>,
+    arena_next_frees: Vec<u64>,
+    arenas_len: usize,
     free_tables: Vec<u64>,
     reclaim_pending: bool,
     /// Length of `dirty` when the journal opened, so a rollback can drop
@@ -391,10 +520,9 @@ struct UndoJournal {
 impl Clone for PageTableManager {
     fn clone(&self) -> Self {
         Self {
-            bytes: self.bytes.clone(),
-            base: self.base,
+            arenas: self.arenas.clone(),
+            arena_source: self.arena_source.as_ref().and_then(|s| s.clone_source()),
             asid_scoped_leaves: self.asid_scoped_leaves,
-            next_free: self.next_free,
             free_tables: self.free_tables.clone(),
             multi_vcpu: self.multi_vcpu,
             stage1_exclusive: self.stage1_exclusive,
@@ -409,10 +537,9 @@ impl Clone for PageTableManager {
     /// allocations differ. `Vec::clone_from` keeps the destination's capacity,
     /// which is the entire point on the 1.75 MiB table image.
     fn clone_from(&mut self, source: &Self) {
-        self.bytes.clone_from(&source.bytes);
-        self.base = source.base;
+        self.arenas.clone_from(&source.arenas);
+        self.arena_source = source.arena_source.as_ref().and_then(|s| s.clone_source());
         self.asid_scoped_leaves = source.asid_scoped_leaves;
-        self.next_free = source.next_free;
         self.free_tables.clone_from(&source.free_tables);
         self.multi_vcpu = source.multi_vcpu;
         self.stage1_exclusive = source.stage1_exclusive;
@@ -432,10 +559,13 @@ impl PageTableManager {
         )) & NON_GLOBAL
             != 0;
         Self {
-            bytes,
-            base,
+            arenas: vec![TableArena {
+                base,
+                bytes,
+                next_free,
+            }],
+            arena_source: None,
             asid_scoped_leaves,
-            next_free,
             free_tables: Vec::new(),
             multi_vcpu: false,
             stage1_exclusive: false,
@@ -451,7 +581,30 @@ impl PageTableManager {
     /// address. Callers that publish edits must use this address, not a fixed
     /// global page-table constant, to select the live backing.
     pub fn base(&self) -> u64 {
-        self.base
+        self.arenas[0].base
+    }
+
+    pub fn set_arena_source(&mut self, source: Box<dyn TableArenaSource>) {
+        self.arena_source = Some(source);
+    }
+
+    pub fn arena_source(&self) -> Option<&(dyn TableArenaSource + 'static)> {
+        self.arena_source.as_deref()
+    }
+
+    fn total_pages(&self) -> usize {
+        self.arenas
+            .iter()
+            .map(|a| a.bytes.len() / PT_PAGE as usize)
+            .sum()
+    }
+
+    fn loc_to_page_index(&self, loc: TableLocation) -> usize {
+        let prior: usize = self.arenas[..loc.arena]
+            .iter()
+            .map(|a| a.bytes.len() / PT_PAGE as usize)
+            .sum();
+        prior + loc.offset / PT_PAGE as usize
     }
 
     /// Relocate this complete stage-1 table image to `new_base` while
@@ -467,72 +620,106 @@ impl PageTableManager {
         if !new_base.is_multiple_of(PT_PAGE) {
             return Err(PageTableError::BadAddress);
         }
-        let Some(last_byte) = new_base.checked_add(self.bytes.len() as u64 - 1) else {
+        let Some(last_byte) = new_base.checked_add(self.arenas[0].bytes.len() as u64 - 1) else {
             return Err(PageTableError::BadAddress);
         };
         if last_byte & !(PA_MASK_TABLE | (PT_PAGE - 1)) != 0 {
             return Err(PageTableError::BadAddress);
         }
 
-        let old_base = self.base;
-        let mut pending = vec![(0usize, 0usize)];
-        let mut visited = vec![false; self.bytes.len().div_ceil(PT_PAGE as usize)];
-        let mut pointers = Vec::new();
-        while let Some((table_off, level)) = pending.pop() {
-            if level > 3
-                || table_off % PT_PAGE as usize != 0
-                || table_off + PT_PAGE as usize > self.bytes.len()
-            {
+        let mut new_bases = Vec::with_capacity(self.arenas.len());
+        new_bases.push(new_base);
+        for _ in 1..self.arenas.len() {
+            let Some(gpa) = self
+                .arena_source
+                .as_mut()
+                .and_then(|source| source.take_arena())
+            else {
+                for &b in &new_bases[1..] {
+                    if let Some(source) = self.arena_source.as_mut() {
+                        source.return_arena(carrick_guest_mem::Gpa(b));
+                    }
+                }
                 return Err(PageTableError::BadAddress);
-            }
-            let page = table_off / PT_PAGE as usize;
-            if visited[page] {
-                continue;
-            }
-            visited[page] = true;
-            if level == 3 {
-                continue;
-            }
-            for index in 0..512usize {
-                let entry_off = table_off + index * 8;
-                let descriptor = self.read_desc(entry_off);
-                if descriptor & VALID == 0 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+            };
+            new_bases.push(gpa.0);
+        }
+
+        let traverse = || -> Result<_, PageTableError> {
+            let mut pending = vec![(TableLocation::new(0, 0), 0usize)];
+            let mut visited = vec![false; self.total_pages()];
+            let mut pointers = Vec::new();
+            while let Some((table_loc, level)) = pending.pop() {
+                if level > 3
+                    || table_loc.offset % PT_PAGE as usize != 0
+                    || table_loc.offset + PT_PAGE as usize
+                        > self.arenas[table_loc.arena].bytes.len()
+                {
+                    return Err(PageTableError::BadAddress);
+                }
+                let page = self.loc_to_page_index(table_loc);
+                if visited[page] {
                     continue;
                 }
-                let child_pa = descriptor & PA_MASK_TABLE;
-                let child_off = child_pa
-                    .checked_sub(old_base)
-                    .and_then(|offset| usize::try_from(offset).ok())
-                    .filter(|offset| {
-                        offset.is_multiple_of(PT_PAGE as usize)
-                            && offset + PT_PAGE as usize <= self.bytes.len()
-                    })
-                    .ok_or(PageTableError::BadAddress)?;
-                pointers.push((entry_off, descriptor, child_off));
-                pending.push((child_off, level + 1));
+                visited[page] = true;
+                if level == 3 {
+                    continue;
+                }
+                for index in 0..512usize {
+                    let entry_loc = table_loc.entry(index);
+                    let descriptor = self.read_desc(entry_loc);
+                    if descriptor & VALID == 0 || descriptor & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+                        continue;
+                    }
+                    let child_pa = descriptor & PA_MASK_TABLE;
+                    let child_loc = self.pa_to_loc(child_pa)?;
+                    if !child_loc.offset.is_multiple_of(PT_PAGE as usize)
+                        || child_loc.offset + PT_PAGE as usize
+                            > self.arenas[child_loc.arena].bytes.len()
+                    {
+                        return Err(PageTableError::BadAddress);
+                    }
+                    pointers.push((entry_loc, descriptor, child_loc));
+                    pending.push((child_loc, level + 1));
+                }
             }
-        }
 
-        let mut rebased_free = Vec::with_capacity(self.free_tables.len());
-        for &table_pa in &self.free_tables {
-            let offset = table_pa
-                .checked_sub(old_base)
-                .filter(|offset| {
-                    offset.is_multiple_of(PT_PAGE) && *offset + PT_PAGE <= self.bytes.len() as u64
-                })
-                .ok_or(PageTableError::BadAddress)?;
-            rebased_free.push(new_base + offset);
-        }
+            let mut rebased_free = Vec::with_capacity(self.free_tables.len());
+            for &table_pa in &self.free_tables {
+                let loc = self.pa_to_loc(table_pa)?;
+                if !loc.offset.is_multiple_of(PT_PAGE as usize)
+                    || loc.offset + PT_PAGE as usize > self.arenas[loc.arena].bytes.len()
+                {
+                    return Err(PageTableError::BadAddress);
+                }
+                rebased_free.push(new_bases[loc.arena] + loc.offset as u64);
+            }
+            Ok((pointers, rebased_free))
+        };
+
+        let (pointers, rebased_free) = match traverse() {
+            Ok(res) => res,
+            Err(err) => {
+                for &b in &new_bases[1..] {
+                    if let Some(source) = self.arena_source.as_mut() {
+                        source.return_arena(carrick_guest_mem::Gpa(b));
+                    }
+                }
+                return Err(err);
+            }
+        };
 
         self.dirty.clear();
-        for (entry_off, descriptor, child_off) in pointers {
-            let child_pa = new_base + child_off as u64;
+        for (entry_loc, descriptor, child_loc) in pointers {
+            let child_pa = new_bases[child_loc.arena] + child_loc.offset as u64;
             self.write_table_desc(
-                entry_off,
+                entry_loc,
                 (descriptor & !PA_MASK_TABLE) | (child_pa & PA_MASK_TABLE),
             );
         }
-        self.base = new_base;
+        for (i, &base) in new_bases.iter().enumerate() {
+            self.arenas[i].base = base;
+        }
         self.free_tables = rebased_free;
         Ok(())
     }
@@ -574,67 +761,75 @@ impl PageTableManager {
     /// — the boot L0/L1/L2/L3 hold the null guard and kernel hole and must
     /// never be coalesced/freed).
     fn is_spare_table(&self, pa: u64) -> bool {
-        pa >= self.base + SPARE_START_OFFSET && pa < self.base + self.bytes.len() as u64
+        if self.arenas.is_empty() {
+            return false;
+        }
+        let primary = &self.arenas[0];
+        if pa >= primary.base + SPARE_START_OFFSET && pa < primary.base + primary.bytes.len() as u64
+        {
+            return true;
+        }
+        for arena in &self.arenas[1..] {
+            if pa >= arena.base && pa < arena.base + arena.bytes.len() as u64 {
+                return true;
+            }
+        }
+        false
     }
 
     /// Zero a freed spare sub-table and return it to the reusable free list.
     /// Only reached from `try_coalesce`, which is gated on single-vCPU, so the
     /// reused page can never be referenced by a sibling's stale walk cache.
     fn free_table(&mut self, pa: u64) {
-        if let Ok(off) = self.pa_to_off(pa) {
+        if let Ok(loc) = self.pa_to_loc(pa) {
             // Bulk zeroing bypasses `write_desc`, so journal the page word by
             // word; coalescing is rare and a missed pre-image here would be an
             // unrecoverable rollback.
             if self.undo.is_some() {
-                for word in (off..off + PT_PAGE as usize).step_by(8) {
-                    self.note_undo(word);
+                for off in (loc.offset..loc.offset + PT_PAGE as usize).step_by(8) {
+                    self.note_undo(TableLocation::new(loc.arena, off));
                 }
             }
-            for b in &mut self.bytes[off..off + PT_PAGE as usize] {
+            for b in &mut self.arenas[loc.arena].bytes[loc.offset..loc.offset + PT_PAGE as usize] {
                 *b = 0;
             }
             self.free_tables.push(pa);
         }
     }
 
-    /// Borrow the (possibly edited) table-region bytes.
-    ///
-    /// Prefer this to `clone().into_bytes()` on any path that only needs to
-    /// READ the image. The table region is `LINUX_PAGE_TABLES_SIZE` = 1.75 MiB,
-    /// so a clone there is 1.75 MiB of allocation and memcpy per call — and the
-    /// HVPatch fork path did exactly that once per fork, on top of the copy
-    /// into the child's backing.
+    /// Borrow the (possibly edited) table-region bytes of the primary arena.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.arenas[0].bytes
     }
 
-    /// Consume the manager, returning the (possibly edited) table-region bytes.
+    /// Consume the manager, returning the (possibly edited) table-region bytes of the primary arena.
     /// Used by the boot-time ELF read-only-span pass, which edits the pristine
     /// `stage1_identity_page_tables` image before it is mapped into the guest.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        self.arenas.remove(0).bytes
     }
 
-    fn read_desc(&self, off: usize) -> u64 {
+    fn read_desc(&self, loc: TableLocation) -> u64 {
         let mut a = [0u8; 8];
-        a.copy_from_slice(&self.bytes[off..off + 8]);
+        a.copy_from_slice(&self.arenas[loc.arena].bytes[loc.offset..loc.offset + 8]);
         u64::from_le_bytes(a)
     }
 
     /// Write a leaf/child descriptor (a block, page, or sub-table entry that is
     /// not itself newly pointing the walker at a fresh table).
-    fn write_desc(&mut self, off: usize, desc: u64) {
-        self.note_undo(off);
-        self.bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
-        self.dirty.push((off, false));
+    fn write_desc(&mut self, loc: TableLocation, desc: u64) {
+        self.note_undo(loc);
+        self.arenas[loc.arena].bytes[loc.offset..loc.offset + 8]
+            .copy_from_slice(&desc.to_le_bytes());
+        self.dirty.push((loc, false));
     }
 
     /// Record one descriptor word's pre-image while a journal is open.
-    fn note_undo(&mut self, off: usize) {
+    fn note_undo(&mut self, loc: TableLocation) {
         if self.undo.is_some() {
-            let previous = self.read_desc(off);
+            let previous = self.read_desc(loc);
             if let Some(journal) = self.undo.as_mut() {
-                journal.words.push((off, previous));
+                journal.words.push((loc, previous));
             }
         }
     }
@@ -642,66 +837,53 @@ impl PageTableManager {
     /// Write a table descriptor that exposes a (freshly populated) sub-table to
     /// the walker. Tagged so the host sync orders it AFTER the sub-table's
     /// entries are visible.
-    fn write_table_desc(&mut self, off: usize, desc: u64) {
-        self.note_undo(off);
-        self.bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
-        self.dirty.push((off, true));
+    fn write_table_desc(&mut self, loc: TableLocation, desc: u64) {
+        self.note_undo(loc);
+        self.arenas[loc.arena].bytes[loc.offset..loc.offset + 8]
+            .copy_from_slice(&desc.to_le_bytes());
+        self.dirty.push((loc, true));
     }
 
     /// Replay this edit's descriptor stores to the host page-table backing as
     /// aligned atomic 64-bit writes, with a release barrier before each
     /// table-pointer store so a concurrent sibling hardware walk never sees a
     /// table descriptor pointing at not-yet-visible child entries. Clears the
-    /// dirty set. `host` is the VA of byte offset 0 of the region.
+    /// dirty set.
     ///
     /// # Safety
-    /// `host` must point to a writable mapping of at least `self.bytes.len()`
-    /// bytes that backs the live guest page tables.
-    pub unsafe fn sync_to_host(&mut self, host: *mut u8) {
+    /// The resolver must return valid, writable mappings for the touched arenas.
+    pub unsafe fn sync_to_host(&mut self, resolver: impl HostArenaResolver) {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
-        for (off, is_ptr) in self.dirty.drain(..) {
+        for (loc, is_ptr) in self.dirty.drain(..) {
+            let arena = &self.arenas[loc.arena];
             let mut a = [0u8; 8];
-            a.copy_from_slice(&self.bytes[off..off + 8]);
+            a.copy_from_slice(&arena.bytes[loc.offset..loc.offset + 8]);
             let v = u64::from_le_bytes(a);
             if is_ptr {
                 // Ensure the child-table entries written earlier are globally
                 // visible before the pointer that exposes them.
                 fence(Ordering::SeqCst);
             }
-            // Offsets are 8-byte aligned (index*8), so this is a single atomic
-            // store the guest walker observes whole.
-            unsafe {
-                let slot = host.add(off) as *mut AtomicU64;
-                (*slot).store(v, Ordering::SeqCst);
+            if let Some(host) = resolver.host_ptr_for_base(arena.base) {
+                // Offsets are 8-byte aligned (index*8), so this is a single atomic
+                // store the guest walker observes whole.
+                unsafe {
+                    let slot = host.add(loc.offset) as *mut AtomicU64;
+                    (*slot).store(v, Ordering::SeqCst);
+                }
             }
         }
         fence(Ordering::SeqCst);
     }
 
-    /// Restore an entire previously cloned table image into live backing.
-    ///
-    /// This is deliberately distinct from [`Self::sync_to_host`]: a snapshot's
-    /// dirty list describes edits which preceded the snapshot, not the later
-    /// transaction being rolled back, so replaying it cannot restore the live
-    /// descriptors that transaction changed.  Whole-image replacement is safe
-    /// only while every vCPU which can walk this table is quiesced.  The caller
-    /// must issue an appropriately scoped stage-1 TLBI before resuming them.
-    ///
-    /// # Safety
-    /// `host` must point to a writable, non-overlapping mapping of at least
-    /// `self.bytes.len()` bytes which backs this mm's live page tables, and all
-    /// hardware walkers of that backing must remain quiesced for the copy.
     /// Open an undo journal covering every descriptor edit from here until
     /// [`Self::commit_undo`] or [`Self::rollback_undo`].
-    ///
-    /// Replaces snapshotting the manager by clone: see the `undo` field. An
-    /// already-open journal is kept and this is a no-op, so a nested caller
-    /// cannot silently shorten an outer transaction's rollback.
     pub fn begin_undo(&mut self) {
         if self.undo.is_none() {
             self.undo = Some(UndoJournal {
                 words: Vec::new(),
-                next_free: self.next_free,
+                arena_next_frees: self.arenas.iter().map(|a| a.next_free).collect(),
+                arenas_len: self.arenas.len(),
                 free_tables: self.free_tables.clone(),
                 reclaim_pending: self.reclaim_pending,
                 dirty_len: self.dirty.len(),
@@ -722,79 +904,93 @@ impl PageTableManager {
     /// Undo every edit since [`Self::begin_undo`] and publish the restored
     /// words to the live host backing.
     ///
-    /// Pre-images replay in REVERSE write order so repeated writes to one
-    /// offset unwind to the value that offset held before the transaction.
-    /// Each restored word is stored to the host as an aligned atomic 64-bit
-    /// write preceded by a release fence — the conservative form of the
-    /// ordering `sync_to_host` applies only to table pointers, used here
-    /// because a rollback restores pointers and leaves indiscriminately.
-    ///
     /// # Safety
-    /// `host` must point to a writable mapping of at least `self.bytes.len()`
-    /// bytes backing the live guest page tables, and no vCPU may be walking or
-    /// editing this mm (the caller holds the COW quiesce and topology guards).
-    pub unsafe fn rollback_undo(&mut self, host: *mut u8) {
+    /// Resolver must return writable mappings for all touched arenas.
+    pub unsafe fn rollback_undo(&mut self, resolver: impl HostArenaResolver) {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
 
         let Some(journal) = self.undo.take() else {
             return;
         };
-        for &(off, previous) in journal.words.iter().rev() {
-            self.bytes[off..off + 8].copy_from_slice(&previous.to_le_bytes());
+        for &(loc, previous) in journal.words.iter().rev() {
+            let arena = &mut self.arenas[loc.arena];
+            arena.bytes[loc.offset..loc.offset + 8].copy_from_slice(&previous.to_le_bytes());
             fence(Ordering::SeqCst);
-            // SAFETY: offsets are 8-byte aligned (index * 8) and within
-            // `self.bytes`, which the caller guarantees `host` backs.
-            unsafe {
-                let slot = host.add(off).cast::<AtomicU64>();
-                (*slot).store(previous, Ordering::Release);
+            if let Some(host) = resolver.host_ptr_for_base(arena.base) {
+                // SAFETY: offsets are 8-byte aligned and within the arena.
+                unsafe {
+                    let slot = host.add(loc.offset).cast::<AtomicU64>();
+                    (*slot).store(previous, Ordering::Release);
+                }
             }
         }
         fence(Ordering::SeqCst);
-        self.next_free = journal.next_free;
+        for (i, &next_free) in journal.arena_next_frees.iter().enumerate() {
+            if i < self.arenas.len() {
+                self.arenas[i].next_free = next_free;
+            }
+        }
         self.free_tables = journal.free_tables;
         self.reclaim_pending = journal.reclaim_pending;
-        // The failed transaction's dirty entries describe offsets that now hold
-        // their pre-images again, and this method has already published them.
         self.dirty.truncate(journal.dirty_len);
+        while self.arenas.len() > journal.arenas_len {
+            let Some(arena) = self.arenas.pop() else {
+                break;
+            };
+            if let Some(source) = self.arena_source.as_mut() {
+                source.return_arena(carrick_guest_mem::Gpa(arena.base));
+            }
+        }
     }
 
-    /// Replace the live host backing with this manager's complete image.
-    ///
-    /// The COW/mmap transactions roll back through [`Self::rollback_undo`],
-    /// which republishes only the words it changed. This whole-image restore
-    /// remains for the foreign-MM write path, which still snapshots by clone.
+    /// Replace the live host backing with this manager's complete image across all arenas.
     ///
     /// # Safety
-    /// `host` must point to a writable mapping of at least `self.bytes.len()`
-    /// bytes backing the live guest page tables, and no vCPU may be walking or
-    /// editing this mm (the caller holds the quiesce and topology guards).
-    pub unsafe fn restore_quiesced_snapshot_to_host(&self, host: *mut u8) {
+    /// `resolver` must return writable mappings for all attached arenas.
+    pub unsafe fn restore_quiesced_snapshot_to_host(&self, resolver: impl HostArenaResolver) {
         use core::sync::atomic::{Ordering, fence};
 
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.bytes.as_ptr(), host, self.bytes.len());
+        for arena in &self.arenas {
+            if let Some(host) = resolver.host_ptr_for_base(arena.base) {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(arena.bytes.as_ptr(), host, arena.bytes.len());
+                }
+            }
         }
         fence(Ordering::SeqCst);
     }
 
-    /// Byte offset of a PA known to live inside the page-table region.
-    fn pa_to_off(&self, pa: u64) -> Result<usize, PageTableError> {
-        let end = self.base + self.bytes.len() as u64;
-        if pa < self.base || pa >= end {
-            return Err(PageTableError::BadAddress);
+    /// Location of a PA known to live inside one of the page-table arenas.
+    fn pa_to_loc(&self, pa: u64) -> Result<TableLocation, PageTableError> {
+        for (i, arena) in self.arenas.iter().enumerate() {
+            let end = arena.base + arena.bytes.len() as u64;
+            if pa >= arena.base && pa < end {
+                return Ok(TableLocation::new(i, (pa - arena.base) as usize));
+            }
         }
-        Ok((pa - self.base) as usize)
+        Err(PageTableError::BadAddress)
     }
 
     /// Spare sub-table pool occupancy for diagnostics/tracing:
-    /// `(in_use, free_list, capacity)` pages. `in_use` is bumped-minus-reclaimed
-    /// (live split tables); a monotonically rising `in_use` toward `capacity`
-    /// under multithreaded churn is the coalesce-disabled pool leak.
-    pub fn pool_stats(&self) -> (u32, u32, u32) {
-        let bumped = (self.next_free - SPARE_START_OFFSET) / PT_PAGE;
+    /// `(in_use, free_list, capacity, arenas)` pages.
+    pub fn pool_stats(&self) -> (u32, u32, u32, u32) {
+        let primary_capacity = (self.arenas[0].bytes.len() as u64 - SPARE_START_OFFSET) / PT_PAGE;
+        let primary_bumped = (self.arenas[0].next_free - SPARE_START_OFFSET) / PT_PAGE;
+        let ext_capacity: u64 = self.arenas[1..]
+            .iter()
+            .map(|a| a.bytes.len() as u64 / PT_PAGE)
+            .sum();
+        let ext_bumped: u64 = self.arenas[1..].iter().map(|a| a.next_free / PT_PAGE).sum();
+        let capacity = primary_capacity + ext_capacity;
+        let bumped = primary_bumped + ext_bumped;
         let free = self.free_tables.len() as u64;
-        let capacity = (self.bytes.len() as u64 - SPARE_START_OFFSET) / PT_PAGE;
-        ((bumped - free) as u32, free as u32, capacity as u32)
+        let in_use = bumped.saturating_sub(free);
+        (
+            in_use as u32,
+            free as u32,
+            capacity as u32,
+            self.arenas.len() as u32,
+        )
     }
 
     /// The three policy bits that decide whether an exhausted pool can recover:
@@ -815,14 +1011,14 @@ impl PageTableManager {
     pub fn debug_walk(&self, va: u64) -> [u64; 4] {
         let idx = indices(va);
         let mut out = [0u64; 4];
-        let mut table_off = 0usize;
+        let mut table_loc = TableLocation::new(0, 0);
         #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
-            let off = table_off + idx[level] * 8;
-            if off + 8 > self.bytes.len() {
+            let entry_loc = table_loc.entry(idx[level]);
+            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].bytes.len() {
                 break;
             }
-            let desc = self.read_desc(off);
+            let desc = self.read_desc(entry_loc);
             out[level] = desc;
             if level == 3 {
                 break;
@@ -832,8 +1028,8 @@ impl PageTableManager {
             if !(valid && is_table) {
                 break;
             }
-            match self.pa_to_off(desc & PA_MASK_TABLE) {
-                Ok(o) => table_off = o,
+            match self.pa_to_loc(desc & PA_MASK_TABLE) {
+                Ok(loc) => table_loc = loc,
                 Err(_) => break,
             }
         }
@@ -848,22 +1044,20 @@ impl PageTableManager {
     /// backing.
     ///
     /// # Safety
-    /// `host` must point to a readable mapping of at least `self.bytes.len()`
-    /// bytes whose byte offset zero represents `self.base`.
-    pub unsafe fn debug_walk_host(&self, host: *const u8, va: u64) -> [u64; 4] {
+    /// `resolver` must return readable mappings for all arenas walked.
+    pub unsafe fn debug_walk_host(&self, resolver: impl HostArenaResolver, va: u64) -> [u64; 4] {
         use core::sync::atomic::{AtomicU64, Ordering};
 
         let idx = indices(va);
         let mut out = [0_u64; 4];
+        let mut current_base = self.arenas[0].base;
         let mut table_off = 0_usize;
         #[allow(clippy::needless_range_loop)]
         for level in 0..4_usize {
             let off = table_off + idx[level] * 8;
-            if off + 8 > self.bytes.len() {
+            let Some(host) = resolver.host_const_ptr_for_base(current_base) else {
                 break;
-            }
-            // SAFETY: upheld by this method's caller contract; every descriptor
-            // offset is 8-byte aligned and remains within the supplied mapping.
+            };
             let desc = unsafe {
                 let slot = host.add(off).cast::<AtomicU64>();
                 (*slot).load(Ordering::Acquire)
@@ -877,8 +1071,12 @@ impl PageTableManager {
             if !(valid && is_table) {
                 break;
             }
-            match self.pa_to_off(desc & PA_MASK_TABLE) {
-                Ok(offset) => table_off = offset,
+            let child_pa = desc & PA_MASK_TABLE;
+            match self.pa_to_loc(child_pa) {
+                Ok(loc) => {
+                    current_base = self.arenas[loc.arena].base;
+                    table_off = loc.offset;
+                }
                 Err(_) => break,
             }
         }
@@ -912,25 +1110,18 @@ impl PageTableManager {
 
     fn translate_with_invalid_leaf(&self, va: u64, allow_invalid_leaf: bool) -> Option<u64> {
         let idx = indices(va);
-        let mut table_off = 0usize;
+        let mut table_loc = TableLocation::new(0, 0);
         #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
-            let off = table_off + idx[level] * 8;
-            if off + 8 > self.bytes.len() {
+            let entry_loc = table_loc.entry(idx[level]);
+            if entry_loc.offset + 8 > self.arenas[entry_loc.arena].bytes.len() {
                 return None;
             }
-            let desc = self.read_desc(off);
+            let desc = self.read_desc(entry_loc);
             if desc & VALID == 0 {
                 if !allow_invalid_leaf {
                     return None;
                 }
-                // Protection invalidation edits the terminal descriptor in
-                // place, so a coarse L1/L2 alias retains its non-identity PA
-                // just like an L3 page.  The cleared TYPE_BLOCK valid bit
-                // leaves type 0b00; the walk level therefore supplies the
-                // output mask/span.  Interior table descriptors are never
-                // invalidated by `apply`, so a non-zero address here is an
-                // authenticated retained terminal output, not a table pointer.
                 return match level {
                     1 if desc & PA_MASK_1GIB != 0 => {
                         Some((desc & PA_MASK_1GIB) | (va & ((1u64 << 30) - 1)))
@@ -949,7 +1140,7 @@ impl PageTableManager {
             }
             if is_table_or_page {
                 // Table descriptor: descend to the next level.
-                table_off = self.pa_to_off(desc & PA_MASK_TABLE).ok()?;
+                table_loc = self.pa_to_loc(desc & PA_MASK_TABLE).ok()?;
             } else {
                 // Block descriptor (TYPE_BLOCK) terminates the walk at L1/L2.
                 return match level {
@@ -963,38 +1154,53 @@ impl PageTableManager {
     }
 
     /// Carve a zeroed table page: reuse a coalesced one if available, else bump
-    /// the spare tail. Freed pages were zeroed on free, the tail is zero from
-    /// boot, so the returned page is always all-invalid descriptors.
+    /// the spare tail of the primary arena or an extension arena, or allocate a
+    /// new extension arena from the attached source.
     fn alloc_table(&mut self) -> Result<u64, PageTableError> {
         if let Some(pa) = self.free_tables.pop() {
             return Ok(pa);
         }
-        let off = self.next_free;
-        if off + PT_PAGE > self.bytes.len() as u64 {
-            // Last resort before failing: sweep the live table structure for
-            // sub-tables an earlier teardown left ALL-INVALID and take them
-            // back. Deliberately done HERE and nowhere else. Reclaiming eagerly
-            // on every edit is what a busy guest cannot afford — it holds most
-            // of the pool legitimately, so the scan runs constantly and finds
-            // almost nothing (`go-net_http`: 50 s -> over 200 s). Paying it once,
-            // on the path that would otherwise return `OutOfTables`, costs
-            // nothing in the common case and still keeps a churning guest alive.
-            if self.reclaim_all_invalid_tables()
-                && let Some(pa) = self.free_tables.pop()
-            {
-                return Ok(pa);
-            }
-            return Err(PageTableError::OutOfTables);
+        if self.arenas[0].next_free + PT_PAGE <= self.arenas[0].bytes.len() as u64 {
+            let off = self.arenas[0].next_free;
+            self.arenas[0].next_free += PT_PAGE;
+            return Ok(self.arenas[0].base + off);
         }
-        self.next_free += PT_PAGE;
-        Ok(self.base + off)
+        for arena in &mut self.arenas[1..] {
+            if arena.next_free + PT_PAGE <= arena.bytes.len() as u64 {
+                let off = arena.next_free;
+                arena.next_free += PT_PAGE;
+                return Ok(arena.base + off);
+            }
+        }
+        if self.reclaim_all_invalid_tables()
+            && let Some(pa) = self.free_tables.pop()
+        {
+            return Ok(pa);
+        }
+        if let Some(source) = self.arena_source.as_mut()
+            && let Some(gpa) = source.take_arena()
+        {
+            let base = gpa.0;
+            let arena = TableArena {
+                base,
+                bytes: vec![0u8; crate::memory::LINUX_PAGE_TABLES_SIZE as usize],
+                next_free: PT_PAGE,
+            };
+            self.arenas.push(arena);
+            return Ok(base);
+        }
+        Err(PageTableError::OutOfTables)
     }
 
-    /// Split the block descriptor at `parent_off` (a leaf at `level`, where
+    /// Split the block descriptor at `parent_loc` (a leaf at `level`, where
     /// level 1 = 1 GiB block, level 2 = 2 MiB block) into a finer sub-table,
     /// then rewrite the parent as a table descriptor pointing at it.
-    fn split_block(&mut self, parent_off: usize, level: usize) -> Result<(), PageTableError> {
-        let block = self.read_desc(parent_off);
+    fn split_block(
+        &mut self,
+        parent_loc: TableLocation,
+        level: usize,
+    ) -> Result<(), PageTableError> {
+        let block = self.read_desc(parent_loc);
         let (parent_pa_mask, child_pa_mask, child_stride, child_is_page) = match level {
             1 => (PA_MASK_1GIB, PA_MASK_2MIB, 1u64 << 21, false),
             2 => (PA_MASK_2MIB, PA_MASK_4KIB, 1u64 << 12, true),
@@ -1008,25 +1214,15 @@ impl PageTableManager {
         } else {
             TYPE_BLOCK
         };
-        // The children must map exactly what the parent block did. Crucially,
-        // preserve the parent's VALIDITY: splitting an INVALID block (e.g. a
-        // coarse PROT_NONE reservation) must yield invalid children, not valid
-        // ones — `child_type` sets the valid bit, so clear it when the parent
-        // was invalid. (Getting this wrong silently revalidated PROT_NONE
-        // reservations and broke Go's page-summary region.)
         let parent_valid = block & VALID != 0;
-        // An EMPTY invalid parent (output field zero: never populated, or
-        // cleared by a table reclaim) records nothing, so its children record
-        // nothing either. Minting `i * stride` outputs from a zero base would
-        // hand every child a fabricated address that the in-place protection
-        // edit then preserves — and publishes as a VALID leaf.
         let parent_empty = !parent_valid && base_pa == 0;
 
         let table_pa = self.alloc_table()?;
-        let table_off = self.pa_to_off(table_pa)?;
+        let table_loc = self.pa_to_loc(table_pa)?;
         for i in 0..512u64 {
+            let child_loc = table_loc.entry(i as usize);
             if parent_empty {
-                self.write_desc(table_off + (i as usize) * 8, 0);
+                self.write_desc(child_loc, 0);
                 continue;
             }
             let child_pa = base_pa + i * child_stride;
@@ -1034,53 +1230,51 @@ impl PageTableManager {
             if !parent_valid {
                 desc &= !VALID;
             }
-            self.write_desc(table_off + (i as usize) * 8, desc);
+            self.write_desc(child_loc, desc);
         }
-        // Parent becomes a table descriptor — exposed to the walker only after
-        // the children above are visible (enforced in sync_to_host).
-        self.write_table_desc(parent_off, (table_pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
+        self.write_table_desc(parent_loc, (table_pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
         Ok(())
     }
 
     /// Descend to the leaf descriptor for `va`. When `allocate`, split any
     /// covering block so the returned leaf is a 4 KiB page; otherwise stop at
     /// the first leaf (block or page) and report its level.
-    fn leaf_offset(&mut self, va: u64, allocate: bool) -> Result<(usize, usize), PageTableError> {
+    fn leaf_offset(
+        &mut self,
+        va: u64,
+        allocate: bool,
+    ) -> Result<(TableLocation, usize), PageTableError> {
         let idx = indices(va);
-        let mut table_off = 0usize; // L0 at byte offset 0
+        let mut table_loc = TableLocation::new(0, 0);
         #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
-            let off = table_off + idx[level] * 8;
+            let entry_loc = table_loc.entry(idx[level]);
             if level == 3 {
-                return Ok((off, 3));
+                return Ok((entry_loc, 3));
             }
-            let desc = self.read_desc(off);
+            let desc = self.read_desc(entry_loc);
             let valid = desc & VALID != 0;
             let is_table = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
             if is_table && valid {
-                table_off = self.pa_to_off(desc & PA_MASK_TABLE)?;
+                table_loc = self.pa_to_loc(desc & PA_MASK_TABLE)?;
                 continue;
             }
-            // A block leaf (valid, type 0b01) or an invalid descriptor.
             if !allocate {
-                return Ok((off, level));
+                return Ok((entry_loc, level));
             }
             if !valid {
-                // Our identity layout never leaves an intermediate unmapped on
-                // a path the guest can map; refuse to fabricate one.
                 return Err(PageTableError::BadAddress);
             }
-            // Valid block: split to finer granularity, then descend.
-            self.split_block(off, level)?;
-            let desc2 = self.read_desc(off);
-            table_off = self.pa_to_off(desc2 & PA_MASK_TABLE)?;
+            self.split_block(entry_loc, level)?;
+            let desc2 = self.read_desc(entry_loc);
+            table_loc = self.pa_to_loc(desc2 & PA_MASK_TABLE)?;
         }
         Err(PageTableError::BadAddress)
     }
 
-    /// Next-level table PA if the entry at `off` is a valid table descriptor.
-    fn child_table_pa(&self, off: usize) -> Option<u64> {
-        let d = self.read_desc(off);
+    /// Next-level table PA if the entry at `loc` is a valid table descriptor.
+    fn child_table_pa(&self, loc: TableLocation) -> Option<u64> {
+        let d = self.read_desc(loc);
         if d & VALID != 0 && d & TYPE_BITS == TYPE_TABLE_OR_PAGE {
             Some(d & PA_MASK_TABLE)
         } else {
@@ -1097,12 +1291,12 @@ impl PageTableManager {
     /// precisely what the table did.
     fn uniform_block(
         &self,
-        table_off: usize,
+        table_loc: TableLocation,
         child_pa_mask: u64,
         child_stride: u64,
         child_type: u64,
     ) -> Option<(u64, u64)> {
-        let e0 = self.read_desc(table_off);
+        let e0 = self.read_desc(table_loc);
         if e0 & VALID == 0 || e0 & TYPE_BITS != child_type {
             return None;
         }
@@ -1112,11 +1306,11 @@ impl PageTableManager {
             return None;
         }
         let attrs = e0 & !child_pa_mask & !TYPE_BITS;
-        for i in 0..512u64 {
-            let d = self.read_desc(table_off + (i as usize) * 8);
+        for i in 0..512usize {
+            let d = self.read_desc(table_loc.entry(i));
             if d & VALID == 0
                 || d & TYPE_BITS != child_type
-                || (d & child_pa_mask) != base_pa + i * child_stride
+                || (d & child_pa_mask) != base_pa + (i as u64) * child_stride
                 || (d & !child_pa_mask & !TYPE_BITS) != attrs
             {
                 return None;
@@ -1130,38 +1324,30 @@ impl PageTableManager {
     /// Only spare tables are touched (the boot L2_A/L2_B/L3_A — null guard +
     /// kernel hole — are never uniform and never spare, so are doubly safe).
     fn try_coalesce(&mut self, va: u64) -> bool {
-        // Coalescing flips a table descriptor to a block (and frees the
-        // sub-table) for a live VA. That is a break-before-make structural
-        // change: a sibling vCPU mid-walk through the old table-pointer can hit
-        // the being-freed sub-table and fault (proven via the mmap-churn
-        // reproducer + host-table walk). Correct break-before-make needs an
-        // all-vCPU TLB flush, which one vCPU's `tlbi vmalle1is` does not provide
-        // under HVF. So coalesce only when single-vCPU (no siblings to race);
-        // when multi-vCPU the structure stays split — safe, at the cost of not
-        // reclaiming until back to one vCPU.
         if self.multi_vcpu {
             return false;
         }
         let mut coalesced = false;
         let idx = indices(va);
-        let Some(l1_pa) = self.child_table_pa(idx[0] * 8) else {
+        let l0_entry = TableLocation::new(0, idx[0] * 8);
+        let Some(l1_pa) = self.child_table_pa(l0_entry) else {
             return false;
         };
-        let Ok(l1_off) = self.pa_to_off(l1_pa) else {
+        let Ok(l1_loc) = self.pa_to_loc(l1_pa) else {
             return false;
         };
-        let l1_entry = l1_off + idx[1] * 8;
+        let l1_entry = l1_loc.entry(idx[1]);
 
         // L3 -> L2: the L2 entry must point at a spare L3 table of uniform pages.
         if let Some(l2_pa) = self.child_table_pa(l1_entry)
-            && let Ok(l2_off) = self.pa_to_off(l2_pa)
+            && let Ok(l2_loc) = self.pa_to_loc(l2_pa)
         {
-            let l2_entry = l2_off + idx[2] * 8;
+            let l2_entry = l2_loc.entry(idx[2]);
             if let Some(l3_pa) = self.child_table_pa(l2_entry)
                 && self.is_spare_table(l3_pa)
-                && let Ok(l3_off) = self.pa_to_off(l3_pa)
+                && let Ok(l3_loc) = self.pa_to_loc(l3_pa)
                 && let Some((base, attrs)) =
-                    self.uniform_block(l3_off, PA_MASK_4KIB, 1 << 12, TYPE_TABLE_OR_PAGE)
+                    self.uniform_block(l3_loc, PA_MASK_4KIB, 1 << 12, TYPE_TABLE_OR_PAGE)
             {
                 self.write_desc(l2_entry, (base & PA_MASK_2MIB) | attrs | TYPE_BLOCK);
                 self.free_table(l3_pa);
@@ -1172,9 +1358,9 @@ impl PageTableManager {
         // L2 -> L1: the L1 entry must point at a spare L2 table of uniform blocks.
         if let Some(l2_pa) = self.child_table_pa(l1_entry)
             && self.is_spare_table(l2_pa)
-            && let Ok(l2_off) = self.pa_to_off(l2_pa)
+            && let Ok(l2_loc) = self.pa_to_loc(l2_pa)
             && let Some((base, attrs)) =
-                self.uniform_block(l2_off, PA_MASK_2MIB, 1 << 21, TYPE_BLOCK)
+                self.uniform_block(l2_loc, PA_MASK_2MIB, 1 << 21, TYPE_BLOCK)
         {
             self.write_desc(l1_entry, (base & PA_MASK_1GIB) | attrs | TYPE_BLOCK);
             self.free_table(l2_pa);
@@ -1539,35 +1725,35 @@ impl PageTableManager {
         self.reclaim_pending = false;
         let mut freed = false;
         for l0 in 0..512usize {
-            let Some(l1_pa) = self.child_table_pa(l0 * 8) else {
+            let Some(l1_pa) = self.child_table_pa(TableLocation::new(0, l0 * 8)) else {
                 continue;
             };
-            let Ok(l1_off) = self.pa_to_off(l1_pa) else {
+            let Ok(l1_loc) = self.pa_to_loc(l1_pa) else {
                 continue;
             };
             for l1 in 0..512usize {
-                let l1_entry = l1_off + l1 * 8;
+                let l1_entry = l1_loc.entry(l1);
                 let Some(l2_pa) = self.child_table_pa(l1_entry) else {
                     continue;
                 };
-                let Ok(l2_off) = self.pa_to_off(l2_pa) else {
+                let Ok(l2_loc) = self.pa_to_loc(l2_pa) else {
                     continue;
                 };
                 let l2_table_va = ((l0 as u64) << 39) | ((l1 as u64) << 30);
                 for l2 in 0..512usize {
-                    let l2_entry = l2_off + l2 * 8;
+                    let l2_entry = l2_loc.entry(l2);
                     let l3_table_va = l2_table_va | ((l2 as u64) << 21);
                     if let Some(l3_pa) = self.child_table_pa(l2_entry)
                         && self.is_spare_table(l3_pa)
-                        && let Ok(l3_off) = self.pa_to_off(l3_pa)
-                        && self.table_reclaimable(l3_off, l3_table_va, 3)
+                        && let Ok(l3_loc) = self.pa_to_loc(l3_pa)
+                        && self.table_reclaimable(l3_loc, l3_table_va, 3)
                     {
                         self.write_desc(l2_entry, 0);
                         self.free_table(l3_pa);
                         freed = true;
                     }
                 }
-                if self.is_spare_table(l2_pa) && self.table_reclaimable(l2_off, l2_table_va, 2) {
+                if self.is_spare_table(l2_pa) && self.table_reclaimable(l2_loc, l2_table_va, 2) {
                     self.write_desc(l1_entry, 0);
                     self.free_table(l2_pa);
                     freed = true;
@@ -1579,23 +1765,24 @@ impl PageTableManager {
 
     fn reclaim_invalid_block(&mut self, va: u64) -> bool {
         let idx = indices(va);
-        let Some(l1_pa) = self.child_table_pa(idx[0] * 8) else {
+        let l0_entry = TableLocation::new(0, idx[0] * 8);
+        let Some(l1_pa) = self.child_table_pa(l0_entry) else {
             return false;
         };
-        let Ok(l1_off) = self.pa_to_off(l1_pa) else {
+        let Ok(l1_loc) = self.pa_to_loc(l1_pa) else {
             return false;
         };
-        let l1_entry = l1_off + idx[1] * 8;
+        let l1_entry = l1_loc.entry(idx[1]);
         let mut freed = false;
         // L3 all-invalid -> free it, invalidate the L2 entry that pointed at it.
         if let Some(l2_pa) = self.child_table_pa(l1_entry)
-            && let Ok(l2_off) = self.pa_to_off(l2_pa)
+            && let Ok(l2_loc) = self.pa_to_loc(l2_pa)
         {
-            let l2_entry = l2_off + idx[2] * 8;
+            let l2_entry = l2_loc.entry(idx[2]);
             if let Some(l3_pa) = self.child_table_pa(l2_entry)
                 && self.is_spare_table(l3_pa)
-                && let Ok(l3_off) = self.pa_to_off(l3_pa)
-                && self.table_reclaimable(l3_off, va & !((1 << 21) - 1), 3)
+                && let Ok(l3_loc) = self.pa_to_loc(l3_pa)
+                && self.table_reclaimable(l3_loc, va & !((1 << 21) - 1), 3)
             {
                 self.write_desc(l2_entry, 0);
                 self.free_table(l3_pa);
@@ -1605,8 +1792,8 @@ impl PageTableManager {
         // L2 now all-invalid (the last alias in this 1 GiB went away) -> free it.
         if let Some(l2_pa) = self.child_table_pa(l1_entry)
             && self.is_spare_table(l2_pa)
-            && let Ok(l2_off) = self.pa_to_off(l2_pa)
-            && self.table_reclaimable(l2_off, va & !((1 << 30) - 1), 2)
+            && let Ok(l2_loc) = self.pa_to_loc(l2_pa)
+            && self.table_reclaimable(l2_loc, va & !((1 << 30) - 1), 2)
         {
             self.write_desc(l1_entry, 0);
             self.free_table(l2_pa);
@@ -1615,7 +1802,7 @@ impl PageTableManager {
         freed
     }
 
-    /// Whether the table at `table_off`, whose entries are terminal
+    /// Whether the table at `table_loc`, whose entries are terminal
     /// descriptors at `level` covering `[table_va, table_va + 512 * span)`,
     /// records nothing a rebuild could not reproduce — so freeing it (and
     /// zeroing the parent entry) loses no information.
@@ -1634,10 +1821,10 @@ impl PageTableManager {
     /// Reclaimable entries are: empty (no output), identity (a rebuild yields
     /// the same address), or RETIRED by `munmap` (the lease is gone; the
     /// retained address is only a reuse signal).
-    fn table_reclaimable(&self, table_off: usize, table_va: u64, level: usize) -> bool {
+    fn table_reclaimable(&self, table_loc: TableLocation, table_va: u64, level: usize) -> bool {
         let (span, mask) = Self::level_span(level);
         (0..512usize).all(|i| {
-            let desc = self.read_desc(table_off + i * 8);
+            let desc = self.read_desc(table_loc.entry(i));
             if desc & VALID != 0 {
                 return false;
             }
@@ -1800,14 +1987,14 @@ impl PageTableManager {
         for index in 0..pages {
             let page_va = (va & !(FOUR_KIB - 1)) + index * FOUR_KIB;
             let page_ipa = (ipa & !(FOUR_KIB - 1)) + index * FOUR_KIB;
-            let (off, level) = self.leaf_offset(page_va, true)?;
+            let (loc, level) = self.leaf_offset(page_va, true)?;
             if level != 3 {
                 return Err(PageTableError::BadAddress);
             }
-            let descriptor = self.read_desc(off);
+            let descriptor = self.read_desc(loc);
             let replacement = (descriptor & !PA_MASK_4KIB) | (page_ipa & PA_MASK_4KIB);
             if replacement != descriptor {
-                self.write_desc(off, replacement);
+                self.write_desc(loc, replacement);
                 changed = true;
             }
         }
@@ -1828,17 +2015,17 @@ impl PageTableManager {
         let mut changed = false;
         for index in 0..pages {
             let page_va = (va & !(FOUR_KIB - 1)) + index * FOUR_KIB;
-            let (off, level) = self.leaf_offset(page_va, true)?;
+            let (loc, level) = self.leaf_offset(page_va, true)?;
             if level != 3 {
                 return Err(PageTableError::BadAddress);
             }
-            let descriptor = self.read_desc(off);
+            let descriptor = self.read_desc(loc);
             if descriptor & VALID == 0 {
                 continue;
             }
             let replacement = (descriptor & !AP_MASK) | AP_RW;
             if replacement != descriptor {
-                self.write_desc(off, replacement);
+                self.write_desc(loc, replacement);
                 changed = true;
             }
         }
@@ -1846,9 +2033,12 @@ impl PageTableManager {
     }
 
     /// Spare pages still available to `alloc_table`: the free list plus the
-    /// untouched bump tail.
+    /// untouched bump tail across all arenas.
     fn spare_tables_available(&self) -> u64 {
-        let tail = (self.bytes.len() as u64).saturating_sub(self.next_free) / PT_PAGE;
+        let mut tail = 0u64;
+        for arena in &self.arenas {
+            tail += (arena.bytes.len() as u64).saturating_sub(arena.next_free) / PT_PAGE;
+        }
         self.free_tables.len() as u64 + tail
     }
 
@@ -1918,7 +2108,7 @@ impl PageTableManager {
             // before `alloc_table` is ever called and its last-resort sweep
             // would never run. Take the same one-shot reclaim here, then re-ask.
             self.reclaim_all_invalid_tables();
-            if needed > self.spare_tables_available() {
+            if self.arena_source.is_none() && needed > self.spare_tables_available() {
                 return Err(PageTableError::OutOfTables);
             }
         }
@@ -1942,29 +2132,33 @@ impl PageTableManager {
             };
             let (span, mask) = Self::level_span(level);
             let flags = if level == 3 { page_flags } else { block_flags };
-            let table_off = self.descend_creating(cursor, level)?;
+            let table_loc = self.descend_creating(cursor, level)?;
             let idx = indices(cursor);
-            self.write_desc(table_off + idx[level] * 8, (out & mask) | flags);
+            self.write_desc(table_loc.entry(idx[level]), (out & mask) | flags);
             cursor += span;
         }
         Ok(true)
     }
 
     /// Descend from L0 to the table at `target_level` (1, 2, or 3), allocating
-    /// any missing intermediate table from the spare pool. Returns the byte
-    /// offset of that table within the region. Errors if an existing block sits
-    /// on the path (never the case for the high alias space).
-    fn descend_creating(&mut self, va: u64, target_level: usize) -> Result<usize, PageTableError> {
+    /// any missing intermediate table from the spare pool. Returns the table's
+    /// location. Errors if an existing block sits on the path (never the case
+    /// for the high alias space).
+    fn descend_creating(
+        &mut self,
+        va: u64,
+        target_level: usize,
+    ) -> Result<TableLocation, PageTableError> {
         let idx = indices(va);
-        let mut table_off = 0usize; // L0 at byte offset 0
+        let mut table_loc = TableLocation::new(0, 0); // L0 at byte offset 0 in arena 0
         #[allow(clippy::needless_range_loop)]
         for level in 0..target_level {
-            let off = table_off + idx[level] * 8;
-            let desc = self.read_desc(off);
+            let entry_loc = table_loc.entry(idx[level]);
+            let desc = self.read_desc(entry_loc);
             let valid = desc & VALID != 0;
             let is_table = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
             if valid && is_table {
-                table_off = self.pa_to_off(desc & PA_MASK_TABLE)?;
+                table_loc = self.pa_to_loc(desc & PA_MASK_TABLE)?;
                 continue;
             }
             if valid {
@@ -1974,23 +2168,23 @@ impl PageTableManager {
                 // a 2 MiB block an earlier alias mapping created (the case a
                 // forked child hits when it maps inside a block its parent's
                 // cloned tables already established). Mirrors `leaf_offset`.
-                self.split_block(off, level)?;
-                let desc2 = self.read_desc(off);
-                table_off = self.pa_to_off(desc2 & PA_MASK_TABLE)?;
+                self.split_block(entry_loc, level)?;
+                let desc2 = self.read_desc(entry_loc);
+                table_loc = self.pa_to_loc(desc2 & PA_MASK_TABLE)?;
                 continue;
             }
             let pa = self.alloc_table()?;
-            table_off = self.pa_to_off(pa)?;
-            self.write_table_desc(off, (pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
+            table_loc = self.pa_to_loc(pa)?;
+            self.write_table_desc(entry_loc, (pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
         }
-        Ok(table_off)
+        Ok(table_loc)
     }
 
     /// True iff the leaf for `va` (block or page) is valid. Test/diagnostic.
     #[cfg(test)]
     pub fn is_valid(&mut self, va: u64) -> bool {
         match self.leaf_offset(va, false) {
-            Ok((off, _)) => self.read_desc(off) & VALID != 0,
+            Ok((loc, _)) => self.read_desc(loc) & VALID != 0,
             Err(_) => false,
         }
     }
@@ -1999,7 +2193,7 @@ impl PageTableManager {
     #[cfg(test)]
     pub fn ap_bits(&mut self, va: u64) -> u64 {
         match self.leaf_offset(va, false) {
-            Ok((off, _)) => self.read_desc(off) & AP_MASK,
+            Ok((loc, _)) => self.read_desc(loc) & AP_MASK,
             Err(_) => 0,
         }
     }
@@ -2124,7 +2318,7 @@ mod tests {
             let mut host = journalled.as_bytes().to_vec();
             // SAFETY: `host` is a writable buffer of exactly the region length
             // and no guest is running against this test-local manager.
-            unsafe { journalled.rollback_undo(host.as_mut_ptr()) };
+            unsafe { journalled.rollback_undo((journalled.base(), host.as_mut_ptr())) };
 
             assert!(
                 !journalled.undo_is_open(),
@@ -2540,11 +2734,11 @@ mod tests {
             mgr.is_valid(va1) && mgr.is_valid(va2),
             "both aliases mapped"
         );
-        let (two, _, _) = mgr.pool_stats();
+        let (two, _, _, _) = mgr.pool_stats();
 
         let changed = mgr.unmap_aliased(va1, 0x1000).expect("unmap alias 1");
         assert!(changed.changed, "unmap edited the tables");
-        let (one, _, _) = mgr.pool_stats();
+        let (one, _, _, _) = mgr.pool_stats();
         assert_eq!(
             one,
             two - 1,
@@ -2648,7 +2842,7 @@ mod tests {
     fn multi_gib_alias_maps_with_coarse_leaves_and_a_tiny_table_budget() {
         const ONE_GIB: u64 = 1 << 30;
         let mut mgr = manager();
-        let (before, _, capacity) = mgr.pool_stats();
+        let (before, _, capacity, _) = mgr.pool_stats();
         let va = LINUX_HIGH_VA_THRESHOLD;
         let ipa = LINUX_ALIAS_IPA_BASE;
         // CPython mmaps a 2 GiB sparse file, so the alias length rounds to
@@ -2657,7 +2851,7 @@ mod tests {
         let len = 2 * ONE_GIB + 4 * 0x1000;
         mgr.map_aliased(va, ipa, len, true)
             .expect("a 2 GiB + 16 KiB alias must map");
-        let (after, _, _) = mgr.pool_stats();
+        let (after, _, _, _) = mgr.pool_stats();
         assert!(
             after.saturating_sub(before) <= 8,
             "coarse leaves must keep the table budget O(1): used {} of {capacity}",
@@ -2859,7 +3053,7 @@ mod tests {
         parent
             .set_prot_none(LINUX_MMAP_BASE + 0x4080_0000, 0x1000)
             .unwrap();
-        let (parent_in_use, _, _) = parent.pool_stats();
+        let (parent_in_use, _, _, _) = parent.pool_stats();
         assert!(parent_in_use >= 2, "two splits allocated >=2 tables");
 
         // The child inherits a CLONE — cursor and live tables intact.
@@ -2874,7 +3068,7 @@ mod tests {
         child
             .set_prot_none(LINUX_MMAP_BASE + 0x8080_0000, 0x1000)
             .unwrap();
-        let (child_in_use, _, _) = child.pool_stats();
+        let (child_in_use, _, _, _) = child.pool_stats();
         assert!(child_in_use > parent_in_use, "fresh table, no re-handout");
         // The first split's neighborhood is still a correctly-mapped page (the
         // bug clobbered exactly this L2 table with an L3 page descriptor).
@@ -2918,7 +3112,7 @@ mod tests {
         let mut mgr = manager();
         let block = LINUX_MMAP_BASE + 0x20_0000; // 2 MiB-aligned arena block
         mgr.set_prot_none(block, 0x1000).expect("split");
-        let after_split = mgr.next_free;
+        let after_split = mgr.arenas[0].next_free;
         assert!(
             after_split > SPARE_START_OFFSET,
             "split consumed spare pages"
@@ -2943,10 +3137,10 @@ mod tests {
             0,
             "arena base is 1 GiB-aligned"
         );
-        let before = mgr.next_free;
+        let before = mgr.arenas[0].next_free;
         mgr.set_prot_none(LINUX_MMAP_BASE, 512 << 20)
             .expect("coarse prot_none");
-        let pages_used = (mgr.next_free - before) / 0x1000;
+        let pages_used = (mgr.arenas[0].next_free - before) / 0x1000;
         assert_eq!(
             pages_used, 1,
             "512 MiB PROT_NONE used {pages_used} tables, want 1"
@@ -3109,7 +3303,7 @@ mod tests {
             block += 1 << 21;
         }
         assert!(exhausted, "the churn must exhaust the spare pool");
-        let (in_use, free, capacity) = parent.pool_stats();
+        let (in_use, free, capacity, _) = parent.pool_stats();
         assert_eq!(free, 0, "a refused sweep reclaims nothing");
         assert_eq!(in_use, capacity, "the pool is at its limit");
         assert_eq!(
@@ -3188,7 +3382,7 @@ mod tests {
     }
 
     #[test]
-    fn into_bytes_preserves_edits() {
+    fn as_bytes_into_bytes_round_trip() {
         let mut mgr = manager();
         let va = LINUX_MMAP_BASE + 0x40_0000;
         mgr.set_prot_none(va, 0x1000).unwrap();
@@ -3202,7 +3396,7 @@ mod tests {
         let snapshot = manager();
         let mut live = vec![0xa5; snapshot.as_bytes().len()];
 
-        unsafe { snapshot.restore_quiesced_snapshot_to_host(live.as_mut_ptr()) };
+        unsafe { snapshot.restore_quiesced_snapshot_to_host((snapshot.base(), live.as_mut_ptr())) };
 
         assert_eq!(live, snapshot.as_bytes());
     }
@@ -3219,7 +3413,7 @@ mod tests {
         let identity_va = LINUX_HEAP_BASE + 0x1234;
         let before_identity = mgr.translate(identity_va);
         let before_alias = mgr.translate(alias_va + 0x234);
-        let old_base = mgr.base;
+        let old_base = mgr.base();
         let new_base = 0xa0_0000_0000;
 
         mgr.rebase(new_base).expect("rebase cloned tables");
@@ -3230,14 +3424,14 @@ mod tests {
         assert!(!mgr.is_valid(invalid_va));
         assert!(mgr.dirty.iter().any(|(_, is_pointer)| *is_pointer));
         for level in 0..3 {
-            for descriptor in walk_descriptors(&mgr.bytes, new_base, alias_va)
+            for descriptor in walk_descriptors(&mgr.arenas[0].bytes, new_base, alias_va)
                 .into_iter()
                 .take(level + 1)
             {
                 if descriptor & VALID != 0 && descriptor & TYPE_BITS == TYPE_TABLE_OR_PAGE {
                     let pa = descriptor & PA_MASK_TABLE;
                     assert!(
-                        (new_base..new_base + mgr.bytes.len() as u64).contains(&pa),
+                        (new_base..new_base + mgr.arenas[0].bytes.len() as u64).contains(&pa),
                         "level {level} table pointer 0x{pa:x} stayed under old base 0x{old_base:x}"
                     );
                 }
@@ -3257,11 +3451,11 @@ mod tests {
         let ro_va = 0x40_0000; // image-shaped low VA inside a 2 MiB boot block
         boot.set_readonly(ro_va, 0x2000, true)
             .expect("boot RO span");
-        let (used, _, _) = boot.pool_stats();
+        let (used, _, _, _) = boot.pool_stats();
         assert!(used >= 1, "boot edit allocated spare table(s)");
 
         let mut rebuilt = PageTableManager::new(boot.into_bytes(), LINUX_PAGE_TABLES_BASE);
-        let (rebuilt_used, _, _) = rebuilt.pool_stats();
+        let (rebuilt_used, _, _, _) = rebuilt.pool_stats();
         assert_eq!(rebuilt_used, used, "cursor re-discovered, not reset");
         // The boot edit is visible and intact through the rebuilt manager.
         assert_eq!(rebuilt.ap_bits(ro_va), AP_RO);
@@ -3271,7 +3465,7 @@ mod tests {
         rebuilt
             .set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000)
             .expect("fresh split");
-        let (after, _, _) = rebuilt.pool_stats();
+        let (after, _, _, _) = rebuilt.pool_stats();
         assert!(after > rebuilt_used, "fresh table allocated");
         assert_eq!(rebuilt.ap_bits(ro_va), AP_RO, "boot edit survives");
     }
@@ -3425,7 +3619,7 @@ mod tests {
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut block = keep_out + 64 * TWO_MIB;
         loop {
-            let (_, free, _) = mgr.pool_stats();
+            let (_, free, _, _) = mgr.pool_stats();
             let spare = mgr.spare_tables_available();
             if spare == 0 && free == 0 {
                 break;
@@ -3489,7 +3683,7 @@ mod tests {
         let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1234_5000;
         mgr.map_private_aliased(va, ipa, TWO_MIB - 0x1000, true)
             .expect("publish sparse extent");
-        let (in_use_before, _, _) = mgr.pool_stats();
+        let (in_use_before, _, _, _) = mgr.pool_stats();
         mgr.invalidate(va, (TWO_MIB - 0x1000) as usize)
             .expect("munmap");
         assert_eq!(
@@ -3501,7 +3695,7 @@ mod tests {
             mgr.reclaim_all_invalid_tables(),
             "the retired table is reclaimable"
         );
-        let (in_use_after, _, _) = mgr.pool_stats();
+        let (in_use_after, _, _, _) = mgr.pool_stats();
         // The retired L3 goes, and so does the L2 above it: its other entries
         // are identity-invalid reservation blocks, which a rebuild reproduces.
         assert_eq!(in_use_after, in_use_before - 2);
@@ -3601,6 +3795,112 @@ mod tests {
         assert!(
             outcome_both.flush_required,
             "an edit touching both invalid and valid leaves must report flush_required=true"
+        );
+    }
+
+    #[test]
+    fn stage1_arena_exhaustion_fails_without_growth() {
+        let mut mgr = hvpatch_manager();
+        exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
+        let err = mgr.set_rw(next_block + 0x1000, 0x1000, false).unwrap_err();
+        assert_eq!(err, PageTableError::OutOfTables);
+    }
+
+    struct TestArenaSource {
+        available: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
+        returned: std::sync::Arc<std::sync::Mutex<Vec<carrick_guest_mem::Gpa>>>,
+    }
+
+    impl TableArenaSource for TestArenaSource {
+        fn take_arena(&mut self) -> Option<carrick_guest_mem::Gpa> {
+            self.available.lock().unwrap().pop()
+        }
+        fn return_arena(&mut self, base: carrick_guest_mem::Gpa) {
+            self.returned.lock().unwrap().push(base);
+        }
+        fn clone_source(&self) -> Option<Box<dyn TableArenaSource>> {
+            Some(Box::new(Self {
+                available: std::sync::Arc::clone(&self.available),
+                returned: std::sync::Arc::clone(&self.returned),
+            }))
+        }
+    }
+
+    #[test]
+    fn growable_stage1_arena_exhaustion_uses_extension_source() {
+        use crate::memory::LINUX_PAGE_TABLES_SIZE;
+        use carrick_guest_mem::Gpa;
+        use std::sync::{Arc, Mutex};
+
+        let mut mgr = hvpatch_manager();
+        exhaust_spare_pool(&mut mgr, LINUX_MMAP_BASE);
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let next_block = LINUX_MMAP_BASE + 600 * TWO_MIB;
+        let va = next_block + 0x1000;
+        assert_eq!(
+            mgr.set_rw(va, 0x1000, false).unwrap_err(),
+            PageTableError::OutOfTables
+        );
+
+        let ext_base = Gpa(0xb0_0000_0000);
+        let available = Arc::new(Mutex::new(vec![ext_base]));
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let source = TestArenaSource {
+            available: Arc::clone(&available),
+            returned: Arc::clone(&returned),
+        };
+        mgr.set_arena_source(Box::new(source));
+
+        // Start an undo transaction to verify rollback returns the arena.
+        mgr.begin_undo();
+        mgr.set_rw(va, 0x1000, false)
+            .expect("mapping succeeds by allocating extension arena");
+        assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas during tx");
+        assert_eq!(
+            mgr.translate(va),
+            Some(va),
+            "page in extension arena translated"
+        );
+        assert!(available.lock().unwrap().is_empty(), "source arena taken");
+
+        let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
+        let resolver = [
+            (mgr.base(), host_arena0.as_mut_ptr()),
+            (ext_base.0, host_arena1.as_mut_ptr()),
+        ];
+        // Rollback transaction: extension arena should be returned to source.
+        unsafe { mgr.rollback_undo(&resolver[..]) };
+        assert_eq!(mgr.pool_stats().3, 1, "pool reports 1 arena after rollback");
+        assert_eq!(
+            returned.lock().unwrap().as_slice(),
+            &[ext_base],
+            "rolled back arena returned to source"
+        );
+
+        // Put the arena back into available for the real mapping.
+        available.lock().unwrap().push(ext_base);
+        mgr.set_rw(va, 0x1000, false)
+            .expect("mapping succeeds with extension arena");
+        assert_eq!(mgr.pool_stats().3, 2, "pool reports 2 arenas");
+        assert_eq!(
+            mgr.translate(va),
+            Some(va),
+            "page in extension arena translated"
+        );
+
+        unsafe { mgr.sync_to_host(&resolver[..]) };
+        assert_ne!(
+            host_arena0,
+            vec![0u8; LINUX_PAGE_TABLES_SIZE as usize],
+            "host arena 0 written"
+        );
+        assert_ne!(
+            host_arena1,
+            vec![0u8; LINUX_PAGE_TABLES_SIZE as usize],
+            "host arena 1 written"
         );
     }
 }
