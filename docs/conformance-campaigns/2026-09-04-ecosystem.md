@@ -870,3 +870,40 @@ Also landed: foreign-mm zero-fill for non-resident readable pages (`213ddbcf6`,
 `processvmsparse` MATCH both lanes). LTP `process_vm_readv03` still TBROKs
 (131072 requested, 18368 returned) — a further short-read class to attribute on
 the rebuilt main.
+
+## 2026-09-05: process_vm_readv03 — two structural defects, both landed
+
+LTP `process_vm_readv03` had failed at two different points; neither was the
+zero-fill gap the worker fixed.
+
+1. **Per-local-iovec transactions** (`a2b0c5610`). The foreign read loop cut
+   every transaction at the LOCAL iovec boundary, so the 1024×1-byte local
+   shape opened 1024 snapshot+transport round trips for a 1 KiB read, each
+   under a 50 ms wall-clock deadline; under load the 959th timed out and the
+   syscall returned a prefix (Linux never shortens a read for time). Now one
+   transaction per remote page, scattered across local iovecs. Unit test
+   counts transactions through the test transport (1024 → 1). Timing for the
+   scatter shapes went from ~30 ms to ~0 ms.
+2. **Stale lease misreported as a missing binding** (`7c58644eb`). Remaining
+   failure was deterministic: `bufsize=131072, remote_iovecs=1024` returned
+   18368. A glibc reproducer (parent scatter buffer in brk heap shared COW with
+   the forked child) reproduced it; field-level diagnostics on the carrier
+   lease showed only the TARGET's frame-inventory revision drifting between
+   retain and chunk 5 — the parent's host-side writes republish the shared
+   frames and bump the child's revision. The carrier returned `MissingBinding`
+   for a lease that merely predated the snapshot. New typed `LeaseStale`;
+   `read_foreign` re-retains against the snapshot it just validated and caches
+   the fresh lease in the token. Red-first unit test; LTP MATCH 32/32 ×3.
+
+Tooling kept: `tracing::debug!` on `carrick::process_vm` (silent break points)
+and `carrick::foreign_mm` (which snapshot fields drifted), enabled with
+`RUST_LOG=carrick::process_vm=debug,carrick::foreign_mm=debug`. Probes for
+libc-only cases cross-compile locally without Docker
+(`cargo build --target aarch64-unknown-linux-{musl,gnu}` in `conformance-probes`).
+
+Open (recorded, not fixed): `MmAccessState::OVERALL_DEADLINE` (50 ms) still
+converts scheduling delay into a short foreign read; with page-granular
+transactions the exposure is ~32 round trips per 128 KiB instead of 1024, but
+the shape (wall clock → guest-visible short read) is the flaky class the owner
+ruled architectural. The write side (`prepare_write`) now returns `LeaseStale`
+typed but the runtime does not yet re-retain there.
