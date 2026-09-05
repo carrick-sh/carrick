@@ -718,3 +718,27 @@ anonymous page of the child (Linux reads it as zeros). Next step is a probe
 (`processvmsparse`: remote buffer partially touched, read the whole range,
 assert full length and zeros in the untouched pages) and a fix in the
 foreign-mm read path once the two trap.rs workers have landed.
+
+## adjtimex model landed (cf4357f9b); two new red probes
+
+`clock-adjtime` (fresh worker, one round plus two oracle corrections by
+the director) gives the container clock domain a real `struct timex`
+state: every ADJ_* mode stores and reads back, `ADJ_SETOFFSET` moves the
+virtual realtime offset, capability still gates any modification; `freq`
+and `tick` are recorded but do not skew the rate, `maxerror` is static and
+the singleshot offset is a step (all documented approximations). Two
+places the first cut was stricter than Linux were corrected against the
+oracle: an oversized `freq` is clamped and undefined `status` bits are
+dropped, and `ADJ_MICRO|ADJ_NANO` / `ADJ_TAI|ADJ_TIMECONST` together are
+accepted. Probe `adjtimexmodel` (18 lines, `CAP_SYS_TIME`) MATCHes both
+lanes; `ltp-clock_adjtime01` 9/9 MATCH through the harness (was 3/9 with
+six EPERM). `adjtimex01`/`adjtimex02` match as fail-on-both-sides and are
+the next oracle-privilege check.
+
+Two probes were added red on purpose and gate from here:
+`processvmsparse` (process_vm_readv03: the remote read stops at the first
+non-resident page) and `mremapfixedshared` (mremap06: fixed move inside a
+shared file mapping). The mremap fix's first cut moved the VMA but minted a
+fresh host `MAP_SHARED` mmap at a 4 KiB file offset, which Darwin rejects on
+a 16 KiB page host; the correct lowering is a stage-1 repoint to the extent
+already mapped, sent back to the worker.
