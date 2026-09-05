@@ -1394,6 +1394,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "perf_arena_churn": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "perf_direct_compute": {
     "class": "performance",
     "excluded": false,
