@@ -6002,6 +6002,7 @@ mod container_clock_tests {
     //! task and therefore its own `Container`; the clock a handler reads must
     //! be that container's `ClockDomain`, never a process static.
     use super::*;
+    use carrick_abi::*;
     use crate::compat::CompatReporter;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -6184,8 +6185,43 @@ mod container_clock_tests {
     }
 
     #[test]
-    fn clock_adjtime_privileged_accepts_idempotent_discipline_restore() {
-        const ADJ_ALL: u32 = 0x403f;
+    fn clock_adjtime_read_reports_time_ok_by_default() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        timex.modes = 0;
+        memory
+            .write_bytes(TIMEX_ADDR, timex.abi_bytes())
+            .expect("write timex");
+
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_adjtime");
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_OK });
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).expect("read timex");
+        assert_eq!({ read.offset }, 0);
+        assert_eq!({ read.freq }, 0);
+        assert_eq!({ read.maxerror }, 16_000_000);
+        assert_eq!({ read.esterror }, 16_000_000);
+        assert_eq!({ read.status }, 0);
+        assert_eq!({ read.constant }, 2);
+        assert_eq!({ read.tick }, 10_000);
+        assert_eq!({ read.tai }, 0);
+    }
+
+    #[test]
+    fn clock_adjtime_reports_time_error_when_sta_unsync_set() {
         let mut dispatcher = SyscallDispatcher::new();
         let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
         let reporter = CompatReporter::default();
@@ -6193,8 +6229,10 @@ mod container_clock_tests {
         context
             .task()
             .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+
         let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
-        timex.modes = ADJ_ALL;
+        timex.modes = LINUX_ADJ_STATUS;
+        timex.status = LINUX_STA_UNSYNC;
         memory
             .write_bytes(TIMEX_ADDR, timex.abi_bytes())
             .expect("write timex");
@@ -6210,23 +6248,196 @@ mod container_clock_tests {
                 &reporter,
             )
             .expect("dispatch clock_adjtime");
-
         assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_ERROR });
+
+        // Subsequent read-only call must now report TIME_ERROR because STA_UNSYNC is set
+        timex.modes = 0;
+        memory
+            .write_bytes(TIMEX_ADDR, timex.abi_bytes())
+            .expect("write timex");
+        let read_outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_adjtime");
+        assert_eq!(read_outcome, DispatchOutcome::Returned { value: LINUX_TIME_ERROR });
     }
 
     #[test]
-    fn clock_adjtime_offset_ss_read_is_unprivileged_and_reports_no_pending_slew() {
-        const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+    fn clock_adjtime_unprivileged_modifying_modes_fail_with_eperm() {
         let mut dispatcher = SyscallDispatcher::new();
         let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
         let reporter = CompatReporter::default();
         let context = dispatcher.capture_one_task_context().expect("task context");
+
+        for mode in [
+            LINUX_ADJ_OFFSET,
+            LINUX_ADJ_FREQUENCY,
+            LINUX_ADJ_MAXERROR,
+            LINUX_ADJ_ESTERROR,
+            LINUX_ADJ_STATUS,
+            LINUX_ADJ_TIMECONST,
+            LINUX_ADJ_TAI,
+            LINUX_ADJ_TICK,
+            LINUX_ADJ_SETOFFSET,
+            LINUX_ADJ_OFFSET_SINGLESHOT,
+        ] {
+            let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+            timex.modes = mode;
+            timex.tick = 10_000;
+            memory
+                .write_bytes(TIMEX_ADDR, timex.abi_bytes())
+                .expect("write timex");
+
+            let outcome = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_CLOCK_ADJTIME,
+                        SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .expect("dispatch clock_adjtime");
+
+            assert_eq!(
+                outcome,
+                DispatchOutcome::errno(LINUX_EPERM),
+                "mode {mode:#x} without CAP_SYS_TIME must be EPERM"
+            );
+        }
+    }
+
+    #[test]
+    fn clock_adjtime_privileged_roundtrips_all_adj_modes() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+
+        // 1. ADJ_OFFSET
         let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
-        timex.modes = ADJ_OFFSET_SS_READ;
-        timex.offset = 123;
-        memory
-            .write_bytes(TIMEX_ADDR, timex.abi_bytes())
-            .expect("write timex");
+        timex.modes = LINUX_ADJ_OFFSET;
+        timex.offset = 42_000;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.offset }, 42_000);
+
+        // 2. ADJ_FREQUENCY
+        timex.modes = LINUX_ADJ_FREQUENCY;
+        timex.freq = 12_345;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.freq }, 12_345);
+
+        // 3. ADJ_MAXERROR
+        timex.modes = LINUX_ADJ_MAXERROR;
+        timex.maxerror = 500_000;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.maxerror }, 500_000);
+
+        // 4. ADJ_ESTERROR
+        timex.modes = LINUX_ADJ_ESTERROR;
+        timex.esterror = 250_000;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.esterror }, 250_000);
+
+        // 5. ADJ_TIMECONST
+        timex.modes = LINUX_ADJ_TIMECONST;
+        timex.constant = 8;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.constant }, 8);
+
+        // 6. ADJ_TAI
+        timex.modes = LINUX_ADJ_TAI;
+        timex.constant = 37;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.tai }, 37);
+
+        // 7. ADJ_TICK
+        timex.modes = LINUX_ADJ_TICK;
+        timex.tick = 10_500;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.tick }, 10_500);
+
+        // 8. ADJ_STATUS
+        timex.modes = LINUX_ADJ_STATUS;
+        timex.status = LINUX_STA_PLL | LINUX_STA_PPSFREQ;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.status } & (LINUX_STA_PLL | LINUX_STA_PPSFREQ), LINUX_STA_PLL | LINUX_STA_PPSFREQ);
+
+        // 9. ADJ_NANO
+        timex.modes = LINUX_ADJ_NANO;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_ne!({ read.status } & LINUX_STA_NANO, 0);
+
+        // 10. ADJ_MICRO
+        timex.modes = LINUX_ADJ_MICRO;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.status } & LINUX_STA_NANO, 0);
+    }
+
+    #[test]
+    fn clock_adjtime_setoffset_moves_realtime() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(100, 500_000));
+        timex.modes = LINUX_ADJ_SETOFFSET;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
 
         let outcome = dispatcher
             .dispatch(
@@ -6239,11 +6450,144 @@ mod container_clock_tests {
                 &reporter,
             )
             .expect("dispatch clock_adjtime");
-        let bytes = memory.read_bytes(TIMEX_ADDR + 8, 8).expect("returned offset");
-        let offset = i64::from_le_bytes(bytes.try_into().expect("offset bytes"));
+        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_OK });
 
-        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_ERROR });
-        assert_eq!(offset, 0, "no singleshot slew is pending in a fresh domain");
+        let offset_ns = context.task().container().clock().realtime_offset_ns();
+        assert_eq!(offset_ns, 100 * 1_000_000_000 + 500_000 * 1_000);
+    }
+
+    #[test]
+    fn clock_adjtime_offset_singleshot_moves_realtime() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        timex.modes = LINUX_ADJ_OFFSET_SINGLESHOT;
+        timex.offset = 50_000;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_adjtime");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_OK });
+
+        let offset_ns = context.task().container().clock().realtime_offset_ns();
+        assert_eq!(offset_ns, 50_000 * 1_000);
+
+        // SS_READ reports 0 remaining slew
+        timex.modes = LINUX_ADJ_OFFSET_SS_READ;
+        timex.offset = 999;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_CLOCK_ADJTIME,
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch clock_adjtime");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: LINUX_TIME_OK });
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        assert_eq!({ read.offset }, 0);
+    }
+
+    #[test]
+    fn clock_adjtime_rejects_out_of_range_values_with_einval() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+
+        // Out-of-range freq
+        for bad_freq in [32_768_001, -32_768_001] {
+            let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+            timex.modes = LINUX_ADJ_FREQUENCY;
+            timex.freq = bad_freq;
+            memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+            let outcome = dispatcher
+                .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+                .unwrap();
+            assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+        }
+
+        // Out-of-range singleshot offset
+        for bad_offset in [131_072, -131_072] {
+            let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+            timex.modes = LINUX_ADJ_OFFSET_SINGLESHOT;
+            timex.offset = bad_offset;
+            memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+            let outcome = dispatcher
+                .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+                .unwrap();
+            assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+        }
+
+        // Invalid status bits
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        timex.modes = LINUX_ADJ_STATUS;
+        timex.status = 1 << 20;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        let outcome = dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+
+        // Invalid SETOFFSET tv_usec
+        for bad_usec in [-1, 1_000_000] {
+            let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(10, bad_usec));
+            timex.modes = LINUX_ADJ_SETOFFSET;
+            memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+            let outcome = dispatcher
+                .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+                .unwrap();
+            assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+        }
+
+        // Mutually exclusive MICRO and NANO
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        timex.modes = LINUX_ADJ_MICRO | LINUX_ADJ_NANO;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        let outcome = dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+
+        // Mutually exclusive TAI and TIMECONST
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        timex.modes = LINUX_ADJ_TAI | LINUX_ADJ_TIMECONST;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        let outcome = dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+
+        // Singleshot flag without OFFSET
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        timex.modes = LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        let outcome = dispatcher
+            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
     }
 
     fn armed_absolute_timerfd(
