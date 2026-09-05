@@ -12720,7 +12720,11 @@ impl AliasRegistry {
             .get(&scope)
             .and_then(|counts| counts.last_key_value().map(|(&size, _)| size))
             .unwrap_or(0);
-        let lower = physical_end.saturating_sub(widest);
+        // A row can contain the extent only if it starts in
+        // `[physical_end - widest, physical_ipa]`. When the query is longer
+        // than every recorded row that interval is empty, and a reversed
+        // `BTreeMap::range` panics, so clamp the lower bound to the start.
+        let lower = physical_end.saturating_sub(widest).min(physical_ipa);
         let rows = self
             .by_scope_physical_start
             .range((scope, lower)..=(scope, physical_ipa))
@@ -56620,6 +56624,45 @@ mod tag_strip_tests {
                 "resulting registry ordered rows mismatch for case: {desc}"
             );
         }
+    }
+
+    #[test]
+    fn containing_physical_query_wider_than_any_recorded_row_does_not_panic() {
+        // The scope's widest recorded physical size bounds the range's lower
+        // end; a query longer than every recorded row put the lower bound
+        // ABOVE the query start and `BTreeMap::range` panicked on a reversed
+        // range. Reported by the fork-table-copy worker while reading the
+        // alias index; a guest-reachable abort.
+        let root_slot = Some((0x5000_0000, 0x4000));
+        let owned_scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x5000_0000,
+            size: 0x4000,
+        };
+        let mut registry = AliasRegistry::default();
+        registry.push(make_test_alias(
+            0x1000_0000,
+            0x4000,
+            0x8000_0000,
+            0x4000,
+            owned_scope,
+        ));
+        let candidates = registry.private_owned_containing_physical(
+            root_slot,
+            ContainerRootToken::ROOT,
+            0x8000_0000,
+            0x10000,
+        );
+        assert!(
+            candidates.is_empty(),
+            "a 16 KiB row cannot contain a 64 KiB extent"
+        );
+        let exact = registry.private_owned_containing_physical(
+            root_slot,
+            ContainerRootToken::ROOT,
+            0x8000_0000,
+            0x4000,
+        );
+        assert_eq!(exact.len(), 1);
     }
 
     #[test]
