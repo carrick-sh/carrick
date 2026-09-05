@@ -201,6 +201,33 @@ fn case_epipe_on_closed_read_end() {
     }
 }
 
+/// Positional I/O on a pipe end: Linux answers ESPIPE for `pwrite`/`pread` on
+/// an unseekable description before it looks at the open mode, so even the
+/// read end of a pipe gets ESPIPE from `pwrite`, never EBADF.
+fn case_positional_io_on_pipe_ends() {
+    unsafe {
+        let (rc, rd, wr) = make_pipe2(0);
+        let mut buf = [0u8; 4];
+        let pw_rd = libc::pwrite(rd, b"x".as_ptr() as *const libc::c_void, 1, 0);
+        let pw_rd_errno = errno();
+        let pw_wr = libc::pwrite(wr, b"x".as_ptr() as *const libc::c_void, 1, 0);
+        let pw_wr_errno = errno();
+        let pr_wr = libc::pread(wr, buf.as_mut_ptr() as *mut libc::c_void, 4, 0);
+        let pr_wr_errno = errno();
+        let pr_rd = libc::pread(rd, buf.as_mut_ptr() as *mut libc::c_void, 4, 0);
+        let pr_rd_errno = errno();
+        report!(
+            positional_setup_rc_zero = rc == 0,
+            pwrite_pipe_read_end_espipe = pw_rd == -1 && pw_rd_errno == libc::ESPIPE,
+            pwrite_pipe_write_end_espipe = pw_wr == -1 && pw_wr_errno == libc::ESPIPE,
+            pread_pipe_write_end_espipe = pr_wr == -1 && pr_wr_errno == libc::ESPIPE,
+            pread_pipe_read_end_espipe = pr_rd == -1 && pr_rd_errno == libc::ESPIPE,
+        );
+        libc::close(rd);
+        libc::close(wr);
+    }
+}
+
 fn main() {
     case_nonblock();
     case_cloexec();
@@ -208,4 +235,5 @@ fn main() {
     case_fionread_and_nonblock_write();
     case_eof_on_closed_write_end();
     case_epipe_on_closed_read_end();
+    case_positional_io_on_pipe_ends();
 }
