@@ -1178,3 +1178,21 @@ syscalls, with host revalidation only under shared (`-v`) mounts. Brief:
 `scratchpad/brief-dentry-cache.md`, worker `dentry-cache` dispatched from
 main (file-disjoint from the page-table workers). Targets: stat ≤ 4 µs,
 ENOENT ≤ 3 µs, open+close ≤ 8 µs.
+
+Two more instances of the same class, same method (attached carrier CPU ranking):
+
+- **readdir**: `os.listdir` of a 201-entry directory is 1.54 ms vs 40 µs on
+  Docker (39x), 12 entries 177 µs vs 6 µs, `/proc/self/fd` 265 µs vs 3.6 µs.
+  `getdents64` → `layered_directory_entries` → `shadows` plus a per-entry
+  `real_stat`/`lookup_kind` (fstatat is 74% of samples): every entry is
+  stat'ed on the host to derive d_type/ino and layer shadowing, ~7.5 µs per
+  entry. `getdirentries64` already reports d_type and d_ino; only nodes
+  carrying a carrick mode xattr need more. Follow-up for the dentry-cache
+  worker (a listing fills the cache; d_type from the host entry).
+- **any open under a synthetic mount** (`/proc`, `/sys`, `/dev`) builds the
+  ENTIRE `OpenContext` eagerly in `try_vfs_open`: memory snapshot, creds,
+  groups, signal masks, the SysV shm/sem/msg tables (`msg_table` reads files
+  and was 57% of the `/proc/self/fd` open), the process list, zombies,
+  threads. CPython's `_posixsubprocess` lists `/proc/self/fd` on every spawn.
+  Fix shape: lazy fields, so the opened node's renderer pulls only what it
+  reads. Brief: `scratchpad/brief-lazy-proc-context.md`.
