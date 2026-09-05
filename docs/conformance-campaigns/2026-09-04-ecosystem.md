@@ -544,3 +544,24 @@ not generating its event (Docker 9/9, carrick 7/8 + TBROK).
 The `socket-state` worker's refactor (peer credentials and cork state on
 `DescriptionCommon`) landed as `7f63a0a39`; main's K1 burndown is green
 again with no ceiling raised.
+
+## Batch closed (99fc45746)
+
+Two more deterministic defects fell out of gating the batch, both in
+"fast path skips the bookkeeping" shape:
+
+- `sigunblockpending` regressed on the probe shard gate after the pipe
+  readiness landing: `write_pipe` consulted the pending-signal check before
+  copying, so a handler's one-byte write with a second signal pending
+  returned EINTR with nothing written. The guest syscall-flow trace showed
+  the `write ret=-4` directly. Restructured to the BSD `pipe_write` shape
+  (copy when there is room; interruptible only at the sleep) in `7f11d985b`.
+- `fanotify04`: the three trusted `--fs host` fast lanes declined on inotify
+  watches but not fanotify marks, so a marked directory's open never reached
+  the FAN_OPEN emission. `99fc45746`; new probe `fanotifyondir` (all eight
+  lines MATCH both lanes), `ltp-fanotify04` 9/9.
+
+All twelve suites touched by the fd/net/pty/pipe landings now MATCH.
+`fanotify01`/`fanotify06` match as broken-on-both-sides; they are candidates
+for the under-privileged-oracle inversion and need a Docker privilege check
+before anything else.
