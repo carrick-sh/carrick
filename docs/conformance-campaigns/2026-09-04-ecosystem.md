@@ -1024,3 +1024,38 @@ a vfork child until exec; NO path may take, clone-replace, or retire through a
 shared authority. The five leaks were: exec pending-only install, engine-local
 deferral vs sibling lazy build, foreign-COW/fork-COW rollback clones,
 rolled-back fork clone, and the vfork child's exec stealing the parent's slot.
+
+## 2026-09-06: process creation is the lever behind both CPython pool suites
+
+Measured on this host (Docker twin run in the Docker phase; carrick figures are
+from a mostly quiet host unless noted):
+
+| operation                          | carrick      | Docker   | ratio |
+|------------------------------------|--------------|----------|-------|
+| `fork` + `_exit` + `waitpid`       | 6.1 ms       | 0.66 ms  | 9x    |
+| `posix_spawn /bin/true`            | 37 ms (loaded) | 0.36 ms | ~100x (loaded) |
+| `python3 -c pass`                  | 72 ms (loaded) | 6.7 ms  | ~11x (loaded) |
+
+Where the fork goes (`hvpatch-fork-wait-roundtrip.d`, `-fork-child-dispatch.d`,
+`-frame-cow.d`, a 30-fork loop whose child only `_exit`s):
+
+- parent critical section 1–2 ms, of which the process-spec build
+  (`ProcessSpec`, mostly the 1.75 MiB page-table clone + COW arming) is ~1.1 ms;
+- the child's lifetime 4–16 ms: **~47 copy-on-write faults per child** (CPython's
+  refcount writes on the fork-return path) at a **median 80 µs per fault**
+  (p99 107 µs), and 71 µs of that is between the fault trigger and the byte
+  copy — fault exit, decode, frame lease, host allocation, stage-2 map — before
+  16 KiB is copied. Linux takes the same faults at ~1–2 µs;
+- reap 0.5–8 ms (parent wake after child exit).
+
+So the structural target is the per-fault service pipeline (COW and sparse
+anonymous faults alike), not fork itself; a pre-mapped frame pool and a
+lighter fault exit path are the levers, and they compound into exec (dynamic
+loader faults) and `posix_spawn`. `concurrent_futures` standalone: 658 s vs
+74 s (8.9x), 20 ok, forkserver cluster failing with a widened race (late
+worker connects after the Manager's temp dir is gone).
+
+Also found by the gate on this binary and fixed in `f6b48151e`: a quadratic
+page-table resolver once extension arenas exist (every edit scanned every
+mapping row), and a rebind heuristic that stole a shared authority's manager
+(coredumpfile lost two threads).
