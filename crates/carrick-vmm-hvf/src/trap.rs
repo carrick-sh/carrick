@@ -9794,8 +9794,8 @@ mod task_only_carrier_directory_tests {
         registry.retain(|entry| entry.ownership_scope == AliasOwnershipScope::Global);
         check(&registry, "retain");
 
-        let snapshot = registry.process_visible_snapshot(None, ContainerRootToken::ROOT);
-        check(&snapshot, "process_visible_snapshot");
+        registry.reindex();
+        check(&registry, "reindex");
         registry.clear();
         check(&registry, "clear");
     }
@@ -12601,6 +12601,7 @@ impl AliasRegistry {
         }
     }
 
+    #[cfg(test)]
     /// Rebuild all window indexes from the buckets. Used where a registry is
     /// constructed directly rather than through the mutators.
     fn reindex(&mut self) {
@@ -12807,6 +12808,7 @@ impl AliasRegistry {
 
     /// Every row in GLOBAL insertion order, oldest first. O(n log n); use
     /// [`Self::scope_rows`] when the question is scoped.
+    #[cfg(test)]
     fn ordered(&self) -> Vec<AliasBacking> {
         let mut rows: Vec<(u64, AliasBacking)> = self
             .by_scope
@@ -13209,27 +13211,109 @@ impl AliasRegistry {
         rows.into_iter().map(|(_, alias)| alias).collect()
     }
 
-    /// A registry holding only the rows one process can see, sequences and
-    /// order preserved. Every caller that plans a mutation against a private
-    /// copy is scope-filtered anyway, so cloning the whole carrier-global
-    /// registry per `munmap` was pure per-process tax.
-    fn process_visible_snapshot(
+    /// Rows whose guest-VA window overlaps `[va, va + len)` in the process-visible scopes,
+    /// ordered by sequence.
+    fn overlapping_process_aliases(
         &self,
+        va: u64,
+        len: usize,
         mm_root_slot: Option<(u64, u64)>,
         container_root: ContainerRootToken,
-    ) -> Self {
-        let mut snapshot = Self {
-            next_seq: self.next_seq,
-            ..Self::default()
+    ) -> Vec<(u64, AliasBacking)> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let Some(end) = va.checked_add(len as u64) else {
+            return Vec::new();
         };
-        for scope in Self::process_visible_scopes(mm_root_slot, container_root) {
-            if let Some(rows) = self.by_scope.get(&scope) {
-                snapshot.rows = snapshot.rows.saturating_add(rows.len());
-                snapshot.by_scope.insert(scope, rows.clone());
+        if end <= va {
+            return Vec::new();
+        }
+        let lower = va.saturating_sub(self.widest_va);
+        if lower >= end {
+            return Vec::new();
+        }
+        let mut overlapping = Vec::new();
+        for (_, rows) in self.by_va_start.range(lower..end) {
+            note_alias_state_rows_scanned(rows.len());
+            for &(seq, alias) in rows {
+                if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                    && alias.start.saturating_add(alias.size as u64) > va
+                {
+                    overlapping.push((seq, alias));
+                }
             }
         }
-        snapshot.reindex();
-        snapshot
+        overlapping.sort_by_key(|(seq, _)| *seq);
+        overlapping
+    }
+
+    /// Insert a single row into buckets and indices with an explicit sequence.
+    /// Used when staging a planned mutation subset without cloning or reindexing the whole registry.
+    fn insert_indexed_row(&mut self, seq: u64, alias: AliasBacking) {
+        let rows = self.by_scope.entry(alias.ownership_scope).or_default();
+        let position = rows.len();
+        rows.push((seq, alias));
+        self.exact_first_by_scope
+            .entry(alias.ownership_scope)
+            .or_default()
+            .entry((alias.start, alias.ipa))
+            .or_insert((position, seq, alias));
+        self.rows = self.rows.saturating_add(1);
+        self.next_seq = self.next_seq.max(seq.saturating_add(1));
+        self.index_insert(seq, alias);
+    }
+
+    /// Plan the retirement of physical leases and disarm spans for an unmap of `[va, va+len)`
+    /// from the process-visible scopes without cloning the registry.
+    /// Returns the planned retirement leases and the overlapping rows before unmapping.
+    fn plan_unregister_process_alias(
+        &self,
+        va: u64,
+        len: usize,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> (std::collections::BTreeSet<(u64, u64)>, Vec<AliasBacking>) {
+        let overlapping = self.overlapping_process_aliases(va, len, mm_root_slot, container_root);
+        let registry_before: Vec<AliasBacking> =
+            overlapping.iter().map(|(_, alias)| *alias).collect();
+        if overlapping.is_empty() {
+            return (std::collections::BTreeSet::new(), registry_before);
+        }
+        let scopes = Self::process_visible_scopes(mm_root_slot, container_root);
+        let mut co_holders = Vec::new();
+        let mut seen_extents = std::collections::BTreeSet::new();
+        for (_, entry) in &overlapping {
+            if seen_extents.insert((entry.physical_ipa, entry.physical_size as u64)) {
+                for &scope in &scopes {
+                    if let Some(rows) = self
+                        .by_scope_physical_start
+                        .get(&(scope, entry.physical_ipa))
+                    {
+                        note_alias_state_rows_scanned(rows.len());
+                        for &(seq, alias) in rows {
+                            if alias.physical_size == entry.physical_size {
+                                co_holders.push((seq, alias));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut planned = Self::default();
+        let mut seen_seqs = std::collections::BTreeSet::new();
+        for (seq, alias) in overlapping {
+            seen_seqs.insert(seq);
+            planned.insert_indexed_row(seq, alias);
+        }
+        for (seq, alias) in co_holders {
+            if seen_seqs.insert(seq) {
+                planned.insert_indexed_row(seq, alias);
+            }
+        }
+        let planned_leases =
+            unregister_alias_entries(&mut planned, va, len, mm_root_slot, container_root);
+        (planned_leases, registry_before)
     }
 
     /// The two scopes a process can see, per `alias_matches_process_scope`:
@@ -16934,64 +17018,128 @@ fn unregister_alias_entries(
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
 ) -> std::collections::BTreeSet<(u64, u64)> {
-    let end = va.saturating_add(len as u64);
+    if len == 0 {
+        return std::collections::BTreeSet::new();
+    }
+    let Some(end) = va.checked_add(len as u64) else {
+        return std::collections::BTreeSet::new();
+    };
+    if end <= va {
+        return std::collections::BTreeSet::new();
+    }
+    let lower = va.saturating_sub(registry.widest_va);
+    if lower >= end {
+        return std::collections::BTreeSet::new();
+    }
+    let mut overlapping = Vec::new();
+    for (_, rows) in registry.by_va_start.range(lower..end) {
+        note_alias_state_rows_scanned(rows.len());
+        for &(seq, alias) in rows {
+            if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                && alias.start.saturating_add(alias.size as u64) > va
+            {
+                overlapping.push((seq, alias));
+            }
+        }
+    }
+    if overlapping.is_empty() {
+        return std::collections::BTreeSet::new();
+    }
+
     let mut candidates = std::collections::BTreeSet::new();
-    // `alias_matches_process_scope` admits exactly the owned scope and the
-    // shared-file `Global` namespace, so this touches two buckets rather than
-    // draining and rebuilding the whole carrier-global registry per unmap.
-    let scopes = AliasRegistry::process_visible_scopes(mm_root_slot, container_root);
-    for scope in scopes {
-        registry.rebuild_scope_rows(scope, |rows| {
+    let mut touched_scopes = std::collections::BTreeSet::new();
+    for (_, entry) in &overlapping {
+        candidates.insert((entry.physical_ipa, entry.physical_size as u64));
+        touched_scopes.insert(entry.ownership_scope);
+    }
+
+    for scope in touched_scopes {
+        let mut mutations = Vec::new();
+        let mut removed_count = 0usize;
+        let mut inserted_count = 0usize;
+        {
+            let Some(rows) = registry.by_scope.get_mut(&scope) else {
+                continue;
+            };
             note_alias_state_rows_scanned(rows.len());
-            let mut replacement = Vec::with_capacity(rows.len().saturating_add(1));
-            for (seq, entry) in rows {
-                let entry_end = entry.start.saturating_add(entry.size as u64);
-                if entry_end <= va || entry.start >= end {
-                    replacement.push((seq, entry));
-                    continue;
+            let mut to_process = Vec::new();
+            for (pos, &(seq, alias)) in rows.iter().enumerate() {
+                let entry_end = alias.start.saturating_add(alias.size as u64);
+                if entry_end > va && alias.start < end {
+                    to_process.push((pos, seq, alias));
                 }
-                candidates.insert((entry.physical_ipa, entry.physical_size as u64));
-                // Fragments inherit the parent's sequence: they occupy its place in
-                // the global order, and `AliasRegistry::ordered` sorts stably.
+            }
+            to_process.reverse();
+
+            for (pos, seq, entry) in to_process {
+                let entry_end = entry.start.saturating_add(entry.size as u64);
+                let mut fragments = Vec::with_capacity(2);
                 if entry.start < va {
-                    replacement.push((
-                        seq,
-                        AliasBacking {
-                            size: usize::try_from(va - entry.start).unwrap_or_default(),
-                            ..entry
-                        },
-                    ));
+                    let head = AliasBacking {
+                        size: usize::try_from(va - entry.start).unwrap_or_default(),
+                        ..entry
+                    };
+                    fragments.push((seq, head));
                 }
                 if entry_end > end {
                     let delta = end.saturating_sub(entry.start);
-                    replacement.push((
-                        seq,
-                        AliasBacking {
-                            start: end,
-                            ipa: entry.ipa.saturating_add(delta),
-                            host_addr: entry.host_addr.saturating_add(delta as usize),
-                            size: usize::try_from(entry_end - end).unwrap_or_default(),
-                            shared_key_offset: entry.shared_key_offset.saturating_add(delta),
-                            ..entry
-                        },
-                    ));
+                    let tail = AliasBacking {
+                        start: end,
+                        ipa: entry.ipa.saturating_add(delta),
+                        host_addr: entry.host_addr.saturating_add(delta as usize),
+                        size: usize::try_from(entry_end - end).unwrap_or_default(),
+                        shared_key_offset: entry.shared_key_offset.saturating_add(delta),
+                        ..entry
+                    };
+                    fragments.push((seq, tail));
                 }
+                removed_count = removed_count.saturating_add(1);
+                inserted_count = inserted_count.saturating_add(fragments.len());
+                match fragments.len() {
+                    0 => {
+                        rows.remove(pos);
+                    }
+                    1 => {
+                        rows[pos] = fragments[0];
+                    }
+                    2 => {
+                        rows[pos] = fragments[0];
+                        rows.insert(pos + 1, fragments[1]);
+                    }
+                    _ => unreachable!(),
+                }
+                mutations.push((seq, entry, fragments));
             }
-            replacement
-        });
-    }
-    // A candidate extent is reclaimable only when NO row this process can see
-    // still names it. Collect the survivors once instead of rescanning the
-    // registry per candidate.
-    let mut retained_extents = std::collections::BTreeSet::new();
-    for scope in scopes {
-        let rows = registry.scope_rows(scope);
-        note_alias_state_rows_scanned(rows.len());
-        for (_, entry) in rows {
-            retained_extents.insert((entry.physical_ipa, entry.physical_size as u64));
         }
+        for (seq, entry, fragments) in mutations {
+            registry.index_remove(seq, entry);
+            for (frag_seq, frag_entry) in fragments {
+                registry.index_insert(frag_seq, frag_entry);
+            }
+        }
+        registry.rows = registry
+            .rows
+            .saturating_sub(removed_count)
+            .saturating_add(inserted_count);
+        registry.bump_revision();
+        registry.rebuild_exact_scope(scope);
+        registry.drop_empty_scope(scope);
     }
-    candidates.retain(|extent| !retained_extents.contains(extent));
+
+    let scopes = AliasRegistry::process_visible_scopes(mm_root_slot, container_root);
+    candidates.retain(|&(physical_ipa, physical_size)| {
+        let retained = scopes.iter().any(|&scope| {
+            registry
+                .by_scope_physical_start
+                .get(&(scope, physical_ipa))
+                .is_some_and(|rows| {
+                    note_alias_state_rows_scanned(rows.len());
+                    rows.iter()
+                        .any(|(_, alias)| alias.physical_size as u64 == physical_size)
+                })
+        });
+        !retained
+    });
     candidates
 }
 
@@ -41074,23 +41222,24 @@ impl HvfVmState {
             identity.linux_tid,
         );
 
-        // Plan against a private copy before mutating the process-wide alias
-        // index. Reservation failure therefore leaves the exact pre-munmap
-        // lifetime graph intact; the checked stage-1 invalidation has already
-        // made the guest range inaccessible.
-        let visible = alias_registry()
-            .lock()
-            .process_visible_snapshot(self.mm_root_slot, self.container_root);
-        let registry_before = visible.ordered();
-        let planned_leases = {
-            let mut planned = visible.clone();
-            unregister_alias_entries(
-                &mut planned,
+        // Plan against the live registry's scope-keyed indices before mutating
+        // the process-wide alias index. Reservation failure therefore leaves
+        // the exact pre-munmap lifetime graph intact; the checked stage-1
+        // invalidation has already made the guest range inaccessible.
+        let (planned_leases, registry_before, diagnostic_before) = {
+            let registry = alias_registry().lock();
+            let (planned_leases, registry_before) = registry.plan_unregister_process_alias(
                 va,
                 len,
                 self.mm_root_slot,
                 self.container_root,
-            )
+            );
+            let diagnostic_before = if cow_refusal_diagnostics_enabled() {
+                registry.process_visible_ordered(self.mm_root_slot, self.container_root)
+            } else {
+                Vec::new()
+            };
+            (planned_leases, registry_before, diagnostic_before)
         };
         let disarm_spans = retired_alias_disarm_spans(
             &registry_before,
@@ -41109,7 +41258,7 @@ impl HvfVmState {
                 Some(identity),
                 self.mm_root_slot,
                 self.container_root,
-                &registry_before,
+                &diagnostic_before,
             );
             // Keep this engine's rows in step with the split the registry just
             // took (see `split_local_rows_for_unmap`).
@@ -41142,7 +41291,7 @@ impl HvfVmState {
                 Some(identity),
                 self.mm_root_slot,
                 self.container_root,
-                &registry_before,
+                &diagnostic_before,
             );
             let mut armed = self.cow_armed.lock();
             for span in disarm_spans {
@@ -41185,7 +41334,7 @@ impl HvfVmState {
             Some(identity),
             self.mm_root_slot,
             self.container_root,
-            &registry_before,
+            &diagnostic_before,
         );
         if let Err(error) = authority.apply(reservation.commit(())) {
             // Name the retirement, not just the id that failed. This abort used
@@ -55522,5 +55671,358 @@ mod tag_strip_tests {
         assert!(super::zero_anonymous_remap_enabled());
 
         assert_eq!(unsafe { libc::munmap(mapped, SIZE) }, 0);
+    }
+
+    fn legacy_unregister_alias_entries(
+        registry: &mut AliasRegistry,
+        va: u64,
+        len: usize,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> std::collections::BTreeSet<(u64, u64)> {
+        let end = va.saturating_add(len as u64);
+        let mut candidates = std::collections::BTreeSet::new();
+        let scopes = AliasRegistry::process_visible_scopes(mm_root_slot, container_root);
+        for scope in scopes {
+            registry.rebuild_scope_rows(scope, |rows| {
+                let mut replacement = Vec::with_capacity(rows.len().saturating_add(1));
+                for (seq, entry) in rows {
+                    let entry_end = entry.start.saturating_add(entry.size as u64);
+                    if entry_end <= va || entry.start >= end {
+                        replacement.push((seq, entry));
+                        continue;
+                    }
+                    candidates.insert((entry.physical_ipa, entry.physical_size as u64));
+                    if entry.start < va {
+                        replacement.push((
+                            seq,
+                            AliasBacking {
+                                size: usize::try_from(va - entry.start).unwrap_or_default(),
+                                ..entry
+                            },
+                        ));
+                    }
+                    if entry_end > end {
+                        let delta = end.saturating_sub(entry.start);
+                        replacement.push((
+                            seq,
+                            AliasBacking {
+                                start: end,
+                                ipa: entry.ipa.saturating_add(delta),
+                                host_addr: entry.host_addr.saturating_add(delta as usize),
+                                size: usize::try_from(entry_end - end).unwrap_or_default(),
+                                shared_key_offset: entry.shared_key_offset.saturating_add(delta),
+                                ..entry
+                            },
+                        ));
+                    }
+                }
+                replacement
+            });
+        }
+        let mut retained_extents = std::collections::BTreeSet::new();
+        for scope in scopes {
+            let rows = registry.scope_rows(scope);
+            for (_, entry) in rows {
+                retained_extents.insert((entry.physical_ipa, entry.physical_size as u64));
+            }
+        }
+        candidates.retain(|extent| !retained_extents.contains(extent));
+        candidates
+    }
+
+    fn legacy_snapshot_plan_unmap(
+        registry: &AliasRegistry,
+        va: u64,
+        len: usize,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> (std::collections::BTreeSet<(u64, u64)>, Vec<CowArmedSpan>) {
+        let mut visible = AliasRegistry {
+            next_seq: registry.next_seq,
+            ..AliasRegistry::default()
+        };
+        for scope in AliasRegistry::process_visible_scopes(mm_root_slot, container_root) {
+            if let Some(rows) = registry.by_scope.get(&scope) {
+                visible.rows = visible.rows.saturating_add(rows.len());
+                visible.by_scope.insert(scope, rows.clone());
+            }
+        }
+        visible.reindex();
+        let registry_before = visible.ordered();
+        let mut planned = visible.clone();
+        let planned_leases =
+            legacy_unregister_alias_entries(&mut planned, va, len, mm_root_slot, container_root);
+        let disarm_spans = retired_alias_disarm_spans(
+            &registry_before,
+            va,
+            len,
+            mm_root_slot,
+            container_root,
+            &planned_leases,
+        );
+        (planned_leases, disarm_spans)
+    }
+
+    fn make_test_alias(
+        va: u64,
+        size: usize,
+        physical_ipa: u64,
+        physical_size: usize,
+        scope: AliasOwnershipScope,
+    ) -> AliasBacking {
+        AliasBacking {
+            start: va,
+            ipa: physical_ipa,
+            host_addr: 0x4000_0000 + va as usize,
+            size,
+            physical_ipa,
+            physical_host_addr: 0x4000_0000 + physical_ipa as usize,
+            physical_size,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: scope,
+            inventory_backing: InventoryBackingIdentity::Private(1),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 1,
+        }
+    }
+
+    #[test]
+    fn planned_unmap_matches_legacy_snapshot_oracle() {
+        let root_slot = Some((0x5000_0000, 0x4000));
+        let owned_scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x5000_0000,
+            size: 0x4000,
+        };
+        let global_scope = AliasOwnershipScope::Global;
+        let foreign_scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x6000_0000,
+            size: 0x4000,
+        };
+
+        // Seed entries for various test patterns
+        let seed = vec![
+            // Discrete mappings
+            make_test_alias(0x1000_0000, 0x1000, 0x8000_0000, 0x1000, owned_scope),
+            make_test_alias(0x1000_4000, 0x4000, 0x8000_4000, 0x4000, owned_scope),
+            make_test_alias(0x1000_a000, 0x8000, 0x8000_a000, 0x8000, owned_scope),
+            // Contiguous mappings
+            make_test_alias(0x1002_0000, 0x2000, 0x8002_0000, 0x2000, owned_scope),
+            make_test_alias(0x1002_2000, 0x2000, 0x8002_2000, 0x2000, owned_scope),
+            make_test_alias(0x1002_4000, 0x2000, 0x8002_4000, 0x2000, owned_scope),
+            // Shared physical extent between two aliases
+            make_test_alias(0x1003_0000, 0x2000, 0x8003_0000, 0x4000, owned_scope),
+            make_test_alias(0x1003_4000, 0x2000, 0x8003_0000, 0x4000, owned_scope),
+            // Global scope alias
+            make_test_alias(0x1004_0000, 0x4000, 0x8004_0000, 0x4000, global_scope),
+            // Foreign scope alias (should be untouched and invisible)
+            make_test_alias(0x1005_0000, 0x4000, 0x8005_0000, 0x4000, foreign_scope),
+        ];
+
+        let base_registry = {
+            let mut reg = AliasRegistry::default();
+            for alias in &seed {
+                reg.push(*alias);
+            }
+            reg
+        };
+
+        // Test vectors: (description, unmap_va, unmap_len)
+        let test_cases = vec![
+            ("empty len unmap", 0x1000_0000, 0),
+            ("non-overlapping unmap", 0x1009_0000, 0x2000),
+            ("exact match single alias", 0x1000_0000, 0x1000),
+            ("prefix unmap", 0x1000_4000, 0x2000),
+            ("suffix unmap", 0x1000_6000, 0x2000),
+            ("middle unmap", 0x1000_b000, 0x2000),
+            ("multi-row span (contiguous 3 rows)", 0x1002_1000, 0x4000),
+            (
+                "shared physical extent - first alias unmapped",
+                0x1003_0000,
+                0x2000,
+            ),
+            (
+                "shared physical extent - second alias unmapped",
+                0x1003_4000,
+                0x2000,
+            ),
+            (
+                "shared physical extent - both aliases unmapped",
+                0x1003_0000,
+                0x6000,
+            ),
+            ("global scope unmap", 0x1004_1000, 0x2000),
+            ("foreign scope address unmap", 0x1005_0000, 0x4000),
+        ];
+
+        for (desc, va, len) in test_cases {
+            let (oracle_leases, oracle_spans) = legacy_snapshot_plan_unmap(
+                &base_registry,
+                va,
+                len,
+                root_slot,
+                ContainerRootToken::ROOT,
+            );
+            let (planned_leases, registry_before) = base_registry.plan_unregister_process_alias(
+                va,
+                len,
+                root_slot,
+                ContainerRootToken::ROOT,
+            );
+            let disarm_spans = retired_alias_disarm_spans(
+                &registry_before,
+                va,
+                len,
+                root_slot,
+                ContainerRootToken::ROOT,
+                &planned_leases,
+            );
+
+            assert_eq!(
+                planned_leases, oracle_leases,
+                "planned leases mismatch for case: {desc} (va={va:#x}, len={len:#x})"
+            );
+            assert_eq!(
+                disarm_spans, oracle_spans,
+                "disarm spans mismatch for case: {desc} (va={va:#x}, len={len:#x})"
+            );
+
+            // Now verify actual in-place removal against legacy removal
+            let mut reg_new = base_registry.clone();
+            let mut reg_oracle = base_registry.clone();
+            let actual_new = unregister_alias_entries(
+                &mut reg_new,
+                va,
+                len,
+                root_slot,
+                ContainerRootToken::ROOT,
+            );
+            let actual_oracle = legacy_unregister_alias_entries(
+                &mut reg_oracle,
+                va,
+                len,
+                root_slot,
+                ContainerRootToken::ROOT,
+            );
+
+            assert_eq!(
+                actual_new, actual_oracle,
+                "actual removed leases mismatch for case: {desc}"
+            );
+            assert_eq!(
+                actual_new, planned_leases,
+                "actual removed leases must match planned leases for case: {desc}"
+            );
+            assert_eq!(
+                reg_new.ordered(),
+                reg_oracle.ordered(),
+                "resulting registry ordered rows mismatch for case: {desc}"
+            );
+        }
+    }
+
+    #[test]
+    fn unmap_single_row_in_5000_row_registry_is_fast() {
+        let mut registry = AliasRegistry::default();
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x5000_0000,
+            size: 0x4000,
+        };
+        for i in 0..5000u64 {
+            let va = 0x1000_0000 + i * 0x8000;
+            let physical_ipa = 0x8000_0000 + i * 0x8000;
+            registry.push(make_test_alias(va, 0x1000, physical_ipa, 0x1000, scope));
+        }
+        assert_eq!(registry.len(), 5000);
+
+        let target_va = 0x1000_0000 + 2500 * 0x8000;
+        let start = std::time::Instant::now();
+        let (planned, registry_before) = registry.plan_unregister_process_alias(
+            target_va,
+            0x1000,
+            Some((0x5000_0000, 0x4000)),
+            ContainerRootToken::ROOT,
+        );
+        let spans = retired_alias_disarm_spans(
+            &registry_before,
+            target_va,
+            0x1000,
+            Some((0x5000_0000, 0x4000)),
+            ContainerRootToken::ROOT,
+            &planned,
+        );
+        let actual = unregister_alias_entries(
+            &mut registry,
+            target_va,
+            0x1000,
+            Some((0x5000_0000, 0x4000)),
+            ContainerRootToken::ROOT,
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(planned, actual);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].va, target_va);
+        assert_eq!(spans[0].len, 0x1000);
+        assert_eq!(registry.len(), 4999);
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "unmapping 1 row in 5000-row registry took {elapsed:?}, expected < 50ms"
+        );
+    }
+
+    #[test]
+    #[ignore = "director perf benchmark: single-row unmap in 5000-row registry"]
+    fn perf_unmap_single_row_in_5000_row_registry() {
+        let mut registry = AliasRegistry::default();
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x5000_0000,
+            size: 0x4000,
+        };
+        for i in 0..5000u64 {
+            let va = 0x1000_0000 + i * 0x8000;
+            let physical_ipa = 0x8000_0000 + i * 0x8000;
+            registry.push(make_test_alias(va, 0x1000, physical_ipa, 0x1000, scope));
+        }
+
+        let target_va = 0x1000_0000 + 2500 * 0x8000;
+        let start = std::time::Instant::now();
+        let (planned, registry_before) = registry.plan_unregister_process_alias(
+            target_va,
+            0x1000,
+            Some((0x5000_0000, 0x4000)),
+            ContainerRootToken::ROOT,
+        );
+        let spans = retired_alias_disarm_spans(
+            &registry_before,
+            target_va,
+            0x1000,
+            Some((0x5000_0000, 0x4000)),
+            ContainerRootToken::ROOT,
+            &planned,
+        );
+        let actual = unregister_alias_entries(
+            &mut registry,
+            target_va,
+            0x1000,
+            Some((0x5000_0000, 0x4000)),
+            ContainerRootToken::ROOT,
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(planned, actual);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].va, target_va);
+        assert_eq!(spans[0].len, 0x1000);
+        assert_eq!(registry.len(), 4999);
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "unmapping 1 row in 5000-row registry took {elapsed:?}, expected < 10ms"
+        );
     }
 }
