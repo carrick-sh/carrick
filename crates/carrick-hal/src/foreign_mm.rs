@@ -565,6 +565,11 @@ pub enum ForeignMmTransportError {
     Translation(GuestVa),
     #[error("foreign MM binding is unavailable in this carrier")]
     MissingBinding,
+    /// The lease was retained against an older target snapshot (typically the
+    /// frame inventory moved when a sibling broke COW on a shared frame). The
+    /// binding is fine; the caller must retain a fresh lease and retry.
+    #[error("foreign MM lease predates the target's current snapshot; retain again")]
+    LeaseStale,
     #[error("foreign MM read deadline expired")]
     TimedOut,
     #[error("foreign MM live authority is unavailable")]
