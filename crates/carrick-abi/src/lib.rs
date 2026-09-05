@@ -1320,9 +1320,38 @@ impl LinuxTimeval {
     }
 }
 
+pub const LINUX_TIME_OK: i64 = 0;
+pub const LINUX_TIME_INS: i64 = 1;
+pub const LINUX_TIME_DEL: i64 = 2;
+pub const LINUX_TIME_OOP: i64 = 3;
+pub const LINUX_TIME_WAIT: i64 = 4;
 pub const LINUX_TIME_ERROR: i64 = 5;
+
+pub const LINUX_STA_PLL: i32 = 0x0001;
+pub const LINUX_STA_PPSFREQ: i32 = 0x0002;
+pub const LINUX_STA_PPSTIME: i32 = 0x0004;
+pub const LINUX_STA_FLL: i32 = 0x0008;
+pub const LINUX_STA_INS: i32 = 0x0010;
+pub const LINUX_STA_DEL: i32 = 0x0020;
 pub const LINUX_STA_UNSYNC: i32 = 0x0040;
+pub const LINUX_STA_FREQHOLD: i32 = 0x0080;
+pub const LINUX_STA_PPSSIGNAL: i32 = 0x0100;
+pub const LINUX_STA_PPSJITTER: i32 = 0x0200;
+pub const LINUX_STA_PPSWANDER: i32 = 0x0400;
+pub const LINUX_STA_PPSERROR: i32 = 0x0800;
+pub const LINUX_STA_CLOCKERR: i32 = 0x1000;
 pub const LINUX_STA_NANO: i32 = 0x2000;
+pub const LINUX_STA_MODE: i32 = 0x4000;
+pub const LINUX_STA_CLK: i32 = 0x8000;
+pub const LINUX_STA_RONLY: i32 = LINUX_STA_PPSSIGNAL
+    | LINUX_STA_PPSJITTER
+    | LINUX_STA_PPSWANDER
+    | LINUX_STA_PPSERROR
+    | LINUX_STA_CLOCKERR
+    | LINUX_STA_NANO
+    | LINUX_STA_MODE
+    | LINUX_STA_CLK;
+
 pub const LINUX_ADJ_OFFSET: u32 = 0x0001;
 pub const LINUX_ADJ_FREQUENCY: u32 = 0x0002;
 pub const LINUX_ADJ_MAXERROR: u32 = 0x0004;
@@ -1330,6 +1359,7 @@ pub const LINUX_ADJ_ESTERROR: u32 = 0x0008;
 pub const LINUX_ADJ_STATUS: u32 = 0x0010;
 pub const LINUX_ADJ_TIMECONST: u32 = 0x0020;
 pub const LINUX_ADJ_TAI: u32 = 0x0080;
+pub const LINUX_ADJ_SETOFFSET: u32 = 0x0100;
 pub const LINUX_ADJ_MICRO: u32 = 0x1000;
 pub const LINUX_ADJ_NANO: u32 = 0x2000;
 pub const LINUX_ADJ_TICK: u32 = 0x4000;
@@ -4899,6 +4929,7 @@ bitflags! {
         const STATUS = LINUX_ADJ_STATUS;
         const TIMECONST = LINUX_ADJ_TIMECONST;
         const TAI = LINUX_ADJ_TAI;
+        const SETOFFSET = LINUX_ADJ_SETOFFSET;
         const MICRO = LINUX_ADJ_MICRO;
         const NANO = LINUX_ADJ_NANO;
         const TICK = LINUX_ADJ_TICK;
@@ -4912,6 +4943,7 @@ bitflags! {
             | LINUX_ADJ_STATUS
             | LINUX_ADJ_TIMECONST
             | LINUX_ADJ_TAI
+            | LINUX_ADJ_SETOFFSET
             | LINUX_ADJ_MICRO
             | LINUX_ADJ_NANO
             | LINUX_ADJ_TICK;
@@ -4920,7 +4952,22 @@ bitflags! {
     /// `timex.status` state bits consumed by Carrick's clock-discipline seam.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct LinuxTimexStatus: i32 {
+        const PLL = LINUX_STA_PLL;
+        const PPSFREQ = LINUX_STA_PPSFREQ;
+        const PPSTIME = LINUX_STA_PPSTIME;
+        const FLL = LINUX_STA_FLL;
+        const INS = LINUX_STA_INS;
+        const DEL = LINUX_STA_DEL;
+        const UNSYNC = LINUX_STA_UNSYNC;
+        const FREQHOLD = LINUX_STA_FREQHOLD;
+        const PPSSIGNAL = LINUX_STA_PPSSIGNAL;
+        const PPSJITTER = LINUX_STA_PPSJITTER;
+        const PPSWANDER = LINUX_STA_PPSWANDER;
+        const PPSERROR = LINUX_STA_PPSERROR;
+        const CLOCKERR = LINUX_STA_CLOCKERR;
         const NANO = LINUX_STA_NANO;
+        const MODE = LINUX_STA_MODE;
+        const CLK = LINUX_STA_CLK;
     }
 
     /// `splice`/`vmsplice`/`tee` flag bits. The full set IS the supported set
@@ -6236,10 +6283,16 @@ mod kernel_abi_tests {
             LinuxTimexModes::OFFSET_SS_READ.bits(),
             LINUX_ADJ_OFFSET_SS_READ
         );
+        assert_eq!(LinuxTimexModes::SETOFFSET.bits(), LINUX_ADJ_SETOFFSET);
         assert!(LinuxTimexModes::IDEMPOTENT_SUPPORTED.contains(
-            LinuxTimexModes::OFFSET | LinuxTimexModes::FREQUENCY | LinuxTimexModes::TICK
+            LinuxTimexModes::OFFSET
+                | LinuxTimexModes::FREQUENCY
+                | LinuxTimexModes::TICK
+                | LinuxTimexModes::SETOFFSET
         ));
         assert_eq!(LinuxTimexStatus::NANO.bits(), LINUX_STA_NANO);
+        assert_eq!(LinuxTimexStatus::UNSYNC.bits(), LINUX_STA_UNSYNC);
+        assert_eq!(LinuxTimexStatus::PLL.bits(), LINUX_STA_PLL);
     }
 
     #[test]
