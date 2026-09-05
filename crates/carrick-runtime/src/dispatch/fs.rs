@@ -3444,6 +3444,7 @@ impl SyscallDispatcher {
             || !path.starts_with('/')
             || !self.cred_snapshot().euid.is_root()
             || !self.fs.inotify_registry.is_empty()
+            || !self.fs.fanotify_registry.is_empty()
         {
             return None;
         }
@@ -3523,9 +3524,14 @@ impl SyscallDispatcher {
         if !trusted_fs_lane_enabled() {
             return None;
         }
-        // Inotify hooks must keep today's path; chroot rebases absolute
-        // resolution, so keep the lane out of it.
-        if !self.fs.inotify_registry.is_empty() {
+        // Notification hooks must keep today's path: the fast lane installs
+        // the directory description without reaching the FAN_OPEN / IN_OPEN
+        // emission at the end of the resolving open, so a fanotify mark on a
+        // directory with FAN_ONDIR (LTP fanotify04, probe `fanotifyondir`)
+        // saw no event while any inotify watch already steered around the
+        // lane. chroot rebases absolute resolution, so keep the lane out of
+        // it too.
+        if !self.fs.inotify_registry.is_empty() || !self.fs.fanotify_registry.is_empty() {
             return None;
         }
         if self
@@ -3638,10 +3644,13 @@ impl SyscallDispatcher {
         }
         let host_dir = &trusted_dir.fd;
         let full = self.trusted_child_path(&dir_path, name)?;
-        // inotify watches need the slow path's IN_OPEN bookkeeping; a
-        // non-root euid needs its DAC checks (root — the overwhelming
-        // default — bypasses both DAC and search permission).
-        if !self.fs.inotify_registry.is_empty() || !self.cred_snapshot().euid.is_root() {
+        // inotify watches and fanotify marks need the slow path's IN_OPEN /
+        // FAN_OPEN bookkeeping; a non-root euid needs its DAC checks (root —
+        // the overwhelming default — bypasses both DAC and search permission).
+        if !self.fs.inotify_registry.is_empty()
+            || !self.fs.fanotify_registry.is_empty()
+            || !self.cred_snapshot().euid.is_root()
+        {
             return None;
         }
         let access = flags & LINUX_O_ACCMODE;
