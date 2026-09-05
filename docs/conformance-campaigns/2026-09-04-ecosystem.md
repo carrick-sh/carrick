@@ -1256,3 +1256,9 @@ lands; same files).
   crate. Cached dir fds and the process-global resolve generation are shared
   or recycled across backends. Folded into the cap-std retirement brief: fd
   ownership becomes explicit in the dentry cache, parallel batch 10/10.
+- **Open (tooling)**: four `carrick trace -s scripts/dtrace/hvpatch-stage1-arena.d`
+  fronts from this morning were still alive as root 5–6 hours later with no
+  guest, and a worker's `carrick trace --script /dev/stdin` wedged for 13
+  minutes with the script on a pipe. `carrick trace` should bound itself
+  (the flow script's 45 s bound is the model) and refuse a non-file script
+  path; reaped with `scripts/sudo/kill.sh --all`.
