@@ -434,68 +434,12 @@
       "rationale": "Process-global configuration or failpoint cache watch_addr::WATCH_ADDR in crates/carrick-runtime/src/dispatch/mod.rs initialized from environment flags."
     },
     {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "connect::CARRICK_NET_DEBUG",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in connect::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "connect::CARRICK_NET_DEBUG#2",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in connect::CARRICK_NET_DEBUG#2 (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
       "kind": "thread_local",
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
       "symbol": "description_readiness::VISITED",
       "fingerprint": "f408f8c0ae0cb4b9200f22f10fafea3dfd5630f6080f4126702024046a4d6374",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell description_readiness::VISITED in crates/carrick-runtime/src/dispatch/net.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "queue_socket_error_after_send::CARRICK_NET_DEBUG",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in queue_socket_error_after_send::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "sendto::CARRICK_NET_DEBUG",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in sendto::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "sendto::CARRICK_NET_DEBUG#2",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in sendto::CARRICK_NET_DEBUG#2 (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "sendto::CARRICK_NET_DEBUG#3",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in sendto::CARRICK_NET_DEBUG#3 (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "symbol": "set_socket_error_after_send::CARRICK_NET_DEBUG",
-      "fingerprint": "98c2cd114e70f3b1193a7cffd5318f2768b3b06f6a75304226df2a01185675eb",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_NET_DEBUG read in set_socket_error_after_send::CARRICK_NET_DEBUG (crates/carrick-runtime/src/dispatch/net.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
