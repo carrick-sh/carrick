@@ -1250,3 +1250,9 @@ lands; same files).
   `scratchpad/brief-retire-capstd.md`, queued as the dentry-cache worker's
   round 2. Workers `mmap-lazy` and `fork-table-copy` dispatched from the
   post-Stage1Authority main.
+- **Open (flaky = flaw)**: the runtime's vfs/dispatch::fs unit tests fail a
+  different test each PARALLEL run (`closedir` EBADF, stale `fd_open_paths`
+  counts) on main and on branches; `just test` hides it by serializing the
+  crate. Cached dir fds and the process-global resolve generation are shared
+  or recycled across backends. Folded into the cap-std retirement brief: fd
+  ownership becomes explicit in the dentry cache, parallel batch 10/10.
