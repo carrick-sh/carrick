@@ -527,7 +527,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 1,
-      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
+      "fingerprint": "bd03eaaa569333639f6e3207e7c7d90a148fcfadb28262cb40bcb2d2ed77ae89",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap",
       "rationale": "Source alias and metadata were retired before destination projection, so projection failure leaves neither authoritative source nor destination publication. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
@@ -536,7 +536,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 2,
-      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
+      "fingerprint": "bd03eaaa569333639f6e3207e7c7d90a148fcfadb28262cb40bcb2d2ed77ae89",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap_shared",
       "rationale": "restore_shared_identity failed on expanded shared mapping range during mremap; leaves page tables in inconsistent state. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
@@ -545,7 +545,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 3,
-      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
+      "fingerprint": "bd03eaaa569333639f6e3207e7c7d90a148fcfadb28262cb40bcb2d2ed77ae89",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap_shared",
       "rationale": "mark_identity_restored failed on expanded shared range in shared aperture tracking during mremap. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
@@ -554,7 +554,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 4,
-      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
+      "fingerprint": "bd03eaaa569333639f6e3207e7c7d90a148fcfadb28262cb40bcb2d2ed77ae89",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap_shared",
       "rationale": "Shrinking shared aperture allocation in mremap failed after backend tail unmap completed; allocation bookkeeping is corrupted. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
@@ -563,7 +563,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mremap",
       "ordinal_in_function": 5,
-      "fingerprint": "2b83c384a7a9db840fcd52b3b90b48285c7fe16ed876e33706232fb76930f387",
+      "fingerprint": "bd03eaaa569333639f6e3207e7c7d90a148fcfadb28262cb40bcb2d2ed77ae89",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mremap_overlay",
       "rationale": "Carving source overlay range in mremap failed after backend tail unmap completed; overlay allocation state is corrupted. Re-reviewed 2026-08-31: the abort is unchanged; the surrounding handler gained MREMAP_FIXED/MREMAP_DONTUNMAP relocation and the first-touch residency arm, which is what moved the fingerprint. Re-reviewed 2026-09-01: the abort is unchanged; the handler now carries the read-only shared-file mprotect ceiling across the relocation (`range_is_read_only_shared_file`), which is what moved the fingerprint."
