@@ -758,3 +758,16 @@ backtrace shows its `HostArenaResolver` closure resolving an arena base
 through `mapping_for_range` -> `translate_va_for_cow`, which re-takes the
 page-table mutex the caller already holds under `sync_to_host`. Sent back
 with the frames.
+
+Page-table growth branch, round three: with the resolver deadlock fixed
+(resolvers now go through stage-2/physical lookups), every multi-task mm
+and every fork child failed with "stage-1 table arena source is already
+installed". The install-exactly-once guard I had asked for was scoped to a
+task's first poll, but the manager is a per-mm object: thread siblings
+share it and a fork child's job also polls, so the second task of any mm
+tripped it. Corrected semantics sent back: the source is an mm property
+installed where the manager is created or adopted (root, exec, fork child
+before its rebase); re-installing the same lease's source is a no-op, a
+different lease is the error. This is the identity-and-scope class
+(`docs/identity-and-scope-domains.md`): a rule that is true while one task
+exists and wrong the instant a second appears.
