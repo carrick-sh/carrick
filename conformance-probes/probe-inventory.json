@@ -1559,6 +1559,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "pipeblockedge": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "pipeextra": {
     "class": "conformance",
     "excluded": false,

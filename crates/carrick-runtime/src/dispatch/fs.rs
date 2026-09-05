@@ -8118,9 +8118,11 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     match &*open {
-                        OpenDescription::PipeReader { base, .. }
-                        | OpenDescription::PipeWriter { base, .. }
-                        | OpenDescription::HostPipe { base, .. } => DispatchOutcome::Returned {
+                        OpenDescription::PipeReader { pipe, .. }
+                        | OpenDescription::PipeWriter { pipe, .. } => DispatchOutcome::Returned {
+                            value: pipe.get_capacity() as i64,
+                        },
+                        OpenDescription::HostPipe { base, .. } => DispatchOutcome::Returned {
                             // The per-description capacity, set by a prior
                             // F_SETPIPE_SZ or the default pipe buffer size.
                             value: base.pipe_capacity(),
@@ -10836,22 +10838,22 @@ impl SyscallDispatcher {
                 }
                 OpenDescription::Inotify { state, .. } => {
                     let state = Arc::clone(state);
+                    let nonblocking =
+                        open_file.description.common().status_flags() & LINUX_O_NONBLOCK != 0;
                     drop(open);
                     // Drain queued inotify_event records into the guest buffer.
-                    // An empty queue is EAGAIN (inotify fds are overwhelmingly
                     // used non-blocking + epoll; a true blocking wait on the
-                    // backing kqueue fd is a tracked follow-up).
-                    //
-                    // NOTE: a blocking-mode read cannot be reliably satisfied on
-                    // macOS for a CROSS-PROCESS transient-event flood (inotify11:
-                    // a forked child create+unlinks 9999 files). kqueue only
-                    // reports "the directory vnode changed", and carrick's
-                    // dir-snapshot diff misses any file both created AND deleted
-                    // between two coalesced scans — so parking on the kqueue would
-                    // hang rather than deliver the IN_DELETE names. That needs a
-                    // cross-process inotify event mirror, out of scope here.
+                    // backing readiness poll fd parks via would_block_outcome.
                     return Ok(match state.read_records(length) {
-                        Ok(bytes) if bytes.is_empty() => DispatchOutcome::errno(LINUX_EAGAIN),
+                        Ok(bytes) if bytes.is_empty() => super::would_block_outcome(
+                            state.poll_fd(),
+                            libc::POLLIN,
+                            nonblocking,
+                            None,
+                            WaitFdAuthority::logical(
+                                this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                            ),
+                        ),
                         Ok(bytes) => {
                             if memory.write_bytes(address, &bytes).is_err() {
                                 DispatchOutcome::errno(LINUX_EFAULT)
@@ -10866,11 +10868,11 @@ impl SyscallDispatcher {
                 }
                 OpenDescription::Fanotify { group, .. } => {
                     let group = Arc::clone(group);
-                    // FAN_NONBLOCK (init) and O_NONBLOCK (a later fcntl) are
-                    // independent switches; either one makes the read
-                    // non-blocking.
-                    let nonblocking = group.init_nonblocking()
-                        || open_file.description.common().status_flags() & LINUX_O_NONBLOCK != 0;
+                    // Linux mirrors FAN_NONBLOCK into status_flags at init, and F_SETFL
+                    // mutates status_flags; status_flags is authoritative for nonblocking.
+                    let _ = group.init_nonblocking();
+                    let nonblocking =
+                        open_file.description.common().status_flags() & LINUX_O_NONBLOCK != 0;
                     drop(open);
                     return read_fanotify(
                         this,
@@ -11356,10 +11358,13 @@ impl SyscallDispatcher {
             let Some(open) = open_file.description.read() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            // pread reads the fd, so a descriptor not open for reading
+            // pread reads the fd, so a regular file descriptor not open for reading
             // (O_WRONLY) is EBADF (pread02 "not open for reading" case), exactly
-            // as the kernel rejects it before touching the data.
-            if open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
+            // as the kernel rejects it before touching the data. Non-seekable
+            // descriptions (pipes, sockets, FIFOs) return ESPIPE on positional read.
+            if matches!(&*open, OpenDescription::HostFile { .. })
+                && open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
             // Real host file: positional read via libc::pread (doesn't
@@ -11425,25 +11430,15 @@ impl SyscallDispatcher {
                 OpenDescription::Directory { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
-                OpenDescription::PipeWriter { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                OpenDescription::HostPipe {
-                    is_read_end,
-                    pty,
-                    bidirectional,
-                    ..
-                } if !*is_read_end && pty.is_none() && !*bidirectional => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                OpenDescription::EventFd { .. }
+                OpenDescription::PipeReader { .. }
+                | OpenDescription::PipeWriter { .. }
+                | OpenDescription::HostPipe { .. }
+                | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::Fanotify { .. }
-                | OpenDescription::PipeReader { .. }
-                | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::PerfEvent { .. }
@@ -11509,10 +11504,13 @@ impl SyscallDispatcher {
             let Some(open) = open_file.description.read() else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            // preadv reads the fd, so a descriptor not open for reading
+            // preadv reads the fd, so a regular file descriptor not open for reading
             // (O_WRONLY) is EBADF (preadv02 "not open for reading" case), exactly
-            // as the kernel rejects it before touching the data.
-            if open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
+            // as the kernel rejects it before touching the data. Non-seekable
+            // descriptions (pipes, sockets, FIFOs) return ESPIPE on positional read.
+            if matches!(&*open, OpenDescription::HostFile { .. })
+                && open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
             // Real host file: positional readv via libc::pread per iovec
@@ -11604,17 +11602,6 @@ impl SyscallDispatcher {
                 OpenDescription::Directory { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
-                OpenDescription::PipeWriter { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                OpenDescription::HostPipe {
-                    is_read_end,
-                    pty,
-                    bidirectional,
-                    ..
-                } if !*is_read_end && pty.is_none() && !*bidirectional => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
                 OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
@@ -11622,6 +11609,7 @@ impl SyscallDispatcher {
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
+                | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
@@ -11832,21 +11820,15 @@ impl SyscallDispatcher {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
                 | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. }
-                | OpenDescription::PipeReader { .. } => LINUX_EBADF,
-                OpenDescription::HostPipe {
-                    is_read_end,
-                    pty,
-                    bidirectional,
-                    ..
-                } if *is_read_end && pty.is_none() && !*bidirectional => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
-                OpenDescription::PipeWriter { .. }
+                OpenDescription::PipeReader { .. }
+                | OpenDescription::PipeWriter { .. }
+                | OpenDescription::HostPipe { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
-                | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::PerfEvent { .. }
@@ -12095,21 +12077,15 @@ impl SyscallDispatcher {
                 OpenDescription::Closed { .. }
                 | OpenDescription::File { .. }
                 | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. }
-                | OpenDescription::PipeReader { .. } => LINUX_EBADF,
-                OpenDescription::HostPipe {
-                    is_read_end,
-                    pty,
-                    bidirectional,
-                    ..
-                } if *is_read_end && pty.is_none() && !*bidirectional => LINUX_EBADF,
+                | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
                 OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
                 OpenDescription::HostFile { .. } => LINUX_EINVAL,
                 OpenDescription::Directory { .. } => LINUX_EISDIR,
-                OpenDescription::PipeWriter { .. }
+                OpenDescription::PipeReader { .. }
+                | OpenDescription::PipeWriter { .. }
+                | OpenDescription::HostPipe { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
-                | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::PerfEvent { .. }
