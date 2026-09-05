@@ -114,7 +114,7 @@ const SPARE_START_OFFSET: u64 = 8 * PT_PAGE;
 
 /// A protection change applied to a guest VA range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PtOp {
+pub enum PtOp {
     /// Clear the valid bit — any access faults (SEGV_MAPERR). The output
     /// address is retained and still names a frame this mm owns.
     Invalidate,
@@ -136,6 +136,45 @@ enum PtOp {
     /// this for Carrick's identity/mailbox pages so PSTATE.PAN never turns the
     /// EL1 vector's own access into a false second fault.
     KernelReadOnly { exec: bool },
+}
+
+/// The outcome of an edit applied to a page-table range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PageTableApplyOutcome {
+    /// Whether any descriptor in the page tables was changed.
+    pub changed: bool,
+    /// Whether any previously-VALID descriptor was modified, or a valid block
+    /// was split/coalesced, requiring an architectural TLB invalidation.
+    /// Validating a previously-invalid descriptor does NOT require a flush on
+    /// AArch64 because invalid translations are never cached in the TLB.
+    pub flush_required: bool,
+}
+
+impl PageTableApplyOutcome {
+    #[must_use]
+    pub const fn new(changed: bool, flush_required: bool) -> Self {
+        Self {
+            changed,
+            flush_required,
+        }
+    }
+}
+
+impl std::ops::BitOr for PageTableApplyOutcome {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self {
+            changed: self.changed | rhs.changed,
+            flush_required: self.flush_required | rhs.flush_required,
+        }
+    }
+}
+
+impl std::ops::BitOrAssign for PageTableApplyOutcome {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.changed |= rhs.changed;
+        self.flush_required |= rhs.flush_required;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1090,7 +1129,7 @@ impl PageTableManager {
     /// block, reclaiming the table page. L3→L2 (2 MiB) then L2→L1 (1 GiB).
     /// Only spare tables are touched (the boot L2_A/L2_B/L3_A — null guard +
     /// kernel hole — are never uniform and never spare, so are doubly safe).
-    fn try_coalesce(&mut self, va: u64) {
+    fn try_coalesce(&mut self, va: u64) -> bool {
         // Coalescing flips a table descriptor to a block (and frees the
         // sub-table) for a live VA. That is a break-before-make structural
         // change: a sibling vCPU mid-walk through the old table-pointer can hit
@@ -1101,14 +1140,15 @@ impl PageTableManager {
         // when multi-vCPU the structure stays split — safe, at the cost of not
         // reclaiming until back to one vCPU.
         if self.multi_vcpu {
-            return;
+            return false;
         }
+        let mut coalesced = false;
         let idx = indices(va);
         let Some(l1_pa) = self.child_table_pa(idx[0] * 8) else {
-            return;
+            return false;
         };
         let Ok(l1_off) = self.pa_to_off(l1_pa) else {
-            return;
+            return false;
         };
         let l1_entry = l1_off + idx[1] * 8;
 
@@ -1125,6 +1165,7 @@ impl PageTableManager {
             {
                 self.write_desc(l2_entry, (base & PA_MASK_2MIB) | attrs | TYPE_BLOCK);
                 self.free_table(l3_pa);
+                coalesced = true;
             }
         }
 
@@ -1137,7 +1178,9 @@ impl PageTableManager {
         {
             self.write_desc(l1_entry, (base & PA_MASK_1GIB) | attrs | TYPE_BLOCK);
             self.free_table(l2_pa);
+            coalesced = true;
         }
+        coalesced
     }
 
     /// Block size in bytes mapped by a leaf at `level` (1=1 GiB, 2=2 MiB,
@@ -1231,10 +1274,16 @@ impl PageTableManager {
     /// keeps the stage-1 tables sparse — a 512 MiB `PROT_NONE` reservation costs
     /// one L1→L2 split + 256 L2-block edits (1 table), not 256 L3 tables. Skips
     /// granules already at the target protection (so RW-on-already-RW is free).
-    fn apply(&mut self, va: u64, len: usize, op: PtOp) -> Result<bool, PageTableError> {
+    pub fn apply(
+        &mut self,
+        va: u64,
+        len: usize,
+        op: PtOp,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
         let end = va + (len as u64).div_ceil(PT_PAGE) * PT_PAGE;
         let mut cur = va;
         let mut changed = false;
+        let mut flush_required = false;
         while cur < end {
             // The existing covering descriptor (block or page) for `cur`.
             let (off, level) = self.leaf_offset(cur, false)?;
@@ -1282,6 +1331,7 @@ impl PageTableManager {
                 // NOT that test: an invalidated-then-split empty block once
                 // left `index * stride | flags` children here, and this branch
                 // published them as VALID leaves at IPA 0x5000.
+                let previously_valid = desc & VALID != 0;
                 let new_desc = match op {
                     PtOp::Invalidate | PtOp::Retire => {
                         let scope = if self.asid_scoped_leaves {
@@ -1349,8 +1399,13 @@ impl PageTableManager {
                     | PtOp::ReadWrite { .. }
                     | PtOp::KernelReadOnly { .. } => self.desc_for(op, block_start, level),
                 };
-                self.write_desc(off, new_desc);
-                changed = true;
+                if new_desc != desc {
+                    self.write_desc(off, new_desc);
+                    changed = true;
+                    if previously_valid {
+                        flush_required = true;
+                    }
+                }
                 cur = block_end;
             } else {
                 // The range edge bisects a block that needs changing: split one
@@ -1359,8 +1414,13 @@ impl PageTableManager {
                 // split itself mutates the tables (parent → table pointer + a
                 // new sub-table), so it must be synced even if the subsequent
                 // in-range edits all happen to be no-ops.
+                let block = self.read_desc(off);
+                let parent_valid = block & VALID != 0;
                 self.split_block(off, level)?;
                 changed = true;
+                if parent_valid {
+                    flush_required = true;
+                }
                 // `cur` unchanged; loop re-reads the now-finer covering leaf.
             }
         }
@@ -1369,15 +1429,24 @@ impl PageTableManager {
         if changed {
             let mut block = va & !((1 << 21) - 1);
             while block < end {
-                self.try_coalesce(block);
+                if self.try_coalesce(block) {
+                    flush_required = true;
+                }
                 block += 1 << 21;
             }
         }
-        Ok(changed)
+        Ok(PageTableApplyOutcome {
+            changed,
+            flush_required,
+        })
     }
 
     /// Mark `[va, va+len)` invalid (faults on any access → SEGV_MAPERR).
-    pub fn set_prot_none(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+    pub fn set_prot_none(
+        &mut self,
+        va: u64,
+        len: usize,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
         // A teardown is the only thing that can empty a sub-table, so this is
         // where the reclaim sweep becomes worth re-running.
         self.reclaim_pending = true;
@@ -1391,7 +1460,11 @@ impl PageTableManager {
     /// holding only retired/empty/identity leaves becomes reclaimable, unlike
     /// one whose invalid leaves (`set_prot_none`) still name frames this mm
     /// owns.
-    pub fn invalidate(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+    pub fn invalidate(
+        &mut self,
+        va: u64,
+        len: usize,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
         self.reclaim_pending = true;
         self.apply(va, len, PtOp::Retire)
     }
@@ -1408,10 +1481,18 @@ impl PageTableManager {
     /// OutOfTables. Caller must hold the alias region exclusively here (this is
     /// the munmap path, PMR-gated under multi-vCPU); reclaim is additionally
     /// gated single-vCPU/PMR inside (see `reclaim_invalid_tables`).
-    pub fn unmap_aliased(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
-        let changed = self.invalidate(va, len)?;
+    pub fn unmap_aliased(
+        &mut self,
+        va: u64,
+        len: usize,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        let mut outcome = self.invalidate(va, len)?;
         let reclaimed = self.reclaim_invalid_tables(va, len);
-        Ok(changed || reclaimed)
+        outcome.changed |= reclaimed;
+        if reclaimed {
+            outcome.flush_required = true;
+        }
+        Ok(outcome)
     }
 
     /// Free spare L3/L2 sub-tables in `[va, va+len)` that the caller just left
@@ -1575,14 +1656,18 @@ impl PageTableManager {
         va: u64,
         len: usize,
         exec: bool,
-    ) -> Result<bool, PageTableError> {
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
         self.apply(va, len, PtOp::ReadOnly { exec })
     }
 
     /// Arm a private fork range read-only and make the descriptor ASID-scoped.
     /// The output address and all unrelated attributes are preserved, including
     /// for non-identity aliases and already-read-only mappings.
-    pub fn set_fork_readonly(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+    pub fn set_fork_readonly(
+        &mut self,
+        va: u64,
+        len: usize,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
         self.apply(va, len, PtOp::ForkReadOnly)
     }
 
@@ -1594,13 +1679,18 @@ impl PageTableManager {
         va: u64,
         len: usize,
         exec: bool,
-    ) -> Result<bool, PageTableError> {
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
         self.apply(va, len, PtOp::KernelReadOnly { exec })
     }
 
     /// Restore `[va, va+len)` to a valid RW user page (identity-mapped). `exec`
     /// clears UXN (executable, PROT_EXEC); otherwise UXN is set (NX).
-    pub fn set_rw(&mut self, va: u64, len: usize, exec: bool) -> Result<bool, PageTableError> {
+    pub fn set_rw(
+        &mut self,
+        va: u64,
+        len: usize,
+        exec: bool,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
         self.apply(va, len, PtOp::ReadWrite { exec })
     }
 
@@ -2313,7 +2403,7 @@ mod tests {
         );
         // Re-arming an already-armed range is satisfied regardless of UXN.
         assert!(
-            !mgr.set_fork_readonly(nx, 0x2000).expect("re-arm"),
+            !mgr.set_fork_readonly(nx, 0x2000).expect("re-arm").changed,
             "an armed leaf is satisfied whatever its execute bit"
         );
     }
@@ -2453,7 +2543,7 @@ mod tests {
         let (two, _, _) = mgr.pool_stats();
 
         let changed = mgr.unmap_aliased(va1, 0x1000).expect("unmap alias 1");
-        assert!(changed, "unmap edited the tables");
+        assert!(changed.changed, "unmap edited the tables");
         let (one, _, _) = mgr.pool_stats();
         assert_eq!(
             one,
@@ -2816,7 +2906,7 @@ mod tests {
         // Already RW + non-exec → no change, no split, no allocation.
         assert_eq!(
             mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000, false),
-            Ok(false)
+            Ok(PageTableApplyOutcome::default())
         );
     }
 
@@ -2902,7 +2992,13 @@ mod tests {
         let mut bytes = stage1_identity_page_tables();
         bytes.truncate(6 * 0x1000);
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
-        assert_eq!(mgr.set_prot_none(LINUX_MMAP_BASE, 1 << 30), Ok(true));
+        assert_eq!(
+            mgr.set_prot_none(LINUX_MMAP_BASE, 1 << 30),
+            Ok(PageTableApplyOutcome {
+                changed: true,
+                flush_required: true
+            })
+        );
         assert!(!mgr.is_valid(LINUX_MMAP_BASE));
         assert!(!mgr.is_valid(LINUX_MMAP_BASE + (1 << 30) - 0x1000));
     }
@@ -3035,7 +3131,10 @@ mod tests {
         offline.declare_offline_private_image();
         assert_eq!(
             offline.set_prot_none(block, 0x1000),
-            Ok(true),
+            Ok(PageTableApplyOutcome {
+                changed: true,
+                flush_required: true
+            }),
             "an offline private copy may sweep and recover the pool"
         );
         assert_eq!(
@@ -3455,6 +3554,53 @@ mod tests {
             mgr.translate(probe),
             Some(0),
             "revalidating an empty leaf must not publish output address 0"
+        );
+    }
+
+    #[test]
+    fn invalid_to_valid_leaf_edit_reports_flush_not_required() {
+        let mut mgr = hvpatch_manager();
+        let block = LINUX_MMAP_BASE + 20 * (2 * 1024 * 1024);
+        let page0 = block;
+        let page1 = block + 0x1000;
+
+        // Ensure page0 and page1 are invalid leaves.
+        mgr.set_prot_none(block, 2 * 1024 * 1024)
+            .expect("set block to prot_none");
+        assert!(!mgr.is_valid(page0));
+        assert!(!mgr.is_valid(page1));
+
+        // 1. Validating an invalid leaf reports flush_required=false
+        let outcome_validating = mgr
+            .set_rw(page0, 0x1000, false)
+            .expect("validate invalid leaf to rw");
+        assert!(outcome_validating.changed, "leaf changed to valid");
+        assert!(
+            !outcome_validating.flush_required,
+            "validating an invalid leaf must report flush_required=false"
+        );
+        assert!(mgr.is_valid(page0));
+
+        // 2. Changing a valid leaf's AP reports flush_required=true
+        let outcome_perm_change = mgr
+            .set_readonly(page0, 0x1000, false)
+            .expect("change valid leaf AP to ro");
+        assert!(outcome_perm_change.changed, "leaf changed to ro");
+        assert!(
+            outcome_perm_change.flush_required,
+            "changing a valid leaf's AP must report flush_required=true"
+        );
+
+        // 3. An edit touching both reports flush_required=true:
+        // page0 is currently valid (RO), page1 is invalid (PROT_NONE).
+        // Editing [page0, page0 + 0x2000) touches both.
+        let outcome_both = mgr
+            .set_rw(page0, 0x2000, false)
+            .expect("edit touching both invalid and valid leaves");
+        assert!(outcome_both.changed);
+        assert!(
+            outcome_both.flush_required,
+            "an edit touching both invalid and valid leaves must report flush_required=true"
         );
     }
 }

@@ -46892,7 +46892,10 @@ mod frame_inventory_backend_tests {
             None
         );
         assert!(
-            !manager.set_readonly(0x20_4000, 0x4000, false).unwrap(),
+            !manager
+                .set_readonly(0x20_4000, 0x4000, false)
+                .unwrap()
+                .changed,
             "root exec must preserve the ELF read-only span"
         );
     }
@@ -52081,19 +52084,22 @@ mod tag_strip_tests {
         assert!(
             !tables
                 .set_readonly(va + 0x4000, 0x1000, false)
-                .expect("span is already read-only"),
+                .expect("span is already read-only")
+                .changed,
             "reapplying the same read-only protection must be a no-op"
         );
         assert!(
             !tables
                 .set_rw(va + 0x3000, 0x1000, true)
-                .expect("prefix remains writable"),
+                .expect("prefix remains writable")
+                .changed,
             "the page before the span must retain the merged mapping's RWX attributes"
         );
         assert!(
             !tables
                 .set_rw(va + 0x6000, 0x1000, true)
-                .expect("suffix remains writable"),
+                .expect("suffix remains writable")
+                .changed,
             "the page after the span must retain the merged mapping's RWX attributes"
         );
     }

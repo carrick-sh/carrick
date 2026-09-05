@@ -36,7 +36,7 @@ use carrick_hal::{
     SyscallTrap, ThreadedEngine, TrapError,
 };
 use carrick_mem::memory::AddressSpace;
-use carrick_mem::page_table::{PageTableError, PageTableManager};
+use carrick_mem::page_table::{PageTableApplyOutcome, PageTableError, PageTableManager};
 use parking_lot::Mutex;
 
 use crate::vmm::{Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, FrameCowWriteIntent};
@@ -58,7 +58,7 @@ pub fn asid_maintenance_bytes() -> Vec<u8> {
 /// through the live editor before the first ASID is installed.
 pub fn reserve_hvpatch_process_apertures(
     manager: &mut PageTableManager,
-) -> Result<bool, PageTableError> {
+) -> Result<PageTableApplyOutcome, PageTableError> {
     manager.set_prot_none(
         carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
         (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE
@@ -814,8 +814,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// publication.
     fn pt_edit_locked(
         &mut self,
-        edit: impl FnOnce(&mut PageTableManager) -> Result<bool, PageTableError>,
-    ) -> Result<bool, MemoryError> {
+        edit: impl FnOnce(&mut PageTableManager) -> Result<PageTableApplyOutcome, PageTableError>,
+    ) -> Result<PageTableApplyOutcome, MemoryError> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
@@ -893,8 +893,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
         mgr.set_multi_vcpu(unsafe_to_coalesce);
         mgr.set_stage1_exclusive(stage1_exclusive);
-        let changed = match edit(mgr) {
-            Ok(changed) => changed,
+        let outcome: PageTableApplyOutcome = match edit(mgr) {
+            Ok(res) => res,
             Err(PageTableError::OutOfTables) => {
                 // Report the pool's own numbers. "Exhausted" alone cannot
                 // distinguish a genuinely huge address space from the reclaim
@@ -916,32 +916,32 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 });
             }
         };
-        if changed {
+        if outcome.changed {
             // SAFETY: `host` backs the live page-table region for the whole process
             // lifetime; the manager writes only 8-byte-aligned descriptor slots
             // within `[host, host + size)`.
             unsafe { mgr.sync_to_host(host) };
         }
-        Ok(changed)
+        Ok(outcome)
     }
 
     /// Edit the stage-1 tables WITHOUT a TLB flush. Reserved for changes that do
     /// not publish a new guest-visible translation.
     fn pt_edit(
         &mut self,
-        edit: impl FnOnce(&mut PageTableManager) -> Result<bool, PageTableError>,
+        edit: impl FnOnce(&mut PageTableManager) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<(), MemoryError> {
-        self.pt_edit_locked(edit).map(|_changed| ())
+        self.pt_edit_locked(edit).map(|_outcome| ())
     }
 
-    /// Edit the stage-1 tables AND, if any descriptor changed, flush the stale
-    /// stage-1 TLB by running the EL1-maintenance trampoline on this vCPU
-    /// ([`Self::run_el1_maintenance`]). This makes a RE-protect / `munmap` of an
-    /// ALREADY-WALKED page take effect (e.g. `mprotect(PROT_READ)` of a touched RW
-    /// page → a subsequent store faults; `munmap` of a touched page → access
-    /// faults), where a bare descriptor edit would leave a stale writable TLB entry
-    /// live. A no-op edit (range already at the target protection) writes nothing
-    /// and skips the flush. Mirrors HVF's `pt_edit_and_flush`.
+    /// Edit the stage-1 tables AND, if any descriptor changed in a way that
+    /// requires a TLB flush, flush the stale stage-1 TLB by running the
+    /// EL1-maintenance trampoline on this vCPU ([`Self::run_el1_maintenance`]).
+    ///
+    /// Transitions that only validate previously-invalid leaves require NO TLB
+    /// maintenance on AArch64 (invalid translations are never cached in TLBs by
+    /// hardware MMUs). Coalescing, splitting, or changing already-valid leaf
+    /// permissions/output addresses set `flush_required` and invoke TLBI.
     ///
     /// Cross-vCPU: the generic threaded loop's Pause-Modify-Resume
     /// (`vcpu_loop.rs` `pt_pause`) has already PAUSED every sibling vCPU out of
@@ -952,12 +952,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// re-invented.
     fn pt_edit_and_flush(
         &mut self,
-        edit: impl FnOnce(&mut PageTableManager) -> Result<bool, PageTableError>,
+        edit: impl FnOnce(&mut PageTableManager) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<(), MemoryError> {
-        let changed = self.pt_edit_locked(edit)?;
-        if !changed {
-            // Nothing changed (range already at the target protection): no host
-            // write happened, so there is no stale TLB entry to flush.
+        let outcome = self.pt_edit_locked(edit)?;
+        if !outcome.flush_required {
+            // Nothing changed that requires a TLB flush: no previously-valid leaf
+            // was modified, split, or coalesced, so there is no stale TLB entry
+            // to invalidate.
             return Ok(());
         }
         self.run_stage1_maintenance()
@@ -1316,7 +1317,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // so a redundant TTBR0 read from that parked vCPU would fail even though
         // the target stack is already materialized.
         let editor_present = self.page_tables.lock().is_some();
-        ensure_sparse_page_table_editor(editor_present, || self.pt_edit(|_| Ok(false)))?;
+        ensure_sparse_page_table_editor(editor_present, || {
+            self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
+        })?;
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let process_asid = self.process_asid;
@@ -1710,7 +1713,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // Same editor precondition as `ensure_sparse_mmap_backing`: a fresh
         // materialization needs the software stage-1 editor.
         let editor_present = self.page_tables.lock().is_some();
-        ensure_sparse_page_table_editor(editor_present, || self.pt_edit(|_| Ok(false)))?;
+        ensure_sparse_page_table_editor(editor_present, || {
+            self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
+        })?;
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let process_asid = self.process_asid;
@@ -1759,7 +1764,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             address: va,
             length: len,
         })?;
-        self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, va, len, true))
+        self.pt_edit_and_flush(|mgr| {
+            mgr.map_aliased(va, va, len, true)
+                .map(|changed| PageTableApplyOutcome::new(changed, changed))
+        })
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -1862,10 +1870,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // prevents `sync_to_host`, a multi-leaf operation may have changed its
         // scratch image; fail stopped so a later successful edit cannot publish
         // partial leaves after this candidate was recycled.
-        let changed = self
-            .pt_edit_locked(|mgr| mgr.map_aliased(va, overlay_ipa, len as u64, true))
+        let outcome = self
+            .pt_edit_locked(|mgr| {
+                mgr.map_aliased(va, overlay_ipa, len as u64, true)
+                    .map(|changed| PageTableApplyOutcome::new(changed, changed))
+            })
             .map_err(RepointPrivateError::indeterminate)?;
-        if !changed {
+        if !outcome.changed {
             return Ok(());
         }
         classify_private_repoint_tlbi(self.run_stage1_maintenance())?;
@@ -1885,10 +1896,10 @@ fn apply_stage1_protection_edit(
     len: usize,
     prot: u64,
     armed_cow: &[crate::vmm::ForkCowRange],
-) -> Result<bool, PageTableError> {
+) -> Result<PageTableApplyOutcome, PageTableError> {
     use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
     let exec = prot & LINUX_PROT_EXEC != 0;
-    let mut changed = if prot & LINUX_PROT_WRITE != 0 {
+    let mut outcome = if prot & LINUX_PROT_WRITE != 0 {
         mgr.set_rw(address, len, exec)?
     } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
         mgr.set_readonly(address, len, exec)?
@@ -1896,9 +1907,9 @@ fn apply_stage1_protection_edit(
         mgr.set_prot_none(address, len)?
     };
     for range in armed_cow {
-        changed |= mgr.set_readonly(range.va, range.len, exec)?;
+        outcome |= mgr.set_readonly(range.va, range.len, exec)?;
     }
-    Ok(changed)
+    Ok(outcome)
 }
 
 impl<V: Aarch64Vmm> CurrentMmMemory for Aarch64EngineCore<V> {}
@@ -2201,7 +2212,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         let page_table_result = self.pt_edit_and_flush(|mgr| {
             let changed = mgr.map_aliased(va.raw(), gpa, len, writable)?;
             descriptors = mgr.debug_walk(va.raw());
-            Ok(changed)
+            Ok(PageTableApplyOutcome::new(changed, changed))
         });
         let walk_flags =
             i32::from(self.is_forked_child) | (i32::from(page_table_result.is_err()) << 1);
@@ -2662,9 +2673,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             // this process never called mmap/mprotect after exec. The no-op
             // edit initializes from TTBR backing, writes nothing, and performs
             // no TLBI.
-            self.pt_edit(|_| Ok(false)).map_err(|error| {
-                TrapError::Hypervisor(format!("load live page tables for core snapshot: {error}"))
-            })?;
+            self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "load live page tables for core snapshot: {error}"
+                    ))
+                })?;
         }
         Ok(())
     }
@@ -2883,11 +2897,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let stage_started = std::time::Instant::now();
         let page_tables_absent = self.page_tables.lock().is_none();
         if page_tables_absent {
-            self.pt_edit(|_| Ok(false)).map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "load hvpatch parent page tables for process fork: {error}"
-                ))
-            })?;
+            self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "load hvpatch parent page tables for process fork: {error}"
+                    ))
+                })?;
         }
         emit_stage(
             HvpatchForkProcessSpecStagePhase::ParentPageTablesLoad,
@@ -3059,15 +3074,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             };
             let publish_parent = (|| -> Result<(), TrapError> {
                 self.pt_edit_and_flush(|manager| {
-                    let mut changed = false;
+                    let mut outcome = PageTableApplyOutcome::default();
                     for range in &cow_ranges {
-                        changed |= if range.kernel_only {
+                        outcome |= if range.kernel_only {
                             manager.set_kernel_readonly(range.va, range.len, range.executable)?
                         } else {
                             manager.set_fork_readonly(range.va, range.len)?
                         };
                     }
-                    Ok(changed)
+                    Ok(outcome)
                 })
                 .map_err(|error| {
                     TrapError::Hypervisor(format!(
@@ -3139,7 +3154,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             if let Err(error) = publish_parent {
                 let rollback_result = self.pt_edit_and_flush(|manager| {
                     *manager = parent_page_tables_snapshot.clone();
-                    Ok(true)
+                    Ok(PageTableApplyOutcome::new(true, true))
                 });
                 if let Err(rollback_error) = rollback_result {
                     eprintln!(
@@ -3205,7 +3220,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         };
         self.pt_edit_and_flush(|manager| {
             *manager = rollback.page_tables;
-            Ok(true)
+            Ok(PageTableApplyOutcome::new(true, true))
         })
         .map_err(|error| {
             TrapError::Hypervisor(format!(
@@ -4073,7 +4088,11 @@ mod tests {
                 .is_some()
         );
 
-        assert!(reserve_hvpatch_process_apertures(&mut manager).expect("reserve apertures"));
+        assert!(
+            reserve_hvpatch_process_apertures(&mut manager)
+                .expect("reserve apertures")
+                .changed
+        );
         assert_eq!(
             manager.translate(carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE),
             None
@@ -4223,7 +4242,11 @@ mod tests {
             &[cow_range_stale_exec],
         )
         .expect("apply RW protection edit");
-        assert!(changed, "protection edit must report changes");
+        assert!(changed.changed, "protection edit must report changes");
+        assert!(
+            changed.flush_required,
+            "protection edit on valid pages must require flush"
+        );
 
         // Page 0 (un-armed in range): RW, NX, IPA preserved, non-global preserved
         let d0 = leaf(&mgr, base_va);
@@ -4314,7 +4337,11 @@ mod tests {
             &[cow_range_stale_nonexec],
         )
         .expect("apply RWX protection edit");
-        assert!(changed, "protection edit must report changes");
+        assert!(changed.changed, "protection edit must report changes");
+        assert!(
+            changed.flush_required,
+            "protection edit on valid pages must require flush"
+        );
 
         // Page 0 (un-armed in range): RW, Executable, IPA preserved, non-global preserved
         let d0 = leaf(&mgr, base_va);
