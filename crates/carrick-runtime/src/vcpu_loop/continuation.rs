@@ -1602,13 +1602,6 @@ impl BlockedContinuation {
                 } else {
                     ContinuationCompletion::Errno(LINUX_EINTR)
                 };
-                if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
-                    eprintln!(
-                        "SIGDBG continuation signal-event family={family:?} restart={restart:?} \
-                         reserved={:?} deliverable={deliverable:?}",
-                        reserved_signal.as_ref().map(|r| r.signum()),
-                    );
-                }
                 if signal_masks.temporary.is_some() {
                     if let Some(reserved) = reserved_signal.as_ref() {
                         signal_authority.set_blocked(reserved.effective_mask());

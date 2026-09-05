@@ -297,11 +297,6 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
         Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))))
     };
 
-    if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
-        eprintln!(
-            "[FAULTDBG tid={this_tid:?}] signum={signum} si_code={si_code} si_addr={si_addr:#x} interrupted_pc={interrupted_pc:?}"
-        );
-    }
     match inject_fault_signal(
         engine,
         dispatcher,

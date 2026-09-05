@@ -3765,9 +3765,6 @@ impl SyscallDispatcher {
                     }
                     crate::hvpatch::WaitResult::StillRunning => {
                         if guest_nohang {
-                            if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
-                                eprintln!("SIGDBG wait4 StillRunning -> WNOHANG 0");
-                            }
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
                         let tid = Self::ctx_tid(cx);
@@ -3780,9 +3777,6 @@ impl SyscallDispatcher {
                             tid,
                             carrick_abi::WaitSigMask::Additive(non_interrupting),
                         ) {
-                            if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
-                                eprintln!("SIGDBG wait4 StillRunning -> pre-park EINTR");
-                            }
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         return Ok(DispatchOutcome::WaitOnHvpatchChild {

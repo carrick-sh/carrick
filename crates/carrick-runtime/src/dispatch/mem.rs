@@ -5008,7 +5008,6 @@ impl SyscallDispatcher {
             }
 
             let mut bus_fault_offset = None;
-            let mut bus_fault_debug = None;
             // A MAP_SHARED mapping of a memfd sealed F_SEAL_WRITE is created
             // read-only here (a writable one already returned EPERM above); record
             // it so a later mprotect(PROT_WRITE) is rejected.
@@ -5078,10 +5077,6 @@ impl SyscallDispatcher {
                             )
                         {
                             bus_fault_offset = Some(bus_offset);
-                            bus_fault_debug = Some(format!(
-                                "vfs path={path:?} file_len={} desc=File",
-                                contents.len()
-                            ));
                         }
                         if map_sharing == MmapSharing::Shared
                             && matches!(
@@ -5117,10 +5112,6 @@ impl SyscallDispatcher {
                             )
                         {
                             bus_fault_offset = Some(bus_offset);
-                            bus_fault_debug = Some(format!(
-                                "vfs path={path:?} file_len={} desc=SyntheticFile",
-                                contents.len()
-                            ));
                         }
                         if offset_usize < contents.len() {
                             let available = &contents[offset_usize..];
@@ -5138,10 +5129,6 @@ impl SyscallDispatcher {
                             )
                         {
                             bus_fault_offset = Some(bus_offset);
-                            bus_fault_debug = Some(format!(
-                                "vfs path={path:?} file_len={} desc=InMemoryFile",
-                                data.len()
-                            ));
                         }
                         if offset_usize < data.len() {
                             let available = &data[offset_usize..];
@@ -5155,11 +5142,6 @@ impl SyscallDispatcher {
                                 shared_file_bus_offset(file_len, offset, length, page_size)
                         {
                             bus_fault_offset = Some(bus_offset);
-                            bus_fault_debug = Some(format!(
-                                "host path={:?} file_len={file_len} desc=HostFile host_fd={}",
-                                carrick_portable::fd_abs_path(host_fd.raw()),
-                                host_fd.raw()
-                            ));
                         }
                         let n = unsafe {
                             libc::pread(
@@ -5355,12 +5337,6 @@ impl SyscallDispatcher {
                 if let Some(file_len) = host_fd_file_len(host_fd) {
                     bus_fault_offset =
                         shared_file_bus_offset(file_len, offset, length, page_size);
-                    if bus_fault_offset.is_some() {
-                        bus_fault_debug = Some(format!(
-                            "host path={:?} file_len={file_len} desc=host-backed host_fd={host_fd}",
-                            carrick_portable::fd_abs_path(host_fd),
-                        ));
-                    }
                     // SAFETY: the description read guard (`open`) keeps the
                     // owning fd (a `HostFdRef`, or the memfd's `OwnedFd`) alive
                     // across the borrow.
@@ -5455,15 +5431,6 @@ impl SyscallDispatcher {
                 && let Some(bus_len) = length.checked_sub(bus_offset)
                 && let Ok(bus_len_usize) = usize::try_from(bus_len)
             {
-                if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
-                    eprintln!(
-                        "[FAULTDBG] mmap BUS fd={} addr={address:#x} len={length:#x} \
-                         offset={offset:#x} bus_offset={bus_offset:#x} sharing={map_sharing:?} \
-                         prot={prot_flags:?} flags={map_flags:?} {}",
-                        fd.0,
-                        bus_fault_debug.as_deref().unwrap_or("desc=unknown")
-                    );
-                }
                 memory.set_no_access(bus_start, bus_len_usize, true);
                 if let Err(error) = memory.protect_range(bus_start, bus_len_usize, 0)
                     && memory.supports_concurrent_exec_protection()
