@@ -6570,23 +6570,17 @@ mod container_clock_tests {
             assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
         }
 
-        // Mutually exclusive MICRO and NANO
-        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
-        timex.modes = LINUX_ADJ_MICRO | LINUX_ADJ_NANO;
-        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
-        let outcome = dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
-            .unwrap();
-        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
-
-        // Mutually exclusive TAI and TIMECONST
-        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
-        timex.modes = LINUX_ADJ_TAI | LINUX_ADJ_TIMECONST;
-        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
-        let outcome = dispatcher
-            .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
-            .unwrap();
-        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+        // MICRO|NANO together and TAI|TIMECONST together are accepted
+        // (oracle); neither is EINVAL.
+        for modes in [LINUX_ADJ_MICRO | LINUX_ADJ_NANO, LINUX_ADJ_TAI | LINUX_ADJ_TIMECONST] {
+            let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+            timex.modes = modes;
+            memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+            let outcome = dispatcher
+                .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
+                .unwrap();
+            assert_ne!(outcome, DispatchOutcome::errno(LINUX_EINVAL), "modes {modes:#x}");
+        }
 
         // Singleshot flag without OFFSET
         let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));

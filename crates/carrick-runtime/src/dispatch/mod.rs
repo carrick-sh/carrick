@@ -10210,16 +10210,10 @@ fn adjtimex_bootstrap(
             errno: LINUX_EINVAL,
         };
     }
-    if modes.contains(LinuxTimexModes::MICRO) && modes.contains(LinuxTimexModes::NANO) {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
-    }
-    if modes.contains(LinuxTimexModes::TAI) && modes.contains(LinuxTimexModes::TIMECONST) {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
-    }
+    // ADJ_MICRO|ADJ_NANO together and ADJ_TAI|ADJ_TIMECONST together are
+    // ACCEPTED by Linux (native arm64 oracle, probe `adjtimexmodel`
+    // `micro_nano_together_accepted` / `tai_timeconst_together_accepted`);
+    // the later of the two stores simply wins.
     if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG)
         && modes != LinuxTimexModes::OFFSET_SINGLESHOT
     {
