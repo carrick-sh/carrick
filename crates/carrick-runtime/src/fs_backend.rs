@@ -725,6 +725,12 @@ pub trait FsBackend: Send + Sync {
         None
     }
 
+    /// Return the host identity `(st_dev, st_ino)` of the FIFO at `path` by stating
+    /// the resolved host node, without opening an fd. Default: unsupported (returns None).
+    fn fifo_identity(&self, _path: &str) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Create a symlink at `linkpath` pointing at `target` (the target is
     /// stored verbatim, not resolved). Default: unsupported.
     fn symlink(&self, _target: &str, _linkpath: &str) -> Result<(), BackendError> {
@@ -6871,6 +6877,19 @@ impl FsBackend for HostFsBackend {
             )
         };
         if fd < 0 { None } else { Some(fd) }
+    }
+
+    fn fifo_identity(&self, path: &str) -> Option<(u64, u64)> {
+        use std::os::fd::AsRawFd;
+        let normalized = self.resolve_following(path)?;
+        let rel = Self::rel_path(&normalized)?;
+        let c_rel = cstring_from_osstr(rel.as_os_str())?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstatat(self.dir.as_raw_fd(), c_rel.as_ptr(), &mut st, 0) };
+        if rc != 0 {
+            return None;
+        }
+        Some((st.st_dev as u64, st.st_ino as u64))
     }
 
     fn symlink(&self, target: &str, linkpath: &str) -> Result<(), BackendError> {
