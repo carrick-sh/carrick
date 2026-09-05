@@ -907,3 +907,29 @@ transactions the exposure is ~32 round trips per 128 KiB instead of 1024, but
 the shape (wall clock → guest-visible short read) is the flaky class the owner
 ruled architectural. The write side (`prepare_write`) now returns `LeaseStale`
 typed but the runtime does not yet re-retain there.
+
+## 2026-09-05 (later): page-table backing landed; splice02 was a false EOF
+
+- **Extension table arenas backed** (`6516fb902`, worker pt-backing after a
+  transport death at 59 min; director committed its clean, fully-tested diff).
+  `pagetablegrow` 5/5 on both lanes; gap entry retired. `cpython-compile` now
+  runs 65 tests and dies at `test_compiler_recursion_limit` with a genuine
+  guest SIGSEGV (was ENOMEM/refusal) — next attribution via
+  `scripts/dtrace/hvpatch-phase4-guest-fault.d`.
+- **splice02** (`640d8a849`): not slow, not a wakeup loss. `take_pipe_bytes`
+  returned an empty Vec for an empty pipe with live writers, so
+  `splice(pipe->file)`/`vmsplice` returned 0 (EOF) whenever the reader outran
+  the writer; four concurrent LTP runs stopped at 76–212 KB, alone it passed.
+  Typed `PipeDrain`, shared `wait_for_pipe_readable` park with `read(2)`.
+  Probe `splicepipeempty` red-first 4/5 → 5/5 both lanes; splice02 4/4 concurrent.
+- LTP tail rerun on `92540fc5a`: 18/49 previously-gating rows now match.
+  Still gating and attributed: futex_wake02 (`/proc/<pid>/task` for a foreign
+  pid answered from host-process legacy → worker proctask), lseek11
+  (SEEK_DATA/HOLE on the overlay lane → worker seekhole), ioctl02/test_ioctl
+  (`/dev/tty0`), setsockopt02 (AF_PACKET), fork14 (16 TB PROT_NONE reservation
+  refused: arena-bounded hidden reservations), sendfile09 (statfs free space
+  < 5G), syslog12 (`syslog(2)` ENOSYS), semctl06 (oracle broken, privilege),
+  inotify09/msgstress01/setsid01/shmctl05 (timeouts, unattributed).
+- Pre-existing unit failure `pipe_end_direction_matrix_and_fd_lifecycle_closure`
+  (pwrite64 on a pipe read end EBADF vs expected ESPIPE) predates today's fs
+  commits through `7f11d985b`; bisect continuing over the later merges.
