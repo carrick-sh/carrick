@@ -708,3 +708,13 @@ Worker hygiene: two long-lived Antigravity conversations (`pt-pool`,
 `overlay-owner`) started timing out on every turn with nothing committed
 once their context grew; both were replaced by fresh conversations on the
 same worktrees with narrower briefs (`pt-pool-wire`, `overlay-read`).
+
+`process_vm_readv03`, traced with `hvpatch-guest-syscall-flow.d`: every
+small case (1024 bytes) returns fully; the 8-iov 131072-byte case returns
+18368 with errno 0 (receipt `pvr03-flow.txt`). A short cross-process read
+that stops mid-buffer without an error is the remote-side chunk loop ending
+at the first page it cannot resolve, most plausibly a not-yet-resident
+anonymous page of the child (Linux reads it as zeros). Next step is a probe
+(`processvmsparse`: remote buffer partially touched, read the whole range,
+assert full length and zeros in the untouched pages) and a fix in the
+foreign-mm read path once the two trap.rs workers have landed.
