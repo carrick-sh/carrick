@@ -1,0 +1,4 @@
+f12072848228662f
+rlimit_stack_is_8mib=true
+main_thread_recurses_6mib=true
+thread_recurses_6mib=true
