@@ -946,7 +946,8 @@ fn msg_more_and_cork_coalescing() {
     let fd_a = i32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]) as u64;
     let fd_b = i32::from_le_bytes([pair[4], pair[5], pair[6], pair[7]]) as u64;
 
-    // Send "hello " with MSG_MORE on fd_a
+    // Linux does not cork AF_UNIX datagrams: a MSG_MORE send goes out at once
+    // (`socketcredmore` oracle: `unix_dgram_msg_more_coalesced_len=false`).
     memory.write_bytes(0x4100, b"hello ").unwrap();
     assert_eq!(
         call(
@@ -957,8 +958,6 @@ fn msg_more_and_cork_coalescing() {
         ),
         DispatchOutcome::Returned { value: 6 }
     );
-
-    // Non-blocking recv on fd_b should see EAGAIN (no datagram emitted yet)
     assert_eq!(
         call(
             &mut dispatcher,
@@ -966,10 +965,12 @@ fn msg_more_and_cork_coalescing() {
             207, // recvfrom
             [fd_b, 0x4200, 100, LINUX_MSG_DONTWAIT, 0, 0]
         ),
-        DispatchOutcome::errno(carrick_abi::LINUX_EAGAIN)
+        DispatchOutcome::Returned { value: 6 }
     );
+    let recv_data = memory.read_bytes(0x4200, 6).unwrap();
+    assert_eq!(&recv_data, b"hello ");
 
-    // Send "world" without MSG_MORE on fd_a -> emits the coalesced datagram
+    // A plain send is its own datagram.
     memory.write_bytes(0x4110, b"world").unwrap();
     assert_eq!(
         call(
@@ -980,8 +981,6 @@ fn msg_more_and_cork_coalescing() {
         ),
         DispatchOutcome::Returned { value: 5 }
     );
-
-    // Now recv on fd_b should receive the combined 11 bytes "hello world"
     assert_eq!(
         call(
             &mut dispatcher,
@@ -989,12 +988,13 @@ fn msg_more_and_cork_coalescing() {
             207, // recvfrom
             [fd_b, 0x4200, 100, LINUX_MSG_DONTWAIT, 0, 0]
         ),
-        DispatchOutcome::Returned { value: 11 }
+        DispatchOutcome::Returned { value: 5 }
     );
-    let recv_data = memory.read_bytes(0x4200, 11).unwrap();
-    assert_eq!(&recv_data, b"hello world");
+    let recv_data = memory.read_bytes(0x4200, 5).unwrap();
+    assert_eq!(&recv_data, b"world");
 
-    // Test close flush: send "flushme" with MSG_MORE, then close(fd_a)
+    // A MSG_MORE send on AF_UNIX right before close is likewise delivered
+    // immediately, and close leaves nothing corked.
     memory.write_bytes(0x4120, b"flushme").unwrap();
     assert_eq!(
         call(
@@ -1010,7 +1010,7 @@ fn msg_more_and_cork_coalescing() {
         call(&mut dispatcher, &mut memory, 57, [fd_a, 0, 0, 0, 0, 0]),
         DispatchOutcome::Returned { value: 0 }
     );
-    // fd_b receives the flushed 7 bytes
+    // fd_b already holds the 7 bytes sent before close
     assert_eq!(
         call(
             &mut dispatcher,

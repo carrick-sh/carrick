@@ -1278,29 +1278,13 @@ impl Drop for OpenDescription {
         if let Self::HostSocket {
             host_fd,
             cork_buffer,
-            cork_dest_addr,
             ..
         } = self
         {
-            if !cork_buffer.is_empty() {
-                let dest_ptr = cork_dest_addr
-                    .as_ref()
-                    .map_or(core::ptr::null(), |a| a.as_ptr().cast());
-                let dest_len = cork_dest_addr
-                    .as_ref()
-                    .map_or(0, |a| a.len() as libc::socklen_t);
-                unsafe {
-                    libc::sendto(
-                        host_fd.raw(),
-                        cork_buffer.as_ptr().cast(),
-                        cork_buffer.len(),
-                        libc::MSG_DONTWAIT,
-                        dest_ptr,
-                        dest_len,
-                    );
-                }
-                cork_buffer.clear();
-            }
+            // Linux discards a still-corked datagram on the last close
+            // (`socketcredmore` oracle: `msg_more_then_close_flushes=false`);
+            // only a plain send or a cork release emits it.
+            cork_buffer.clear();
             crate::dispatch::net::support::unregister_unix_listener(host_fd.raw());
         }
     }

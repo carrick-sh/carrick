@@ -19,8 +19,8 @@
 //! socketpair_peercred_pid_matches_creator=true
 //! udp_msg_more_coalesced_len=true
 //! udp_plain_send_len=true
-//! unix_dgram_msg_more_coalesced_len=true
-//! msg_more_then_close_flushes=true
+//! unix_dgram_msg_more_coalesced_len=false   (Linux does not cork AF_UNIX datagrams)
+//! msg_more_then_close_flushes=false          (a corked datagram is discarded on close)
 
 use conformance_probes::report;
 use core::mem::MaybeUninit;
