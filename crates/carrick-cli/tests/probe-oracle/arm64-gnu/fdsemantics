@@ -1,4 +1,4 @@
-542f05c940168355
+ef363e4a13de4a8b
 getfl_nonblock_set=true
 getfl_default_clear=true
 waitid_nonblock_eagain_while_alive=true
@@ -13,3 +13,6 @@ reopen_rdonly_get_seals_shared=true
 reopen_rdonly_add_seals_eperm=true
 reopen_rdonly_write_ebadf=true
 reopen_rdwr_add_seals_ok=true
+write_sealed_reopen_trunc_ok=true
+write_sealed_reopen_trunc_shrinks=true
+shrink_sealed_reopen_trunc_eperm=true

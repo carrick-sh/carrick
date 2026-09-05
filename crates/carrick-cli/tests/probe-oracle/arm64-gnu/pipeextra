@@ -1,4 +1,4 @@
-2ee04aa33c9ed332
+60beb069fa48cd59
 pipe2_nonblock_rc_zero=true
 pipe2_nonblock_read_end_nonblock=true
 pipe2_nonblock_write_end_nonblock=true
@@ -10,6 +10,7 @@ pipe2_direct_packet_read_short=true
 pipe2_direct_empty_returns_eagain=true
 pipe_setup_rc_zero=true
 pipe_fionread_matches_written=true
+pipe_fionread_write_end_matches_written=true
 pipe_nonblock_fills=true
 pipe_nonblock_write_eagains_when_full=true
 pipe_eof_setup_rc_zero=true
