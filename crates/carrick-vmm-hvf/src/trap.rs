@@ -6445,6 +6445,92 @@ mod foreign_mm_tests {
     }
 
     #[test]
+    fn shared_extent_repoint_subpage_resolves_covering_owner_and_repoints_leaf() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external_alias_restore = ExternalAliasStateRestore::capture();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let va = 0x6001_020000_u64;
+        let size = 0x4000; // 16 KiB
+        let mut lease = GlobalFrameStage2Lease::reserve(size as u64, size as u64)
+            .expect("reserve global frame stage-2 lease");
+        let extent_base = lease.base;
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate backing");
+        let host_addr = mapping.as_ptr() as usize;
+        let rc = unsafe { inventory_hv_vm_map(mapping.as_ptr().cast(), extent_base, size, 7) };
+        assert_eq!(rc, 0);
+        lease.mark_mapped();
+        let generation = register_global_frame_host_owner(lease, mapping, 7)
+            .expect("register global frame host owner");
+
+        let mut task = HvfTaskState::neutral();
+        task.persistent_vm_lifecycle = true;
+        task.mm_root_slot = Some((0x9a00_f000_0000, 0x20_0000));
+        task.container_root = ContainerRootToken::from_raw(250);
+
+        let own = AliasBacking {
+            start: va,
+            ipa: extent_base,
+            host_addr,
+            size,
+            physical_ipa: extent_base,
+            physical_host_addr: host_addr,
+            physical_size: size,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: AliasOwnershipScope::Global,
+            inventory_backing: InventoryBackingIdentity::Private(9_608),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        };
+        register_shared_alias(own);
+
+        let mut tables = crate::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables
+            .map_aliased(va, extent_base, size as u64, false)
+            .expect("stage-1 mapping");
+        *task.page_tables_authority().lock() = Some(tables);
+
+        let repoint_va = 0x6001_030000_u64;
+        let repoint_ipa = extent_base + 0x1000;
+        let repoint_len = 0x1000;
+
+        // Repointing outside any extent still fails with "no physical owner".
+        let outside_ipa = extent_base + (size as u64) + 0x1000;
+        let outside_err = task
+            .publish_shared_repoint(repoint_va, outside_ipa, repoint_len)
+            .unwrap_err();
+        assert!(
+            outside_err.to_string().contains("has no physical owner"),
+            "expected no physical owner error, got: {outside_err}"
+        );
+
+        // Repointing a 4 KiB sub-page at offset 0x1000 succeeds.
+        task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len)
+            .expect("repoint 4 KiB sub-page of covering shared extent");
+
+        // translate_va on the repointed VA returns extent_base + 0x1000.
+        assert_eq!(
+            task.translate_va(repoint_va),
+            Some(repoint_ipa),
+            "stage-1 page table leaf must point to extent_base + 0x1000"
+        );
+
+        assert!(
+            retire_global_frame_host_owner_if_generation(extent_base, size as u64, generation)
+                .is_retired()
+        );
+    }
+
+    #[test]
     fn semantic_lookup_isolates_same_va_in_different_mm() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let _external_alias_restore = ExternalAliasStateRestore::capture();
@@ -35536,158 +35622,6 @@ impl HvfVmState {
         Ok(())
     }
 
-    pub(crate) fn publish_shared_repoint(
-        &mut self,
-        va: u64,
-        target_ipa: u64,
-        len: usize,
-    ) -> Result<(), TrapError> {
-        let target_end = target_ipa.checked_add(len as u64).ok_or_else(|| {
-            TrapError::Hypervisor("shared repoint target IPA overflow".to_owned())
-        })?;
-        let (
-            mapping_ipa,
-            physical_ipa,
-            mapping_host,
-            physical_size,
-            perms,
-            mapping_owner_generation,
-            mapping_shared_key_base,
-            mapping_shared_key_offset,
-        ) = self
-            .mappings
-            .iter()
-            .rev()
-            .find(|mapping| {
-                (target_ipa >= mapping.ipa
-                    && mapping
-                        .ipa
-                        .checked_add(mapping.size as u64)
-                        .is_some_and(|end| target_end <= end))
-                    || (target_ipa >= mapping.physical_ipa
-                        && mapping
-                            .physical_ipa
-                            .checked_add(mapping.physical_size as u64)
-                            .is_some_and(|end| target_end <= end))
-            })
-            .map(|mapping| {
-                (
-                    mapping.ipa,
-                    mapping.physical_ipa,
-                    mapping.host_addr as usize,
-                    mapping.physical_size,
-                    mapping.perms,
-                    mapping
-                        .structural_owner
-                        .as_ref()
-                        .map(|owner| owner.epoch().raw())
-                        .unwrap_or(mapping.owner_generation),
-                    mapping.shared_key_base,
-                    mapping.shared_key_offset,
-                )
-            })
-            .ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "shared repoint IPA 0x{target_ipa:x} size {len} has no physical owner"
-                ))
-            })?;
-        let semantic_offset = target_ipa.checked_sub(physical_ipa).ok_or_else(|| {
-            TrapError::Hypervisor("shared repoint precedes its physical extent".to_owned())
-        })?;
-        let physical_host_addr = mapping_host
-            .checked_sub(mapping_ipa.checked_sub(physical_ipa).ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "shared repoint mapping precedes its physical extent".to_owned(),
-                )
-            })? as usize)
-            .ok_or_else(|| {
-                TrapError::Hypervisor("shared repoint physical host underflow".to_owned())
-            })?;
-        let host_addr = physical_host_addr
-            .checked_add(semantic_offset as usize)
-            .ok_or_else(|| {
-                TrapError::Hypervisor("shared repoint semantic host overflow".to_owned())
-            })?;
-        let inventory_backing = {
-            let registry = alias_registry().lock();
-            registry
-                .physical_start_rows(physical_ipa)
-                .iter()
-                .find(|(_, alias)| alias.physical_size == physical_size)
-                .map(|(_, alias)| alias.inventory_backing)
-                .or_else(|| {
-                    registry
-                        .physical_start_rows(physical_ipa)
-                        .first()
-                        .map(|(_, alias)| alias.inventory_backing)
-                })
-        }
-        .or_else(|| {
-            self.frame_inventory
-                .lock()
-                .extents
-                .get(&(physical_ipa, physical_size as u64))
-                .map(|extent| extent.backing)
-        })
-        .or_else(|| (!self.persistent_vm_lifecycle).then(Self::private_backing_identity))
-        .ok_or_else(|| {
-            TrapError::Hypervisor(format!(
-                "shared repoint physical IPA 0x{:x} size {} lacks frame inventory",
-                physical_ipa, physical_size
-            ))
-        })?;
-        let owner_generation =
-            if is_reusable_global_frame_extent(physical_ipa, physical_size as u64) {
-                global_frame_host_owner_generation_in(
-                    self.custody(),
-                    physical_ipa,
-                    physical_size as u64,
-                )
-            } else {
-                mapping_owner_generation
-            };
-        let shared_key_offset = mapping_shared_key_offset.saturating_add(semantic_offset);
-        let sharing = GuestMappingSharing::GlobalShared;
-        register_shared_alias(AliasBacking {
-            start: va,
-            ipa: target_ipa,
-            host_addr,
-            size: len,
-            physical_ipa,
-            physical_host_addr,
-            physical_size,
-            perms: u64::from(perms),
-            guest_writable: true,
-            sharing,
-            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
-            inventory_backing,
-            shared_key_base: mapping_shared_key_base,
-            shared_key_offset,
-            owner_generation,
-        });
-        self.mappings.push(HvfMappedRegion {
-            start: va,
-            ipa: target_ipa,
-            physical_ipa,
-            end: va.saturating_add(len as u64),
-            host_addr: host_addr as *mut u8,
-            size: len,
-            physical_size,
-            perms,
-            memory: None,
-            host_mapping: None,
-            structural_owner: None,
-            stage2_lease: None,
-            is_dynamic_alias: true,
-            sharing,
-            guest_writable: true,
-            shared_key_base: mapping_shared_key_base,
-            shared_key_offset,
-            owner_generation,
-        });
-        Ok(())
-    }
-
     pub(crate) fn apply_exec_inventory(
         &mut self,
         replacement_mm: u64,
@@ -36910,6 +36844,231 @@ impl HvfVmState {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
+    pub(crate) fn publish_shared_repoint(
+        &mut self,
+        va: u64,
+        target_ipa: u64,
+        len: usize,
+    ) -> Result<(), TrapError> {
+        let target_end = target_ipa.checked_add(len as u64).ok_or_else(|| {
+            TrapError::Hypervisor("shared repoint target IPA overflow".to_owned())
+        })?;
+
+        let (
+            physical_ipa,
+            physical_size,
+            physical_host_addr,
+            perms,
+            mapping_owner_generation,
+            shared_key_base,
+            shared_key_offset,
+            alias_inventory_backing,
+        ) = if let Some(mapping) = self.mappings.iter().rev().find(|mapping| {
+            let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
+            let phys_end = mapping
+                .physical_ipa
+                .checked_add(mapping.physical_size as u64);
+            ((target_ipa >= mapping.ipa && mapping_end.is_some_and(|limit| target_end <= limit))
+                || (target_ipa >= mapping.physical_ipa
+                    && phys_end.is_some_and(|limit| target_end <= limit)))
+                && (!self.persistent_vm_lifecycle
+                    || !is_reusable_global_frame_extent(
+                        mapping.physical_ipa,
+                        mapping.physical_size as u64,
+                    )
+                    || global_frame_region_owner_matches_in(self.custody(), mapping))
+        }) {
+            let physical_ipa = mapping.physical_ipa;
+            let physical_size = mapping.physical_size;
+            let mapping_ipa = mapping.ipa;
+            let mapping_host = mapping.host_addr as usize;
+            let physical_offset = mapping_ipa.checked_sub(physical_ipa).ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "shared repoint mapping precedes its physical extent".to_owned(),
+                )
+            })? as usize;
+            let physical_host_addr =
+                mapping_host.checked_sub(physical_offset).ok_or_else(|| {
+                    TrapError::Hypervisor("shared repoint physical host underflow".to_owned())
+                })?;
+            let owner_gen = mapping
+                .structural_owner
+                .as_ref()
+                .map(|owner| owner.epoch().raw())
+                .unwrap_or(mapping.owner_generation);
+            (
+                physical_ipa,
+                physical_size,
+                physical_host_addr,
+                mapping.perms,
+                owner_gen,
+                mapping.shared_key_base,
+                mapping.shared_key_offset,
+                None,
+            )
+        } else {
+            let alias = alias_registry()
+                .lock()
+                .newest_matching_for_process(self.mm_root_slot, self.container_root, |alias| {
+                    let alias_end = alias.ipa.checked_add(alias.size as u64);
+                    let phys_end = alias.physical_ipa.checked_add(alias.physical_size as u64);
+                    ((target_ipa >= alias.ipa
+                        && alias_end.is_some_and(|limit| target_end <= limit))
+                        || (target_ipa >= alias.physical_ipa
+                            && phys_end.is_some_and(|limit| target_end <= limit)))
+                        && alias_matches_process_scope(
+                            alias.ownership_scope,
+                            self.mm_root_slot,
+                            self.container_root,
+                        )
+                        && (!self.persistent_vm_lifecycle
+                            || !is_reusable_global_frame_extent(
+                                alias.physical_ipa,
+                                alias.physical_size as u64,
+                            )
+                            || global_frame_host_owner_matches_in(
+                                self.custody(),
+                                alias.physical_ipa,
+                                alias.physical_size as u64,
+                                alias.physical_host_addr,
+                                alias.owner_generation,
+                            ))
+                })
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "shared repoint IPA 0x{target_ipa:x} size {len} has no physical owner"
+                    ))
+                })?;
+            let perms = match alias.perms {
+                0 => applevisor::memory::MemPerms::None,
+                1 => applevisor::memory::MemPerms::Read,
+                2 => applevisor::memory::MemPerms::Write,
+                3 => applevisor::memory::MemPerms::ReadWrite,
+                4 => applevisor::memory::MemPerms::Exec,
+                5 => applevisor::memory::MemPerms::ReadExec,
+                6 => applevisor::memory::MemPerms::WriteExec,
+                7 => applevisor::memory::MemPerms::ReadWriteExec,
+                _ => applevisor::memory::MemPerms::ReadWrite,
+            };
+            (
+                alias.physical_ipa,
+                alias.physical_size,
+                alias.physical_host_addr,
+                perms,
+                alias.owner_generation,
+                alias.shared_key_base,
+                alias.shared_key_offset,
+                Some(alias.inventory_backing),
+            )
+        };
+
+        let semantic_offset = target_ipa.checked_sub(physical_ipa).ok_or_else(|| {
+            TrapError::Hypervisor("shared repoint precedes its physical extent".to_owned())
+        })?;
+        let host_addr = physical_host_addr
+            .checked_add(semantic_offset as usize)
+            .ok_or_else(|| {
+                TrapError::Hypervisor("shared repoint semantic host overflow".to_owned())
+            })?;
+
+        let inventory_backing = alias_inventory_backing
+            .or_else(|| {
+                let registry = alias_registry().lock();
+                registry
+                    .physical_start_rows(physical_ipa)
+                    .iter()
+                    .find(|(_, alias)| alias.physical_size == physical_size)
+                    .map(|(_, alias)| alias.inventory_backing)
+                    .or_else(|| {
+                        registry
+                            .physical_start_rows(physical_ipa)
+                            .first()
+                            .map(|(_, alias)| alias.inventory_backing)
+                    })
+            })
+            .or_else(|| {
+                self.frame_inventory
+                    .lock()
+                    .extents
+                    .get(&(physical_ipa, physical_size as u64))
+                    .map(|extent| extent.backing)
+            })
+            .or_else(|| (!self.persistent_vm_lifecycle).then(HvfVmState::private_backing_identity))
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "shared repoint physical IPA 0x{:x} size {} lacks frame inventory",
+                    physical_ipa, physical_size
+                ))
+            })?;
+
+        let owner_generation =
+            if is_reusable_global_frame_extent(physical_ipa, physical_size as u64) {
+                global_frame_host_owner_generation_in(
+                    self.custody(),
+                    physical_ipa,
+                    physical_size as u64,
+                )
+            } else {
+                mapping_owner_generation
+            };
+
+        if let Some(tables) = self.page_tables_authority().lock().as_mut() {
+            tables
+                .map_aliased(va, target_ipa, len as u64, true)
+                .map_err(|e| {
+                    TrapError::Hypervisor(format!("repoint shared leaf pt edit: {e:?}"))
+                })?;
+        }
+
+        let shared_key_offset = shared_key_offset.saturating_add(semantic_offset);
+        let sharing = GuestMappingSharing::GlobalShared;
+        register_shared_alias(AliasBacking {
+            start: va,
+            ipa: target_ipa,
+            host_addr,
+            size: len,
+            physical_ipa,
+            physical_host_addr,
+            physical_size,
+            perms: u64::from(perms),
+            guest_writable: true,
+            sharing,
+            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
+            inventory_backing,
+            shared_key_base,
+            shared_key_offset,
+            owner_generation,
+        });
+        self.mappings.push(HvfMappedRegion {
+            start: va,
+            ipa: target_ipa,
+            physical_ipa,
+            end: va.saturating_add(len as u64),
+            host_addr: host_addr as *mut u8,
+            size: len,
+            physical_size,
+            perms,
+            memory: None,
+            host_mapping: None,
+            structural_owner: None,
+            stage2_lease: None,
+            is_dynamic_alias: true,
+            sharing,
+            guest_writable: true,
+            shared_key_base,
+            shared_key_offset,
+            owner_generation,
+        });
+        Ok(())
+    }
+
+    /// Walk the guest's live stage-1 page tables to resolve `va`→IPA (the output
+    /// address carrick `hv_vm_map`'d). `None` if unmapped. Used to disambiguate
+    /// overlapping high-VA alias regions in `mapping_for_range[_mut]`.
+    pub(crate) fn translate_va(&self, va: u64) -> Option<u64> {
+        self.page_tables_authority().lock().as_ref()?.translate(va)
+    }
+
     fn live_stage1_names_writable_private_mapping(
         &self,
         custody: &CarrierVmCustody,
@@ -40195,13 +40354,6 @@ impl HvfVmState {
                         ))
             })
             .map(|alias| MappingView::from_alias(&alias))
-    }
-
-    /// Walk the guest's live stage-1 page tables to resolve `va`→IPA (the output
-    /// address carrick `hv_vm_map`'d). `None` if unmapped. Used to disambiguate
-    /// overlapping high-VA alias regions in `mapping_for_range[_mut]`.
-    fn translate_va(&self, va: u64) -> Option<u64> {
-        self.page_tables_authority().lock().as_ref()?.translate(va)
     }
 
     pub(crate) fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
