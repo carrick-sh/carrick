@@ -12598,7 +12598,23 @@ impl SyscallDispatcher {
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(DispatchOutcome::errno(errno));
                 }
-                let bytes = take_pipe_bytes(&pipe, count, status_flags)?;
+                let bytes = match take_pipe_bytes(&pipe, count) {
+                    PipeDrain::Bytes(bytes) => bytes,
+                    PipeDrain::Eof => return Ok(DispatchOutcome::Returned { value: 0 }),
+                    PipeDrain::WouldBlock => {
+                        let in_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
+                            || status_flags & LINUX_O_NONBLOCK != 0;
+                        if in_nonblocking {
+                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                        }
+                        return Ok(complete_wait(wait_for_pipe_readable(
+                            &pipe,
+                            WaitFdAuthority::logical(
+                                this.captured_slot_authority(in_fd.0).ok_or(LINUX_EBADF)?,
+                            ),
+                        )));
+                    }
+                };
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &bytes, cx.memory, tid, out_nonblocking);
                 let DispatchOutcome::Returned { value } = outcome else {
                     Self::restore_pipe_bytes(&pipe, &bytes);
@@ -13061,7 +13077,26 @@ impl SyscallDispatcher {
                     if want == 0 {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    let bytes = take_pipe_bytes(&pipe, want, status_flags)?;
+                    let bytes = match take_pipe_bytes(&pipe, want) {
+                        PipeDrain::Bytes(bytes) => bytes,
+                        PipeDrain::Eof => return Ok(DispatchOutcome::Returned { value: 0 }),
+                        PipeDrain::WouldBlock => {
+                            if nonblocking || status_flags & LINUX_O_NONBLOCK != 0 {
+                                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                            }
+                            let wait = wait_for_pipe_readable(
+                                &pipe,
+                                WaitFdAuthority::logical(
+                                    this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                                ),
+                            );
+                            return Ok(this.complete_wait_fd_authority(
+                                wait,
+                                &this.captured_file_table(),
+                                [fd.0],
+                            ));
+                        }
+                    };
                     let mut off = 0usize;
                     for v in &iovecs {
                         if off >= bytes.len() {

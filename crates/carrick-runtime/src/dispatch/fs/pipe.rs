@@ -225,7 +225,20 @@ pub(crate) fn read_pipe<M: CurrentMmMemory>(
     }
     if nonblocking {
         DispatchOutcome::errno(LINUX_EAGAIN)
-    } else if let Some(host_fd) = pipe.read_poll_fd_locked(&state) {
+    } else {
+        wait_for_pipe_readable_locked(pipe, &state, authority)
+    }
+}
+
+/// Park until `pipe` has bytes (or loses its last writer): the one blocking
+/// read wait every in-memory pipe consumer shares — `read(2)`, `splice(2)`
+/// and `vmsplice(2)` out of a pipe.
+fn wait_for_pipe_readable_locked(
+    pipe: &PipeRef,
+    state: &PipeState,
+    authority: super::WaitFdAuthority,
+) -> DispatchOutcome {
+    if let Some(host_fd) = pipe.read_poll_fd_locked(state) {
         DispatchOutcome::WaitOnFds {
             fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
             timeout: None,
@@ -235,6 +248,16 @@ pub(crate) fn read_pipe<M: CurrentMmMemory>(
     } else {
         DispatchOutcome::errno(LINUX_EMFILE)
     }
+}
+
+/// Park a blocking splice/vmsplice reader on an empty pipe that still has
+/// writers (see [`take_pipe_bytes`]).
+pub(crate) fn wait_for_pipe_readable(
+    pipe: &PipeRef,
+    authority: super::WaitFdAuthority,
+) -> DispatchOutcome {
+    let state = pipe.state.lock();
+    wait_for_pipe_readable_locked(pipe, &state, authority)
 }
 
 #[allow(dead_code)]
@@ -269,20 +292,25 @@ pub(crate) fn read_pipe_bytes(
     Err(LINUX_EAGAIN)
 }
 
-pub(crate) fn take_pipe_bytes(
-    pipe: &PipeRef,
-    length: usize,
-    status_flags: u64,
-) -> Result<Vec<u8>, LinuxErrno> {
+/// What draining an in-memory pipe for `splice`/`vmsplice` found. An empty
+/// pipe is NOT a zero-byte transfer: with writers alive it is a wait (or
+/// EAGAIN), and only with no writer left is it EOF. Collapsing the two into
+/// an empty `Vec` made `splice(pipe -> file)` return 0 whenever the reader
+/// outran the writer, so LTP splice02 ended its copy loop early under load.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PipeDrain {
+    Bytes(Vec<u8>),
+    Eof,
+    WouldBlock,
+}
+
+pub(crate) fn take_pipe_bytes(pipe: &PipeRef, length: usize) -> PipeDrain {
     let mut state = pipe.state.lock();
     if state.buffer.is_empty() {
         if state.writers == 0 {
-            return Ok(Vec::new());
+            return PipeDrain::Eof;
         }
-        if status_flags & LINUX_O_NONBLOCK != 0 {
-            return Err(LINUX_EAGAIN);
-        }
-        return Ok(Vec::new());
+        return PipeDrain::WouldBlock;
     }
 
     let read_len = state.buffer.len().min(length);
@@ -290,7 +318,7 @@ pub(crate) fn take_pipe_bytes(
     pipe.update_readiness_locked(&state);
     drop(state);
     pipe.changed.notify_all();
-    Ok(bytes)
+    PipeDrain::Bytes(bytes)
 }
 
 pub(crate) fn restore_pipe_bytes(pipe: &PipeRef, bytes: &[u8]) {
