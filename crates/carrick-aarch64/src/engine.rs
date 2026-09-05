@@ -900,12 +900,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 // distinguish a genuinely huge address space from the reclaim
                 // leak, and `in_use` rising monotonically toward `capacity`
                 // while `free` stays at 0 IS the leak's signature.
-                let (in_use, free, capacity) = mgr.pool_stats();
+                let (in_use, free, capacity, arenas) = mgr.pool_stats();
                 let engines = Arc::strong_count(&self.page_tables);
                 let pmr = stage1_exclusive;
                 return Err(MemoryError::HostMap(format!(
                     "stage-1 page-table pool exhausted \
-                     (in_use={in_use} free={free} capacity={capacity} \
+                     (in_use={in_use} free={free} capacity={capacity} arenas={arenas} \
                      reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
                 )));
             }
@@ -920,7 +920,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // SAFETY: `host` backs the live page-table region for the whole process
             // lifetime; the manager writes only 8-byte-aligned descriptor slots
             // within `[host, host + size)`.
-            unsafe { mgr.sync_to_host(host) };
+            unsafe {
+                mgr.sync_to_host(|base| {
+                    self.vm
+                        .host_ptr(base, size)
+                        .or_else(|| (base == pt_base).then_some(host))
+                })
+            };
         }
         Ok(outcome)
     }
@@ -995,7 +1001,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
         // SAFETY: `host_ptr` resolved the complete live page-table mapping at
         // `pt_base`, and the manager's base/length were checked above.
-        Ok(unsafe { manager.debug_walk_host(host.cast_const(), va) })
+        Ok(unsafe {
+            manager.debug_walk_host(
+                |base| {
+                    self.vm
+                        .host_ptr(base, size)
+                        .or_else(|| (base == pt_base).then_some(host))
+                },
+                va,
+            )
+        })
     }
 
     /// Flush the stale stage-1 TLB after a host page-descriptor edit by running the

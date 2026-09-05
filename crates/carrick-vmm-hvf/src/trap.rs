@@ -2016,7 +2016,7 @@ mod foreign_mm_tests {
             tables
                 .repoint_preserving_attributes(TEST_VA + 0x1000, 0x9900_0000_0000, 0x1000)
                 .unwrap();
-            unsafe { tables.sync_to_host(table_owner.as_ptr()) };
+            unsafe { tables.sync_to_host((tables.base(), table_owner.as_ptr())) };
         }
 
         // An 8 KiB write from TEST_VA crosses the 4 KiB leaf boundary into the discontinuous leaf
@@ -2151,7 +2151,7 @@ mod foreign_mm_tests {
             tables
                 .map_aliased(alias_va, cow.physical_base().raw(), 0x1000, true)
                 .expect("map stage-1 alias outside compound span");
-            unsafe { tables.sync_to_host(table_owner.as_ptr()) };
+            unsafe { tables.sync_to_host((tables.base(), table_owner.as_ptr())) };
         }
 
         // Prove prepare_write rejects the alias specifically because semantic authority is
@@ -3826,7 +3826,7 @@ mod foreign_mm_tests {
             .expect("prepared child page-table mapping")
             .host_addr;
         unsafe {
-            child_page_tables.sync_to_host(child_page_table_host);
+            child_page_tables.sync_to_host((child_page_tables.base(), child_page_table_host));
         }
         let child_inventory = prepared
             .inventory
@@ -24330,6 +24330,19 @@ fn perform_foreign_cow_transaction(
         .map_err(|_| carrick_hal::ForeignMmTransportError::OwnerStale)?;
         unsafe { page_table_extent.owner.ptr().add(offset) }
     };
+    let resolve_page_table_host = |base: u64| -> Option<*mut u8> {
+        lease_guard
+            .backing
+            .extent_for(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+            .ok()
+            .and_then(|extent| {
+                let offset = usize::try_from(base.saturating_sub(extent.key.0)).ok()?;
+                Some(unsafe { extent.owner.ptr().add(offset) })
+            })
+            .or_else(|| {
+                (base == requested.binding.stage1_root.raw()).then_some(page_table_host_ptr)
+            })
+    };
     let mut recycled = lease.state.cow_rollback_scratch.lock().take();
     let mut rollback = None;
     let page_table_result = (|| {
@@ -24360,7 +24373,7 @@ fn perform_foreign_cow_transaction(
             }
             page_va = page_va.saturating_add(0x1000);
         }
-        unsafe { tables.sync_to_host(page_table_host_ptr) };
+        unsafe { tables.sync_to_host(resolve_page_table_host) };
         // Authenticate the exact live leaves before the TLBI publishes this
         // foreign COW.  Ptrace text authority permits the host copy; it must
         // never grant the guest write access that the source VMA did not have.
@@ -24374,7 +24387,7 @@ fn perform_foreign_cow_transaction(
         let mut page_va = span.va & !0xfff;
         while page_va < span_end {
             let shadow = tables.debug_walk(page_va);
-            let live = unsafe { tables.debug_walk_host(page_table_host_ptr.cast_const(), page_va) };
+            let live = unsafe { tables.debug_walk_host(resolve_page_table_host, page_va) };
             let expected_ipa = new_ipa
                 .checked_add(page_va.saturating_sub(span.va))
                 .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
@@ -24406,7 +24419,7 @@ fn perform_foreign_cow_transaction(
         if let Some(snapshot) = rollback.take() {
             let recycled_manager = {
                 let mut tables = page_tables_authority.lock();
-                unsafe { snapshot.restore_quiesced_snapshot_to_host(page_table_host_ptr) };
+                unsafe { snapshot.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
                 tables.replace(snapshot)
             };
             *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
@@ -24425,7 +24438,7 @@ fn perform_foreign_cow_transaction(
     if let Err(error) = invalidator.invalidate_exact_asid(binding, deadline) {
         let recycled_manager = {
             let mut tables = page_tables_authority.lock();
-            unsafe { rollback.restore_quiesced_snapshot_to_host(page_table_host_ptr) };
+            unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
             tables.replace(rollback)
         };
         *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
@@ -24440,7 +24453,7 @@ fn perform_foreign_cow_transaction(
     if let Err(error) = foreign_cow_failpoint(&lease.state, 4) {
         let recycled_manager = {
             let mut tables = page_tables_authority.lock();
-            unsafe { rollback.restore_quiesced_snapshot_to_host(page_table_host_ptr) };
+            unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
             tables.replace(rollback)
         };
         *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
@@ -24508,7 +24521,7 @@ fn perform_foreign_cow_transaction(
                     .unwrap_or_else(|| std::process::abort());
                 let recycled_manager = {
                     let mut tables = page_tables_authority.lock();
-                    unsafe { rollback.restore_quiesced_snapshot_to_host(page_table_host_ptr) };
+                    unsafe { rollback.restore_quiesced_snapshot_to_host(resolve_page_table_host) };
                     tables.replace(rollback)
                 };
                 *lease.state.cow_rollback_scratch.lock() = recycled_manager;
@@ -25990,8 +26003,20 @@ impl HvfTaskState {
                 let mut va = compound_va;
                 while va < compound_end {
                     let shadow = manager.debug_walk(va);
-                    let live = page_table_host
-                        .map(|host| unsafe { manager.debug_walk_host(host.cast_const(), va) });
+                    let live = page_table_host.map(|host| unsafe {
+                        manager.debug_walk_host(
+                            |base| {
+                                self.mapping_for_range_in(
+                                    custody,
+                                    base,
+                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                                )
+                                .map(|mapping| mapping.host_addr)
+                                .or_else(|| (base == manager.base()).then_some(host))
+                            },
+                            va,
+                        )
+                    });
                     rows.push((
                         va,
                         manager.translate(va),
@@ -28905,11 +28930,11 @@ fn sparse_mmap_stage1_error(
     span: &str,
     error: carrick_mem::page_table::PageTableError,
 ) -> TrapError {
-    let (in_use, free, capacity) = manager.pool_stats();
+    let (in_use, free, capacity, arenas) = manager.pool_stats();
     let (multi_vcpu, exclusive, reclaim_pending) = manager.coalesce_policy();
     TrapError::Hypervisor(format!(
         "plan sparse HVPatch mmap {span} stage-1 output: {error:?} \
-         (in_use={in_use} free={free} capacity={capacity} multi_vcpu={multi_vcpu} \
+         (in_use={in_use} free={free} capacity={capacity} arenas={arenas} multi_vcpu={multi_vcpu} \
          exclusive={exclusive} reclaim_pending={reclaim_pending})"
     ))
 }
@@ -36274,12 +36299,18 @@ impl HvfVmState {
                         "keep sparse HVPatch mmap stage-1 invalid: {error:?}"
                     ))
                 })?;
-            unsafe { manager.sync_to_host(page_table_host) };
+            let manager_base = manager.base();
+            let page_table_resolver = |base: u64| {
+                self.mapping_for_range(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+                    .map(|mapping| mapping.host_addr)
+                    .or_else(|| (base == manager_base).then_some(page_table_host))
+            };
+            unsafe { manager.sync_to_host(page_table_resolver) };
             let mut page = start;
             while page < end {
                 let expected_ipa = semantic_ipa + (page - start);
                 let shadow = manager.debug_walk(page);
-                let live = unsafe { manager.debug_walk_host(page_table_host.cast_const(), page) };
+                let live = unsafe { manager.debug_walk_host(page_table_resolver, page) };
                 let leaf = carrick_mem::page_table::terminal_descriptor(live);
                 if shadow != live
                     || manager.translate(page).is_some()
@@ -36301,10 +36332,19 @@ impl HvfVmState {
                 let page_tables_authority = self.page_tables_authority();
                 let mut page_tables = page_tables_authority.lock();
                 if let Some(manager) = page_tables.as_mut() {
+                    let manager_base = manager.base();
+                    let page_table_resolver = |base: u64| {
+                        self.mapping_for_range(
+                            base,
+                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                        )
+                        .map(|mapping| mapping.host_addr)
+                        .or_else(|| (base == manager_base).then_some(page_table_host))
+                    };
                     // SAFETY: the COW quiesce and topology guards remain held,
                     // so no vCPU can walk or edit this mm while the journalled
                     // pre-images are replayed into its live backing.
-                    unsafe { manager.rollback_undo(page_table_host) };
+                    unsafe { manager.rollback_undo(page_table_resolver) };
                 }
             }
             if let Err(flush_error) = flush_stage1() {
@@ -36735,15 +36775,20 @@ impl HvfVmState {
                         "restrict HVPatch retained reuse leaves: {error:?}"
                     ))
                 })?;
-            unsafe { manager.sync_to_host(page_table_host) };
+            let manager_base = manager.base();
+            let page_table_resolver = |base: u64| {
+                self.mapping_for_range(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+                    .map(|mapping| mapping.host_addr)
+                    .or_else(|| (base == manager_base).then_some(page_table_host))
+            };
+            unsafe { manager.sync_to_host(page_table_resolver) };
             let mut current = page_va;
             while current < span_end {
                 let expected_ipa = new_ipa.checked_add(current - page_va).ok_or_else(|| {
                     TrapError::Hypervisor("retained reuse leaf IPA overflow".to_owned())
                 })?;
                 let shadow = manager.debug_walk(current);
-                let live =
-                    unsafe { manager.debug_walk_host(page_table_host.cast_const(), current) };
+                let live = unsafe { manager.debug_walk_host(page_table_resolver, current) };
                 if shadow != live {
                     return Err(TrapError::Hypervisor(format!(
                         "HVPatch retained reuse shadow/live mismatch at VA 0x{current:x}"
@@ -36768,8 +36813,17 @@ impl HvfVmState {
                 let page_tables_authority = self.page_tables_authority();
                 let mut page_tables = page_tables_authority.lock();
                 if let Some(manager) = page_tables.as_mut() {
+                    let manager_base = manager.base();
+                    let page_table_resolver = |base: u64| {
+                        self.mapping_for_range(
+                            base,
+                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                        )
+                        .map(|mapping| mapping.host_addr)
+                        .or_else(|| (base == manager_base).then_some(page_table_host))
+                    };
                     // SAFETY: the COW quiesce and topology guards remain held.
-                    unsafe { manager.rollback_undo(page_table_host) };
+                    unsafe { manager.rollback_undo(page_table_resolver) };
                 }
             }
             if let Err(flush_error) = flush_stage1() {
@@ -37158,7 +37212,20 @@ impl HvfTaskState {
             TrapError::Hypervisor("HVPatch winner PTE manager is absent".to_owned())
         })?;
         let shadow = manager.debug_walk(page_va);
-        let live = unsafe { manager.debug_walk_host(page_table_host.cast_const(), page_va) };
+        let live = unsafe {
+            manager.debug_walk_host(
+                |base| {
+                    self.mapping_for_range_in(
+                        custody,
+                        base,
+                        carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                    )
+                    .map(|mapping| mapping.host_addr)
+                    .or_else(|| (base == manager.base()).then_some(page_table_host))
+                },
+                page_va,
+            )
+        };
         if shadow != live {
             return Err(TrapError::Hypervisor(format!(
                 "HVPatch winner PTE shadow/live mismatch at VA 0x{page_va:x}: shadow={shadow:x?} live={live:x?}"
@@ -37618,7 +37685,17 @@ impl HvfTaskState {
                     page_va = page_va.saturating_add(PAGE_SIZE);
                 }
             }
-            unsafe { manager.sync_to_host(page_table_host) };
+            let manager_base = manager.base();
+            let page_table_resolver = |base: u64| {
+                self.mapping_for_range_in(
+                    custody,
+                    base,
+                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                )
+                .map(|mapping| mapping.host_addr)
+                .or_else(|| (base == manager_base).then_some(page_table_host))
+            };
+            unsafe { manager.sync_to_host(page_table_resolver) };
 
             // A semantic fork result is not structural proof.  Before the
             // stage-1 TLBI publishes this transaction, authenticate the exact
@@ -37633,8 +37710,7 @@ impl HvfTaskState {
             let mut page_va = span.va;
             while page_va < span_end {
                 let shadow = manager.debug_walk(page_va);
-                let live =
-                    unsafe { manager.debug_walk_host(page_table_host.cast_const(), page_va) };
+                let live = unsafe { manager.debug_walk_host(page_table_resolver, page_va) };
                 if shadow != live {
                     return Err(TrapError::Hypervisor(format!(
                         "HVPatch COW stage-1 shadow/live mismatch at VA 0x{page_va:x}: shadow={shadow:x?} live={live:x?}"
@@ -37690,10 +37766,20 @@ impl HvfTaskState {
                 let page_tables_authority = self.page_tables_authority();
                 let mut page_tables = page_tables_authority.lock();
                 if let Some(manager) = page_tables.as_mut() {
+                    let manager_base = manager.base();
+                    let page_table_resolver = |base: u64| {
+                        self.mapping_for_range_in(
+                            custody,
+                            base,
+                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                        )
+                        .map(|mapping| mapping.host_addr)
+                        .or_else(|| (base == manager_base).then_some(page_table_host))
+                    };
                     // SAFETY: the COW quiesce and topology guards remain held;
                     // no vCPU can walk or edit this mm while the journalled
                     // pre-images are replayed into its live backing.
-                    unsafe { manager.rollback_undo(page_table_host) };
+                    unsafe { manager.rollback_undo(page_table_resolver) };
                 }
             }
             if let Err(flush_error) = flush_stage1() {
@@ -38394,6 +38480,12 @@ impl HvfVmState {
         let manager = page_tables.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("deferred COW protection has no page-table manager".to_owned())
         })?;
+        let manager_base = manager.base();
+        let page_table_resolver = |base: u64| {
+            self.mapping_for_range(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+                .map(|mapping| mapping.host_addr)
+                .or_else(|| (base == manager_base).then_some(page_table_host))
+        };
         let mut authenticated = Vec::with_capacity(pending.len());
         for receipt in pending {
             let receipt_end = receipt.va.checked_add(receipt.len as u64).ok_or_else(|| {
@@ -38417,7 +38509,7 @@ impl HvfVmState {
                         TrapError::Hypervisor("deferred COW receipt IPA range overflow".to_owned())
                     })?;
                 let shadow = manager.debug_walk(page);
-                let live = unsafe { manager.debug_walk_host(page_table_host.cast_const(), page) };
+                let live = unsafe { manager.debug_walk_host(page_table_resolver, page) };
                 let leaf = carrick_mem::page_table::terminal_descriptor(live);
                 let translated = if must_be_valid {
                     manager.translate(page)
@@ -41835,11 +41927,11 @@ impl HvfTaskState {
                 // for the syscall path. "OutOfTables" alone cannot distinguish a
                 // legitimately huge address space from a pool the child clone was
                 // refused permission to sweep.
-                let (in_use, free, capacity) = page_tables.pool_stats();
+                let (in_use, free, capacity, arenas) = page_tables.pool_stats();
                 let (multi_vcpu, exclusive, reclaim_pending) = page_tables.coalesce_policy();
                 TrapError::Hypervisor(format!(
                     "map hvpatch child VA 0x{:x} to global/root-slot IPA 0x{ipa:x}: {error:?} \
-                     (in_use={in_use} free={free} capacity={capacity} multi_vcpu={multi_vcpu} \
+                     (in_use={in_use} free={free} capacity={capacity} arenas={arenas} multi_vcpu={multi_vcpu} \
                      exclusive={exclusive} reclaim_pending={reclaim_pending})",
                     mapping.start
                 ))
@@ -42046,9 +42138,18 @@ impl HvfTaskState {
                 table_bytes.len(),
             );
         }
+        let table_host_ptr = table.host.ptr().cast_const();
+        let page_table_resolver =
+            carrick_mem::page_table::const_resolver(|base: u64| -> Option<*const u8> {
+                mappings
+                    .iter()
+                    .find(|m| m.ipa == base)
+                    .map(|m| m.host.ptr().cast_const())
+                    .or_else(|| (base == page_tables.base()).then_some(table_host_ptr))
+            });
         for (va, expected_ipa, expected_ap, expected_non_global) in child_pte_receipts {
             let shadow = page_tables.debug_walk(va);
-            let live = unsafe { page_tables.debug_walk_host(table.host.ptr().cast_const(), va) };
+            let live = unsafe { page_tables.debug_walk_host(page_table_resolver, va) };
             let live_leaf = carrick_mem::page_table::terminal_descriptor(live);
             if shadow != live
                 // An unmodified CLONE_VM graph may retain an L1/L2 block: its
