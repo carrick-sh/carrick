@@ -471,6 +471,23 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     ) {
     }
 
+    /// Ensure any stage-1 extension table arenas in `manager` have real stage-2 backing
+    /// before `sync_to_host` publishes descriptor stores to them.
+    fn publish_stage1_extension_arenas(
+        &mut self,
+        _manager: &PageTableManager,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Retire and unmap stage-1 extension table arenas belonging to `manager`.
+    fn retire_stage1_extension_arenas(
+        &mut self,
+        _manager: &mut PageTableManager,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     // HVPatch-only K1 frame-inventory transaction seam. Defaults preserve the
     // mature HVF VMM and KVM lanes exactly: they report no inventory authority
     // and are never called by their runtime paths.
