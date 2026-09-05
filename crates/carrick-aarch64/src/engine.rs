@@ -1690,20 +1690,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         &mut self,
         address: u64,
         len: usize,
-        sharing: MappingSharing,
+        _sharing: MappingSharing,
     ) -> Result<(), MemoryError> {
-        if sharing == MappingSharing::Private
-            && self.vm.sparse_mmap_arena_enabled()
-            && address >= carrick_mem::memory::LINUX_MMAP_BASE
-            && address.checked_add(len as u64).is_some_and(|end| {
-                end <= carrick_mem::memory::LINUX_MMAP_BASE + carrick_mem::memory::mmap_arena_size()
-            })
-        {
-            // HVPatch sparse arena retires private frames at munmap and allocates
-            // pristine zeroed compounds on demand on first touch/fault.
-            // Skipping the eager physical scrub keeps mmap service latency O(1).
-            return Ok(());
-        }
         self.zero_backing(address, len)
     }
 

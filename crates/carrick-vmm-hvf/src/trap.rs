@@ -12416,6 +12416,16 @@ fn split_local_mapping_rows_for_unmap(mappings: &mut Vec<HvfMappedRegion>, va: u
             tails.pop();
         }
     }
+    mappings.retain(|row| {
+        if !row.is_dynamic_alias {
+            return true;
+        }
+        let row_size = semantic_extent_size(row.start, row.end);
+        let Some(row_end) = row.start.checked_add(row_size as u64) else {
+            return true;
+        };
+        !(row.start >= va && row_end <= end)
+    });
     mappings.append(&mut tails);
 }
 
@@ -37392,52 +37402,21 @@ impl HvfVmState {
         let view_end = va + view_len;
         let file_pages_end = align_up(view_end, PAGE_SIZE).unwrap_or(end).min(end);
 
-        // Holes vs overlapping existing mappings:
-        // A plain MAP_PRIVATE file mmap lands in a hole. A MAP_FIXED over an
-        // existing private mapping (such as the ELF loader's PROT_NONE reservation)
-        // retires the old backing for the range so it takes the lazy view too.
-        // If any overlapping mapping or process-scoped alias is non-private or
-        // non-dynamic (e.g. shared memory), refuse the lowering so dispatcher falls back.
-        let overlapping_aliases = alias_registry().lock().overlapping_process_aliases(
-            va,
-            len,
-            self.mm_root_slot,
-            self.container_root,
-        );
-        let has_non_retirable_alias = overlapping_aliases.iter().any(|(_, alias)| {
-            alias.sharing != GuestMappingSharing::Private
-                || !alias_backing_is_live(alias.physical_host_addr)
-        });
-        if has_non_retirable_alias {
-            return Ok(false);
-        }
-
-        let has_non_retirable_mapping = self.mappings.iter().any(|m| {
-            m.start < end
-                && m.end > va
-                && global_frame_region_owner_matches_in(self.custody(), m)
-                && (!m.is_dynamic_alias || m.sharing != GuestMappingSharing::Private)
-        });
-        if has_non_retirable_mapping {
-            return Ok(false);
-        }
-
-        if !overlapping_aliases.is_empty()
-            || self.mappings.iter().any(|m| {
-                m.start < end
-                    && m.end > va
-                    && m.is_dynamic_alias
-                    && global_frame_region_owner_matches_in(self.custody(), m)
-            })
+        // The whole range must be a hole: an overlapping mapping or process-scoped
+        // alias anywhere inside it means `MAP_FIXED` over occupied pages, which the
+        // eager path replaces byte-wise in place.
+        // Single O(log n) range query on the process alias registry + local mappings.
+        if !alias_registry()
+            .lock()
+            .overlapping_process_aliases(va, len, self.mm_root_slot, self.container_root)
+            .is_empty()
         {
-            self.unregister_process_alias(va, len)?;
-            self.mappings.retain(|m| {
-                !(m.is_dynamic_alias
-                    && m.sharing == GuestMappingSharing::Private
-                    && m.start >= va
-                    && m.end <= end)
-            });
-            flush_stage1()?;
+            return Ok(false);
+        }
+        if self.mappings.iter().any(|m| {
+            m.start < end && m.end > va && global_frame_region_owner_matches_in(self.custody(), m)
+        }) {
+            return Ok(false);
         }
 
         let mut current = va;
