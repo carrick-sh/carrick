@@ -652,7 +652,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fifo_beacon.rs",
-      "line": 381,
+      "line": 387,
       "categories": [
         "epoll"
       ],
