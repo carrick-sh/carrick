@@ -565,3 +565,22 @@ All twelve suites touched by the fd/net/pty/pipe landings now MATCH.
 `fanotify01`/`fanotify06` match as broken-on-both-sides; they are candidates
 for the under-privileged-oracle inversion and need a Docker privilege check
 before anything else.
+
+## Two findings from gating the mmap-cost branch
+
+- **Guest-reachable crash on the default rootfs lane, pre-existing on main.**
+  `mapfixedfork` and `mmapcluster` run cleanly under `--fs host` (the shard
+  gate's lane) but kill the guest on the in-memory rootfs:
+  `borrowed structural mapping at IPA 0x9800000000 lost its owner`
+  (`LINUX_PRIVATE_OVERLAY_BASE`) in the fork projection plan. A
+  `MAP_FIXED|MAP_PRIVATE` over a shared-aperture VA records its overlay
+  mapping without a structural owner on that lane. Delegated as
+  `overlay-owner` (worktree `.worktrees/agy-overlay-owner-sep05`); the gate
+  must run both lanes for the memory probes from now on.
+- **`preemptsigstorm` is a throughput assertion in disguise.** Its
+  `iters_floor` demanded 1000 iterations per worker inside a 2.5 s wall
+  window, so a contended host (the branch gate running beside the main shard
+  gate) failed it with every other line true, and five quiet reruns matched.
+  The probe now keeps the storm running until every worker has crossed the
+  floor (watchdog-bounded), which makes the line the progress invariant it
+  was documented as. Rebuild and re-bless pending the Docker phase.
