@@ -511,11 +511,6 @@ use crate::linux_abi::{
     LINUX_SOL_UDP,
     LINUX_SS_DISABLE,
     LINUX_SS_ONSTACK,
-    LINUX_STA_DEL,
-    LINUX_STA_INS,
-    LINUX_STA_NANO,
-    LINUX_STA_RONLY,
-    LINUX_STA_UNSYNC,
     LINUX_STATX_BASIC_STATS,
     LINUX_STATX_RESERVED,
     LINUX_TASK_COMM_LEN,
@@ -624,6 +619,7 @@ use crate::linux_abi::{
     LinuxTimeval,
     LinuxTimex,
     LinuxTimexModes,
+    LinuxTimexStatus,
     LinuxTimezone,
     LinuxTms,
     LinuxUtsname,
@@ -10102,12 +10098,12 @@ fn linux_timeval_usec_is_valid(tv: LinuxTimeval) -> bool {
     (0..1_000_000).contains(&usec)
 }
 
-fn linux_time_state_from_status(status: i32) -> i64 {
-    if (status & LINUX_STA_UNSYNC) != 0 {
+fn linux_time_state_from_status(status: LinuxTimexStatus) -> i64 {
+    if status.contains(LinuxTimexStatus::UNSYNC) {
         LINUX_TIME_ERROR
-    } else if (status & LINUX_STA_INS) != 0 {
+    } else if status.contains(LinuxTimexStatus::INS) {
         LINUX_TIME_INS
-    } else if (status & LINUX_STA_DEL) != 0 {
+    } else if status.contains(LinuxTimexStatus::DEL) {
         LINUX_TIME_DEL
     } else {
         LINUX_TIME_OK
@@ -10146,8 +10142,8 @@ fn linux_timex_from_state(
     }
 }
 
-fn linux_timex_time(duration: Duration, status: i32) -> LinuxTimeval {
-    let sub = if (status & LINUX_STA_NANO) != 0 {
+fn linux_timex_time(duration: Duration, status: LinuxTimexStatus) -> LinuxTimeval {
+    let sub = if status.contains(LinuxTimexStatus::NANO) {
         i64::from(duration.subsec_nanos())
     } else {
         i64::from(duration.subsec_micros())
@@ -10179,10 +10175,11 @@ fn adjtimex_bootstrap(
     }
     if timex.modes == 0 {
         let state = clock.adjtimex_state();
+        let status = LinuxTimexStatus::from_bits_retain(state.status);
         let now = clock.realtime_now();
-        let time = linux_timex_time(now, state.status);
+        let time = linux_timex_time(now, status);
         let current = linux_timex_from_state(time, &state);
-        let value = linux_time_state_from_status(state.status);
+        let value = linux_time_state_from_status(status);
         return match write_kernel_struct(memory, address, &current) {
             DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned { value },
             other => other,
@@ -10190,12 +10187,13 @@ fn adjtimex_bootstrap(
     }
     if modes == LinuxTimexModes::OFFSET_SS_READ {
         let state = clock.adjtimex_state();
+        let status = LinuxTimexStatus::from_bits_retain(state.status);
         let now = clock.realtime_now();
-        let time = linux_timex_time(now, state.status);
+        let time = linux_timex_time(now, status);
         let mut current = linux_timex_from_state(time, &state);
         current.modes = timex.modes;
         current.offset = 0;
-        let value = linux_time_state_from_status(state.status);
+        let value = linux_time_state_from_status(status);
         return match write_kernel_struct(memory, address, &current) {
             DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned { value },
             other => other,
@@ -10271,7 +10269,8 @@ fn adjtimex_bootstrap(
         } else if modes.contains(LinuxTimexModes::MICRO) {
             false
         } else {
-            (clock.adjtimex_state().status & LINUX_STA_NANO) != 0
+            LinuxTimexStatus::from_bits_retain(clock.adjtimex_state().status)
+                .contains(LinuxTimexStatus::NANO)
         };
         let max_sub = if is_nano { 1_000_000_000 } else { 1_000_000 };
         if timex.time.tv_usec < 0 || timex.time.tv_usec >= max_sub {
@@ -10337,13 +10336,21 @@ fn adjtimex_bootstrap(
             state.esterror = timex.esterror;
         }
         if modes.contains(LinuxTimexModes::STATUS) {
-            state.status = (state.status & LINUX_STA_RONLY) | (timex.status & !LINUX_STA_RONLY);
+            let current_status = LinuxTimexStatus::from_bits_retain(state.status);
+            let requested_status = LinuxTimexStatus::from_bits_retain(timex.status);
+            let merged = (current_status & LinuxTimexStatus::RONLY)
+                | (requested_status & !LinuxTimexStatus::RONLY);
+            state.status = merged.bits();
         }
         if modes.contains(LinuxTimexModes::NANO) {
-            state.status |= LINUX_STA_NANO;
+            let mut s = LinuxTimexStatus::from_bits_retain(state.status);
+            s.insert(LinuxTimexStatus::NANO);
+            state.status = s.bits();
         }
         if modes.contains(LinuxTimexModes::MICRO) {
-            state.status &= !LINUX_STA_NANO;
+            let mut s = LinuxTimexStatus::from_bits_retain(state.status);
+            s.remove(LinuxTimexStatus::NANO);
+            state.status = s.bits();
         }
         if modes.contains(LinuxTimexModes::TIMECONST) {
             state.constant = timex.constant;
@@ -10357,11 +10364,12 @@ fn adjtimex_bootstrap(
         state.clone()
     });
 
+    let status = LinuxTimexStatus::from_bits_retain(updated_state.status);
     let now = clock.realtime_now();
-    let time = linux_timex_time(now, updated_state.status);
+    let time = linux_timex_time(now, status);
     let mut current = linux_timex_from_state(time, &updated_state);
     current.modes = timex.modes;
-    let value = linux_time_state_from_status(updated_state.status);
+    let value = linux_time_state_from_status(status);
     match write_kernel_struct(memory, address, &current) {
         DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned { value },
         other => other,
