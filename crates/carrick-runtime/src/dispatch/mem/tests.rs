@@ -8354,7 +8354,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
             .core_file_mappings
             .iter()
             .find(|m| m.start == dst && m.end == dst + PAGE)
-            .expect("dst core file mapping");
+            .expect("dst core file entry");
         assert_eq!(dst_mapping.file_page_offset, 1);
 
         assert!(
@@ -8425,7 +8425,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
             .core_file_mappings
             .iter()
             .find(|m| m.start == src && m.end == src + PAGE)
-            .expect("src core file mapping");
+            .expect("src core file entry");
         assert_eq!(src_mapping.file_page_offset, 1);
     }
 }

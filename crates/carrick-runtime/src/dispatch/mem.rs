@@ -6021,6 +6021,59 @@ impl SyscallDispatcher {
                     }
                 }
             }
+            let publish_shared_file_alias_outcome =
+                |host_alias_dispatch: crate::dispatch::HostAliasDispatchGuard<'_>,
+                 va: u64,
+                 ipa: u64,
+                 new_size: u64,
+                 pf: LinuxProtFlags,
+                 host_prot: i32,
+                 file_offset: u64,
+                 file_page_offset: Option<u64>,
+                 droppable: bool,
+                 path: String,
+                 semantic_vmas: Option<Vec<SemanticVma>>,
+                 bus_fault: Option<(u64, u64)>,
+                 read_only_shared_file: bool,
+                 description: Arc<crate::kernel::FileDescription>,
+                 dup_fd: i32|
+                 -> DispatchOutcome {
+                    let transaction =
+                        host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                            start: va,
+                            len: new_size,
+                            prot: pf,
+                            sharing: ProcMapSharing::Shared,
+                            path,
+                            file_page_offset,
+                            droppable,
+                            semantic_vmas,
+                            locked: None,
+                            resident: true,
+                            bus_fault,
+                            write_sealed_shared: false,
+                            read_only_shared_file,
+                            secretmem: false,
+                            writable_memfd: None,
+                            shared_file_alias: Some(description),
+                        }));
+                    DispatchOutcome::MapHostAlias {
+                        success_retval: va as i64,
+                        transaction,
+                        va: GuestVa(va),
+                        ipa: Gpa(ipa),
+                        len: new_size,
+                        payload: Vec::new(),
+                        backing: HostAliasBacking::File {
+                            fd: HostAliasOwnedFd::from(unsafe { OwnedFd::from_raw_fd(dup_fd) }),
+                            offset: file_offset as libc::off_t,
+                            host_prot,
+                            sharing: HostAliasSharing::Shared,
+                        },
+                        prot: pf.bits(),
+                        prot_none: pf.is_empty(),
+                    }
+                };
             if is_shared_file_fixed {
                 let Some(description) =
                     this.shared_file_alias_description(old_address.0, old_size)
@@ -6148,42 +6201,23 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
 
-                let transaction =
-                    host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-                        start: va,
-                        len: new_size,
-                        prot: pf,
-                        sharing: ProcMapSharing::Shared,
-                        path: source_metadata.path.clone(),
-                        file_page_offset,
-                        droppable: source_metadata.droppable,
-                        semantic_vmas: Some(semantic_vmas),
-                        locked: None,
-                        resident: true,
-                        bus_fault,
-                        write_sealed_shared: false,
-                        read_only_shared_file,
-                        secretmem: false,
-                        writable_memfd: None,
-                        shared_file_alias: Some(Arc::clone(&description)),
-                    }));
-
-                return Ok(DispatchOutcome::MapHostAlias {
-                    success_retval: va as i64,
-                    transaction,
-                    va: GuestVa(va),
-                    ipa: Gpa(ipa),
-                    len: new_size,
-                    payload: Vec::new(),
-                    backing: HostAliasBacking::File {
-                        fd: HostAliasOwnedFd::from(unsafe { OwnedFd::from_raw_fd(dup_fd) }),
-                        offset: file_offset as libc::off_t,
-                        host_prot,
-                        sharing: HostAliasSharing::Shared,
-                    },
-                    prot: pf.bits(),
-                    prot_none: pf.is_empty(),
-                });
+                return Ok(publish_shared_file_alias_outcome(
+                    host_alias_dispatch,
+                    va,
+                    ipa,
+                    new_size,
+                    pf,
+                    host_prot,
+                    file_offset,
+                    file_page_offset,
+                    source_metadata.droppable,
+                    source_metadata.path.clone(),
+                    Some(semantic_vmas),
+                    bus_fault,
+                    read_only_shared_file,
+                    Arc::clone(&description),
+                    dup_fd,
+                ));
             }
             let shared_aperture_alloc = this.mem()
                 .lock()
@@ -6450,49 +6484,28 @@ impl SyscallDispatcher {
                         mark_range_unmapped(memory, old_address.0, old_len);
                         this.remove_mapping_metadata(old_address.0, old_size);
                     }
-                    let transaction =
-                        host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-                            start: va,
-                            len: new_size,
-                            prot: pf,
-                            sharing: ProcMapSharing::Shared,
-                            path: source_metadata.path.clone(),
-                            file_page_offset: source_metadata.file_page_offset,
-                            droppable: source_metadata.droppable,
-                            semantic_vmas: Some(
-                                source_metadata
-                                    .fork_semantics
-                                    .project(va, new_size)
-                                    .unwrap_or_else(|| std::process::abort()),
-                            ),
-                            locked: None,
-                            resident: true,
-                            bus_fault: None,
-                            write_sealed_shared: false,
-                            read_only_shared_file,
-                            secretmem: false,
-                            writable_memfd: None,
-                            shared_file_alias: Some(Arc::clone(&description)),
-                        }));
-                    return Ok(DispatchOutcome::MapHostAlias {
-                        success_retval: va as i64,
-                        transaction,
-                        va: GuestVa(va),
-                        ipa: Gpa(ipa),
-                        len: new_size,
-                        payload: Vec::new(),
-                        backing: HostAliasBacking::File {
-                            // SAFETY: `dup_fd` is the successful, uniquely-owned
-                            // descriptor created just above and is transferred
-                            // into the non-cloneable outcome exactly once.
-                            fd: HostAliasOwnedFd::from(unsafe { OwnedFd::from_raw_fd(dup_fd) }),
-                            offset: file_offset as libc::off_t,
-                            host_prot,
-                            sharing: HostAliasSharing::Shared,
-                        },
-                        prot: pf.bits(),
-                        prot_none: pf.is_empty(),
-                    });
+                    return Ok(publish_shared_file_alias_outcome(
+                        host_alias_dispatch,
+                        va,
+                        ipa,
+                        new_size,
+                        pf,
+                        host_prot,
+                        file_offset,
+                        source_metadata.file_page_offset,
+                        source_metadata.droppable,
+                        source_metadata.path.clone(),
+                        Some(
+                            source_metadata
+                                .fork_semantics
+                                .project(va, new_size)
+                                .unwrap_or_else(|| std::process::abort()),
+                        ),
+                        None,
+                        read_only_shared_file,
+                        Arc::clone(&description),
+                        dup_fd,
+                    ));
                 }
                 if let Some(bus_start) = shared_file_alias_grow {
                     // Leave the live alias exactly as it is — it IS the shared
