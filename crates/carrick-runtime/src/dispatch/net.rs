@@ -8614,8 +8614,16 @@ impl SyscallDispatcher {
             } else {
                 host_addr
             };
+            // MSG_MORE corks only the IP transports (UDP datagrams and TCP
+            // streams). The native-arm64 Docker oracle for `socketcredmore`
+            // shows an AF_UNIX SOCK_DGRAM send with MSG_MORE going out at once.
             let is_msg_more = carrick_abi::LinuxMsgFlags::from_bits_retain(flags)
-                .contains(carrick_abi::LinuxMsgFlags::MORE);
+                .contains(carrick_abi::LinuxMsgFlags::MORE)
+                && this
+                    .socket_guest_domain_type_and_protocol(fd)
+                    .is_some_and(|(family, _, _)| {
+                        family == LINUX_AF_INET || family == LINUX_AF_INET6
+                    });
             let (is_cork_enabled, has_pending_cork) = if let Some(open_file) = this.open_file(fd)
                 && let Some(open) = open_file.description.read()
                 && let OpenDescription::HostSocket { cork_enabled, cork_buffer, .. } = &*open
@@ -9930,8 +9938,12 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
         };
+        // MSG_MORE corks only the IP transports; see the sendto arm.
         let is_msg_more = carrick_abi::LinuxMsgFlags::from_bits_retain(flags)
-            .contains(carrick_abi::LinuxMsgFlags::MORE);
+            .contains(carrick_abi::LinuxMsgFlags::MORE)
+            && self
+                .socket_guest_domain_type_and_protocol(fd)
+                .is_some_and(|(family, _, _)| family == LINUX_AF_INET || family == LINUX_AF_INET6);
         let (is_cork_enabled, has_pending_cork) = if let Some(open_file) = self.open_file(fd)
             && let Some(open) = open_file.description.read()
             && let OpenDescription::HostSocket {
