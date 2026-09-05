@@ -799,3 +799,11 @@ shard gate stay green. `processvmsparse` is registered as the tracked gap
 it is until its fix lands (worker `processvm` dispatched); the page-table
 growth branch has the deferred-install fix (director-written) under its
 hardware gate.
+
+Root cause of the probe-directory symlink incident, found while wiring a
+new probe: `git add -A crates conformance-probes` in a worktree swept that
+worktree's `conformance-probes/target` symlink into `4a9cb845e`; when the
+branch fast-forwarded and the main tree checked it out, git replaced the
+real probe directory with a symlink pointing at itself. The path is now
+untracked and ignored (`842ad99dc`). Lesson: never `git add -A` a directory
+that carries a per-worktree convenience symlink; add files by name.
