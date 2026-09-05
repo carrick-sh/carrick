@@ -281,13 +281,14 @@ fn main() {
     // bounded DIFF). Stopping on the wall clock alone made the floor a
     // load-sensitive throughput assertion that a contended host failed with
     // every other line true.
-    let floor_deadline = now_ns() + (WATCHDOG_MS - STORM_MS - 2_000) * 1_000_000;
+    let mut floor_wait_ms = 0;
     while ITERS
         .iter()
         .any(|c| c.load(Ordering::Relaxed) < ITER_FLOOR)
-        && now_ns() < floor_deadline
+        && floor_wait_ms < WATCHDOG_MS - STORM_MS - 2_000
     {
         sleep_wall(10);
+        floor_wait_ms += 10;
     }
     STOP.store(true, Ordering::SeqCst);
     let zero = libc::itimerval {
