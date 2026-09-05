@@ -1323,3 +1323,7 @@ quiet-host number follows. Fork/COW probes MATCH; `sh -c '/bin/true'` rc=0.
 Open from the worker: `AliasRegistry::private_owned_containing_physical`
 can panic on a reversed `BTreeMap` range when the scope's widest recorded
 physical size is smaller than the query length; guard to land on main.
+- **Gate on the fork-table-copy landing** (`8abf4648b` + reconcile): green,
+  all three shards, the dedicated runners and the CLI suite. The alias
+  reversed-range panic the worker reported is fixed (`ed304a27b`, red-first
+  test `containing_physical_query_wider_than_any_recorded_row_does_not_panic`).
