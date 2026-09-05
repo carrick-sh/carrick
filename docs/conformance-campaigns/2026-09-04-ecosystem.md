@@ -687,3 +687,24 @@ declared. `fanotify01`/`fanotify06` need a loop block device
 (`tst_device: Failed to acquire device`), which neither Docker's default
 container nor carrick provides; they stay matched-broken until carrick has
 a block-device story, and are not mis-filed as runtime gaps.
+
+## LTP tail read on 98f705902
+
+- `mremap06`: `mremap(MREMAP_MAYMOVE|MREMAP_FIXED)` of one page inside a
+  `MAP_SHARED` file mapping to a fixed address in the same mapping fails
+  (TBROK at the first mremap). Needs a probe (`mremapfixedshared`) and a
+  runtime fix for fixed-destination moves of shared file-backed pages.
+- `process_vm_readv03`: the remote read returns 18368 of 131072 bytes (the
+  child TBROKs, 17 passed). A cross-process read that stops short at what
+  looks like an iov or page boundary; reduce with a probe before fixing.
+- `splice02` passes 1/1 when run directly; its ledger row is stale.
+- `setsockopt02` needs `AF_PACKET` (`SOL_PACKET`/`PACKET_VERSION`), an
+  unimplemented family: a real gap, not a privilege inversion.
+- `clock_adjtime01` reports `tst_test.c:825: TBROK: Invalid option` under
+  carrick; the harness invocation passes no option, so something in the
+  argv/env the guest sees differs. Unattributed.
+
+Worker hygiene: two long-lived Antigravity conversations (`pt-pool`,
+`overlay-owner`) started timing out on every turn with nothing committed
+once their context grew; both were replaced by fresh conversations on the
+same worktrees with narrower briefs (`pt-pool-wire`, `overlay-read`).
