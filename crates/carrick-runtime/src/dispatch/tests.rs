@@ -6517,8 +6517,9 @@ mod container_clock_tests {
             .task()
             .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
 
-        // Out-of-range freq
-        for bad_freq in [32_768_001, -32_768_001] {
+        // Oversized freq is CLAMPED to +/-MAXFREQ, not refused (native
+        // arm64 oracle, probe `adjtimexmodel` `oversized_freq_accepted`).
+        for (bad_freq, clamped) in [(35_000_000, 32_768_000), (-35_000_000, -32_768_000)] {
             let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
             timex.modes = LINUX_ADJ_FREQUENCY;
             timex.freq = bad_freq;
@@ -6526,7 +6527,10 @@ mod container_clock_tests {
             let outcome = dispatcher
                 .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
                 .unwrap();
-            assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+            assert_ne!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+            let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+            let read_freq = { read.freq };
+            assert_eq!(read_freq, clamped, "freq {bad_freq} must clamp to {clamped}");
         }
 
         // Out-of-range singleshot offset
@@ -6541,7 +6545,8 @@ mod container_clock_tests {
             assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
         }
 
-        // Invalid status bits
+        // Undefined status bits are IGNORED, not refused (oracle accepts
+        // `1 << 20`; `unknown_status_bits_accepted`).
         let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
         timex.modes = LINUX_ADJ_STATUS;
         timex.status = 1 << 20;
@@ -6549,7 +6554,10 @@ mod container_clock_tests {
         let outcome = dispatcher
             .dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &reporter)
             .unwrap();
-        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+        assert_ne!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+        let read = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+        let read_status = { read.status };
+        assert_eq!(read_status & (1 << 20), 0, "undefined status bit must be dropped");
 
         // Invalid SETOFFSET tv_usec
         for bad_usec in [-1, 1_000_000] {

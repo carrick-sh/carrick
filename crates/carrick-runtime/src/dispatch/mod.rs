@@ -10238,14 +10238,9 @@ fn adjtimex_bootstrap(
             };
         }
     }
-    if modes.contains(LinuxTimexModes::FREQUENCY) {
-        let requested_freq = timex.freq;
-        if !(-32_768_000..=32_768_000).contains(&requested_freq) {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            };
-        }
-    }
+    // An out-of-range `freq` is CLAMPED to +/-MAXFREQ, not refused: the
+    // native arm64 oracle accepts 35_000_000 (probe `adjtimexmodel`,
+    // `oversized_freq_accepted`). The clamp happens where the value is stored.
     if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG) {
         let requested_offset = timex.offset;
         if !(-131_071..=131_071).contains(&requested_offset) {
@@ -10254,13 +10249,9 @@ fn adjtimex_bootstrap(
             };
         }
     }
-    if modes.contains(LinuxTimexModes::STATUS) {
-        if (timex.status as u32 & !0xffff) != 0 {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            };
-        }
-    }
+    // Unknown `status` bits are ignored, not refused: the oracle accepts
+    // `1 << 20` (`unknown_status_bits_accepted`). Only the defined, writable
+    // bits are stored where the value lands.
 
     let mut step_realtime_ns: Option<i64> = None;
     if modes.contains(LinuxTimexModes::SETOFFSET) {
@@ -10327,7 +10318,8 @@ fn adjtimex_bootstrap(
             }
         }
         if modes.contains(LinuxTimexModes::FREQUENCY) {
-            state.freq = timex.freq;
+            // Linux clamps to +/-MAXFREQ (scaled ppm) instead of refusing.
+            state.freq = timex.freq.clamp(-32_768_000, 32_768_000);
         }
         if modes.contains(LinuxTimexModes::MAXERROR) {
             state.maxerror = timex.maxerror;
@@ -10337,7 +10329,9 @@ fn adjtimex_bootstrap(
         }
         if modes.contains(LinuxTimexModes::STATUS) {
             let current_status = LinuxTimexStatus::from_bits_retain(state.status);
-            let requested_status = LinuxTimexStatus::from_bits_retain(timex.status);
+            // `from_bits_truncate`: bits Linux does not define are dropped,
+            // not refused (the oracle accepts `1 << 20`).
+            let requested_status = LinuxTimexStatus::from_bits_truncate(timex.status);
             let merged = (current_status & LinuxTimexStatus::RONLY)
                 | (requested_status & !LinuxTimexStatus::RONLY);
             state.status = merged.bits();
