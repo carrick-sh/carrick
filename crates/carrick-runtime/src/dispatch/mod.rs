@@ -799,6 +799,11 @@ pub(crate) enum WaitFdGuard {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InternalWaitKind {
     CarrierControl,
+    /// A blocking FIFO `open` parked on the peer-presence pipe owned by
+    /// `fifo_beacon`. The guest has no fd for the FIFO yet, so there is no
+    /// exact file description to pin; the parked-opener guard owns the host
+    /// state for the wait's lifetime.
+    FifoOpen,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -910,7 +915,7 @@ impl WaitFds {
         Self {
             fds: vec![crate::io_wait::WaitFd::anchored(fd, events)],
             guards: vec![WaitFdGuard::ParkedOpener(token)],
-            authority: WaitFdAuthority::Missing,
+            authority: WaitFdAuthority::internal(InternalWaitKind::FifoOpen),
         }
     }
 
