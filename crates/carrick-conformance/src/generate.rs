@@ -143,6 +143,12 @@ const DOCKER_FLAG_OVERRIDES: &[(&str, &[&str])] = &[
     // settimeofday02 and stime02 exercise rejection paths and must remain
     // without SYS_TIME.
     ("ltp-clock_adjtime01", &["--cap-add", "SYS_TIME"]),
+    // adjtimex01/02 adjust the clock too; without CAP_SYS_TIME the oracle
+    // fails every modifying mode with EPERM and the rows read fail-on-both-
+    // sides (the under-privileged-oracle inversion). With it the native
+    // arm64 oracle passes 2/2 and 7/7.
+    ("ltp-adjtimex01", &["--cap-add", "SYS_TIME"]),
+    ("ltp-adjtimex02", &["--cap-add", "SYS_TIME"]),
     ("ltp-clock_adjtime02", &["--cap-add", "SYS_TIME"]),
     ("ltp-clock_settime01", &["--cap-add", "SYS_TIME"]),
     ("ltp-clock_settime02", &["--cap-add", "SYS_TIME"]),
