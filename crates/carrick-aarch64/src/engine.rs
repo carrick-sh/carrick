@@ -926,6 +926,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                                     "sync stage-1 page tables to host failed: {error:?}"
                                 ))
                             })?;
+                            editor.manager.record_populated_prefixes(|base, prefix| {
+                                self.vm.record_stage1_populated_prefix(base, prefix);
+                            });
                         }
                         Ok(())
                     }

@@ -484,6 +484,9 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Ok(())
     }
 
+    /// Record the populated prefix (high-water mark in bytes) for a stage-1 table arena at `base`.
+    fn record_stage1_populated_prefix(&mut self, _base: u64, _prefix: usize) {}
+
     // HVPatch-only K1 frame-inventory transaction seam. Defaults preserve the
     // mature HVF VMM and KVM lanes exactly: they report no inventory authority
     // and are never called by their runtime paths.
