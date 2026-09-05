@@ -76,7 +76,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#2",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 9478,
+      "line": 9506,
       "item": "SyscallDispatcher::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -85,7 +85,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::readlinkat::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 15048,
+      "line": 15076,
       "item": "SyscallDispatcher::readlinkat",
       "category": "proc",
       "expression": ".proc.lock()",
