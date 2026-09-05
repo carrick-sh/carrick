@@ -1106,3 +1106,40 @@ mapping row), and a rebind heuristic that stole a shared authority's manager
   topology-lock bypass on the fault path (`is_fork_in_flight`), a
   frame-pool/state lock-order inversion against VM destroy, swallowed pool
   creation failures, and an out-of-fence test edit.
+
+## 2026-09-05 afternoon: frame pool landed; fork's fixed cost attributed
+
+Frame pool (`61daae8b4`, worker frame-pool, two review rounds: the first
+round's `is_fork_in_flight` topology-lock bypass was a check-then-act race
+and was removed; a frame-pool/state lock inversion against VM destroy was
+fixed with a two-thread test). A/B on one binary, `CARRICK_FRAME_POOL=0`
+as the off arm, 30-iteration `fork`+`_exit`+`waitpid` fixture
+(`scratchpad/forkloop`, musl static; child touches N 4 KiB pages), host
+under worker compile load so absolute numbers are "suggests":
+
+| fixture | carrick pool on | carrick pool off | Docker |
+|---|---|---|---|
+| fork+wait, child touches 1 page | 0.62 ms | 0.64 ms | 0.08 ms |
+| child touches 64 pages | 0.76 ms | 0.90 ms | 0.16 ms |
+| child touches 512 pages (128 COW faults) | 2.04 ms | 2.77 ms | 0.67 ms |
+| CPython `os.fork`+`_exit`+`waitpid` | 2.4 ms | 2.6 ms | 0.17 ms |
+
+Per COW fault: ~11 µs with the pool, ~17 µs without, ~1.2 µs on Linux.
+The pool met the per-fault target; the remaining pathology is the FIXED
+cost per fork, 0.54 ms against Linux's 0.08 ms. `carrick trace -s
+scripts/dtrace/hvpatch-phase4-fork-process-spec-stages.d` on the 1-page
+fixture attributes it: the process-spec stage is ~0.4 of the ~0.49 ms
+fork, and inside it phase 2 "parent table clone" is 0.19–0.24 ms for
+3.5 MiB copied (the 1.75 MiB stage-1 image cloned once for the child and
+once as the parent's rollback pre-image) and phase 7 "table publish" is
+~0.1 ms for 2 MiB (a fresh `map_shared_anon` root-slot backing per fork
+plus a full-image `restore_quiesced_snapshot_to_host`). Linux copies only
+populated page tables, tens of KiB for a small process. Next lever, briefed
+in `scratchpad/brief-fork-table-copy.md`: copy and publish only the
+populated prefix of each table arena and take root-slot backing from a
+pre-mapped slot pool, the same shape as the frame pool.
+
+Also today: the probe gate's `docker_compose_shared_network_namespace_smoke`
+failed once with an empty `docker compose down` error and passed alone in
+5.5 s; it runs in the same test binary as carrick-lane smokes, so Docker and
+carrick overlap there. Open harness item.
