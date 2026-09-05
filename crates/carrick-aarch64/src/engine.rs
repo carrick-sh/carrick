@@ -3441,8 +3441,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let Some(rollback) = self.pending_process_fork.take() else {
             return Ok(());
         };
+        let mut restored = Some(rollback.page_tables);
         self.pt_edit_and_flush(|manager| {
-            *manager = rollback.page_tables;
+            // The pre-fork image is a clone: carry the live manager's arena
+            // source and adopted extension arenas over, or the parent could
+            // never grow again after a refused fork (CPython's `-v` uname
+            // fork lost the root's source this way).
+            if let Some(mut image) = restored.take() {
+                image.adopt_live_extension_state(manager);
+                *manager = image;
+            }
             Ok(PageTableApplyOutcome::new(true, true))
         })
         .map_err(|error| {
