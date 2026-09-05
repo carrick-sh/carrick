@@ -414,6 +414,13 @@ pub trait HostArenaResolver {
     fn host_const_ptr_for_base(&self, base: u64) -> Option<*const u8> {
         self.host_ptr_for_base(base).map(|p| p.cast_const())
     }
+
+    /// Record the populated prefix (high-water mark in bytes) for the arena at `base`.
+    ///
+    /// Pooled root slot handles track this so that on recycling, any host bytes an
+    /// occupant wrote during its lifetime are guaranteed to be zero-filled before
+    /// the slot is handed to the next occupant.
+    fn record_populated_prefix(&self, _base: u64, _prefix: usize) {}
 }
 
 impl HostArenaResolver for (u64, *mut u8) {
@@ -948,8 +955,12 @@ impl PageTableManager {
         resolver: impl HostArenaResolver,
     ) -> Result<(), PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
+        let mut touched_arenas = [false; 8];
         for (loc, is_ptr) in self.dirty.drain(..) {
             let arena = &self.arenas[loc.arena];
+            if loc.arena < touched_arenas.len() {
+                touched_arenas[loc.arena] = true;
+            }
             let mut a = [0u8; 8];
             a.copy_from_slice(&arena.bytes[loc.offset..loc.offset + 8]);
             let v = u64::from_le_bytes(a);
@@ -969,6 +980,14 @@ impl PageTableManager {
             }
         }
         fence(Ordering::SeqCst);
+        for (i, &touched) in touched_arenas.iter().enumerate() {
+            if touched && i < self.arenas.len() {
+                resolver.record_populated_prefix(
+                    self.arenas[i].base,
+                    (self.arenas[i].next_free as usize).min(self.arenas[i].capacity),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1060,9 +1079,17 @@ impl PageTableManager {
                 unsafe {
                     std::ptr::copy_nonoverlapping(arena.bytes.as_ptr(), host, prefix_len);
                 }
+                resolver.record_populated_prefix(arena.base, prefix_len);
             }
         }
         fence(Ordering::SeqCst);
+    }
+
+    /// Record the populated prefix across all arenas using `recorder`.
+    pub fn record_populated_prefixes(&self, mut recorder: impl FnMut(u64, usize)) {
+        for arena in &self.arenas {
+            recorder(arena.base, (arena.next_free as usize).min(arena.capacity));
+        }
     }
 
     /// Location of a PA known to live inside one of the page-table arenas.
@@ -1096,6 +1123,20 @@ impl PageTableManager {
             capacity as u32,
             self.arenas.len() as u32,
         )
+    }
+
+    /// Allocate one spare table page from the primary arena and return its base PA.
+    /// Test helper for verifying table growth semantics.
+    pub fn alloc_table_for_test(&mut self) -> Result<u64, PageTableError> {
+        self.alloc_table(None)
+    }
+
+    /// Write one descriptor into the table at `pa` and mark it dirty for sync_to_host.
+    /// Test helper for verifying table descriptor sync.
+    pub fn write_desc_for_test(&mut self, pa: u64, desc: u64) -> Result<(), PageTableError> {
+        let loc = self.pa_to_loc(pa)?;
+        self.write_desc(loc, desc);
+        Ok(())
     }
 
     /// Restore a pre-transaction image over `live` without losing what the

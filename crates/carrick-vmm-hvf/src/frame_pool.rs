@@ -562,6 +562,19 @@ impl PooledRootSlotHandle {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_mem::page_table::HostArenaResolver for &PooledRootSlotHandle {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        (base == self.ipa()).then_some(self.as_mut_ptr())
+    }
+
+    fn record_populated_prefix(&self, base: u64, prefix: usize) {
+        if base == self.ipa() {
+            PooledRootSlotHandle::record_populated_prefix(self, prefix);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for PooledRootSlotHandle {
     fn drop(&mut self) {
         self.pool.recycle(
@@ -737,5 +750,75 @@ mod tests {
         assert!(pool.contains_ipa(base + ROOT_SLOT_SIZE as u64));
         assert!(pool.contains_ipa(base + size - 1));
         assert!(!pool.contains_ipa(base + size));
+    }
+
+    #[test]
+    fn root_slot_pool_recycled_slot_growth_beyond_published_prefix_is_zeroed() {
+        let pool = Arc::new(PreMappedRootSlotPool::new_test_fixture(4));
+        let s0 = pool.allocate_slot().expect("checkout s0");
+        let s0_ipa = s0.ipa();
+
+        // Occupant A: initializes with prefix P (48 KiB).
+        let mut bytes_a = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
+        bytes_a[48 * 1024 - 1] = 1;
+        let mut mgr_a = crate::page_table::PageTableManager::new(bytes_a, s0_ipa);
+        let prefix_a = mgr_a.copied_bytes() as usize;
+        assert_eq!(prefix_a, 48 * 1024);
+        s0.record_populated_prefix(prefix_a);
+
+        // Occupant A grows its image by 1 table beyond P.
+        let table_a = mgr_a.alloc_table_for_test().expect("alloc_table for A");
+        assert_eq!(table_a, s0_ipa + (48 * 1024) as u64);
+
+        // Occupant A writes descriptors across this new table and syncs to host.
+        for i in 0..512u64 {
+            mgr_a
+                .write_desc_for_test(table_a + i * 8, 0xdead_beef_dead_beef)
+                .expect("write desc");
+        }
+        unsafe { mgr_a.sync_to_host(&s0).expect("sync_to_host for A") };
+
+        // Occupant A retires (drops handle). Slot is recycled.
+        drop(s0);
+
+        // Occupant B checks out the recycled slot.
+        let s1 = pool
+            .allocate_slot_at(s0_ipa)
+            .expect("reacquire recycled slot s0");
+
+        // Occupant B publishes an image with smaller prefix P2 (32 KiB).
+        let mut bytes_b = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
+        bytes_b[32 * 1024 - 1] = 1;
+        let mut mgr_b = crate::page_table::PageTableManager::new(bytes_b, s0_ipa);
+        let prefix_b = mgr_b.copied_bytes() as usize;
+        assert_eq!(prefix_b, 32 * 1024);
+        s1.record_populated_prefix(prefix_b);
+
+        // Occupant B grows into A's old table region (allocates up to 48 KiB).
+        let mut table_b = 0;
+        while mgr_b.copied_bytes() <= (48 * 1024) as u64 {
+            table_b = mgr_b.alloc_table_for_test().expect("alloc_table for B");
+        }
+        assert_eq!(table_b, table_a, "B must allocate at exact offset A used");
+
+        // Occupant B writes 1 descriptor at word 0 and syncs to host.
+        mgr_b
+            .write_desc_for_test(table_b, 0xcafe_babe_cafe_babe)
+            .expect("write word 0");
+        unsafe { mgr_b.sync_to_host(&s1).expect("sync_to_host for B") };
+
+        // Assert every word of B's new table on HOST is zero except word 0.
+        let offset = (table_a - s0_ipa) as usize;
+        let host_words =
+            unsafe { std::slice::from_raw_parts(s1.as_ptr().add(offset) as *const u64, 512) };
+        assert_eq!(
+            host_words[0], 0xcafe_babe_cafe_babe,
+            "word 0 was written by B"
+        );
+        assert!(
+            host_words[1..512].iter().all(|&w| w == 0),
+            "recycled slot must zero unwritten words in newly allocated table; found stale descriptors: {:?}",
+            host_words[1..8].to_vec()
+        );
     }
 }

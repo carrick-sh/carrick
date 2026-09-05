@@ -1406,6 +1406,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.retire_stage1_extension_arenas(manager)
     }
 
+    fn record_stage1_populated_prefix(&mut self, base: u64, prefix: usize) {
+        self.state.record_stage1_populated_prefix(base, prefix);
+    }
+
     // ── memory windows + stage-2 ──
 
     fn map_stage2(

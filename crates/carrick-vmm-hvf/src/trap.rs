@@ -27048,6 +27048,41 @@ pub(crate) fn swap_hvpatch_task_state(live: &mut HvfTaskState, parked: &mut HvfT
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Copy, Clone)]
+pub(crate) struct HvfPageTableResolver<'a> {
+    task: &'a HvfTaskState,
+    manager_base: u64,
+    primary_host: Option<*mut u8>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> carrick_mem::page_table::HostArenaResolver for HvfPageTableResolver<'a> {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        self.primary_host
+            .filter(|_| base == self.manager_base)
+            // Extension arenas are published as structural owners keyed by
+            // exactly (base, 2 MiB): O(1). The mapping-row scan below is
+            // O(rows) and made every page-table edit of a process with
+            // thousands of mappings quadratic (pagetablegrow spent minutes
+            // in `live_pt_debug_walk`); it stays only as the last resort.
+            .or_else(|| {
+                self.task.mm_access.structural_owner_host_ptr(
+                    base,
+                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                )
+            })
+            .or_else(|| {
+                self.task
+                    .host_ptr_for_ipa(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
+            })
+    }
+
+    fn record_populated_prefix(&self, base: u64, prefix: usize) {
+        self.task.record_stage1_populated_prefix(base, prefix);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
     fn custody(&self) -> &CarrierVmCustody {
         #[cfg(not(test))]
@@ -27684,31 +27719,31 @@ impl HvfTaskState {
         Some(unsafe { mapping.host_addr.add(offset) })
     }
 
+    pub(crate) fn record_stage1_populated_prefix(&self, base: u64, prefix: usize) {
+        if let Some(owner) = self
+            .mm_access
+            .structural_owners
+            .read()
+            .get(&(base, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize))
+        {
+            owner.record_populated_prefix(prefix);
+        }
+        if let Some(ref auth) = *self.mm_access.mm_root_stage2.lock() {
+            if auth.root_slot.0 == base {
+                auth.owner.record_populated_prefix(prefix);
+            }
+        }
+    }
+
     pub(crate) fn page_table_resolver<'a>(
         &'a self,
         manager_base: u64,
         primary_host: Option<*mut u8>,
-    ) -> impl carrick_mem::page_table::HostArenaResolver + Copy + 'a {
-        move |base: u64| -> Option<*mut u8> {
-            primary_host
-                .filter(|_| base == manager_base)
-                // Extension arenas are published as structural owners keyed by
-                // exactly (base, 2 MiB): O(1). The mapping-row scan below is
-                // O(rows) and made every page-table edit of a process with
-                // thousands of mappings quadratic (pagetablegrow spent minutes
-                // in `live_pt_debug_walk`); it stays only as the last resort.
-                .or_else(|| {
-                    self.mm_access.structural_owner_host_ptr(
-                        base,
-                        carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                    )
-                })
-                .or_else(|| {
-                    self.host_ptr_for_ipa(
-                        base,
-                        carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                    )
-                })
+    ) -> HvfPageTableResolver<'a> {
+        HvfPageTableResolver {
+            task: self,
+            manager_base,
+            primary_host,
         }
     }
 
@@ -39740,8 +39775,12 @@ impl HvfVmState {
         &'a self,
         manager_base: u64,
         primary_host: Option<*mut u8>,
-    ) -> impl carrick_mem::page_table::HostArenaResolver + Copy + 'a {
+    ) -> HvfPageTableResolver<'a> {
         self.task.page_table_resolver(manager_base, primary_host)
+    }
+
+    pub(crate) fn record_stage1_populated_prefix(&mut self, base: u64, prefix: usize) {
+        self.task.record_stage1_populated_prefix(base, prefix);
     }
 
     pub(crate) fn publish_stage1_extension_arenas(
