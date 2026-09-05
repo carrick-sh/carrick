@@ -152,6 +152,14 @@ pub(crate) fn foreground_process_group(
     }
 }
 
+/// Whether `session` already has a controlling terminal (the launch tty or
+/// any guest pty). Linux refuses `TIOCSCTTY` with EPERM for a session leader
+/// that already has one.
+pub(crate) fn session_owns_tty(session: SessionId) -> bool {
+    let reg = slot().lock();
+    reg.launch.session == Some(session) || reg.ptys.values().any(|s| s.session == Some(session))
+}
+
 pub(crate) fn session(tty: TtyKey) -> Option<SessionId> {
     let reg = slot().lock();
     match tty {

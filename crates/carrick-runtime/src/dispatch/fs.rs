@@ -9076,6 +9076,14 @@ impl SyscallDispatcher {
                         if session.raw() != cx.kernel.task().key().id.raw() {
                             return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
+                        // A session leader that already has a controlling
+                        // terminal cannot take a second one (Linux: EPERM).
+                        if crate::kernel::tty::session(crate::kernel::tty::TtyKey::Pty(role.index))
+                            != Some(session)
+                            && crate::kernel::tty::session_owns_tty(session)
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                        }
                         let force = arg != 0;
                         let group = cx.kernel.task().process_group();
                         match crate::kernel::tty::attach_pty(
@@ -9121,14 +9129,34 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_TIOCNOTTY => {
-                        if this.pty_is_controlling(role.index) {
-                            crate::vfs::devpts::set_controlling_index(this.pty_table(), None);
-                            let _ = cx.kernel.kernel().tty_detach(cx.kernel);
+                        // Only the session that owns this pty as its controlling
+                        // terminal may give it up; anyone else gets ENOTTY
+                        // (oracle `ptyflagmatrix`: `ctty_tiocnotty_errno=25`).
+                        let session = cx.kernel.task().session();
+                        let key = crate::kernel::tty::TtyKey::Pty(role.index);
+                        if crate::kernel::tty::session(key) != Some(session) {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
                         }
-                        crate::kernel::tty::detach_if_session(
-                            crate::kernel::tty::TtyKey::Pty(role.index),
-                            cx.kernel.task().session(),
-                        );
+                        // A session LEADER giving up its terminal hangs up the
+                        // foreground process group (SIGHUP, then SIGCONT) before
+                        // the terminal is detached; a non-leader only drops its
+                        // own reference, which this per-session model has no
+                        // separate state for.
+                        if session.raw() == cx.kernel.task().key().id.raw() {
+                            crate::kernel::tty::route_foreground_signal_to_tty(
+                                key,
+                                crate::linux_abi::LINUX_SIGHUP,
+                            );
+                            crate::kernel::tty::route_foreground_signal_to_tty(
+                                key,
+                                crate::linux_abi::LINUX_SIGCONT,
+                            );
+                            if this.pty_is_controlling(role.index) {
+                                crate::vfs::devpts::set_controlling_index(this.pty_table(), None);
+                                let _ = cx.kernel.kernel().tty_detach(cx.kernel);
+                            }
+                            crate::kernel::tty::detach_if_session(key, session);
+                        }
                         DispatchOutcome::Returned { value: 0 }
                     }
                     LINUX_TIOCSIG => {
