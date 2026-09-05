@@ -2248,6 +2248,10 @@ mod hvpatch_guest_probe_abi {
             "stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));",
             "fn hvpatch__stale__stage1__retry(_: u64, _: u32, _: i32) {}",
             "stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));",
+            "fn stage1__arena__bind(_: u64, _: u32, _: u32, _: u32) {}",
+            "stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));",
+            "fn stage1__arena__install(_: u32, _: u32, _: u32, _: u64) {}",
+            "stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));",
             "fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}",
             "stub!(hvpatch_guest_address_space(event: super::HvpatchGuestAddressSpace));",
         ] {
@@ -4795,6 +4799,16 @@ mod real {
         /// of receiving SIGSEGV. Args: FAR, decoded access (0 read, 1 write,
         /// 2 execute), guest TID.
         fn hvpatch__stale__stage1__retry(_: u64, _: u32, _: i32) {}
+        /// Stage-1 page-table authority (re)bound into a VMM task state. Args:
+        /// authority pointer (identifies the shared `Arc`), manager present,
+        /// manager has a table arena source, arena count. Fires only at bind
+        /// (process/thread bring-up, exec rebuild), never on the edit path.
+        fn stage1__arena__bind(_: u64, _: u32, _: u32, _: u32) {}
+        /// A table arena source reached an engine. Args: site (1 = manager
+        /// present, 2 = eager build from live tables, 3 = deferred, 4 = applied
+        /// by the lazy edit build, 5 = applied by the exec rebuild), applied,
+        /// deferred, authority pointer. Fires only at those events.
+        fn stage1__arena__install(_: u32, _: u32, _: u32, _: u64) {}
         /// HVPatch frame-COW intent. Emitted immediately before identity/data.
         /// Args: 0 guest-visible, 1 backing maintenance, 2 privileged internal.
         fn hvpatch__frame__cow__intent(_: u32) {}
@@ -5931,6 +5945,18 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32) {
         carrick_usdt::hvpatch__stale__stage1__retry!(|| (far, access, tid));
+    }
+
+    /// See the `stage1__arena__bind` provider doc. Bind-time only.
+    #[inline(never)]
+    pub fn stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32) {
+        carrick_usdt::stage1__arena__bind!(|| (authority, present, has_source, arenas));
+    }
+
+    /// See the `stage1__arena__install` provider doc. Install-time only.
+    #[inline(never)]
+    pub fn stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64) {
+        carrick_usdt::stage1__arena__install!(|| (site, applied, deferred, authority));
     }
 
     #[inline(never)]
@@ -7825,6 +7851,8 @@ mod stub {
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
     stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));
+    stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));
+    stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));
     stub!(hvpatch_frame_cow(event: super::HvpatchFrameCow));
     stub!(hvpatch_frame_cow_trigger(event: super::HvpatchFrameCowTrigger));
     stub!(hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]));

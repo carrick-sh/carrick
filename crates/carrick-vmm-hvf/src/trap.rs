@@ -35164,12 +35164,21 @@ impl HvfVmState {
     ) {
         {
             let guard = page_tables.lock();
+            let present = guard.is_some();
+            let has_source = guard.as_ref().is_some_and(|m| m.has_arena_source());
+            let arenas = guard.as_ref().map_or(0, |m| m.pool_stats().3);
+            carrick_observability::probes::stage1_arena_bind(
+                std::sync::Arc::as_ptr(&page_tables) as u64,
+                u32::from(present),
+                u32::from(has_source),
+                arenas,
+            );
             tracing::debug!(
                 target: "carrick::stage1_arena",
                 authority = std::sync::Arc::as_ptr(&page_tables) as usize,
-                present = guard.is_some(),
-                has_source = guard.as_ref().is_some_and(|m| m.has_arena_source()),
-                arenas = guard.as_ref().map_or(0, |m| m.pool_stats().3),
+                present,
+                has_source,
+                arenas,
                 "bind stage-1 page tables"
             );
         }
