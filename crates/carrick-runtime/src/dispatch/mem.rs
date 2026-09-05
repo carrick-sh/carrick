@@ -6220,10 +6220,14 @@ impl SyscallDispatcher {
                 };
                 let delta = old_address.0.saturating_sub(alias_entry.range.start().raw());
                 let source_file_offset = alias_entry.row_file_offset.saturating_add(delta);
-                let destination_leaf_ipa = alias_entry
-                    .extent_base
-                    .raw()
-                    .saturating_add(source_file_offset);
+                let destination_leaf_ipa = memory
+                    .translate_va(old_address.0)
+                    .unwrap_or_else(|| {
+                        alias_entry
+                            .extent_base
+                            .raw()
+                            .saturating_add(source_file_offset)
+                    });
 
                 let pf = source_metadata.prot;
                 let desc = &alias_entry.description;
@@ -6280,7 +6284,9 @@ impl SyscallDispatcher {
                 {
                     return fail(
                         SharedFileFixedMremapError::RepointSharedLeaf { source: err },
-                        Some(alias_entry.extent_base),
+                        Some(carrick_guest_mem::Gpa(
+                            destination_leaf_ipa.saturating_sub(source_file_offset),
+                        )),
                         Some(source_file_offset),
                     );
                 }
@@ -6334,14 +6340,18 @@ impl SyscallDispatcher {
                             va,
                             end: va.saturating_add(new_size),
                         },
-                        Some(alias_entry.extent_base),
+                        Some(carrick_guest_mem::Gpa(
+                            destination_leaf_ipa.saturating_sub(source_file_offset),
+                        )),
                         Some(source_file_offset),
                     );
                 };
                 let new_alias_entry = SharedFileAliasEntry {
                     range: dest_range,
                     description: Arc::clone(&alias_entry.description),
-                    extent_base: alias_entry.extent_base,
+                    extent_base: carrick_guest_mem::Gpa(
+                        destination_leaf_ipa.saturating_sub(source_file_offset),
+                    ),
                     row_file_offset: source_file_offset,
                 };
 

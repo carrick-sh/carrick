@@ -6483,12 +6483,39 @@ mod foreign_mm_tests {
             guest_writable: true,
             sharing: GuestMappingSharing::GlobalShared,
             ownership_scope: AliasOwnershipScope::Global,
-            inventory_backing: InventoryBackingIdentity::Private(9_608),
+            inventory_backing: InventoryBackingIdentity::SharedFile {
+                device: 1,
+                inode: 2,
+                offset: 0,
+                length: size as u64,
+            },
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation: generation,
         };
         register_shared_alias(own);
+
+        let region = HvfMappedRegion {
+            start: va,
+            ipa: extent_base,
+            physical_ipa: extent_base,
+            end: va + size as u64,
+            host_addr: host_addr as *mut u8,
+            size,
+            physical_size: size,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            structural_owner: None,
+            stage2_lease: None,
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation,
+        };
+        task.mappings.push(region);
 
         let mut tables = crate::page_table::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
@@ -6500,8 +6527,20 @@ mod foreign_mm_tests {
         *task.page_tables_authority().lock() = Some(tables);
 
         let repoint_va = 0x6001_030000_u64;
-        let repoint_ipa = extent_base + 0x1000;
         let repoint_len = 0x1000;
+
+        // An unauthenticated disconnected semantic IPA (such as LINUX_ALIAS_IPA_BASE + 0x1000)
+        // has no physical owner in the VMM's global frame stage-2 arena.
+        let disconnected_ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x1000;
+        let disconnected_err = task
+            .publish_shared_repoint(repoint_va, disconnected_ipa, repoint_len)
+            .unwrap_err();
+        assert!(
+            disconnected_err
+                .to_string()
+                .contains("has no physical owner"),
+            "expected unauthenticated semantic IPA to fail physical owner lookup: {disconnected_err}"
+        );
 
         // Repointing outside any extent still fails with "no physical owner".
         let outside_ipa = extent_base + (size as u64) + 0x1000;
@@ -6513,7 +6552,14 @@ mod foreign_mm_tests {
             "expected no physical owner error, got: {outside_err}"
         );
 
-        // Repointing a 4 KiB sub-page at offset 0x1000 succeeds.
+        // Authenticating through the live stage-1 translation yields the authoritative
+        // physical leaf IPA (extent_base + 0x1000).
+        let repoint_ipa = task
+            .translate_va(va + 0x1000)
+            .expect("translate source subpage through live stage-1 page table");
+        assert_eq!(repoint_ipa, extent_base + 0x1000);
+
+        // Repointing a 4 KiB sub-page at offset 0x1000 succeeds via the covering production mapping.
         task.publish_shared_repoint(repoint_va, repoint_ipa, repoint_len)
             .expect("repoint 4 KiB sub-page of covering shared extent");
 
@@ -6523,6 +6569,13 @@ mod foreign_mm_tests {
             Some(repoint_ipa),
             "stage-1 page table leaf must point to extent_base + 0x1000"
         );
+        let repointed = task.mappings.last().expect("repointed mapping");
+        assert_eq!(repointed.start, repoint_va);
+        assert_eq!(repointed.ipa, repoint_ipa);
+        assert_eq!(repointed.physical_ipa, extent_base);
+        assert_eq!(repointed.size, repoint_len);
+        assert_eq!(repointed.physical_size, size);
+        assert_eq!(repointed.owner_generation, generation);
 
         assert!(
             retire_global_frame_host_owner_if_generation(extent_base, size as u64, generation)
