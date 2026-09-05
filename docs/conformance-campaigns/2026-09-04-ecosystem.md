@@ -463,3 +463,33 @@ Method: exact suite invocation under `carrick trace` (in-process libdtrace)
 for the syscall shape first, then a controlled single-variable quiet-host
 comparison per fix. Traces land under
 `target/conformance/ecosystem-sep04-receipts/perf/`.
+
+## Anonymous-memory cost, attributed (2026-09-04 late)
+
+`perf_arena_churn` (CPython arena shape) serially under Docker and Carrick,
+two runs each: untouched map+unmap 1 µs vs 60 µs; map, touch 64 pages,
+unmap 52 µs vs 325 µs; the same with 64 arenas live 54 µs vs 550 µs.
+`guest-mmap-shape.d` places 417 ms wall / 412 ms CPU of the run inside the
+6,064 `mmap(256 KiB, anon)` dispatches (69 µs CPU each).
+
+A symbolized carrier CPU ranking (`perf/arena-cpu-ranking4.txt`; taken
+with the dtrace CLI grabbing the carrier directly because `carrick trace`
+still prints `ustack()` frames unsymbolized for progeny, a tool gap now
+noted in the ranking script) attributes the run: 28% first-touch faults
+(`resident_fault_plan` → `protect_range` of one 4 KiB leaf → the EL1
+stage-1 TLBI trampoline on a vCPU, per page), 29% guest execution, 8.5%
+`memset` in `zero_guest_backing` on every anonymous mmap, 6% an
+`AliasRegistry::process_visible_ordered` scan inside that scrub (grows
+with live mappings), 3% `hv_vm_unmap`+`munmap` per unmap. Delegated as
+Antigravity `mmap-cost` with three ordered levers: no TLBI for an
+invalid→valid leaf edit (the architecture never caches an invalid
+translation), no scrub of fresh backing (kernel zero-fill), and no
+registry scan on the mmap path. Correctness gate: the mmap/COW probe
+set; performance gate: `perf_arena_churn` per lever.
+
+`socketcredmore`'s Docker oracle corrected two assumptions in the MSG_MORE
+work: Linux does not cork AF_UNIX datagrams and discards a corked UDP
+datagram on close. `pipeblockedge` needed `CAP_SYS_ADMIN` in both lanes
+(fanotify_init) to stop its fanotify lines being vacuous; under that
+privilege the pipe branch's runtime loses the whole probe output (a
+fanotify blocking-read park that never wakes), still open.
