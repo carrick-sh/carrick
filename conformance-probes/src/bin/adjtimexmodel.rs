@@ -109,7 +109,8 @@ fn main() {
     tx.modes = ADJ_FREQUENCY;
     tx.freq = 35_000_000;
     let (rc, err) = clock_adjtime_call(&mut tx);
-    report!(bad_freq_einval = rc == -1 && err == libc::EINVAL);
+    // Linux clamps an oversized freq to MAXFREQ rather than refusing it.
+    report!(oversized_freq_accepted = rc >= 0);
 
     let mut tx: libc::timex = unsafe { core::mem::zeroed() };
     tx.modes = ADJ_TICK;
@@ -121,7 +122,8 @@ fn main() {
     tx.modes = ADJ_STATUS;
     tx.status = 1 << 20;
     let (rc, err) = clock_adjtime_call(&mut tx);
-    report!(bad_status_einval = rc == -1 && err == libc::EINVAL);
+    // Undefined status bits are ignored, not refused.
+    report!(unknown_status_bits_accepted = rc >= 0);
 
     let mut tx: libc::timex = unsafe { core::mem::zeroed() };
     tx.modes = ADJ_SETOFFSET;
