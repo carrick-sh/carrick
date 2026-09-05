@@ -1,0 +1,6 @@
+e8a720cc9877a236
+blocking_splice_waited_for_writer=true
+file_holds_spliced_bytes=true
+splice_after_last_writer_is_eof=true
+nonblock_splice_empty_pipe_eagain=true
+nonblock_vmsplice_empty_pipe_eagain=true
