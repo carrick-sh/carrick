@@ -7603,22 +7603,23 @@ impl SyscallDispatcher {
         // duplicate to trigger the host kernel's process-lock release without
         // shortening the shared description's actual fd lifetime. OFD locks are
         // tied to the open file description and survive a non-final dup close.
-        let classic_lock_release_fd = match open_file.description.read().as_deref() {
-            Some(OpenDescription::HostFile { host_fd, .. }) => Some(host_fd.raw()),
-            _ => None,
-        };
-        if let Some(host_fd) = classic_lock_release_fd {
-            let duped = unsafe { libc::dup(host_fd) };
-            if duped >= 0 {
-                unsafe {
-                    libc::close(duped);
-                }
-            }
-        }
-
         // Only act when THIS is the last reference (the host fd is actually
         // closing) — a dup'd fd sharing the Arc keeps the writer/pty alive.
         let last_ref = open_file.description.fd_ref_count() == 1;
+        if !last_ref {
+            let classic_lock_release_fd = match open_file.description.read().as_deref() {
+                Some(OpenDescription::HostFile { host_fd, .. }) => Some(host_fd.raw()),
+                _ => None,
+            };
+            if let Some(host_fd) = classic_lock_release_fd {
+                let duped = unsafe { libc::dup(host_fd) };
+                if duped >= 0 {
+                    unsafe {
+                        libc::close(duped);
+                    }
+                }
+            }
+        }
         if last_ref
             && carrick_signal_core::fasync::any_armed()
             && let Some(pipe_id) = self.fasync_pipe_id_for_open_file(open_file)

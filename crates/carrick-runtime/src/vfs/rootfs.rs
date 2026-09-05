@@ -39,7 +39,7 @@
 //! contract the dispatcher relies on.
 
 use crate::fs_backend::{
-    FsBackend, ImmutableHostFileOpen, MemoryBackend, OverlayEntry, OverlayEntryKind,
+    FsBackend, ImmutableHostFileOpen, MemoryBackend, OverlayEntry, OverlayEntryKind, RealStat,
     SharedFileContents,
 };
 use crate::linux_abi::LinuxErrno;
@@ -64,6 +64,7 @@ use super::{
 pub struct RootFsVfs {
     pub rootfs: Option<RootFs>,
     pub overlay: Box<dyn FsBackend>,
+    pub dentry_cache: Arc<crate::vfs::DentryCache>,
 }
 
 /// Richer result from [`RootFsVfs::open_for_dispatch`]. Carries the
@@ -138,6 +139,7 @@ impl RootFsVfs {
         Self {
             rootfs: None,
             overlay: Box::new(MemoryBackend::new()),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
         }
     }
 
@@ -145,13 +147,37 @@ impl RootFsVfs {
         Self {
             rootfs: Some(rootfs),
             overlay: Box::new(MemoryBackend::new()),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
         }
     }
 
     /// Swap the writable overlay. Returns the previously-installed
     /// backend so the caller can decide what to do with it.
     pub fn set_overlay(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
+        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(backend.is_shared()));
         std::mem::replace(&mut self.overlay, backend)
+    }
+
+    /// Read stat for `path` via the dentry cache.
+    pub fn dentry_stat(&self, path: &str, follow: bool) -> Result<RealStat, LinuxErrno> {
+        self.dentry_cache
+            .stat(path, follow, &*self.overlay, self.rootfs.as_ref())
+    }
+
+    /// Read link target for `path` via the dentry cache.
+    pub fn dentry_readlink(&self, path: &str) -> Result<String, LinuxErrno> {
+        self.dentry_cache
+            .readlink(path, &*self.overlay, self.rootfs.as_ref())
+    }
+
+    /// Fast non-creating open for a regular file via the dentry cache.
+    pub fn dentry_fast_open(
+        &self,
+        path: &str,
+        write: bool,
+    ) -> Result<(std::os::fd::OwnedFd, RealStat, String), LinuxErrno> {
+        self.dentry_cache
+            .fast_open(path, write, &*self.overlay, self.rootfs.as_ref())
     }
 
     /// Non-following metadata lookup (the `lstat`/`AT_SYMLINK_NOFOLLOW`
@@ -1787,6 +1813,7 @@ mod tests {
         let v = RootFsVfs {
             rootfs: Some(rootfs_with_files()),
             overlay: Box::new(backend),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
         };
 
         let md = v.lookup_nofollow("/etc").unwrap();
@@ -1802,6 +1829,7 @@ mod tests {
         let v = RootFsVfs {
             rootfs: None,
             overlay: Box::new(backend),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
         };
 
         let md = v.lookup("/large.bin").unwrap();
@@ -1821,6 +1849,7 @@ mod tests {
         let v = RootFsVfs {
             rootfs: None,
             overlay: Box::new(backend),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
         };
 
         let opened = v
@@ -2146,6 +2175,7 @@ mod tests {
         let v = RootFsVfs {
             rootfs: None,
             overlay: Box::new(backend),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
         };
 
         let result = v

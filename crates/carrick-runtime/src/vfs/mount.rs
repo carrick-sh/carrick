@@ -103,6 +103,27 @@ impl VfsMounts {
         count
     }
 
+    /// Fast check whether any mount matches `path`. Avoids string allocations
+    /// when `path` contains no '.' or '..' components.
+    pub fn has_mount(&self, path: &str) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        if !path.as_bytes().contains(&b'.') {
+            if !self
+                .entries
+                .iter()
+                .any(|e| path_starts_with_mount(norm, &e.point))
+            {
+                return false;
+            }
+            return !self.overridden.read().contains(norm);
+        }
+        self.resolve(path).is_some()
+    }
+
     /// Resolve `path` to the mount that owns it. Returns the full
     /// absolute path back to the caller — most mounts (proc, sys)
     /// know their own mount point and already accept absolute paths,

@@ -294,6 +294,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "dentrycache": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "devnullseek": {
     "class": "conformance",
     "excluded": false,
