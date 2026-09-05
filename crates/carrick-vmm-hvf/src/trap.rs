@@ -37404,6 +37404,86 @@ impl HvfTaskState {
     }
 }
 
+/// Does `zero_guest_backing` REPLACE an eligible reused private anonymous
+/// range with fresh kernel zero pages (`mmap MAP_FIXED|MAP_ANON`) instead of
+/// memsetting the old backing end to end?
+///
+/// **DEFAULT ON.** `CARRICK_DSR_ZERO_REMAP=0` is the exact escape hatch
+/// (mirroring commit 52342762), preserving the immovable zeroed-anon guarantee
+/// while touching nothing.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn zero_anonymous_remap_enabled() -> bool {
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("CARRICK_DSR_ZERO_REMAP").as_deref() != Some(std::ffi::OsStr::new("0"))
+        })
+    }
+    #[cfg(test)]
+    {
+        std::env::var_os("CARRICK_DSR_ZERO_REMAP").as_deref() != Some(std::ffi::OsStr::new("0"))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct ScrubRun {
+    pub(crate) host_start: *mut u8,
+    pub(crate) len: usize,
+    pub(crate) eligible: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ScrubRun {
+    pub(crate) fn flush(self) {
+        const HOST_PAGE: usize = 16384;
+        let ScrubRun {
+            host_start,
+            len,
+            eligible,
+        } = self;
+        if len == 0 {
+            return;
+        }
+        let aligned_len = if eligible && (host_start as usize) % HOST_PAGE == 0 {
+            len & !(HOST_PAGE - 1)
+        } else {
+            0
+        };
+        let mut remapped = false;
+        if aligned_len > 0 {
+            let mapped = unsafe {
+                libc::mmap(
+                    host_start as *mut libc::c_void,
+                    aligned_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            if mapped == host_start as *mut libc::c_void {
+                remapped = true;
+                let tail_len = len - aligned_len;
+                if tail_len > 0 {
+                    unsafe {
+                        core::ptr::write_bytes(host_start.add(aligned_len), 0u8, tail_len);
+                    }
+                }
+            } else if mapped != libc::MAP_FAILED {
+                unsafe {
+                    libc::munmap(mapped, aligned_len);
+                }
+            }
+        }
+        if !remapped {
+            unsafe {
+                core::ptr::write_bytes(host_start, 0u8, len);
+            }
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
     pub(crate) fn resolve_frame_cow_fault(
@@ -38825,6 +38905,7 @@ impl HvfVmState {
             );
         }
         let mut cleared = 0usize;
+        let mut active_run: Option<ScrubRun> = None;
         while cleared < length {
             let (chunk_va, chunk_len) = Self::guest_copy_chunk(address, cleared, length)?;
             // munmap invalidates the leaf but intentionally preserves its PA.
@@ -38878,12 +38959,21 @@ impl HvfVmState {
             // this mm's own backing.
             let live_ipa = self.translate_va(chunk_va);
             let ipa = live_ipa.or(retained_ipa);
-            let target = ipa
+            let chunk_resolved = ipa
                 .and_then(|ipa| {
                     self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
                         .and_then(|mapping| {
                             let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
-                            Some(unsafe { mapping.host_addr.add(offset) })
+                            let target = unsafe { mapping.host_addr.add(offset) };
+                            let cow_source = self.physical_cow_source(chunk_va, ipa).is_some();
+                            let is_alias = is_reusable_global_frame_extent(mapping.ipa, 1);
+                            let eligible = mapping.sharing == GuestMappingSharing::Private
+                                && mapping.shared_key_base == 0
+                                && !cow_source
+                                && !is_alias
+                                && retained_fragment.is_none()
+                                && zero_anonymous_remap_enabled();
+                            Some((target, eligible))
                         })
                 })
                 .or_else(|| {
@@ -38905,7 +38995,15 @@ impl HvfVmState {
                             }
                             let offset =
                                 usize::try_from(chunk_va.checked_sub(mapping.start)?).ok()?;
-                            Some(unsafe { mapping.host_addr.add(offset) })
+                            let target = unsafe { mapping.host_addr.add(offset) };
+                            let cow_source =
+                                self.physical_cow_source(chunk_va, mapping.ipa).is_some();
+                            let eligible = mapping.sharing == GuestMappingSharing::Private
+                                && mapping.shared_key_base == 0
+                                && !cow_source
+                                && retained_fragment.is_none()
+                                && zero_anonymous_remap_enabled();
+                            Some((target, eligible))
                         })
                 });
             if let Some(debug_va) = fork_debug_va()
@@ -38914,19 +39012,49 @@ impl HvfVmState {
             {
                 eprintln!(
                     "[SCRUBDBG pid={:?}] chunk va={chunk_va:#x}+{chunk_len:#x} live_ipa={live_ipa:x?} \
-                     retained_ipa={retained_ipa:x?} target={target:?}",
+                     retained_ipa={retained_ipa:x?} target={:?}",
                     self.cow_identity.map(|identity| identity.linux_pid),
+                    chunk_resolved.map(|(target, _)| target),
                 );
             }
-            if let Some(target) = target {
-                unsafe {
-                    core::ptr::write_bytes(target, 0u8, chunk_len);
+            if let Some(fragment) = retained_fragment {
+                register_shared_alias(fragment);
+            }
+            match (active_run.as_mut(), chunk_resolved) {
+                (Some(run), Some((target, eligible)))
+                    if run.eligible == eligible
+                        && unsafe { run.host_start.add(run.len) } == target =>
+                {
+                    run.len += chunk_len;
                 }
-                if let Some(fragment) = retained_fragment {
-                    register_shared_alias(fragment);
+                (Some(_), Some((target, eligible))) => {
+                    if let Some(prev) = active_run.take() {
+                        prev.flush();
+                    }
+                    active_run = Some(ScrubRun {
+                        host_start: target,
+                        len: chunk_len,
+                        eligible,
+                    });
                 }
+                (Some(_), None) => {
+                    if let Some(prev) = active_run.take() {
+                        prev.flush();
+                    }
+                }
+                (None, Some((target, eligible))) => {
+                    active_run = Some(ScrubRun {
+                        host_start: target,
+                        len: chunk_len,
+                        eligible,
+                    });
+                }
+                (None, None) => {}
             }
             cleared += chunk_len;
+        }
+        if let Some(run) = active_run {
+            run.flush();
         }
         Ok(())
     }
@@ -53528,5 +53656,85 @@ mod tag_strip_tests {
         super::global_frame_host_owners()
             .lock()
             .remove(&(physical_ipa, physical_len as u64));
+    }
+
+    #[test]
+    fn scrub_run_remap_and_fallback() {
+        static ZERO_REMAP_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _env_guard = ZERO_REMAP_ENV_LOCK.lock();
+
+        const SIZE: usize = 64 * 1024;
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+        let ptr = mapped as *mut u8;
+
+        // 1. Eligible aligned run zeroes memory via kernel mmap replacement
+        unsafe { core::ptr::write_bytes(ptr, 0x5a, SIZE) };
+        assert_eq!(unsafe { *ptr }, 0x5a);
+        let run = super::ScrubRun {
+            host_start: ptr,
+            len: SIZE,
+            eligible: true,
+        };
+        run.flush();
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, SIZE) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "eligible aligned run must zero memory"
+        );
+
+        // 2. Ineligible run zeroes memory via write_bytes fallback
+        unsafe { core::ptr::write_bytes(ptr, 0xa5, SIZE) };
+        let run = super::ScrubRun {
+            host_start: ptr,
+            len: SIZE,
+            eligible: false,
+        };
+        run.flush();
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, SIZE) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "ineligible run must zero memory via fallback"
+        );
+
+        // 3. Partial alignment (e.g. 20 KiB): 16 KiB remapped + 4 KiB memset
+        unsafe { core::ptr::write_bytes(ptr, 0x33, SIZE) };
+        let run = super::ScrubRun {
+            host_start: ptr,
+            len: 20480,
+            eligible: true,
+        };
+        run.flush();
+        let scrubbed = unsafe { std::slice::from_raw_parts(ptr, 20480) };
+        assert!(
+            scrubbed.iter().all(|&b| b == 0),
+            "scrubbed portion must be zeroed"
+        );
+        let untouched = unsafe { std::slice::from_raw_parts(ptr.add(20480), SIZE - 20480) };
+        assert!(
+            untouched.iter().all(|&b| b == 0x33),
+            "unscrubbed tail must remain untouched"
+        );
+
+        // 4. Escape hatch CARRICK_DSR_ZERO_REMAP=0 disables remap
+        let prior = std::env::var_os("CARRICK_DSR_ZERO_REMAP");
+        unsafe { std::env::set_var("CARRICK_DSR_ZERO_REMAP", "0") };
+        assert!(!super::zero_anonymous_remap_enabled());
+        match prior {
+            Some(val) => unsafe { std::env::set_var("CARRICK_DSR_ZERO_REMAP", val) },
+            None => unsafe { std::env::remove_var("CARRICK_DSR_ZERO_REMAP") },
+        }
+        assert!(super::zero_anonymous_remap_enabled());
+
+        assert_eq!(unsafe { libc::munmap(mapped, SIZE) }, 0);
     }
 }
