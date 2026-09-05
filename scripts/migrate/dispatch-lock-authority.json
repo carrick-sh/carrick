@@ -31,7 +31,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::open_at_path_string::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2666,
+      "line": 2669,
       "item": "DispatchError::open_at_path_string",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -40,7 +40,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::dup_stdio_pty_role::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4158,
+      "line": 4161,
       "item": "DispatchError::dup_stdio_pty_role",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -49,7 +49,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::try_vfs_open::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4406,
+      "line": 4409,
       "item": "DispatchError::try_vfs_open",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -58,7 +58,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::proc_self_fd_tty_link::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 6432,
+      "line": 6470,
       "item": "DispatchError::proc_self_fd_tty_link",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -67,7 +67,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 8851,
+      "line": 8901,
       "item": "SyscallDispatcher::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -76,7 +76,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyscallDispatcher::ioctl::pty_table#2",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 8878,
+      "line": 9009,
       "item": "SyscallDispatcher::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
