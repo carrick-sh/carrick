@@ -807,3 +807,17 @@ branch fast-forwarded and the main tree checked it out, git replaced the
 real probe directory with a symlink pointing at itself. The path is now
 untracked and ignored (`842ad99dc`). Lesson: never `git add -A` a directory
 that carries a per-worktree convenience symlink; add files by name.
+
+Page-table growth, round five: with the director-written deferred install
+(the source is applied the moment a manager exists, at the lazy first
+edit or the exec rebuild, and rides the task-state round trip), every
+guest boots, `concurrent_futures` runs 186 tests before its 2x-budget
+timeout, and `cpython-compile` no longer exhausts its tables: it now runs
+to `test_compiler_recursion_limit`, which dies with a real guest
+`Segmentation fault` while the C compiler recurses on the main thread. A
+200k-frame pure-Python recursion is fine under carrick, so the remaining
+gap is C-stack growth toward `RLIMIT_STACK` (Linux grows the main stack on
+demand to 8 MiB); probe `stackgrowmain` isolates it and is red-first
+pending the next Docker phase. The branch's last gate diffs
+(`processvmsparse`, `mremapfixedshared`) were its stale base; the clean
+rebase and full gate run now.
