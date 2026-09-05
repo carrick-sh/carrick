@@ -2164,6 +2164,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "socketcredmore": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "sockoptdomainproto": {
     "class": "conformance",
     "excluded": false,
