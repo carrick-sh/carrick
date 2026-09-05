@@ -741,6 +741,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         if let (Some(manager), Some(source)) =
             (manager.as_mut(), self.pending_arena_source.lock().take())
         {
+            carrick_observability::probes::stage1_arena_install(5, 1, 0, 0);
             // A source installed before this rebuild belongs to the new
             // manager. `set_arena_source` refuses a different lease, which is
             // an invariant violation the exec must fail on, not swallow.
@@ -938,6 +939,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     bytes, pt_base,
                 );
             if let Some(source) = self.pending_arena_source.lock().take() {
+                carrick_observability::probes::stage1_arena_install(
+                    4,
+                    1,
+                    0,
+                    Arc::as_ptr(&pt) as u64,
+                );
                 manager.set_arena_source(source).map_err(|error| {
                     MemoryError::HostMap(format!(
                         "apply deferred stage-1 table arena source: {error:?}"
@@ -2703,11 +2710,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         source: Box<dyn carrick_mem::page_table::TableArenaSource>,
     ) -> Result<(), TrapError> {
         let page_tables = Arc::clone(&self.page_tables);
+        let authority = Arc::as_ptr(&page_tables) as u64;
         let mut page_tables = page_tables.lock();
         match page_tables.as_mut() {
-            Some(manager) => manager.set_arena_source(source).map_err(|error| {
-                TrapError::Hypervisor(format!("set stage-1 table arena source: {error:?}"))
-            }),
+            Some(manager) => {
+                carrick_observability::probes::stage1_arena_install(1, 1, 0, authority);
+                manager.set_arena_source(source).map_err(|error| {
+                    TrapError::Hypervisor(format!("set stage-1 table arena source: {error:?}"))
+                })
+            }
             // No manager yet. When the live tables are already readable (an
             // exec rebuild, or a root whose boot tables are in place) build the
             // manager NOW and attach the source to it: the slot is shared with
@@ -2719,6 +2730,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             // kept for the lazy build.
             None => match self.build_page_tables_manager_from_live() {
                 Ok(mut manager) => {
+                    carrick_observability::probes::stage1_arena_install(2, 1, 0, authority);
                     manager.set_arena_source(source).map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "set stage-1 table arena source on eager build: {error:?}"
@@ -2728,6 +2740,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     Ok(())
                 }
                 Err(_) => {
+                    carrick_observability::probes::stage1_arena_install(3, 0, 1, authority);
                     *self.pending_arena_source.lock() = Some(source);
                     Ok(())
                 }
