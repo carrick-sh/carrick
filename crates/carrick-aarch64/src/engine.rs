@@ -1888,6 +1888,34 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 )))
             })
     }
+
+    fn repoint_shared_leaf(
+        &mut self,
+        va: u64,
+        target_ipa: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        let outcome = self
+            .pt_edit_locked(|mgr| {
+                mgr.map_aliased(va, target_ipa, len as u64, true)
+                    .map(|changed| PageTableApplyOutcome::new(changed, changed))
+            })
+            .map_err(|e| MemoryError::HostMap(format!("repoint shared leaf pt edit: {e}")))?;
+        if !outcome.changed {
+            return Ok(());
+        }
+        self.run_stage1_maintenance()
+            .map_err(|e| MemoryError::HostMap(format!("repoint shared leaf tlbi: {e}")))?;
+        self.vm
+            .publish_shared_repoint(va, target_ipa, len)
+            .map_err(|e| MemoryError::HostMap(format!("publish shared repoint: {e}")))?;
+        Ok(())
+    }
+
+    fn translate_va(&self, va: u64) -> Option<u64> {
+        let page_tables = self.page_tables.lock();
+        page_tables.as_ref().and_then(|mgr| mgr.translate(va))
+    }
 }
 
 fn apply_stage1_protection_edit(

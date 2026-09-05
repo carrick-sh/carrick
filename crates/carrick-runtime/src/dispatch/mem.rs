@@ -527,10 +527,7 @@ pub(crate) struct MemState {
     /// answer "where does this file end?" before it can grow the mapping (the
     /// tail past EOF is SIGBUS, not zeroes). Same shape and lifetime rules as
     /// `writable_memfd_maps`: trimmed by range whenever a mapping goes away.
-    shared_file_alias_maps: Vec<(
-        crate::vfs::GuestMemoryRange,
-        Arc<crate::kernel::FileDescription>,
-    )>,
+    shared_file_alias_maps: Vec<SharedFileAliasEntry>,
     /// VA ranges of live MAP_SHARED mappings backed by a `memfd_secret(2)` fd.
     /// Secret memory is hidden from the kernel's own view of the process, so
     /// `/proc/<pid>/mem` reads that touch one of these ranges fail EIO
@@ -1839,8 +1836,24 @@ pub(crate) struct HostAliasMmapCommit {
     pub(super) secretmem: bool,
     pub(super) writable_memfd: Option<Arc<crate::kernel::FileDescription>>,
     /// The open-file description behind a live `MAP_SHARED` file alias, kept so
-    /// `mremap` can still find the file after the guest closes its own fd.
-    pub(super) shared_file_alias: Option<Arc<crate::kernel::FileDescription>>,
+    /// `mremap` can still find the file after the guest closes its own fd,
+    /// paired with the extent base IPA and file offset.
+    pub(super) shared_file_alias: Option<SharedFileAliasCommit>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedFileAliasCommit {
+    pub(crate) description: Arc<crate::kernel::FileDescription>,
+    pub(crate) extent_base: carrick_guest_mem::Gpa,
+    pub(crate) row_file_offset: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedFileAliasEntry {
+    pub(crate) range: crate::vfs::GuestMemoryRange,
+    pub(crate) description: Arc<crate::kernel::FileDescription>,
+    pub(crate) extent_base: carrick_guest_mem::Gpa,
+    pub(crate) row_file_offset: u64,
 }
 
 fn prot_to_proc_perms(prot: LinuxProtFlags) -> (bool, bool, bool) {
@@ -1849,6 +1862,55 @@ fn prot_to_proc_perms(prot: LinuxProtFlags) -> (bool, bool, bool) {
         prot.contains(LinuxProtFlags::WRITE),
         prot.contains(LinuxProtFlags::EXEC),
     )
+}
+
+fn trim_shared_file_alias_maps_for_range(
+    maps: &mut Vec<SharedFileAliasEntry>,
+    start: u64,
+    len: u64,
+) {
+    let Some(end) = start.checked_add(len) else {
+        maps.clear();
+        return;
+    };
+    let mut retained = Vec::with_capacity(maps.len() + 1);
+    for entry in maps.drain(..) {
+        let range_start = entry.range.start().raw();
+        let range_end = entry.range.end().raw();
+        if range_start >= end || start >= range_end {
+            retained.push(entry);
+            continue;
+        }
+        if range_start < start
+            && let Some(prefix) = crate::vfs::GuestMemoryRange::new(
+                GuestVa(range_start),
+                GuestVa(start.min(range_end)),
+            )
+        {
+            retained.push(SharedFileAliasEntry {
+                range: prefix,
+                description: Arc::clone(&entry.description),
+                extent_base: entry.extent_base,
+                row_file_offset: entry.row_file_offset,
+            });
+        }
+        if end < range_end
+            && let Some(suffix) =
+                crate::vfs::GuestMemoryRange::new(GuestVa(end.max(range_start)), GuestVa(range_end))
+        {
+            let suffix_start = end.max(range_start);
+            let suffix_offset = entry
+                .row_file_offset
+                .saturating_add(suffix_start.saturating_sub(range_start));
+            retained.push(SharedFileAliasEntry {
+                range: suffix,
+                description: entry.description,
+                extent_base: entry.extent_base,
+                row_file_offset: suffix_offset,
+            });
+        }
+    }
+    *maps = retained;
 }
 
 fn trim_writable_memfd_maps_for_range(
@@ -2033,7 +2095,7 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     trim_growdown_ranges_for_range(mem, start, len);
     trim_ranges_for_range(&mut mem.bus_fault_ranges, start, len);
     trim_writable_memfd_maps_for_range(&mut mem.writable_memfd_maps, start, len);
-    trim_writable_memfd_maps_for_range(&mut mem.shared_file_alias_maps, start, len);
+    trim_shared_file_alias_maps_for_range(&mut mem.shared_file_alias_maps, start, len);
     trim_remap_snapshots_for_range(&mut mem.remap_snapshots, start, len);
     let Some(remove) =
         crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
@@ -2343,8 +2405,13 @@ impl SyscallDispatcher {
         if let Some(description) = commit.writable_memfd {
             mem.writable_memfd_maps.push((replacement, description));
         }
-        if let Some(description) = commit.shared_file_alias {
-            mem.shared_file_alias_maps.push((replacement, description));
+        if let Some(shared_alias) = commit.shared_file_alias {
+            mem.shared_file_alias_maps.push(SharedFileAliasEntry {
+                range: replacement,
+                description: shared_alias.description,
+                extent_base: shared_alias.extent_base,
+                row_file_offset: shared_alias.row_file_offset,
+            });
         }
         if let Some(file_page_offset) = commit.file_page_offset
             && !commit.path.is_empty()
@@ -2707,6 +2774,16 @@ impl SyscallDispatcher {
         }
     }
 
+    fn shared_file_alias_entry(&self, start: u64, len: u64) -> Option<SharedFileAliasEntry> {
+        let end = start.checked_add(len)?;
+        self.mem()
+            .lock()
+            .shared_file_alias_maps
+            .iter()
+            .find(|entry| entry.range.start().raw() <= start && entry.range.end().raw() >= end)
+            .cloned()
+    }
+
     /// The open-file description behind the live `MAP_SHARED` alias covering
     /// `[start, start+len)`, if that whole range is one recorded alias. Callers
     /// use it to re-derive a fact about the FILE (notably its length) after the
@@ -2716,13 +2793,8 @@ impl SyscallDispatcher {
         start: u64,
         len: u64,
     ) -> Option<Arc<crate::kernel::FileDescription>> {
-        let end = start.checked_add(len)?;
-        self.mem()
-            .lock()
-            .shared_file_alias_maps
-            .iter()
-            .find(|(range, _)| range.start().raw() <= start && range.end().raw() >= end)
-            .map(|(_, description)| Arc::clone(description))
+        self.shared_file_alias_entry(start, len)
+            .map(|entry| entry.description)
     }
 
     fn range_is_read_only_shared_file(&self, start: u64, len: u64) -> bool {
@@ -4540,7 +4612,13 @@ impl SyscallDispatcher {
                             read_only_shared_file: mmap_read_only_shared_file,
                             secretmem: false,
                             writable_memfd: alias_writable_memfd,
-                            shared_file_alias: alias_description,
+                            shared_file_alias: alias_description.map(|description| {
+                                SharedFileAliasCommit {
+                                    description,
+                                    extent_base: Gpa(ipa.saturating_sub(offset)),
+                                    row_file_offset: offset,
+                                }
+                            }),
                         },
                     ));
                     return Ok(DispatchOutcome::MapHostAlias {
@@ -6055,7 +6133,11 @@ impl SyscallDispatcher {
                             read_only_shared_file,
                             secretmem: false,
                             writable_memfd: None,
-                            shared_file_alias: Some(description),
+                            shared_file_alias: Some(SharedFileAliasCommit {
+                                description,
+                                extent_base: Gpa(ipa.saturating_sub(file_offset)),
+                                row_file_offset: file_offset,
+                            }),
                         }));
                     DispatchOutcome::MapHostAlias {
                         success_retval: va as i64,
@@ -6075,49 +6157,34 @@ impl SyscallDispatcher {
                     }
                 };
             if is_shared_file_fixed {
-                let Some(description) =
-                    this.shared_file_alias_description(old_address.0, old_size)
+                let Some(alias_entry) =
+                    this.shared_file_alias_entry(old_address.0, old_size)
                 else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                let dup_fd = {
-                    let open = description.read();
-                    match open.as_deref().and_then(OpenDescription::shared_alias_host_fd) {
-                        Some(raw_fd) if host_fd_can_back_shared_alias(raw_fd) => {
-                            let d = unsafe { libc::dup(raw_fd) };
-                            (d >= 0).then_some(d)
-                        }
-                        _ => None,
-                    }
-                };
-                let Some(dup_fd) = dup_fd else {
+                let Ok(new_len) = usize::try_from(new_size) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                let Some(ipa) = alloc_alias_ipa_for_publication(new_size, true) else {
-                    unsafe { libc::close(dup_fd) };
+                let Ok(old_len) = usize::try_from(old_size) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 let va = new_address.0;
+                let delta = old_address.0.saturating_sub(alias_entry.range.start().raw());
+                let source_file_offset = alias_entry.row_file_offset.saturating_add(delta);
+                let destination_leaf_ipa = alias_entry
+                    .extent_base
+                    .raw()
+                    .saturating_add(source_file_offset);
+
                 let pf = source_metadata.prot;
-                let mut host_prot = 0;
-                if pf.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
-                    host_prot |= libc::PROT_READ;
-                }
-                if pf.contains(LinuxProtFlags::WRITE) {
-                    host_prot |= libc::PROT_WRITE;
-                }
-                let file_page_offset = source_metadata.file_page_offset;
-                let file_offset = file_page_offset
-                    .unwrap_or(0)
-                    .checked_mul(crate::core_dump::GUEST_PAGE as u64)
-                    .unwrap_or(0);
+                let desc = &alias_entry.description;
                 let bus_fault = (|| {
-                    let open = description.read();
+                    let open = desc.read();
                     let file_len = open
                         .as_deref()
                         .and_then(OpenDescription::shared_alias_host_fd)
                         .and_then(host_fd_file_len)?;
-                    let bus_offset = shared_file_bus_offset(file_len, file_offset, new_size, page_size)?;
+                    let bus_offset = shared_file_bus_offset(file_len, source_file_offset, new_size, page_size)?;
                     Some((
                         va.checked_add(bus_offset)?,
                         new_size.checked_sub(bus_offset)?,
@@ -6125,11 +6192,6 @@ impl SyscallDispatcher {
                 })();
                 let read_only_shared_file =
                     this.range_is_read_only_shared_file(old_address.0, old_size);
-
-                let Ok(new_len) = usize::try_from(new_size) else {
-                    unsafe { libc::close(dup_fd) };
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                };
 
                 // MREMAP_FIXED replaces whatever was at the destination range.
                 if new_len > 0 {
@@ -6153,14 +6215,19 @@ impl SyscallDispatcher {
                     )
                     .is_none()
                 {
-                    unsafe { libc::close(dup_fd) };
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+
+                // Repoint destination stage-1 leaf to the existing shared extent.
+                if memory
+                    .repoint_shared_leaf(va, destination_leaf_ipa, new_len)
+                    .is_err()
+                {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
 
                 // Reclaim the source range.
-                if let Ok(old_len) = usize::try_from(old_size)
-                    && old_len > 0
-                {
+                if old_len > 0 {
                     if this.range_is_alias_vma(old_address.0, old_size)
                         || mmap_address_uses_alias(old_address.0, old_size, layout)
                     {
@@ -6193,31 +6260,65 @@ impl SyscallDispatcher {
                     prot_none,
                     !prot_none && !pf.contains(LinuxProtFlags::WRITE),
                 );
+                memory.set_mapping_sharing(
+                    va,
+                    new_len,
+                    carrick_guest_mem::MappingSharing::Shared,
+                );
 
+                let Some(dest_range) = crate::vfs::GuestMemoryRange::new(
+                    GuestVa(va),
+                    GuestVa(va.saturating_add(new_size)),
+                ) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let new_alias_entry = SharedFileAliasEntry {
+                    range: dest_range,
+                    description: Arc::clone(&alias_entry.description),
+                    extent_base: alias_entry.extent_base,
+                    row_file_offset: source_file_offset,
+                };
+
+                let file_page_offset =
+                    Some(source_file_offset / crate::core_dump::GUEST_PAGE as u64);
                 let Some(semantic_vmas) =
                     source_metadata.fork_semantics.project(va, new_size)
                 else {
-                    unsafe { libc::close(dup_fd) };
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
 
-                return Ok(publish_shared_file_alias_outcome(
-                    host_alias_dispatch,
+                this.record_dynamic_mapping_with_file_offset(
                     va,
-                    ipa,
                     new_size,
-                    pf,
-                    host_prot,
-                    file_offset,
-                    file_page_offset,
-                    source_metadata.droppable,
+                    source_metadata.prot,
+                    source_metadata.sharing,
                     source_metadata.path.clone(),
-                    Some(semantic_vmas),
-                    bus_fault,
-                    read_only_shared_file,
-                    Arc::clone(&description),
-                    dup_fd,
-                ));
+                    DynamicMappingSemantics {
+                        file_page_offset,
+                        droppable: source_metadata.droppable,
+                        semantic_vmas: Some(semantic_vmas),
+                    },
+                );
+
+                {
+                    let mem_authority = this.mem();
+                    let mut mem = mem_authority.lock();
+                    locked_ranges_insert(&mut mem.host_alias_backed_ranges, dest_range);
+                    locked_ranges_insert(&mut mem.alias_vma_ranges, dest_range);
+                    locked_ranges_insert(&mut mem.resident_ranges, dest_range);
+                    if read_only_shared_file {
+                        locked_ranges_insert(&mut mem.read_only_shared_file_maps, dest_range);
+                    }
+                    if let Some((start, len)) = bus_fault {
+                        mem.bus_fault_ranges.push((start, len));
+                    }
+                    mem.shared_file_alias_maps.push(new_alias_entry);
+                }
+
+                this.mark_vma_dispatch(&mut host_alias_dispatch);
+                return Ok(DispatchOutcome::Returned {
+                    value: va as i64,
+                });
             }
             let shared_aperture_alloc = this.mem()
                 .lock()
