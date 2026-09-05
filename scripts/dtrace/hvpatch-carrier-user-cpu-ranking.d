@@ -60,22 +60,27 @@ dtrace:::ERROR
 }
 
 /*
- * Print the ranking while the carrier is still alive: DTrace resolves
- * `ustack()` symbols lazily at output time against the LIVE process, so an
- * aggregation printed from `dtrace:::END` after the target exited comes out
- * as bare addresses (observed 2026-09-04 on the arena-churn profile). The
- * END clause below is the fallback for a bounded/aborted capture.
+ * Print the ranking in 5-second slices WHILE the carrier is alive: DTrace
+ * resolves `ustack()` symbols lazily at output time by grabbing the live
+ * process, so an aggregation printed from `dtrace:::END` (or even from
+ * `proc:::exit`, when the process is already tearing down) comes out as bare
+ * addresses. Observed twice on the arena-churn profile, 2026-09-04. Each
+ * slice is a complete ranking of that window; sum slices for a whole-run
+ * ranking. The END clause is the fallback for a bounded/aborted capture.
  */
+profile:::tick-5sec
+{
+    printf("HVPUSERCPU|slice|samples=%d\n", samples);
+    printf("HVPUSERCPU|stacks\n");
+    trunc(@stacks, 60);
+    printa(@stacks);
+    trunc(@stacks);
+    printed = 1;
+}
+
 proc:::exit
 /pid == $target/
 {
-    printf("HVPUSERCPU|summary|samples=%d|empty=%d|bounded=%d|errors=%d\n",
-        samples, samples == 0, bounded, errors);
-    printf("HVPUSERCPU|stacks\n");
-    trunc(@stacks, 120);
-    printa("%@d %k\n", @stacks);
-    trunc(@stacks);
-    printed = 1;
     exit(0);
 }
 
