@@ -512,3 +512,35 @@ The growable per-mm page-table backing (cpython `test_compile` exhaustion,
 `in_use=438 capacity=440`) is briefed as chained 2 MiB root slots behind a
 typed arena source on the manager; it waits on the `mmap-cost` worker, which
 holds `page_table.rs`.
+
+## Partial-send count loss (ae130a80a) and the touched-suite re-run
+
+Re-running the twelve suites the fd/net/pty/pipe landings touched on
+`b31077560` left four gating rows. `cpython-asyncio` moved from a crash to
+twelve `test_sendfile_*` failures whose server side received 278529 of
+1114113 bytes; a plain non-blocking `send` loop with `SO_SNDBUF` shrunk to
+4 KiB reproduces the loss outside asyncio. Both socket send sites mapped any
+non-negative host result to the full payload length, so a partial host
+accept was reported as complete and the remainder was silently dropped.
+`settle_cork_send` now returns the host's count minus the corked prefix that
+rode along, EAGAINs a non-blocking call that made no progress, and puts the
+unsent corked bytes back at the head of the cork buffer. The new
+`socketpartialsend` probe (send / sendmsg / MSG_MORE on a 4 KiB send buffer;
+counts must equal bytes received) is red on `b31077560` and MATCH on
+`e4f233615` in both lanes. Its first draft also asserted that a short send
+was observed; the Docker oracle showed Linux accepts every 16 KiB send whole
+on loopback even with the shrunk buffer, so that line was not a Linux
+invariant and was dropped before the bless.
+
+Two LTP rows in the same batch were fixed the same way: `memfd_create01`
+(a `/proc/self/fd` re-open of a write-sealed memfd returned EPERM; Linux
+opens it and lets the resize seals decide the O_TRUNC; `fdsemantics` lines
+15-16) and `pipe12` (FIONREAD on an in-memory pipe write end fell to the
+catch-all 0; `pipeextra` write-end line). `pipe06`'s stale Docker row was
+refilled Docker-only. `fanotify04` remains: `read` on a `FAN_NONBLOCK`
+group returns EAGAIN where Linux has an event queued, so a marked open is
+not generating its event (Docker 9/9, carrick 7/8 + TBROK).
+
+The `socket-state` worker's refactor (peer credentials and cork state on
+`DescriptionCommon`) landed as `7f63a0a39`; main's K1 burndown is green
+again with no ceiling raised.
