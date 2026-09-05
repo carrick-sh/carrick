@@ -1081,7 +1081,11 @@ impl SyscallDispatcher {
         // Linux creates the pidfd with O_CLOEXEC unconditionally (the flags arg
         // only carries PIDFD_NONBLOCK), so the returned fd must have FD_CLOEXEC
         // set — pidfd_open01 asserts F_GETFD & FD_CLOEXEC.
-        self.install_fd(description, LINUX_FD_CLOEXEC)
+        self.install_fd_with_status_flags(
+            description,
+            LINUX_O_RDWR | status_flags,
+            LINUX_FD_CLOEXEC,
+        )
     }
 
     /// Allocate a pidfd for one Linux process multiplexed inside the shared
@@ -1111,7 +1115,11 @@ impl SyscallDispatcher {
             kqueue,
             base: OpenDescriptionBase::new(status_flags),
         };
-        self.install_fd(description, LINUX_FD_CLOEXEC)
+        self.install_fd_with_status_flags(
+            description,
+            LINUX_O_RDWR | status_flags,
+            LINUX_FD_CLOEXEC,
+        )
     }
 
     /// Allocate a pidfd referring to freshly-forked `child_pid`. Called by the
@@ -1173,7 +1181,7 @@ impl SyscallDispatcher {
             base: OpenDescriptionBase::new(0),
         };
         match super::resources::with_captured_resources(context, || {
-            self.install_fd(description, LINUX_FD_CLOEXEC)
+            self.install_fd_with_status_flags(description, LINUX_O_RDWR, LINUX_FD_CLOEXEC)
         }) {
             DispatchOutcome::Returned { value } => {
                 i32::try_from(value).map_err(|_| crate::linux_abi::LINUX_EMFILE)
@@ -4439,6 +4447,11 @@ impl SyscallDispatcher {
             if flags & !PIDFD_NONBLOCK != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let status_flags = if flags & PIDFD_NONBLOCK != 0 {
+                LINUX_O_NONBLOCK
+            } else {
+                0
+            };
             if let Some(process) = this.hvpatch_process() {
                 // The guest names the target by ns-pid; the graph indexes by
                 // task id. A non-member is ESRCH (`pidfd_open(getpid())`
@@ -4450,7 +4463,7 @@ impl SyscallDispatcher {
                 else {
                     return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                 };
-                return Ok(this.open_hvpatch_pidfd(&process, host, flags));
+                return Ok(this.open_hvpatch_pidfd(&process, host, status_flags));
             }
             // PID namespace (§5.3): the guest names the target by its ns-pid;
             // the pidfd must watch the underlying host pid. A foreign ns-pid is
@@ -4463,7 +4476,7 @@ impl SyscallDispatcher {
             } else {
                 pid.0
             };
-            Ok(this.open_pidfd(host_pid, flags))
+            Ok(this.open_pidfd(host_pid, status_flags))
         }
 
         fn pidfd_getfd(this, cx, _pidfd: Fd, _targetfd: u64, _flags: u64) {
@@ -8685,5 +8698,54 @@ mod process_identity_dispatch_tests {
             leader_pid,
             "a zombie keeps the retired session's namespace identity",
         );
+    }
+
+    #[test]
+    fn pidfd_open_status_flags_and_nonblock_wait() {
+        let dispatcher = SyscallDispatcher::new();
+        let my_pid = unsafe { libc::getpid() };
+        const PIDFD_NONBLOCK: u64 = 0o4000;
+
+        // 1. open_pidfd with 0 -> default is LINUX_O_RDWR, no O_NONBLOCK
+        let outcome_def = dispatcher.open_pidfd(my_pid, 0);
+        let fd_def = match outcome_def {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("expected fd, got {other:?}"),
+        };
+        assert!(fd_def >= 0);
+        let open_def = dispatcher.open_file(fd_def).expect("open file");
+        let fl = open_def.description.common().status_flags();
+        assert_eq!(fl & LINUX_O_NONBLOCK, 0, "default pidfd has no O_NONBLOCK");
+        assert_eq!(fl & LINUX_O_ACCMODE, LINUX_O_RDWR, "pidfd has O_RDWR");
+        assert!(!dispatcher.pidfd_is_nonblocking(fd_def));
+
+        // 2. open_pidfd with PIDFD_NONBLOCK -> has O_NONBLOCK
+        let outcome_nb = dispatcher.open_pidfd(my_pid, PIDFD_NONBLOCK);
+        let fd_nb = match outcome_nb {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("expected fd, got {other:?}"),
+        };
+        assert!(fd_nb >= 0);
+        let open_nb = dispatcher.open_file(fd_nb).expect("open file");
+        let fl_nb = open_nb.description.common().status_flags();
+        assert_ne!(
+            fl_nb & LINUX_O_NONBLOCK,
+            0,
+            "nonblocking pidfd has O_NONBLOCK"
+        );
+        assert_eq!(fl_nb & LINUX_O_ACCMODE, LINUX_O_RDWR, "pidfd has O_RDWR");
+        assert!(dispatcher.pidfd_is_nonblocking(fd_nb));
+
+        // 3. F_SETFL logic can toggle O_NONBLOCK on the pidfd description
+        let mutable_flags = LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_ASYNC;
+        let next_flags = (fl & LINUX_O_ACCMODE) | ((fl | LINUX_O_NONBLOCK) & mutable_flags);
+        open_def.description.common().set_status_flags(next_flags);
+        assert!(dispatcher.pidfd_is_nonblocking(fd_def));
+        let next_flags_clear = (fl & LINUX_O_ACCMODE) | (fl & mutable_flags);
+        open_def
+            .description
+            .common()
+            .set_status_flags(next_flags_clear);
+        assert!(!dispatcher.pidfd_is_nonblocking(fd_def));
     }
 }
