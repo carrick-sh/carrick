@@ -2888,10 +2888,10 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `forkprotectexec` adds child `mprotect` execute-permission changes over
 /// inherited COW pages; `fifoopenmatrix` adds the FIFO open
 /// handshake/EINTR/SA_RESTART matrix.
-/// The authoritative inventory contains 517 probe sources: 490 conformance
-/// sources (467 generic, 23 dedicated), 26 performance sources, and one helper.
-/// Both libc lanes therefore gate 980 conformance rows.
-const PROBE_SOURCE_COUNT: usize = 517;
+/// The authoritative inventory contains 518 probe sources: 491 conformance
+/// sources (468 generic, 23 dedicated), 26 performance sources, and one helper.
+/// Both libc lanes therefore gate 982 conformance rows.
+const PROBE_SOURCE_COUNT: usize = 518;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping

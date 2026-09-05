@@ -84,6 +84,7 @@
 use carrick_abi::{NsGid, NsUid};
 
 pub mod bind;
+pub mod dentry;
 pub mod dev;
 pub mod devpts;
 pub mod etc_services;
@@ -94,6 +95,7 @@ pub mod rootfs;
 pub mod sys;
 
 pub use bind::BindVfs;
+pub use dentry::DentryCache;
 pub use dev::DevVfs;
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use etc_services::EtcServicesVfs;

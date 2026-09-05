@@ -790,6 +790,10 @@ impl RootFs {
         host_real_stat(host, path.as_ref(), follow)
     }
 
+    pub fn immutable_backend(&self) -> Option<&HostFsBackend> {
+        self.immutable_host.as_ref().map(|h| &*h.backend)
+    }
+
     pub fn symlink_metadata(&self, path: impl AsRef<Path>) -> Result<RootFsMetadata, RootFsError> {
         if let Some(host) = self.immutable_host.as_ref() {
             return host_metadata(host, path.as_ref(), false);

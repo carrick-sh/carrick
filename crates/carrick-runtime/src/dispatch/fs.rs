@@ -48,7 +48,7 @@
 //! and `xattr`.
 use super::*;
 use crate::linux_abi::{
-    LINUX_ENOSPC, LINUX_ENXIO, LINUX_SEEK_DATA, LINUX_SEEK_HOLE, LINUX_TIOCSIG,
+    LINUX_ELOOP, LINUX_ENOSPC, LINUX_ENXIO, LINUX_SEEK_DATA, LINUX_SEEK_HOLE, LINUX_TIOCSIG,
 };
 use crate::vfs::PtyRole;
 
@@ -1902,6 +1902,27 @@ impl SyscallDispatcher {
         // raw path before resolve_at_path normalizes the slash away.
         let requires_dir = path.ends_with('/') || path.ends_with("/.");
 
+        // Dentry-cache fast path: a stat of a plain absolute path is served
+        // from the dentry cache (resolving symlinks and negative entries in-memory).
+        if (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
+            && path.starts_with('/')
+            && !path.starts_with("/proc")
+            && !path.starts_with("/sys")
+            && !path.starts_with("/dev")
+            && !path.split('/').any(|c| c == "..")
+            && self.dac_overrides_permissions()
+            && !self.fs.vfs_mounts.has_mount(path)
+        {
+            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
+            match self.fs.rootfs_vfs.dentry_stat(path, follow) {
+                Ok(real) => return Ok(self.stat_record_with_device(path, &real)),
+                Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
+                Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
+                Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
+                Err(_) => {}
+            }
+        }
+
         // Dispatch-level stat-cache fast path (default on; CARRICK_FS_STATCACHE=0
         // opts out): a repeat stat of a plain absolute path is served by one
         // revalidating fstatat through a cached, contained parent fd. Gated so
@@ -1927,6 +1948,22 @@ impl SyscallDispatcher {
         }
 
         let path = self.resolve_at_path(dirfd, path)?;
+        let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
+        if !path.starts_with("/proc")
+            && !path.starts_with("/sys")
+            && !path.starts_with("/dev")
+            && !path.split('/').any(|c| c == "..")
+            && self.dac_overrides_permissions()
+            && self.fs.vfs_mounts.resolve(&path).is_none()
+        {
+            match self.fs.rootfs_vfs.dentry_stat(&path, follow) {
+                Ok(real) => return Ok(self.stat_record_with_device(&path, &real)),
+                Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
+                Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
+                Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
+                Err(_) => {}
+            }
+        }
         // Second stat-cache consult, AFTER dirfd resolution: find-style
         // dirfd-relative stats (newfstatat(dirfd, name) on getdents output)
         // failed the pre-resolution gate above and paid the full multi-walk
@@ -2182,6 +2219,7 @@ impl SyscallDispatcher {
                 if let Some(err) = err {
                     Ok(DispatchOutcome::errno(err))
                 } else {
+                    self.fs.rootfs_vfs.dentry_cache.invalidate_path(&resolved);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
             }
@@ -2317,6 +2355,57 @@ impl SyscallDispatcher {
         // `resolve_at_path` and the layered open stack entirely.
         if let Some(outcome) = self.try_trusted_dirfd_openat(dirfd, path, flags) {
             return Ok(outcome);
+        }
+        // Dentry cache fast open for non-creating opens of plain absolute paths.
+        if !want_create
+            && !want_trunc
+            && !open_flags.contains(LinuxOpenFlags::DIRECTORY)
+            && !open_flags.contains(LinuxOpenFlags::TMPFILE)
+            && !open_flags.contains(LinuxOpenFlags::PATH)
+            && (access == LINUX_O_RDONLY || access == LINUX_O_RDWR || access == LINUX_O_WRONLY)
+            && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
+            && path.starts_with('/')
+            && !path.ends_with('/')
+            && !path.ends_with("/.")
+            && !path.split('/').any(|c| c == "..")
+            && !path.starts_with("/proc")
+            && !path.starts_with("/sys")
+            && !path.starts_with("/dev")
+            && self.dac_overrides_permissions()
+            && self.fs.inotify_registry.is_empty()
+            && self.fs.fanotify_registry.is_empty()
+            && !self.fs.vfs_mounts.has_mount(path)
+        {
+            if let Ok((host_fd, real, canonical_path)) =
+                self.fs.rootfs_vfs.dentry_fast_open(path, writable_request)
+            {
+                use std::os::fd::IntoRawFd;
+                let raw = host_fd.into_raw_fd();
+                debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(raw));
+                crate::probes::path_open(path, real.size, 0);
+                let metadata = RootFsMetadata {
+                    path: std::path::Path::new(path).to_path_buf(),
+                    kind: RootFsEntryKind::File,
+                    mode: real.mode,
+                    size: usize::try_from(real.size).unwrap_or(usize::MAX),
+                };
+                let description = OpenDescription::HostFile {
+                    host_fd: HostFdRef::new(raw),
+                    metadata,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                    writable: writable_request,
+                };
+                let status = flags & !LINUX_O_CLOEXEC;
+                let open_file = OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(description)),
+                    status,
+                    linux_fd_flags_from_open_flags(flags),
+                );
+                if let Ok(fd) = self.install_fd_at_or_above(0, open_file) {
+                    self.record_fd_open_path(fd, canonical_path);
+                    return Ok(DispatchOutcome::Returned { value: fd as i64 });
+                }
+            }
         }
         // A trailing slash or "/." forces directory semantics on the final component.
         // Linux's open(2): `O_CREAT` of a path that ends in `/` can NEVER
@@ -3237,6 +3326,10 @@ impl SyscallDispatcher {
                         crate::fs_backend::HostFdOpen::Unavailable => None,
                     };
                 if let Some((host_fd, mode_applied)) = created {
+                    self.fs.rootfs_vfs.dentry_cache.notify_create(&path);
+                    if want_trunc {
+                        self.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
+                    }
                     debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
                     // A backend that created with the host umask (or could not
                     // represent the mode natively) still needs the guest mode
@@ -3264,7 +3357,12 @@ impl SyscallDispatcher {
                     }
                 } else {
                     match self.fs.rootfs_vfs.overlay.create_file(&path) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            self.fs.rootfs_vfs.dentry_cache.notify_create(&path);
+                            if want_trunc {
+                                self.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
+                            }
+                        }
                         Err(crate::fs_backend::BackendError::Host(refused)) => {
                             return Ok(DispatchOutcome::errno(refused));
                         }
@@ -6676,6 +6774,14 @@ impl SyscallDispatcher {
                 .exchange_with_flags(&resolved_old, &resolved_new)
             {
                 Ok(()) => {
+                    self.fs
+                        .rootfs_vfs
+                        .dentry_cache
+                        .notify_rename(&resolved_old, &resolved_new);
+                    self.fs
+                        .rootfs_vfs
+                        .dentry_cache
+                        .notify_rename(&resolved_new, &resolved_old);
                     if !self.fs.inotify_registry.is_empty() {
                         // A swap is two moves: each name now holds the other's
                         // object, so emit IN_MOVED_FROM/IN_MOVED_TO for both
@@ -6739,6 +6845,10 @@ impl SyscallDispatcher {
             .rename_with_flags(&resolved_old, &resolved_new, no_replace)
         {
             Ok(()) => {
+                self.fs
+                    .rootfs_vfs
+                    .dentry_cache
+                    .notify_rename(&resolved_old, &resolved_new);
                 if !self.fs.inotify_registry.is_empty() {
                     // IN_MOVED_FROM (old name) + IN_MOVED_TO (new name), cookie-
                     // tied, to watches on the respective parent directories.
@@ -6801,7 +6911,9 @@ impl SyscallDispatcher {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
         match &*open {
-            OpenDescription::HostFile { host_fd, .. } => {
+            OpenDescription::HostFile {
+                host_fd, metadata, ..
+            } => {
                 let to_ts = |t: Option<(i64, i64)>| match t {
                     Some((sec, nsec)) => libc::timespec {
                         tv_sec: sec as libc::time_t,
@@ -6823,6 +6935,11 @@ impl SyscallDispatcher {
                         &format!("fd={fd} {e}"),
                         e.raw_os_error().unwrap_or(0),
                     );
+                } else {
+                    let p = metadata.path.to_string_lossy();
+                    if !p.is_empty() && !p.starts_with("/__carrick_") {
+                        self.fs.rootfs_vfs.dentry_cache.invalidate_path(&p);
+                    }
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
@@ -6832,7 +6949,10 @@ impl SyscallDispatcher {
                 drop(open);
                 if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
                     return match m.vfs.set_times(&m.full_path, atime, mtime, false) {
-                        Ok(()) => DispatchOutcome::Returned { value: 0 },
+                        Ok(()) => {
+                            self.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
+                            DispatchOutcome::Returned { value: 0 }
+                        }
                         Err(errno) => DispatchOutcome::errno(errno),
                     };
                 }
@@ -6845,6 +6965,7 @@ impl SyscallDispatcher {
                     .set_times(&path, atime, mtime, false)
                 {
                     Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
+                        self.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
                         DispatchOutcome::Returned { value: 0 }
                     }
                     Err(_) => DispatchOutcome::errno(LINUX_EROFS),
@@ -7537,6 +7658,7 @@ impl SyscallDispatcher {
         }
         match self.fs.rootfs_vfs.overlay.set_mode(&resolved, mode) {
             Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
+                self.fs.rootfs_vfs.dentry_cache.invalidate_path(&resolved);
                 self.inotify_attrib(&resolved);
                 self.dnotify_attrib(context, &resolved);
                 Ok(DispatchOutcome::Returned { value: 0 })
@@ -7687,6 +7809,7 @@ impl SyscallDispatcher {
                 }
             } else {
                 let _ = self.fs.rootfs_vfs.overlay.set_owner(&path, uid, gid);
+                self.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
             }
             self.clear_setid_on_chown(&path);
             self.dnotify_attrib(context, &path);
@@ -15143,6 +15266,8 @@ impl SyscallDispatcher {
                     Ok(p) => p.to_string_lossy().into_owned(),
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
+            } else if let Ok(t) = this.fs.rootfs_vfs.dentry_readlink(&path) {
+                t
             } else if let Some(t) = this.fs.rootfs_vfs.overlay.read_link(&path) {
                 // Symlink created in the writable backend (cap-std on --fs host).
                 t
@@ -15273,6 +15398,10 @@ impl SyscallDispatcher {
                             .create_device(&materialize_path, full_mode, dev)
                         {
                             Ok(()) => {
+                                this.fs
+                                    .rootfs_vfs
+                                    .dentry_cache
+                                    .notify_create(&materialize_path);
                                 this.stamp_new_node_owner(&materialize_path, full_mode);
                                 this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
@@ -15302,6 +15431,10 @@ impl SyscallDispatcher {
                             .create_socket(&materialize_path, sock_mode)
                         {
                             Ok(()) => {
+                                this.fs
+                                    .rootfs_vfs
+                                    .dentry_cache
+                                    .notify_create(&materialize_path);
                                 this.stamp_new_node_owner(&materialize_path, sock_mode);
                                 this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
@@ -15325,6 +15458,10 @@ impl SyscallDispatcher {
             // path exists in the layered view.
             match this.fs.rootfs_vfs.overlay.create_file(&materialize_path) {
                 Ok(()) => {
+                    this.fs
+                        .rootfs_vfs
+                        .dentry_cache
+                        .notify_create(&materialize_path);
                     if mode & 0o7777 != 0 {
                         let _ = this
                             .fs
@@ -15453,6 +15590,7 @@ impl SyscallDispatcher {
                             .overlay
                             .set_owner(&resolved, Some(creds.euid), Some(owner_gid));
                     }
+                    this.fs.rootfs_vfs.dentry_cache.notify_mkdir(&resolved);
                     // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
                     this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
                     this.dnotify_child(cx.kernel, &resolved, LinuxDnotifyMask::CREATE);
@@ -15500,6 +15638,7 @@ impl SyscallDispatcher {
                     }
                 } else {
                     let _ = this.fs.rootfs_vfs.overlay.set_mode(&path, mode);
+                    this.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
                 }
                 // Refresh THIS fd's cached metadata so a subsequent fstat on it
                 // sees the new mode. A Directory/File fstat reads the cached
@@ -15620,6 +15759,7 @@ impl SyscallDispatcher {
                         uid,
                         gid,
                     );
+                    this.fs.rootfs_vfs.dentry_cache.invalidate_path(&resolved);
                     this.clear_setid_on_chown(&resolved);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -15837,6 +15977,10 @@ impl SyscallDispatcher {
             }
             match this.fs.rootfs_vfs.overlay.hard_link(&src, &resolved_new) {
                 Ok(()) => {
+                    this.fs
+                        .rootfs_vfs
+                        .dentry_cache
+                        .notify_create(&resolved_new);
                     this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -15863,6 +16007,10 @@ impl SyscallDispatcher {
                         .set_file_contents(&resolved_new, contents)
                     {
                         Ok(()) => {
+                            this.fs
+                                .rootfs_vfs
+                                .dentry_cache
+                                .notify_create(&resolved_new);
                             this.dnotify_child(cx.kernel, &resolved_new, LinuxDnotifyMask::CREATE);
                             Ok(DispatchOutcome::Returned { value: 0 })
                         }
@@ -15922,6 +16070,10 @@ impl SyscallDispatcher {
                 .symlink(&target_path, &resolved_link)
             {
                 Ok(()) => {
+                    this.fs
+                        .rootfs_vfs
+                        .dentry_cache
+                        .notify_symlink(&resolved_link);
                     this.dnotify_child(cx.kernel, &resolved_link, LinuxDnotifyMask::CREATE);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -16218,6 +16370,13 @@ impl SyscallDispatcher {
                 } else {
                     this.fs.rootfs_vfs.unlink(&resolved)
                 };
+                if overlay_result.is_ok() {
+                    if remove_dir {
+                        this.fs.rootfs_vfs.dentry_cache.notify_rmdir(&resolved);
+                    } else {
+                        this.fs.rootfs_vfs.dentry_cache.notify_unlink(&resolved);
+                    }
+                }
                 // A missing overlay file is expected (the injection had no real
                 // backing) — that's still a successful detach. Only a non-ENOENT
                 // error from a real overlay file should surface.
@@ -16255,6 +16414,11 @@ impl SyscallDispatcher {
             };
             match result {
                 Ok(()) => {
+                    if remove_dir {
+                        this.fs.rootfs_vfs.dentry_cache.notify_rmdir(&resolved);
+                    } else {
+                        this.fs.rootfs_vfs.dentry_cache.notify_unlink(&resolved);
+                    }
                     // inotify: IN_DELETE (name) to a watch on the parent dir.
                     this.inotify_child(
                         &resolved,
@@ -16398,7 +16562,10 @@ impl SyscallDispatcher {
                     mtime_set,
                     flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
                 ) {
-                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Ok(()) => {
+                        this.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
+                        Ok(DispatchOutcome::Returned { value: 0 })
+                    }
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 };
             }
@@ -16417,7 +16584,10 @@ impl SyscallDispatcher {
                     flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
                 )
             {
-                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Ok(()) => {
+                    this.fs.rootfs_vfs.dentry_cache.invalidate_path(&path);
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
                 Err(crate::fs_backend::BackendError::Unsupported) => {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -16541,6 +16711,28 @@ impl SyscallDispatcher {
             // ENOTDIR (matches newfstatat; man path_resolution(7)).
             let requires_dir = path.ends_with('/') || path.ends_with("/.");
 
+            // Dentry cache fast path for statx
+            if (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
+                && path.starts_with('/')
+                && !path.starts_with("/proc")
+                && !path.starts_with("/sys")
+                && !path.starts_with("/dev")
+                && !path.split('/').any(|c| c == "..")
+                && this.dac_overrides_permissions()
+                && !this.fs.vfs_mounts.has_mount(&path)
+            {
+                let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
+                match this.fs.rootfs_vfs.dentry_stat(&path, follow) {
+                    Ok(real) => {
+                        return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
+                    }
+                    Err(LINUX_ENOENT) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                    Err(LINUX_ENOTDIR) => return Ok(DispatchOutcome::errno(LINUX_ENOTDIR)),
+                    Err(LINUX_ELOOP) => return Ok(DispatchOutcome::errno(LINUX_ELOOP)),
+                    Err(_) => {}
+                }
+            }
+
             // Dispatch-level stat-cache fast path — see the twin block in
             // `newfstatat` for the gating rationale. write_statx_real's `path`
             // only feeds the type bits, so a hit is byte-identical.
@@ -16556,6 +16748,24 @@ impl SyscallDispatcher {
             }
 
             let path = this.resolve_at_path(dirfd, &path)?;
+            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
+            if !path.starts_with("/proc")
+                && !path.starts_with("/sys")
+                && !path.starts_with("/dev")
+                && !path.split('/').any(|c| c == "..")
+                && this.dac_overrides_permissions()
+                && this.fs.vfs_mounts.resolve(&path).is_none()
+            {
+                match this.fs.rootfs_vfs.dentry_stat(&path, follow) {
+                    Ok(real) => {
+                        return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
+                    }
+                    Err(LINUX_ENOENT) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
+                    Err(LINUX_ENOTDIR) => return Ok(DispatchOutcome::errno(LINUX_ENOTDIR)),
+                    Err(LINUX_ELOOP) => return Ok(DispatchOutcome::errno(LINUX_ELOOP)),
+                    Err(_) => {}
+                }
+            }
             if crate::vfs::may_be_synthetic_virtual_path(&path) {
                 // One context assembly for both consults — see the twin block
                 // in `path_stat_record`, including why the kernel task graph is

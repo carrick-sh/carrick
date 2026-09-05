@@ -4,6 +4,7 @@
 //! methods — method resolution is type-based, so the intra-dispatcher `self.…`
 //! calls are unaffected by living in a separate file.
 use super::*;
+use crate::linux_abi::LINUX_ELOOP;
 
 impl SyscallDispatcher {
     pub(super) fn access_at(
@@ -122,6 +123,7 @@ impl SyscallDispatcher {
         if !path.starts_with('/')
             || path.starts_with("/proc")
             || path.starts_with("/sys")
+            || path.starts_with("/dev")
             || path.split('/').any(|component| component == "..")
             || self.fs.vfs_mounts.resolve(path).is_some()
         {
@@ -130,11 +132,19 @@ impl SyscallDispatcher {
         if !self.cred_snapshot().ruid.is_root() {
             return None;
         }
-        self.fs
-            .rootfs_vfs
-            .overlay
-            .stat_cache_lookup(path)
-            .map(|_| DispatchOutcome::Returned { value: 0 })
+        let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
+        match self.fs.rootfs_vfs.dentry_stat(path, follow) {
+            Ok(_) => Some(DispatchOutcome::Returned { value: 0 }),
+            Err(LINUX_ENOENT) => Some(DispatchOutcome::errno(LINUX_ENOENT)),
+            Err(LINUX_ENOTDIR) => Some(DispatchOutcome::errno(LINUX_ENOTDIR)),
+            Err(LINUX_ELOOP) => Some(DispatchOutcome::errno(LINUX_ELOOP)),
+            Err(_) => self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .stat_cache_lookup(path)
+                .map(|_| DispatchOutcome::Returned { value: 0 }),
+        }
     }
 
     fn access_resolved_path(

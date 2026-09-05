@@ -876,6 +876,22 @@
     {
       "kind": "static",
       "file": "crates/carrick-runtime/src/fs_resolve_cache.rs",
+      "symbol": "ATFORK_INIT",
+      "fingerprint": "be461cf5872a14fa167336dac2e8c15847b0e5af28bd90a21f34002b483b3420",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure static ATFORK_INIT in crates/carrick-runtime/src/fs_resolve_cache.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/fs_resolve_cache.rs",
+      "symbol": "PROCESS_GENERATION",
+      "fingerprint": "69ba843171b39032e4235c32797a4ab0b93a1924839f1fdc7153b99739233e23",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure static PROCESS_GENERATION in crates/carrick-runtime/src/fs_resolve_cache.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/fs_resolve_cache.rs",
       "symbol": "generation_word_at::CELL",
       "fingerprint": "5ddd9a26bc50591d368264245d366c2c048ad61c12501d50f2e4b3673c00607c",
       "classification": "carrier_infra",

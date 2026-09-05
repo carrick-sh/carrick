@@ -874,6 +874,16 @@ pub trait FsBackend: Send + Sync {
         None
     }
 
+    /// Return an open, contained host dirfd for `dir` if supported.
+    fn dir_fd_for(&self, _dir: &Path) -> Option<std::sync::Arc<cap_std::fs::Dir>> {
+        None
+    }
+
+    /// Whether this backend is shared with the host (not private to container).
+    fn is_shared(&self) -> bool {
+        false
+    }
+
     /// `true` when the overlay's own bookkeeping could make a RAW host
     /// directory stream lie about the guest view of `dir` — i.e. `getdents`
     /// must take the layered (per-child classified) path instead of streaming
@@ -1842,20 +1852,14 @@ pub struct HostFsBackend {
     /// it; the later `insert` replaces the earlier. Both are valid, contained
     /// and independently owned, so the only effect is a transient second fd.
     dir_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, DirCacheEntry>>,
-    /// The pid that owns the current [`Self::dir_cache`] fds. carrick's
-    /// `native`/`vmm` lanes COW-fork the host process for guest `clone(2)`, so
-    /// a child inherits both the map and the dup'd fds; the first use after a
-    /// pid change drops the inherited entries and adopts the cache for this
-    /// process. Under the kernel (`hvpatch`) lane there is exactly one host
-    /// process and this never fires. `0` forces the first use to adopt.
-    dir_cache_pid: std::sync::atomic::AtomicU32,
-    /// The pid that owns the current `stat_cache` contents. carrick COW-forks for
-    /// guest `clone`/`fork` (and for the default private-PID-namespace guest
-    /// init), so a child inherits the map + dup'd parent fds. On the first cache
-    /// use after a pid change we DROP the inherited entries and adopt the cache
-    /// for this process — so each process caches its own view and never trusts a
-    /// sibling's stale fd. `0` (no real pid) forces the first use to adopt.
-    cache_pid: std::sync::atomic::AtomicU32,
+    /// The process generation that owns the current [`Self::dir_cache`] fds.
+    /// Changed on host fork so a child drops inherited entries and adopts
+    /// the cache for this process. Replaces per-call `libc::getpid()`.
+    dir_cache_proc_gen: std::sync::atomic::AtomicU64,
+    /// The process generation that owns the current `stat_cache` contents.
+    /// Changed on host fork so each process caches its own view.
+    /// Replaces per-call `libc::getpid()`.
+    cache_proc_gen: std::sync::atomic::AtomicU64,
     /// `CARRICK_FS_STATCACHE` enabled (default ON — see `stat_cache`).
     use_stat_cache: bool,
     /// `Some(merged)` when this scratch is composed as an overlayfs mount
@@ -1875,9 +1879,8 @@ pub struct HostFsBackend {
     /// cached, a host fork adopts this cache by clearing inherited parent entries
     /// before first use in the child.
     watch_res_cache: parking_lot::Mutex<std::collections::HashMap<String, WatchResCacheEntry>>,
-    /// The pid that owns current `watch_res_cache` fd entries; see the cache
-    /// comment above.
-    watch_cache_pid: std::sync::atomic::AtomicU32,
+    /// The process generation that owns current `watch_res_cache` fd entries.
+    watch_cache_proc_gen: std::sync::atomic::AtomicU64,
     /// Sticky fast answer for [`FsBackend::may_have_fifo_nodes`]: once ANY
     /// process is known to have created a FIFO under this scratch root the
     /// answer is `true` forever with no syscall. `false` only means "consult
@@ -2595,12 +2598,12 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_cache_pid: std::sync::atomic::AtomicU32::new(0),
-            cache_pid: std::sync::atomic::AtomicU32::new(0),
+            dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
+            cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
+            watch_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
             fifo_seen: std::sync::atomic::AtomicBool::new(false),
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
@@ -2658,12 +2661,12 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_cache_pid: std::sync::atomic::AtomicU32::new(0),
-            cache_pid: std::sync::atomic::AtomicU32::new(0),
+            dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
+            cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
+            watch_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
             fifo_seen: std::sync::atomic::AtomicBool::new(false),
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
@@ -2751,12 +2754,12 @@ impl HostFsBackend {
             sparse_upper_fast_miss: authority.sparse_upper_fast_miss,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_cache_pid: std::sync::atomic::AtomicU32::new(0),
-            cache_pid: std::sync::atomic::AtomicU32::new(0),
+            dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
+            cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
+            watch_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
             fifo_seen: std::sync::atomic::AtomicBool::new(false),
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
@@ -2806,15 +2809,15 @@ impl HostFsBackend {
             return None;
         }
         let generation = crate::fs_resolve_cache::current_dir_generation();
-        let me = unsafe { libc::getpid() } as u32;
+        let proc_gen = crate::fs_resolve_cache::current_process_generation();
 
         // Adopt-and-clear if we crossed a host fork: a child must not trust
         // dirfds it inherited from a parent that may since have moved them.
         {
             let mut cache = self.dir_cache.lock();
-            if self.dir_cache_pid.load(Relaxed) != me {
+            if self.dir_cache_proc_gen.load(Relaxed) != proc_gen {
                 cache.clear();
-                self.dir_cache_pid.store(me, Relaxed);
+                self.dir_cache_proc_gen.store(proc_gen, Relaxed);
             }
             if let Some(entry) = cache.get(dir)
                 && entry.dir_generation == generation
@@ -4078,17 +4081,17 @@ impl HostFsBackend {
         //     may have moved the directory the fd names, and identity
         //     revalidation cannot see that — the inode, ctime and size are all
         //     unchanged at the new location.
-        let me = unsafe { libc::getpid() } as u32;
+        let proc_gen = crate::fs_resolve_cache::current_process_generation();
         let meta_generation = crate::fs_resolve_cache::current_meta_generation();
         let cached = {
             use std::sync::atomic::Ordering::Relaxed;
             let mut map = self.stat_cache.lock();
-            if self.cache_pid.load(Relaxed) != me {
+            if self.cache_proc_gen.load(Relaxed) != proc_gen {
                 map.clear();
                 // LOCK ORDER `stat_cache` -> `dir_cache`; this is the only site
                 // that holds both, and `dir_cache` is never taken first.
                 self.drop_dir_cache();
-                self.cache_pid.store(me, Relaxed);
+                self.cache_proc_gen.store(proc_gen, Relaxed);
             }
             map.get(rel)
                 .filter(|e| e.dir_generation == dir_generation)
@@ -6714,11 +6717,11 @@ impl FsBackend for HostFsBackend {
         let gen_at_entry = crate::fs_resolve_cache::current_generation();
         let cached = {
             let now = crate::fs_resolve_cache::current_generation();
-            let me = unsafe { libc::getpid() } as u32;
+            let proc_gen = crate::fs_resolve_cache::current_process_generation();
             let mut guard = self.watch_res_cache.lock();
-            if self.watch_cache_pid.load(Relaxed) != me {
+            if self.watch_cache_proc_gen.load(Relaxed) != proc_gen {
                 guard.clear();
-                self.watch_cache_pid.store(me, Relaxed);
+                self.watch_cache_proc_gen.store(proc_gen, Relaxed);
             }
             guard.get(path).and_then(|entry| {
                 (entry.generation == now)
@@ -7607,6 +7610,22 @@ impl FsBackend for HostFsBackend {
             let _ = path;
             None
         }
+    }
+
+    fn dir_fd_for(&self, dir: &Path) -> Option<std::sync::Arc<cap_std::fs::Dir>> {
+        #[cfg(target_os = "macos")]
+        {
+            Self::dir_fd_for(self, dir)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = dir;
+            None
+        }
+    }
+
+    fn is_shared(&self) -> bool {
+        self._scratch.is_none()
     }
 
     fn stat_cache_lookup(&self, path: &str) -> Option<RealStat> {

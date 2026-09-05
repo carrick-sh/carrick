@@ -87,11 +87,42 @@ fn generation_word() -> &'static AtomicU64 {
     generation_word_at(PATH_GENERATION_SLOT)
 }
 
+/// Process-local generation counter. Incremented whenever this process is
+/// created via a host fork (`pthread_atfork` child callback, or explicit hook in
+/// `carrier::reset_after_fork_child` and `reinit_after_fork`).
+/// Used by in-process caches to detect fork without issuing `libc::getpid()`.
+static PROCESS_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+static ATFORK_INIT: std::sync::Once = std::sync::Once::new();
+
+fn ensure_atfork_installed() {
+    ATFORK_INIT.call_once(|| {
+        extern "C" fn atfork_child() {
+            bump_process_generation();
+        }
+        unsafe {
+            libc::pthread_atfork(None, None, Some(atfork_child));
+        }
+    });
+}
+
+/// Current process generation. Validated by caches to detect fork without `libc::getpid()`.
+pub fn current_process_generation() -> u64 {
+    ensure_atfork_installed();
+    PROCESS_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Advance the process generation after a host fork.
+pub fn bump_process_generation() {
+    PROCESS_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Force the shared generation word into existence in the ROOT process, BEFORE
 /// any guest `fork`, so every descendant inherits the one `MAP_SHARED` word (a
 /// child that first touched it after forking would map its own private page).
 pub fn init() {
     let _ = generation_word();
+    ensure_atfork_installed();
 }
 
 /// Current fs-structure generation. A cache entry stamped with this value is
