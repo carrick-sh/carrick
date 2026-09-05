@@ -1764,6 +1764,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "proctaskchild": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "protnonesyscall": {
     "class": "conformance",
     "excluded": false,

@@ -1687,44 +1687,38 @@ pub(crate) fn synthetic_task_dir(
     pid: u32,
     container: Option<carrick_hal::ContainerId>,
 ) -> Option<Vec<String>> {
-    let own = container
-        .map(crate::container_thread_states)
-        .unwrap_or_default();
-    if own.iter().any(|(t, _)| t.raw() as u32 == pid) {
-        let self_host_pid = std::process::id();
-        let self_ns_pid = crate::namespace::pid::self_ns_pid();
-        return Some(
-            own.iter()
-                .map(|(t, _)| {
-                    let raw = t.raw() as u32;
-                    if raw == self_host_pid {
-                        self_ns_pid.to_string()
-                    } else {
-                        raw.to_string()
-                    }
+    crate::dispatch::resources::with_active_context(|context| {
+        let container_id = container.unwrap_or_else(|| context.container().id());
+        let internal_id = crate::namespace::pid::ns_to_kernel_for(context, pid)?;
+        let pid_i32 = i32::try_from(internal_id).ok()?;
+        let task_id = crate::kernel::TaskId::from_abi_positive(pid_i32).ok()?;
+        let registry = context.kernel().registry();
+        if let Some(process) = registry
+            .live_processes_for_container(container_id)
+            .into_iter()
+            .find(|p| p.key.id == task_id || p.tids.iter().any(|t| t.raw() as u32 == internal_id))
+        {
+            let mut tids: Vec<String> = process
+                .tids
+                .into_iter()
+                .filter_map(|tid| {
+                    let raw = tid.raw() as u32;
+                    crate::namespace::pid::kernel_to_ns_for(context, raw).map(|ns| ns.to_string())
                 })
-                .collect(),
-        );
-    }
-    if crate::host_proc::is_guest_process(pid) {
-        let display_pid = if crate::namespace::pid::enabled() {
-            crate::namespace::pid::host_to_ns_or_self(pid)
-        } else {
-            pid
-        };
-        if display_pid == 0 {
-            return None;
+                .collect();
+            tids.sort_unstable_by_key(|s| s.parse::<u32>().unwrap_or(0));
+            return Some(tids);
         }
-        return Some(vec![display_pid.to_string()]);
-    }
-    // The calling process is always its own live task, so `/proc/self` (which
-    // resolves to `std::process::id()`) must stay openable even when no guest
-    // thread is registered (unit tests) or `is_guest_process` is gated by a
-    // namespace region this process was never registered in.
-    if pid == std::process::id() {
-        return Some(vec![pid.to_string()]);
-    }
-    None
+        if registry
+            .zombies_for_container(container_id)
+            .into_iter()
+            .any(|z| z.key.id == task_id)
+        {
+            return Some(vec![pid.to_string()]);
+        }
+        None
+    })
+    .flatten()
 }
 
 /// Translate a guest-supplied (namespace) pid to a HOST pid; identity when no
@@ -1769,14 +1763,14 @@ pub(crate) fn proc_pid_dir_host_pid(path: &str) -> Option<u32> {
     // `self`/`thread-self` resolve to the calling process (the same mapping
     // parse_proc_pid_path uses for sub-path file reads), so the bare /proc/self
     // directory is openable/stat-able/scandir-able — not just /proc/self/<file>.
-    let (host_pid, ns_pid) = if comp == "self" || comp == "thread-self" {
-        (std::process::id(), None)
-    } else {
-        let ns_pid = comp.parse().ok()?;
-        (ns_pid_to_host(ns_pid)?, Some(ns_pid))
-    };
-    if synthetic_task_dir(host_pid, None).is_none()
-        && !ns_pid.is_some_and(|pid| mapped_existing_ns_pid(pid, host_pid))
+    if comp == "self" || comp == "thread-self" {
+        return Some(std::process::id());
+    }
+    let ns_pid = comp.parse().ok()?;
+    let host_pid = ns_pid_to_host(ns_pid)?;
+    if synthetic_task_dir(ns_pid, None).is_none()
+        && !crate::host_proc::is_guest_process(host_pid)
+        && !mapped_existing_ns_pid(ns_pid, host_pid)
     {
         return None;
     }
@@ -1808,9 +1802,48 @@ fn proc_task_dir_entries(
 ) -> Option<Vec<DirEnt>> {
     let p = path.strip_suffix('/').unwrap_or(path);
     let pid_comp = p.strip_prefix("/proc/")?.strip_suffix("/task")?;
-    let (_is_self, host_pid) = proc_live_pid(pid_comp)?;
-    let tids = synthetic_task_dir(host_pid, container)?;
+    let pid = if matches!(pid_comp, "self" | "thread-self" | "curproc" | "this") {
+        crate::namespace::pid::self_ns_pid()
+    } else {
+        pid_comp.parse::<u32>().ok()?
+    };
+    let tids = synthetic_task_dir(pid, container).or_else(|| {
+        if matches!(pid_comp, "self" | "thread-self" | "curproc" | "this")
+            || pid == crate::namespace::pid::self_ns_pid()
+        {
+            Some(vec![pid.to_string()])
+        } else {
+            None
+        }
+    })?;
     Some(proc_task_dir_entries_from_tids(tids))
+}
+
+fn proc_task_tid_dir_entries(
+    path: &str,
+    container: Option<carrick_hal::ContainerId>,
+) -> Option<Vec<DirEnt>> {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let (pid_comp, tid_comp) = path.strip_prefix("/proc/")?.split_once("/task/")?;
+    if pid_comp.is_empty() || pid_comp.contains('/') || tid_comp.contains('/') {
+        return None;
+    }
+    let pid = if matches!(pid_comp, "self" | "thread-self" | "curproc" | "this") {
+        crate::namespace::pid::self_ns_pid()
+    } else {
+        pid_comp.parse::<u32>().ok()?
+    };
+    let tids = synthetic_task_dir(pid, container).or_else(|| {
+        if matches!(pid_comp, "self" | "thread-self" | "curproc" | "this")
+            || pid == crate::namespace::pid::self_ns_pid()
+        {
+            Some(vec![pid.to_string()])
+        } else {
+            None
+        }
+    })?;
+    tids.contains(&tid_comp.to_string())
+        .then(|| proc_pid_dir_entries_for_known_process_named(false))
 }
 
 fn proc_task_dir_entries_from_tids(tids: impl IntoIterator<Item = String>) -> Vec<DirEnt> {
@@ -2393,6 +2426,7 @@ impl Vfs for ProcVfs {
             || proc_fd_is_dir(path)
             || proc_fdinfo_is_dir(path)
             || proc_task_dir_entries(path, None).is_some()
+            || proc_task_tid_dir_entries(path, None).is_some()
             || proc_pid_dir_entries(path).is_some()
         {
             return Ok(Metadata {
@@ -2525,6 +2559,9 @@ impl Vfs for ProcVfs {
         if let Some(entries) = proc_task_dir_entries(path, None) {
             return Ok(entries);
         }
+        if let Some(entries) = proc_task_tid_dir_entries(path, None) {
+            return Ok(entries);
+        }
         if let Some(entries) = proc_pid_dir_entries(path) {
             return Ok(entries);
         }
@@ -2615,6 +2652,7 @@ impl Vfs for ProcVfs {
                 )
             })
             .or_else(|| proc_task_dir_entries(path, ctx.runtime_endpoint_container))
+            .or_else(|| proc_task_tid_dir_entries(path, ctx.runtime_endpoint_container))
         {
             return Ok(VfsHandle::Directory {
                 path: path.to_string(),
@@ -3575,7 +3613,9 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
     // can numerically equal a peer's pid only if the graph is inconsistent —
     // still resolves through the richer per-thread snapshot.
     if let Some(processes) = ctx.processes.as_ref()
-        && let Some(process) = processes.iter().find(|process| process.pid == pid)
+        && let Some(process) = processes
+            .iter()
+            .find(|process| process.pid == pid || process.tids.contains(&pid))
     {
         let name = if process.comm.is_empty() {
             self_comm
@@ -3608,7 +3648,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
                 format!(
                     "Name:\t{name}\n\
 State:\t{state} ({state_long})\n\
-Tgid:\t{pid}\n\
+Tgid:\t{tgid}\n\
 Pid:\t{pid}\n\
 PPid:\t{ppid}\n\
 TracerPid:\t0\n\
@@ -3617,6 +3657,7 @@ Gid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
 Threads:\t{threads}\n",
                     state = process.state,
                     state_long = proc_state_long(process.state),
+                    tgid = process.pid,
                     ppid = process.ppid,
                     // Per-process credentials are not in the kernel graph yet.
                     // The reader's own modeled container credentials are the
@@ -3849,7 +3890,7 @@ fn parse_proc_pid_path(path: &str) -> Option<(u32, &str)> {
     // recursion in synthetic_proc_pid_file then picks the specific thread.
     // glibc's pthread_getname_np opens /proc/self/task/<tid>/comm.
     let pid: u32 = match pid_str {
-        "self" | "thread-self" => std::process::id(),
+        "self" | "thread-self" => crate::namespace::pid::self_ns_pid(),
         _ => pid_str.parse().ok()?,
     };
     Some((pid, rest))
@@ -6024,5 +6065,121 @@ mod tests {
             btime + boot_elapsed().as_secs() >= host_now + 3_599,
             "btime {btime} must be derived from the guest clock"
         );
+    }
+
+    #[test]
+    fn kernel_graph_proc_child_task_directory_and_liveness() {
+        let _guard = crate::dispatch::resources::dirty_executor_boundary_resources_guard_for_test();
+        crate::dispatch::resources::with_active_context(|root| {
+            let kernel = root.kernel();
+            let v = ProcVfs::new();
+
+            // Dead / non-existent pid ENOENTs
+            assert_eq!(v.lookup("/proc/999999/task"), Err(LINUX_ENOENT));
+            assert_eq!(v.readdir("/proc/999999/task"), Err(LINUX_ENOTDIR));
+            assert!(synthetic_task_dir(999999, None).is_none());
+
+            // 1. Fork a child process
+            let fork_plan =
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .expect("fork plan");
+            let reservation = kernel
+                .reserve_fork(root, fork_plan, "test-child".to_owned(), None)
+                .expect("fork reservation");
+            let child_internal = reservation.child_id();
+            let child_pid = reservation.visible_child_id() as u32;
+            let prepared_child = reservation
+                .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(6_101))
+                .expect("prepare child");
+            let published_child = prepared_child.commit().expect("commit child");
+            let (child_ctx, _) = published_child.into_parts().expect("start child");
+
+            // Verify parent listing /proc/<child>/task sees the child's tid
+            let child_task_path = format!("/proc/{child_pid}/task");
+            let md = v.lookup(&child_task_path).expect("lookup child task dir");
+            assert_eq!(md.kind, EntryKind::Directory);
+
+            let tids = synthetic_task_dir(child_pid, None).expect("child task tids");
+            assert_eq!(tids, vec![child_pid.to_string()]);
+
+            let entries = v.readdir(&child_task_path).expect("readdir child task dir");
+            let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+            assert!(names.contains(&".".to_string()));
+            assert!(names.contains(&"..".to_string()));
+            assert!(names.contains(&child_pid.to_string()));
+            assert_eq!(names.len(), 3);
+
+            // 2. Multi-threaded child creates a thread
+            let thread_plan = crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::SIGHAND,
+            )
+            .expect("thread plan");
+            let thread_res = kernel
+                .reserve_thread_clone(&child_ctx, thread_plan, None)
+                .expect("reserve thread clone");
+            let thread_tid = thread_res.visible_tid() as u32;
+            let prepared_thread = thread_res
+                .prepare(carrick_hal::ThreadId::synthetic_for_tests(6_102))
+                .expect("prepare thread");
+            let published_thread = prepared_thread.commit().expect("commit thread");
+            let thread_ctx = published_thread.into_context().expect("start thread");
+
+            // Verify multi-threaded child lists every tid
+            let mut tids_mt = synthetic_task_dir(child_pid, None).expect("multi-threaded tids");
+            tids_mt.sort_unstable_by_key(|s| s.parse::<u32>().unwrap_or(0));
+            assert_eq!(tids_mt, vec![child_pid.to_string(), thread_tid.to_string()]);
+
+            let entries_mt = v
+                .readdir(&child_task_path)
+                .expect("readdir multi-threaded task dir");
+            let names_mt: Vec<String> = entries_mt.into_iter().map(|e| e.name).collect();
+            assert!(names_mt.contains(&child_pid.to_string()));
+            assert!(names_mt.contains(&thread_tid.to_string()));
+            assert_eq!(names_mt.len(), 4);
+
+            // Verify /proc/<child>/task/<tid> is a directory
+            let child_tid_path = format!("/proc/{child_pid}/task/{thread_tid}");
+            let tid_md = v.lookup(&child_tid_path).expect("lookup tid dir");
+            assert_eq!(tid_md.kind, EntryKind::Directory);
+            assert!(v.readdir(&child_tid_path).is_ok());
+
+            // 3. Child exits and is reaped -> ENOENT
+            kernel
+                .exit_thread(&thread_ctx, None)
+                .expect("exit secondary thread");
+            kernel
+                .exit_task_key_eventually(
+                    child_ctx.task().key(),
+                    crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                )
+                .expect("exit child task");
+
+            // Before reap, as zombie: task dir still lists leader
+            let zombie_tids = synthetic_task_dir(child_pid, None).expect("zombie task tids");
+            assert_eq!(zombie_tids, vec![child_pid.to_string()]);
+
+            // Reap child
+            let refreshed_root = kernel
+                .context(root.task().key().id, root.thread().key().tid)
+                .expect("refresh root context");
+            let wait_outcome = kernel
+                .wait_child(
+                    refreshed_root.task().key().id,
+                    Some(child_internal),
+                    crate::kernel::WaitMode::Consume,
+                )
+                .expect("wait child consume");
+            assert!(matches!(
+                wait_outcome,
+                crate::kernel::WaitOutcome::Exited(_)
+            ));
+
+            // After consume/reap: dead pid ENOENTs
+            assert!(synthetic_task_dir(child_pid, None).is_none());
+            assert_eq!(v.lookup(&child_task_path), Err(LINUX_ENOENT));
+            assert_eq!(v.readdir(&child_task_path), Err(LINUX_ENOTDIR));
+        });
     }
 }

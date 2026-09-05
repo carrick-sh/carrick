@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-const CACHED_SHARD_0_PROBE_COUNT: usize = 144;
+const CACHED_SHARD_0_PROBE_COUNT: usize = 145;
 
 /// Derive the shard 0 subset from a complete baseline set.
 pub fn expected_shard_gaps(baseline: &[&'static str]) -> BTreeSet<&'static str> {
@@ -141,11 +141,11 @@ pub fn find_probe_binary_dir(repo_root: &Path, target: &str) -> Option<PathBuf> 
 
 #[test]
 fn test_shard_0_inventory() {
-    // Hard-assert exactly 155 sorted unique names.
+    // Hard-assert exactly 156 sorted unique names.
     assert_eq!(
         SHARD_0_PROBES.len(),
-        155,
-        "shard 0 must have exactly 155 probes"
+        156,
+        "shard 0 must have exactly 156 probes"
     );
 
     let mut sorted_probes = SHARD_0_PROBES.to_vec();
@@ -159,8 +159,8 @@ fn test_shard_0_inventory() {
     let unique_probes: BTreeSet<_> = SHARD_0_PROBES.iter().copied().collect();
     assert_eq!(
         unique_probes.len(),
-        155,
-        "SHARD_0_PROBES must contain 155 unique names"
+        156,
+        "SHARD_0_PROBES must contain 156 unique names"
     );
     assert_eq!(
         SHARD_0_PROBES
@@ -224,8 +224,8 @@ fn test_shard_0_inventory() {
     selected_names.sort();
     assert_eq!(
         selected_names.len(),
-        465,
-        "expected exactly 465 conformance generic probes in inventory"
+        466,
+        "expected exactly 466 conformance generic probes in inventory"
     );
 
     let derived_shard_0: Vec<&str> = selected_names
@@ -236,8 +236,8 @@ fn test_shard_0_inventory() {
 
     assert_eq!(
         derived_shard_0.len(),
-        155,
-        "derived shard 0 must have exactly 155 items"
+        156,
+        "derived shard 0 must have exactly 156 items"
     );
     assert_eq!(
         SHARD_0_PROBES,
