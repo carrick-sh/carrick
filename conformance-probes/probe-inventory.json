@@ -2244,6 +2244,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "stackgrowmain": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "statfdino": {
     "class": "conformance",
     "excluded": false,
