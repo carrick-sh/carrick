@@ -6333,7 +6333,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, dense_fd, -1, LINUX_SEEK_DATA, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
 
     // SEEK_HOLE
@@ -6355,7 +6355,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, dense_fd, -1, LINUX_SEEK_HOLE, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
 
     // Check offset was updated to 100 by the last successful SEEK_HOLE
@@ -6406,7 +6406,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, rootfs_fd, -1, LINUX_SEEK_DATA, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
     assert_eq!(
         lseek(&dispatcher, rootfs_fd, 0, LINUX_SEEK_HOLE, &mut memory),
@@ -6422,7 +6422,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, rootfs_fd, -1, LINUX_SEEK_HOLE, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
 
     // 3. InMemoryFile (100 bytes)
@@ -6452,7 +6452,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, memfile_fd, -1, LINUX_SEEK_DATA, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
     assert_eq!(
         lseek(&dispatcher, memfile_fd, 0, LINUX_SEEK_HOLE, &mut memory),
@@ -6468,7 +6468,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, memfile_fd, -1, LINUX_SEEK_HOLE, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
 
     // 4. SyntheticFile (100 bytes)
@@ -6496,7 +6496,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, synth_fd, -1, LINUX_SEEK_DATA, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
     assert_eq!(
         lseek(&dispatcher, synth_fd, 0, LINUX_SEEK_HOLE, &mut memory),
@@ -6512,7 +6512,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, synth_fd, -1, LINUX_SEEK_HOLE, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
 
     // 5. HostBacked file (1 MiB sparse file: 4 KiB data at 0, hole, 4 KiB data at 512 KiB, hole to EOF)
@@ -6608,7 +6608,7 @@ fn lseek_data_and_hole_across_backends() {
             LINUX_SEEK_DATA,
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
 
     assert_eq!(
@@ -6673,7 +6673,7 @@ fn lseek_data_and_hole_across_backends() {
             LINUX_SEEK_HOLE,
             &mut memory
         ),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
 
     // Verify offset was tracked in OpenDescription::File
@@ -6746,7 +6746,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, hf_fd, -1, LINUX_SEEK_DATA, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
 
     assert_eq!(
@@ -6775,7 +6775,7 @@ fn lseek_data_and_hole_across_backends() {
     );
     assert_eq!(
         lseek(&dispatcher, hf_fd, -1, LINUX_SEEK_HOLE, &mut memory),
-        DispatchOutcome::errno(LINUX_EINVAL)
+        DispatchOutcome::errno(LINUX_ENXIO)
     );
 
     // 7. Directory returns EINVAL on whence 3/4
