@@ -584,3 +584,33 @@ before anything else.
   The probe now keeps the storm running until every worker has crossed the
   floor (watchdog-bounded), which makes the line the progress invariant it
   was documented as. Rebuild and re-bless pending the Docker phase.
+
+## mmap-cost levers landed (perf, first pathological-ratio work)
+
+Three commits from the `mmap-cost` worker after one rejected round (a
+freshness flag duplicated across six alias indices with linear scans, and a
+chore commit raising three burndown ceilings, both dropped):
+
+1. Skip the stage-1 TLBI when an edit only validates invalid leaves (an
+   invalid translation is never cached); `PageTableApplyOutcome` carries
+   `changed` and `flush_required` as a typed outcome, no bool impersonation.
+2. Replace the whole-range memset of reused private anonymous backing with
+   a fresh `mmap(MAP_FIXED|MAP_ANON|MAP_PRIVATE)` of the coalesced run, so
+   the kernel zero-fills lazily; COW sources, shared/file-backed and
+   unaligned tails keep the memset.
+3. Answer the mmap reuse-path alias queries from the existing `by_va_start`
+   and owned-scope indices instead of the full process-visible scan.
+
+Gate: full probe shard gate green on the branch binary (both lanes, all
+shards). Interleaved A/B, three reps each, same host load:
+
+| probe / case | main (µs/op) | branch (µs/op) | Docker |
+|---|---|---|---|
+| arena churn, touched | 328 | 212 | 52 |
+| arena pool, 64 live | 555 | 385 | 54 |
+| arena untouched | 59 | 50 | 1 |
+| mmap churn total (ms) | 9.95 | 9.69 | n/a |
+
+Still 4x/7x/50x the oracle; the untouched case is pure dispatch cost and is
+the next attribution target. Receipts: `perf-ab-mmap-cost.txt`,
+`conformance-probes-mmap-cost.log`. Landed as `ea55f4028..c89dec3c2`.
