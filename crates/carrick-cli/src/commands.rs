@@ -1768,6 +1768,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     out_path: output_path.map(|path| path.to_string_lossy().into_owned()),
                     drop_credentials: drop_credentials.clone(),
                     print_remaining_aggregates: profile.is_none(),
+                    post_child_linger: carrick_runtime::dtrace_consumer::default_post_child_linger(
+                    ),
                 };
                 #[cfg(target_os = "macos")]
                 if profile == Some(crate::trace_profile::TraceProfileKind::NativeShape) {

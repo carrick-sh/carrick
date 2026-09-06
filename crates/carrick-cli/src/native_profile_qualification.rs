@@ -473,6 +473,7 @@ where
         out_path: Some(output.path().to_string_lossy().into_owned()),
         drop_credentials,
         print_remaining_aggregates: false,
+        post_child_linger: carrick_runtime::dtrace_consumer::default_post_child_linger(),
     };
     let report = run_trace(executable, command, &options)
         .with_context(|| format!("run {label} qualification"))?;
