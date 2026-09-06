@@ -778,6 +778,14 @@
       "rationale": "Bisection hatch for the custom-script post-child linger bound in carrick trace (CARRICK_TRACE_POST_CHILD_LINGER_S; 0 = wait forever, the pre-fix behaviour)."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dtrace_consumer.rs",
+      "symbol": "post_child_linger_tests::hatch_contract_zero_disables_absent_is_sixty_seconds_number_overrides::key",
+      "fingerprint": "d0eab53b3bdca61a0d38973031cf88d0ea84564679fdf423da6ef171543335b5",
+      "classification": "test_only",
+      "rationale": "Unit test of the CARRICK_TRACE_POST_CHILD_LINGER_S hatch contract; reads and restores the variable inside one serialized test."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/event_ring.rs",
       "symbol": "IDX",
