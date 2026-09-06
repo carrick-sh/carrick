@@ -1259,6 +1259,11 @@
     "excluded": false,
     "runner": "conformance_native_multi_network_roles"
   },
+  "namei_escape": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "nanosleeprem": {
     "class": "conformance",
     "excluded": false,

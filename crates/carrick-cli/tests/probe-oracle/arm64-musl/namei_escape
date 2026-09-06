@@ -1,0 +1,14 @@
+b72d55ed2bd2fe4e
+dotdot_samestat=true
+deep_dotdot_samestat=true
+root_dotdot_samestat=true
+nonexistent_parent_errno=2
+abs_symlink_samestat=true
+abs_symlink_is_link=true
+abs_symlink_distinct=true
+abs_nofollow_errno=40
+swap_chain_samestat=true
+symlink_loop_errno=40
+rel_symlink_dotdot_samestat=true
+dir_symlink_samestat=true
+symlink_creat_excl_errno=17
