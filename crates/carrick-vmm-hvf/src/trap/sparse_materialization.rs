@@ -272,3 +272,82 @@ mod tests {
         }
     }
 }
+
+impl MmAccessState {
+    /// Publish missing structural arenas into this MM's custody. Callers hold
+    /// exact-MM mutation exclusion and topology; executor rows are only caches.
+    pub(super) fn publish_stage1_extension_arenas(
+        &self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        manager: &carrick_mem::page_table::PageTableManager,
+        root_perms: applevisor::memory::MemPerms,
+    ) -> Result<Vec<HvfMappedRegion>, TrapError> {
+        const TWO_MIB: usize = 2 * 1024 * 1024;
+        let mut published = Vec::new();
+        for base in manager.extension_arena_bases() {
+            if self.structural_owners.read().contains_key(&(base, TWO_MIB)) {
+                continue;
+            }
+
+            let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                TWO_MIB,
+                crate::host_mapping::HostMappingKind::PerMmKernelState,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "allocate stage-1 extension arena host backing: {error}"
+                ))
+            })?;
+
+            let rc = unsafe {
+                inventory_hv_vm_map(
+                    host_mapping.as_ptr().cast(),
+                    base,
+                    TWO_MIB,
+                    u64::from(root_perms),
+                )
+            };
+            if rc != 0 {
+                return Err(TrapError::ChildMapFailed {
+                    host_addr: host_mapping.as_ptr() as u64,
+                    guest_start: base,
+                    size: TWO_MIB,
+                    code: rc as u32,
+                });
+            }
+
+            let mut lease = GlobalFrameStage2Lease::fixed(base, TWO_MIB as u64);
+            lease.mark_mapped();
+
+            let mut region = HvfMappedRegion {
+                start: base,
+                end: base + TWO_MIB as u64,
+                ipa: base,
+                physical_ipa: base,
+                physical_size: TWO_MIB,
+                owner_generation: 0,
+                host_addr: host_mapping.as_ptr(),
+                size: TWO_MIB,
+                perms: root_perms,
+                memory: None,
+                host_mapping: Some(host_mapping),
+                structural_owner: None,
+                stage2_lease: None,
+                is_dynamic_alias: false,
+                sharing: GuestMappingSharing::Private,
+                guest_writable: true,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+            };
+
+            let _ = publish_exec_region_host_owner_in(custody, &mut region, lease, None)?;
+
+            if let Some(owner) = &region.structural_owner {
+                self.install_structural_mapping_authority(None, std::sync::Arc::clone(owner))?;
+            }
+
+            published.push(region);
+        }
+        Ok(published)
+    }
+}
