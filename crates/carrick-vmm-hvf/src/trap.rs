@@ -10619,6 +10619,42 @@ mod task_only_carrier_directory_tests {
     }
 
     #[test]
+    fn unregister_last_alias_does_not_rebuild_earlier_exact_rows() {
+        const PREFIX: usize = 512;
+        let mut registry = AliasRegistry::default();
+        let mut mine = alias(0x9000_0000, 3);
+        for index in 0..PREFIX {
+            let mut row = mine;
+            row.start -= (index as u64 + 1) * 0x4000;
+            row.ipa -= (index as u64 + 1) * 0x4000;
+            row.physical_ipa -= (index as u64 + 1) * 0x4000;
+            registry.push(row);
+        }
+        mine.start += 0x100000;
+        registry.push(mine);
+        let scope = match mine.ownership_scope {
+            AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
+            _ => None,
+        };
+        let before = alias_state_rows_scanned();
+        unregister_alias_entries(
+            &mut registry,
+            mine.start,
+            mine.size,
+            scope,
+            ContainerRootToken::ROOT,
+        );
+        let scanned = alias_state_rows_scanned() - before;
+        let mut expected = registry.clone();
+        expected.rebuild_exact_scope(mine.ownership_scope);
+        assert_eq!(registry.exact_first_by_scope, expected.exact_first_by_scope);
+        assert!(
+            scanned <= PREFIX as u64 + 16,
+            "last-row unmap visited {scanned} rows; prefix scan may remain, full index rebuild must not"
+        );
+    }
+
+    #[test]
     fn unregister_alias_matches_full_snapshot_invalidation() {
         let directory = HvpatchCarrierTaskStateDirectory::default();
         let owner = owner_key(&directory, 88, 1);
@@ -10740,6 +10776,14 @@ mod task_only_carrier_directory_tests {
                     reference_registry.iter().copied().collect::<Vec<_>>()
                 );
                 assert_eq!(replay, reference_replay);
+                let mut reindexed = registry.clone();
+                for scope in registry.by_scope.keys() {
+                    reindexed.rebuild_exact_scope(*scope);
+                }
+                assert_eq!(
+                    registry.exact_first_by_scope,
+                    reindexed.exact_first_by_scope
+                );
                 assert_eq!(
                     versions, reference_versions,
                     "version invalidation variant={variant} offset={offset}"
@@ -12732,6 +12776,7 @@ impl AliasRegistry {
             return;
         };
         let mut exact = std::collections::BTreeMap::new();
+        note_alias_state_rows_scanned(rows.len());
         for (position, &(seq, alias)) in rows.iter().enumerate() {
             exact
                 .entry((alias.start, alias.ipa))
@@ -12741,6 +12786,40 @@ impl AliasRegistry {
             self.exact_first_by_scope.remove(&scope);
         } else {
             self.exact_first_by_scope.insert(scope, exact);
+        }
+    }
+
+    /// Refresh only positions affected by a scope-bucket edit. Earlier first
+    /// occurrences still mask duplicate keys in the suffix. Tail unmaps leave
+    /// the existing prefix tree intact instead of allocating it again.
+    fn refresh_exact_scope_suffix(
+        &mut self,
+        scope: AliasOwnershipScope,
+        first_changed: usize,
+        old_keys: &[(u64, u64)],
+    ) {
+        let Some(rows) = self.by_scope.get(&scope) else {
+            self.exact_first_by_scope.remove(&scope);
+            return;
+        };
+        let exact = self.exact_first_by_scope.entry(scope).or_default();
+        note_alias_state_rows_scanned(old_keys.len());
+        for key in old_keys {
+            if exact
+                .get(key)
+                .is_some_and(|&(position, _, _)| position >= first_changed)
+            {
+                exact.remove(key);
+            }
+        }
+        note_alias_state_rows_scanned(rows.len().saturating_sub(first_changed));
+        for (position, &(seq, alias)) in rows.iter().enumerate().skip(first_changed) {
+            exact
+                .entry((alias.start, alias.ipa))
+                .or_insert((position, seq, alias));
+        }
+        if exact.is_empty() {
+            self.exact_first_by_scope.remove(&scope);
         }
     }
 
@@ -17468,6 +17547,8 @@ fn unregister_alias_entries(
         let mut mutations = Vec::new();
         let mut removed_count = 0usize;
         let mut inserted_count = 0usize;
+        let first_changed;
+        let old_suffix_keys;
         {
             let Some(rows) = registry.by_scope.get_mut(&scope) else {
                 continue;
@@ -17480,6 +17561,14 @@ fn unregister_alias_entries(
                     to_process.push((pos, seq, alias));
                 }
             }
+            let Some(&(first, _, _)) = to_process.first() else {
+                continue;
+            };
+            first_changed = first;
+            old_suffix_keys = rows[first..]
+                .iter()
+                .map(|(_, row)| (row.start, row.ipa))
+                .collect::<Vec<_>>();
             to_process.reverse();
 
             for (pos, seq, entry) in to_process {
@@ -17533,7 +17622,7 @@ fn unregister_alias_entries(
             .saturating_sub(removed_count)
             .saturating_add(inserted_count);
         registry.bump_revision();
-        registry.rebuild_exact_scope(scope);
+        registry.refresh_exact_scope_suffix(scope, first_changed, &old_suffix_keys);
         registry.drop_empty_scope(scope);
     }
 

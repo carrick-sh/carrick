@@ -171,3 +171,14 @@ whole cached probe family; exact signed artifact receipts and Ubuntu/Python
 launches; clean committed-tree inventory reconciliation, commit, then lint.
 Only afterward fast-forward main from the main checkout, rebuild/recheck, take
 the quiet-host fork number and full 2,127-row cached-only ecosystem ledger.
+
+
+## Scope-index suffix repair
+
+The tail-unmap regression visited 1,026 rows with a 512-row untouched prefix
+(`index-red.log`). Unregistration now preserves that prefix tree and repairs
+only changed suffix positions, including duplicate first-row masking. The
+work-count test passes with the prefix scan plus a 16-row bound; a full index
+rebuild is also compared after every existing differential unmap case. Full
+signed HVF lib suite: 438 passed, 3 ignored (`index-hvf-lib.log`). This is a
+local source checkpoint; fresh signed CLI timing and launch receipts follow.
