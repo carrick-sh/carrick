@@ -5022,6 +5022,10 @@ impl SyscallDispatcher {
                 && !address_uses_alias
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
+                if fixed_anonymous {
+                    let _ = memory.unmap_range(address, length_usize);
+                    this.remove_mapping_metadata(address, length);
+                }
                 memory.set_mapping_protection_and_sharing(
                     address,
                     length_usize,

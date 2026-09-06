@@ -1040,6 +1040,63 @@ impl DentryCache {
             };
             self.insert_positive(parent_id, name, pos.clone());
             return Ok(pos);
+        } else if let Some(md) = backend.fast_nofollow_metadata(&full_path) {
+            let symlink_target = if md.kind == RootFsEntryKind::Symlink {
+                backend.read_link(&full_path)
+            } else {
+                None
+            };
+            let (uid, gid) = backend
+                .get_owner(&full_path)
+                .unwrap_or((NsUid::ROOT, NsGid::ROOT));
+            let (dir_id, child_dir_gen) = if md.kind == RootFsEntryKind::Directory {
+                let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
+                let child_dir_gen = Arc::new(AtomicU64::new(1));
+                let child_upper_dir_fd = backend.dir_fd_for(Path::new(rel_full));
+                let child_lower_dir_fd = rootfs
+                    .and_then(|rf| rf.immutable_backend())
+                    .and_then(|b| b.dir_fd_for(Path::new(rel_full)));
+                self.insert_dir(
+                    new_dir_id,
+                    child_dir_gen.clone(),
+                    child_upper_dir_fd,
+                    child_lower_dir_fd,
+                    parent_id,
+                    name,
+                    &full_path,
+                );
+                (Some(new_dir_id), Some(child_dir_gen))
+            } else {
+                (None, None)
+            };
+            let ino = 1;
+            let record = InodeRecord {
+                mode: md.mode,
+                uid,
+                gid,
+                size: md.size as u64,
+                atime: (0, 0),
+                mtime: (0, 0),
+                ctime: (0, 0),
+                nlink: if md.kind == RootFsEntryKind::Directory {
+                    2
+                } else {
+                    1
+                },
+            };
+            self.inodes.write().insert((0, ino), record);
+            let pos = PositiveDentry {
+                id: dir_id,
+                kind: md.kind,
+                ino,
+                dev: 0,
+                symlink_target,
+                parent_gen: parent_dir_gen,
+                dir_gen: child_dir_gen,
+                is_lower: false,
+            };
+            self.insert_positive(parent_id, name, pos.clone());
+            return Ok(pos);
         }
 
         // 2. Check Lower RootFs (if available)

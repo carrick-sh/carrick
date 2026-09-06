@@ -36,4 +36,3 @@ pid$target::*materialize_private_file_backing*:return
     self->in_backing = 0;
 }
 
-tick-2s { exit(0); }
