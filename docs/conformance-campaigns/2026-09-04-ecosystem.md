@@ -1418,3 +1418,24 @@ commit is running to confirm the attribution.
   pages through `write_guest_bytes` afterwards, so installing the view only
   added work. Round 2 requires a zero-copy receipt for a whole-file private
   view before any number is re-measured.
+
+## 2026-09-06: cap-std retirement rounds 3–4 — glibc fixed by the worker, extraction containment lost
+
+Round 3 (`b97a9d32e..20165cef4`, rebased onto main by the director) removed
+the fork from the descriptor-exhaustion test, moved the dentry cache behind
+`RootFsVfs` with four mutator verbs and zero dispatch references (the
+owner's structural ask), and resolved intermediate directory symlinks in
+`dir_fd_for`, which the worker found itself via `accessx`/`fexecveprobe`.
+Director receipts on that binary: `ubuntu:24.04 /bin/true` rc 0, `sh -c`
+child exit reported, CPython prints. All three probe shards green in the
+worker's run.
+
+Blocking finding at the lint gate: 88 new host-authority rows, and the
+real ones are `extract_to_dir` rewritten from cap-std's `Dir` methods to
+`std::fs::*` on `dest.join(<layer entry path>)`. Image content is
+untrusted; with `Path::join` a `../` entry escapes the scratch root and an
+absolute or directory symlink entry is followed by the host for later
+entries. No test ever guarded this because cap-std made it unrepresentable.
+Round 5: extraction becomes fd-relative namei from the scratch root fd
+(`mkdirat`/`openat(O_EXCL|O_NOFOLLOW)`/`symlinkat`/`linkat`/`unlinkat`),
+red-first escape tests, then the inventory rows classified one by one.
