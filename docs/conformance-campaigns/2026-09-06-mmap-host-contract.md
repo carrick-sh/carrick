@@ -549,3 +549,33 @@ obligations. The new contract test was red against the refusal stub
 (`pristine-query-red.log`, run eco-pristine-query-red-20260906a); all 43 guest
 memory lib tests pass after implementation (`pristine-query-green.log`, run
 eco-pristine-query-green-20260906a). Caller integration is still pending.
+
+
+### Untouched anonymous syscall copyout red-to-green
+
+A bounded epoll/eventfd reducer gives epoll_wait=-1 errno14 against the signed
+boot-owner integration artifact; the events buffer is fresh RW private anonymous
+memory. `pristine-epoll-red.json` references the authoritative
+`boot-owner-integration-smoke.json` source receipt (its driver HEAD field names
+the later invocation checkout, not the binary source). Run
+eco-mmap-counter-1788722287138150000, cleanup zero.
+
+Prevalidation now accepts explicitly pristine ranges with logical write
+permission and the bound MM identity; actual writes still materialize and
+authenticate backing. The same reducer returns one event and the expected token
+on binary SHA256 63f5adda59b2c996a63252c8542a63db5f20543fe09cedb8891d486c587efa5e.
+Source: 47a27f766 plus diff d58b302e073f0d28315455c21fc306ad276d200f3ab4ce665a800fea19382495.
+`pristine-epoll-green.json`, run eco-mmap-counter-1788722432423146000, cleanup zero.
+
+Durable in-process conformance-next regression `deferred_anonymous_epoll_copyout`
+passes fresh and mixed-backed cross-page copyout, preserves neighboring data,
+and rejects read-only, PROT_NONE and unmapped buffers. Signed runner receipt
+`pristine-embed.log`, run eco-pristine-embed-20260906a; entitlement negative
+control passes and scoped cleanup is zero. Full signed HVF lib suite: 447 pass /
+3 ignored, `pristine-copyout.log`, run
+eco-mmap-pristine-copyout-1788722554479857000, cleanup zero. The caller change
+remains part of unfinished anonymous integration; no main landing claimed.
+
+Full serial carrick-runtime lib suite on the same integration also passes:
+2472 passed / 2 ignored, `pristine-runtime.log`, run
+eco-pristine-runtime-20260906a. No filtered worker suite substituted.
