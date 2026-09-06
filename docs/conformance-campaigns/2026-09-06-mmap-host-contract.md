@@ -84,3 +84,18 @@ page-table synchronization and whole alias-registry cloning/diffing during
 unmap as further amplification. Raw/resolved samples and LLDB image slides are
 in `symbol-stacks2.log`, `resolved-stacks.json`, and `profile-images2.lldb.log`.
 The full serial runtime suite and whole probe-family acceptance remain pending.
+
+
+## Page-table publication amplification
+
+The deterministic red-first test resolved one arena 1,122 times for one edit.
+The missing-extension test also proved partial descriptor publication before
+returning `UnresolvedArena`. `sync_to_host` now preflights each touched arena
+once per publication, preserves the dirty journal on resolution failure, and
+keeps descriptor order, atomic stores and barriers unchanged. The common case
+uses stack storage; extension counts above eight also receive populated-prefix
+notifications. No pointer survives this publication call.
+
+Both tests failed before the fix (`pt-resolve-red.log`); all 190 carrick-mem
+lib tests passed afterward (`pt-resolve-green.log`). These are host tests,
+not the required signed page-table integration acceptance.
