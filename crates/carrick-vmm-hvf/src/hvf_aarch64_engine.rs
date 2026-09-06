@@ -1262,6 +1262,19 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.mark_exec_predecessor_shared(shared);
     }
 
+    fn bind_deferred_anonymous_state(
+        &mut self,
+        state: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
+    ) {
+        self.state.bind_deferred_anonymous_state(state);
+    }
+
+    fn deferred_anonymous_state(
+        &self,
+    ) -> Option<std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>> {
+        self.state.deferred_anonymous_state()
+    }
+
     fn sparse_mmap_arena_enabled(&self) -> bool {
         self.state.sparse_mmap_arena_enabled()
     }

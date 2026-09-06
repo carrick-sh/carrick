@@ -6176,6 +6176,28 @@ impl SyscallDispatcher {
         })
     }
 
+    pub(crate) fn deferred_anonymous_state(
+        &self,
+        mm: crate::kernel::MmId,
+    ) -> Option<Arc<carrick_guest_mem::DeferredAnonymousState>> {
+        let authority = self.mm_authority();
+        (authority.mm_id == mm).then(|| Arc::clone(&authority.lock().deferred_anonymous))
+    }
+
+    pub(crate) fn bind_deferred_anonymous_state(
+        &self,
+        memory: &mut impl carrick_guest_mem::GuestMemory,
+        mm: crate::kernel::MmId,
+    ) -> bool {
+        let authority = self.mm_authority();
+        if authority.mm_id != mm {
+            return false;
+        }
+        let state = Arc::clone(&authority.lock().deferred_anonymous);
+        memory.bind_deferred_anonymous_state(state);
+        true
+    }
+
     pub(crate) fn mm_mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
         Arc::clone(&self.mm_authority().mutation_coordinator)
     }

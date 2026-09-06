@@ -1818,6 +1818,7 @@ where
             })?;
             let authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
                 std::sync::Arc::new(super::KernelFrameCowAuthority {
+                    deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(committed_mm),
                     kernel: std::sync::Arc::clone(committed_context.kernel()),
                     mm: committed_mm,
                     owner_inventory,
@@ -1839,6 +1840,14 @@ where
                     asid: binding.asid.raw(),
                 },
             );
+            if !kernel
+                .dispatcher
+                .bind_deferred_anonymous_state(engine, committed_mm)
+            {
+                return Err(RuntimeError::Configuration(
+                    "exec anonymous authority MM mismatch".to_owned(),
+                ));
+            }
             // The exec rebuild starts a fresh stage-1 manager for the
             // replacement mm; its extension arenas must be leased against the
             // REPLACEMENT lease (the old source belongs to the retired mm and

@@ -5665,6 +5665,69 @@ mod container_policy_dispatch_tests {
     }
 
     #[test]
+    fn deferred_anonymous_copied_fork_preserves_residency_and_isolates_state() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.record_dynamic_mapping(
+            0x10000,
+            0x3000,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            crate::vfs::ProcMapSharing::Private,
+            "[anon]".to_string(),
+        );
+        let parent_state = Arc::clone(&dispatcher.mem().lock().deferred_anonymous);
+        parent_state.reserve_fresh(GuestVa(0x10000), 0x3000).unwrap();
+        for page in [0x10000, 0x11000, 0x12000] {
+            assert!(parent_state.copy_pristine_zero(GuestVa(page), &mut [1; 4]).unwrap());
+        }
+        let before = parent_state.snapshot();
+        let parent_mm = crate::kernel::MmId::from_raw_u64(1).unwrap();
+        let child_mm = crate::kernel::MmId::from_raw_u64(2).unwrap();
+        let prepared = dispatcher.prepare_fork_mm(parent_mm, child_mm, crate::kernel::CloneObjectMode::Copy).unwrap();
+        let child = dispatcher.fork_clone_with_prepared_mm(parent_mm, child_mm, 100, 101, prepared).unwrap();
+        let child_state = Arc::clone(&child.mem().lock().deferred_anonymous);
+        assert!(!Arc::ptr_eq(&parent_state, &child_state));
+        assert_eq!(child_state.snapshot(), before);
+        child_state.retire(GuestVa(0x10000), 0x1000).unwrap();
+        assert_eq!(parent_state.snapshot(), before);
+        parent_state.begin_materialization(GuestVa(0x12000), 0x1000).unwrap().commit();
+        assert!(child_state.copy_pristine_zero(GuestVa(0x12000), &mut [1; 4]).unwrap());
+        assert!(!parent_state.copy_pristine_zero(GuestVa(0x12000), &mut [1; 4]).unwrap());
+    }
+
+    #[test]
+    fn deferred_anonymous_copied_fork_applies_dontfork_and_wipeonfork() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.record_dynamic_mapping(
+            0x10000,
+            0x3000,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            crate::vfs::ProcMapSharing::Private,
+            "[anon]".to_string(),
+        );
+        let parent_state = Arc::clone(&dispatcher.mem().lock().deferred_anonymous);
+        parent_state.reserve_fresh(GuestVa(0x10000), 0x3000).unwrap();
+        for page in [0x10000, 0x11000, 0x12000] {
+            assert!(parent_state.copy_pristine_zero(GuestVa(page), &mut [1; 4]).unwrap());
+        }
+        dispatcher.update_madvise_vma_policy(0x10000, 0x1000, Some(carrick_abi::VmaForkCopyPolicy::Omit), None, None);
+        dispatcher.update_madvise_vma_policy(0x11000, 0x1000, None, Some(carrick_abi::VmaForkChildPolicy::ZeroInChild), None);
+        let before = parent_state.snapshot();
+        let parent_mm = crate::kernel::MmId::from_raw_u64(1).unwrap();
+        let child_mm = crate::kernel::MmId::from_raw_u64(2).unwrap();
+        let prepared = dispatcher.prepare_fork_mm(parent_mm, child_mm, crate::kernel::CloneObjectMode::Copy).unwrap();
+        let child = dispatcher.fork_clone_with_prepared_mm(parent_mm, child_mm, 100, 101, prepared).unwrap();
+        let child_state = Arc::clone(&child.mem().lock().deferred_anonymous);
+        assert_eq!(child_state.snapshot().pristine, vec![GuestVa(0x11000)..GuestVa(0x13000)]);
+        assert_eq!(child_state.snapshot().zero_read_resident, vec![GuestVa(0x12000)..GuestVa(0x13000)]);
+        let mut bytes = [7; 4];
+        assert!(!child_state.copy_pristine_zero(GuestVa(0x10000), &mut bytes).unwrap());
+        assert_eq!(bytes, [7; 4]);
+        assert!(child_state.copy_pristine_zero(GuestVa(0x11000), &mut bytes).unwrap());
+        assert_eq!(bytes, [0; 4]);
+        assert_eq!(parent_state.snapshot(), before);
+    }
+
+    #[test]
     fn fork_projection_copied_is_total_and_holes_are_absent() {
         let dispatcher = SyscallDispatcher::new();
         dispatcher.set_address_space_regions(vec![

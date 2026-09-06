@@ -365,16 +365,50 @@ impl MmAccessState {
 
 /// Exact-MM local publication permit. Only this constructor acquires exclusion;
 /// callers cannot substitute an arbitrary FrameCowQuiesce implementation.
-pub(super) struct PublicationContext {
+pub(super) struct PublicationContext<'a> {
     state: std::sync::Arc<MmAccessState>,
     custody: std::sync::Arc<CarrierVmCustody>,
     authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
-    _exclusion: Box<dyn carrick_hal::FrameCowQuiesce>,
+    _exclusion: Option<Box<dyn carrick_hal::FrameCowQuiesce>>,
+    _invocation: Option<&'a carrick_hal::ForeignMmInvocation>,
+    foreign: Option<CarrierForeignMmSnapshot>,
 }
 
-impl PublicationContext {
+impl<'a> PublicationContext<'a> {
+    pub(super) fn for_foreign(
+        state: std::sync::Arc<MmAccessState>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+        invocation: &'a carrick_hal::ForeignMmInvocation,
+        requested: &CarrierForeignMmSnapshot,
+        deadline: std::time::Instant,
+    ) -> Result<Self, carrick_hal::ForeignMmTransportError> {
+        let binding = state
+            .cow_runtime
+            .try_read_until(deadline)
+            .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?
+            .clone()
+            .ok_or(carrick_hal::ForeignMmTransportError::MissingBinding)?;
+        if binding.identity.mm != requested.mm.raw_for_probe()
+            || binding.identity.asid != requested.binding.asid.raw_for_probe()
+            || binding.mm_root_slot.map(|r| r.0) != Some(requested.binding.stage1_root.raw())
+            || !binding.persistent_vm_lifecycle
+        {
+            return Err(carrick_hal::ForeignMmTransportError::MissingBinding);
+        }
+        Ok(Self {
+            state,
+            custody,
+            authority: binding.authority,
+            mm_root_slot: binding.mm_root_slot,
+            container_root: binding.container_root,
+            _exclusion: None,
+            _invocation: Some(invocation),
+            foreign: Some(requested.clone()),
+        })
+    }
+
     pub(super) fn for_local(
         state: std::sync::Arc<MmAccessState>,
         custody: std::sync::Arc<CarrierVmCustody>,
@@ -415,7 +449,9 @@ impl PublicationContext {
             authority: binding.authority,
             mm_root_slot: binding.mm_root_slot,
             container_root: binding.container_root,
-            _exclusion: exclusion,
+            _exclusion: Some(exclusion),
+            _invocation: None,
+            foreign: None,
         })
     }
 }
@@ -424,12 +460,13 @@ pub(super) struct PublishedSparseExtent {
     pub(super) region: HvfMappedRegion,
     pub(super) extension_regions: Vec<HvfMappedRegion>,
     pub(super) page_granular_arm: bool,
+    pub(super) foreign_receipt: Option<CarrierForeignCowReceipt>,
 }
 
 /// Publish backing, inventory and stage-1 through one MM-owned implementation.
 /// The local adapter only updates its cache and completes deferred protection.
 pub(super) fn publish(
-    context: &PublicationContext,
+    context: &PublicationContext<'_>,
     start: u64,
     end: u64,
     backing: SparseExtentBacking<'_>,
@@ -545,15 +582,22 @@ pub(super) fn publish(
                                 sparse_mmap_stage1_error(editor.manager, "trailing", error, has_source)
                             })?;
                     }
-                    editor
-                        .set_prot_none(start, semantic_len)
-                        .map_err(|error| {
-                            TrapError::Hypervisor(format!(
-                                "keep sparse HVPatch mmap stage-1 invalid: {error:?}"
-                            ))
-                        })?;
+                    if context.foreign.is_some() {
+                        editor.set_rw(start, semantic_len,
+                            context.state.protections.range_executable(start, semantic_len))
+                    } else {
+                        editor.set_prot_none(start, semantic_len)
+                    }.map_err(|error| TrapError::Hypervisor(format!(
+                        "publish sparse HVPatch mmap stage-1 permissions: {error:?}"
+                    )))?;
                     context.state.publish_stage1_extension_arenas_into(
-                        &context.custody, editor.manager, applevisor::memory::MemPerms::ReadWrite,
+                        // The root region's guest-visible mapping is read-only,
+                        // but structural table backing must remain writable for
+                        // hardware table-walk updates. Fork construction uses
+                        // the same explicit permission for extension arenas.
+                        &context.custody,
+                        editor.manager,
+                        applevisor::memory::MemPerms::ReadWrite,
                         &mut extension_regions,
                     )?;
                     let page_table_resolver =
@@ -579,10 +623,10 @@ pub(super) fn publish(
                             })?;
                             let leaf = carrick_mem::page_table::terminal_descriptor(live);
                             if shadow != live
-                                || editor.translate(page).is_some()
+                                || editor.translate(page) != context.foreign.as_ref().map(|_| expected_ipa)
                                 || editor.translate_retained_output(page) != Some(expected_ipa)
-                                || leaf & VALID != 0
-                                || leaf & AP_MASK != AP_USER_RO
+                                || leaf & VALID != u64::from(context.foreign.is_some())
+                                || leaf & AP_MASK != if context.foreign.is_some() { 0b01 << 6 } else { AP_USER_RO }
                                 || leaf & NON_GLOBAL == 0
                             {
                                 return Err(TrapError::Hypervisor(format!(
@@ -654,10 +698,70 @@ pub(super) fn publish(
         eprintln!("carrick: FATAL: sparse HVPatch mmap TLBI failed: {error}");
         std::process::abort();
     }
-    if let Err(error) = context.authority.apply(reservation.commit(())) {
-        eprintln!("carrick: FATAL: sparse HVPatch mmap inventory commit failed: {error}");
-        std::process::abort();
-    }
+    let commit = reservation.commit(());
+    let foreign_receipt = if let Some(requested) = &context.foreign {
+        let mut mapping_ids = requested.mapping_ids.clone();
+        for event in commit.batch().events() {
+            match *event {
+                carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
+                    mapping_ids.retain(|id| *id != mapping)
+                }
+                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. } => {
+                    mapping_ids.push(mapping)
+                }
+                _ => {}
+            }
+        }
+        mapping_ids.sort_unstable();
+        mapping_ids.dedup();
+        let challenge = commit.receipt_challenge();
+        let (receipt, kernel_proof, generation) = context
+            .authority
+            .apply_foreign_cow(
+                commit,
+                carrick_guest_mem::GuestVa(start),
+                std::num::NonZeroUsize::new(semantic_len).unwrap_or_else(|| std::process::abort()),
+                inventory_mapping.mapping,
+                inventory_mapping.frame,
+                carrick_guest_mem::Gpa(physical_ipa),
+                carrick_hal::FrameLength::from_mapping_extent(
+                    std::num::NonZeroU64::new(physical_len)
+                        .unwrap_or_else(|| std::process::abort()),
+                ),
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        if generation.raw_for_probe() != owner_generation
+            || !challenge.authenticate_apply(
+                &receipt,
+                std::num::NonZeroU64::new(requested.mm.raw_for_probe())
+                    .unwrap_or_else(|| std::process::abort()),
+            )
+            || !receipt.authorizes(inventory_mapping.mapping, inventory_mapping.frame)
+        {
+            std::process::abort();
+        }
+        let mut snapshot = requested.clone();
+        snapshot.mapping_ids = mapping_ids;
+        snapshot.frame_inventory_revision =
+            carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(receipt.revision());
+        Some(CarrierForeignCowReceipt {
+            snapshot,
+            start: carrick_guest_mem::GuestVa(start),
+            len: semantic_len,
+            mapping: inventory_mapping.mapping,
+            frame: inventory_mapping.frame,
+            physical_base: carrick_guest_mem::Gpa(physical_ipa),
+            physical_len,
+            owner_generation: generation,
+            kernel_proof,
+        })
+    } else {
+        if let Err(error) = context.authority.apply(commit) {
+            eprintln!("carrick: FATAL: sparse HVPatch mmap inventory commit failed: {error}");
+            std::process::abort();
+        }
+        None
+    };
     owner_rollback.commit();
 
     match context.authority.mapping_is_live(
@@ -725,6 +829,7 @@ pub(super) fn publish(
         region,
         extension_regions,
         page_granular_arm,
+        foreign_receipt,
     })
 }
 

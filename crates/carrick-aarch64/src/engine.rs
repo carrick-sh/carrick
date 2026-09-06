@@ -1514,6 +1514,19 @@ fn debug_tid() -> i64 {
 // EL0 access honours mmap/mprotect/munmap permissions.
 
 impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
+    fn bind_deferred_anonymous_state(
+        &mut self,
+        state: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
+    ) {
+        self.vm.bind_deferred_anonymous_state(state);
+    }
+
+    fn supports_lazy_anonymous_mmap(&self) -> bool {
+        self.process_asid.is_some()
+            && self.vm.sparse_mmap_arena_enabled()
+            && self.vm.deferred_anonymous_state().is_some()
+    }
+
     /// The PROT_NONE set the shared default `read_bytes`/`write_bytes` gate on
     /// (keyed on the guest VA). The backend owns it (KVM in `GuestRam`, shared
     /// across siblings); `*_raw` does the IPA-translated backing lookup only.
