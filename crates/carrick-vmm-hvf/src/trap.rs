@@ -37869,12 +37869,11 @@ impl HvfVmState {
         let identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch sparse mmap has no bound mm identity".to_owned())
         })?;
-        let authority = self.cow_authority.clone().ok_or_else(|| {
-            TrapError::Hypervisor("HVPatch sparse mmap has no inventory authority".to_owned())
-        })?;
-        let _quiesce = authority.quiesce().map_err(|error| {
-            TrapError::Hypervisor(format!("quiesce HVPatch sparse mmap: {error}"))
-        })?;
+        let publication = sparse_materialization::PublicationContext::for_local(
+            std::sync::Arc::clone(&self.mm_access),
+            self.carrier_vm_custody(),
+            identity,
+        )?;
         let _topology = crate::fork_quiesce::acquire_topology_lock(
             carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
             identity.linux_pid,
@@ -37952,21 +37951,8 @@ impl HvfVmState {
 
         let semantic_len =
             usize::try_from(end - start).map_err(|_| TrapError::MappingTooLarge(end - start))?;
-        let custody = self.carrier_vm_custody();
-        let published = sparse_materialization::publish(
-            &sparse_materialization::PublicationContext {
-                state: &self.mm_access,
-                custody: &custody,
-                authority: authority.as_ref(),
-                mm_root_slot: self.mm_root_slot,
-                container_root: self.container_root,
-                _exclusion: _quiesce.as_ref(),
-            },
-            start,
-            end,
-            backing,
-            flush_stage1,
-        )?;
+        let published =
+            sparse_materialization::publish(&publication, start, end, backing, flush_stage1)?;
         let page_granular_arm = published.page_granular_arm;
         let semantic_ipa = published.region.ipa;
         self.mappings.extend(published.extension_regions);
