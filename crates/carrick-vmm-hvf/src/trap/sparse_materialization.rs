@@ -672,7 +672,13 @@ impl MmAccessState {
     ) -> Result<PinnedStage1Arenas, TrapError> {
         let mut owners = std::collections::BTreeMap::new();
         for (&(base, size), owner) in self.structural_owners.read().iter() {
-            if size != carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize {
+            // Boot primary tables use 0x1c0000 bytes, while reusable roots
+            // and extension arenas retain complete 2 MiB structural owners.
+            // Both are exact-base table backings; neither may be dropped from
+            // the resolver merely because its physical reservation is larger.
+            if size != carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize
+                && size != 2 * 1024 * 1024
+            {
                 continue;
             }
             let pin = custody
@@ -692,12 +698,20 @@ mod arena_pin_tests {
     use carrick_mem::page_table::HostArenaResolver;
 
     #[test]
-    fn publication_resolver_pins_exact_structural_owner_until_edit_finishes() {
+    fn publication_resolver_pins_exact_primary_owner_until_edit_finishes() {
+        check_pinned_arena(carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize);
+    }
+
+    #[test]
+    fn publication_resolver_pins_exact_full_slot_until_edit_finishes() {
+        check_pinned_arena(2 * 1024 * 1024);
+    }
+
+    fn check_pinned_arena(size: usize) {
         let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
         let base = 0x7d00_3000_0000;
-        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             size,
             crate::host_mapping::HostMappingKind::PerMmKernelState,

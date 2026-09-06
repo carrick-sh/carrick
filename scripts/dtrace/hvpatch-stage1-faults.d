@@ -4,7 +4,7 @@
  * 2026-09-06 resident-fault-protection-error: arg0 page VA, arg1 Linux
  * protection bits, arg2 formatted backend error C string. This failure-only
  * addition identifies first-touch refusals otherwise lowered to SIGSEGV;
- * live qualification is recorded with the campaign capture.
+ * live-qualified on macOS/arm64 in eco-resident-error-1788721196681925000.
  *
  * WHAT: records the hardware ESR/FAR/instruction, the live serialized stage-1
  * walk, TTBR0, typed COW-trigger identity, and the sparse stage-2 lifecycle for
