@@ -263,3 +263,24 @@ residency separately from pending physical allocation through mprotect, fork,
 unmap/replacement and exec. Do not relax the existing rejection of nonempty
 foreign reads without owner generations. These are unresolved prerequisites to
 production opt-in, not completed features.
+
+## Isolated mmap counter measurement
+
+The existing Python fixture measures mmap **plus close**, including Python's
+extra fd-stat/dup work. Preserve it for application comparisons; do not label
+that total as isolated mmap service time. The new durable
+`scripts/perf/fixtures/mmap-contract.rs` uses the guest's enabled 24 MHz
+architectural counter, brackets mmap and munmap separately, and keeps setup,
+fstat and output outside both intervals. It runs five trials of 1,000 untouched
+mappings per case. Counter-pair mean was 0.008917 us, reported without subtraction.
+
+On the exact `4856777d6` signed artifact (SHA-256
+`aa9249dd2963f78c37a1558af86bc3ad9c6ede9be100511b95a1d5e6e02e23a0`),
+median trial means were file mmap **59.882667 us** / munmap **25.230167 us**,
+and anonymous 1 MiB mmap **26.577625 us** / munmap **14.289875 us**.
+Both mmap targets still fail. This is a separate reducer/process footprint,
+not a replacement or speedup of the previous Python measurement. Run
+`eco-mmap-counter-1788716163327720000`, exit 0 and scoped cleanup;
+`counter.{json,out,err}` retains command, exact executable hashes and raw trials.
+The current source HEAD was `b57b5ff34`, but the measured binary was explicitly
+not rebuilt from that source; its producing source remains `4856777d6`.
