@@ -1439,3 +1439,9 @@ entries. No test ever guarded this because cap-std made it unrepresentable.
 Round 5: extraction becomes fd-relative namei from the scratch root fd
 (`mkdirat`/`openat(O_EXCL|O_NOFOLLOW)`/`symlinkat`/`linkat`/`unlinkat`),
 red-first escape tests, then the inventory rows classified one by one.
+- Correction: `/bin` and `/sbin` appearing as empty real directories on
+  `ubuntu:24.04` is identical on main (directory mtimes from the run
+  itself), so it is pre-existing and not the extraction rewrite; the
+  containment regression stands on the `dest.join` shape alone. Open item
+  on main: where the run-time `/bin` and `/sbin` directories come from on a
+  merged-usr image (see the merged-/usr clonefile note in memory).
