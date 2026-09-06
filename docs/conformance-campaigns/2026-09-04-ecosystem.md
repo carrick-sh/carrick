@@ -1499,3 +1499,20 @@ and `/sbin` run-time directories on merged-usr images; `docker_compose`
 smoke sharing a test binary with carrick lanes; stale `.worktrees/` (over a
 hundred, including `bisect-*`); the quiet-host fork number and a fresh full
 ecosystem ledger, both deferred until the two parked branches land.
+
+## 2026-09-06 resumed: cap-std accepted on macOS
+
+The reviewed `agy/retire-capstd-sep06` work landed through the acceptance branch
+at `5c959e191`, fast-forwarded from the main checkout. Full serial runtime
+2467 passed / 2 ignored; full cached generic probe gate 874/874 across musl
+and GNU; lint, Ubuntu glibc launches, Python print and coherence loops passed.
+The full probe run additionally exposed and fixed the dentry fast-open
+O_NOFOLLOW bypass with a red-first dispatcher regression. Exact artifact and
+run receipts: [cap-std acceptance](2026-09-06-capstd-acceptance.md).
+
+Scope is macOS and pathological performance affecting correctness. Further
+cross-platform xattr work is deferred. Next: rebase the parked mmap branch
+onto this landing, use a fresh worker conversation, prove zero write_guest_bytes
+for the whole-file private view and meet file <=10 us / anon <=6 us. The
+quiet-host fork number and full cached ecosystem ledger remain pending; the
+Sep 4 floor is not replaced yet.
