@@ -395,6 +395,11 @@ pub enum DTraceError {
     HandleDrop(String),
     #[error("dtrace_work failed: {0}")]
     Work(String),
+    #[error(
+        "custom D script did not exit within {0} s after the traced child ended; \
+         bound it with `tick-Ns {{ exit(0); }}` (or set CARRICK_TRACE_POST_CHILD_LINGER_S=0 to wait forever)"
+    )]
+    ScriptOutlivedChild(u64),
     #[error("argv contains nul byte: {0:?}")]
     BadArg(String),
     #[error("failed to open trace output file: {0}")]
@@ -593,6 +598,12 @@ pub struct TraceOptions {
     /// Built-in profiles emit their complete protocol from `END` and disable
     /// this to prevent an unversioned duplicate dump.
     pub print_remaining_aggregates: bool,
+    /// How long a custom `-s` script may keep the session alive after the
+    /// traced child has exited. A script is expected to bound itself with
+    /// `tick-Ns { exit(0); }`; one that never does used to keep `carrick
+    /// trace` running as root until someone reaped it (five wedged sessions
+    /// in one day). `None` waits forever (`CARRICK_TRACE_POST_CHILD_LINGER_S=0`).
+    pub post_child_linger: Option<std::time::Duration>,
 }
 
 impl Default for TraceOptions {
@@ -603,7 +614,24 @@ impl Default for TraceOptions {
             out_path: None,
             drop_credentials: None,
             print_remaining_aggregates: true,
+            post_child_linger: default_post_child_linger(),
         }
+    }
+}
+
+/// Default bound for a custom script's life after the traced child: 60 s is
+/// enough for a `tick-10sec` aggregation window plus a forked host child that
+/// re-registers its probes, and short enough that a forgotten `exit(0)` is a
+/// named error within a minute rather than a root process that runs all night.
+/// `CARRICK_TRACE_POST_CHILD_LINGER_S=<n>` overrides it; `0` disables the bound.
+pub fn default_post_child_linger() -> Option<std::time::Duration> {
+    match std::env::var("CARRICK_TRACE_POST_CHILD_LINGER_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
+        None => Some(std::time::Duration::from_secs(60)),
     }
 }
 
@@ -805,6 +833,8 @@ fn run_child_under_dtrace_impl<T>(
     // behaviour: stop as soon as the spawned child is gone, so a plain
     // `carrick trace -- run …` returns promptly.
     let linger_past_child = opts.script.is_some();
+    let mut child_ended_at: Option<std::time::Instant> = None;
+    let mut script_outlived_child: Option<u64> = None;
     loop {
         unsafe { dtrace_sleep(hdl.as_ptr()) };
         let status = unsafe {
@@ -836,6 +866,13 @@ fn run_child_under_dtrace_impl<T>(
                 if child_terminal && !linger_past_child {
                     break;
                 }
+                if child_terminal && let Some(bound) = opts.post_child_linger {
+                    let ended_at = *child_ended_at.get_or_insert_with(std::time::Instant::now);
+                    if ended_at.elapsed() >= bound {
+                        script_outlived_child = Some(bound.as_secs());
+                        break;
+                    }
+                }
             }
             _ => {
                 let msg = hdl.errmsg();
@@ -851,6 +888,11 @@ fn run_child_under_dtrace_impl<T>(
         unsafe { dtrace_aggregate_print(hdl.as_ptr(), out.fp(), std::ptr::null_mut()) };
     }
     unsafe { fflush(out.fp()) };
+    if let Some(seconds) = script_outlived_child {
+        // The aggregations above were still printed so the receipt is not
+        // lost; the session itself is a failure, named, not a silent hang.
+        return Err(observation.failure(DTraceError::ScriptOutlivedChild(seconds)));
+    }
     let post_stop_result = post_stop(hdl.as_ptr(), observation.report())
         .map_err(|error| observation.failure(error))?;
     Ok((observation.report(), post_stop_result))
@@ -1396,5 +1438,36 @@ mod tests {
             ),
             DTRACE_CONSUME_THIS
         );
+    }
+}
+
+#[cfg(test)]
+mod post_child_linger_tests {
+    use super::default_post_child_linger;
+    use std::time::Duration;
+
+    // Serialized through one test so the env mutation cannot leak between
+    // parallel tests.
+    #[test]
+    fn hatch_contract_zero_disables_absent_is_sixty_seconds_number_overrides() {
+        let key = "CARRICK_TRACE_POST_CHILD_LINGER_S";
+        let saved = std::env::var(key).ok();
+        // SAFETY (test-only): single-threaded within this test; restored below.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(default_post_child_linger(), Some(Duration::from_secs(60)));
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(default_post_child_linger(), None, "0 waits forever");
+        unsafe { std::env::set_var(key, "5") };
+        assert_eq!(default_post_child_linger(), Some(Duration::from_secs(5)));
+        unsafe { std::env::set_var(key, "nonsense") };
+        assert_eq!(
+            default_post_child_linger(),
+            Some(Duration::from_secs(60)),
+            "unparseable falls back to the default bound"
+        );
+        match saved {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 }
