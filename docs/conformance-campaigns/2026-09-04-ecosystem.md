@@ -1445,3 +1445,16 @@ red-first escape tests, then the inventory rows classified one by one.
   containment regression stands on the `dest.join` shape alone. Open item
   on main: where the run-time `/bin` and `/sbin` directories come from on a
   merged-usr image (see the merged-/usr clonefile note in memory).
+
+## 2026-09-06: `carrick trace` fails closed on an unbounded custom script
+
+Five wedged root-owned tracers in one day, all the same shape: a worker's
+`-s` script with no `exit()` outliving a one-second guest, because the
+consumer let a custom script outlive the traced child on the strength of a
+skill rule. `14cb2439c`: a bounded post-child drain (60 s, hatch
+`CARRICK_TRACE_POST_CHILD_LINGER_S`, `0` = legacy) then a named
+`ScriptOutlivedChild` error that says what to add. Red: still running at
+a 40 s cap; green: named error in 6 s with a 5 s bound; the self-exiting
+flow script still completes. Also learned: `scripts/sudo/kill.sh --all`
+matches its own caller if the caller's command line contains the literal
+`release/carrick trace`, so never grep for that text in the same command.
