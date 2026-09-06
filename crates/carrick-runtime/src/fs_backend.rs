@@ -2799,6 +2799,7 @@ impl HostFsBackend {
         if authority.cleanup_on_drop {
             backend._attached_cleanup_path = Some(path);
         }
+        backend.owner_pid = unsafe { libc::getpid() as u32 };
         backend.sparse_upper_fast_miss = authority.sparse_upper_fast_miss;
         Ok(backend)
     }
@@ -4936,34 +4937,34 @@ fn with_entry_fd<R>(
     writable: bool,
     f: impl FnOnce(std::os::fd::RawFd) -> R,
 ) -> Option<R> {
-    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt as _;
     let abs = root_path.join(rel);
-    let file = if is_dir {
-        std::fs::File::open(&abs).ok()?
+    let abs_c = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
+    let flags = if is_dir {
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC
     } else if writable {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&abs)
-            .ok()?
+        libc::O_RDWR | libc::O_CLOEXEC
     } else {
         #[cfg(target_os = "macos")]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            const O_EVTONLY: i32 = 0x8000;
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(O_EVTONLY)
-                .open(&abs)
-                .or_else(|_| std::fs::File::open(&abs))
-                .ok()?
+            const O_EVTONLY: libc::c_int = 0x8000;
+            libc::O_RDONLY | libc::O_CLOEXEC | O_EVTONLY
         }
         #[cfg(not(target_os = "macos"))]
         {
-            std::fs::File::open(&abs).ok()?
+            libc::O_RDONLY | libc::O_CLOEXEC
         }
     };
-    Some(f(file.as_raw_fd()))
+    let mut fd = unsafe { libc::open(abs_c.as_ptr(), flags) };
+    if fd < 0 && !is_dir && !writable {
+        fd = unsafe { libc::open(abs_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    }
+    if fd < 0 {
+        return None;
+    }
+    let res = f(fd);
+    unsafe { libc::close(fd) };
+    Some(res)
 }
 
 /// Read the guest-mode xattr for `rel` under `root_path`. `None` => fall back to the
