@@ -5970,8 +5970,8 @@ impl FsBackend for HostFsBackend {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let (parent_fd, leaf_c) = match self.namei_leaf_res(rel) {
-            Ok(pair) => pair,
+        let parent_fd = match self.ensure_parent_dirs(rel) {
+            Ok(fd) => fd,
             Err(errno) => {
                 return match host_open_refusal(errno) {
                     Some(refused) => Err(BackendError::Host(refused)),
@@ -5979,6 +5979,10 @@ impl FsBackend for HostFsBackend {
                 };
             }
         };
+        let leaf_c = rel
+            .file_name()
+            .and_then(cstring_from_osstr)
+            .ok_or(BackendError::Invalid)?;
         self.stamp_fifo_marker();
         self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();

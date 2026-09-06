@@ -383,10 +383,9 @@ pub(crate) fn seed_guest_baseline(
 }
 
 fn set_baseline_dir_if_missing(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>, path: &str) {
-    if backend.metadata(path).is_some()
-        || rootfs
-            .and_then(|rootfs| rootfs.symlink_metadata(path).ok())
-            .is_some()
+    if let Some(rootfs) = rootfs
+        && let Ok(meta) = rootfs.symlink_metadata(path)
+        && meta.kind == crate::rootfs::RootFsEntryKind::Symlink
     {
         return;
     }
