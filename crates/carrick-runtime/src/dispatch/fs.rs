@@ -2326,9 +2326,11 @@ impl SyscallDispatcher {
         if let Some(outcome) = self.try_trusted_dirfd_openat(dirfd, path, flags) {
             return Ok(outcome);
         }
-        // Dentry cache fast open for non-creating opens of plain absolute paths.
+        // Dentry cache fast open resolves the followed target. O_NOFOLLOW
+        // must reach the leaf-kind check below instead of reusing that target.
         if !want_create
             && !want_trunc
+            && !open_flags.contains(LinuxOpenFlags::NOFOLLOW)
             && !open_flags.contains(LinuxOpenFlags::DIRECTORY)
             && !open_flags.contains(LinuxOpenFlags::TMPFILE)
             && !open_flags.contains(LinuxOpenFlags::PATH)

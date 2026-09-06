@@ -1806,6 +1806,23 @@ fn absolute_readonly_open_can_install_an_upper_absent_lower_file_directly() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn dentry_fast_open_preserves_nofollow_after_following_stat() {
+    let (_scratch, mut dispatcher) = trusted_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+    // Warm the follow cache, then request the distinct no-follow contract.
+    dispatcher.layered_metadata("/walk/link").unwrap();
+    let result = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/walk/link",
+        LINUX_O_RDONLY | LinuxOpenFlags::NOFOLLOW.bits(),
+    );
+    assert_eq!(result, -i64::from(crate::linux_abi::LINUX_ELOOP.get()));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn absolute_lower_fast_open_refuses_nofollow_symlink_semantics() {
     let (_lower, _upper, dispatcher) = trusted_lower_lane_fixture();
     assert!(
