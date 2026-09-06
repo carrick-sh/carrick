@@ -129,3 +129,45 @@ also leaves state untouched. The signed full HVF library suite passed
 437 tests with 3 ignored (`hvf-lib-signed.log`, run
 `eco-mmap-hvf-lib-1788713559871706000`). Full runtime and probe acceptance,
 latency gates and main landing are still pending.
+
+
+## Handoff after alias checkpoint (Sep 6)
+
+Source `6e6c0393e`, signed artifact SHA-256
+`61f9859cb8540c6350012d93b628c4f2301aeab5956fe3fc12c320fc4d276853`:
+
+- Whole-file mmap+close 141.083 us; anonymous 1 MiB mmap+close 70.968 us.
+  Same five-trial Python fixture, `alias-bench.{json,out,err}` and
+  `alias-bench.log`, run `eco-mmap-immutable-bench-1788713785496764000`.
+- Exact 100-map copy contract remains count=100, errors=0,
+  write_guest_bytes=0, chunks=0. `alias-copy.log`, run
+  `eco-mmap-immutable-lazy-1788713942158072000`.
+- Ubuntu shell true and Python print passed again (`alias-launch.{json,log}`).
+- Carrier-scoped profile: 218 samples, run
+  `eco-mmap-stacks-1788713819884859000`, carrier PID 47153, LLDB image slide
+  0x2870000 / load base 0x102870000. `alias-stacks.log`,
+  `alias-images.lldb.log`, `alias-resolved-stacks.json`. The repeated global
+  clone/diff is gone; remaining work includes scope-index rebuilding,
+  page-table edit/validation and host mapping retirement. Of the 23 closest
+  Carrick fstat frames, 22 are inside host `fgetxattr` (PC 0x185121478,
+  resolved against the same-boot shared cache with dladdr); fd stat assembles
+  mode/owner from host xattrs each time. These are diagnostic samples, never
+  acceptance latency.
+
+The branch is clean apart from preserved untracked diagnostic scripts. No
+mmap fast-forward has happened: 141/71 us still fails 10/6 us. Cap-std remains
+accepted on main. The next bounded index improvement should avoid rebuilding
+all `exact_first_by_scope` entries when unmapping a suffix: preserve first-row
+semantics and shifted positions, prove index equivalence against a full rebuild,
+and retain the existing partial-unmap/version tests. That is a candidate from
+samples, not a completed fix. Further lazy-anonymous or page-table work must
+retain exact owner generations, barriers and rollback; do not weaken validation
+to meet timing. The stat xattr cost also needs attribution before changing its
+metadata coherence behavior.
+
+Still required before landing mmap: complete timing contracts; register/bless
+`mmapanonreuse` on both libc lanes if retained; full serial runtime lib suite;
+whole cached probe family; exact signed artifact receipts and Ubuntu/Python
+launches; clean committed-tree inventory reconciliation, commit, then lint.
+Only afterward fast-forward main from the main checkout, rebuild/recheck, take
+the quiet-host fork number and full 2,127-row cached-only ecosystem ledger.
