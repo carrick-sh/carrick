@@ -481,3 +481,21 @@ wrong-carrier and retirement assertions. Full signed HVF suite: 447 passed /
 3 ignored, `eco-mmap-resume/root-resolver-green.log`, run
 eco-mmap-root-resolver-green-1788721312687952000. Live launch validation of
 this correction remains pending until the CLI is rebuilt.
+
+
+### Initial boot root owner registration
+
+The full-slot correction alone does not fix launch: the 38f0cee25 diagnostic
+artifact still exits139 and reports the same UnresolvedArena(0x2d00020000).
+Exact artifact/source and traces: `root-resolver-integration-smoke.json` and
+`root-resolver-fault.json`, binary SHA256
+dde02db9d7884c985725860f46efb5be16d850b69624ce625287b80ad6e81c08.
+
+Source attribution found the boot mapping path creates StructuralBackingOwner
+but only pushes its region into the executor cache. The relocated mapping path
+already installs that owner into MmAccessState. Initial boot now performs the
+same exact-owner registration; the shared resolver retains its ordinary pins.
+Full signed HVF suite after the change: 447 passed / 3 ignored,
+`eco-mmap-resume/boot-owner.log`, run eco-mmap-boot-owner-1788721637939281000,
+scoped cleanup zero. Signed CLI rebuild and live red-to-green check still
+required; no main landing is claimed.

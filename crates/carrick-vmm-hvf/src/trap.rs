@@ -36921,6 +36921,15 @@ impl HvfVmState {
                         false,
                         true,
                     )?;
+                    // The boot path owns structural tables just like relocated
+                    // exec. Publish that ownership to the MM before any guest
+                    // fault needs the executor-independent table resolver.
+                    if let Some(owner) = region.structural_owner.as_ref() {
+                        state.mm_access.install_structural_mapping_authority(
+                            None,
+                            std::sync::Arc::clone(owner),
+                        )?;
+                    }
                     state.mappings.push(region);
                 }
                 plan
