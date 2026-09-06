@@ -37639,6 +37639,9 @@ impl HvfVmState {
         ) = if let Some(handle) = pooled_handle {
             let host_ptr = handle.as_mut_ptr();
             let ipa = handle.ipa();
+            unsafe {
+                std::ptr::write_bytes(host_ptr, 0, CowArmedRanges::COMPOUND_SIZE as usize);
+            }
             carrick_observability::probes::hvpatch_frame_pool_hit(1, ipa);
             let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
             let inventory_backing = Self::private_backing_identity();
@@ -39841,31 +39844,317 @@ impl HvfVmState {
         ttbr0: u64,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
-        if !is_stage1_cow_write_fault(syndrome) {
-            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        if is_stage1_cow_write_fault(syndrome) {
+            let fault_va = strip_pointer_tag(far);
+            let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
+            let resolved = self.task.perform_frame_cow(
+                &custody,
+                fault_va,
+                carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+                FrameCowTrigger {
+                    class: carrick_observability::probes::HvpatchFrameCowTriggerClass::Stage1PermissionFault,
+                    syndrome,
+                    far: fault_va,
+                    ttbr0,
+                },
+                flush_stage1,
+            )?;
+            if !resolved {
+                return Ok(carrick_hal::CowFaultResolution::NotCow);
+            }
+            // The refault livelock detector keys on this live post-resolution
+            // translation: a fork loop legitimately re-COWs the same VA to a
+            // FRESH frame every iteration (fork re-arms the span, the wait loop
+            // rewrites the same stack slot), so (FAR, ESR) alone cannot prove
+            // the resolver made no progress.
+            return Ok(carrick_hal::CowFaultResolution::Resolved {
+                translation: self.translate_va(fault_va),
+            });
         }
+
+        // --- Demand Zero-Fill / Stage-1 Leaf Installation Path ---
         let fault_va = strip_pointer_tag(far);
-        let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
-        let resolved = self.task.perform_frame_cow(
-            &custody,
-            fault_va,
-            carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
-            FrameCowTrigger {
-                class: carrick_observability::probes::HvpatchFrameCowTriggerClass::Stage1PermissionFault,
-                syndrome,
-                far: fault_va,
-                ttbr0,
-            },
-            flush_stage1,
-        )?;
-        if !resolved {
+        let ec = (syndrome >> 26) & 0x3f;
+        let is_data_abort = matches!(ec, 0x24 | 0x25);
+        let is_inst_abort = matches!(ec, 0x20 | 0x21);
+        if !is_data_abort && !is_inst_abort {
             return Ok(carrick_hal::CowFaultResolution::NotCow);
         }
-        // The refault livelock detector keys on this live post-resolution
-        // translation: a fork loop legitimately re-COWs the same VA to a
-        // FRESH frame every iteration (fork re-arms the span, the wait loop
-        // rewrites the same stack slot), so (FAR, ESR) alone cannot prove
-        // the resolver made no progress.
+        let fault_status = syndrome & 0x3f;
+        if !matches!(fault_status, 0x04..=0x07 | 0x0c..=0x0f) {
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        }
+
+        if !self.persistent_vm_lifecycle
+            || fault_va < crate::memory::LINUX_MMAP_BASE
+            || fault_va
+                >= crate::memory::LINUX_MMAP_BASE.saturating_add(crate::memory::mmap_arena_size())
+        {
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        }
+
+        if self.protections.range_unmapped(fault_va, 1)
+            || self.protections.range_no_access(fault_va, 1)
+            || self.protections.range_mutable_shared_backing(fault_va, 1)
+        {
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        }
+        let is_write = is_data_abort && (syndrome & (1 << 6) != 0);
+        if is_write && self.protections.range_write_denied(fault_va, 1) {
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        }
+        if is_inst_abort && !self.protections.range_executable(fault_va, 1) {
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        }
+
+        if self.translate_va(fault_va).is_some() {
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        }
+
+        let custody = self.carrier_vm_custody();
+        if self
+            .task
+            .mapping_for_range_in(&custody, fault_va, 1)
+            .is_some()
+        {
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        }
+
+        let identity = self.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch frame COW has no bound mm identity".to_owned())
+        })?;
+        let authority = self.cow_authority.clone().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch frame COW has no inventory authority".to_owned())
+        })?;
+        let _quiesce = authority.quiesce().map_err(|error| {
+            TrapError::Hypervisor(format!("quiesce HVPatch demand zero-fill: {error}"))
+        })?;
+        let _topology = crate::fork_quiesce::acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
+            identity.linux_pid,
+            identity.linux_tid,
+        );
+
+        if self.translate_va(fault_va).is_some()
+            || self
+                .task
+                .mapping_for_range_in(&custody, fault_va, 1)
+                .is_some()
+        {
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        }
+
+        let page_table_host = self
+            .mapping_for_range(
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+            )
+            .map(|m| m.host_addr)
+            .ok_or_else(|| TrapError::Hypervisor("absent page table backing".to_owned()))?;
+
+        const COMPOUND_SIZE: u64 = CowArmedRanges::COMPOUND_SIZE; // 16 KiB
+        let compound_va = align_down(fault_va, COMPOUND_SIZE);
+        let mut reservation = authority.reserve(1, 1, 2).map_err(|error| {
+            TrapError::Hypervisor(format!("reserve demand zero-fill inventory: {error}"))
+        })?;
+        let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+        let pooled = custody.frame_pool().and_then(|p| p.allocate_compound());
+        let (new_host_ptr, new_physical_ipa, owner_generation) = if let Some(handle) = pooled {
+            let host_ptr = handle.as_mut_ptr();
+            let physical_ipa = handle.ipa();
+            carrick_observability::probes::hvpatch_frame_pool_hit(0, physical_ipa);
+            unsafe {
+                std::ptr::write_bytes(host_ptr, 0, COMPOUND_SIZE as usize);
+            }
+            let owner_generation = register_pooled_global_frame_host_owner_in(
+                &custody,
+                handle,
+                u64::from(stage2_perms),
+            )?;
+            (host_ptr, physical_ipa, owner_generation)
+        } else {
+            carrick_observability::probes::hvpatch_frame_pool_miss(0, 0);
+            let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                COMPOUND_SIZE as usize,
+                crate::host_mapping::HostMappingKind::PrivateAnon,
+            )
+            .map_err(|e| {
+                TrapError::Hypervisor(format!("allocate demand zero-fill backing: {e}"))
+            })?;
+            let new_host_ptr = new_host.as_ptr();
+            let mut new_lease = GlobalFrameStage2Lease::reserve(COMPOUND_SIZE, COMPOUND_SIZE)?;
+            let new_physical_ipa = new_lease.base;
+            let map_result = unsafe {
+                inventory_hv_vm_map(
+                    new_host_ptr.cast(),
+                    new_physical_ipa,
+                    COMPOUND_SIZE as usize,
+                    u64::from(stage2_perms),
+                )
+            };
+            if map_result != 0 {
+                return Err(TrapError::Hypervisor(format!(
+                    "map demand zero-fill IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
+                )));
+            }
+            new_lease.mark_mapped();
+            let owner_generation = register_global_frame_host_owner_in(
+                &custody,
+                new_lease,
+                new_host,
+                u64::from(stage2_perms),
+            )?;
+            (new_host_ptr, new_physical_ipa, owner_generation)
+        };
+
+        let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(&custody));
+        owner_rollback.record((new_physical_ipa, COMPOUND_SIZE));
+
+        let backing = HvfVmState::private_backing_identity();
+        let inventory_mapping = {
+            let mut inventory = self.frame_inventory.lock();
+            Self::stage_mapping_in(
+                self.custody(),
+                &mut inventory,
+                &mut reservation,
+                InventoryMappingStage {
+                    gpa: new_physical_ipa,
+                    length: COMPOUND_SIZE,
+                    permissions: carrick_hal::MemPerms {
+                        read: true,
+                        write: true,
+                        exec: true,
+                    },
+                    backing,
+                    inherited_frame: None,
+                    stage2_lease: Some((new_physical_ipa, COMPOUND_SIZE)),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: new_host_ptr as usize,
+                        generation: owner_generation,
+                    },
+                },
+            )?
+        };
+        let inventory_entry = ((new_physical_ipa, COMPOUND_SIZE), inventory_mapping);
+
+        let page_tables_authority = self.page_tables_authority();
+        let page_table_result = page_tables_authority.edit(
+            || {
+                Err(TrapError::Hypervisor(
+                    "HVPatch demand page manager absent".to_owned(),
+                ))
+            },
+            |editor| -> Result<(), TrapError> {
+                editor.begin_undo();
+                Self::refresh_stage1_exclusivity(editor.manager);
+                let mut page_offset = 0u64;
+                while page_offset < COMPOUND_SIZE {
+                    let p_va = compound_va + page_offset;
+                    let p_ipa = new_physical_ipa + page_offset;
+                    if !self.protections.range_unmapped(p_va, 1)
+                        && !self.protections.range_no_access(p_va, 1)
+                    {
+                        let writable = !self.protections.range_write_denied(p_va, 1)
+                            && !self.cow_armed.lock().span_for(p_va).is_some();
+                        editor
+                            .map_private_aliased(p_va, p_ipa, 4096, writable)
+                            .map_err(|e| {
+                                TrapError::Hypervisor(format!("map_private_aliased failed: {e:?}"))
+                            })?;
+                    }
+                    page_offset += 4096;
+                }
+                self.publish_stage1_extension_arenas(editor.manager)?;
+                let resolver = self.page_table_resolver(editor.base(), Some(page_table_host));
+                unsafe { editor.sync_to_host(resolver) }
+                    .map_err(|e| TrapError::Hypervisor(format!("sync_to_host failed: {e:?}")))?;
+                Ok(())
+            },
+        );
+        if let Err(error) = page_table_result {
+            let _ = self.page_tables_authority().edit(
+                || Err(()),
+                |editor| {
+                    let manager_base = editor.base();
+                    let resolver = |base: u64| {
+                        (base == manager_base)
+                            .then_some(page_table_host)
+                            .or_else(|| {
+                                self.host_ptr(
+                                    base,
+                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                                )
+                            })
+                    };
+                    unsafe { editor.rollback_undo(resolver) };
+                    Ok::<(), ()>(())
+                },
+            );
+            let _ = flush_stage1();
+            Self::rollback_unpublished_mappings(
+                &mut self.frame_inventory.lock(),
+                &[inventory_entry],
+            )?;
+            let _ = retire_global_frame_host_owner_in(&custody, new_physical_ipa, COMPOUND_SIZE);
+            return Err(error);
+        }
+
+        let _ = self.page_tables_authority().edit(
+            || Err(()),
+            |editor| {
+                editor.commit_undo();
+                Ok::<(), ()>(())
+            },
+        );
+        flush_stage1()?;
+        authority
+            .apply(reservation.commit(()))
+            .map_err(|e| TrapError::Hypervisor(format!("inventory commit failed: {e}")))?;
+        owner_rollback.commit();
+
+        let alias = AliasBacking {
+            start: compound_va,
+            ipa: new_physical_ipa,
+            host_addr: new_host_ptr as usize,
+            size: COMPOUND_SIZE as usize,
+            physical_ipa: new_physical_ipa,
+            physical_host_addr: new_host_ptr as usize,
+            physical_size: COMPOUND_SIZE as usize,
+            perms: u64::from(stage2_perms),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: alias_ownership_scope(
+                GuestMappingSharing::Private,
+                self.mm_root_slot,
+                self.container_root,
+            ),
+            inventory_backing: backing,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation,
+        };
+        register_shared_alias(alias);
+        self.mappings.push(HvfMappedRegion {
+            start: compound_va,
+            ipa: new_physical_ipa,
+            physical_ipa: new_physical_ipa,
+            end: compound_va + COMPOUND_SIZE,
+            host_addr: new_host_ptr,
+            size: COMPOUND_SIZE as usize,
+            physical_size: COMPOUND_SIZE as usize,
+            perms: stage2_perms,
+            memory: None,
+            host_mapping: None,
+            structural_owner: None,
+            stage2_lease: None,
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation,
+        });
+
         Ok(carrick_hal::CowFaultResolution::Resolved {
             translation: self.translate_va(fault_va),
         })
@@ -41823,6 +42112,7 @@ impl HvfVmState {
                 self.container_root,
                 &diagnostic_before,
             );
+            self.split_local_rows_for_unmap(va, len);
             let mut armed = self.cow_armed.lock();
             for span in disarm_spans {
                 if let Some(debug_va) = fork_debug_va()
@@ -41973,6 +42263,7 @@ impl HvfVmState {
                 !mapped_region_matches_retired_inventory_extent(mapping, retired[0])
             });
         }
+        self.split_local_rows_for_unmap(va, len);
         let mut armed = self.cow_armed.lock();
         for span in disarm_spans {
             armed.disarm(span);
