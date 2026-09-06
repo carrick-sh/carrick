@@ -1381,3 +1381,28 @@ that does not exist, so the first store faults through to SIGSEGV. Round
 zeroed compound and install the leaf) with a red-first test, then the
 microbench and the mmap/COW probe family. A bisect build without the last
 commit is running to confirm the attribution.
+
+## 2026-09-06 morning: in-memory lane blind spot fixed; cap-std round 2 fails on glibc images
+
+- **Main**: `mkdirat_creates_overlay_dir_and_fstatat_sees_it` had been red
+  since the dentry landing and none of the earlier filtered test runs
+  covered its group. The dentry cache fills from host fds and `real_stat`,
+  so on `FsBackendKind::Memory` guest-created entries were invisible to it.
+  `FsBackend::serves_dentry_cache` (host backend only) gates the three
+  `RootFsVfs` entry points; `notify_create` also clears negative entries
+  along the whole created path. Full serial runtime suite green (2440),
+  `1bb1edbf4`.
+- **cap-std retirement round 2** (`e61e95028`, worker's tree committed by
+  the director after a third transport death): cap-std and cap-primitives
+  are out of the graph and banned; the parallel fs test batch is 10/10 (3/3
+  in the director's runs). Rejected: every glibc image exits 127 before the
+  guest runs. Proof: `ubuntu:24.04 /usr/bin/true` → 127; the same program
+  launched through its real interpreter path
+  `/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /usr/bin/true` → 0. The
+  new namei refuses a symlinked intermediate directory (`/lib -> usr/lib`,
+  where the interpreter lives) and follows links only at the leaf; the
+  removed cap-std walk used to re-root intermediate targets under the guest
+  root. The extraction rewrite also wrote `/bin` as an empty real directory.
+  Round 3b: full component-wise namei with carrick-side symlink resolution,
+  extraction fidelity, `namei_escape` rows for symlinked intermediates, and
+  glibc launches as mandatory receipts.
