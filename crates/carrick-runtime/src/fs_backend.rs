@@ -427,6 +427,15 @@ pub trait FsBackend: Send + Sync {
         true
     }
 
+    /// Whether this backend's entries can be resolved and filled by the
+    /// rootfs dentry cache. The cache fills from host directory fds and
+    /// `real_stat`, which only a disk-backed backend answers; an in-memory
+    /// backend must stay on the layered path or its own entries are
+    /// invisible to the cache (`mkdirat_creates_overlay_dir_and_fstatat_sees_it`).
+    fn serves_dentry_cache(&self) -> bool {
+        false
+    }
+
     fn is_deleted(&self, path: &str) -> bool {
         matches!(self.lookup_kind(path), Some(OverlayEntryKind::Deleted))
     }
@@ -5339,6 +5348,10 @@ fn dir_from_raw_fd(raw: i32) -> cap_std::fs::Dir {
 }
 
 impl FsBackend for HostFsBackend {
+    fn serves_dentry_cache(&self) -> bool {
+        true
+    }
+
     fn name_matches_on_disk(&self, rel: &Path) -> bool {
         self.name_matches_on_disk_impl(rel)
     }

@@ -1474,11 +1474,24 @@ impl DentryCache {
     /// Notify that a file or directory was created.
     pub fn notify_create(&self, path: &str) {
         self.bump_mutation();
-        if let Some((parent_path, name)) = Self::split_parent_and_name(path)
-            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
-        {
-            let mut entries = self.entries.write();
-            entries.remove(&(parent_id, name.to_string()));
+        // Creating `a/b/c` can materialize `a` and `a/b` too (the overlay's
+        // mkdir-with-parents, `O_CREAT` under a not-yet-seen directory), and
+        // an earlier failed lookup may have cached a NEGATIVE entry for any of
+        // those components. Drop the entry for every component on the path,
+        // not just the leaf, so a later lookup re-walks the real tree
+        // (`mkdirat_creates_overlay_dir_and_fstatat_sees_it`).
+        let mut entries = self.entries.write();
+        let mut parent_path = String::from("/");
+        for component in path.split('/').filter(|c| !c.is_empty()) {
+            let Some(parent_id) = self.find_parent_dir_id(&parent_path) else {
+                break;
+            };
+            entries.remove(&(parent_id, component.to_string()));
+            if parent_path == "/" {
+                parent_path = format!("/{component}");
+            } else {
+                parent_path = format!("{parent_path}/{component}");
+            }
         }
     }
 

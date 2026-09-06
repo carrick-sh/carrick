@@ -160,12 +160,18 @@ impl RootFsVfs {
 
     /// Read stat for `path` via the dentry cache.
     pub fn dentry_stat(&self, path: &str, follow: bool) -> Result<RealStat, LinuxErrno> {
+        if !self.overlay.serves_dentry_cache() {
+            return Err(LINUX_ENOSYS);
+        }
         self.dentry_cache
             .stat(path, follow, &*self.overlay, self.rootfs.as_ref())
     }
 
     /// Read link target for `path` via the dentry cache.
     pub fn dentry_readlink(&self, path: &str) -> Result<String, LinuxErrno> {
+        if !self.overlay.serves_dentry_cache() {
+            return Err(LINUX_ENOSYS);
+        }
         self.dentry_cache
             .readlink(path, &*self.overlay, self.rootfs.as_ref())
     }
@@ -176,6 +182,9 @@ impl RootFsVfs {
         path: &str,
         write: bool,
     ) -> Result<(std::os::fd::OwnedFd, RealStat, String), LinuxErrno> {
+        if !self.overlay.serves_dentry_cache() {
+            return Err(LINUX_ENOSYS);
+        }
         self.dentry_cache
             .fast_open(path, write, &*self.overlay, self.rootfs.as_ref())
     }
