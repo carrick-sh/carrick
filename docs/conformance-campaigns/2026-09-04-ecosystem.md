@@ -1410,3 +1410,11 @@ commit is running to confirm the attribution.
   fork+exec sanity, and the full `just conformance-probes` gate all green
   (rc 0). Main is landed end to end after the dentry cache and its five
   follow-ups.
+- **Lazy mmap round 2** (`65c9b48d6`): the CPython crash is fixed by a
+  fault-path zero-fill (frame pool first, per-fault allocation on a miss)
+  and every mmap/COW probe matches both lanes. Performance regressed: file
+  mmap 1444 → 3222 µs, anon 58 → 98 µs, spawn 4.5 → 6.4 ms. The page-cache
+  view is installed 100/100 times and the dispatcher still copies all 1,616
+  pages through `write_guest_bytes` afterwards, so installing the view only
+  added work. Round 2 requires a zero-copy receipt for a whole-file private
+  view before any number is re-measured.
