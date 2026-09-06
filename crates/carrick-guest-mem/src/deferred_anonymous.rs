@@ -133,6 +133,22 @@ impl DeferredAnonymousState {
         insert(&mut state.resident, page..page_end);
         Ok(true)
     }
+    /// Check pristine provenance without materializing or marking pages resident.
+    /// Callers separately authenticate the MM and logical access permission.
+    pub fn covers_pristine(&self, start: GuestVa, len: usize) -> bool {
+        let Ok(len) = u64::try_from(len) else {
+            return false;
+        };
+        let Some(end) = start.raw().checked_add(len).filter(|_| len != 0) else {
+            return false;
+        };
+        let state = self.state.lock();
+        let index = state.pristine.partition_point(|r| r.end <= start.raw());
+        state
+            .pristine
+            .get(index)
+            .is_some_and(|r| r.start <= start.raw() && end <= r.end)
+    }
     pub fn snapshot(&self) -> DeferredAnonymousSnapshot {
         let state = self.state.lock();
         DeferredAnonymousSnapshot {
@@ -182,6 +198,29 @@ impl DeferredAnonymousTransition<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pristine_validation_is_nonmutating_and_rejects_holes_and_overflow() {
+        let state = DeferredAnonymousState::new();
+        state.reserve_fresh(GuestVa(0x1000), 0x3000).unwrap();
+        let before = state.snapshot();
+        assert!(state.covers_pristine(GuestVa(0x1fff), 2));
+        assert!(state.covers_pristine(GuestVa(0x1000), 0x3000));
+        assert!(!state.covers_pristine(GuestVa(0xfff), 2));
+        assert!(!state.covers_pristine(GuestVa(0x3fff), 2));
+        assert!(!state.covers_pristine(GuestVa(u64::MAX), 2));
+        assert!(!state.covers_pristine(GuestVa(0x1000), 0));
+        assert_eq!(state.snapshot(), before);
+        state
+            .begin_materialization(GuestVa(0x2000), 4096)
+            .unwrap()
+            .commit();
+        assert!(!state.covers_pristine(GuestVa(0x1fff), 0x1002));
+        assert!(state.covers_pristine(GuestVa(0x3001), 2));
+        state.retire(GuestVa(0x3000), 4096).unwrap();
+        assert!(!state.covers_pristine(GuestVa(0x3001), 2));
+        assert!(state.snapshot().zero_read_resident.is_empty());
+    }
+
     #[test]
     fn exact_zero_reads_and_lifecycle() {
         let state = DeferredAnonymousState::new();
