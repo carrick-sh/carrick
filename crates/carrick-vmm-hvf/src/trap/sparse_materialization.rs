@@ -282,8 +282,19 @@ impl MmAccessState {
         manager: &carrick_mem::page_table::PageTableManager,
         root_perms: applevisor::memory::MemPerms,
     ) -> Result<Vec<HvfMappedRegion>, TrapError> {
-        const TWO_MIB: usize = 2 * 1024 * 1024;
         let mut published = Vec::new();
+        self.publish_stage1_extension_arenas_into(custody, manager, root_perms, &mut published)?;
+        Ok(published)
+    }
+
+    fn publish_stage1_extension_arenas_into(
+        &self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        manager: &carrick_mem::page_table::PageTableManager,
+        root_perms: applevisor::memory::MemPerms,
+        published: &mut Vec<HvfMappedRegion>,
+    ) -> Result<(), TrapError> {
+        const TWO_MIB: usize = 2 * 1024 * 1024;
         for base in manager.extension_arena_bases() {
             if self.structural_owners.read().contains_key(&(base, TWO_MIB)) {
                 continue;
@@ -348,7 +359,7 @@ impl MmAccessState {
 
             published.push(region);
         }
-        Ok(published)
+        Ok(())
     }
 }
 
@@ -495,9 +506,10 @@ pub(super) fn publish(
                                 "keep sparse HVPatch mmap stage-1 invalid: {error:?}"
                             ))
                         })?;
-                    extension_regions.extend(context.state.publish_stage1_extension_arenas(
+                    context.state.publish_stage1_extension_arenas_into(
                         context.custody, editor.manager, applevisor::memory::MemPerms::ReadWrite,
-                    )?);
+                        &mut extension_regions,
+                    )?;
                     let page_table_resolver =
                         context.state.pinned_stage1_arenas(context.custody)?;
                     unsafe { editor.sync_to_host(&page_table_resolver) }.map_err(|e| {
@@ -539,22 +551,43 @@ pub(super) fn publish(
             )
     };
     if let Err(error) = publication {
-        let _ = context.state.page_tables_authority().edit(
-            || Err(()),
+        let rollback = context.state.page_tables_authority().edit(
+            || {
+                Err(TrapError::Hypervisor(
+                    "rollback page tables disappeared".to_owned(),
+                ))
+            },
             |editor| {
-                let page_table_resolver = context
-                    .state
-                    .pinned_stage1_arenas(context.custody)
-                    .unwrap_or_else(|_| std::process::abort());
-                // SAFETY: the COW quiesce and topology guards remain held,
-                // so no vCPU can walk or edit this mm while the journalled
-                // pre-images are replayed into its live backing.
-                unsafe { editor.rollback_undo(&page_table_resolver) };
-                Ok::<(), ()>(())
+                let resolver = context.state.pinned_stage1_arenas(context.custody)?;
+                // The owned resolver drops its pins before retirement. Exact-MM
+                // exclusion remains held through descriptor restore and TLBI.
+                unsafe {
+                    editor.rollback_undo_retiring(resolver, |popped| {
+                        flush_stage1()?;
+                        let journal = extension_regions
+                            .iter()
+                            .filter_map(|region| {
+                                region
+                                    .structural_owner
+                                    .as_ref()
+                                    .map(|owner| (owner.physical_ipa, std::sync::Arc::clone(owner)))
+                            })
+                            .collect();
+                        context.state.retire_rolled_back_arenas(
+                            context.custody,
+                            popped,
+                            &journal,
+                            &mut unmap_global_frame_stage2_record,
+                            &mut release_retired_stage2_ipa,
+                        )?;
+                        Ok::<(), TrapError>(())
+                    })?;
+                }
+                Ok::<(), TrapError>(())
             },
         );
-        if let Err(flush_error) = flush_stage1() {
-            eprintln!("carrick: FATAL: sparse HVPatch mmap rollback TLBI failed: {flush_error}");
+        if let Err(rollback_error) = rollback {
+            eprintln!("carrick: FATAL: sparse HVPatch mmap rollback failed: {rollback_error}");
             std::process::abort();
         }
         HvfVmState::rollback_unpublished_mappings(
@@ -655,6 +688,16 @@ struct PinnedStage1Arenas {
     owners:
         std::collections::BTreeMap<u64, (std::sync::Arc<StructuralBackingOwner>, CarrierStage2Pin)>,
 }
+impl carrick_mem::page_table::HostArenaResolver for PinnedStage1Arenas {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        <&Self as carrick_mem::page_table::HostArenaResolver>::host_ptr_for_base(&self, base)
+    }
+    fn record_populated_prefix(&self, base: u64, prefix: usize) {
+        <&Self as carrick_mem::page_table::HostArenaResolver>::record_populated_prefix(
+            &self, base, prefix,
+        );
+    }
+}
 impl carrick_mem::page_table::HostArenaResolver for &PinnedStage1Arenas {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
         self.owners.get(&base).map(|(owner, _)| owner.ptr())
@@ -666,6 +709,45 @@ impl carrick_mem::page_table::HostArenaResolver for &PinnedStage1Arenas {
     }
 }
 impl MmAccessState {
+    /// Called only after descriptor rollback and exact-ASID invalidation, while
+    /// the transaction still excludes mutations and holds its publication journal.
+    fn retire_rolled_back_arenas(
+        &self,
+        custody: &CarrierVmCustody,
+        popped: &[u64],
+        journal: &std::collections::BTreeMap<u64, std::sync::Arc<StructuralBackingOwner>>,
+        unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+        release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        for &base in popped {
+            let key = (base, 2 * 1024 * 1024);
+            let owner = self.structural_owners.read().get(&key).cloned();
+            let owner = match (owner, journal.get(&base)) {
+                (None, None) => continue, // Never reached backing publication.
+                (Some(owner), Some(created)) if std::sync::Arc::ptr_eq(&owner, created) => owner,
+                _ => {
+                    return Err(TrapError::Hypervisor(
+                        "rollback refuses an arena owner outside its publication journal"
+                            .to_owned(),
+                    ));
+                }
+            };
+            let identity = owner.record_identity();
+            owner
+                .retained
+                .owner_retired
+                .store(true, std::sync::atomic::Ordering::Release);
+            retry_structural_backing_identities_in_using(custody, &[identity], unmap, release_ipa)?;
+            if custody.stage2_record_snapshot(identity.record_id).is_some() {
+                return Err(TrapError::Hypervisor(
+                    "rollback arena backing remained nonterminal".to_owned(),
+                ));
+            }
+            self.structural_owners.write().remove(&key);
+        }
+        Ok(())
+    }
+
     fn pinned_stage1_arenas(
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
@@ -705,6 +787,131 @@ mod arena_pin_tests {
     #[test]
     fn publication_resolver_pins_exact_full_slot_until_edit_finishes() {
         check_pinned_arena(2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rollback_arena_retirement_preserves_pinned_or_failed_backing_until_retry() {
+        for fail_backend in [false, true] {
+            let (state, custody, owner) = rollback_fixture();
+            let base = owner.physical_ipa;
+            let identity = owner.record_identity();
+            let journal = std::collections::BTreeMap::from([(base, owner.clone())]);
+            let pin = (!fail_backend).then(|| custody.pin_stage2_record(identity).unwrap());
+            let calls = std::cell::Cell::new(0);
+            let result = state.retire_rolled_back_arenas(
+                &custody,
+                &[base],
+                &journal,
+                &mut |_, _| {
+                    calls.set(calls.get() + 1);
+                    Err(CarrierStage2BackendError::HvReturn(1))
+                },
+                &mut |_, _| Ok(()),
+            );
+            assert!(result.is_err());
+            assert_eq!(calls.get(), usize::from(fail_backend));
+            assert!(custody.stage2_record_snapshot(identity.record_id).is_some());
+            assert!(
+                state
+                    .structural_owners
+                    .read()
+                    .contains_key(&(base, owner.physical_size))
+            );
+            drop(pin);
+            state
+                .retire_rolled_back_arenas(
+                    &custody,
+                    &[base],
+                    &journal,
+                    &mut |ipa, len| {
+                        assert_eq!((ipa, len), (base, owner.physical_size));
+                        Ok(())
+                    },
+                    &mut |_, _| Ok(()),
+                )
+                .unwrap();
+            assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
+            assert!(state.structural_owners.read().is_empty());
+        }
+    }
+
+    #[test]
+    fn rollback_arena_retirement_rejects_missing_journal_and_missing_mm_owner() {
+        let (state, custody, owner) = rollback_fixture();
+        let base = owner.physical_ipa;
+        let journal = std::collections::BTreeMap::from([(base, owner.clone())]);
+        for missing_mm in [false, true] {
+            if missing_mm {
+                state.structural_owners.write().clear();
+            }
+            let empty = std::collections::BTreeMap::new();
+            assert!(
+                state
+                    .retire_rolled_back_arenas(
+                        &custody,
+                        &[base],
+                        if missing_mm { &journal } else { &empty },
+                        &mut |_, _| panic!("unmatched owner must not unmap"),
+                        &mut |_, _| panic!("unmatched owner must not release address")
+                    )
+                    .is_err()
+            );
+            assert!(
+                !owner
+                    .retained
+                    .owner_retired
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+        }
+        state.install_structural_owner(owner.clone());
+        state
+            .retire_rolled_back_arenas(
+                &custody,
+                &[base],
+                &journal,
+                &mut |_, _| Ok(()),
+                &mut |_, _| Ok(()),
+            )
+            .unwrap();
+    }
+
+    fn rollback_fixture() -> (
+        std::sync::Arc<MmAccessState>,
+        std::sync::Arc<CarrierVmCustody>,
+        std::sync::Arc<StructuralBackingOwner>,
+    ) {
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let base = 0x7d00_4000_0000;
+        let size = 2 * 1024 * 1024;
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .unwrap();
+        let mut lease = GlobalFrameStage2Lease::fixed(base, size as u64);
+        // Exercise the injected backend callback as a live stage-2 record.
+        lease.mark_mapped();
+        let owner = StructuralBackingOwner::new_in(
+            &custody,
+            host,
+            lease,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            next_structural_epoch().unwrap(),
+            base,
+            size,
+        )
+        .unwrap();
+        let state = MmAccessState::new(
+            carrick_aarch64::Stage1Authority::new(),
+            std::sync::Arc::new(MemoryProtections::default()),
+            std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        );
+        state.install_structural_owner(owner.clone());
+        (state, custody, owner)
     }
 
     fn check_pinned_arena(size: usize) {

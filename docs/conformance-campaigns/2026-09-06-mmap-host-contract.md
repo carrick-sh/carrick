@@ -593,3 +593,40 @@ were returned before the retirement callback. All 45 AArch64 lib tests pass
 with delayed return (`arena-retire-green.log`, run eco-arena-retire-green-20260906a).
 The first harness attempt had a Rust temporary-lifetime compile error and is
 not counted as red evidence. Sparse publisher integration remains next.
+
+Sparse publisher integration now keeps extension regions in a caller-owned
+journal so successful earlier publications survive a later publication error.
+Rollback consumes its resolver (releasing pins), restores descriptors, flushes
+translations, retires only exact journal-owned structural records, checks
+terminal custody, removes MM owner entries, and then returns arena addresses.
+Unexpected or nonterminal owners fail-stop rather than permitting reuse.
+Compile check passes (`arena-publish-check.log`, run eco-arena-publish-check-20260906a).
+Full signed HVF suite passes 447 / 3 ignored (`arena-publish.log`, run
+eco-mmap-arena-publish-1788722969145696000, cleanup zero). This integration
+was held for retirement failure-injection coverage; results follow below.
+
+
+### Exact arena retirement failure coverage
+
+The production sparse rollback callback now uses `retire_rolled_back_arenas`
+with its exact publication journal. Injected backend unmap failures and retained
+stage-2 pins leave custody records and MM owners intact until retry succeeds.
+Missing journal ownership and missing MM ownership both refuse retirement,
+without setting the owner-retired bit or calling unmap. Replaying the previous
+`None => continue` behavior proves the missing-MM test red
+(`arena-journal-red.log`, run eco-arena-journal-red-20260906a); restoring the
+exact match passes (`arena-journal-green.log`, run eco-arena-journal-green-20260906a).
+
+Full signed HVF suite on the restored implementation: 449 passed / 3 ignored
+(`arena-inject2.log`, run eco-mmap-arena-inject2-1788723163677196000, cleanup zero).
+That full suite preceded the temporary old-behavior replay; restoration was
+byte-for-byte from its saved source and the focused test reran green. The first
+injection fixture incorrectly marked the backing as having no backend map,
+skipping the callback; `arena-inject.log` is a fixture failure, not a runtime
+regression. The corrected fixture uses a mapped custody record and injected
+backend operations.
+
+Scope: these tests exercise actual custody retirement and its production helper,
+not a full publish invocation with every failure stage injected. End-to-end
+publication failures, foreign materialization and post-publication commit error
+handling remain open. No main landing or latency acceptance is claimed.
