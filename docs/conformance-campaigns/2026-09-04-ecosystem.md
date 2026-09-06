@@ -1458,3 +1458,44 @@ a 40 s cap; green: named error in 6 s with a 5 s bound; the self-exiting
 flow script still completes. Also learned: `scripts/sudo/kill.sh --all`
 matches its own caller if the caller's command line contains the literal
 `release/carrick trace`, so never grep for that text in the same command.
+
+## Handoff at 2026-09-06 landing
+
+**Main** (`38a5d78be`): clean, full probe gate green (gate44, rc 0), serial
+runtime suite green, lint green through the ledger step (a final
+`just lint-domains` was still running at landing; the only change after the
+last green lint was the ledgered env-var row).
+
+**Landed this campaign leg**: frame pool; lazy `/proc` context; fork
+populated-table copy + root-slot pool; Stage1Authority (plus its exec fix);
+dentry cache with inode records, five follow-up fixes and the in-memory-lane
+capability gate; alias planner and alias range-panic fixes; the exec-in-child
+regression fix; `carrick trace` bounded custom-script drain.
+
+**In flight, parked** (worktrees under `.worktrees/`, briefs in this
+session's scratchpad are summarized here):
+- `agy/retire-capstd-sep06` (worker `retire-capstd`, round 5 running):
+  cap-std is out and banned, namei is the resolver, dentry cache is behind
+  `RootFsVfs` (zero dispatch references), glibc images run. BLOCKED on a
+  security regression: `extract_to_dir` uses `dest.join(<layer entry>)` +
+  `std::fs`, so a `../` or symlink entry escapes the scratch root. Required:
+  fd-relative extraction (`mkdirat`/`openat(O_EXCL|O_NOFOLLOW)`/`symlinkat`/
+  `linkat`/`unlinkat` from the root fd) with red-first escape tests, then
+  classify the 88 host-authority rows, then land. Correction already sent:
+  `/bin` as an empty dir is pre-existing on main, not the branch.
+- `agy/mmap-lazy-sep06` (worker stopped after five wedged tracers; the
+  tracer now fails closed so a fresh conversation can take it): correctness
+  restored (CPython runs, all mmap/COW probes match) but file mmap is 3222 µs
+  vs main 1444 vs Docker 2, anon 98 vs 58 vs 2.4. The page-cache view is
+  installed 100/100 and the dispatcher still copies 1,616 pages per mmap
+  through `write_guest_bytes`; find why `lowered_file_backed` does not skip
+  the snapshot, prove zero-copy, then re-measure.
+- Not started: readdir per-entry stats (840 µs / 201 entries), the
+  VFS-owned invalidation is done but `serves_dentry_cache` means the
+  in-memory lane has no cache at all.
+
+**Open items**: `futexforkrequeue` gate-concurrency sensitivity; the `/bin`
+and `/sbin` run-time directories on merged-usr images; `docker_compose`
+smoke sharing a test binary with carrick lanes; stale `.worktrees/` (over a
+hundred, including `bisect-*`); the quiet-host fork number and a fresh full
+ecosystem ledger, both deferred until the two parked branches land.
