@@ -316,3 +316,31 @@ read-only review found no blocker. Full signed HVF lib suite passed 442 tests,
 3 ignored (`block-auth-final.log`), using the shipped post-link signer and
 scoped cleanup. Runtime timing has not yet been remeasured on this source;
 the structural count is not a latency or landing claim.
+
+## Block authentication signed CLI receipt
+
+Committed source `fd2121d51`, signed SHA-256
+`16f0c64400cdc366b95d8a95d0916d22830d18ce1733652d0c2c2c5a543398b9`,
+LC_UUID `7B2CFC87-225E-382B-A244-55552CBEF091`. CDHash, hypervisor entitlement
+and DOF section recorded in `block-artifact.json`.
+
+Isolated median trial means: file mmap **44.774958 us**, munmap **22.357958 us**;
+anonymous mmap **27.350042 us**, munmap **13.879875 us**. File mmap is about
+25% below the previous 59.882667 us observation; anonymous did not improve.
+Raw five-trial results and exact run identity are in `block-counter.*`.
+The unchanged Python benchmark reports file mmap+close **110.572875 us**
+(previous 125.425584), anonymous **55.543917 us** (previous 54.3695), with
+raw trials in `block-bench.*`. These are separate fixtures and still fail the
+10/6 us acceptance targets.
+
+Ubuntu `sh -c '/bin/true'` and `python:3.12-slim print(1)` both exit 0 on
+this binary (`block-launch.json`). Fresh whole-file zero-copy trace:
+100 mappings, zero errors, zero `write_guest_bytes`, zero chunks;
+run `eco-mmap-immutable-lazy-1788717301168007000`, `block-copy.*`.
+All runs were serialized and scoped-reaped. No mmap main landing occurred.
+
+Remaining: true anonymous lazy backing with authenticated kernel/foreign reads
+and correct first-touch residency; residual file-map cost; complete latency
+contracts; full final serial runtime and whole probe family on the final
+artifact; line inventory reconciliation/commit/lint; only then mmap FF from
+main, quiet-host fork and fresh full cached-only ecosystem ledger.
