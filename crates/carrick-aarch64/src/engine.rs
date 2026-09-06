@@ -1690,8 +1690,20 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         &mut self,
         address: u64,
         len: usize,
-        _sharing: MappingSharing,
+        sharing: MappingSharing,
     ) -> Result<(), MemoryError> {
+        if sharing == MappingSharing::Private
+            && self.vm.sparse_mmap_arena_enabled()
+            && address >= carrick_mem::memory::LINUX_MMAP_BASE
+            && address.checked_add(len as u64).is_some_and(|end| {
+                end <= carrick_mem::memory::LINUX_MMAP_BASE + carrick_mem::memory::mmap_arena_size()
+            })
+        {
+            // HVPatch sparse arena retires private frames at munmap and allocates
+            // pristine zeroed compounds on demand on first touch/fault.
+            // Skipping the eager physical scrub keeps mmap service latency O(1).
+            return Ok(());
+        }
         self.zero_backing(address, len)
     }
 
@@ -1841,7 +1853,17 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // Only then retire process-shared backend lookup metadata. If the page-
         // table/TLBI operation fails, the alias registry remains an exact owner
         // of the still-published backing instead of becoming a dangling absence.
-        self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))?;
+        if self.vm.sparse_mmap_arena_enabled()
+            && address >= carrick_mem::memory::LINUX_MMAP_BASE
+            && address.checked_add(len as u64).is_some_and(|end| {
+                end <= carrick_mem::memory::LINUX_MMAP_BASE
+                    .saturating_add(carrick_mem::memory::mmap_arena_size())
+            })
+        {
+            self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))?;
+        } else {
+            self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))?;
+        }
         self.vm.on_unmap(address, len).map_err(|error| {
             MemoryError::HostMap(format!("retire backend mapping after munmap: {error}"))
         })?;

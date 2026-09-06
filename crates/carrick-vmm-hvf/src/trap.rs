@@ -37402,21 +37402,46 @@ impl HvfVmState {
         let view_end = va + view_len;
         let file_pages_end = align_up(view_end, PAGE_SIZE).unwrap_or(end).min(end);
 
-        // The whole range must be a hole: an overlapping mapping or process-scoped
-        // alias anywhere inside it means `MAP_FIXED` over occupied pages, which the
-        // eager path replaces byte-wise in place.
-        // Single O(log n) range query on the process alias registry + local mappings.
-        if !alias_registry()
-            .lock()
-            .overlapping_process_aliases(va, len, self.mm_root_slot, self.container_root)
-            .is_empty()
-        {
+        // Holes vs overlapping existing mappings:
+        // A plain MAP_PRIVATE file mmap lands in a hole. A MAP_FIXED over an
+        // existing private mapping (such as the ELF loader's PROT_NONE reservation)
+        // retires the old backing for the range so it takes the lazy view too.
+        // If any overlapping mapping or process-scoped alias is non-private or
+        // non-dynamic (e.g. shared memory), refuse the lowering so dispatcher falls back.
+        let overlapping_aliases = alias_registry().lock().overlapping_process_aliases(
+            va,
+            len,
+            self.mm_root_slot,
+            self.container_root,
+        );
+        let has_non_retirable_alias = overlapping_aliases.iter().any(|(_, alias)| {
+            alias.sharing != GuestMappingSharing::Private
+                || !alias_backing_is_live(alias.physical_host_addr)
+        });
+        if has_non_retirable_alias {
             return Ok(false);
         }
-        if self.mappings.iter().any(|m| {
-            m.start < end && m.end > va && global_frame_region_owner_matches_in(self.custody(), m)
-        }) {
+
+        let has_non_retirable_mapping = self.mappings.iter().any(|m| {
+            m.start < end
+                && m.end > va
+                && global_frame_region_owner_matches_in(self.custody(), m)
+                && (!m.is_dynamic_alias || m.sharing != GuestMappingSharing::Private)
+        });
+        if has_non_retirable_mapping {
             return Ok(false);
+        }
+
+        if !overlapping_aliases.is_empty()
+            || self.mappings.iter().any(|m| {
+                m.start < end
+                    && m.end > va
+                    && m.is_dynamic_alias
+                    && global_frame_region_owner_matches_in(self.custody(), m)
+            })
+        {
+            self.unregister_process_alias(va, len)?;
+            flush_stage1()?;
         }
 
         let mut current = va;
@@ -37831,31 +37856,34 @@ impl HvfVmState {
                                 "sparse HVPatch mmap sync_to_host failed: {e:?}"
                             ))
                         })?;
-                        let mut page = start;
-                        while page < end {
-                            let expected_ipa = semantic_ipa + (page - start);
-                            let shadow = editor.debug_walk(page);
-                            let live = unsafe {
-                                editor.debug_walk_host(page_table_resolver, page)
+                        #[cfg(debug_assertions)]
+                        {
+                            let mut page = start;
+                            while page < end {
+                                let expected_ipa = semantic_ipa + (page - start);
+                                let shadow = editor.debug_walk(page);
+                                let live = unsafe {
+                                    editor.debug_walk_host(page_table_resolver, page)
+                                }
+                                .map_err(|e| {
+                                    TrapError::Hypervisor(format!(
+                                        "sparse HVPatch mmap debug_walk_host failed: {e:?}"
+                                    ))
+                                })?;
+                                let leaf = carrick_mem::page_table::terminal_descriptor(live);
+                                if shadow != live
+                                    || editor.translate(page).is_some()
+                                    || editor.translate_retained_output(page) != Some(expected_ipa)
+                                    || leaf & VALID != 0
+                                    || leaf & AP_MASK != AP_USER_RO
+                                    || leaf & NON_GLOBAL == 0
+                                {
+                                    return Err(TrapError::Hypervisor(format!(
+                                        "sparse HVPatch mmap publication failed at VA 0x{page:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
+                                    )));
+                                }
+                                page = page.saturating_add(PAGE_SIZE);
                             }
-                            .map_err(|e| {
-                                TrapError::Hypervisor(format!(
-                                    "sparse HVPatch mmap debug_walk_host failed: {e:?}"
-                                ))
-                            })?;
-                            let leaf = carrick_mem::page_table::terminal_descriptor(live);
-                            if shadow != live
-                                || editor.translate(page).is_some()
-                                || editor.translate_retained_output(page) != Some(expected_ipa)
-                                || leaf & VALID != 0
-                                || leaf & AP_MASK != AP_USER_RO
-                                || leaf & NON_GLOBAL == 0
-                            {
-                                return Err(TrapError::Hypervisor(format!(
-                                    "sparse HVPatch mmap publication failed at VA 0x{page:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
-                                )));
-                            }
-                            page = page.saturating_add(PAGE_SIZE);
                         }
                         Ok(())
                     },
