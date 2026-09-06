@@ -1406,3 +1406,7 @@ commit is running to confirm the attribution.
   Round 3b: full component-wise namei with carrick-side symlink resolution,
   extraction fidelity, `namei_escape` rows for symlinked intermediates, and
   glibc launches as mandatory receipts.
+- **Gate on `1bb1edbf4` + positions chore**: signed build, `ubuntu:24.04`
+  fork+exec sanity, and the full `just conformance-probes` gate all green
+  (rc 0). Main is landed end to end after the dentry cache and its five
+  follow-ups.
