@@ -412,3 +412,24 @@ Full signed HVF lib suite passes 445 / 3 ignored in
 `eco-mmap-resume/mm-arenas.log`; scoped cleanup reports zero. This mechanical
 extraction is committed separately from anonymous integration and has not
 landed on main. No new guest latency result is claimed.
+
+
+### Shared sparse publication extraction
+
+The local adapter now invokes `sparse_materialization::publish`, which owns
+backing preparation, stage-1 edits/sync/authentication, inventory publication
+and alias registration. Its context carries the caller's existing quiesce
+lifetime, MM-owned state, carrier custody and inventory authority. Executor
+mapping rows are returned cache updates. Foreign entry and permission-aware
+ready publication still need implementation; local deferred protection remains
+explicit in the adapter. Existing inventory apply/fatal failure semantics are
+preserved; receipt-based foreign publication and structural rollback journaling
+are not claimed complete.
+
+The MM resolver now retains exact structural owners and stage-2 pins during
+table editing. Its lifetime test rejects another carrier, keeps pointers valid
+after MM lookup removal, defers retirement while pinned, and allows retirement
+after release. Full signed HVF suite: 446 passed / 3 ignored,
+`eco-mmap-resume/shared-publish-final.log`, run
+`eco-mmap-shared-publish-final-1788720196445898000`; scoped cleanup zero.
+No main landing or new latency acceptance is claimed.
