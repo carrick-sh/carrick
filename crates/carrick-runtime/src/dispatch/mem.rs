@@ -8156,6 +8156,15 @@ impl SyscallDispatcher {
     }
 
     #[cfg(test)]
+    pub(crate) fn seed_resident_fault_for_test(&self, page: u64, prot: u64) {
+        self.track_resident_fault_range(
+            page,
+            self.linux_page_size(),
+            LinuxProtFlags::from_bits_truncate(prot),
+        );
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_resident_fault_plan_for_test<T>(
         &self,
         addr: u64,
