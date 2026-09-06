@@ -2632,8 +2632,18 @@ impl HostFsBackend {
         let scratch = tempfile::TempDir::new_in(scratch_root)?;
         let lock = acquire_lockfile(scratch.path())?;
         drop(root_guard);
-        let file = std::fs::File::open(scratch.path())?;
-        let root_fd = std::sync::Arc::new(std::os::fd::OwnedFd::from(file));
+        let scratch_c = std::ffi::CString::new(scratch.path().as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let raw = unsafe {
+            libc::open(
+                scratch_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let root_fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
         let root_prefix = host_root_prefix(&root_fd);
         let fast_fs = fast_fs_enabled();
         let root_path = scratch.path().to_path_buf();
@@ -2744,8 +2754,18 @@ impl HostFsBackend {
 
     /// Construct against an already-allocated scratch path.
     pub fn from_path(path: &Path) -> std::io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let root_fd = std::sync::Arc::new(std::os::fd::OwnedFd::from(file));
+        let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let raw = unsafe {
+            libc::open(
+                path_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let root_fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
         Ok(Self::from_existing_root_fd(root_fd, path.to_path_buf()))
     }
 
@@ -4453,8 +4473,19 @@ impl HostFsBackend {
             && let Some(scratch) = self._scratch.as_ref().map(|t| t.path().to_path_buf())
         {
             if let Ok(Some(merged)) = crate::layer_cache::overlay_seed_scratch(paths, &scratch) {
-                let file = std::fs::File::open(&merged)?;
-                let root_fd = std::sync::Arc::new(std::os::fd::OwnedFd::from(file));
+                let merged_c = std::ffi::CString::new(merged.as_os_str().as_encoded_bytes())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                let raw = unsafe {
+                    libc::open(
+                        merged_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                if raw < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let root_fd =
+                    std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
                 self.root_prefix = host_root_prefix(&root_fd);
                 self.root_path = merged.clone();
                 self.root_fd = root_fd;
