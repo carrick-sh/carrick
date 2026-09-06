@@ -83,9 +83,12 @@
 //! (char/block/fifo) are skipped on the on-disk path and accounted in
 //! [`ExtractStats::skipped_special`].
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -328,13 +331,621 @@ pub fn extract_layer_paths_to_dir(
     Ok(stats)
 }
 
+/// Capability-rooted layer extractor. Operates entirely via file descriptors relative
+/// to the open scratch root (`root_fd`), refusing paths that escape root via `..`,
+/// refusing symlinks whose targets escape root, and resolving intermediate directory
+/// symlinks entirely inside the scratch root with a 40-hop limit.
+pub(crate) struct ContainedExtractor {
+    root_fd: Arc<OwnedFd>,
+    #[allow(dead_code)]
+    root_path: PathBuf,
+}
+
+impl ContainedExtractor {
+    pub(crate) fn open(dest: &Path) -> Result<Self, RootFsError> {
+        let dest_c = CString::new(dest.as_os_str().as_bytes())
+            .map_err(|_| RootFsError::UnsafePath(dest.display().to_string()))?;
+        let raw = unsafe {
+            libc::open(
+                dest_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(RootFsError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(Self {
+            root_fd: Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }),
+            root_path: dest.to_path_buf(),
+        })
+    }
+
+    /// Resolve intermediate components of `path` to the parent directory descriptor,
+    /// returning `(parent_fd, leaf_name_c)`.
+    pub(crate) fn resolve_parent_and_leaf(
+        &self,
+        path: &Path,
+    ) -> Result<(Arc<OwnedFd>, CString), RootFsError> {
+        let leaf = path
+            .file_name()
+            .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?;
+        let leaf_c = CString::new(leaf.as_bytes())
+            .map_err(|_| RootFsError::UnsafePath(path.display().to_string()))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let parent_fd = if parent.as_os_str().is_empty() {
+            Arc::clone(&self.root_fd)
+        } else {
+            self.resolve_dir(parent, true)?
+        };
+        Ok((parent_fd, leaf_c))
+    }
+
+    /// Reopen a logical path consisting purely of real directory components from root_fd.
+    fn reopen_logical_path(&self, logical_path: &Path) -> Result<Arc<OwnedFd>, RootFsError> {
+        if logical_path.as_os_str().is_empty() {
+            return Ok(Arc::clone(&self.root_fd));
+        }
+        let mut current_fd = Arc::clone(&self.root_fd);
+        for comp in logical_path.components() {
+            if let Component::Normal(n) = comp {
+                let comp_c = CString::new(n.as_bytes())
+                    .map_err(|_| RootFsError::UnsafePath(logical_path.display().to_string()))?;
+                let next_raw = unsafe {
+                    libc::openat(
+                        current_fd.as_raw_fd(),
+                        comp_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                        0,
+                    )
+                };
+                if next_raw < 0 {
+                    return Err(RootFsError::Io(std::io::Error::last_os_error()));
+                }
+                current_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(next_raw) });
+            }
+        }
+        Ok(current_fd)
+    }
+
+    /// Walk path components fd-relatively with O_NOFOLLOW.
+    /// When intermediate symlinks are encountered, reads the link, re-roots absolute
+    /// targets under scratch root, resolves relative targets relative to the symlink's parent,
+    /// and bounds total hops to 40 (`TooManySymlinks`).
+    pub(crate) fn resolve_dir(
+        &self,
+        path: &Path,
+        mkdir_intermediates: bool,
+    ) -> Result<Arc<OwnedFd>, RootFsError> {
+        if path.as_os_str().is_empty() {
+            return Ok(Arc::clone(&self.root_fd));
+        }
+        let mut current_fd = Arc::clone(&self.root_fd);
+        let mut logical_path = PathBuf::new();
+        let mut remaining: VecDeque<PathBuf> = VecDeque::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(n) => remaining.push_back(PathBuf::from(n)),
+                Component::ParentDir => remaining.push_back(PathBuf::from("..")),
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(RootFsError::UnsafePath(path.display().to_string()));
+                }
+                Component::CurDir => {}
+            }
+        }
+
+        let mut hops = 0;
+        while let Some(comp) = remaining.pop_front() {
+            let comp_bytes = comp.as_os_str().as_bytes();
+            if comp_bytes.is_empty() || comp_bytes == b"." {
+                continue;
+            }
+            if comp_bytes == b".." {
+                if !logical_path.pop() {
+                    return Err(RootFsError::UnsafePath(path.display().to_string()));
+                }
+                current_fd = self.reopen_logical_path(&logical_path)?;
+                continue;
+            }
+
+            let comp_c = CString::new(comp_bytes)
+                .map_err(|_| RootFsError::UnsafePath(path.display().to_string()))?;
+
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(
+                    current_fd.as_raw_fd(),
+                    comp_c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    if mkdir_intermediates {
+                        let mkdir_rc = unsafe {
+                            libc::mkdirat(current_fd.as_raw_fd(), comp_c.as_ptr(), 0o755)
+                        };
+                        if mkdir_rc < 0 {
+                            let mkdir_err = std::io::Error::last_os_error();
+                            if mkdir_err.raw_os_error() != Some(libc::EEXIST) {
+                                return Err(RootFsError::Io(mkdir_err));
+                            }
+                        }
+                        let next_raw = unsafe {
+                            libc::openat(
+                                current_fd.as_raw_fd(),
+                                comp_c.as_ptr(),
+                                libc::O_RDONLY
+                                    | libc::O_DIRECTORY
+                                    | libc::O_CLOEXEC
+                                    | libc::O_NOFOLLOW,
+                                0,
+                            )
+                        };
+                        if next_raw < 0 {
+                            return Err(RootFsError::Io(std::io::Error::last_os_error()));
+                        }
+                        current_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(next_raw) });
+                        logical_path.push(&comp);
+                        continue;
+                    } else {
+                        return Err(RootFsError::NotFound(path.display().to_string()));
+                    }
+                } else {
+                    return Err(RootFsError::Io(err));
+                }
+            }
+
+            let mode = st.st_mode as libc::mode_t;
+            if (mode & libc::S_IFMT) == libc::S_IFLNK {
+                hops += 1;
+                if hops > 40 {
+                    return Err(RootFsError::TooManySymlinks(path.display().to_string()));
+                }
+                let mut link_buf = vec![0u8; 4096];
+                let n = unsafe {
+                    libc::readlinkat(
+                        current_fd.as_raw_fd(),
+                        comp_c.as_ptr(),
+                        link_buf.as_mut_ptr() as *mut libc::c_char,
+                        link_buf.len(),
+                    )
+                };
+                if n < 0 {
+                    return Err(RootFsError::Io(std::io::Error::last_os_error()));
+                }
+                let target_str = std::str::from_utf8(&link_buf[..n as usize])
+                    .map_err(|_| RootFsError::UnsafePath(path.display().to_string()))?;
+                let target_path = Path::new(target_str);
+                if target_path.is_absolute() {
+                    // Re-root absolute target under scratch root!
+                    current_fd = Arc::clone(&self.root_fd);
+                    logical_path.clear();
+                    let target_comps: Vec<PathBuf> = target_path
+                        .components()
+                        .filter_map(|c| match c {
+                            Component::Normal(n) => Some(PathBuf::from(n)),
+                            Component::ParentDir => Some(PathBuf::from("..")),
+                            _ => None,
+                        })
+                        .collect();
+                    for (idx, c) in target_comps.into_iter().enumerate() {
+                        remaining.insert(idx, c);
+                    }
+                } else {
+                    // Relative target: relative to current directory
+                    let target_comps: Vec<PathBuf> = target_path
+                        .components()
+                        .filter_map(|c| match c {
+                            Component::Normal(n) => Some(PathBuf::from(n)),
+                            Component::ParentDir => Some(PathBuf::from("..")),
+                            _ => None,
+                        })
+                        .collect();
+                    for (idx, c) in target_comps.into_iter().enumerate() {
+                        remaining.insert(idx, c);
+                    }
+                }
+                continue;
+            } else if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                let next_raw = unsafe {
+                    libc::openat(
+                        current_fd.as_raw_fd(),
+                        comp_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                        0,
+                    )
+                };
+                if next_raw < 0 {
+                    return Err(RootFsError::Io(std::io::Error::last_os_error()));
+                }
+                current_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(next_raw) });
+                logical_path.push(&comp);
+                continue;
+            } else {
+                return Err(RootFsError::NotFound(path.display().to_string()));
+            }
+        }
+        Ok(current_fd)
+    }
+
+    fn unlink_leaf_if_exists(&self, parent_fd: &OwnedFd, leaf_c: &CStr) -> Result<(), RootFsError> {
+        let rc = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EISDIR) || err.raw_os_error() == Some(libc::EPERM) {
+                self.unlink_tree_at(parent_fd, leaf_c)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn unlink_dir_contents(&self, dir_fd: &OwnedFd) -> Result<(), RootFsError> {
+        let dup_raw = unsafe { libc::dup(dir_fd.as_raw_fd()) };
+        if dup_raw < 0 {
+            return Err(RootFsError::Io(std::io::Error::last_os_error()));
+        }
+        let dirp = unsafe { libc::fdopendir(dup_raw) };
+        if dirp.is_null() {
+            unsafe { libc::close(dup_raw) };
+            return Err(RootFsError::Io(std::io::Error::last_os_error()));
+        }
+        unsafe { libc::rewinddir(dirp) };
+        let mut entries = Vec::new();
+        loop {
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
+                break;
+            }
+            let d_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let bytes = d_name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let d_type = unsafe { (*entry).d_type };
+            entries.push((d_name.to_owned(), d_type));
+        }
+        unsafe { libc::closedir(dirp) };
+
+        for (name_c, d_type) in entries {
+            if d_type == libc::DT_DIR {
+                self.unlink_tree_at(dir_fd, &name_c)?;
+            } else if d_type == libc::DT_UNKNOWN {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::fstatat(
+                        dir_fd.as_raw_fd(),
+                        name_c.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc == 0 && (st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFDIR {
+                    self.unlink_tree_at(dir_fd, &name_c)?;
+                } else {
+                    let _ = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), name_c.as_ptr(), 0) };
+                }
+            } else {
+                let rc = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), name_c.as_ptr(), 0) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EISDIR)
+                        || err.raw_os_error() == Some(libc::EPERM)
+                    {
+                        self.unlink_tree_at(dir_fd, &name_c)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unlink_tree_at(&self, parent_fd: &OwnedFd, name_c: &CStr) -> Result<(), RootFsError> {
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if raw >= 0 {
+            let child_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            self.unlink_dir_contents(&child_fd)?;
+            drop(child_fd);
+            let _ = unsafe {
+                libc::unlinkat(parent_fd.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR)
+            };
+        } else {
+            let _ = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name_c.as_ptr(), 0) };
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_opaque_whiteout(&self, parent: &Path) -> Result<(), RootFsError> {
+        let parent_fd = match self.resolve_dir(parent, false) {
+            Ok(fd) => fd,
+            Err(RootFsError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        self.unlink_dir_contents(&parent_fd)
+    }
+
+    pub(crate) fn apply_whiteout(
+        &self,
+        parent: &Path,
+        hidden_name: &str,
+    ) -> Result<(), RootFsError> {
+        let parent_fd = if parent.as_os_str().is_empty() {
+            Arc::clone(&self.root_fd)
+        } else {
+            match self.resolve_dir(parent, false) {
+                Ok(fd) => fd,
+                Err(RootFsError::NotFound(_)) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        };
+        let leaf_c = CString::new(hidden_name.as_bytes())
+            .map_err(|_| RootFsError::UnsafePath(hidden_name.to_string()))?;
+        self.unlink_leaf_if_exists(&parent_fd, &leaf_c)
+    }
+
+    pub(crate) fn extract_dir(
+        &self,
+        path: &Path,
+        mode: u32,
+        stats: &mut ExtractStats,
+    ) -> Result<(), RootFsError> {
+        let (parent_fd, leaf_c) = self.resolve_parent_and_leaf(path)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            let st_mode = st.st_mode as libc::mode_t;
+            if (st_mode & libc::S_IFMT) == libc::S_IFLNK {
+                let mut link_buf = vec![0u8; 4096];
+                let n = unsafe {
+                    libc::readlinkat(
+                        parent_fd.as_raw_fd(),
+                        leaf_c.as_ptr(),
+                        link_buf.as_mut_ptr() as *mut libc::c_char,
+                        link_buf.len(),
+                    )
+                };
+                if n > 0 {
+                    if let Ok(target_str) = std::str::from_utf8(&link_buf[..n as usize]) {
+                        let target_path = Path::new(target_str);
+                        let _ = if target_path.is_absolute() {
+                            if let Ok(p) = normalize_rootfs_path(target_path) {
+                                self.resolve_dir(&p, true)
+                            } else {
+                                Err(RootFsError::UnsafePath(target_str.to_string()))
+                            }
+                        } else {
+                            self.resolve_dir(target_path, true)
+                        };
+                        stats.dirs += 1;
+                        return Ok(());
+                    }
+                }
+            } else if (st_mode & libc::S_IFMT) == libc::S_IFDIR {
+                stats.dirs += 1;
+                return Ok(());
+            } else {
+                self.unlink_leaf_if_exists(&parent_fd, &leaf_c)?;
+            }
+        }
+
+        let rc = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0o755) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EEXIST) {
+                return Err(RootFsError::Io(err));
+            }
+        }
+
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if raw >= 0 {
+            if mode & 0o500 != 0o500 {
+                unsafe {
+                    libc::fchmod(raw, (mode | 0o700) as libc::mode_t);
+                }
+                crate::fs_backend::fset_mode_xattr(raw, mode);
+                stats.mode_xattrs += 1;
+            } else {
+                unsafe {
+                    libc::fchmod(raw, mode as libc::mode_t);
+                }
+            }
+            unsafe {
+                libc::close(raw);
+            }
+        }
+        stats.dirs += 1;
+        Ok(())
+    }
+
+    pub(crate) fn extract_file(
+        &self,
+        path: &Path,
+        mode: u32,
+        contents: &[u8],
+        stats: &mut ExtractStats,
+    ) -> Result<(), RootFsError> {
+        let (parent_fd, leaf_c) = self.resolve_parent_and_leaf(path)?;
+        self.unlink_leaf_if_exists(&parent_fd, &leaf_c)?;
+
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if raw < 0 {
+            return Err(RootFsError::Io(std::io::Error::last_os_error()));
+        }
+        let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        f.write_all(contents)?;
+        if mode & 0o400 == 0 {
+            unsafe {
+                libc::fchmod(f.as_raw_fd(), (mode | 0o600) as libc::mode_t);
+            }
+            crate::fs_backend::fset_mode_xattr(f.as_raw_fd(), mode);
+            stats.mode_xattrs += 1;
+        } else {
+            unsafe {
+                libc::fchmod(f.as_raw_fd(), mode as libc::mode_t);
+            }
+        }
+        drop(f);
+        stats.files += 1;
+        Ok(())
+    }
+
+    pub(crate) fn extract_file_reader<R: Read>(
+        &self,
+        path: &Path,
+        mode: u32,
+        reader: &mut R,
+        stats: &mut ExtractStats,
+    ) -> Result<(), RootFsError> {
+        let (parent_fd, leaf_c) = self.resolve_parent_and_leaf(path)?;
+        self.unlink_leaf_if_exists(&parent_fd, &leaf_c)?;
+
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if raw < 0 {
+            return Err(RootFsError::Io(std::io::Error::last_os_error()));
+        }
+        let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        std::io::copy(reader, &mut f)?;
+        if mode & 0o400 == 0 {
+            unsafe {
+                libc::fchmod(f.as_raw_fd(), (mode | 0o600) as libc::mode_t);
+            }
+            crate::fs_backend::fset_mode_xattr(f.as_raw_fd(), mode);
+            stats.mode_xattrs += 1;
+        } else {
+            unsafe {
+                libc::fchmod(f.as_raw_fd(), mode as libc::mode_t);
+            }
+        }
+        drop(f);
+        stats.files += 1;
+        Ok(())
+    }
+
+    pub(crate) fn extract_symlink(
+        &self,
+        path: &Path,
+        target: &Path,
+        stats: &mut ExtractStats,
+    ) -> Result<(), RootFsError> {
+        let _ = normalize_symlink_target(path, target)?;
+
+        let (parent_fd, leaf_c) = self.resolve_parent_and_leaf(path)?;
+        self.unlink_leaf_if_exists(&parent_fd, &leaf_c)?;
+
+        let target_c = CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| RootFsError::UnsafePath(path.display().to_string()))?;
+        let rc =
+            unsafe { libc::symlinkat(target_c.as_ptr(), parent_fd.as_raw_fd(), leaf_c.as_ptr()) };
+        if rc < 0 {
+            return Err(RootFsError::Io(std::io::Error::last_os_error()));
+        }
+        stats.symlinks += 1;
+        Ok(())
+    }
+
+    pub(crate) fn extract_hardlink(
+        &self,
+        path: &Path,
+        link_name: &Path,
+        stats: &mut ExtractStats,
+    ) -> Result<(), RootFsError> {
+        let target = normalize_layer_path(link_name)?;
+        if target == path {
+            return Err(RootFsError::UnsafePath(path.display().to_string()));
+        }
+        let (dst_parent, dst_leaf) = self.resolve_parent_and_leaf(path)?;
+        self.unlink_leaf_if_exists(&dst_parent, &dst_leaf)?;
+
+        let (src_parent, src_leaf) = self.resolve_parent_and_leaf(&target)?;
+        let rc = unsafe {
+            libc::linkat(
+                src_parent.as_raw_fd(),
+                src_leaf.as_ptr(),
+                dst_parent.as_raw_fd(),
+                dst_leaf.as_ptr(),
+                0,
+            )
+        };
+        if rc == 0 {
+            stats.files += 1;
+            return Ok(());
+        }
+
+        // Fallback: copy bytes
+        let src_raw = unsafe {
+            libc::openat(
+                src_parent.as_raw_fd(),
+                src_leaf.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if src_raw < 0 {
+            return Err(RootFsError::Io(std::io::Error::last_os_error()));
+        }
+        let mut src_file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(src_raw) });
+
+        let dst_raw = unsafe {
+            libc::openat(
+                dst_parent.as_raw_fd(),
+                dst_leaf.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if dst_raw < 0 {
+            return Err(RootFsError::Io(std::io::Error::last_os_error()));
+        }
+        let mut dst_file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(dst_raw) });
+        std::io::copy(&mut src_file, &mut dst_file)?;
+        stats.files += 1;
+        Ok(())
+    }
+}
+
 fn apply_tar_to_dir<R: Read>(
     archive: &mut tar::Archive<R>,
     dest: &Path,
     stats: &mut ExtractStats,
 ) -> Result<(), RootFsError> {
-    use std::io::ErrorKind;
-    use std::os::unix::fs::PermissionsExt as _;
+    let extractor = ContainedExtractor::open(dest)?;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -349,36 +960,18 @@ fn apply_tar_to_dir<R: Read>(
         // Whiteout detection — replicates apply_layer exactly.
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if file_name == OPAQUE_WHITEOUT {
-                // Opaque whiteout: clear the parent directory then recreate it.
+                // Opaque whiteout: clear the parent directory.
                 if let Some(parent) = path.parent()
                     && !parent.as_os_str().is_empty()
                 {
-                    let parent_abs = dest.join(parent);
-                    match std::fs::remove_dir_all(&parent_abs) {
-                        Ok(()) | Err(_) => {}
-                    }
-                    std::fs::create_dir_all(&parent_abs)?;
+                    extractor.apply_opaque_whiteout(parent)?;
                 }
                 continue;
             }
 
             if let Some(hidden_name) = file_name.strip_prefix(WHITEOUT_PREFIX) {
-                if let Some(parent) = path.parent() {
-                    let target = if parent.as_os_str().is_empty() {
-                        PathBuf::from(hidden_name)
-                    } else {
-                        parent.join(hidden_name)
-                    };
-                    let target_abs = dest.join(&target);
-                    // Try removing as a file first, then as a directory tree.
-                    match std::fs::remove_file(&target_abs) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == ErrorKind::NotFound => {}
-                        Err(_) => match std::fs::remove_dir_all(&target_abs) {
-                            Ok(()) | Err(_) => {}
-                        },
-                    }
-                }
+                let parent = path.parent().unwrap_or_else(|| Path::new(""));
+                extractor.apply_whiteout(parent, hidden_name)?;
                 continue;
             }
         }
@@ -386,95 +979,22 @@ fn apply_tar_to_dir<R: Read>(
         let entry_type = entry.header().entry_type();
         let mode = entry.header().mode().unwrap_or(0o644);
 
-        // Ensure parent directory exists for all non-root entries.
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(dest.join(parent))?;
-        }
-
-        let dest_path = dest.join(&path);
         if entry_type.is_dir() {
-            std::fs::create_dir_all(&dest_path)?;
-            // A directory the owner can't read+search (r-x) would lock carrick
-            // (a non-root macOS process) out of its own scratch. Preserve the
-            // true mode in the carrick xattr and force owner r-x on the real
-            // dir; otherwise apply the image mode directly. (See HostFsBackend
-            // / CARRICK_MODE_XATTR.)
-            if mode & 0o500 != 0o500 {
-                let _ = std::fs::set_permissions(
-                    &dest_path,
-                    std::fs::Permissions::from_mode(mode | 0o700),
-                );
-                crate::fs_backend::write_mode_xattr(dest, &path, true, mode);
-                stats.mode_xattrs += 1;
-            } else {
-                let _ = std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(mode));
-            }
-            stats.dirs += 1;
+            extractor.extract_dir(&path, mode, stats)?;
         } else if entry_type.is_symlink() {
             let link_name = entry
                 .link_name()?
                 .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?
                 .into_owned();
-            // Remove any existing entry at path before creating the symlink.
-            let _ = std::fs::remove_file(&dest_path);
-            let _ = std::fs::remove_dir_all(&dest_path);
-            // Store the raw link target verbatim (Linux symlinkat(2) semantics).
-            std::os::unix::fs::symlink(link_name, &dest_path)?;
-            stats.symlinks += 1;
+            extractor.extract_symlink(&path, &link_name, stats)?;
         } else if entry_type.is_file() {
-            // Streaming copy — never buffers the whole file.
-            let mut f = std::fs::File::create(&dest_path)?;
-            std::io::copy(&mut entry, &mut f)?;
-            drop(f);
-            // A file the owner can't read would lock carrick (non-root) out of
-            // serving its content. Preserve the true mode in the carrick xattr
-            // and force owner rw on the real file; otherwise apply the image
-            // mode directly (real_stat reports it faithfully).
-            if mode & 0o400 == 0 {
-                let _ = std::fs::set_permissions(
-                    &dest_path,
-                    std::fs::Permissions::from_mode(mode | 0o600),
-                );
-                crate::fs_backend::write_mode_xattr(dest, &path, false, mode);
-                stats.mode_xattrs += 1;
-            } else {
-                let _ = std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(mode));
-            }
-            stats.files += 1;
+            extractor.extract_file_reader(&path, mode, &mut entry, stats)?;
         } else if entry_type.is_hard_link() {
             let link_name = entry
                 .link_name()?
                 .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?
                 .into_owned();
-            let target = normalize_layer_path(&link_name)?;
-            if target == path {
-                return Err(RootFsError::UnsafePath(path.display().to_string()));
-            }
-            // A new-layer hardlink replaces the path from lower layers. Remove
-            // that destination before linking: falling back to `create(path)`
-            // while it is already a hardlink to `target` truncates BOTH names.
-            match std::fs::remove_file(&dest_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(_) => match std::fs::remove_dir_all(&dest_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                },
-            }
-            let target_abs = dest.join(&target);
-            match std::fs::hard_link(&target_abs, &dest_path) {
-                Ok(()) => {}
-                Err(_) => {
-                    // Fall back to copying target's bytes if hard_link fails.
-                    let mut src = std::fs::File::open(&target_abs)?;
-                    let mut dst = std::fs::File::create(&dest_path)?;
-                    std::io::copy(&mut src, &mut dst)?;
-                }
-            }
-            stats.files += 1;
+            extractor.extract_hardlink(&path, &link_name, stats)?;
         } else {
             // char/block/fifo/other special — skip.
             stats.skipped_special += 1;
@@ -593,38 +1113,32 @@ impl RootFs {
     /// materializer used by HostFsBackend so rootfs seeding stays inside the
     /// already-open scratch dir.
     pub fn extract_to_dir(&self, dest: &Path) -> Result<(), RootFsError> {
-        use std::os::unix::fs::PermissionsExt as _;
+        let extractor = ContainedExtractor::open(dest)?;
+        let mut stats = ExtractStats::default();
 
-        // Directories: process shallowest first.
-        let mut dirs: Vec<&PathBuf> = self.directories.iter().collect();
+        // 1. Symlinks first: directory symlinks like `bin -> usr/bin` must exist
+        // before files like `bin/true` are extracted so intermediate resolution
+        // resolves through the link.
+        for (link_path, entry) in &self.symlinks {
+            extractor.extract_symlink(link_path, Path::new(&entry.target_text), &mut stats)?;
+        }
+
+        // 2. Directories: skip any directory path that is already a symlink (e.g. "bin").
+        let mut dirs: Vec<&PathBuf> = self
+            .directories
+            .iter()
+            .filter(|d| !d.as_os_str().is_empty() && !self.symlinks.contains_key(*d))
+            .collect();
         dirs.sort_by_key(|p| p.components().count());
         for d in dirs {
-            std::fs::create_dir_all(dest.join(d))?;
+            extractor.extract_dir(d, 0o755, &mut stats)?;
         }
-        // Files.
+
+        // 3. Files.
         for (path, entry) in &self.files {
-            let dest_path = dest.join(path);
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut file = std::fs::File::create(&dest_path)?;
-            file.write_all(entry.contents.as_ref())?;
-            drop(file);
-            let _ =
-                std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(entry.mode));
+            extractor.extract_file(path, entry.mode, entry.contents.as_ref(), &mut stats)?;
         }
-        // Symlinks last (target paths might point at files we just wrote).
-        for (link_path, entry) in &self.symlinks {
-            let dest_path = dest.join(link_path);
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            // If the link path already exists (e.g. parent created it as a dir),
-            // remove first.
-            let _ = std::fs::remove_file(&dest_path);
-            let _ = std::fs::remove_dir_all(&dest_path);
-            std::os::unix::fs::symlink(&entry.target_text, &dest_path)?;
-        }
+
         Ok(())
     }
 
@@ -1032,11 +1546,12 @@ impl RootFs {
                 self.symlinks.insert(
                     path.clone(),
                     SymlinkEntry {
-                        path,
+                        path: path.clone(),
                         target,
                         target_text,
                     },
                 );
+                self.directories.remove(&path);
                 continue;
             }
 
@@ -1090,7 +1605,9 @@ impl RootFs {
         for component in path.components() {
             if let Component::Normal(name) = component {
                 current.push(name);
-                self.directories.insert(current.clone());
+                if !self.symlinks.contains_key(&current) {
+                    self.directories.insert(current.clone());
+                }
             }
         }
     }
