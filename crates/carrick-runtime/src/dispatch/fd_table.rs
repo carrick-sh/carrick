@@ -1271,6 +1271,7 @@ impl Drop for OpenDescription {
 #[derive(Debug)]
 struct HostFdOwner {
     fd: i32,
+    private_file_source: carrick_guest_mem::PrivateFileSource,
 }
 
 impl Drop for HostFdOwner {
@@ -1295,7 +1296,21 @@ pub(crate) struct HostFdRef(Arc<HostFdOwner>);
 
 impl HostFdRef {
     pub(super) fn new(fd: i32) -> Self {
-        Self(Arc::new(HostFdOwner { fd }))
+        Self::with_private_file_source(fd, carrick_guest_mem::PrivateFileSource::Mutable)
+    }
+
+    pub(super) fn with_private_file_source(
+        fd: i32,
+        private_file_source: carrick_guest_mem::PrivateFileSource,
+    ) -> Self {
+        Self(Arc::new(HostFdOwner {
+            fd,
+            private_file_source,
+        }))
+    }
+
+    pub(super) fn private_file_source(&self) -> carrick_guest_mem::PrivateFileSource {
+        self.0.private_file_source
     }
 
     /// The raw fd number for a host `libc` call (borrowed — the caller must

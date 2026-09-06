@@ -154,6 +154,20 @@ impl OwnedHostMapping {
         offset: libc::off_t,
         len: usize,
     ) -> Result<(), std::io::Error> {
+        self.overlay_file_view(at, fd, offset, len, false)
+    }
+
+    /// Overlay a file view before any HVF publication. `immutable` may only be
+    /// true for a filesystem-owned immutable inode: Darwin private views stop
+    /// tracking later file writes. Such a view needs no host write authority.
+    pub fn overlay_file_view(
+        &self,
+        at: usize,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: libc::off_t,
+        len: usize,
+        immutable: bool,
+    ) -> Result<(), std::io::Error> {
         use std::os::fd::AsRawFd as _;
         let host_page = host_page_size();
         let end = at
@@ -173,7 +187,11 @@ impl OwnedHostMapping {
                 target,
                 len,
                 libc::PROT_READ,
-                libc::MAP_SHARED | libc::MAP_FIXED,
+                (if immutable {
+                    libc::MAP_PRIVATE
+                } else {
+                    libc::MAP_SHARED
+                }) | libc::MAP_FIXED,
                 fd.as_raw_fd(),
                 offset,
             )

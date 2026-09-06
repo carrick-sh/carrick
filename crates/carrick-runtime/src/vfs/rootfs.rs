@@ -181,7 +181,15 @@ impl RootFsVfs {
         &self,
         path: &str,
         write: bool,
-    ) -> Result<(std::os::fd::OwnedFd, RealStat, String), LinuxErrno> {
+    ) -> Result<
+        (
+            std::os::fd::OwnedFd,
+            RealStat,
+            String,
+            carrick_guest_mem::PrivateFileSource,
+        ),
+        LinuxErrno,
+    > {
         if !self.overlay.serves_dentry_cache() {
             return Err(LINUX_ENOSYS);
         }

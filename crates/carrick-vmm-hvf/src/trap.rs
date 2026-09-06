@@ -19226,6 +19226,7 @@ enum SparseExtentBacking<'a> {
         fd: std::os::fd::BorrowedFd<'a>,
         offset: u64,
         view_len: u64,
+        source: carrick_guest_mem::PrivateFileSource,
     },
 }
 
@@ -37362,6 +37363,7 @@ impl HvfVmState {
         len: usize,
         fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
+        source: carrick_guest_mem::PrivateFileSource,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<bool, TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
@@ -37465,6 +37467,7 @@ impl HvfVmState {
                     fd,
                     offset: offset + (current - va),
                     view_len: (view_end.saturating_sub(current)).min(hole_end - current),
+                    source,
                 }
             } else {
                 SparseExtentBacking::Anon
@@ -37489,9 +37492,13 @@ impl HvfVmState {
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<u64, TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
+        #[cfg(debug_assertions)]
         const VALID: u64 = 1;
+        #[cfg(debug_assertions)]
         const AP_MASK: u64 = 0b11 << 6;
+        #[cfg(debug_assertions)]
         const AP_USER_RO: u64 = 0b11 << 6;
+        #[cfg(debug_assertions)]
         const NON_GLOBAL: u64 = 1 << 11;
 
         if start >= end || !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE) {
@@ -37690,6 +37697,7 @@ impl HvfVmState {
                     fd,
                     offset,
                     view_len,
+                    source,
                 } => {
                     let delta = start & (HVF_PAGE_SIZE - 1);
                     if offset & (HVF_PAGE_SIZE - 1) != delta {
@@ -37709,12 +37717,13 @@ impl HvfVmState {
                         ))
                     })?;
                     host_mapping
-                        .overlay_shared_file_view(
+                        .overlay_file_view(
                             usize::try_from(host_at)
                                 .map_err(|_| TrapError::MappingTooLarge(host_at))?,
                             fd,
                             file_offset,
                             view_host_size,
+                            source == carrick_guest_mem::PrivateFileSource::ImmutableLower,
                         )
                         .map_err(|error| {
                             TrapError::Hypervisor(format!(

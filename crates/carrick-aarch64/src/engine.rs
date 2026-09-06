@@ -1777,6 +1777,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         len: usize,
         host_fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
+        source: carrick_guest_mem::PrivateFileSource,
     ) -> Result<bool, MemoryError> {
         let in_sparse_arena = self.process_asid.is_some()
             && self.vm.sparse_mmap_arena_enabled()
@@ -1799,7 +1800,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let process_asid = self.process_asid;
         let carrier_root = vm.carrier_maintenance_root().ok();
         let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
-        vm.materialize_private_file_backing(va, len, host_fd, offset, &mut flush)
+        vm.materialize_private_file_backing(va, len, host_fd, offset, source, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
     }
 

@@ -2348,7 +2348,7 @@ impl SyscallDispatcher {
             && self.fs.fanotify_registry.is_empty()
             && !self.fs.vfs_mounts.has_mount(path)
         {
-            if let Ok((host_fd, real, canonical_path)) =
+            if let Ok((host_fd, real, canonical_path, source)) =
                 self.fs.rootfs_vfs.dentry_fast_open(path, writable_request)
             {
                 use std::os::fd::IntoRawFd;
@@ -2362,7 +2362,7 @@ impl SyscallDispatcher {
                     size: usize::try_from(real.size).unwrap_or(usize::MAX),
                 };
                 let description = OpenDescription::HostFile {
-                    host_fd: HostFdRef::new(raw),
+                    host_fd: HostFdRef::with_private_file_source(raw, source),
                     metadata,
                     base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     writable: writable_request,
@@ -3552,7 +3552,10 @@ impl SyscallDispatcher {
         debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(raw));
         crate::probes::path_open(path, metadata.size as u64, 0);
         let description = OpenDescription::HostFile {
-            host_fd: HostFdRef::new(raw),
+            host_fd: HostFdRef::with_private_file_source(
+                raw,
+                carrick_guest_mem::PrivateFileSource::ImmutableLower,
+            ),
             metadata,
             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
             writable: false,
