@@ -418,6 +418,15 @@ pub trait FsBackend: Send + Sync {
     }
 
     /// `True` iff `path` is currently tombstoned.
+    /// Whether the final component of `rel` exists on the host under exactly
+    /// these bytes. A normalizing host filesystem (APFS) resolves an NFD
+    /// spelling to an NFC entry that Linux would report ENOENT for; a
+    /// resolver that stats through a parent fd must ask this before
+    /// believing a hit. Default: byte-exact (in-memory backends).
+    fn name_matches_on_disk(&self, _rel: &Path) -> bool {
+        true
+    }
+
     fn is_deleted(&self, path: &str) -> bool {
         matches!(self.lookup_kind(path), Some(OverlayEntryKind::Deleted))
     }
@@ -4517,7 +4526,7 @@ impl HostFsBackend {
         Some(out)
     }
 
-    fn name_matches_on_disk(&self, rel: &Path) -> bool {
+    fn name_matches_on_disk_impl(&self, rel: &Path) -> bool {
         use std::os::unix::ffi::OsStrExt;
         let Some(file_name) = rel.file_name() else {
             // No final component (the scratch root) — nothing to alias.
@@ -5330,6 +5339,10 @@ fn dir_from_raw_fd(raw: i32) -> cap_std::fs::Dir {
 }
 
 impl FsBackend for HostFsBackend {
+    fn name_matches_on_disk(&self, rel: &Path) -> bool {
+        self.name_matches_on_disk_impl(rel)
+    }
+
     fn archive_mutation_gate(&self) -> Option<&ArchiveMutationGate> {
         Some(&self.archive_mutation_gate)
     }

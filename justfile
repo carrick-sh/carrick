@@ -35,6 +35,7 @@ _platform_crates:
 build *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
+    just --justfile {{justfile()}} check-disk
     if [ "{{os()}}" = "macos" ]; then
         exec ./scripts/build-signed.sh {{ARGS}}
     fi
@@ -157,6 +158,50 @@ reconcile-inventories:
 # allowlist. Install once with `cargo install cargo-deny`.
 deny:
     cargo deny check licenses bans sources
+
+# Free space must be checked BEFORE a build, not discovered during one.
+#
+# On 2026-09-04 this container reached 13 GiB free (99.3% used) with no warning:
+# 104 agent worktrees had regenerated ~500 GiB of `target/`, and the first symptom
+# was builds and guest runs failing for unrelated-looking reasons. A disk that is
+# nearly full does not announce itself — it corrupts a link step, truncates a
+# conformance log, or makes an HVF guest die somewhere unhelpful, and the hours go
+# into debugging the symptom. So this fails CLOSED with a named error, in the same
+# spirit as `check-frame-pointers`.
+#
+# Both thresholds are one APFS container here: `/`, `/System/Volumes/Data`,
+# `/Volumes/CaseSensitive` and `/Volumes/carrick` all share the same free pool, so
+# checking the repo's own filesystem covers every lane.
+#
+#   CARRICK_DISK_FLOOR_GIB   hard-fail below this (default 20)
+#   CARRICK_DISK_WARN_GIB    warn below this (default 75)
+#   CARRICK_DISK_GUARD=0     escape hatch for a deliberate run near the edge
+
+# Fail if free disk is below the floor; warn in the band above it.
+check-disk:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${CARRICK_DISK_GUARD:-1}" = "0" ]; then
+        echo "disk: guard disabled (CARRICK_DISK_GUARD=0)"
+        exit 0
+    fi
+    floor="${CARRICK_DISK_FLOOR_GIB:-20}"
+    warn="${CARRICK_DISK_WARN_GIB:-75}"
+    # -g reports whole GiB and rounds DOWN, so this never over-reports headroom.
+    free="$(df -g . | awk 'NR==2 {print $4}')"
+    if [ "$free" -lt "$floor" ]; then
+        echo "error: only ${free} GiB free (floor ${floor} GiB)" >&2
+        echo "       A near-full disk fails as a corrupt link, a truncated gate log," >&2
+        echo "       or a guest dying somewhere unrelated — not as ENOSPC." >&2
+        echo "       Reclaim agent build output:  just worktree-gc" >&2
+        echo "       Override for one run:        CARRICK_DISK_GUARD=0 just ..." >&2
+        exit 1
+    fi
+    if [ "$free" -lt "$warn" ]; then
+        echo "disk: ${free} GiB free — below the ${warn} GiB mark; 'just worktree-gc' to reclaim"
+    else
+        echo "disk: ${free} GiB free"
+    fi
 
 # Frame pointers must actually reach rustc, or `dtrace`'s `ustack()` silently
 # fabricates call stacks (see the rationale in `.cargo/config.toml`). A
@@ -345,6 +390,7 @@ ci:
     #!/usr/bin/env bash
     set -euo pipefail
     j() { just --justfile {{justfile()}} "$@"; }
+    j check-disk
     j check-frame-pointers
     j fmt-check
     j clippy
@@ -635,3 +681,84 @@ bsdvm-gate VM STAGE="stage0":
 
 bsdvm-acceptance:
     python3 scripts/bsdvm.py ladder freebsd-arm64:stage0 netbsd-arm64:stage0 freebsd-arm64:stage1 netbsd-arm64:stage1
+
+# Reclaim build output from `.worktrees/*/target`.
+#
+# WHY: 104 agent worktrees regenerated ~500 GiB of `target/` and took the disk to
+# 13 GiB free on 2026-09-04, and a day after a manual sweep 12 rebuilt targets had
+# already put 78 GiB back. Cold rebuilds are cheap here — `~/.cargo/config.toml`
+# wires sccache in as `rustc-wrapper` globally (100% hit rate across worktrees),
+# so deleting a worktree's target costs relink and fingerprint work, not
+# recompilation. That asymmetry is what makes sweeping the right lever, and why
+# a shared CARGO_TARGET_DIR is NOT: cargo locks a target dir exclusively, so one
+# shared dir would serialize every concurrent agent build behind one another.
+#
+# The main repo's own `target/` is deliberately OUT OF SCOPE. It is not pure build
+# output — it also holds `perf/` (20G), `conformance/` (18G), `host-authority-census/`
+# and the `ci-*.log` gate receipts, none of which are regenerable. Only
+# `.worktrees/*/target` is swept.
+#
+#   just worktree-gc            # dry run: what would go, and why each survivor stays
+#   just worktree-gc 14 apply   # delete target/ in worktrees idle >14 days
+#
+# Three guards, each of which cost a real incident:
+#   - LIVE: a worktree named by a running process is never touched (a `cargo check`
+#     was building inside one during the manual sweep).
+#   - AGE: "idle" means no file under target/ modified within DAYS, not the
+#     directory's own mtime, which does not move for writes deeper in the tree.
+#   - ROOT: files left by `sudo lldb` captures cannot be removed without a
+#     password; those are REPORTED with the exact sudo command rather than
+#     failing the sweep or being silently skipped.
+# Read-only `host-authority-census/snapshots/` trees are handled directly: they
+# are chmod u+w'd first, which is what blocked five worktrees in the manual pass.
+
+# Sweep `target/` from idle agent worktrees (dry run unless MODE=apply).
+worktree-gc DAYS="14" MODE="dry":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)/.worktrees"
+    [ -d "$root" ] || { echo "worktree-gc: no $root"; exit 0; }
+    case "{{MODE}}" in dry|apply) ;; *) echo "worktree-gc: MODE must be dry|apply" >&2; exit 2 ;; esac
+
+    # One ps scan for the whole run: any worktree path named in a live command line.
+    live="$(ps -Ao args= | grep -oE "$root/[^/ ]+" | sort -u || true)"
+
+    swept=0 kept=0 freed=0 nroot=0 rootowned=""
+    for wt in "$root"/*/; do
+        wt="${wt%/}"; name="$(basename "$wt")"
+        [ -d "$wt/target" ] || continue
+        size_k="$(du -skx "$wt/target" 2>/dev/null | cut -f1)"
+        size_h="$(du -shx "$wt/target" 2>/dev/null | cut -f1)"
+
+        if printf '%s\n' "$live" | grep -qx "$wt"; then
+            echo "  keep  $name ($size_h) — live process"; kept=$((kept+1)); continue
+        fi
+        # -quit stops at the first hit, so this is cheap even on a 140G tree.
+        if [ -n "$(find "$wt/target" -type f -mtime -{{DAYS}} -print -quit 2>/dev/null)" ]; then
+            echo "  keep  $name ($size_h) — active within {{DAYS}}d"; kept=$((kept+1)); continue
+        fi
+        if [ -n "$(find "$wt/target" ! -user "$(id -un)" -print -quit 2>/dev/null)" ]; then
+            echo "  ROOT  $name ($size_h) — root-owned files, needs sudo"
+            rootowned="$rootowned $wt/target"; nroot=$((nroot+1)); kept=$((kept+1)); continue
+        fi
+
+        if [ "{{MODE}}" = "apply" ]; then
+            chmod -R u+w "$wt/target" 2>/dev/null || true
+            rm -rf "$wt/target"
+            echo "  SWEPT $name ($size_h)"
+        else
+            echo "  would sweep $name ($size_h)"
+        fi
+        swept=$((swept+1)); freed=$((freed+size_k))
+    done
+
+    verb=$([ "{{MODE}}" = "apply" ] && echo freed || echo reclaimable)
+    if [ "$freed" -ge 1048576 ]; then total="$((freed/1048576)) GiB"; else total="$((freed/1024)) MiB"; fi
+    printf '\nworktree-gc: %d swept, %d kept, %s %s\n' "$swept" "$kept" "$total" "$verb"
+    if [ "$nroot" -gt 0 ]; then
+        printf 'worktree-gc: %d target dir(s) need a password:\n  sudo rm -rf%s\n' \
+            "$nroot" "$rootowned"
+    fi
+    [ "{{MODE}}" = "dry" ] && [ "$swept" -gt 0 ] && \
+        echo "worktree-gc: re-run as 'just worktree-gc {{DAYS}} apply' to delete."
+    exit 0

@@ -48,7 +48,8 @@ use parking_lot::RwLock;
 
 use crate::fs_backend::{FsBackend, RealStat};
 use crate::linux_abi::{
-    LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EXDEV, LinuxErrno,
+    LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP, LINUX_ENAMETOOLONG, LINUX_ENOENT, LINUX_ENOTDIR,
+    LINUX_EXDEV, LinuxErrno,
 };
 use crate::rootfs::{RootFs, RootFsEntryKind};
 use carrick_abi::{NsGid, NsUid};
@@ -938,6 +939,11 @@ impl DentryCache {
             return Err(LINUX_ENOENT);
         }
 
+        // Linux NAME_MAX: a component longer than 255 bytes is ENAMETOOLONG
+        // before any lookup, and is never a negative entry (`patherrno`).
+        if name.len() > 255 {
+            return Err(LINUX_ENAMETOOLONG);
+        }
         let name_c = CString::new(name.as_bytes()).map_err(|_| LINUX_ENOENT)?;
 
         // 1. Check Upper Overlay
@@ -951,6 +957,15 @@ impl DentryCache {
                     libc::AT_SYMLINK_NOFOLLOW,
                 )
             };
+            // A normalizing host (APFS) answers an NFD spelling with the NFC
+            // entry; Linux says ENOENT. Ask the backend for the byte-exact
+            // name before trusting the hit (`unicodenorm`).
+            if rc == 0 && !backend.name_matches_on_disk(Path::new(rel_full)) {
+                if !self.is_shared {
+                    self.insert_negative(parent_id, name, parent_dir_gen);
+                }
+                return Err(LINUX_ENOENT);
+            }
             if rc == 0 {
                 return self.construct_positive_from_stat(
                     parent_id,
