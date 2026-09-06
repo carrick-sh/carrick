@@ -39,7 +39,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -1915,13 +1914,6 @@ pub struct HostFsBackend {
     /// it; the later `insert` replaces the earlier. Both are valid, contained
     /// and independently owned, so the only effect is a transient second fd.
     dir_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, DirCacheEntry>>,
-    /// Per-backend directory-topology generation. Bumped on directory-topology mutations
-    /// (rmdir, rename, exchange) within this backend so cached fds are evicted
-    /// without interference across independent backends or concurrent tests.
-    dir_generation: std::sync::atomic::AtomicU64,
-    /// Per-backend fs-structure generation. Bumped on any mutation that adds,
-    /// removes, or renames entries in this backend's namespace.
-    structural_gen: std::sync::atomic::AtomicU64,
     /// The process generation that owns the current [`Self::dir_cache`] fds.
     /// Changed on host fork so a child drops inherited entries and adopts
     /// the cache for this process. Replaces per-call `libc::getpid()`.
@@ -2661,8 +2653,6 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_generation: std::sync::atomic::AtomicU64::new(1),
-            structural_gen: std::sync::atomic::AtomicU64::new(1),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
@@ -2721,8 +2711,6 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_generation: std::sync::atomic::AtomicU64::new(1),
-            structural_gen: std::sync::atomic::AtomicU64::new(1),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
@@ -2868,9 +2856,13 @@ impl HostFsBackend {
         }
 
         if !self.fast_fs {
-            return Err(libc::ENOSYS);
+            return self.dir_fd_for_after_reclaim(
+                dir,
+                crate::fs_resolve_cache::current_dir_generation(),
+                hops,
+            );
         }
-        let generation = self.dir_generation.load(Ordering::SeqCst);
+        let generation = crate::fs_resolve_cache::current_dir_generation();
         let proc_gen = crate::fs_resolve_cache::current_process_generation();
 
         // Adopt-and-clear if we crossed a host fork: a child must not trust
@@ -3093,6 +3085,9 @@ impl HostFsBackend {
         fd: &std::sync::Arc<std::os::fd::OwnedFd>,
         generation: u64,
     ) {
+        if !self.fast_fs {
+            return;
+        }
         const DIR_CACHE_MAX_ENTRIES: usize = 4096;
         let mut cache = self.dir_cache.lock();
         if cache.len() >= DIR_CACHE_MAX_ENTRIES {
@@ -3134,6 +3129,42 @@ impl HostFsBackend {
         Ok((parent_fd, name_c))
     }
 
+    /// Open the exact metadata inode without a second ambient path walk.
+    /// O_NONBLOCK is mandatory for writerless FIFOs. macOS O_SYMLINK binds
+    /// the link itself; other hosts refuse a link instead of following it.
+    fn metadata_fd(&self, rel: &Path, follow: bool) -> Result<Arc<std::os::fd::OwnedFd>, i32> {
+        let resolved;
+        let rel = if follow {
+            resolved = self
+                .resolve_following(rel.to_str().ok_or(libc::EINVAL)?)
+                .ok_or(libc::ELOOP)?;
+            resolved.as_path()
+        } else {
+            rel
+        };
+        if rel.as_os_str().is_empty() {
+            return Ok(self.root_fd.clone());
+        }
+        let (parent, leaf) = self.namei_leaf_res(rel)?;
+        #[cfg(target_os = "macos")]
+        let nofollow = libc::O_SYMLINK;
+        #[cfg(not(target_os = "macos"))]
+        let nofollow = libc::O_NOFOLLOW;
+        let raw = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | nofollow,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
+        Ok(Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }))
+    }
+
     /// Ensure all intermediate parent directories for `rel` exist beneath the
     /// contained sandbox root, creating them on demand (similar to `mkdir -p`),
     /// and return the parent directory fd.
@@ -3145,7 +3176,7 @@ impl HostFsBackend {
         if let Ok(fd) = self.dir_fd_for(parent) {
             return Ok(fd);
         }
-        let generation = self.dir_generation.load(Ordering::SeqCst);
+        let generation = crate::fs_resolve_cache::current_dir_generation();
         let mut current = self.dir_fd_for(Path::new(""))?;
         let mut walked = PathBuf::new();
         let flags = libc::O_RDONLY
@@ -4247,9 +4278,7 @@ impl HostFsBackend {
 
         let name = rel.file_name()?; // leaf is always a single component here
         let name_c = std::ffi::CString::new(name.as_bytes()).ok()?;
-        let dir_generation = self
-            .dir_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let dir_generation = crate::fs_resolve_cache::current_dir_generation();
 
         // --- Revalidate an existing entry: ONE fstatat through the cached,
         //     already-contained parent fd (no path walk, no openat). Clone the
@@ -4538,7 +4567,14 @@ impl HostFsBackend {
         let parent_fd = self
             .dir_fd_for(dir)
             .map_err(std::io::Error::from_raw_os_error)?;
-        let dup_raw = unsafe { libc::dup(parent_fd.as_raw_fd()) };
+        // A new open description gives each enumeration its own seek offset.
+        let dup_raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
         if dup_raw < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -4547,9 +4583,6 @@ impl HostFsBackend {
             unsafe { libc::close(dup_raw) };
             return Err(std::io::Error::last_os_error());
         }
-        // fdopendir adopts the fd's current offset; dup shares the cached fd's
-        // offset, so rewind to read the directory from the beginning.
-        unsafe { libc::rewinddir(dirp) };
         let mut results = Vec::new();
         loop {
             let entry = unsafe { libc::readdir(dirp) };
@@ -4962,99 +4995,46 @@ pub(crate) fn fget_owner_xattr(fd: std::os::fd::RawFd) -> (Option<NsUid>, Option
 
 /// Open a short-lived fd for `rel` (file or dir) and run `f` on it.
 fn with_entry_fd<R>(
-    root_path: &Path,
+    backend: &HostFsBackend,
     rel: &Path,
     is_dir: bool,
     writable: bool,
     f: impl FnOnce(std::os::fd::RawFd) -> R,
 ) -> Option<R> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let abs = root_path.join(rel);
-    let abs_c = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
-    let flags = if is_dir {
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC
-    } else if writable {
-        libc::O_RDWR | libc::O_CLOEXEC
-    } else {
-        #[cfg(target_os = "macos")]
-        {
-            const O_EVTONLY: libc::c_int = 0x8000;
-            libc::O_RDONLY | libc::O_CLOEXEC | O_EVTONLY
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            libc::O_RDONLY | libc::O_CLOEXEC
-        }
-    };
-    let mut fd = unsafe { libc::open(abs_c.as_ptr(), flags) };
-    if fd < 0 && !is_dir && !writable {
-        fd = unsafe { libc::open(abs_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    }
-    if fd < 0 {
-        return None;
-    }
-    let res = f(fd);
-    unsafe { libc::close(fd) };
-    Some(res)
+    let _ = (is_dir, writable);
+    let fd = backend.metadata_fd(rel, false).ok()?;
+    Some(f(fd.as_raw_fd()))
 }
 
 /// Read the guest-mode xattr for `rel` under `root_path`. `None` => fall back to the
 /// real mode.
-fn read_mode_xattr(root_path: &Path, rel: &Path, is_dir: bool) -> Option<u32> {
+fn read_mode_xattr(backend: &HostFsBackend, rel: &Path, is_dir: bool) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
         let _ = is_dir;
-        path_get_u32_xattr(root_path, rel, CARRICK_MODE_XATTR, false)
+        path_get_u32_xattr(backend, rel, CARRICK_MODE_XATTR, false)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        with_entry_fd(root_path, rel, is_dir, false, |fd| {
+        with_entry_fd(backend, rel, is_dir, false, |fd| {
             fget_u32_xattr(fd, CARRICK_MODE_XATTR)
         })
         .flatten()
     }
 }
 
-/// Write the guest-mode xattr for `rel` under `root_path`. Best-effort.
-pub(crate) fn write_mode_xattr(root_path: &Path, rel: &Path, is_dir: bool, mode: u32) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = is_dir;
-        path_set_u32_xattr(root_path, rel, CARRICK_MODE_XATTR, mode);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = with_entry_fd(root_path, rel, is_dir, true, |fd| {
-            fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode)
-        });
-    }
-}
-
-fn fremove_mode_xattr(root_path: &Path, rel: &Path) {
-    #[cfg(target_os = "macos")]
-    {
-        path_remove_xattr(root_path, rel, CARRICK_MODE_XATTR);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = with_entry_fd(root_path, rel, false, true, |fd| {
-            fremove_xattr(fd, CARRICK_MODE_XATTR);
-        });
-    }
-}
-
 /// Read the device-node id (`st_rdev`) xattr for the regular `rel` under `root_path`.
 /// `None` => the file is not a device-node marker. Mirrors `read_mode_xattr`
 /// (read-only, atime-preserving on macOS).
-fn read_rdev_xattr(root_path: &Path, rel: &Path) -> Option<u64> {
+fn read_rdev_xattr(backend: &HostFsBackend, rel: &Path) -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        path_get_u64_xattr(root_path, rel, CARRICK_RDEV_XATTR, false)
+        path_get_u64_xattr(backend, rel, CARRICK_RDEV_XATTR, false)
     }
     #[cfg(not(target_os = "macos"))]
     {
         // Devices are never directories, so a plain (non-dir) read-only fd peek.
-        with_entry_fd(root_path, rel, false, false, |fd| {
+        with_entry_fd(backend, rel, false, false, |fd| {
             fget_u64_xattr(fd, CARRICK_RDEV_XATTR)
         })
         .flatten()
@@ -5067,169 +5047,84 @@ fn read_rdev_xattr(root_path: &Path, rel: &Path) -> Option<u64> {
 /// xattr writers (a failed write leaves the file looking like a plain regular
 /// file). `full_mode` carries the `S_IFCHR`/`S_IFBLK` type bits so the stat
 /// reconstruction can recover the device type.
-fn write_device_xattrs(root_path: &Path, rel: &Path, full_mode: u32, dev: u64) {
+fn write_device_xattrs(backend: &HostFsBackend, rel: &Path, full_mode: u32, dev: u64) {
     #[cfg(target_os = "macos")]
     {
-        path_set_u32_xattr(root_path, rel, CARRICK_MODE_XATTR, full_mode);
-        path_set_u64_xattr(root_path, rel, CARRICK_RDEV_XATTR, dev);
+        path_set_u32_xattr(backend, rel, CARRICK_MODE_XATTR, full_mode);
+        path_set_u64_xattr(backend, rel, CARRICK_RDEV_XATTR, dev);
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = with_entry_fd(root_path, rel, false, true, |fd| {
+        let _ = with_entry_fd(backend, rel, false, true, |fd| {
             fset_u32_xattr(fd, CARRICK_MODE_XATTR, full_mode);
             fset_u64_xattr(fd, CARRICK_RDEV_XATTR, dev);
         });
     }
 }
 
-/// `true` iff `rel` carries the `AF_UNIX`-socket marker xattr (see
-/// `CARRICK_SOCKET_XATTR`). A read-only `O_EVTONLY` peek that preserves atime,
-/// just like `read_mode_xattr`.
-fn read_socket_xattr(root_path: &Path, rel: &Path) -> bool {
+/// `true` iff the contained inode carries the `AF_UNIX` socket marker xattr.
+fn read_socket_xattr(backend: &HostFsBackend, rel: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
-        path_get_u32_xattr(root_path, rel, CARRICK_SOCKET_XATTR, false).is_some()
+        path_get_u32_xattr(backend, rel, CARRICK_SOCKET_XATTR, false).is_some()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        with_entry_fd(root_path, rel, false, false, |fd| {
+        with_entry_fd(backend, rel, false, false, |fd| {
             fget_u32_xattr(fd, CARRICK_SOCKET_XATTR).is_some()
         })
         .unwrap_or(false)
     }
 }
 
-/// Path-based u32 xattr read (macOS).
+/// Read a u32 xattr through a contained metadata fd (macOS).
 #[cfg(target_os = "macos")]
-fn path_get_u32_xattr(root_path: &Path, rel: &Path, name: &[u8], nofollow: bool) -> Option<u32> {
-    use std::os::unix::ffi::OsStrExt;
-    let abs = root_path.join(rel);
-    let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
-    let mut v = [0u8; 4];
-    let n = unsafe {
-        if nofollow {
-            carrick_portable::lgetxattr(
-                cpath.as_ptr(),
-                name.as_ptr() as *const libc::c_char,
-                v.as_mut_ptr() as *mut libc::c_void,
-                v.len(),
-            )
-        } else {
-            carrick_portable::getxattr(
-                cpath.as_ptr(),
-                name.as_ptr() as *const libc::c_char,
-                v.as_mut_ptr() as *mut libc::c_void,
-                v.len(),
-            )
-        }
-    };
-    (n == 4).then(|| u32::from_le_bytes(v))
+fn path_get_u32_xattr(
+    backend: &HostFsBackend,
+    rel: &Path,
+    name: &[u8],
+    nofollow: bool,
+) -> Option<u32> {
+    let fd = backend.metadata_fd(rel, !nofollow).ok()?;
+    fget_u32_xattr(fd.as_raw_fd(), name)
 }
 
-/// Path-based 8-byte LE xattr read (macOS), mirroring `path_get_u32_xattr`.
+/// Read an 8-byte LE xattr through a contained metadata fd (macOS).
 #[cfg(target_os = "macos")]
-fn path_get_u64_xattr(root_path: &Path, rel: &Path, name: &[u8], nofollow: bool) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let abs = root_path.join(rel);
-    let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
-    let mut v = [0u8; 8];
-    let n = unsafe {
-        if nofollow {
-            carrick_portable::lgetxattr(
-                cpath.as_ptr(),
-                name.as_ptr() as *const libc::c_char,
-                v.as_mut_ptr() as *mut libc::c_void,
-                v.len(),
-            )
-        } else {
-            carrick_portable::getxattr(
-                cpath.as_ptr(),
-                name.as_ptr() as *const libc::c_char,
-                v.as_mut_ptr() as *mut libc::c_void,
-                v.len(),
-            )
-        }
-    };
-    (n == 8).then(|| u64::from_le_bytes(v))
+fn path_get_u64_xattr(
+    backend: &HostFsBackend,
+    rel: &Path,
+    name: &[u8],
+    nofollow: bool,
+) -> Option<u64> {
+    let fd = backend.metadata_fd(rel, !nofollow).ok()?;
+    fget_u64_xattr(fd.as_raw_fd(), name)
 }
 
 #[cfg(target_os = "macos")]
-fn symlink_get_u32_xattr(root_path: &Path, rel: &Path, name: &[u8]) -> Option<u32> {
-    path_get_u32_xattr(root_path, rel, name, true)
+fn symlink_get_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8]) -> Option<u32> {
+    path_get_u32_xattr(backend, rel, name, true)
 }
 
 #[cfg(target_os = "macos")]
-fn symlink_set_u32_xattr(root_path: &Path, rel: &Path, name: &[u8], val: u32) {
-    use std::os::unix::ffi::OsStrExt;
-    let abs = root_path.join(rel);
-    let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
-        return;
-    };
-    let v = val.to_le_bytes();
-    // symlink_set always targets the link itself (no-follow).
-    unsafe {
-        carrick_portable::lsetxattr(
-            cpath.as_ptr(),
-            name.as_ptr() as *const libc::c_char,
-            v.as_ptr() as *const libc::c_void,
-            v.len(),
-            0,
-        );
+fn symlink_set_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8], val: u32) {
+    if let Ok(fd) = backend.metadata_fd(rel, false) {
+        fset_u32_xattr(fd.as_raw_fd(), name, val);
     }
-    crate::fs_resolve_cache::bump_meta_generation();
 }
 
 #[cfg(target_os = "macos")]
-fn path_set_u32_xattr(root_path: &Path, rel: &Path, name: &[u8], val: u32) {
-    use std::os::unix::ffi::OsStrExt;
-    let abs = root_path.join(rel);
-    let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
-        return;
-    };
-    let v = val.to_le_bytes();
-    unsafe {
-        carrick_portable::setxattr(
-            cpath.as_ptr(),
-            name.as_ptr() as *const libc::c_char,
-            v.as_ptr() as *const libc::c_void,
-            v.len(),
-            0,
-        );
+fn path_set_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8], val: u32) {
+    if let Ok(fd) = backend.metadata_fd(rel, false) {
+        fset_u32_xattr(fd.as_raw_fd(), name, val);
     }
-    crate::fs_resolve_cache::bump_meta_generation();
 }
 
 #[cfg(target_os = "macos")]
-fn path_set_u64_xattr(root_path: &Path, rel: &Path, name: &[u8], val: u64) {
-    use std::os::unix::ffi::OsStrExt;
-    let abs = root_path.join(rel);
-    let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
-        return;
-    };
-    let v = val.to_le_bytes();
-    unsafe {
-        carrick_portable::setxattr(
-            cpath.as_ptr(),
-            name.as_ptr() as *const libc::c_char,
-            v.as_ptr() as *const libc::c_void,
-            v.len(),
-            0,
-        );
+fn path_set_u64_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8], val: u64) {
+    if let Ok(fd) = backend.metadata_fd(rel, false) {
+        fset_u64_xattr(fd.as_raw_fd(), name, val);
     }
-    crate::fs_resolve_cache::bump_meta_generation();
-}
-
-#[cfg(target_os = "macos")]
-fn path_remove_xattr(root_path: &Path, rel: &Path, name: &[u8]) {
-    use std::os::unix::ffi::OsStrExt;
-    let abs = root_path.join(rel);
-    let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
-        return;
-    };
-    unsafe {
-        carrick_portable::lremovexattr(cpath.as_ptr(), name.as_ptr() as *const libc::c_char);
-    }
-    crate::fs_resolve_cache::bump_meta_generation();
 }
 
 /// Prefix for a per-symlink xattr SIDECAR file (non-macOS). Linux (and every
@@ -5238,8 +5133,8 @@ fn path_remove_xattr(root_path: &Path, rel: &Path, name: &[u8]) {
 /// xattr the way a regular file's is. We persist it instead in a tiny sidecar
 /// file placed ADJACENT to the link (`<dir>/.carrick-lnkxattr.<name>.<key>`),
 /// which is fork-coherent (a real on-disk file under the rootfs, inherited
-/// across `libc::fork`, NOT an in-process map) and resolved through the SAME
-/// cap-std `Dir` as the link itself. macOS keeps the XATTR_NOFOLLOW path above.
+/// across `libc::fork`, not an in-process map) and resolved through the same
+/// contained parent fd as the link itself. macOS uses an O_SYMLINK fd.
 const LINK_OWNER_SIDECAR_PREFIX: &str = ".carrick-lnkown.";
 const LINK_XATTR_SIDECAR_PREFIX: &str = ".carrick-lnkxattr.";
 /// Adjacent sparse-upper whiteout. The suffix is SHA-256 of the host-encoded
@@ -5316,59 +5211,90 @@ fn link_xattr_sidecar_rel(rel: &Path, key: &str) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn symlink_get_u32_xattr(root_path: &Path, rel: &Path, name: &[u8]) -> Option<u32> {
+fn symlink_get_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8]) -> Option<u32> {
     let key = link_xattr_sidecar_key(name)?;
     let sidecar = link_xattr_sidecar_rel(rel, key)?;
-    let bytes = std::fs::read(root_path.join(&sidecar)).ok()?;
+    let fd = backend.metadata_fd(&sidecar, false).ok()?;
+    let mut bytes = [0u8; 4];
+    let n = unsafe { libc::pread(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+    if n != 4 {
+        return None;
+    }
     (bytes.len() == 4).then(|| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn symlink_set_u32_xattr(root_path: &Path, rel: &Path, name: &[u8], val: u32) {
+fn symlink_set_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8], val: u32) {
     let Some(key) = link_xattr_sidecar_key(name) else {
         return;
     };
     let Some(sidecar) = link_xattr_sidecar_rel(rel, key) else {
         return;
     };
-    let _ = std::fs::write(root_path.join(&sidecar), val.to_le_bytes());
+    let Some((parent, leaf)) = backend.namei_leaf(&sidecar) else {
+        return;
+    };
+    let raw = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_WRONLY
+                | libc::O_CREAT
+                | libc::O_TRUNC
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK
+                | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if raw >= 0 {
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let bytes = val.to_le_bytes();
+        unsafe {
+            libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len());
+        }
+    }
     crate::fs_resolve_cache::bump_meta_generation();
 }
 
 /// Remove any xattr sidecars belonging to the symlink `rel` (called from the
 /// backend's unlink so a reused name does not inherit a stale owner). Best-effort.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn remove_link_xattr_sidecars(root_path: &Path, rel: &Path) {
+pub(crate) fn remove_link_xattr_sidecars(backend: &HostFsBackend, rel: &Path) {
     for key in ["uid", "gid", "socket"] {
         if let Some(sidecar) = link_xattr_sidecar_rel(rel, key) {
-            let _ = std::fs::remove_file(root_path.join(&sidecar));
+            if let Some((parent, leaf)) = backend.namei_leaf(&sidecar) {
+                unsafe {
+                    libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), 0);
+                }
+            }
         }
     }
 }
 
 fn read_owner_xattr(
-    root_path: &Path,
+    backend: &HostFsBackend,
     rel: &Path,
     is_dir: bool,
     symlink: bool,
 ) -> (Option<NsUid>, Option<NsGid>) {
     let (uid, gid) = if symlink {
         (
-            symlink_get_u32_xattr(root_path, rel, CARRICK_UID_XATTR),
-            symlink_get_u32_xattr(root_path, rel, CARRICK_GID_XATTR),
+            symlink_get_u32_xattr(backend, rel, CARRICK_UID_XATTR),
+            symlink_get_u32_xattr(backend, rel, CARRICK_GID_XATTR),
         )
     } else {
         #[cfg(target_os = "macos")]
         {
             let _ = is_dir;
             (
-                path_get_u32_xattr(root_path, rel, CARRICK_UID_XATTR, false),
-                path_get_u32_xattr(root_path, rel, CARRICK_GID_XATTR, false),
+                path_get_u32_xattr(backend, rel, CARRICK_UID_XATTR, false),
+                path_get_u32_xattr(backend, rel, CARRICK_GID_XATTR, false),
             )
         }
         #[cfg(not(target_os = "macos"))]
         {
-            with_entry_fd(root_path, rel, is_dir, false, |fd| {
+            with_entry_fd(backend, rel, is_dir, false, |fd| {
                 (
                     fget_u32_xattr(fd, CARRICK_UID_XATTR),
                     fget_u32_xattr(fd, CARRICK_GID_XATTR),
@@ -5383,7 +5309,7 @@ fn read_owner_xattr(
 /// Write the guest owner uid/gid xattrs for `rel`. Pass `None` to leave unchanged.
 /// Best-effort.
 pub(crate) fn write_owner_xattr(
-    root_path: &Path,
+    backend: &HostFsBackend,
     rel: &Path,
     is_dir: bool,
     symlink: bool,
@@ -5393,14 +5319,14 @@ pub(crate) fn write_owner_xattr(
     if symlink {
         // lchown: the owner lives on the LINK itself (XATTR_NOFOLLOW).
         if let Some(uid) = uid {
-            symlink_set_u32_xattr(root_path, rel, CARRICK_UID_XATTR, uid.raw());
+            symlink_set_u32_xattr(backend, rel, CARRICK_UID_XATTR, uid.raw());
         }
         if let Some(gid) = gid {
-            symlink_set_u32_xattr(root_path, rel, CARRICK_GID_XATTR, gid.raw());
+            symlink_set_u32_xattr(backend, rel, CARRICK_GID_XATTR, gid.raw());
         }
         return;
     }
-    let _ = with_entry_fd(root_path, rel, is_dir, !is_dir, |fd| {
+    let _ = with_entry_fd(backend, rel, is_dir, !is_dir, |fd| {
         if let Some(uid) = uid {
             fset_u32_xattr(fd, CARRICK_UID_XATTR, uid.raw());
         }
@@ -5658,7 +5584,7 @@ impl FsBackend for HostFsBackend {
         let override_mode = if is_symlink {
             None
         } else {
-            read_mode_xattr(&self.root_path, rel, is_dir)
+            read_mode_xattr(self, rel, is_dir)
         };
         let m = override_mode.unwrap_or(mode & 0o7777);
         if is_dir {
@@ -5674,7 +5600,7 @@ impl FsBackend for HostFsBackend {
             });
         }
         if is_file {
-            let kind = if read_socket_xattr(&self.root_path, rel) {
+            let kind = if read_socket_xattr(self, rel) {
                 RootFsEntryKind::Socket
             } else {
                 RootFsEntryKind::File
@@ -5930,7 +5856,7 @@ impl FsBackend for HostFsBackend {
             }
         }
         self.clear_whiteout_normalized(&normalized);
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
+        crate::fs_resolve_cache::bump_generation();
         Ok(())
     }
 
@@ -5962,7 +5888,7 @@ impl FsBackend for HostFsBackend {
         }
         unsafe { libc::close(fd) };
         self.clear_whiteout_normalized(&normalized);
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
+        crate::fs_resolve_cache::bump_generation();
         Ok(())
     }
 
@@ -5984,7 +5910,6 @@ impl FsBackend for HostFsBackend {
             .and_then(cstring_from_osstr)
             .ok_or(BackendError::Invalid)?;
         self.stamp_fifo_marker();
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();
         let rc = unsafe {
             libc::mkfifoat(
@@ -6025,7 +5950,6 @@ impl FsBackend for HostFsBackend {
             .and_then(cstring_from_osstr)
             .ok_or(BackendError::Invalid)?;
         self.stamp_marker_node_marker();
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
@@ -6057,7 +5981,6 @@ impl FsBackend for HostFsBackend {
             }
         };
         self.stamp_marker_node_marker();
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
@@ -6069,7 +5992,7 @@ impl FsBackend for HostFsBackend {
                 None => Err(BackendError::Io),
             };
         }
-        write_device_xattrs(&self.root_path, rel, full_mode, dev);
+        write_device_xattrs(self, rel, full_mode, dev);
         unsafe { libc::close(fd) };
         Ok(())
     }
@@ -6094,14 +6017,14 @@ impl FsBackend for HostFsBackend {
         if (mode & (libc::S_IFMT as u32)) != libc::S_IFREG as u32 {
             return None;
         }
-        let full_mode = read_mode_xattr(&self.root_path, rel, false)?;
+        let full_mode = read_mode_xattr(self, rel, false)?;
         let type_bits = full_mode & crate::linux_abi::LINUX_S_IFMT;
         if type_bits != crate::linux_abi::LINUX_S_IFCHR
             && type_bits != crate::linux_abi::LINUX_S_IFBLK
         {
             return None;
         }
-        let dev = read_rdev_xattr(&self.root_path, rel).unwrap_or(0);
+        let dev = read_rdev_xattr(self, rel).unwrap_or(0);
         Some((type_bits, dev))
     }
 
@@ -6129,7 +6052,6 @@ impl FsBackend for HostFsBackend {
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
         self.clear_whiteout_normalized(&normalized);
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();
         Ok(())
     }
@@ -6216,6 +6138,16 @@ impl FsBackend for HostFsBackend {
             Some(pair) => pair,
             None => return Ok(false),
         };
+        let mut before: libc::stat = unsafe { core::mem::zeroed() };
+        let removed_symlink = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut before,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+            && before.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
         let mut rc = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0) };
         let mut removed_dir = false;
         if rc != 0 {
@@ -6230,15 +6162,14 @@ impl FsBackend for HostFsBackend {
             }
         }
         if rc == 0 {
-            self.structural_gen.fetch_add(1, Ordering::SeqCst);
-            if removed_dir {
-                self.dir_generation.fetch_add(1, Ordering::SeqCst);
+            crate::fs_resolve_cache::bump_generation();
+            if removed_dir || removed_symlink {
                 crate::fs_resolve_cache::bump_dir_generation();
                 self.drop_dir_cache();
             }
             #[cfg(not(target_os = "macos"))]
             {
-                remove_link_xattr_sidecars(&self.root_path, rel);
+                remove_link_xattr_sidecars(self, rel);
             }
             return Ok(true);
         }
@@ -6256,7 +6187,7 @@ impl FsBackend for HostFsBackend {
         let _ = self.remove_entry_checked(path);
         let res = self.write_whiteout_normalized(&normalized);
         if res.is_ok() {
-            self.structural_gen.fetch_add(1, Ordering::SeqCst);
+            crate::fs_resolve_cache::bump_generation();
         }
         res
     }
@@ -6413,7 +6344,7 @@ impl FsBackend for HostFsBackend {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            remove_link_xattr_sidecars(&self.root_path, dst_rel);
+            remove_link_xattr_sidecars(self, dst_rel);
             for key in ["uid", "gid", "socket"] {
                 if let (Some(s), Some(d)) = (
                     link_xattr_sidecar_rel(src_rel, key),
@@ -6436,8 +6367,7 @@ impl FsBackend for HostFsBackend {
                 }
             }
         }
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
-        self.dir_generation.fetch_add(1, Ordering::SeqCst);
+        crate::fs_resolve_cache::bump_generation();
         crate::fs_resolve_cache::bump_dir_generation();
         self.drop_dir_cache();
         if self.use_stat_cache {
@@ -6537,8 +6467,7 @@ impl FsBackend for HostFsBackend {
                 return Err(BackendError::Io);
             }
         }
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
-        self.dir_generation.fetch_add(1, Ordering::SeqCst);
+        crate::fs_resolve_cache::bump_generation();
         crate::fs_resolve_cache::bump_dir_generation();
         self.drop_dir_cache();
         if self.use_stat_cache {
@@ -6948,7 +6877,6 @@ impl FsBackend for HostFsBackend {
             .ok_or(BackendError::Invalid)?;
         let target_c = std::ffi::CString::new(target).map_err(|_| BackendError::Invalid)?;
         self.stamp_root_marker(CARRICK_HAS_SYMLINKS_XATTR, &self.symlink_seen);
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();
         let rc = unsafe {
             libc::symlinkat(target_c.as_ptr(), parent_fd.as_raw_fd(), leaf_name.as_ptr())
@@ -6985,71 +6913,45 @@ impl FsBackend for HostFsBackend {
         if rc != 0 {
             return Err(BackendError::Io);
         }
-        self.structural_gen.fetch_add(1, Ordering::SeqCst);
+        crate::fs_resolve_cache::bump_generation();
         Ok(())
     }
 
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let (parent_fd, leaf_c) = self.namei_leaf(rel).ok_or(BackendError::Invalid)?;
-        let mode = mode & 0o7777;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::fstatat(
-                parent_fd.as_raw_fd(),
-                leaf_c.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if rc != 0 {
+        let fd = self
+            .metadata_fd(&normalized, false)
+            .map_err(|_| BackendError::Io)?;
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
             return Err(BackendError::Io);
         }
-        let raw_type = (st.st_mode as u32) & (libc::S_IFMT as u32);
-        if raw_type == libc::S_IFIFO as u32 {
-            unsafe {
-                libc::fchmodat(
-                    parent_fd.as_raw_fd(),
-                    leaf_c.as_ptr(),
-                    mode as libc::mode_t,
-                    0,
-                );
-            }
-            return Ok(());
+        let mode = mode & 0o7777;
+        let kind = st.st_mode as u32 & libc::S_IFMT as u32;
+        if kind == libc::S_IFIFO as u32 {
+            return unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) }
+                .host_syscall_errno()
+                .map(|_| ())
+                .map_err(BackendError::Host);
         }
-        let is_dir = raw_type == libc::S_IFDIR as u32;
-        let is_symlink = raw_type == libc::S_IFLNK as u32;
-        let owner_ok = if is_dir {
+        let owner_ok = if kind == libc::S_IFDIR as u32 {
             mode & 0o700 == 0o700
         } else {
             mode & 0o600 == 0o600
         };
-        if owner_ok && !is_symlink {
-            let res = unsafe {
-                libc::fchmodat(
-                    parent_fd.as_raw_fd(),
-                    leaf_c.as_ptr(),
-                    mode as libc::mode_t,
-                    0,
-                )
-            };
-            if res == 0 {
-                fremove_mode_xattr(&self.root_path, rel);
+        if kind != libc::S_IFLNK as u32 {
+            let native_mode = if owner_ok { mode } else { mode | 0o700 };
+            unsafe { libc::fchmod(fd.as_raw_fd(), native_mode as libc::mode_t) }
+                .host_syscall_errno()
+                .map_err(BackendError::Host)?;
+            if owner_ok {
+                fremove_xattr(fd.as_raw_fd(), CARRICK_MODE_XATTR);
                 return Ok(());
             }
         }
-        unsafe {
-            libc::fchmodat(
-                parent_fd.as_raw_fd(),
-                leaf_c.as_ptr(),
-                (mode | 0o700) as libc::mode_t,
-                0,
-            );
-        }
         self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
-        write_mode_xattr(&self.root_path, rel, is_dir, mode);
+        fset_mode_xattr(fd.as_raw_fd(), mode);
         Ok(())
     }
 
@@ -7083,15 +6985,15 @@ impl FsBackend for HostFsBackend {
         {
             if !is_symlink && raw_type == libc::S_IFIFO as u32 {
                 if let Some(uid) = uid {
-                    path_set_u32_xattr(&self.root_path, rel, CARRICK_UID_XATTR, uid.raw());
+                    path_set_u32_xattr(self, rel, CARRICK_UID_XATTR, uid.raw());
                 }
                 if let Some(gid) = gid {
-                    path_set_u32_xattr(&self.root_path, rel, CARRICK_GID_XATTR, gid.raw());
+                    path_set_u32_xattr(self, rel, CARRICK_GID_XATTR, gid.raw());
                 }
                 return Ok(());
             }
         }
-        write_owner_xattr(&self.root_path, rel, is_dir, is_symlink, uid, gid);
+        write_owner_xattr(self, rel, is_dir, is_symlink, uid, gid);
         Ok(())
     }
 
@@ -7115,8 +7017,8 @@ impl FsBackend for HostFsBackend {
         if raw_type == libc::S_IFIFO as u32 {
             #[cfg(target_os = "macos")]
             {
-                let uid = path_get_u32_xattr(&self.root_path, rel, CARRICK_UID_XATTR, false);
-                let gid = path_get_u32_xattr(&self.root_path, rel, CARRICK_GID_XATTR, false);
+                let uid = path_get_u32_xattr(self, rel, CARRICK_UID_XATTR, false);
+                let gid = path_get_u32_xattr(self, rel, CARRICK_GID_XATTR, false);
                 return Some((
                     uid.map(NsUid::new).unwrap_or(NsUid::ROOT),
                     gid.map(NsGid::new).unwrap_or(NsGid::ROOT),
@@ -7127,7 +7029,7 @@ impl FsBackend for HostFsBackend {
         }
         let is_dir = raw_type == libc::S_IFDIR as u32;
         let is_symlink = raw_type == libc::S_IFLNK as u32;
-        let (uid, gid) = read_owner_xattr(&self.root_path, rel, is_dir, is_symlink);
+        let (uid, gid) = read_owner_xattr(self, rel, is_dir, is_symlink);
         Some((uid.unwrap_or(NsUid::ROOT), gid.unwrap_or(NsGid::ROOT)))
     }
 
@@ -7281,28 +7183,12 @@ impl FsBackend for HostFsBackend {
         if xflags.contains(carrick_abi::LinuxXattrFlags::REPLACE) {
             opts |= carrick_portable::XATTR_REPLACE;
         }
-        if !follow {
-            use std::os::unix::ffi::OsStrExt;
-            let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
-            let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
-            let abs = self.root_path.join(rel);
-            let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
-                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-            let rc = unsafe {
-                carrick_portable::lsetxattr(
-                    cpath.as_ptr(),
-                    cname.as_ptr(),
-                    value.as_ptr() as *const libc::c_void,
-                    value.len() as libc::size_t,
-                    opts,
-                )
-            };
-            return rc.host_syscall_errno().map(|_| ());
-        }
-        let host_fd = self
-            .open_raw_fd(path, true, false, false)
-            .or_else(|| self.open_raw_fd(path, false, false, false))
-            .into_errno(crate::linux_abi::LINUX_ENODATA)?;
+
+        let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        let owned_fd = self
+            .metadata_fd(&normalized, follow)
+            .map_err(crate::host_to_linux_errno)?;
+        let host_fd = owned_fd.as_raw_fd();
         let rc = unsafe {
             carrick_portable::fsetxattr(
                 host_fd,
@@ -7312,9 +7198,7 @@ impl FsBackend for HostFsBackend {
                 opts,
             )
         };
-        let err = rc.host_syscall_errno().map(|_| ());
-        unsafe { libc::close(host_fd) };
-        err
+        rc.host_syscall_errno().map(|_| ())
     }
 
     fn get_xattr(&self, path: &str, name: &str, follow: bool) -> Result<Vec<u8>, LinuxErrno> {
@@ -7325,34 +7209,12 @@ impl FsBackend for HostFsBackend {
             Ok(c) => c,
             Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
         };
-        if !follow {
-            use std::os::unix::ffi::OsStrExt;
-            let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
-            let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
-            let abs = self.root_path.join(rel);
-            let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
-                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-            let needed = unsafe {
-                carrick_portable::lgetxattr(cpath.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0)
-            };
-            let needed = needed.host_syscall_errno()?;
-            let mut buf = vec![0u8; needed as usize];
-            let n = unsafe {
-                carrick_portable::lgetxattr(
-                    cpath.as_ptr(),
-                    cname.as_ptr(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len() as libc::size_t,
-                )
-            };
-            return n.host_syscall_errno().map(|n| {
-                buf.truncate(n as usize);
-                buf
-            });
-        }
-        let host_fd = self
-            .open_raw_fd(path, false, false, false)
-            .into_errno(crate::linux_abi::LINUX_ENODATA)?;
+
+        let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        let owned_fd = self
+            .metadata_fd(&normalized, follow)
+            .map_err(crate::host_to_linux_errno)?;
+        let host_fd = owned_fd.as_raw_fd();
         // First call with size 0 to learn the value length.
         let needed = unsafe {
             carrick_portable::fgetxattr(host_fd, cname.as_ptr(), std::ptr::null_mut(), 0)
@@ -7360,7 +7222,6 @@ impl FsBackend for HostFsBackend {
         let needed = match needed.host_syscall_errno() {
             Ok(needed) => needed,
             Err(err) => {
-                unsafe { libc::close(host_fd) };
                 return Err(err);
             }
         };
@@ -7373,12 +7234,10 @@ impl FsBackend for HostFsBackend {
                 buf.len() as libc::size_t,
             )
         };
-        let result = n.host_syscall_errno().map(|n| {
+        n.host_syscall_errno().map(|n| {
             buf.truncate(n as usize);
             buf
-        });
-        unsafe { libc::close(host_fd) };
-        result
+        })
     }
 
     fn list_xattr(&self, path: &str, follow: bool) -> Result<Vec<String>, LinuxErrno> {
@@ -7422,47 +7281,11 @@ impl FsBackend for HostFsBackend {
             })
         }
 
-        if !follow {
-            use std::os::unix::ffi::OsStrExt;
-            let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
-            let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
-            let abs = self.root_path.join(rel);
-            let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
-                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-            let needed =
-                unsafe { carrick_portable::llistxattr(cpath.as_ptr(), std::ptr::null_mut(), 0) };
-            return collect_names(needed, |buf| unsafe {
-                carrick_portable::llistxattr(
-                    cpath.as_ptr(),
-                    buf.as_mut_ptr() as *mut libc::c_char,
-                    buf.len() as libc::size_t,
-                )
-            });
-        }
-        let normalized = self
-            .resolve_following(path)
-            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
-        let Some(rel) = Self::rel_path(&normalized) else {
-            return list_xattr_fd(self.root_fd.as_raw_fd());
-        };
-        use std::os::fd::AsRawFd as _;
-        let is_dir = match self.namei_leaf(rel) {
-            Some((parent_fd, leaf_c)) => {
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                let rc = unsafe {
-                    libc::fstatat(
-                        parent_fd.as_raw_fd(),
-                        leaf_c.as_ptr(),
-                        &mut st,
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                };
-                rc == 0 && (st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32)
-            }
-            None => false,
-        };
-        with_entry_fd(&self.root_path, rel, is_dir, false, list_xattr_fd)
-            .ok_or(crate::linux_abi::LINUX_ENODATA)?
+        let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        let fd = self
+            .metadata_fd(&normalized, follow)
+            .map_err(crate::host_to_linux_errno)?;
+        list_xattr_fd(fd.as_raw_fd())
     }
 
     fn remove_xattr(&self, path: &str, name: &str, follow: bool) -> Result<(), LinuxErrno> {
@@ -7479,26 +7302,16 @@ impl FsBackend for HostFsBackend {
             Ok(c) => c,
             Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
         };
-        if !follow {
-            use std::os::unix::ffi::OsStrExt;
-            let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
-            let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
-            let abs = self.root_path.join(rel);
-            let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
-                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-            let rc = unsafe { carrick_portable::lremovexattr(cpath.as_ptr(), cname.as_ptr()) };
-            return rc.host_syscall_errno().map(|_| ());
-        }
-        let host_fd = self
-            .open_raw_fd(path, true, false, false)
-            .or_else(|| self.open_raw_fd(path, false, false, false))
-            .into_errno(crate::linux_abi::LINUX_ENODATA)?;
+
+        let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        let owned_fd = self
+            .metadata_fd(&normalized, follow)
+            .map_err(crate::host_to_linux_errno)?;
+        let host_fd = owned_fd.as_raw_fd();
         // macOS fremovexattr; ENOATTR (absent attribute) maps to Linux ENODATA
         // via host_syscall_errno.
         let rc = unsafe { carrick_portable::fremovexattr(host_fd, cname.as_ptr()) };
-        let err = rc.host_syscall_errno().map(|_| ());
-        unsafe { libc::close(host_fd) };
-        err
+        rc.host_syscall_errno().map(|_| ())
     }
 
     fn validate_parents_fast(&self, abs: &str) -> ParentResolve {
@@ -7727,7 +7540,7 @@ impl FsBackend for HostFsBackend {
             RootFsEntryKind::Symlink
         } else if is_fifo {
             RootFsEntryKind::Fifo
-        } else if rel.is_some_and(|r| read_socket_xattr(&self.root_path, r)) {
+        } else if rel.is_some_and(|r| read_socket_xattr(self, r)) {
             RootFsEntryKind::Socket
         } else {
             RootFsEntryKind::File
@@ -7750,10 +7563,8 @@ impl FsBackend for HostFsBackend {
                     Some(r) => (
                         None,
                         (
-                            path_get_u32_xattr(&self.root_path, r, CARRICK_UID_XATTR, false)
-                                .map(NsUid::new),
-                            path_get_u32_xattr(&self.root_path, r, CARRICK_GID_XATTR, false)
-                                .map(NsGid::new),
+                            path_get_u32_xattr(self, r, CARRICK_UID_XATTR, false).map(NsUid::new),
+                            path_get_u32_xattr(self, r, CARRICK_GID_XATTR, false).map(NsGid::new),
                         ),
                     ),
                     None => (None, (None, None)),
@@ -7768,10 +7579,8 @@ impl FsBackend for HostFsBackend {
                 Some(r) => (
                     None,
                     (
-                        symlink_get_u32_xattr(&self.root_path, r, CARRICK_UID_XATTR)
-                            .map(NsUid::new),
-                        symlink_get_u32_xattr(&self.root_path, r, CARRICK_GID_XATTR)
-                            .map(NsGid::new),
+                        symlink_get_u32_xattr(self, r, CARRICK_UID_XATTR).map(NsUid::new),
+                        symlink_get_u32_xattr(self, r, CARRICK_GID_XATTR).map(NsGid::new),
                     ),
                 ),
                 None => (None, (None, None)),
@@ -7779,8 +7588,8 @@ impl FsBackend for HostFsBackend {
         } else {
             match rel {
                 Some(r) => (
-                    read_mode_xattr(&self.root_path, r, is_dir),
-                    read_owner_xattr(&self.root_path, r, is_dir, false),
+                    read_mode_xattr(self, r, is_dir),
+                    read_owner_xattr(self, r, is_dir, false),
                 ),
                 None => (None, (None, None)),
             }
@@ -7801,8 +7610,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn structural_generation(&self) -> u64 {
-        use std::sync::atomic::Ordering::SeqCst;
-        self.structural_gen.load(SeqCst)
+        crate::fs_resolve_cache::current_generation()
     }
 
     fn name(&self) -> &'static str {
@@ -9377,6 +9185,134 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn authority_root_mode_roundtrip_uses_root_fd() {
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+        backend.set_mode("/", 0o555).unwrap();
+        assert_eq!(fget_mode_xattr(backend.root_fd.as_raw_fd()), Some(0o555));
+        backend.set_mode("/", 0o755).unwrap();
+        assert_eq!(fget_mode_xattr(backend.root_fd.as_raw_fd()), None);
+        let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::fstat(backend.root_fd.as_raw_fd(), &mut stat) },
+            0
+        );
+        assert_eq!(stat.st_mode as u32 & 0o777, 0o755);
+    }
+
+    #[test]
+    fn authority_attached_handles_observe_directory_rename() {
+        let scratch = tempfile::tempdir().unwrap();
+        let first = HostFsBackend::from_path(scratch.path()).unwrap();
+        let second = HostFsBackend::attach(scratch.path()).unwrap();
+        first.make_dir("/old").unwrap();
+        first
+            .set_file_contents("/old/file", b"data".to_vec())
+            .unwrap();
+        assert_eq!(first.file_contents("/old/file").unwrap(), b"data");
+        assert!(second.rename_overlay_entry("/old", "/new").unwrap());
+        assert!(first.file_contents("/old/file").is_none());
+        assert_eq!(first.file_contents("/new/file").unwrap(), b"data");
+    }
+
+    #[test]
+    fn authority_directory_symlink_retarget_drops_cached_alias() {
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+        backend.make_dir("/a").unwrap();
+        backend.make_dir("/b").unwrap();
+        backend.set_file_contents("/a/file", b"a".to_vec()).unwrap();
+        backend.set_file_contents("/b/file", b"b".to_vec()).unwrap();
+        backend.symlink("a", "/alias").unwrap();
+        assert_eq!(backend.file_contents("/alias/file").unwrap(), b"a");
+        assert!(backend.remove_entry("/alias"));
+        backend.symlink("b", "/alias").unwrap();
+        assert_eq!(backend.file_contents("/alias/file").unwrap(), b"b");
+    }
+
+    #[test]
+    fn authority_fast_fs_disabled_keeps_namei_functional() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut backend = HostFsBackend::from_path(scratch.path()).unwrap();
+        backend.fast_fs = false;
+        backend.make_dir("/dir").unwrap();
+        backend
+            .set_file_contents("/dir/file", b"data".to_vec())
+            .unwrap();
+        assert_eq!(backend.file_contents("/dir/file").unwrap(), b"data");
+        assert_eq!(backend.child_names("/dir").len(), 1);
+    }
+
+    #[test]
+    fn authority_nested_listings_have_independent_offsets() {
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+        for n in 0..2000 {
+            std::fs::write(scratch.path().join(format!("file-{n:04}")), b"").unwrap();
+        }
+        let mut nested = false;
+        let names = backend
+            .read_dir_entries(Path::new(""), |name, _, _| {
+                if !nested {
+                    nested = true;
+                    let inner = backend.child_names("/");
+                    assert_eq!(inner.len(), 2000);
+                }
+                Some(name.to_bytes().to_vec())
+            })
+            .unwrap();
+        assert_eq!(
+            names.len(),
+            2000,
+            "nested enumeration must not consume the outer cursor"
+        );
+    }
+
+    #[test]
+    fn authority_chmod_symlink_never_changes_host_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"outside").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+        std::os::unix::fs::symlink(&victim, scratch.path().join("link")).unwrap();
+        let _ = backend.set_mode("/link", 0o444);
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn authority_owner_alias_targets_scratch_inode() {
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"outside").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = HostFsBackend::from_path(scratch.path()).unwrap();
+        let rel = outside.path().strip_prefix("/").unwrap();
+        std::fs::create_dir_all(scratch.path().join(rel)).unwrap();
+        std::fs::write(scratch.path().join(rel).join("victim"), b"inside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), scratch.path().join("alias")).unwrap();
+        backend
+            .set_owner("/alias/victim", Some(NsUid::new(1234)), None)
+            .unwrap();
+        let host = std::fs::File::open(&victim).unwrap();
+        assert_eq!(
+            fget_owner_xattr(host.as_raw_fd()).0,
+            None,
+            "host target must retain metadata"
+        );
+        let inner = std::fs::File::open(scratch.path().join(rel).join("victim")).unwrap();
+        assert_eq!(
+            fget_owner_xattr(inner.as_raw_fd()).0,
+            Some(NsUid::new(1234))
+        );
+    }
+
     #[test]
     fn host_mkdir_then_stat() {
         let (mut b, _scratch) = host_backend();
