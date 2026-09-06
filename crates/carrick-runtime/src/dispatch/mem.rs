@@ -313,10 +313,22 @@ impl MemAuthority {
         let state = self.state.lock();
         let revision = self.vma_revision();
         let mut forked = state.clone();
+        forked.deferred_anonymous = std::sync::Arc::new(state.deferred_anonymous.fork_private());
         let projection = Self::derive_fork_projection(&state)?;
 
         for (start, len) in projection.omitted_ranges {
             remove_mapping_metadata_locked(&mut forked, start, len);
+        }
+        for range in &projection.ranges {
+            if range.disposition == carrick_hal::ForkLeafDisposition::Zero {
+                // WIPEONFORK does not inherit the parent's logical zero-page
+                // residency. Keep pristine provenance only where it already
+                // existed; the backend owns materialized child zero frames.
+                forked
+                    .deferred_anonymous
+                    .clear_zero_read_residency(GuestVa(range.va), range.len as usize)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
         }
         Ok((
             Self::with_revision(forked, revision),
@@ -346,7 +358,9 @@ impl MemAuthority {
     pub(super) fn fork_private(&self) -> std::sync::Arc<Self> {
         let state = self.state.lock();
         let revision = self.vma_revision();
-        std::sync::Arc::new(Self::with_revision(state.clone(), revision))
+        let mut forked = state.clone();
+        forked.deferred_anonymous = std::sync::Arc::new(state.deferred_anonymous.fork_private());
+        std::sync::Arc::new(Self::with_revision(forked, revision))
     }
 
     pub(super) fn vma_revision(&self) -> crate::kernel::VmaRevision {
@@ -423,6 +437,7 @@ pub struct SemanticVma {
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
 #[derive(Clone)]
 pub(crate) struct MemState {
+    pub(super) deferred_anonymous: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
     pub layout: MemoryLayout,
     /// Canonical semantic VMAs owned by this address space.
     pub semantic_vmas: Vec<SemanticVma>,
@@ -608,6 +623,9 @@ impl MemState {
             resident_ranges: Vec::new(),
             resident_tracked_ranges: Vec::new(),
             resident_fault_ranges: Vec::new(),
+            deferred_anonymous: std::sync::Arc::new(
+                carrick_guest_mem::DeferredAnonymousState::new(),
+            ),
             growdown_ranges: Vec::new(),
             read_only_shared_file_maps: Vec::new(),
             write_sealed_shared_maps: Vec::new(),
@@ -2113,6 +2131,10 @@ fn trim_growdown_ranges_for_range(mem: &mut MemState, start: u64, len: u64) {
 }
 
 fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
+    // Metadata retirement also revokes zero-read authority for the old VMA.
+    if len != 0 {
+        let _ = mem.deferred_anonymous.retire(GuestVa(start), len as usize);
+    }
     trim_semantic_vmas(&mut mem.semantic_vmas, start, len);
     trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
     trim_core_file_mappings_for_range(&mut mem.core_file_mappings, start, len);
@@ -5038,6 +5060,7 @@ impl SyscallDispatcher {
                 // fixed replacement eager until its unmap transaction proves
                 // that the previous backing has actually been retired.
                 let defer_anonymous = memory.supports_lazy_anonymous_mmap()
+                    && this.linux_page_size() == 4096
                     && map_flags.contains(LinuxMmapFlags::PRIVATE)
                     && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
                     && !fixed_anonymous
@@ -5116,6 +5139,11 @@ impl SyscallDispatcher {
                         semantic_vmas: None,
                     },
                 );
+                if defer_anonymous {
+                    this.mem().lock().deferred_anonymous
+                        .reserve_fresh(GuestVa(address), length_usize)
+                        .unwrap_or_else(|_| std::process::abort());
+                }
                 if map_flags.contains(LinuxMmapFlags::POPULATE) {
                     this.mark_range_resident(address, length);
                 }
@@ -8049,6 +8077,7 @@ impl SyscallDispatcher {
         let live_residency = memory.resident_pages(GuestVa(address), pages, page_size);
         let mem_authority_30 = self.mem();
         let mem = mem_authority_30.lock();
+        let zero_reads = mem.deferred_anonymous.snapshot().zero_read_resident;
         let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
         for index in 0..pages {
             let page = address.checked_add(index.checked_mul(page_size)?)?;
@@ -8058,6 +8087,9 @@ impl SyscallDispatcher {
                 .any(|m| page >= m.start && page < m.end);
             let resident = if in_dynamic {
                 ranges_contain_page(&mem.resident_ranges, page)
+                    || zero_reads
+                        .iter()
+                        .any(|r| r.start.raw() <= page && page < r.end.raw())
                     || live_residency
                         .as_ref()
                         .and_then(|vector| vector.get(index as usize))
@@ -8130,7 +8162,12 @@ impl SyscallDispatcher {
         else {
             return;
         };
-        locked_ranges_remove(&mut self.mem().lock().resident_ranges, range);
+        let authority = self.mem();
+        let mut mem = authority.lock();
+        locked_ranges_remove(&mut mem.resident_ranges, range);
+        let _ = mem
+            .deferred_anonymous
+            .clear_zero_read_residency(GuestVa(start), len as usize);
     }
 
     pub(crate) fn resident_fault_plan<'permit>(

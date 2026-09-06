@@ -129,6 +129,7 @@ fn apply_alias_frame_inventory(
 }
 
 struct KernelFrameCowAuthority {
+    deferred_anonymous: Option<Arc<carrick_guest_mem::DeferredAnonymousState>>,
     kernel: Arc<crate::kernel::Kernel>,
     mm: crate::kernel::MmId,
     owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
@@ -312,6 +313,7 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
     owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
 ) -> Arc<dyn carrick_hal::FrameCowAuthority> {
     Arc::new(KernelFrameCowAuthority {
+        deferred_anonymous: None,
         kernel,
         mm,
         owner_inventory,
@@ -327,6 +329,10 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
 }
 
 impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
+    fn deferred_anonymous_state(&self) -> Option<Arc<carrick_guest_mem::DeferredAnonymousState>> {
+        self.deferred_anonymous.clone()
+    }
+
     fn quiesce(
         &self,
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
@@ -6056,6 +6062,7 @@ where
             asid: mm_binding.asid.raw(),
         };
         let cow_authority = Arc::new(KernelFrameCowAuthority {
+            deferred_anonymous: self.kernel.dispatcher.deferred_anonymous_state(mm),
             kernel: Arc::clone(child_context.kernel()),
             mm,
             owner_inventory: ops.frame_cow_owner_inventory(&task_backend),
@@ -10780,6 +10787,7 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
         })?;
         engine.bind_frame_cow(
             Arc::new(KernelFrameCowAuthority {
+                deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(mm),
                 kernel: Arc::clone(context.kernel()),
                 mm,
                 owner_inventory,
@@ -10799,6 +10807,11 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
                 asid: binding.asid.raw(),
             },
         );
+    }
+    if !kernel.dispatcher.bind_deferred_anonymous_state(engine, mm) {
+        return Err(RuntimeError::Configuration(
+            "initial runner anonymous authority MM mismatch".to_owned(),
+        ));
     }
     let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
         RuntimeError::Configuration("initial runner task has no runtime directory".to_owned())

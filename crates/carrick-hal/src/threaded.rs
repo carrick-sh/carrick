@@ -1897,6 +1897,11 @@ pub trait FrameCowQuiesce {}
 impl<T> FrameCowQuiesce for T {}
 
 pub trait FrameCowAuthority: Send + Sync {
+    /// Exact-MM pristine anonymous state, including task-only fork publication.
+    fn deferred_anonymous_state(&self) -> Option<Arc<carrick_guest_mem::DeferredAnonymousState>> {
+        None
+    }
+
     fn quiesce(&self)
     -> Result<Box<dyn FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>;
 

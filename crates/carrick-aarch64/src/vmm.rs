@@ -421,6 +421,18 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// Whether this backend keeps the hidden mmap arena as invalid stage-1
     /// coverage and materializes only committed VMA backing. HVPatch overrides;
     /// mature HVF VMM and KVM preserve their eager mappings.
+    fn bind_deferred_anonymous_state(
+        &mut self,
+        _state: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
+    ) {
+    }
+
+    fn deferred_anonymous_state(
+        &self,
+    ) -> Option<std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>> {
+        None
+    }
+
     fn sparse_mmap_arena_enabled(&self) -> bool {
         false
     }

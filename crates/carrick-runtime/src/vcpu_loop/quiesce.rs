@@ -2119,6 +2119,9 @@ where
             asid: child_binding.asid.raw(),
         };
         let cow_authority = Arc::new(KernelFrameCowAuthority {
+            deferred_anonymous: child_kernel
+                .dispatcher
+                .deferred_anonymous_state(child_mm_id),
             kernel: Arc::clone(child_context.kernel()),
             mm: child_mm_id,
             owner_inventory: ops.frame_cow_owner_inventory(&task_backend),
