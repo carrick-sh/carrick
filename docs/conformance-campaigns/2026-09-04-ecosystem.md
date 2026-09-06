@@ -1365,3 +1365,19 @@ fast-forward from the main tree only.
   (shard 2 in 249 s under worker load); the only red row was the CLI
   suite's closure-inventory denominator, still at 467/490/980 after the
   `dentrycache` probe was added (fixed `af1a1f752`).
+
+## 2026-09-06: lazy mmap round 1 (worker mmap-lazy2)
+
+Branch `agy/mmap-lazy-sep06` (five commits plus a continuation the director
+committed after the worker's second transport death): lazy file views, an
+O(log n) hole walk, MAP_FIXED-over-private retirement, and a skipped eager
+arena scrub. Rejected: `python:3.12-slim python3 -c 'print(1)'` dies with
+rc 139 on the branch binary while `ubuntu /bin/ls` runs. Fault record:
+`esr=0x92000047 far=0x6000000028`, a write, level-3 translation fault at
+the first page of the sparse mmap arena. The last commit stopped scrubbing
+reused anonymous ranges eagerly and relies on first-touch materialization
+that does not exist, so the first store faults through to SIGSEGV. Round
+1 review requires the fault path to own lazy zero-fill (materialize a
+zeroed compound and install the leaf) with a red-first test, then the
+microbench and the mmap/COW probe family. A bisect build without the last
+commit is running to confirm the attribution.
