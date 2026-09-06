@@ -28,18 +28,12 @@ pub(super) fn prepare(
             "invalid sparse backing extent".to_owned(),
         ));
     }
-    // A 2 MiB-aligned global-frame base plus the semantic VA's 2 MiB
-    // offset preserves VA/IPA alignment. The stage-1 editor can therefore
-    // use block leaves for the aligned bulk and needs 4 KiB leaves only at
-    // the two edges. This is still one physical/stage-2 lease per VMA.
     const TWO_MIB: u64 = 2 * 1024 * 1024;
-    let physical_offset = start & (TWO_MIB - 1);
-    let physical_len = align_up(
-        physical_offset
-            .checked_add(end - start)
-            .ok_or_else(|| TrapError::Hypervisor("sparse mmap size overflow".to_owned()))?,
-        HVF_PAGE_SIZE,
-    )?;
+    let block_congruence =
+        matches!(backing, SparseExtentBacking::FileView { .. }) || end - start >= TWO_MIB;
+    let layout = allocation_layout(start, end, block_congruence)?;
+    let physical_offset = layout.offset;
+    let physical_len = layout.length;
     let physical_size =
         usize::try_from(physical_len).map_err(|_| TrapError::MappingTooLarge(physical_len))?;
     let can_pool = physical_len == CowArmedRanges::COMPOUND_SIZE
@@ -152,7 +146,7 @@ pub(super) fn prepare(
                 )
             }
         };
-        let mut lease = GlobalFrameStage2Lease::reserve(physical_len, TWO_MIB)?;
+        let mut lease = GlobalFrameStage2Lease::reserve(physical_len, layout.alignment)?;
         let physical_ipa = lease.base;
         let semantic_ipa = physical_ipa
             .checked_add(physical_offset)
@@ -203,4 +197,78 @@ pub(super) fn prepare(
         owner_generation,
         owner_rollback,
     })
+}
+
+#[derive(Debug)]
+struct AllocationLayout {
+    offset: u64,
+    length: u64,
+    alignment: u64,
+}
+
+fn allocation_layout(
+    start: u64,
+    end: u64,
+    block_congruence: bool,
+) -> Result<AllocationLayout, TrapError> {
+    if start >= end || !start.is_multiple_of(4096) || !end.is_multiple_of(4096) {
+        return Err(TrapError::Hypervisor(
+            "invalid sparse allocation range".to_owned(),
+        ));
+    }
+    // Single-page demand allocation needs only host-page congruence. Using
+    // the VA's 2 MiB offset here allocates up to 2 MiB for each 4 KiB fault.
+    // Bulk mappings and file views retain their existing block congruence.
+    let alignment = if block_congruence {
+        2 * 1024 * 1024
+    } else {
+        HVF_PAGE_SIZE
+    };
+    let offset = start & (alignment - 1);
+    let length = align_up(
+        offset
+            .checked_add(end - start)
+            .ok_or_else(|| TrapError::Hypervisor("sparse allocation overflow".to_owned()))?,
+        HVF_PAGE_SIZE,
+    )?;
+    Ok(AllocationLayout {
+        offset,
+        length,
+        alignment,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_first_touch_never_allocates_a_block_of_padding() {
+        for page in (0..512_u32).rev() {
+            let start = u64::from(page) * 4096;
+            let layout = allocation_layout(start, start + 4096, false).unwrap();
+            assert_eq!(layout.length, HVF_PAGE_SIZE, "4 KiB fault at {start:#x}");
+            assert_eq!(layout.alignment, HVF_PAGE_SIZE);
+            assert_eq!(layout.offset, start % HVF_PAGE_SIZE);
+        }
+    }
+
+    #[test]
+    fn block_and_file_views_preserve_block_congruence() {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        for start in [0, 4096, TWO_MIB - 4096, TWO_MIB] {
+            let layout = allocation_layout(start, start + 3 * TWO_MIB, true).unwrap();
+            assert_eq!(layout.alignment, TWO_MIB);
+            assert_eq!(layout.offset, start % TWO_MIB);
+            assert!(layout.length >= layout.offset + 3 * TWO_MIB);
+            assert!(layout.length < layout.offset + 3 * TWO_MIB + HVF_PAGE_SIZE);
+        }
+    }
+
+    #[test]
+    fn sparse_allocation_rejects_invalid_semantic_ranges() {
+        for (start, end) in [(0, 0), (4096, 0), (1, 4096), (0, 4097)] {
+            assert!(allocation_layout(start, end, false).is_err());
+        }
+    }
 }
