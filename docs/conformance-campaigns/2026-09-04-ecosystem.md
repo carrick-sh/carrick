@@ -1344,3 +1344,11 @@ binary was rebuilt (the first bless captured a 33-row build). Landing
 mechanics lesson repeated: `git merge --ff-only` typed inside a worktree
 merges into the worktree's own branch and reports "Already up to date";
 fast-forward from the main tree only.
+- **Gate on the dentry landing** turned three path-resolution rows red
+  (`patherrno` ENAMETOOLONG, `unicodenorm` NFD aliasing, `legacyfs` hard-link
+  nlink after unlink of the other name), each a rule the old resolver
+  enforced somewhere the fast path bypassed. Fixed in one commit with the
+  byte-exact name check lifted onto the `FsBackend` trait; all four probes
+  match on both lanes; gate rerun recorded below. Lesson for the review rule:
+  a resolver change must run the whole `fs`/`path` probe family, not the
+  probe the worker wrote.
