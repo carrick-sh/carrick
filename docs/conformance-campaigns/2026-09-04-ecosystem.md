@@ -1352,3 +1352,12 @@ fast-forward from the main tree only.
   match on both lanes; gate rerun recorded below. Lesson for the review rule:
   a resolver change must run the whole `fs`/`path` probe family, not the
   probe the worker wrote.
+- **Second gate on the dentry fixes** turned `fifonode`, `bindunixnode` and
+  `symlinkfollow` red: the unlink pre-resolve left a negative dentry that the
+  FIFO `mknod` branch and the AF_UNIX `bind` node creation never announced.
+  Patched (`badb9dac8`), all seven affected probes match on both lanes.
+  Owner's reading is the right one: "lacks a `notify_create` call" is a
+  rule in prose. The dentry cache moves behind the rootfs VFS object so
+  every mutator maintains it inside the method and dispatch cannot reach
+  the cache at all; briefed as the cap-std worker's round-3 add-on
+  (`scratchpad/review-capstd-vfs-owned-dcache.md`).
