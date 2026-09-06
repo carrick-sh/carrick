@@ -499,3 +499,41 @@ Full signed HVF suite after the change: 447 passed / 3 ignored,
 `eco-mmap-resume/boot-owner.log`, run eco-mmap-boot-owner-1788721637939281000,
 scoped cleanup zero. Signed CLI rebuild and live red-to-green check still
 required; no main landing is claimed.
+
+
+### Boot owner live red-to-green receipt
+
+The signed diagnostic artifact at 59e4b716155ded1ef966baf1103c36206f7b311a
+plus tracked integration diff SHA256
+4101010ac85853df1df1f3d5a583a23cae449c864ae35416a1471e7ef02bbd62
+passes Ubuntu `sh -c /bin/true` and python:3.12-slim `print(1)`, both exit 0.
+Binary SHA256 1fa74a7a2959b047f80fe0418f5ad86c83982d49e125285fea559516e99595b2,
+CDHash 73a9ee92fa7c57a80af6e22c98968e1f814bc892, UUID
+474DE0F8-009A-3AAD-AB06-DC844919DF04; entitlement and DOF verified.
+Exact run IDs and scoped cleanup-zero receipts are recorded in
+`eco-mmap-resume/boot-owner-integration-smoke.json`. This closes the observed
+first-touch UnresolvedArena launch regression. It is a diagnostic dirty-tree
+receipt, not main landing acceptance; foreign publication, rollback and the
+complete correctness/performance gates remain open.
+
+
+### Deferred anonymous diagnostic allocation and latency
+
+On the same boot-owner diagnostic artifact above, the shipped allocation
+instrument records 100 untouched 255-page anonymous mappings, zero errors,
+zero host allocations and zero host backing bytes. This is red-to-green from
+the retained eager allocation census (100 allocations / 281804800 bytes).
+Receipt: `boot-owner-anon-allocation.json` and `.out`, run
+`eco-mmap-immutable-boot-owner-anon-allocation-1788722034603194000`, scoped
+cleanup zero. Trace elapsed time is not latency evidence.
+
+The separate untraced CNTVCT reducer ran five trials of 1000 operations at
+24 MHz. Median anonymous 1 MiB mmap is 4.179292 us (prior 27.350042 us),
+munmap 4.495708 us. All five mmap trials are below the 6 us target. File mmap
+median remains 45.879625 us, munmap 22.713125 us; the 10 us file target fails.
+Receipt: `boot-owner-counter.json`, `.out`, `.err`, run
+`eco-mmap-counter-1788722080684614000`, scoped cleanup zero. The receipt's HEAD
+is supplemented by `boot-owner-integration-smoke.json` and its retained tracked
+diff; this is unfinished integration evidence, not a clean-tree milestone.
+Foreign access, exact rollback, full correctness gates and file latency remain
+open before landing.
