@@ -4776,9 +4776,8 @@ mod kernel_context_tests {
     fn logical_exec_workdir_checks_target_credentials_before_mutation() {
         let mut dispatcher = SyscallDispatcher::new();
         let scratch = tempfile::tempdir().expect("scratch root");
-        let root = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .expect("scratch authority");
-        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(root);
+        let backend =
+            crate::fs_backend::HostFsBackend::from_path(scratch.path()).expect("scratch backend");
         backend.make_dir("/secret").expect("secret dir");
         backend.set_mode("/secret", 0o710).expect("secret mode");
         backend
@@ -4832,9 +4831,8 @@ mod kernel_context_tests {
     fn logical_exec_target_user_workdir_and_path_share_one_exact_resource_scope() {
         let mut dispatcher = SyscallDispatcher::new();
         let scratch = tempfile::tempdir().expect("scratch root");
-        let root = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .expect("scratch authority");
-        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(root);
+        let backend =
+            crate::fs_backend::HostFsBackend::from_path(scratch.path()).expect("scratch backend");
         backend.make_dir("/private-bin").expect("private bin");
         backend
             .set_owner(
@@ -7173,7 +7171,10 @@ impl SyscallDispatcher {
     /// by Darwin's cached-rootfs setup, which constructs the network-aware
     /// dispatcher before the layer cache is acquired.
     pub fn set_rootfs_layer(&mut self, rootfs: RootFs) {
-        self.fs.rootfs_vfs_mut().rootfs = Some(rootfs);
+        let vfs = self.fs.rootfs_vfs_mut();
+        let is_shared = vfs.dentry_cache.is_shared();
+        vfs.dentry_cache = std::sync::Arc::new(crate::vfs::DentryCache::new(is_shared));
+        vfs.rootfs = Some(rootfs);
         self.exec_host_fs_fallback = false;
     }
 
@@ -7186,7 +7187,10 @@ impl SyscallDispatcher {
     /// only" when the rootfs is `None`. Never call this for `--fs memory`,
     /// whose overlay starts empty and relies on the rootfs for reads.
     pub fn drop_rootfs_layer(&mut self) {
-        self.fs.rootfs_vfs_mut().rootfs = None;
+        let vfs = self.fs.rootfs_vfs_mut();
+        let is_shared = vfs.dentry_cache.is_shared();
+        vfs.dentry_cache = std::sync::Arc::new(crate::vfs::DentryCache::new(is_shared));
+        vfs.rootfs = None;
     }
 
     /// Set the executable path recorded in `/proc/self/cmdline`,

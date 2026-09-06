@@ -381,9 +381,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
 fn sendfile_null_offset_advances_host_backed_file_across_calls() {
     let scratch = tempfile::TempDir::new().unwrap();
     std::fs::write(scratch.path().join("data"), b"ABCDEFGH").unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = HostFsBackend::from_existing_dir(dir);
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
 
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));
@@ -1212,10 +1210,9 @@ fn open_host_out_file(
 fn readv_host_file_uses_guest_host_ptrs_for_writable_iovecs() {
     let scratch = tempfile::TempDir::new().unwrap();
     std::fs::write(scratch.path().join("in.bin"), b"rootfs says hello\n").unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    dispatcher.set_fs_backend(Box::new(backend));
     let reporter = CompatReporter::default();
     let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x800]);
     memory.write_bytes(0x4000, b"/in.bin\0").unwrap();
@@ -1263,10 +1260,9 @@ fn readv_host_file_uses_guest_host_ptrs_for_writable_iovecs() {
 fn preadv_host_file_preserves_offset_with_borrowed_iovecs() {
     let scratch = tempfile::TempDir::new().unwrap();
     std::fs::write(scratch.path().join("in.bin"), b"rootfs says hello\n").unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    dispatcher.set_fs_backend(Box::new(backend));
     let reporter = CompatReporter::default();
     let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x900]);
     memory.write_bytes(0x4000, b"/in.bin\0").unwrap();
@@ -1326,10 +1322,9 @@ fn preadv_host_file_preserves_offset_with_borrowed_iovecs() {
 fn readv_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr() {
     let scratch = tempfile::TempDir::new().unwrap();
     std::fs::write(scratch.path().join("in.bin"), b"abcdefghi").unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    dispatcher.set_fs_backend(Box::new(backend));
     let reporter = CompatReporter::default();
     let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x800]);
     memory.write_bytes(0x4000, b"/in.bin\0").unwrap();
@@ -1370,10 +1365,9 @@ fn readv_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr() {
 #[test]
 fn pwritev_host_file_uses_guest_host_ptrs_without_payload_reads() {
     let scratch = tempfile::TempDir::new().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    dispatcher.set_fs_backend(Box::new(backend));
     let reporter = CompatReporter::default();
     let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x800]);
     memory.write_bytes(0x4000, b"/out.bin\0").unwrap();
@@ -1424,10 +1418,9 @@ fn pwritev_host_file_uses_guest_host_ptrs_without_payload_reads() {
 #[test]
 fn pwritev_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr() {
     let scratch = tempfile::TempDir::new().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    dispatcher.set_fs_backend(Box::new(backend));
     let reporter = CompatReporter::default();
     let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x800]);
     memory.write_bytes(0x4000, b"/out.bin\0").unwrap();
@@ -1472,10 +1465,9 @@ fn pwritev_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr() {
 #[test]
 fn pwritev_host_file_reports_efault_when_fallback_payload_is_unreadable() {
     let scratch = tempfile::TempDir::new().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    dispatcher.set_fs_backend(Box::new(backend));
     let reporter = CompatReporter::default();
     let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x800]);
     memory.write_bytes(0x4000, b"/out.bin\0").unwrap();
@@ -1570,10 +1562,9 @@ fn pwritev_host_file_reads_each_guest_iovec_once() {
     impl CurrentMmMemory for CountingPayloadMemory {}
 
     let scratch = tempfile::TempDir::new().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    dispatcher.set_fs_backend(Box::new(backend));
     let reporter = CompatReporter::default();
     let mut memory = CountingPayloadMemory::new(LinearMemory::new(0x4000, vec![0; 0x800]));
     memory.write_bytes(0x4000, b"/out.bin\0").unwrap();
@@ -1895,10 +1886,9 @@ fn fsync_family_flushes_host_backed_files() {
     use carrick_runtime::fs_backend::HostFsBackend;
 
     let scratch = tempfile::TempDir::new().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    dispatcher.set_fs_backend(Box::new(backend));
     let reporter = CompatReporter::default();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     memory.write_bytes(0x4000, b"/durable.log\0").unwrap();
@@ -1956,10 +1946,9 @@ fn copy_file_range_uses_darwin_fast_path_for_whole_host_files() {
     use carrick_runtime::fs_backend::HostFsBackend;
 
     let scratch = tempfile::TempDir::new().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    dispatcher.set_fs_backend(Box::new(backend));
     let reporter = CompatReporter::default();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x300]);
     memory.write_bytes(0x4000, b"/source.bin\0").unwrap();

@@ -79,7 +79,9 @@ impl SyscallDispatcher {
         }
         let name = Self::trusted_lane_component(path)?;
         let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
-        if !host_dir.namespace_is_current() {
+        if !host_dir
+            .namespace_is_current_against(self.fs.rootfs_vfs.overlay.structural_generation())
+        {
             return None;
         }
         self.trusted_child_path(&dir_path, name)?;

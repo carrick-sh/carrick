@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,8 +117,8 @@ pub enum DentryNode {
 pub struct DirEntry {
     pub id: DentryId,
     pub dir_gen: Arc<AtomicU64>,
-    pub upper_dir_fd: Option<Arc<cap_std::fs::Dir>>,
-    pub lower_dir_fd: Option<Arc<cap_std::fs::Dir>>,
+    pub upper_dir_fd: Option<Arc<OwnedFd>>,
+    pub lower_dir_fd: Option<Arc<OwnedFd>>,
     pub parent: Option<(DentryId, String)>,
     pub path: String,
 }
@@ -127,7 +127,7 @@ pub struct DirEntry {
 pub struct ResolvedDentry {
     pub dentry: PositiveDentry,
     pub canonical_path: String,
-    pub parent_dir_fd: Option<Arc<cap_std::fs::Dir>>,
+    pub parent_dir_fd: Option<Arc<OwnedFd>>,
     pub leaf_name: String,
     pub leaf_name_c: CString,
 }
@@ -190,6 +190,10 @@ impl DentryCache {
             dirs: RwLock::new(dirs),
             path_to_dir_id: RwLock::new(path_to_dir_id),
         }
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.is_shared
     }
 
     fn bump_mutation(&self) {
@@ -673,8 +677,8 @@ impl DentryCache {
         &self,
         id: DentryId,
         dir_gen: Arc<AtomicU64>,
-        upper_dir_fd: Option<Arc<cap_std::fs::Dir>>,
-        lower_dir_fd: Option<Arc<cap_std::fs::Dir>>,
+        upper_dir_fd: Option<Arc<OwnedFd>>,
+        lower_dir_fd: Option<Arc<OwnedFd>>,
         parent_id: DentryId,
         name: &str,
         path: &str,
@@ -719,7 +723,7 @@ impl DentryCache {
         parent_id: DentryId,
         name: &str,
         parent_dir_gen: u64,
-        parent_fd: &Arc<cap_std::fs::Dir>,
+        parent_fd: &Arc<OwnedFd>,
         name_c: &CString,
         st: &libc::stat,
         full_path: &str,
@@ -782,28 +786,10 @@ impl DentryCache {
         }
 
         if mode_type == libc::S_IFDIR as u32 {
-            let flags = libc::O_RDONLY
-                | libc::O_DIRECTORY
-                | libc::O_CLOEXEC
-                | libc::O_NONBLOCK
-                | libc::O_NOFOLLOW;
-            let raw = unsafe { libc::openat(parent_fd.as_raw_fd(), name_c.as_ptr(), flags, 0) };
-            let opened_fd = if raw >= 0 {
-                Some(Arc::new(cap_std::fs::Dir::from_std_file(unsafe {
-                    std::fs::File::from_raw_fd(raw)
-                })))
-            } else {
-                None
-            };
-            let (child_upper_dir_fd, child_lower_dir_fd) = if is_lower {
-                let upper = backend.dir_fd_for(Path::new(rel_full));
-                (upper, opened_fd)
-            } else {
-                let lower = rootfs
-                    .and_then(|rf| rf.immutable_backend())
-                    .and_then(|b| b.dir_fd_for(Path::new(rel_full)));
-                (opened_fd, lower)
-            };
+            let child_upper_dir_fd = backend.dir_fd_for(Path::new(rel_full));
+            let child_lower_dir_fd = rootfs
+                .and_then(|rf| rf.immutable_backend())
+                .and_then(|b| b.dir_fd_for(Path::new(rel_full)));
             let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
             let child_dir_gen = Arc::new(AtomicU64::new(1));
             self.insert_dir(
@@ -919,8 +905,8 @@ impl DentryCache {
         parent_id: DentryId,
         name: &str,
         parent_dir_gen: u64,
-        upper_parent_fd: Option<&Arc<cap_std::fs::Dir>>,
-        lower_parent_fd: Option<&Arc<cap_std::fs::Dir>>,
+        upper_parent_fd: Option<&Arc<OwnedFd>>,
+        lower_parent_fd: Option<&Arc<OwnedFd>>,
         current_dir_path: &str,
         backend: &dyn FsBackend,
         rootfs: Option<&RootFs>,
@@ -1578,9 +1564,7 @@ mod tests {
     #[test]
     fn test_dentry_cache_positive_and_negative() {
         let tmp = tempdir().unwrap();
-        let upper_dir =
-            cap_std::fs::Dir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap();
-        let backend = HostFsBackend::from_existing_dir(upper_dir);
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
         let cache = DentryCache::new(false);
 
         // Create a file
@@ -1624,9 +1608,7 @@ mod tests {
     #[test]
     fn test_dentry_cache_symlink() {
         let tmp = tempdir().unwrap();
-        let upper_dir =
-            cap_std::fs::Dir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap();
-        let backend = HostFsBackend::from_existing_dir(upper_dir);
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
         let cache = DentryCache::new(false);
 
         let target_path = tmp.path().join("target.txt");
@@ -1650,9 +1632,7 @@ mod tests {
     #[test]
     fn test_dentry_cache_dir_generation() {
         let tmp = tempdir().unwrap();
-        let upper_dir =
-            cap_std::fs::Dir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap();
-        let backend = HostFsBackend::from_existing_dir(upper_dir);
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
         let cache = DentryCache::new(false);
 
         let subdir = tmp.path().join("subdir");
@@ -1688,10 +1668,7 @@ mod tests {
         let rootfs = RootFs::from_immutable_host_dir(lower_tmp.path()).unwrap();
 
         let upper_tmp = tempdir().unwrap();
-        let upper_dir =
-            cap_std::fs::Dir::open_ambient_dir(upper_tmp.path(), cap_std::ambient_authority())
-                .unwrap();
-        let backend = HostFsBackend::from_existing_dir(upper_dir);
+        let backend = HostFsBackend::from_path(upper_tmp.path()).unwrap();
         let cache = DentryCache::new(false);
 
         // 1. Stat symlink in lower
@@ -1746,9 +1723,7 @@ mod tests {
     #[test]
     fn test_dentry_cache_inode_invalidation_and_hard_links() {
         let tmp = tempdir().unwrap();
-        let upper_dir =
-            cap_std::fs::Dir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap();
-        let backend = HostFsBackend::from_existing_dir(upper_dir);
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
         let cache = DentryCache::new(false);
 
         // 1. Create file with 5 bytes

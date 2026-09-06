@@ -299,7 +299,7 @@ impl RootFsVfs {
     /// copy-up/create into a failed fast attempt; the caller then takes the
     /// exact resolving path.
     pub(crate) fn open_immutable_lower_readonly(&self, path: &str) -> ImmutableHostFileOpen {
-        let generation = crate::fs_resolve_cache::current_generation();
+        let generation = self.overlay.structural_generation();
         if !self.overlay.fast_nofollow_absent(path) {
             return ImmutableHostFileOpen::Fallback;
         }
@@ -307,7 +307,7 @@ impl RootFsVfs {
             return ImmutableHostFileOpen::Fallback;
         };
         let result = rootfs.open_immutable_file_readonly(path);
-        if crate::fs_resolve_cache::current_generation() != generation {
+        if self.overlay.structural_generation() != generation {
             return ImmutableHostFileOpen::Fallback;
         }
         result
@@ -1353,9 +1353,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn host_lower_vfs(lower: &std::path::Path, upper: &std::path::Path) -> RootFsVfs {
         let rootfs = RootFs::from_immutable_host_dir(lower).unwrap();
-        let upper_dir =
-            cap_std::fs::Dir::open_ambient_dir(upper, cap_std::ambient_authority()).unwrap();
-        let mut overlay = HostFsBackend::from_existing_dir(upper_dir);
+        let mut overlay = HostFsBackend::from_path(upper).unwrap();
         overlay.enable_sparse_upper_fast_miss();
         let mut vfs = RootFsVfs::with_rootfs(rootfs);
         vfs.set_overlay(Box::new(overlay));
@@ -1614,10 +1612,8 @@ mod tests {
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
 
-        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .unwrap();
         let mut vfs = RootFsVfs::new();
-        vfs.set_overlay(Box::new(HostFsBackend::from_existing_dir(dir)));
+        vfs.set_overlay(Box::new(HostFsBackend::from_path(scratch.path()).unwrap()));
 
         assert_eq!(vfs.lookup_nofollow("/file").unwrap().kind, EntryKind::File);
         assert_eq!(

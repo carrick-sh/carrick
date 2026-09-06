@@ -234,11 +234,8 @@ fn build_cache_entry(
     if std::fs::create_dir_all(&building).is_err() {
         return Ok(false);
     }
-    let extracted = (|| {
-        let dir = cap_std::fs::Dir::open_ambient_dir(&building, cap_std::ambient_authority())
-            .map_err(|e| e.to_string())?;
-        crate::rootfs::extract_layer_paths_to_dir(layer_paths, &dir).map_err(|e| e.to_string())
-    })();
+    let extracted = crate::rootfs::extract_layer_paths_to_dir(layer_paths, &building)
+        .map_err(|e| e.to_string());
     match &extracted {
         Err(_) => {
             let _ = std::fs::remove_dir_all(&building);

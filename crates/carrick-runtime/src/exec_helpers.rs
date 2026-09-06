@@ -621,9 +621,7 @@ mod tests {
     fn host_dispatcher(files: &[(&str, &[u8])]) -> (SyscallDispatcher, tempfile::TempDir) {
         use crate::fs_backend::FsBackend as _;
         let scratch = tempfile::TempDir::new().unwrap();
-        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .unwrap();
-        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
         for (path, contents) in files {
             backend.create_file(path).unwrap();
             backend.set_file_contents(path, contents.to_vec()).unwrap();

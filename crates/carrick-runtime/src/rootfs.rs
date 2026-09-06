@@ -45,7 +45,7 @@
 //!    plus [`RootFs::extract_to_dir`] for an
 //!    already-merged in-memory tree). Layer blobs are streamed
 //!    (`std::io::copy`, never the whole file buffered) into a real
-//!    capability-rooted [`cap_std::fs::Dir`] scratch, applying the same
+//!    scratch directory on disk, applying the same
 //!    overlay+whiteout semantics as they land. This backs `--fs host`, where
 //!    apt's downstream operations (`symlinkat`, atomic `rename`, the `gpgv`
 //!    subprocess, hardlink-heavy dpkg unpacks, …) need real kernel filesystem
@@ -307,7 +307,7 @@ pub struct ExtractStats {
 /// or delete entries from prior layers using standard OCI whiteout conventions.
 pub fn extract_layer_paths_to_dir(
     paths: &[PathBuf],
-    dir: &cap_std::fs::Dir,
+    dest: &Path,
 ) -> Result<ExtractStats, RootFsError> {
     let mut stats = ExtractStats::default();
     for path in paths {
@@ -319,10 +319,10 @@ pub fn extract_layer_paths_to_dir(
         if is_gz {
             let decoder = GzDecoder::new(buf);
             let mut archive = tar::Archive::new(decoder);
-            apply_tar_to_dir(&mut archive, dir, &mut stats)?;
+            apply_tar_to_dir(&mut archive, dest, &mut stats)?;
         } else {
             let mut archive = tar::Archive::new(buf);
-            apply_tar_to_dir(&mut archive, dir, &mut stats)?;
+            apply_tar_to_dir(&mut archive, dest, &mut stats)?;
         }
     }
     Ok(stats)
@@ -330,11 +330,11 @@ pub fn extract_layer_paths_to_dir(
 
 fn apply_tar_to_dir<R: Read>(
     archive: &mut tar::Archive<R>,
-    dir: &cap_std::fs::Dir,
+    dest: &Path,
     stats: &mut ExtractStats,
 ) -> Result<(), RootFsError> {
-    use cap_std::fs::PermissionsExt as _;
     use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt as _;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -353,10 +353,11 @@ fn apply_tar_to_dir<R: Read>(
                 if let Some(parent) = path.parent()
                     && !parent.as_os_str().is_empty()
                 {
-                    match dir.remove_dir_all(parent) {
+                    let parent_abs = dest.join(parent);
+                    match std::fs::remove_dir_all(&parent_abs) {
                         Ok(()) | Err(_) => {}
                     }
-                    dir.create_dir_all(parent)?;
+                    std::fs::create_dir_all(&parent_abs)?;
                 }
                 continue;
             }
@@ -368,11 +369,12 @@ fn apply_tar_to_dir<R: Read>(
                     } else {
                         parent.join(hidden_name)
                     };
+                    let target_abs = dest.join(&target);
                     // Try removing as a file first, then as a directory tree.
-                    match dir.remove_file(&target) {
+                    match std::fs::remove_file(&target_abs) {
                         Ok(()) => {}
                         Err(e) if e.kind() == ErrorKind::NotFound => {}
-                        Err(_) => match dir.remove_dir_all(&target) {
+                        Err(_) => match std::fs::remove_dir_all(&target_abs) {
                             Ok(()) | Err(_) => {}
                         },
                     }
@@ -388,23 +390,26 @@ fn apply_tar_to_dir<R: Read>(
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            dir.create_dir_all(parent)?;
+            std::fs::create_dir_all(dest.join(parent))?;
         }
 
+        let dest_path = dest.join(&path);
         if entry_type.is_dir() {
-            dir.create_dir_all(&path)?;
+            std::fs::create_dir_all(&dest_path)?;
             // A directory the owner can't read+search (r-x) would lock carrick
             // (a non-root macOS process) out of its own scratch. Preserve the
             // true mode in the carrick xattr and force owner r-x on the real
             // dir; otherwise apply the image mode directly. (See HostFsBackend
             // / CARRICK_MODE_XATTR.)
             if mode & 0o500 != 0o500 {
-                let _ =
-                    dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o700));
-                crate::fs_backend::write_mode_xattr(dir, &path, true, mode);
+                let _ = std::fs::set_permissions(
+                    &dest_path,
+                    std::fs::Permissions::from_mode(mode | 0o700),
+                );
+                crate::fs_backend::write_mode_xattr(dest, &path, true, mode);
                 stats.mode_xattrs += 1;
             } else {
-                let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode));
+                let _ = std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(mode));
             }
             stats.dirs += 1;
         } else if entry_type.is_symlink() {
@@ -413,14 +418,14 @@ fn apply_tar_to_dir<R: Read>(
                 .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?
                 .into_owned();
             // Remove any existing entry at path before creating the symlink.
-            let _ = dir.remove_file(&path);
-            let _ = dir.remove_dir_all(&path);
+            let _ = std::fs::remove_file(&dest_path);
+            let _ = std::fs::remove_dir_all(&dest_path);
             // Store the raw link target verbatim (Linux symlinkat(2) semantics).
-            dir.symlink_contents(link_name.to_string_lossy().as_ref(), &path)?;
+            std::os::unix::fs::symlink(link_name, &dest_path)?;
             stats.symlinks += 1;
         } else if entry_type.is_file() {
             // Streaming copy — never buffers the whole file.
-            let mut f = dir.create(&path)?;
+            let mut f = std::fs::File::create(&dest_path)?;
             std::io::copy(&mut entry, &mut f)?;
             drop(f);
             // A file the owner can't read would lock carrick (non-root) out of
@@ -428,12 +433,14 @@ fn apply_tar_to_dir<R: Read>(
             // and force owner rw on the real file; otherwise apply the image
             // mode directly (real_stat reports it faithfully).
             if mode & 0o400 == 0 {
-                let _ =
-                    dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o600));
-                crate::fs_backend::write_mode_xattr(dir, &path, false, mode);
+                let _ = std::fs::set_permissions(
+                    &dest_path,
+                    std::fs::Permissions::from_mode(mode | 0o600),
+                );
+                crate::fs_backend::write_mode_xattr(dest, &path, false, mode);
                 stats.mode_xattrs += 1;
             } else {
-                let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode));
+                let _ = std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(mode));
             }
             stats.files += 1;
         } else if entry_type.is_hard_link() {
@@ -448,21 +455,22 @@ fn apply_tar_to_dir<R: Read>(
             // A new-layer hardlink replaces the path from lower layers. Remove
             // that destination before linking: falling back to `create(path)`
             // while it is already a hardlink to `target` truncates BOTH names.
-            match dir.remove_file(&path) {
+            match std::fs::remove_file(&dest_path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(_) => match dir.remove_dir_all(&path) {
+                Err(_) => match std::fs::remove_dir_all(&dest_path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 },
             }
-            match dir.hard_link(&target, dir, &path) {
+            let target_abs = dest.join(&target);
+            match std::fs::hard_link(&target_abs, &dest_path) {
                 Ok(()) => {}
                 Err(_) => {
                     // Fall back to copying target's bytes if hard_link fails.
-                    let mut src = dir.open(&target)?;
-                    let mut dst = dir.create(&path)?;
+                    let mut src = std::fs::File::open(&target_abs)?;
+                    let mut dst = std::fs::File::create(&dest_path)?;
                     std::io::copy(&mut src, &mut dst)?;
                 }
             }
@@ -584,48 +592,45 @@ impl RootFs {
     /// exist and be empty (caller's job). This is the capability-rooted
     /// materializer used by HostFsBackend so rootfs seeding stays inside the
     /// already-open scratch dir.
-    pub fn extract_to_dir(&self, dir: &cap_std::fs::Dir) -> Result<(), RootFsError> {
-        use cap_std::fs::PermissionsExt as _;
+    pub fn extract_to_dir(&self, dest: &Path) -> Result<(), RootFsError> {
+        use std::os::unix::fs::PermissionsExt as _;
 
         // Directories: process shallowest first.
         let mut dirs: Vec<&PathBuf> = self.directories.iter().collect();
         dirs.sort_by_key(|p| p.components().count());
         for d in dirs {
-            dir.create_dir_all(d)?;
+            std::fs::create_dir_all(dest.join(d))?;
         }
         // Files.
         for (path, entry) in &self.files {
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                dir.create_dir_all(parent)?;
+            let dest_path = dest.join(path);
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-            let mut file = dir.create(path)?;
+            let mut file = std::fs::File::create(&dest_path)?;
             file.write_all(entry.contents.as_ref())?;
             drop(file);
-            let _ = dir.set_permissions(path, cap_std::fs::Permissions::from_mode(entry.mode));
+            let _ =
+                std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(entry.mode));
         }
         // Symlinks last (target paths might point at files we just wrote).
         for (link_path, entry) in &self.symlinks {
-            if let Some(parent) = link_path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                dir.create_dir_all(parent)?;
+            let dest_path = dest.join(link_path);
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
             // If the link path already exists (e.g. parent created it as a dir),
             // remove first.
-            let _ = dir.remove_file(link_path);
-            let _ = dir.remove_dir_all(link_path);
-            dir.symlink_contents(&entry.target_text, link_path)?;
+            let _ = std::fs::remove_file(&dest_path);
+            let _ = std::fs::remove_dir_all(&dest_path);
+            std::os::unix::fs::symlink(&entry.target_text, &dest_path)?;
         }
         Ok(())
     }
 
-    /// Path-based compatibility wrapper for callers that do not already hold a
-    /// capability-rooted directory.
+    /// Path-based extraction.
     pub fn extract_to_disk(&self, dest: &Path) -> Result<(), RootFsError> {
-        let dir = cap_std::fs::Dir::open_ambient_dir(dest, cap_std::ambient_authority())?;
-        self.extract_to_dir(&dir)
+        self.extract_to_dir(dest)
     }
 
     /// Every path the rootfs holds, regardless of kind. Used by
@@ -1625,7 +1630,6 @@ mod tests {
 
     #[test]
     fn later_layer_hardlink_replaces_existing_alias_without_truncating_target() {
-        use cap_std::ambient_authority;
         use tar::{Builder, EntryType, Header};
 
         fn hardlink_layer(include_target: bool) -> Vec<u8> {
@@ -1655,12 +1659,11 @@ mod tests {
         }
 
         let scratch = tempfile::tempdir().unwrap();
-        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), ambient_authority()).unwrap();
         let mut stats = ExtractStats::default();
         let mut base = tar::Archive::new(std::io::Cursor::new(hardlink_layer(true)));
-        apply_tar_to_dir(&mut base, &dir, &mut stats).unwrap();
+        apply_tar_to_dir(&mut base, scratch.path(), &mut stats).unwrap();
         let mut update = tar::Archive::new(std::io::Cursor::new(hardlink_layer(false)));
-        apply_tar_to_dir(&mut update, &dir, &mut stats).unwrap();
+        apply_tar_to_dir(&mut update, scratch.path(), &mut stats).unwrap();
 
         assert_eq!(
             std::fs::read(scratch.path().join("usr/bin/perl")).unwrap(),

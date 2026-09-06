@@ -15,3 +15,11 @@ allow = [
   "Unlicense",
   "Zlib",
 ]
+
+[bans]
+multiple-versions = "warn"
+deny = [
+  { name = "cap-std" },
+  { name = "cap-primitives" },
+]
+

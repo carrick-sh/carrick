@@ -679,11 +679,9 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         upper: &std::path::Path,
     ) -> SyscallDispatcher {
         let rootfs = RootFs::from_immutable_host_dir(lower).unwrap();
-        let upper_dir =
-            cap_std::fs::Dir::open_ambient_dir(upper, cap_std::ambient_authority()).unwrap();
         let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
         dispatcher.set_fs_backend(Box::new(
-            crate::fs_backend::HostFsBackend::from_existing_dir(upper_dir),
+            crate::fs_backend::HostFsBackend::from_path(upper).unwrap(),
         ));
         dispatcher
     }

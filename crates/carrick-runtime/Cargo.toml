@@ -118,8 +118,8 @@ arc-swap.workspace = true
 bitflags.workspace = true
 libc.workspace = true
 camino.workspace = true
-cap-std.workspace = true
 clap.workspace = true
+
 fd-lock.workspace = true
 flate2.workspace = true
 getrandom.workspace = true

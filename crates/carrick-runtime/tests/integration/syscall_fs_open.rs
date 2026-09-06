@@ -1461,9 +1461,7 @@ fn open_o_tmpfile_materialize_preserves_setuid_setgid_host_backend() {
     const CREATE_MODE: u64 = 0o7755;
 
     let scratch = tempfile::TempDir::new().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = HostFsBackend::from_existing_dir(dir);
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
 
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));

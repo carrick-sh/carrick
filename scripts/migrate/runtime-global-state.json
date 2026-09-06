@@ -290,22 +290,6 @@
       "rationale": "Host-kernel-object table STATE tracking FIFO readiness beacons keyed by host (dev, ino)."
     },
     {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "symbol": "FD_OPEN_PATH_INSERTS",
-      "fingerprint": "fbf0bd52d4cfdd851565bfa0ee75a014abd6e1614d4e339396993e9cb3272c9c",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static FD_OPEN_PATH_INSERTS in crates/carrick-runtime/src/dispatch/fs.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "symbol": "FD_OPEN_PATH_LOOKUPS",
-      "fingerprint": "3089dfca871b2b272e72c87b35b7db7ad681732a47a50a63b48861a076ff5346",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static FD_OPEN_PATH_LOOKUPS in crates/carrick-runtime/src/dispatch/fs.rs maintaining host process lifecycle or VM resources."
-    },
-    {
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
       "symbol": "ficlone_errno::CARRICK_FICLONE_DEBUG",
