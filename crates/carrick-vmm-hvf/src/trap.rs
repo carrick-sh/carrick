@@ -19569,12 +19569,11 @@ enum InventoryBackingIdentity {
     /// never looked up globally or deduplicated across independently-created
     /// mappings.
     SharedAnon(u64),
-    /// One `MAP_PRIVATE` file mapping whose clean pages are a read-only host
-    /// `MAP_SHARED` view of the file's page cache, so later `write(2)`s reach
-    /// the guest until a page is dirtied. The host bytes are NOT private: a
-    /// maintenance write must materialize a private replacement rather than
-    /// write through the view, and every guest page starts fork-COW armed at
-    /// 4 KiB granularity. Like `SharedAnon` it is never deduplicated.
+    /// One guest `MAP_PRIVATE` file mapping. Mutable files use a writable host
+    /// `MAP_SHARED` page-cache view; immutable lowers use host `MAP_PRIVATE`.
+    /// A maintenance write must still materialize a private replacement rather
+    /// than write through either view, and every guest page starts fork-COW
+    /// armed at 4 KiB granularity. Like `SharedAnon` it is never deduplicated.
     PrivateFileView(u64),
     SharedFile {
         device: u64,
@@ -19590,15 +19589,17 @@ enum InventoryBackingIdentity {
 enum SparseExtentBacking<'a> {
     /// Fresh zero-filled private anonymous frames.
     Anon,
-    /// A `MAP_PRIVATE` file mapping. The first `view_len` bytes of the extent
-    /// are a read-only host `MAP_SHARED` view of `fd` starting at file
-    /// `offset` (Linux's clean-page semantics: later `write(2)`s stay
-    /// visible until the page is dirtied); any remainder is zero-filled anon
-    /// and sits beyond EOF, where the dispatcher publishes BUS faults.
+    /// Fresh private anonymous frames initialized from an exact byte slice.
+    /// Foreign copyout uses this to privatize one page from the retained
+    /// immutable file recipe without publishing the whole mapping first.
+    SeededAnon { bytes: &'a [u8] },
+    /// A file view that supplies a guest `MAP_PRIVATE` mapping. Immutable lower
+    /// files use host `MAP_PRIVATE`; mutable writable files use host
+    /// `MAP_SHARED` so clean guest pages follow later file writes. Stage-1 COW
+    /// keeps guest stores private in both cases.
     FileView {
         fd: std::os::fd::BorrowedFd<'a>,
         offset: u64,
-        view_len: u64,
         source: carrick_guest_mem::PrivateFileSource,
     },
 }
@@ -25733,6 +25734,99 @@ fn materialize_foreign_pristine_write(
     Ok(receipt)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn materialize_foreign_private_file_write(
+    lease: &CarrierForeignMmReadLease,
+    lease_guard: &mut CarrierLeaseState,
+    invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
+    invocation: &carrick_hal::ForeignMmInvocation,
+    requested: &CarrierForeignMmSnapshot,
+    va: carrick_guest_mem::GuestVa,
+    len: usize,
+    deadline: std::time::Instant,
+    deferred: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
+) -> Result<CarrierForeignCowReceipt, carrick_hal::ForeignMmTransportError> {
+    const PAGE: usize = 4096;
+    let start = va.raw() & !(PAGE as u64 - 1);
+    let end = start
+        .checked_add(PAGE as u64)
+        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    if len == 0
+        || va
+            .raw()
+            .checked_add(
+                u64::try_from(len)
+                    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?,
+            )
+            .is_none_or(|limit| limit > end)
+        || lease.state.protections.range_no_access(start, PAGE)
+        || lease.state.protections.range_write_denied(start, PAGE)
+    {
+        return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
+    }
+    let transition = deferred
+        .begin_private_file_materialization(va)
+        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let mut page = [0_u8; PAGE];
+    transition
+        .copy_pristine(carrick_guest_mem::GuestVa(start), &mut page)
+        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let context = sparse_materialization::PublicationContext::for_foreign(
+        lease.state.clone(),
+        lease.custody.clone(),
+        invocation,
+        requested,
+        deadline,
+    )?;
+    let mut flush = || {
+        invalidator
+            .invalidate_exact_asid(carrick_hal::ForeignMmSnapshot::binding(requested), deadline)
+            .map_err(|error| TrapError::Hypervisor(format!("foreign sparse TLBI: {error:?}")))
+    };
+    let published = sparse_materialization::publish(
+        &context,
+        start,
+        end,
+        SparseExtentBacking::SeededAnon { bytes: &page },
+        &mut flush,
+    )
+    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    let receipt = published
+        .foreign_receipt
+        .unwrap_or_else(|| std::process::abort());
+    let key = (receipt.physical_base.raw(), receipt.physical_len);
+    let owner = lease
+        .custody
+        .global_frame_host_owners
+        .lock()
+        .get(&key)
+        .and_then(GlobalFrameOwnerEntry::live_owner)
+        .cloned()
+        .unwrap_or_else(|| std::process::abort());
+    if owner.generation() != receipt.owner_generation.raw_for_probe() {
+        std::process::abort();
+    }
+    let pin = owner.pin().unwrap_or_else(|_| std::process::abort());
+    lease_guard.backing.extents.push(RetainedForeignExtent {
+        key,
+        owner: RetainedPhysicalOwner::Global(pin),
+    });
+    for region in published.extension_regions {
+        let owner = region
+            .structural_owner
+            .unwrap_or_else(|| std::process::abort());
+        lease_guard.backing.extents.push(RetainedForeignExtent {
+            key: (owner.physical_ipa, owner.physical_size as u64),
+            owner: RetainedPhysicalOwner::Structural(owner),
+        });
+    }
+    lease_guard.retained = receipt.snapshot.clone();
+    transition
+        .commit_range(carrick_guest_mem::GuestVa(start), PAGE)
+        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+    Ok(receipt)
+}
+
 fn perform_foreign_cow_transaction(
     lease: &CarrierForeignMmReadLease,
     lease_guard: &mut CarrierLeaseState,
@@ -25799,7 +25893,7 @@ fn perform_foreign_cow_transaction(
                     .as_ref()
                     .filter(|(mm, _)| *mm == requested.mm)
                     .map(|(_, state)| std::sync::Arc::clone(state));
-                if let Some(deferred) = deferred
+                if let Some(deferred) = deferred.as_ref()
                     && deferred.covers_pristine(va, len)
                 {
                     return materialize_foreign_pristine_write(
@@ -25811,7 +25905,22 @@ fn perform_foreign_cow_transaction(
                         va,
                         len,
                         deadline,
-                        deferred,
+                        std::sync::Arc::clone(deferred),
+                    );
+                }
+                if let Some(deferred) = deferred.as_ref()
+                    && deferred.covers_private_file(va, len)
+                {
+                    return materialize_foreign_private_file_write(
+                        lease,
+                        lease_guard,
+                        invalidator,
+                        invocation,
+                        requested,
+                        va,
+                        len,
+                        deadline,
+                        std::sync::Arc::clone(deferred),
                     );
                 }
                 // Not COW-armed: the page is already PRIVATE to this mm — one
@@ -26551,11 +26660,18 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
                         .as_ref()
                         .filter(|(mm, _)| *mm == requested.mm)
                         .map(|(_, state)| std::sync::Arc::clone(state));
-                    if !deferred.as_ref().is_some_and(|state| {
+                    let copied_from_deferred = deferred.as_ref().is_some_and(|state| {
                         state
                             .copy_pristine_zero(current_va, &mut dst[completed..completed + chunk])
                             .unwrap_or(false)
-                    }) {
+                            || state
+                                .copy_pristine_file(
+                                    current_va,
+                                    &mut dst[completed..completed + chunk],
+                                )
+                                .unwrap_or(false)
+                    });
+                    if !copied_from_deferred {
                         return Err(carrick_hal::ForeignMmTransportError::Translation(
                             current_va,
                         ));
@@ -29436,7 +29552,7 @@ fn next_frame_cow_write_probe(
     // keep tracking the file). An unarmed page advances to the end of its
     // compound, but never past the next armed range: a page privatized out
     // of a compound leaves its siblings armed, and stepping over them would
-    // write straight into a shared frame or a read-only page-cache view.
+    // write straight into a shared frame or a file view.
     let next = match armed_span_end {
         Some(span_end) if span_end > current => span_end,
         _ => {
@@ -37838,6 +37954,27 @@ impl HvfVmState {
         if va < arena_start || requested_end > arena_end {
             return Ok(());
         }
+        if let Some(state) = self.deferred_anonymous_state()
+            && let Some(transition) =
+                state.begin_private_file_materialization(carrick_guest_mem::GuestVa(va))
+        {
+            let start = transition.start().raw();
+            let materialized = self.materialize_private_file_backing(
+                start,
+                transition.len(),
+                transition.fd(),
+                transition.file_offset(),
+                transition.source(),
+                flush_stage1,
+            )?;
+            if !materialized {
+                return Err(TrapError::Hypervisor(format!(
+                    "deferred private file view at VA 0x{start:x} refused first-touch publication"
+                )));
+            }
+            transition.commit();
+            return Ok(());
+        }
         let mut current = align_down(va, PAGE_SIZE);
         let end = align_up(requested_end, PAGE_SIZE)?;
         while current < end {
@@ -37894,24 +38031,18 @@ impl HvfVmState {
         Ok(())
     }
 
-    /// Materialize a `MAP_PRIVATE` file mapping in the sparse arena with
-    /// Linux's clean-page semantics: every page starts as a read-only view of
-    /// the file's page cache and stays fork-COW armed at 4 KiB granularity, so
-    /// a later `write(2)` to the file is visible through every page the guest
-    /// has not yet dirtied, while the first guest write to a page privatizes
-    /// exactly that page (`mmapprivatefiletrack`).
-    ///
-    /// Darwin's own `MAP_PRIVATE` cannot express this — it is a snapshot at
-    /// map time (`overlay_shared_file_view_tracks_later_file_writes` is the
-    /// receipt) — so the view is a host `MAP_SHARED|PROT_READ` overlay and the
-    /// copy-on-write is Carrick's frame COW.
+    /// Materialize a file view for a guest `MAP_PRIVATE` mapping in the sparse
+    /// arena. Immutable lower artifacts use Darwin `MAP_PRIVATE`; mutable files
+    /// require a writable `MAP_SHARED` host view so clean pages track later file
+    /// writes. Carrick arms 4 KiB frame COW before guest access, keeping every
+    /// guest and foreign store private to the exact MM.
     ///
     /// Returns `Ok(false)` when the request cannot take this shape and the
-    /// dispatcher must fall back to its eager snapshot: outside the sparse
-    /// arena, a VA/offset pair that is not congruent modulo the 16 KiB host
-    /// page (the view must land on whole host pages and a fork-COW compound
-    /// must not straddle two physical compounds), an offset at/after EOF, or
-    /// a range that is not entirely a hole (`MAP_FIXED` over live pages).
+    /// dispatcher must fall back to its eager snapshot: ranges outside the
+    /// sparse arena, a VA/offset pair that is not congruent modulo the 16 KiB
+    /// host page, an offset at/after EOF, or a range that is not entirely a
+    /// hole. A mutable read-only host fd is also refused by Darwin because the
+    /// coherent host view needs write authority.
     pub(crate) fn materialize_private_file_backing(
         &mut self,
         va: u64,
@@ -38021,7 +38152,6 @@ impl HvfVmState {
                 SparseExtentBacking::FileView {
                     fd,
                     offset: offset + (current - va),
-                    view_len: (view_end.saturating_sub(current)).min(hole_end - current),
                     source,
                 }
             } else {
@@ -41124,18 +41254,27 @@ impl HvfVmState {
                         self.mapping_for_range(lookup, chunk_len)
                     });
                 let Some((lookup_address, mapping)) = resolved else {
-                    if let Some(state) = self.deferred_anonymous_state()
-                        && state
-                            .copy_pristine_zero(
-                                carrick_guest_mem::GuestVa(chunk_address),
-                                &mut dst[copied..copied + chunk_len],
-                            )
+                    if let Some(state) = self.deferred_anonymous_state() {
+                        let chunk = &mut dst[copied..copied + chunk_len];
+                        if state
+                            .copy_pristine_zero(carrick_guest_mem::GuestVa(chunk_address), chunk)
                             .map_err(|error| {
                                 MemoryError::HostMap(format!("anonymous zero read: {error}"))
                             })?
-                    {
-                        copied += chunk_len;
-                        continue;
+                            || state
+                                .copy_pristine_file(
+                                    carrick_guest_mem::GuestVa(chunk_address),
+                                    chunk,
+                                )
+                                .map_err(|error| {
+                                    MemoryError::HostMap(format!(
+                                        "deferred private file read: {error}"
+                                    ))
+                                })?
+                        {
+                            copied += chunk_len;
+                            continue;
+                        }
                     }
                     // `syscall_buffer_lookup_addr` deliberately stays identity
                     // for the common heap/stack hot path. Core capture has

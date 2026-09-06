@@ -1527,6 +1527,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             && self.vm.deferred_anonymous_state().is_some()
     }
 
+    fn supports_lazy_private_file_mmap(&self) -> bool {
+        self.supports_lazy_anonymous_mmap()
+    }
+
     /// The PROT_NONE set the shared default `read_bytes`/`write_bytes` gate on
     /// (keyed on the guest VA). The backend owns it (KVM in `GuestRam`, shared
     /// across siblings); `*_raw` does the IPA-translated backing lookup only.
@@ -1542,7 +1546,26 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut copied = 0usize;
         while copied < length {
             let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
-            let bytes = self.vm.translated_read(va, ipa.raw(), chunk_len)?;
+            let bytes = match self.vm.translated_read(va, ipa.raw(), chunk_len) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let deferred = match self.vm.deferred_anonymous_state() {
+                        Some(state) => state
+                            .copy_pristine_file(GuestVa(va), &mut out[copied..copied + chunk_len])
+                            .map_err(|error| {
+                                MemoryError::HostMap(format!(
+                                    "read deferred private file backing: {error}"
+                                ))
+                            })?,
+                        None => false,
+                    };
+                    if deferred {
+                        copied += chunk_len;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             if bytes.len() != chunk_len {
                 return Err(MemoryError::OutOfBounds { address, length });
             }
@@ -1559,8 +1582,24 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut copied = 0usize;
         while copied < length {
             let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
-            self.vm
-                .translated_read_into(va, ipa.raw(), &mut dst[copied..copied + chunk_len])?;
+            if let Err(error) =
+                self.vm
+                    .translated_read_into(va, ipa.raw(), &mut dst[copied..copied + chunk_len])
+            {
+                let deferred = match self.vm.deferred_anonymous_state() {
+                    Some(state) => state
+                        .copy_pristine_file(GuestVa(va), &mut dst[copied..copied + chunk_len])
+                        .map_err(|error| {
+                            MemoryError::HostMap(format!(
+                                "read deferred private file backing: {error}"
+                            ))
+                        })?,
+                    None => false,
+                };
+                if !deferred {
+                    return Err(error);
+                }
+            }
             copied += chunk_len;
         }
         Ok(())
@@ -1780,10 +1819,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         location
     }
 
-    /// `mmap(MAP_PRIVATE, fd)` inside the sparse arena: hand the hole to the
-    /// backend so it can materialize a page-cache view with page-granular COW
-    /// instead of an eager snapshot. Everything outside the arena (or a backend
-    /// without the lane) answers `Ok(false)` and the dispatcher snapshots.
+    /// `mmap(MAP_PRIVATE, fd)` inside the sparse arena: hand an eligible file to
+    /// the backend so it can materialize a direct view with page-granular COW
+    /// instead of an eager snapshot. Unsupported ranges and mutable read-only
+    /// host descriptors answer `Ok(false)` and the dispatcher snapshots.
     fn map_private_file_backed(
         &mut self,
         va: u64,
@@ -1815,6 +1854,38 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
         vm.materialize_private_file_backing(va, len, host_fd, offset, source, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
+    }
+
+    fn defer_private_file_backed(
+        &mut self,
+        va: u64,
+        len: usize,
+        host_fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        source: carrick_guest_mem::PrivateFileSource,
+    ) -> Result<bool, MemoryError> {
+        if !self.supports_lazy_private_file_mmap()
+            || len == 0
+            || source != carrick_guest_mem::PrivateFileSource::ImmutableLower
+        {
+            return Ok(false);
+        }
+        let Some(granule) = self.vm.private_file_view_granule() else {
+            return Ok(false);
+        };
+        if !granule.is_power_of_two() || va & (granule - 1) != offset & (granule - 1) {
+            return Ok(false);
+        }
+        let state = self
+            .vm
+            .deferred_anonymous_state()
+            .ok_or_else(|| MemoryError::HostMap("missing deferred mmap state".to_owned()))?;
+        state
+            .reserve_private_file(GuestVa(va), len, host_fd, offset, source)
+            .map_err(|error| {
+                MemoryError::HostMap(format!("defer private file backing: {error}"))
+            })?;
+        Ok(true)
     }
 
     /// Make a guest `mprotect`/`mmap`'s protection GUEST-visible by editing the

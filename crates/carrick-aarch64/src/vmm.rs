@@ -437,6 +437,13 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         false
     }
 
+    /// Host mapping granule whose low address bits must match the file offset
+    /// for a deferred private file view. Backends without a direct immutable
+    /// file-view mapping return `None` and never advertise this lazy lane.
+    fn private_file_view_granule(&self) -> Option<u64> {
+        None
+    }
+
     /// Retire the generic loader's eager mmap-arena mapping after the HVPatch
     /// backend is selected and stage-1 has been made inaccessible.
     fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {

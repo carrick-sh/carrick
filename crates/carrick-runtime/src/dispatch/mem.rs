@@ -5466,6 +5466,7 @@ impl SyscallDispatcher {
             // backing primitive, not Linux's private-file fault contract.
             let mut bytes = bytes;
             let mut lowered_file_backed = false;
+            let mut deferred_file_backed_len = None;
             if lowering_candidate {
                 let Some(open_file) = this.open_file(fd.0) else {
                     // The description vanished mid-dispatch; the eager path's
@@ -5492,13 +5493,42 @@ impl SyscallDispatcher {
                 if let Some(file_len) = host_fd_file_len(host_fd) {
                     bus_fault_offset =
                         shared_file_bus_offset(file_len, offset, length, page_size);
+                    let lazy_len = bus_fault_offset.unwrap_or(length);
+                    let defer_file = source
+                        == carrick_guest_mem::PrivateFileSource::ImmutableLower
+                        && memory.supports_lazy_private_file_mmap()
+                        && page_size == 4096
+                        && lazy_len != 0
+                        && !map_flags.intersects(
+                            LinuxMmapFlags::FIXED
+                                | LinuxMmapFlags::POPULATE
+                                | LinuxMmapFlags::LOCKED,
+                        );
                     // SAFETY: the description read guard (`open`) keeps the
                     // owning fd (a `HostFdRef`, or the memfd's `OwnedFd`) alive
                     // across the borrow.
                     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd) };
-                    match memory.map_private_file_backed(address, length_usize, borrowed, offset, source) {
+                    let lowering = if defer_file {
+                        memory.defer_private_file_backed(
+                            address,
+                            lazy_len as usize,
+                            borrowed,
+                            offset,
+                            source,
+                        )
+                    } else {
+                        memory.map_private_file_backed(
+                            address,
+                            length_usize,
+                            borrowed,
+                            offset,
+                            source,
+                        )
+                    };
+                    match lowering {
                         Ok(true) => {
                             lowered_file_backed = true;
+                            deferred_file_backed_len = defer_file.then_some(lazy_len);
                             lowering_outcome = MmapLoweringOutcome::Installed;
                         }
                         Ok(false) => {
@@ -5591,9 +5621,21 @@ impl SyscallDispatcher {
             // Make the requested protection guest-visible (also restores RW for
             // a reused range). prot==0 here means file-backed PROT_NONE.
             // Unconditional: reserve across the whole arena; fatal only in-arena.
-            if let Err(error) = memory.protect_range(address, length_usize, prot)
+            let initial_prot = if deferred_file_backed_len.is_some() {
+                0
+            } else {
+                prot
+            };
+            if let Err(error) = memory.protect_range(address, length_usize, initial_prot)
                 && (in_arena || memory.supports_concurrent_exec_protection())
             {
+                if deferred_file_backed_len.is_some() {
+                    let _ = this
+                        .mem()
+                        .lock()
+                        .deferred_anonymous
+                        .retire(GuestVa(address), length_usize);
+                }
                 mark_range_unmapped(memory, address, length_usize);
                 return Ok(request.refused_by(
                     MmapRefusal::Internal("requested protection could not be published"),
@@ -5610,6 +5652,13 @@ impl SyscallDispatcher {
                 if let Err(error) = memory.protect_range(bus_start, bus_len_usize, 0)
                     && memory.supports_concurrent_exec_protection()
                 {
+                    if deferred_file_backed_len.is_some() {
+                        let _ = this
+                            .mem()
+                            .lock()
+                            .deferred_anonymous
+                            .retire(GuestVa(address), length_usize);
+                    }
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("beyond-EOF SIGBUS protection could not be published"),
                         LINUX_ENOMEM,
@@ -5617,6 +5666,11 @@ impl SyscallDispatcher {
                     ));
                 }
                 this.record_mmap_bus_fault_range(bus_start, bus_len);
+            }
+            if let Some(deferred_len) = deferred_file_backed_len
+                && !prot_flags.is_empty()
+            {
+                this.track_resident_fault_range(address, deferred_len, prot_flags);
             }
             // A file-backed mapping's content is loaded eagerly (above), and
             // MAP_POPULATE prefaults anonymous pages — so mincore must report

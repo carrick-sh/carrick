@@ -564,6 +564,7 @@ dependencies = [
 name = "carrick-guest-mem"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "parking_lot",
  "serde",
  "thiserror",

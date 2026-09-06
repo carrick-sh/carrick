@@ -1437,7 +1437,10 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
 struct FileBackedLoweringMemory {
     inner: CountingMmapMemory,
     accept: bool,
+    defer: bool,
     offers: std::cell::RefCell<Vec<(u64, usize, u64)>>,
+    deferred_offers:
+        std::cell::RefCell<Vec<(u64, usize, u64, carrick_guest_mem::PrivateFileSource)>>,
 }
 
 impl FileBackedLoweringMemory {
@@ -1445,12 +1448,23 @@ impl FileBackedLoweringMemory {
         Self {
             inner: CountingMmapMemory::new(base, len),
             accept,
+            defer: false,
             offers: std::cell::RefCell::new(Vec::new()),
+            deferred_offers: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    fn deferred(mut self) -> Self {
+        self.defer = true;
+        self
     }
 }
 
 impl GuestMemory for FileBackedLoweringMemory {
+    fn supports_lazy_private_file_mmap(&self) -> bool {
+        self.defer
+    }
+
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         self.inner.read_bytes_raw(address, length)
     }
@@ -1474,6 +1488,20 @@ impl GuestMemory for FileBackedLoweringMemory {
         self.offers.borrow_mut().push((address, len, offset));
         Ok(self.accept)
     }
+
+    fn defer_private_file_backed(
+        &mut self,
+        address: u64,
+        len: usize,
+        _host_fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        source: carrick_guest_mem::PrivateFileSource,
+    ) -> Result<bool, MemoryError> {
+        self.deferred_offers
+            .borrow_mut()
+            .push((address, len, offset, source));
+        Ok(self.accept)
+    }
 }
 
 impl CurrentMmMemory for FileBackedLoweringMemory {}
@@ -1481,6 +1509,20 @@ impl CurrentMmMemory for FileBackedLoweringMemory {}
 /// Install a HostFile-backed guest fd whose backing file holds `payload`,
 /// returning the guest fd number.
 fn install_host_file_fd(dispatcher: &SyscallDispatcher, fd: i32, payload: &[u8]) {
+    install_host_file_fd_with_source(
+        dispatcher,
+        fd,
+        payload,
+        carrick_guest_mem::PrivateFileSource::Mutable,
+    );
+}
+
+fn install_host_file_fd_with_source(
+    dispatcher: &SyscallDispatcher,
+    fd: i32,
+    payload: &[u8],
+    source: carrick_guest_mem::PrivateFileSource,
+) {
     use std::os::fd::{AsRawFd, IntoRawFd};
     let host_file = tempfile::tempfile().expect("temporary host private-map source");
     assert_eq!(
@@ -1499,7 +1541,7 @@ fn install_host_file_fd(dispatcher: &SyscallDispatcher, fd: i32, payload: &[u8])
         OpenFile::from_open_description_with_status_flags(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
-                host_fd: HostFdRef::new(host_file.into_raw_fd()),
+                host_fd: HostFdRef::with_private_file_source(host_file.into_raw_fd(), source),
                 metadata: RootFsMetadata {
                     path: std::path::PathBuf::from("/host-private-map"),
                     kind: RootFsEntryKind::File,
@@ -1563,6 +1605,72 @@ fn mmap_private_hostfile_lowers_file_backed_and_publishes_bus_tail() {
     // backed page is not.
     assert!(dispatcher.mmap_fault_is_sigbus(address + 2 * PAGE_SIZE));
     assert!(!dispatcher.mmap_fault_is_sigbus(address + PAGE_SIZE));
+}
+
+#[test]
+fn mmap_private_hostfile_lazy_backend_does_not_publish_backing_at_map_time() {
+    const SYS_MMAP: u64 = 222;
+    const PAGE_SIZE: u64 = 4096;
+    const LENGTH: u64 = 2 * PAGE_SIZE;
+
+    let dispatcher = SyscallDispatcher::new();
+    install_host_file_fd_with_source(
+        &dispatcher,
+        35,
+        &vec![0x63; LENGTH as usize],
+        carrick_guest_mem::PrivateFileSource::ImmutableLower,
+    );
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1305));
+    let reporter = CompatReporter::default();
+    let mut memory =
+        FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 4 * LENGTH as usize, true).deferred();
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                0,
+                LENGTH,
+                LINUX_PROT_READ,
+                crate::linux_abi::LINUX_MAP_PRIVATE,
+                35,
+                0,
+            ]),
+        ),
+    );
+    let DispatchOutcome::Returned { value } = outcome else {
+        panic!("lazy private host-file mmap must succeed, got {outcome:?}");
+    };
+    let address = value as u64;
+    assert!(
+        memory.offers.borrow().is_empty(),
+        "mmap must retain the file recipe without invoking backing publication"
+    );
+    assert_eq!(
+        memory.deferred_offers.borrow().as_slice(),
+        &[(
+            address,
+            LENGTH as usize,
+            0,
+            carrick_guest_mem::PrivateFileSource::ImmutableLower,
+        )],
+        "mmap must retain exactly one deferred file recipe"
+    );
+    assert_eq!(
+        memory.inner.protect_log.borrow().as_slice(),
+        &[(address, LENGTH as usize, 0)],
+        "mmap must leave the semantic file view stage-1-invalid until first access"
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(address, |_| ())
+            .is_some(),
+        "the first permitted access needs an MM-owned fault plan"
+    );
 }
 
 #[test]

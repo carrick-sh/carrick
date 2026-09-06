@@ -1279,6 +1279,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.sparse_mmap_arena_enabled()
     }
 
+    fn private_file_view_granule(&self) -> Option<u64> {
+        Some(crate::trap::HVF_PAGE_SIZE)
+    }
+
     fn retire_initial_mmap_arena(&mut self) -> Result<(), TrapError> {
         self.state.retire_initial_mmap_arena()
     }
