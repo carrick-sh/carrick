@@ -15436,6 +15436,10 @@ impl SyscallDispatcher {
                             .create_fifo(&materialize_path, fifo_mode)
                         {
                             Ok(()) => {
+                                this.fs
+                                    .rootfs_vfs
+                                    .dentry_cache
+                                    .notify_create(&materialize_path);
                                 this.stamp_new_node_owner(&materialize_path, fifo_mode);
                                 this.dnotify_child(cx.kernel, &materialize_path, LinuxDnotifyMask::CREATE);
                                 DispatchOutcome::Returned { value: 0 }
