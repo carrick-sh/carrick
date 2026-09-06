@@ -537,3 +537,15 @@ is supplemented by `boot-owner-integration-smoke.json` and its retained tracked
 diff; this is unfinished integration evidence, not a clean-tree milestone.
 Foreign access, exact rollback, full correctness gates and file latency remain
 open before landing.
+
+
+### Nonmutating pristine provenance query
+
+Added `DeferredAnonymousState::covers_pristine` for syscall-buffer validation.
+It accepts exact covered byte ranges (including partial/cross-page ranges)
+without allocation or residency changes; rejects zero length, overflow, holes,
+materialized pages and retired pages. Permission and MM identity remain caller
+obligations. The new contract test was red against the refusal stub
+(`pristine-query-red.log`, run eco-pristine-query-red-20260906a); all 43 guest
+memory lib tests pass after implementation (`pristine-query-green.log`, run
+eco-pristine-query-green-20260906a). Caller integration is still pending.
