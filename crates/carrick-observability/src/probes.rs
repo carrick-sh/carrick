@@ -5041,6 +5041,7 @@ mod real {
         /// means the base held 0x11=17. Lets a trace see the faulting access
         /// WITHOUT an eprintln rebuild. Fires only at the fault.
         fn vcpu__fault__regs(_: u64, _: u64, _: u64, _: u64, _: u32, _: u64) {}
+        fn resident__fault__protection__error(_: u64, _: u64, _: &str) {}
         /// Companion general-register payload captured at the same fault.
         /// Args are guest x0..x5.
         fn vcpu__fault__gprs(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) {}
@@ -7342,6 +7343,13 @@ mod real {
         ));
     }
 
+    /// Backend refusal while materializing/protecting a logically allowed
+    /// first-touch page. Formatting occurs only when a consumer is attached.
+    #[inline(never)]
+    pub fn resident_fault_protection_error(page: u64, prot: u64, error: &dyn std::fmt::Display) {
+        carrick_usdt::resident__fault__protection__error!(|| (page, prot, format!("{error}")));
+    }
+
     // `#[inline(never)]`: usdt embeds the probe site (an asm! anchor) in
     // the function body. If this gets inlined into multiple callers, each
     // copy becomes a SEPARATE DTrace probe site that fires independently
@@ -8046,6 +8054,7 @@ mod stub {
     stub!(execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64));
     stub!(execve_sysregs(sctlr: u64, ttbr0: u64, mair: u64));
     stub!(vcpu_fault(esr: u64, elr: u64, far: u64, x30: u64, sp: u64, tid: i32));
+    stub!(resident_fault_protection_error(page: u64, prot: u64, error: &dyn std::fmt::Display));
     stub!(vcpu_fault_regs(esr: u64, elr: u64, far: u64, insn: u64, rn: u32, xrn: u64));
     stub!(vcpu_fault_gprs(x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, x5: u64));
     stub!(pt_alias_walk(va: u64, descs: [u64; 4], flag: i32));

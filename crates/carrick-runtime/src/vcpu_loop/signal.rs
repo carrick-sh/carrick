@@ -369,10 +369,16 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
             if let Some(resolved) = apply_first_touch(
                 prot,
                 access,
-                || {
-                    engine
-                        .protect_range(page, crate::linux_abi::LINUX_PAGE_SIZE as usize, prot)
-                        .is_ok()
+                || match engine.protect_range(
+                    page,
+                    crate::linux_abi::LINUX_PAGE_SIZE as usize,
+                    prot,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        crate::probes::resident_fault_protection_error(page, prot, &error);
+                        false
+                    }
                 },
                 || dispatcher.commit_resident_fault(plan),
             ) {

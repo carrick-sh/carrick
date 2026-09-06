@@ -1,6 +1,11 @@
 /*
  * Minimal HVPatch stage-1 fault attribution.
  *
+ * 2026-09-06 resident-fault-protection-error: arg0 page VA, arg1 Linux
+ * protection bits, arg2 formatted backend error C string. This failure-only
+ * addition identifies first-touch refusals otherwise lowered to SIGSEGV;
+ * live qualification is recorded with the campaign capture.
+ *
  * WHAT: records the hardware ESR/FAR/instruction, the live serialized stage-1
  * walk, TTBR0, typed COW-trigger identity, and the sparse stage-2 lifecycle for
  * every guest memory fault. It
@@ -190,4 +195,12 @@ proc:::exit
 /pid == $target/
 {
     exit(0);
+}
+
+
+carrick*:::resident-fault-protection-error
+/pid == $target || progenyof($target)/
+{
+    printf("HVPATCHFAULT1|resident_error|ts=%llu|host_pid=%d|page=%llx|prot=%llx|error=%s\n",
+        timestamp, pid, arg0, arg1, copyinstr(arg2));
 }
