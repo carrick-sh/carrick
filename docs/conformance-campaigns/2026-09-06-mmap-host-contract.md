@@ -460,3 +460,24 @@ instrumentation: 2472 passed / 2 ignored (`resident-error-runtime.log`, run
 eco-resident-error-runtime-20260906a). Live qualification and attribution follow
 on the rebuilt artifact. The shared publisher also needs exact extension-arena
 rollback before allocator reuse and a stronger exact-MM permit for foreign entry.
+
+
+### First-touch refusal attributed to structural owner size
+
+Live-qualified resident-fault-protection-error records the precise refusal:
+`sync_to_host failed: UnresolvedArena(193273659392)` (0x2d00020000).
+`resident-error-fault.json` names the binary SHA256
+3220baa7fd70f902a742317895b9b224cd5b92a419bd5655173f5f6d0e453900,
+HEAD 0e515ec09 plus the recorded integration diff, and run
+eco-resident-error-1788721196681925000. Scoped cleanup zero.
+
+The resolver filtered structural owners to LINUX_PAGE_TABLES_SIZE (0x1c0000)
+and excluded full 2 MiB root slots/extensions. The full-slot lifetime test
+is red before correction (`root-resolver-red.log`): even wrong-carrier
+validation was skipped because no owner entered the resolver. It now accepts
+both exact structural sizes, with exact base, owner identity and stage-2 pin
+checks unchanged. Separate primary-size and full-slot tests run the retention,
+wrong-carrier and retirement assertions. Full signed HVF suite: 447 passed /
+3 ignored, `eco-mmap-resume/root-resolver-green.log`, run
+eco-mmap-root-resolver-green-1788721312687952000. Live launch validation of
+this correction remains pending until the CLI is rebuilt.
