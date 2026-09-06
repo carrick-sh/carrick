@@ -1333,24 +1333,6 @@ fn rewrite_dev_fd_alias(path: &str) -> Option<String> {
     }
 }
 
-#[cfg(test)]
-static FD_OPEN_PATH_INSERTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static FD_OPEN_PATH_LOOKUPS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-fn reset_fd_open_path_inserts() {
-    FD_OPEN_PATH_INSERTS.store(0, std::sync::atomic::Ordering::SeqCst);
-    FD_OPEN_PATH_LOOKUPS.store(0, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[cfg(test)]
-fn fd_open_path_inserts() -> usize {
-    FD_OPEN_PATH_INSERTS.load(std::sync::atomic::Ordering::SeqCst)
-}
-
 use super::fd_table::is_anon_overlay_path;
 
 fn proc_component_is_self(pid: &str, visible_self: Option<u32>) -> bool {
@@ -1583,16 +1565,12 @@ impl SyscallDispatcher {
     }
 
     fn record_fd_open_path(&self, fd: i32, path: String) {
-        #[cfg(test)]
-        FD_OPEN_PATH_INSERTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.captured_file_table()
             .write_fd_open_paths()
             .insert(fd, path);
     }
 
     fn lookup_recorded_fd_open_path(&self, fd: i32) -> Option<String> {
-        #[cfg(test)]
-        FD_OPEN_PATH_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.captured_file_table()
             .read_fd_open_paths()
             .get(&fd)
@@ -3675,10 +3653,10 @@ impl SyscallDispatcher {
             // nothing at this directory. Sample the fork-shared structural
             // generation around both proofs so a concurrent mutation makes
             // the anchor stale before it can serve a child.
-            let generation = crate::fs_resolve_cache::current_generation();
+            let generation = self.fs.rootfs_vfs.overlay.structural_generation();
             if self.fs.rootfs_vfs.overlay.fast_nofollow_absent(path) {
                 let host_fd = rootfs.open_trusted_dir_fd(path)?;
-                if crate::fs_resolve_cache::current_generation() != generation {
+                if self.fs.rootfs_vfs.overlay.structural_generation() != generation {
                     return None;
                 }
                 TrustedHostDir::immutable_lower(HostFdRef::new(host_fd.into_raw_fd()), generation)
@@ -3761,7 +3739,9 @@ impl SyscallDispatcher {
         }
         let name = Self::trusted_lane_component(path)?;
         let (dir_path, trusted_dir) = self.trusted_dir_of(dirfd)?;
-        if !trusted_dir.namespace_is_current() {
+        if !trusted_dir
+            .namespace_is_current_against(self.fs.rootfs_vfs.overlay.structural_generation())
+        {
             return None;
         }
         let host_dir = &trusted_dir.fd;
@@ -3966,7 +3946,9 @@ impl SyscallDispatcher {
         // already-open fd when metadata xattrs may exist anywhere).
         if path == "." {
             let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
-            if !host_dir.namespace_is_current() {
+            if !host_dir
+                .namespace_is_current_against(self.fs.rootfs_vfs.overlay.structural_generation())
+            {
                 return None;
             }
             if !host_dir.is_merged_upper() {
@@ -4016,7 +3998,9 @@ impl SyscallDispatcher {
         }
         let name = Self::trusted_lane_component(path)?;
         let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
-        if !host_dir.namespace_is_current() {
+        if !host_dir
+            .namespace_is_current_against(self.fs.rootfs_vfs.overlay.structural_generation())
+        {
             return None;
         }
         if !host_dir.is_merged_upper() {

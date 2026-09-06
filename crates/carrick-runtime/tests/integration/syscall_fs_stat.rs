@@ -713,9 +713,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
 #[test]
 fn host_stat_following_symlink_reports_target_inode() {
     let scratch = tempfile::TempDir::new().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = HostFsBackend::from_existing_dir(dir);
+    let backend = HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/tmp").unwrap();
     backend.make_dir("/target").unwrap();
     backend.symlink("/target", "/tmp/link").unwrap();

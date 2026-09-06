@@ -1129,9 +1129,8 @@ mod tests {
     #[test]
     fn archive_import_rolls_back_earlier_entries_after_late_backend_failure() {
         let scratch = tempfile::tempdir().expect("scratch");
-        let root = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .expect("scratch authority");
-        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(root);
+        let backend =
+            crate::fs_backend::HostFsBackend::from_path(scratch.path()).expect("scratch backend");
         backend.make_dir("/dest").expect("destination");
         backend
             .set_file_contents("/dest/first", b"original".to_vec())
@@ -1199,9 +1198,8 @@ mod tests {
     #[test]
     fn archive_transaction_blocks_a_concurrent_symlink_pivot() {
         let scratch = tempfile::tempdir().expect("scratch");
-        let root = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .expect("scratch authority");
-        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(root);
+        let backend =
+            crate::fs_backend::HostFsBackend::from_path(scratch.path()).expect("scratch backend");
         backend.make_dir("/dest").expect("destination");
         backend.make_dir("/outside").expect("outside");
         let mut dispatcher = SyscallDispatcher::new();

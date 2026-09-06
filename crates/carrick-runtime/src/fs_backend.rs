@@ -11,7 +11,8 @@
 //! * `MemoryBackend`: pure in-memory `HashMap<PathBuf, Vec<u8>>`,
 //!   fast, ephemeral, ideal for CI / tests / one-shot runs.
 //! * `HostFsBackend`: a real APFS scratch directory, sandboxed via
-//!   `cap_std::fs::Dir` (kernel-rooted, syscall-level escape-proof),
+//!   `root_fd` + `namei_leaf` with `O_NOFOLLOW` / `AT_SYMLINK_NOFOLLOW`
+//!   (kernel-rooted, syscall-level escape-proof),
 //!   byte-copied from the unpacked rootfs (a future clonefile(2) seed
 //!   would be O(1) on APFS). This is the production / durable option.
 //!
@@ -33,10 +34,12 @@
 use crate::linux_abi::LinuxErrno;
 use carrick_abi::{NsGid, NsUid};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -893,7 +896,7 @@ pub trait FsBackend: Send + Sync {
     }
 
     /// Return an open, contained host dirfd for `dir` if supported.
-    fn dir_fd_for(&self, _dir: &Path) -> Option<std::sync::Arc<cap_std::fs::Dir>> {
+    fn dir_fd_for(&self, _dir: &Path) -> Option<std::sync::Arc<std::os::fd::OwnedFd>> {
         None
     }
 
@@ -923,6 +926,12 @@ pub trait FsBackend: Send + Sync {
     /// default: only backends that track the markers may say true.
     fn serves_plain_metadata(&self) -> bool {
         false
+    }
+
+    /// Monotonic per-backend structural generation. Bumped on any mutation
+    /// that adds, removes, or renames entries in this backend's namespace.
+    fn structural_generation(&self) -> u64 {
+        0
     }
 
     /// Human-readable backend name for `--fs` reporting. Default is
@@ -1240,6 +1249,7 @@ struct MemoryBackendState {
 pub struct MemoryBackend {
     inner: RwLock<MemoryBackendState>,
     archive_mutation_gate: ArchiveMutationGate,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl MemoryBackend {
@@ -1253,6 +1263,9 @@ impl Clone for MemoryBackend {
         Self {
             inner: RwLock::new(self.inner.read().clone()),
             archive_mutation_gate: ArchiveMutationGate::default(),
+            generation: std::sync::atomic::AtomicU64::new(
+                self.generation.load(std::sync::atomic::Ordering::SeqCst),
+            ),
         }
     }
 }
@@ -1410,6 +1423,8 @@ impl FsBackend for MemoryBackend {
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
         inner.dirs.insert(normalized);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -1422,6 +1437,8 @@ impl FsBackend for MemoryBackend {
             .files
             .entry(normalized)
             .or_insert_with(|| MemoryFile::Dense(Arc::<[u8]>::from([])));
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -1448,6 +1465,8 @@ impl FsBackend for MemoryBackend {
                 mode: mode & 0o7777,
             },
         );
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -1461,6 +1480,8 @@ impl FsBackend for MemoryBackend {
         // bind, so just record/overwrite the node.
         inner.files.remove(&normalized);
         inner.sockets.insert(normalized, mode & 0o7777);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -1472,6 +1493,8 @@ impl FsBackend for MemoryBackend {
         // Socket nodes track a mode directly.
         if let Some(slot) = inner.sockets.get_mut(&normalized) {
             *slot = mode;
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(());
         }
         // A regular file: upgrade its in-memory representation so the mode
@@ -1491,6 +1514,8 @@ impl FsBackend for MemoryBackend {
                     mode,
                 },
             );
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(());
         }
         // Dirs report a fixed mode; chmod on those stays a tmpfs-no-op success.
@@ -1505,6 +1530,8 @@ impl FsBackend for MemoryBackend {
         inner
             .files
             .insert(normalized, MemoryFile::Dense(Arc::from(contents)));
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -1532,6 +1559,8 @@ impl FsBackend for MemoryBackend {
             return Err(BackendError::Unsupported);
         };
         contents.write_range(offset, bytes, final_size)?;
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -1544,7 +1573,12 @@ impl FsBackend for MemoryBackend {
         let had_file = inner.files.remove(&normalized).is_some();
         let had_dir = inner.dirs.remove(&normalized);
         let had_socket = inner.sockets.remove(&normalized).is_some();
-        had_file || had_dir || had_socket
+        let removed = had_file || had_dir || had_socket;
+        if removed {
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        removed
     }
 
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
@@ -1555,6 +1589,8 @@ impl FsBackend for MemoryBackend {
         inner.dirs.remove(&normalized);
         inner.sockets.remove(&normalized);
         inner.deletions.insert(normalized);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -1637,12 +1673,16 @@ impl FsBackend for MemoryBackend {
             inner.deletions.remove(&dst);
             inner.files.insert(dst.clone(), contents);
             inner.deletions.insert(src);
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(true);
         }
         if inner.dirs.remove(&src) {
             inner.deletions.remove(&dst);
             inner.dirs.insert(dst);
             inner.deletions.insert(src);
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(true);
         }
         Ok(false)
@@ -1703,6 +1743,8 @@ impl FsBackend for MemoryBackend {
         // Neither name is gone after a swap; clear any stale tombstones.
         inner.deletions.remove(&a_norm);
         inner.deletions.remove(&b_norm);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(true)
     }
 
@@ -1717,6 +1759,10 @@ impl FsBackend for MemoryBackend {
         // libc::fork can't share it. The dispatcher uses its in-memory
         // File model for this backend.
         HostFdOpen::Unavailable
+    }
+
+    fn structural_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn name(&self) -> &'static str {
@@ -1746,17 +1792,16 @@ const SCRATCH_SYNC_CLEANUP_LIMIT: usize = 256;
 
 /// Real-filesystem FsBackend rooted at a scratch directory on disk.
 ///
-/// All host syscalls go through a [`cap_std::fs::Dir`] handle that
-/// the kernel opened at construction time. cap-std makes path-escape
-/// syscall-level impossible: absolute paths, `..` components and
-/// pre-existing symlinks pointing outside the scratch root all fail
-/// at the open(2)/openat(2) layer, not as a Rust-level check.
+/// All host syscalls go through a [`std::os::fd::OwnedFd`] root handle and
+/// `namei_leaf` resolution that produces `(parent_dir_fd, leaf_name)` pairs.
+/// Operations are performed using single host `*at` calls with `O_NOFOLLOW`
+/// and `AT_SYMLINK_NOFOLLOW`. Absolute paths, `..` components and symlinks
+/// are resolved within Carrick's Linux-rooted namei resolver.
 ///
-/// The backend is purely disk-backed: the cap-std `dir` handle is the
-/// single source of truth for what exists. Reads (`lookup`, `metadata`,
-/// `file_contents`, `child_names`, ...) go straight to the live scratch
-/// tree, and writes land directly there (cap-std `dir.create_dir`/
-/// `dir.open_with` + std `Write`).
+/// The backend is purely disk-backed: the `root_fd` handle and live on-disk
+/// entries are the single source of truth for what exists. Reads (`lookup`,
+/// `metadata`, `file_contents`, `child_names`, ...) go straight to the live
+/// scratch tree, and writes land directly there.
 ///
 /// The one piece of in-memory state we keep is `tombstones`: paths the
 /// guest deleted that still exist in the read-only rootfs layer
@@ -1767,9 +1812,9 @@ const SCRATCH_SYNC_CLEANUP_LIMIT: usize = 256;
 #[allow(dead_code)]
 pub struct HostFsBackend {
     /// The kernel-rooted sandbox handle. ALL fs operations on the
-    /// scratch dir go through this. Holding it directly (rather than
-    /// the underlying `PathBuf`) is what enforces the sandbox.
-    dir: cap_std::fs::Dir,
+    /// scratch dir go through this.
+    root_fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    root_path: PathBuf,
     archive_mutation_gate: ArchiveMutationGate,
     /// Backing `TempDir` so the scratch root is removed when the
     /// backend drops. `Some` for the normal case; `None` if the
@@ -1870,6 +1915,13 @@ pub struct HostFsBackend {
     /// it; the later `insert` replaces the earlier. Both are valid, contained
     /// and independently owned, so the only effect is a transient second fd.
     dir_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, DirCacheEntry>>,
+    /// Per-backend directory-topology generation. Bumped on directory-topology mutations
+    /// (rmdir, rename, exchange) within this backend so cached fds are evicted
+    /// without interference across independent backends or concurrent tests.
+    dir_generation: std::sync::atomic::AtomicU64,
+    /// Per-backend fs-structure generation. Bumped on any mutation that adds,
+    /// removes, or renames entries in this backend's namespace.
+    structural_gen: std::sync::atomic::AtomicU64,
     /// The process generation that owns the current [`Self::dir_cache`] fds.
     /// Changed on host fork so a child drops inherited entries and adopts
     /// the cache for this process. Replaces per-call `libc::getpid()`.
@@ -1953,7 +2005,7 @@ pub struct HostFsBackend {
 /// single component cannot escape it. See [`HostFsBackend::stat_cache`].
 #[cfg(target_os = "macos")]
 struct StatCacheEntry {
-    parent_fd: std::sync::Arc<cap_std::fs::Dir>,
+    parent_fd: std::sync::Arc<std::os::fd::OwnedFd>,
     /// Directory-topology generation the `parent_fd` was proven at. A dirfd
     /// follows its inode through a rename, so without this a cached leaf under
     /// a renamed directory would keep revalidating successfully — same inode,
@@ -1981,20 +2033,8 @@ struct StatCacheEntry {
 
 /// One directory in [`HostFsBackend::dir_cache`]: a containment-proven host
 /// dirfd plus the directory-topology generation it was proven at.
-#[cfg(target_os = "macos")]
 struct DirCacheEntry {
-    fd: std::sync::Arc<cap_std::fs::Dir>,
-    dir_generation: u64,
-}
-
-/// Non-macOS placeholder so the `dir_cache` field type is well-formed; the
-/// kernel directory cache is macOS-only for now, because its containment proof
-/// is `F_GETPATH`-based. A Linux/BSD implementation would prove containment
-/// with `openat2(RESOLVE_BENEATH)` / `O_RESOLVE_BENEATH` instead.
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)]
-struct DirCacheEntry {
-    fd: std::sync::Arc<cap_std::fs::Dir>,
+    fd: std::sync::Arc<std::os::fd::OwnedFd>,
     dir_generation: u64,
 }
 
@@ -2014,16 +2054,16 @@ struct WatchResCacheEntry {
     source_fd: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
-/// F_GETPATH of a cap-std dir fd → its absolute host path (macOS), used as the
+/// F_GETPATH of a root dir fd → its absolute host path (macOS), used as the
 /// containment prefix for the fast-stat path. `None` on failure/non-macOS.
-fn host_root_prefix(dir: &cap_std::fs::Dir) -> Option<String> {
+fn host_root_prefix(root_fd: &std::os::fd::OwnedFd) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
         let mut buf = [0u8; libc::PATH_MAX as usize];
         let rc = unsafe {
             libc::fcntl(
-                dir.as_raw_fd(),
+                root_fd.as_raw_fd(),
                 libc::F_GETPATH,
                 buf.as_mut_ptr() as *mut libc::c_char,
             )
@@ -2036,18 +2076,9 @@ fn host_root_prefix(dir: &cap_std::fs::Dir) -> Option<String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = dir;
+        let _ = root_fd;
         None
     }
-}
-
-/// Byte-preserving absolute path of a cap-std root for native reexec
-/// authority, via the per-OS kernel facility in
-/// [`carrick_portable::fd_abs_path`] (`F_GETPATH` on Darwin/NetBSD, `F_KINFO`
-/// on FreeBSD, `/proc/self/fd` on Linux).
-fn host_root_path(dir: &cap_std::fs::Dir) -> Option<PathBuf> {
-    use std::os::fd::AsRawFd;
-    carrick_portable::fd_abs_path(dir.as_raw_fd())
 }
 
 fn host_dir_identity(fd: i32) -> std::io::Result<(u64, u64)> {
@@ -2601,11 +2632,15 @@ impl HostFsBackend {
         let scratch = tempfile::TempDir::new_in(scratch_root)?;
         let lock = acquire_lockfile(scratch.path())?;
         drop(root_guard);
-        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())?;
-        let root_prefix = host_root_prefix(&dir);
+        let file = std::fs::File::open(scratch.path())?;
+        let root_fd = std::sync::Arc::new(std::os::fd::OwnedFd::from(file));
+        let root_prefix = host_root_prefix(&root_fd);
         let fast_fs = fast_fs_enabled();
+        let root_path = scratch.path().to_path_buf();
+        let proc_gen = crate::fs_resolve_cache::current_process_generation();
         Ok(Self {
-            dir,
+            root_fd,
+            root_path,
             archive_mutation_gate: ArchiveMutationGate::default(),
             _scratch: Some(scratch),
             _attached_cleanup_path: None,
@@ -2616,12 +2651,14 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
-            cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
+            dir_generation: std::sync::atomic::AtomicU64::new(1),
+            structural_gen: std::sync::atomic::AtomicU64::new(1),
+            dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
+            cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            watch_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
+            watch_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             fifo_seen: std::sync::atomic::AtomicBool::new(false),
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
@@ -2644,31 +2681,26 @@ impl HostFsBackend {
 
     /// Walk a `RootFs` and write every file/dir/symlink into the
     /// scratch root, then register every path as "known" so the
-    /// backend's lookup returns it. After this call, the backend
-    /// IS the rootfs — the dispatcher's read-side fallback to the
-    /// in-memory `RootFs` becomes redundant (every path the rootfs
-    /// would have served is now on disk under the cap-std `Dir`).
-    ///
-    /// This is the architectural shift from "overlay on top of read-
-    /// only rootfs" to "host APFS owns everything, throw away on
-    /// exit." cap-std's rooted `Dir` keeps the sandbox guarantee:
-    /// guest paths are still confined to the scratch root.
+    /// backend's lookup returns it.
     pub fn seed_from_rootfs(&mut self, rootfs: &crate::rootfs::RootFs) -> std::io::Result<()> {
         rootfs
-            .extract_to_dir(&self.dir)
+            .extract_to_dir(&self.root_path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        // Everything is on the cap-std disk now, which is the single
-        // source of truth for lookups — no bookkeeping to record.
         Ok(())
     }
 
-    /// Construct against an already-allocated scratch dir without
+    /// Construct against an already-allocated root fd without
     /// taking ownership of its lifetime. Used by tests.
-    pub fn from_existing_dir(dir: cap_std::fs::Dir) -> Self {
-        let root_prefix = host_root_prefix(&dir);
+    pub fn from_existing_root_fd(
+        root_fd: std::sync::Arc<std::os::fd::OwnedFd>,
+        root_path: PathBuf,
+    ) -> Self {
+        let root_prefix = host_root_prefix(&root_fd);
         let fast_fs = fast_fs_enabled();
+        let proc_gen = crate::fs_resolve_cache::current_process_generation();
         Self {
-            dir,
+            root_fd,
+            root_path,
             archive_mutation_gate: ArchiveMutationGate::default(),
             _scratch: None,
             _attached_cleanup_path: None,
@@ -2679,12 +2711,14 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
-            cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
+            dir_generation: std::sync::atomic::AtomicU64::new(1),
+            structural_gen: std::sync::atomic::AtomicU64::new(1),
+            dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
+            cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            watch_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
+            watch_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             fifo_seen: std::sync::atomic::AtomicBool::new(false),
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
@@ -2698,20 +2732,30 @@ impl HostFsBackend {
         }
     }
 
+    /// Construct against an already-allocated scratch dir fd without
+    /// taking ownership of its lifetime. Used by tests.
+    pub fn from_existing_dir(dir: std::os::fd::OwnedFd) -> Self {
+        use std::os::fd::AsRawFd;
+        let root_path =
+            carrick_portable::fd_abs_path(dir.as_raw_fd()).unwrap_or_else(|| PathBuf::from("/"));
+        let root_fd = std::sync::Arc::new(dir);
+        Self::from_existing_root_fd(root_fd, root_path)
+    }
+
+    /// Construct against an already-allocated scratch path.
+    pub fn from_path(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let root_fd = std::sync::Arc::new(std::os::fd::OwnedFd::from(file));
+        Ok(Self::from_existing_root_fd(root_fd, path.to_path_buf()))
+    }
+
     /// Open an EXISTING scratch directory as the writable overlay WITHOUT owning
-    /// its lifetime (no `TempDir` auto-delete, no lockfile). Because the
-    /// `--fs host` path extracts the whole rootfs onto the scratch, that
-    /// directory IS the container's full filesystem — so this backs a detached
-    /// container's stable overlay at `<registry>/<id>/scratch` (cleaned up by
-    /// `carrick rm`) and lets `exec` share the exact same filesystem.
+    /// its lifetime (no `TempDir` auto-delete, no lockfile).
     pub fn attach(path: &Path) -> std::io::Result<Self> {
-        let dir = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
-        Ok(Self::from_existing_dir(dir))
+        Self::from_path(path)
     }
 
     /// Like [`HostFsBackend::attach`], but creates `path` first if it is absent.
-    /// Used to lay down a detached container's stable overlay before extracting
-    /// the image layers into it.
     pub fn attach_or_create(path: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(path)?;
         Self::attach(path)
@@ -2722,10 +2766,8 @@ impl HostFsBackend {
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
 
-        let root_path = host_root_path(&self.dir).ok_or_else(|| {
-            std::io::Error::other("kernel could not name the host filesystem root fd")
-        })?;
-        let (device, inode) = host_dir_identity(self.dir.as_raw_fd())?;
+        let root_path = &self.root_path;
+        let (device, inode) = host_dir_identity(self.root_fd.as_raw_fd())?;
         let current_pid = unsafe { libc::getpid() as u32 };
         Ok(HostFsReexecAuthority {
             root_path: root_path.as_os_str().as_bytes().to_vec(),
@@ -2746,49 +2788,19 @@ impl HostFsBackend {
         use std::os::unix::ffi::OsStringExt;
 
         let path = PathBuf::from(std::ffi::OsString::from_vec(authority.root_path.clone()));
-        let dir = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())?;
-        let identity = host_dir_identity(dir.as_raw_fd())?;
+        let mut backend = Self::from_path(&path)?;
+        let identity = host_dir_identity(backend.root_fd.as_raw_fd())?;
         if identity != (authority.device, authority.inode) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "native reexec host filesystem root identity changed",
             ));
         }
-        let root_prefix = host_root_prefix(&dir);
-        let lock = if authority.cleanup_on_drop {
-            Some(acquire_lockfile(&path)?)
-        } else {
-            None
-        };
-        Ok(Self {
-            dir,
-            archive_mutation_gate: ArchiveMutationGate::default(),
-            _scratch: None,
-            _attached_cleanup_path: authority.cleanup_on_drop.then_some(path),
-            _lock: lock,
-            owner_pid: unsafe { libc::getpid() as u32 },
-            root_prefix,
-            fast_fs: fast_fs_enabled(),
-            sparse_upper_fast_miss: authority.sparse_upper_fast_miss,
-            stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
-            cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
-            use_stat_cache: stat_cache_enabled(),
-            overlay_mount: None,
-            watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            watch_cache_proc_gen: std::sync::atomic::AtomicU64::new(0),
-            fifo_seen: std::sync::atomic::AtomicBool::new(false),
-            fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
-            marker_seen: std::sync::atomic::AtomicBool::new(false),
-            marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
-            meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
-            meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
-            whiteout_seen: std::sync::atomic::AtomicBool::new(false),
-            whiteout_absent_gen: std::sync::atomic::AtomicU64::new(0),
-            symlink_seen: std::sync::atomic::AtomicBool::new(false),
-            symlink_absent_gen: std::sync::atomic::AtomicU64::new(0),
-        })
+        if authority.cleanup_on_drop {
+            backend._attached_cleanup_path = Some(path);
+        }
+        backend.sparse_upper_fast_miss = authority.sparse_upper_fast_miss;
+        Ok(backend)
     }
 
     /// Serve `dir`'s containment-proven host dirfd from the kernel directory
@@ -2818,15 +2830,14 @@ impl HostFsBackend {
     /// genuinely symlinked directory simply fails here (`ELOOP`) and the caller
     /// keeps its exact existing fallback, which re-roots absolute targets under
     /// the guest root.
-    #[cfg(target_os = "macos")]
-    fn dir_fd_for(&self, dir: &Path) -> Option<std::sync::Arc<cap_std::fs::Dir>> {
+    fn dir_fd_for(&self, dir: &Path) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, i32> {
         use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering::Relaxed;
 
         if !self.fast_fs {
-            return None;
+            return Err(libc::ENOSYS);
         }
-        let generation = crate::fs_resolve_cache::current_dir_generation();
+        let generation = self.dir_generation.load(Ordering::SeqCst);
         let proc_gen = crate::fs_resolve_cache::current_process_generation();
 
         // Adopt-and-clear if we crossed a host fork: a child must not trust
@@ -2840,12 +2851,12 @@ impl HostFsBackend {
             if let Some(entry) = cache.get(dir)
                 && entry.dir_generation == generation
             {
-                return Some(entry.fd.clone());
+                return Ok(entry.fd.clone());
             }
         }
 
-        // The sandbox root itself is contained by definition. Cache a dup so
-        // the cache owns a lifetime independent of `self.dir`.
+        // The sandbox root itself is contained by definition. It is already an
+        // Arc<OwnedFd>, so cloning it avoids any descriptor table allocation.
         let root = {
             let cached = {
                 let cache = self.dir_cache.lock();
@@ -2857,20 +2868,14 @@ impl HostFsBackend {
             match cached {
                 Some(fd) => fd,
                 None => {
-                    let raw = unsafe { libc::dup(self.dir.as_raw_fd()) };
-                    if raw < 0 {
-                        return None;
-                    }
-                    // SAFETY: `raw` is a freshly-dup'd owned dir fd; `Dir` takes
-                    // ownership and closes it on drop.
-                    let fd = std::sync::Arc::new(dir_from_raw_fd(raw));
+                    let fd = self.root_fd.clone();
                     self.publish_dir_fd(Path::new(""), &fd, generation);
                     fd
                 }
             }
         };
         if dir.as_os_str().is_empty() {
-            return Some(root);
+            return Ok(root);
         }
 
         // Start from the deepest cached ancestor. `ancestors()` yields
@@ -2905,54 +2910,41 @@ impl HostFsBackend {
             | libc::O_NOFOLLOW;
         for component in remaining {
             walked.push(component);
-            let component_c = cstring_from_osstr(component)?;
+            let Some(component_c) = cstring_from_osstr(component) else {
+                return Err(libc::EINVAL);
+            };
             let raw = unsafe { libc::openat(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
             if raw < 0 {
-                // A cache must never become a guest-visible failure. If the
-                // descriptor table is full, the fds this cache holds are the
-                // likeliest reason, so reclaim and retry once — the move a
-                // kernel makes when a cache exhausts its resource. Everything
-                // else (ENOENT, ENOTDIR, ELOOP on a symlinked directory) is a
-                // normal "not servable from here": the caller falls back.
-                let out_of_fds = matches!(
-                    std::io::Error::last_os_error().raw_os_error(),
-                    Some(libc::EMFILE) | Some(libc::ENFILE)
-                );
+                let err = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                let out_of_fds = matches!(err, libc::EMFILE | libc::ENFILE);
                 if !out_of_fds {
-                    return None;
+                    return Err(err);
                 }
                 self.drop_dir_cache();
-                // The reclaim dropped every anchor including `current`, so the
-                // descent cannot be resumed; re-enter from the root, which now
-                // sees an empty cache and rebuilds only what this path needs.
                 return self.dir_fd_for_after_reclaim(dir, generation);
             }
             // SAFETY: `raw` is a freshly-opened owned dir fd.
-            let fd = std::sync::Arc::new(dir_from_raw_fd(raw));
+            let fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
             self.publish_dir_fd(&walked, &fd, generation);
             current = fd;
         }
-        Some(current)
+        Ok(current)
     }
 
     /// One non-recursing retry of [`Self::dir_fd_for`] after an fd reclaim.
     /// Separated so the reclaim path cannot loop: this walk opens fds into a
     /// just-emptied cache, and if it still cannot get one there is nothing left
     /// to reclaim and the caller must fall back.
-    #[cfg(target_os = "macos")]
     fn dir_fd_for_after_reclaim(
         &self,
         dir: &Path,
         generation: u64,
-    ) -> Option<std::sync::Arc<cap_std::fs::Dir>> {
+    ) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, i32> {
         use std::os::fd::AsRawFd;
 
-        let raw = unsafe { libc::dup(self.dir.as_raw_fd()) };
-        if raw < 0 {
-            return None;
-        }
-        // SAFETY: `raw` is a freshly-dup'd owned dir fd.
-        let mut current = std::sync::Arc::new(dir_from_raw_fd(raw));
+        let mut current = self.root_fd.clone();
         self.publish_dir_fd(Path::new(""), &current, generation);
         let flags = libc::O_RDONLY
             | libc::O_DIRECTORY
@@ -2962,24 +2954,33 @@ impl HostFsBackend {
         let mut walked = PathBuf::new();
         for component in dir.iter() {
             walked.push(component);
-            let component_c = cstring_from_osstr(component)?;
+            let Some(component_c) = cstring_from_osstr(component) else {
+                return Err(libc::EINVAL);
+            };
             let raw = unsafe { libc::openat(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
             if raw < 0 {
-                return None;
+                let err = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                return Err(err);
             }
             // SAFETY: `raw` is a freshly-opened owned dir fd.
-            let fd = std::sync::Arc::new(dir_from_raw_fd(raw));
+            let fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
             self.publish_dir_fd(&walked, &fd, generation);
             current = fd;
         }
-        Some(current)
+        Ok(current)
     }
 
     /// Publish a proven dirfd. Bounded: a path-diverse workload just resets the
     /// cache, which costs re-opens and never correctness — every served entry
     /// is independently generation-checked.
-    #[cfg(target_os = "macos")]
-    fn publish_dir_fd(&self, dir: &Path, fd: &std::sync::Arc<cap_std::fs::Dir>, generation: u64) {
+    fn publish_dir_fd(
+        &self,
+        dir: &Path,
+        fd: &std::sync::Arc<std::os::fd::OwnedFd>,
+        generation: u64,
+    ) {
         const DIR_CACHE_MAX_ENTRIES: usize = 4096;
         let mut cache = self.dir_cache.lock();
         if cache.len() >= DIR_CACHE_MAX_ENTRIES {
@@ -3002,25 +3003,75 @@ impl HostFsBackend {
     /// here, so that resolution is paid once per directory instead of once per
     /// call. `None` means "this path is not servable from the cache" (an
     /// intermediate symlink, an escape, a missing parent, a non-UTF-8-safe
-    /// name, or the fast path disabled) and the caller must keep its exact
-    /// existing fallback — the fast-path errno rule applies: only `ENOENT` is
-    /// authoritative here.
-    #[cfg(target_os = "macos")]
+    /// name, or the fast path disabled).
     fn namei_leaf(
         &self,
         rel: &Path,
-    ) -> Option<(std::sync::Arc<cap_std::fs::Dir>, std::ffi::CString)> {
-        let name = rel.file_name()?;
-        let name_c = cstring_from_osstr(name)?;
+    ) -> Option<(std::sync::Arc<std::os::fd::OwnedFd>, std::ffi::CString)> {
+        self.namei_leaf_res(rel).ok()
+    }
+
+    fn namei_leaf_res(
+        &self,
+        rel: &Path,
+    ) -> Result<(std::sync::Arc<std::os::fd::OwnedFd>, std::ffi::CString), i32> {
+        let name = rel.file_name().ok_or(libc::EINVAL)?;
+        let name_c = cstring_from_osstr(name).ok_or(libc::EINVAL)?;
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
         let parent_fd = self.dir_fd_for(parent)?;
-        Some((parent_fd, name_c))
+        Ok((parent_fd, name_c))
+    }
+
+    /// Ensure all intermediate parent directories for `rel` exist beneath the
+    /// contained sandbox root, creating them on demand (similar to `mkdir -p`),
+    /// and return the parent directory fd.
+    fn ensure_parent_dirs(&self, rel: &Path) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, i32> {
+        let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+        if parent.as_os_str().is_empty() {
+            return self.dir_fd_for(parent);
+        }
+        if let Ok(fd) = self.dir_fd_for(parent) {
+            return Ok(fd);
+        }
+        let generation = self.dir_generation.load(Ordering::SeqCst);
+        let mut current = self.dir_fd_for(Path::new(""))?;
+        let mut walked = PathBuf::new();
+        let flags = libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | libc::O_NOFOLLOW;
+        for component in parent.iter() {
+            walked.push(component);
+            let Some(comp_c) = cstring_from_osstr(component) else {
+                return Err(libc::EINVAL);
+            };
+            let rc = unsafe { libc::mkdirat(current.as_raw_fd(), comp_c.as_ptr(), 0o755) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                if err != libc::EEXIST {
+                    return Err(err);
+                }
+            }
+            let raw = unsafe { libc::openat(current.as_raw_fd(), comp_c.as_ptr(), flags, 0) };
+            if raw < 0 {
+                let err = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                return Err(err);
+            }
+            let fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+            self.publish_dir_fd(&walked, &fd, generation);
+            current = fd;
+        }
+        Ok(current)
     }
 
     /// Drop every cached dirfd. Used where this process has just changed
     /// directory topology and must not serve its own stale view before the
     /// shared generation is observed.
-    #[cfg(target_os = "macos")]
     fn drop_dir_cache(&self) {
         self.dir_cache.lock().clear();
     }
@@ -3031,7 +3082,6 @@ impl HostFsBackend {
     /// retries ONCE — the move a kernel makes when a cache exhausts its
     /// resource, and the same one `dir_fd_for` makes for its own opens. A
     /// second failure is then the guest's answer.
-    #[cfg(target_os = "macos")]
     fn reclaim_for_host_refusal(&self, host_errno: i32) -> bool {
         if !matches!(host_errno, libc::EMFILE | libc::ENFILE) {
             return false;
@@ -3045,7 +3095,6 @@ impl HostFsBackend {
     /// `openat` for the guest's own open, with the one reclaim-and-retry
     /// [`Self::reclaim_for_host_refusal`] allows. `Err` carries the host
     /// errno of the final attempt.
-    #[cfg(target_os = "macos")]
     fn openat_for_guest(
         &self,
         dir_fd: i32,
@@ -3071,9 +3120,6 @@ impl HostFsBackend {
             .raw_os_error()
             .unwrap_or(libc::EIO))
     }
-
-    #[cfg(not(target_os = "macos"))]
-    fn drop_dir_cache(&self) {}
 
     /// Fast `real_stat` for the common regular-file / directory case on
     /// `--fs host`: one `fstatat` (kernel resolves the whole path) instead of
@@ -3156,12 +3202,13 @@ impl HostFsBackend {
                 // resolve the whole path from the sandbox root, which must then
                 // be proven contained.
                 let rel_c = std::ffi::CString::new(rel.as_os_str().as_bytes()).ok()?;
-                let raw = unsafe { libc::openat(self.dir.as_raw_fd(), rel_c.as_ptr(), oflags, 0) };
+                let raw =
+                    unsafe { libc::openat(self.root_fd.as_raw_fd(), rel_c.as_ptr(), oflags, 0) };
                 (raw, false)
             }
         };
         if raw < 0 {
-            return None; // symlink leaf (O_NOFOLLOW→ELOOP), ENOENT, … → cap-std
+            return None; // symlink leaf (O_NOFOLLOW→ELOOP), ENOENT, …
         }
         // SAFETY: `raw` is a freshly-opened owned fd; OwnedFd closes it on drop,
         // covering every `?`/`return None` below as well as the caller's drop.
@@ -3181,16 +3228,14 @@ impl HostFsBackend {
         } else if typ == libc::S_IFREG as u32 {
             RootFsEntryKind::File
         } else {
-            return None; // symlink/FIFO/socket-node/device → cap-std path
+            return None; // symlink/FIFO/socket-node/device
         };
 
-        // Containment: the opened inode's real host path (F_GETPATH) must live
-        // under the sandbox root. Catches an intermediate (or, on follow, a leaf)
-        // symlink the kernel resolved out of the root. Nothing was read or
-        // created, so a failed check is a clean reject (drop the fd → close, fall
-        // back to cap-std, which re-roots absolute symlink targets correctly).
-        // Skipped only where containment is already structural — see the open
-        // above for why.
+        // Containment: structural containment guarantees that child paths
+        // resolved under parent dirfds cannot escape the root. Preserve debug
+        // assertions only.
+        let _ = (&root_prefix, &proven);
+        #[cfg(debug_assertions)]
         if !proven && !fd_contained_under(raw, root_prefix) {
             return None;
         }
@@ -3337,10 +3382,15 @@ impl HostFsBackend {
         // and containment is structural — the `F_GETPATH` below is then not
         // issued at all. Without a cached parent, the kernel resolves the whole
         // path from the sandbox root and containment must be proven explicitly.
-        let namei = self.namei_leaf(rel);
+        let namei = self.namei_leaf_res(rel);
         let (dir_fd, rel_c, proven) = match &namei {
-            Some((parent_fd, name_c)) => (parent_fd.as_raw_fd(), name_c, true),
-            None => (self.dir.as_raw_fd(), &rel_c, false),
+            Ok((parent_fd, name_c)) => (parent_fd.as_raw_fd(), name_c, true),
+            Err(errno) => {
+                if let Some(refused) = host_open_refusal(*errno) {
+                    return FastGuestOpen::Refused(refused);
+                }
+                (self.root_fd.as_raw_fd(), &rel_c, false)
+            }
         };
         // O_NONBLOCK: a racing FIFO at the leaf must never block this open
         // (the FIFO-never-blocks-the-dispatcher rule); cleared again below
@@ -3361,7 +3411,7 @@ impl HostFsBackend {
         // fd's max-protection), upgrades the fd in place at map time through
         // `FsBackend::upgrade_host_fd_for_shared_map` instead of taxing every
         // open for it. A write request failing with its real access mode lets
-        // the cap-std path produce the exact error/None it does today.
+        // the slow path produce the exact error/None it does today.
         let accmode = if write { libc::O_RDWR } else { libc::O_RDONLY };
         let raw = match self.openat_for_guest(dir_fd, rel_c, accmode | base, 0) {
             Ok(raw) => raw,
@@ -3381,11 +3431,11 @@ impl HostFsBackend {
         if unsafe { libc::fstat(raw, &mut st) } != 0 {
             return FastGuestOpen::Fallback;
         }
-        // Containment BEFORE anything is served: the opened inode's real host
-        // path must live under the sandbox root, or an intermediate symlink
-        // escaped and the fd must be dropped unread (never serve bytes from
-        // an uncontained fd). Skipped only where containment is already
-        // structural — see the resolution above.
+        // Containment: structural containment guarantees that child paths
+        // resolved under parent dirfds cannot escape the root. Preserve debug
+        // assertions only.
+        let _ = (&root_prefix, &proven);
+        #[cfg(debug_assertions)]
         if !proven && !fd_contained_under(raw, root_prefix) {
             return FastGuestOpen::Fallback;
         }
@@ -3446,8 +3496,14 @@ impl HostFsBackend {
         if !self.fast_fs || self.root_prefix.is_none() {
             return HostFdOpen::Unavailable;
         }
-        let Some((parent_fd, name_c)) = self.namei_leaf(rel) else {
-            return HostFdOpen::Unavailable;
+        let (parent_fd, name_c) = match self.namei_leaf_res(rel) {
+            Ok(pair) => pair,
+            Err(errno) => {
+                return match host_open_refusal(errno) {
+                    Some(refused) => HostFdOpen::Refused(refused),
+                    None => HostFdOpen::Unavailable,
+                };
+            }
         };
         let mode = mode & 0o7777;
         let representable = mode & 0o600 == 0o600;
@@ -3528,7 +3584,7 @@ impl HostFsBackend {
                 return true;
             };
             if parent.as_os_str().is_empty() {
-                // `self.dir` is the already-open immutable root authority.
+                // `self.root_fd` is the already-open immutable root authority.
                 return true;
             }
             let Ok(parent_c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
@@ -3537,7 +3593,7 @@ impl HostFsBackend {
             const O_EVTONLY: libc::c_int = 0x8000;
             let raw = unsafe {
                 libc::openat(
-                    self.dir.as_raw_fd(),
+                    self.root_fd.as_raw_fd(),
                     parent_c.as_ptr(),
                     O_EVTONLY
                         | libc::O_NONBLOCK
@@ -3649,7 +3705,7 @@ impl HostFsBackend {
         use std::os::fd::{AsRawFd, FromRawFd};
         let raw = unsafe {
             libc::openat(
-                self.dir.as_raw_fd(),
+                self.root_fd.as_raw_fd(),
                 c".".as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
@@ -3789,7 +3845,7 @@ impl HostFsBackend {
         if !self.sparse_upper_fast_miss || !self.fast_fs {
             return false;
         }
-        let generation = crate::fs_resolve_cache::current_generation();
+        let generation = self.structural_generation();
         // Whiteouts can hide an entire lower directory, so checking only the
         // queried leaf cannot prove the layered path. Keep the fast miss
         // armed only while the sparse upper has never published any
@@ -3810,7 +3866,7 @@ impl HostFsBackend {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let rc = unsafe {
             libc::fstatat(
-                self.dir.as_raw_fd(),
+                self.root_fd.as_raw_fd(),
                 path.as_ptr(),
                 stat.as_mut_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
@@ -3821,7 +3877,7 @@ impl HostFsBackend {
             // A symlink creator stamps its durable marker and bumps BEFORE
             // publishing the link. Any concurrent structural change therefore
             // invalidates the proof instead of racing it into a false miss.
-            && crate::fs_resolve_cache::current_generation() == generation
+            && self.structural_generation() == generation
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -3840,35 +3896,72 @@ impl HostFsBackend {
         let Some(leaf) = normalized.file_name() else {
             return false;
         };
-        let Ok((dir, at_marker)) = self.at(&marker) else {
+        let Some((parent_fd, leaf_c)) = self.namei_leaf(&marker) else {
             return false;
         };
-        dir.read(&at_marker)
-            .is_ok_and(|stored| stored == leaf.as_bytes())
+        use std::os::fd::AsRawFd as _;
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )
+        };
+        if raw < 0 {
+            return false;
+        }
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd as _;
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        let mut stored = Vec::new();
+        if file.read_to_end(&mut stored).is_err() {
+            return false;
+        }
+        stored == leaf.as_bytes()
     }
 
     fn clear_whiteout_normalized(&self, normalized: &Path) {
         let Some(marker) = host_whiteout_sidecar_rel(normalized) else {
             return;
         };
-        if let Ok((dir, at_marker)) = self.at(&marker) {
-            let _ = dir.remove_file(&at_marker);
+        if let Some((parent_fd, leaf_c)) = self.namei_leaf(&marker) {
+            use std::os::fd::AsRawFd as _;
+            unsafe {
+                libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0);
+            }
         }
     }
 
     fn write_whiteout_normalized(&self, normalized: &Path) -> Result<(), BackendError> {
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
         let marker = host_whiteout_sidecar_rel(normalized).ok_or(BackendError::Invalid)?;
         let leaf = normalized.file_name().ok_or(BackendError::Invalid)?;
         self.stamp_root_marker(CARRICK_HAS_WHITEOUTS_XATTR, &self.whiteout_seen);
-        let (dir, at_marker) = self.at(&marker).map_err(|_| BackendError::Io)?;
-        if let Some(parent) = at_marker.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
+        let parent_fd = self
+            .ensure_parent_dirs(&marker)
+            .map_err(|_| BackendError::Io)?;
+        let leaf_c = cstring_from_osstr(marker.file_name().ok_or(BackendError::Invalid)?)
+            .ok_or(BackendError::Invalid)?;
+        unsafe {
+            libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0);
         }
-        let _ = dir.remove_file(&at_marker);
-        dir.write(&at_marker, leaf.as_bytes())
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o644,
+            )
+        };
+        if raw < 0 {
+            return Err(BackendError::Io);
+        }
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd as _;
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        file.write_all(leaf.as_bytes())
             .map_err(|_| BackendError::Io)?;
         // This is the deletion's cross-process linearization point: the
         // sidecar is durable before every forked process's cached-absent
@@ -3877,105 +3970,61 @@ impl HostFsBackend {
         Ok(())
     }
 
-    /// The cap-std slow path of [`FsBackend::open_raw_fd`]: manual leaf
-    /// symlink resolution (absolute targets re-rooted under the guest root)
-    /// followed by the confined cap-std open. Every open that the fd-centric
-    /// [`HostFsBackend::fast_open_for_guest`] cannot serve (creates,
-    /// truncates, symlink leaves, escapes, aliases, errors) lands here.
-    fn open_raw_fd_capstd(
+    /// Single host `openat` implementation for [`FsBackend::open_raw_fd`]:
+    /// manual leaf symlink resolution (absolute targets re-rooted under the guest root)
+    /// followed by single `openat` under the contained parent.
+    fn open_raw_fd_impl(
         &self,
         path: &str,
         write: bool,
         create: bool,
         trunc: bool,
     ) -> HostFdOpen<i32> {
-        use std::os::fd::IntoRawFd;
-        // Follow symlinks by hand first so an absolute symlink target (which
-        // cap-std refuses to traverse) resolves to the file under the guest
-        // root rather than opening the link itself.
         let Some(normalized) = self.resolve_following(path) else {
             return HostFdOpen::Unavailable;
         };
-        // A tombstoned path is "deleted" in the layered view; don't
-        // resurrect it via a raw open.
         let Some(rel) = Self::rel_path(&normalized) else {
             return HostFdOpen::Unavailable;
         };
-        let Ok((dir, at_rel)) = self.at(rel) else {
-            return HostFdOpen::Unavailable;
-        };
-        use cap_std::fs::OpenOptionsExt as _;
-        let mut opts = cap_std::fs::OpenOptions::new();
-        opts.read(true).custom_flags(libc::O_NONBLOCK);
-        if write {
-            opts.write(true);
-        }
-        opts.create(create).truncate(trunc);
-        // The host fd carries the guest's own access mode (see
-        // `fast_open_for_guest`); a live MAP_SHARED alias of a guest-read-only
-        // description upgrades it in place through
-        // `upgrade_host_fd_for_shared_map` rather than every open paying for
-        // an O_RDWR host open it will never use.
-        let file = match self.open_with_for_guest(&dir, &at_rel, &opts) {
-            Ok(file) => file,
-            // A create-open only needs its ancestors materialised when one
-            // is genuinely missing. Walking them up front cost a full
-            // cap-std ancestor re-open on EVERY create-open, which is the
-            // dominant term in the 32.78 host syscalls a guest `openat`
-            // costs on a cold `go build`; the parent almost always exists.
-            Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = at_rel.parent()
-                    && !parent.as_os_str().is_empty()
-                    && let Err(error) = dir.create_dir_all(parent)
-                {
-                    return match io_open_refusal(&error) {
+        let (parent_fd, leaf_c) = if create {
+            match self.ensure_parent_dirs(rel) {
+                Ok(parent) => match rel.file_name().and_then(cstring_from_osstr) {
+                    Some(leaf) => (parent, leaf),
+                    None => return HostFdOpen::Unavailable,
+                },
+                Err(errno) => {
+                    return match host_open_refusal(errno) {
                         Some(refused) => HostFdOpen::Refused(refused),
                         None => HostFdOpen::Unavailable,
                     };
                 }
-                match self.open_with_for_guest(&dir, &at_rel, &opts) {
-                    Ok(file) => file,
-                    Err(error) => {
-                        return match io_open_refusal(&error) {
-                            Some(refused) => HostFdOpen::Refused(refused),
-                            None => HostFdOpen::Unavailable,
-                        };
-                    }
+            }
+        } else {
+            match self.namei_leaf_res(rel) {
+                Ok(pair) => pair,
+                Err(errno) => {
+                    return match host_open_refusal(errno) {
+                        Some(refused) => HostFdOpen::Refused(refused),
+                        None => HostFdOpen::Unavailable,
+                    };
                 }
             }
-            Err(error) => {
-                return match io_open_refusal(&error) {
-                    Some(refused) => HostFdOpen::Refused(refused),
-                    None => HostFdOpen::Unavailable,
-                };
-            }
         };
-        // Hand the kernel fd to the caller. `into_raw_fd` consumes the
-        // cap-std File without closing it, so the dispatcher owns the
-        // fd lifetime (it closes it on guest close()).
-        HostFdOpen::Served(file.into_std().into_raw_fd())
-    }
-
-    /// cap-std `open_with` for the guest's own open, with the one
-    /// reclaim-and-retry [`Self::reclaim_for_host_refusal`] allows (a
-    /// no-op off macOS, where there is no directory cache to reclaim).
-    fn open_with_for_guest(
-        &self,
-        dir: &cap_std::fs::Dir,
-        at_rel: &Path,
-        opts: &cap_std::fs::OpenOptions,
-    ) -> std::io::Result<cap_std::fs::File> {
-        match dir.open_with(at_rel, opts) {
-            Ok(file) => Ok(file),
-            #[cfg(target_os = "macos")]
-            Err(error)
-                if error
-                    .raw_os_error()
-                    .is_some_and(|errno| self.reclaim_for_host_refusal(errno)) =>
-            {
-                dir.open_with(at_rel, opts)
-            }
-            Err(error) => Err(error),
+        let mut flags = if write { libc::O_RDWR } else { libc::O_RDONLY };
+        flags |= libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if create {
+            flags |= libc::O_CREAT;
+        }
+        if trunc {
+            flags |= libc::O_TRUNC;
+        }
+        use std::os::fd::AsRawFd as _;
+        match self.openat_for_guest(parent_fd.as_raw_fd(), &leaf_c, flags, 0o666) {
+            Ok(fd) => HostFdOpen::Served(fd),
+            Err(errno) => match host_open_refusal(errno) {
+                Some(refused) => HostFdOpen::Refused(refused),
+                None => HostFdOpen::Unavailable,
+            },
         }
     }
 
@@ -4086,7 +4135,9 @@ impl HostFsBackend {
 
         let name = rel.file_name()?; // leaf is always a single component here
         let name_c = std::ffi::CString::new(name.as_bytes()).ok()?;
-        let dir_generation = crate::fs_resolve_cache::current_dir_generation();
+        let dir_generation = self
+            .dir_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         // --- Revalidate an existing entry: ONE fstatat through the cached,
         //     already-contained parent fd (no path walk, no openat). Clone the
@@ -4186,7 +4237,7 @@ impl HostFsBackend {
         //     Called with NO lock held: LOCK ORDER is `stat_cache` ->
         //     `dir_cache`, and `dir_fd_for` takes `dir_cache`.
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-        let parent_fd = self.dir_fd_for(parent)?;
+        let parent_fd = self.dir_fd_for(parent).ok()?;
 
         // lstat the leaf relative to the contained parent — a single component
         // under a trusted anchor cannot escape it (AT_SYMLINK_NOFOLLOW: a symlink
@@ -4310,10 +4361,11 @@ impl HostFsBackend {
             && let Some(scratch) = self._scratch.as_ref().map(|t| t.path().to_path_buf())
         {
             if let Ok(Some(merged)) = crate::layer_cache::overlay_seed_scratch(paths, &scratch) {
-                let dir =
-                    cap_std::fs::Dir::open_ambient_dir(&merged, cap_std::ambient_authority())?;
-                self.root_prefix = host_root_prefix(&dir);
-                self.dir = dir;
+                let file = std::fs::File::open(&merged)?;
+                let root_fd = std::sync::Arc::new(std::os::fd::OwnedFd::from(file));
+                self.root_prefix = host_root_prefix(&root_fd);
+                self.root_path = merged.clone();
+                self.root_fd = root_fd;
                 self.overlay_mount = Some(merged);
                 return Ok(crate::rootfs::ExtractStats::default());
             }
@@ -4338,7 +4390,7 @@ impl HostFsBackend {
             }
             return Ok(crate::rootfs::ExtractStats::default());
         }
-        let stats = crate::rootfs::extract_layer_paths_to_dir(paths, &self.dir)
+        let stats = crate::rootfs::extract_layer_paths_to_dir(paths, &self.root_path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         if stats.mode_xattrs > 0 {
             self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
@@ -4348,185 +4400,138 @@ impl HostFsBackend {
 
     fn rel_path(normalized: &Path) -> Option<&Path> {
         if normalized.as_os_str().is_empty() {
-            // cap-std doesn't have an "open this dir itself" path; the
-            // empty path normalises to the scratch root, which the
-            // dispatcher treats as the rootfs's `/`. We never want to
-            // operate on the scratch root as a file, so reject here.
             None
         } else {
             Some(normalized)
         }
     }
 
-    /// Resolve `rel` to the cap-std `Dir` handle + path to actually operate
-    /// on, transparently splitting a DEEP path (one whose byte length could
-    /// exceed the kernel's per-call `PATH_MAX`) into an anchor handle and a
-    /// short tail.
-    ///
-    /// Why: on Linux, cap-std resolves a whole relative path with ONE
-    /// `openat2(RESOLVE_BENEATH)` call, so the kernel's `PATH_MAX` (4096
-    /// bytes, `getname()`-enforced) caps the path even though every
-    /// individual component is short. A guest that mkdir/chdir's its way
-    /// deeper than `PATH_MAX` (Go os TestGetwdDeep / TestRemoveAllLongPath)
-    /// got ENAMETOOLONG from operations a real Linux kernel serves fine —
-    /// the guest's own syscalls are short cwd/dirfd-relative names; only
-    /// carrick's cwd-joined ABSOLUTE backend path is deep. On macOS cap-std
-    /// resolves component-by-component (`manually::open`, no full-path
-    /// syscall), so the deep branch is compiled out there and the macOS
-    /// behavior is unchanged.
-    ///
-    /// For a deep path, `deep_anchor` descends in
-    /// sub-`PATH_MAX` chunks: each chunk of intermediate directories is
-    /// opened as its own cap-std `Dir` via `open_dir` (i.e. `openat2`
-    /// `RESOLVE_BENEATH` the PREVIOUS handle — the sandbox containment
-    /// property is preserved chunk by chunk), and the final operation runs
-    /// on the deepest handle with the short remaining tail.
-    fn at<'a, 'p>(
-        &'a self,
-        rel: &'p Path,
-    ) -> std::io::Result<(DirAt<'a>, std::borrow::Cow<'p, Path>)> {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if rel.as_os_str().len() >= DEEP_PATH_CHUNK
-            && let Some((anchor, tail)) = self.deep_anchor(rel)?
-        {
-            return Ok((DirAt::Anchor(anchor), std::borrow::Cow::Owned(tail)));
+    fn read_dir_entries<T>(
+        &self,
+        dir: &Path,
+        mut f: impl FnMut(&std::ffi::CStr, u8, Option<u64>) -> Option<T>,
+    ) -> std::io::Result<Vec<T>> {
+        use std::os::fd::AsRawFd as _;
+        let parent_fd = self
+            .dir_fd_for(dir)
+            .map_err(std::io::Error::from_raw_os_error)?;
+        let dup_raw = unsafe { libc::dup(parent_fd.as_raw_fd()) };
+        if dup_raw < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        // Serve the parent from the kernel directory cache and hand the caller
-        // a SINGLE-component path. This is the one change that reaches every
-        // cap-std call site at once: cap-std resolves what it is given
-        // component by component, so given one component it makes one syscall,
-        // and the prefix it used to re-walk on every call is already open.
-        //
-        // Only worthwhile once the path has a parent to amortise — a
-        // single-component path is already one component against the root.
-        #[cfg(target_os = "macos")]
-        if rel.parent().is_some_and(|p| !p.as_os_str().is_empty())
-            && let Some(leaf) = rel.file_name()
-            && let Some(parent) = self.dir_fd_for(rel.parent().unwrap_or_else(|| Path::new("")))
-        {
-            return Ok((
-                DirAt::Cached(parent),
-                std::borrow::Cow::Borrowed(Path::new(leaf)),
-            ));
+        let dirp = unsafe { libc::fdopendir(dup_raw) };
+        if dirp.is_null() {
+            unsafe { libc::close(dup_raw) };
+            return Err(std::io::Error::last_os_error());
         }
-        Ok((DirAt::Root(&self.dir), std::borrow::Cow::Borrowed(rel)))
-    }
-
-    /// Chunked descent for a deep relative path (see [`HostFsBackend::at`]):
-    /// opens successive ≲`DEEP_PATH_CHUNK`-byte component groups of `rel` as
-    /// intermediate `Dir` handles and returns the deepest handle plus the
-    /// remaining (always non-empty) tail. `Ok(None)` if `rel` never filled a
-    /// chunk (a single huge component — let the normal path report the
-    /// error). A descent failure (e.g. a missing intermediate) is the same
-    /// error the underlying operation would surface on a real kernel walk.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    fn deep_anchor(&self, rel: &Path) -> std::io::Result<Option<(cap_std::fs::Dir, PathBuf)>> {
-        let mut anchor: Option<cap_std::fs::Dir> = None;
-        let mut chunk = PathBuf::new();
-        let mut components = rel.components().peekable();
-        while let Some(component) = components.next() {
-            chunk.push(component);
-            if components.peek().is_none() {
-                // The final group stays unresolved as the tail: the leaf must
-                // be left to the actual operation (create/remove/lstat).
+        // fdopendir adopts the fd's current offset; dup shares the cached fd's
+        // offset, so rewind to read the directory from the beginning.
+        unsafe { libc::rewinddir(dirp) };
+        let mut results = Vec::new();
+        loop {
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
                 break;
             }
-            if chunk.as_os_str().len() >= DEEP_PATH_CHUNK {
-                let next = match &anchor {
-                    Some(dir) => dir.open_dir(&chunk)?,
-                    None => self.dir.open_dir(&chunk)?,
-                };
-                anchor = Some(next);
-                chunk = PathBuf::new();
+            let d_name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let bytes = d_name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let d_type = unsafe { (*entry).d_type };
+            let size = if d_type == libc::DT_REG {
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        parent_fd.as_raw_fd(),
+                        d_name.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                {
+                    Some(st.st_size as u64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(item) = f(d_name, d_type, size) {
+                results.push(item);
             }
         }
-        Ok(anchor.map(|a| (a, chunk)))
+        unsafe { libc::closedir(dirp) };
+        Ok(results)
     }
 
     /// Resolve `path` to its final non-symlink target, following symlinks
-    /// MANUALLY (40-hop ELOOP guard). cap-std follows a *relative* symlink
-    /// target within the sandbox but refuses an *absolute* one as an escape —
-    /// so `cat /a` where `/a -> /b` (absolute) would otherwise read the link's
-    /// own target string instead of `/b`'s contents. Resolving by hand
-    /// interprets an absolute target relative to the guest root. Returns the
-    /// normalized (scratch-root-relative) path; if the final component doesn't
-    /// exist (e.g. open-for-create) the path is returned unchanged so the
-    /// caller can create it.
+    /// MANUALLY (40-hop ELOOP guard).
     fn resolve_following(&self, path: &str) -> Option<PathBuf> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
         let mut normalized = normalize(path)?;
         let mut hops = 0u32;
         loop {
             let Some(rel) = Self::rel_path(&normalized) else {
                 return Some(normalized);
             };
-            let Ok((dir, at_rel)) = self.at(rel) else {
-                // Deep-descent miss (missing intermediate) — path as-is.
+            let Some((parent_fd, leaf_c)) = self.namei_leaf(rel) else {
                 return Some(normalized);
             };
-            let Ok(meta) = dir.symlink_metadata(&at_rel) else {
-                // Doesn't exist (or unreadable) — hand back the path as-is.
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            if unsafe {
+                libc::fstatat(
+                    parent_fd.as_raw_fd(),
+                    leaf_c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
                 return Some(normalized);
-            };
-            if !meta.is_symlink() {
+            }
+            if st.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFLNK as u32 {
                 return Some(normalized);
             }
             if hops >= 40 {
                 return None; // ELOOP
             }
             hops += 1;
-            let target = dir.read_link_contents(&at_rel).ok()?;
-            // `target` is raw host bytes; normalize it WITHOUT a String round-
-            // trip so an undecodable symlink target isn't corrupted.
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            let n = unsafe {
+                libc::readlinkat(
+                    parent_fd.as_raw_fd(),
+                    leaf_c.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                return None;
+            }
+            let target = std::ffi::OsStr::from_bytes(&buf[..n as usize]);
+            let target = Path::new(target);
             normalized = if target.is_absolute() {
-                normalize_raw(&target)?
+                normalize_raw(target)?
             } else {
                 let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
-                normalize_raw(&parent.join(&target))?
+                normalize_raw(&parent.join(target))?
             };
         }
     }
 
-    /// Byte-exact existence guard against macOS's normalizing VFS.
-    ///
-    /// macOS APFS/HFS+ normalize filenames at the syscall boundary: a
-    /// `stat`/`open` of an NFD byte sequence resolves the NFC-named inode
-    /// (and vice-versa), and compatibility forms (NFKC/NFKD) collapse too.
-    /// Linux does NOT — a filename is an opaque byte string, so two
-    /// differently-normalized names are two DIFFERENT files. carrick must
-    /// present the Linux view: a guest `open("Grü̈ß")` (NFD) where only the
-    /// NFC file exists has to fail with ENOENT, exactly as on Linux.
-    ///
-    /// cap-std's `symlink_metadata(rel)` goes through the normalizing host
-    /// VFS, so it cannot see the difference. We re-check the FINAL component
-    /// against the parent directory's `read_dir` listing, which returns each
-    /// entry's true on-disk bytes; if the guest's requested bytes are not
-    /// present verbatim, the host merely aliased a differently-normalized
-    /// name and we report "not present" (`false`).
-    ///
-    /// Hot-path cheap: ASCII-only names can never be Unicode-normalized, so
-    /// we skip the readdir entirely unless the final component carries a
-    /// non-ASCII byte. (Intermediate path components are not re-checked: a
-    /// normalized directory in the middle of the path is already an
-    /// established on-disk entry, and re-walking every ancestor on every
-    /// stat would be quadratic; the leaf is where guest-supplied freshly-
-    /// normalized names actually bite — the unicode-filename tests.)
-    /// The byte-exact child names of `dir` from ONE directory read — no
-    /// per-entry stat, no kind, no size. `None` when `dir` cannot be read as
-    /// a directory. This is the listing the immutable lower memoises to
-    /// answer "does the lower have `dir/leaf`?" without a host call per
-    /// leaf; the guest path bytes and the on-disk names agree byte-for-byte
-    /// (see [`normalize`] and [`Self::name_matches_on_disk`]), so
-    /// membership here is exactly the host's own answer.
     pub(crate) fn child_name_set(&self, dir: &str) -> Option<HashSet<std::ffi::OsString>> {
+        use std::os::unix::ffi::OsStrExt as _;
         let normalized = normalize(dir)?;
-        let read = match Self::rel_path(&normalized) {
-            Some(rel) => self.at(rel).and_then(|(dir, at_rel)| dir.read_dir(&at_rel)),
-            None => self.dir.entries(),
-        }
-        .ok()?;
+        let rel = Self::rel_path(&normalized).unwrap_or_else(|| Path::new(""));
+        let entries = self
+            .read_dir_entries(rel, |d_name, _, _| {
+                Some(std::ffi::OsStr::from_bytes(d_name.to_bytes()).to_os_string())
+            })
+            .ok()?;
         let mut out = HashSet::new();
-        for entry in read.flatten() {
-            let name = entry.file_name();
+        for name in entries {
             if is_internal_sidecar_name(&name.to_string_lossy()) {
                 continue;
             }
@@ -4538,31 +4543,19 @@ impl HostFsBackend {
     fn name_matches_on_disk_impl(&self, rel: &Path) -> bool {
         use std::os::unix::ffi::OsStrExt;
         let Some(file_name) = rel.file_name() else {
-            // No final component (the scratch root) — nothing to alias.
             return true;
         };
         let want = file_name.as_bytes();
         if want.is_ascii() {
-            // ASCII bytes are never altered by Unicode normalization, so the
-            // host VFS could not have aliased; trust the metadata lookup.
             return true;
         }
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-        let read = if parent.as_os_str().is_empty() {
-            self.dir.entries()
-        } else {
-            self.dir.read_dir(parent)
-        };
-        let Ok(read) = read else {
-            // Parent unreadable: don't manufacture a phantom mismatch.
+        let Ok(entries) =
+            self.read_dir_entries(parent, |d_name, _, _| Some(d_name.to_bytes() == want))
+        else {
             return true;
         };
-        for entry in read.flatten() {
-            if entry.file_name().as_bytes() == want {
-                return true;
-            }
-        }
-        false
+        entries.into_iter().any(|matched| matched)
     }
 }
 
@@ -4700,6 +4693,7 @@ fn is_guest_xattr_namespace(name: &str) -> bool {
         || name.starts_with("system.")
 }
 
+#[allow(dead_code)]
 fn fremove_xattr(fd: std::os::fd::RawFd, name: &[u8]) {
     // Best-effort: a missing stale override is the common case on every host.
     unsafe {
@@ -4757,6 +4751,7 @@ pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
 
 /// 8-byte little-endian xattr write/read, mirroring the u32 helpers above. Used
 /// for the device-node `st_rdev` (a 64-bit `dev_t`).
+#[allow(dead_code)]
 fn fset_u64_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u64) {
     let v = val.to_le_bytes();
     // Portable fd-xattr (carrick-portable maps the per-OS position/options args).
@@ -4840,156 +4835,148 @@ pub(crate) fn fget_owner_xattr(fd: std::os::fd::RawFd) -> (Option<NsUid>, Option
 
 /// Open a short-lived fd for `rel` (file or dir) and run `f` on it.
 fn with_entry_fd<R>(
-    dir: &cap_std::fs::Dir,
+    root_path: &Path,
     rel: &Path,
     is_dir: bool,
     writable: bool,
     f: impl FnOnce(std::os::fd::RawFd) -> R,
 ) -> Option<R> {
-    use cap_std::fs::OpenOptionsExt;
     use std::os::fd::AsRawFd;
-    if is_dir {
-        // cap-std's open_dir() uses O_PATH on Linux, and f*xattr on an O_PATH fd
-        // returns EBADF — so directory owner/mode xattrs (mkdir/chmod setgid,
-        // chmod that follows a symlink to a dir) silently failed there. Open the
-        // directory READ-ONLY instead (a plain fd that accepts f*xattr), via the
-        // same confined cap-std open the file branches use. Falls back to
-        // open_dir if a read open of the directory is refused.
-        match dir.open_with(rel, cap_std::fs::OpenOptions::new().read(true)) {
-            Ok(d) => Some(f(d.as_raw_fd())),
-            Err(_) => {
-                let d = dir.open_dir(rel).ok()?;
-                Some(f(d.as_raw_fd()))
-            }
-        }
+    let abs = root_path.join(rel);
+    let file = if is_dir {
+        std::fs::File::open(&abs).ok()?
     } else if writable {
-        let file = dir
-            .open_with(rel, cap_std::fs::OpenOptions::new().read(true).write(true))
-            .ok()?;
-        Some(f(file.as_raw_fd()))
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&abs)
+            .ok()?
     } else {
-        // Read-only xattr peek (mode/owner). A plain read open() would bump
-        // the file's access time to "now" on a strict-atime APFS volume —
-        // and the mode xattr is read on EVERY stat of a regular file, so a
-        // guest's `os.utime(path, (past_atime, ...))` was silently undone by
-        // the very next stat. macOS `O_EVTONLY` opens the file "for event
-        // monitoring only": fgetxattr still works, but the kernel does NOT
-        // record an access, so atime is preserved exactly as the guest set
-        // it (mailbox.Maildir.clean's getatime-cutoff sweep then matches
-        // Linux). fall back to a plain open if O_EVTONLY isn't honored.
-        const O_EVTONLY: i32 = 0x8000;
-        let file = dir
-            .open_with(
-                rel,
-                cap_std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(O_EVTONLY),
-            )
-            .or_else(|_| dir.open(rel))
-            .ok()?;
-        Some(f(file.as_raw_fd()))
-    }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_EVTONLY: i32 = 0x8000;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_EVTONLY)
+                .open(&abs)
+                .or_else(|_| std::fs::File::open(&abs))
+                .ok()?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            std::fs::File::open(&abs).ok()?
+        }
+    };
+    Some(f(file.as_raw_fd()))
 }
 
-/// Read the guest-mode xattr for `rel` under `dir`. `None` => fall back to the
+/// Read the guest-mode xattr for `rel` under `root_path`. `None` => fall back to the
 /// real mode.
-fn read_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool) -> Option<u32> {
+fn read_mode_xattr(root_path: &Path, rel: &Path, is_dir: bool) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
         let _ = is_dir;
-        path_get_u32_xattr(dir, rel, CARRICK_MODE_XATTR, false)
+        path_get_u32_xattr(root_path, rel, CARRICK_MODE_XATTR, false)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        with_entry_fd(dir, rel, is_dir, false, |fd| {
+        with_entry_fd(root_path, rel, is_dir, false, |fd| {
             fget_u32_xattr(fd, CARRICK_MODE_XATTR)
         })
         .flatten()
     }
 }
 
-/// Write the guest-mode xattr for `rel` under `dir`. Best-effort.
-pub(crate) fn write_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool, mode: u32) {
-    let _ = with_entry_fd(dir, rel, is_dir, true, |fd| {
-        fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode)
-    });
-}
-
-/// Read the device-node id (`st_rdev`) xattr for the regular `rel` under `dir`.
-/// `None` => the file is not a device-node marker. Mirrors `read_mode_xattr`
-/// (read-only, atime-preserving on macOS).
-fn read_rdev_xattr(dir: &cap_std::fs::Dir, rel: &Path) -> Option<u64> {
+/// Write the guest-mode xattr for `rel` under `root_path`. Best-effort.
+pub(crate) fn write_mode_xattr(root_path: &Path, rel: &Path, is_dir: bool, mode: u32) {
     #[cfg(target_os = "macos")]
     {
-        path_get_u64_xattr(dir, rel, CARRICK_RDEV_XATTR, false)
+        let _ = is_dir;
+        path_set_u32_xattr(root_path, rel, CARRICK_MODE_XATTR, mode);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = with_entry_fd(root_path, rel, is_dir, true, |fd| {
+            fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode)
+        });
+    }
+}
+
+fn fremove_mode_xattr(root_path: &Path, rel: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        path_remove_xattr(root_path, rel, CARRICK_MODE_XATTR);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = with_entry_fd(root_path, rel, false, true, |fd| {
+            fremove_xattr(fd, CARRICK_MODE_XATTR);
+        });
+    }
+}
+
+/// Read the device-node id (`st_rdev`) xattr for the regular `rel` under `root_path`.
+/// `None` => the file is not a device-node marker. Mirrors `read_mode_xattr`
+/// (read-only, atime-preserving on macOS).
+fn read_rdev_xattr(root_path: &Path, rel: &Path) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        path_get_u64_xattr(root_path, rel, CARRICK_RDEV_XATTR, false)
     }
     #[cfg(not(target_os = "macos"))]
     {
         // Devices are never directories, so a plain (non-dir) read-only fd peek.
-        with_entry_fd(dir, rel, false, false, |fd| {
+        with_entry_fd(root_path, rel, false, false, |fd| {
             fget_u64_xattr(fd, CARRICK_RDEV_XATTR)
         })
         .flatten()
     }
 }
 
-/// Stamp a regular `rel` under `dir` as a guest DEVICE NODE: persist the FULL
+/// Stamp a regular `rel` under `root_path` as a guest DEVICE NODE: persist the FULL
 /// guest mode (type + perms) in `CARRICK_MODE_XATTR` and the raw guest `dev_t`
 /// in `CARRICK_RDEV_XATTR`. Used by `create_device`. Best-effort, like the other
 /// xattr writers (a failed write leaves the file looking like a plain regular
 /// file). `full_mode` carries the `S_IFCHR`/`S_IFBLK` type bits so the stat
 /// reconstruction can recover the device type.
-fn write_device_xattrs(dir: &cap_std::fs::Dir, rel: &Path, full_mode: u32, dev: u64) {
-    let _ = with_entry_fd(dir, rel, false, true, |fd| {
-        fset_u32_xattr(fd, CARRICK_MODE_XATTR, full_mode);
-        fset_u64_xattr(fd, CARRICK_RDEV_XATTR, dev);
-    });
+fn write_device_xattrs(root_path: &Path, rel: &Path, full_mode: u32, dev: u64) {
+    #[cfg(target_os = "macos")]
+    {
+        path_set_u32_xattr(root_path, rel, CARRICK_MODE_XATTR, full_mode);
+        path_set_u64_xattr(root_path, rel, CARRICK_RDEV_XATTR, dev);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = with_entry_fd(root_path, rel, false, true, |fd| {
+            fset_u32_xattr(fd, CARRICK_MODE_XATTR, full_mode);
+            fset_u64_xattr(fd, CARRICK_RDEV_XATTR, dev);
+        });
+    }
 }
 
 /// `true` iff `rel` carries the `AF_UNIX`-socket marker xattr (see
 /// `CARRICK_SOCKET_XATTR`). A read-only `O_EVTONLY` peek that preserves atime,
 /// just like `read_mode_xattr`.
-fn read_socket_xattr(dir: &cap_std::fs::Dir, rel: &Path) -> bool {
+fn read_socket_xattr(root_path: &Path, rel: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
-        path_get_u32_xattr(dir, rel, CARRICK_SOCKET_XATTR, false).is_some()
+        path_get_u32_xattr(root_path, rel, CARRICK_SOCKET_XATTR, false).is_some()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        with_entry_fd(dir, rel, false, false, |fd| {
+        with_entry_fd(root_path, rel, false, false, |fd| {
             fget_u32_xattr(fd, CARRICK_SOCKET_XATTR).is_some()
         })
         .unwrap_or(false)
     }
 }
 
-/// Absolute host path of `rel` under the cap-std sandbox `dir` (per-OS dir-fd
-/// path lookup via `carrick_portable::fd_abs_path` — F_GETPATH on
-/// Darwin/NetBSD, F_KINFO on FreeBSD, /proc on Linux). Symlink xattr ops need
-/// it: cap-std can't open a symlink (its O_NOFOLLOW conflicts with O_SYMLINK),
-/// so the link's own xattrs are reached by a path-based setxattr/getxattr with
-/// XATTR_NOFOLLOW. `rel` is sandbox-validated.
-fn sandbox_abs_path(dir: &cap_std::fs::Dir, rel: &Path) -> Option<std::path::PathBuf> {
-    use std::os::fd::AsRawFd;
-    Some(carrick_portable::fd_abs_path(dir.as_raw_fd())?.join(rel))
-}
-
-/// Path-based u32 xattr read (macOS). Unlike `with_entry_fd` + `fget_u32_xattr`,
-/// this issues NO open() — so it avoids cap-std's per-component path walk (the
-/// dominant cost of every stat on `--fs host`; ~291 host opens per guest open,
-/// see docs/fs-host-capstd-amplification.md) and never bumps atime (getxattr is
-/// a metadata op, like the O_EVTONLY open it replaces). `nofollow` reads a
-/// symlink's OWN xattr (XATTR_NOFOLLOW); callers resolve real files first, so for
-/// those the leaf is not a symlink and the flag is moot.
+/// Path-based u32 xattr read (macOS).
 #[cfg(target_os = "macos")]
-fn path_get_u32_xattr(
-    dir: &cap_std::fs::Dir,
-    rel: &Path,
-    name: &[u8],
-    nofollow: bool,
-) -> Option<u32> {
+fn path_get_u32_xattr(root_path: &Path, rel: &Path, name: &[u8], nofollow: bool) -> Option<u32> {
     use std::os::unix::ffi::OsStrExt;
-    let abs = sandbox_abs_path(dir, rel)?;
+    let abs = root_path.join(rel);
     let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
     let mut v = [0u8; 4];
     let n = unsafe {
@@ -5013,16 +5000,10 @@ fn path_get_u32_xattr(
 }
 
 /// Path-based 8-byte LE xattr read (macOS), mirroring `path_get_u32_xattr`.
-/// Issues no open() and never bumps atime. Used for the device-node `st_rdev`.
 #[cfg(target_os = "macos")]
-fn path_get_u64_xattr(
-    dir: &cap_std::fs::Dir,
-    rel: &Path,
-    name: &[u8],
-    nofollow: bool,
-) -> Option<u64> {
+fn path_get_u64_xattr(root_path: &Path, rel: &Path, name: &[u8], nofollow: bool) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
-    let abs = sandbox_abs_path(dir, rel)?;
+    let abs = root_path.join(rel);
     let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
     let mut v = [0u8; 8];
     let n = unsafe {
@@ -5046,16 +5027,14 @@ fn path_get_u64_xattr(
 }
 
 #[cfg(target_os = "macos")]
-fn symlink_get_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8]) -> Option<u32> {
-    path_get_u32_xattr(dir, rel, name, true)
+fn symlink_get_u32_xattr(root_path: &Path, rel: &Path, name: &[u8]) -> Option<u32> {
+    path_get_u32_xattr(root_path, rel, name, true)
 }
 
 #[cfg(target_os = "macos")]
-fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32) {
+fn symlink_set_u32_xattr(root_path: &Path, rel: &Path, name: &[u8], val: u32) {
     use std::os::unix::ffi::OsStrExt;
-    let Some(abs) = sandbox_abs_path(dir, rel) else {
-        return;
-    };
+    let abs = root_path.join(rel);
     let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
         return;
     };
@@ -5073,17 +5052,10 @@ fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u
     crate::fs_resolve_cache::bump_meta_generation();
 }
 
-/// Path-based u32 xattr WRITE (macOS, following symlinks). Like
-/// `path_get_u32_xattr` it issues NO open(), so it can stamp a node whose
-/// open() would block — namely a writer-less FIFO. Used to record a FIFO's
-/// guest owner uid/gid (LTP mknod08): the fd-based `write_owner_xattr` would
-/// open the FIFO and wedge the dispatcher.
 #[cfg(target_os = "macos")]
-fn path_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32) {
+fn path_set_u32_xattr(root_path: &Path, rel: &Path, name: &[u8], val: u32) {
     use std::os::unix::ffi::OsStrExt;
-    let Some(abs) = sandbox_abs_path(dir, rel) else {
-        return;
-    };
+    let abs = root_path.join(rel);
     let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
         return;
     };
@@ -5096,6 +5068,39 @@ fn path_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32)
             v.len(),
             0,
         );
+    }
+    crate::fs_resolve_cache::bump_meta_generation();
+}
+
+#[cfg(target_os = "macos")]
+fn path_set_u64_xattr(root_path: &Path, rel: &Path, name: &[u8], val: u64) {
+    use std::os::unix::ffi::OsStrExt;
+    let abs = root_path.join(rel);
+    let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
+        return;
+    };
+    let v = val.to_le_bytes();
+    unsafe {
+        carrick_portable::setxattr(
+            cpath.as_ptr(),
+            name.as_ptr() as *const libc::c_char,
+            v.as_ptr() as *const libc::c_void,
+            v.len(),
+            0,
+        );
+    }
+    crate::fs_resolve_cache::bump_meta_generation();
+}
+
+#[cfg(target_os = "macos")]
+fn path_remove_xattr(root_path: &Path, rel: &Path, name: &[u8]) {
+    use std::os::unix::ffi::OsStrExt;
+    let abs = root_path.join(rel);
+    let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
+        return;
+    };
+    unsafe {
+        carrick_portable::lremovexattr(cpath.as_ptr(), name.as_ptr() as *const libc::c_char);
     }
     crate::fs_resolve_cache::bump_meta_generation();
 }
@@ -5184,62 +5189,59 @@ fn link_xattr_sidecar_rel(rel: &Path, key: &str) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn symlink_get_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8]) -> Option<u32> {
+fn symlink_get_u32_xattr(root_path: &Path, rel: &Path, name: &[u8]) -> Option<u32> {
     let key = link_xattr_sidecar_key(name)?;
     let sidecar = link_xattr_sidecar_rel(rel, key)?;
-    let bytes = dir.read(&sidecar).ok()?;
+    let bytes = std::fs::read(root_path.join(&sidecar)).ok()?;
     (bytes.len() == 4).then(|| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32) {
+fn symlink_set_u32_xattr(root_path: &Path, rel: &Path, name: &[u8], val: u32) {
     let Some(key) = link_xattr_sidecar_key(name) else {
         return;
     };
     let Some(sidecar) = link_xattr_sidecar_rel(rel, key) else {
         return;
     };
-    // Best-effort, matching the macOS `lsetxattr` path (which also ignores
-    // failure): a write error leaves the owner unset and `lstat` falls back to
-    // the host uid, exactly as before this sidecar existed.
-    let _ = dir.write(&sidecar, val.to_le_bytes());
+    let _ = std::fs::write(root_path.join(&sidecar), val.to_le_bytes());
     crate::fs_resolve_cache::bump_meta_generation();
 }
 
 /// Remove any xattr sidecars belonging to the symlink `rel` (called from the
 /// backend's unlink so a reused name does not inherit a stale owner). Best-effort.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn remove_link_xattr_sidecars(dir: &cap_std::fs::Dir, rel: &Path) {
+pub(crate) fn remove_link_xattr_sidecars(root_path: &Path, rel: &Path) {
     for key in ["uid", "gid", "socket"] {
         if let Some(sidecar) = link_xattr_sidecar_rel(rel, key) {
-            let _ = dir.remove_file(&sidecar);
+            let _ = std::fs::remove_file(root_path.join(&sidecar));
         }
     }
 }
 
 fn read_owner_xattr(
-    dir: &cap_std::fs::Dir,
+    root_path: &Path,
     rel: &Path,
     is_dir: bool,
     symlink: bool,
 ) -> (Option<NsUid>, Option<NsGid>) {
     let (uid, gid) = if symlink {
         (
-            symlink_get_u32_xattr(dir, rel, CARRICK_UID_XATTR),
-            symlink_get_u32_xattr(dir, rel, CARRICK_GID_XATTR),
+            symlink_get_u32_xattr(root_path, rel, CARRICK_UID_XATTR),
+            symlink_get_u32_xattr(root_path, rel, CARRICK_GID_XATTR),
         )
     } else {
         #[cfg(target_os = "macos")]
         {
             let _ = is_dir;
             (
-                path_get_u32_xattr(dir, rel, CARRICK_UID_XATTR, false),
-                path_get_u32_xattr(dir, rel, CARRICK_GID_XATTR, false),
+                path_get_u32_xattr(root_path, rel, CARRICK_UID_XATTR, false),
+                path_get_u32_xattr(root_path, rel, CARRICK_GID_XATTR, false),
             )
         }
         #[cfg(not(target_os = "macos"))]
         {
-            with_entry_fd(dir, rel, is_dir, false, |fd| {
+            with_entry_fd(root_path, rel, is_dir, false, |fd| {
                 (
                     fget_u32_xattr(fd, CARRICK_UID_XATTR),
                     fget_u32_xattr(fd, CARRICK_GID_XATTR),
@@ -5254,7 +5256,7 @@ fn read_owner_xattr(
 /// Write the guest owner uid/gid xattrs for `rel`. Pass `None` to leave unchanged.
 /// Best-effort.
 pub(crate) fn write_owner_xattr(
-    dir: &cap_std::fs::Dir,
+    root_path: &Path,
     rel: &Path,
     is_dir: bool,
     symlink: bool,
@@ -5264,14 +5266,14 @@ pub(crate) fn write_owner_xattr(
     if symlink {
         // lchown: the owner lives on the LINK itself (XATTR_NOFOLLOW).
         if let Some(uid) = uid {
-            symlink_set_u32_xattr(dir, rel, CARRICK_UID_XATTR, uid.raw());
+            symlink_set_u32_xattr(root_path, rel, CARRICK_UID_XATTR, uid.raw());
         }
         if let Some(gid) = gid {
-            symlink_set_u32_xattr(dir, rel, CARRICK_GID_XATTR, gid.raw());
+            symlink_set_u32_xattr(root_path, rel, CARRICK_GID_XATTR, gid.raw());
         }
         return;
     }
-    let _ = with_entry_fd(dir, rel, is_dir, !is_dir, |fd| {
+    let _ = with_entry_fd(root_path, rel, is_dir, !is_dir, |fd| {
         if let Some(uid) = uid {
             fset_u32_xattr(fd, CARRICK_UID_XATTR, uid.raw());
         }
@@ -5279,72 +5281,6 @@ pub(crate) fn write_owner_xattr(
             fset_u32_xattr(fd, CARRICK_GID_XATTR, gid.raw());
         }
     });
-}
-
-/// Byte length from which a relative path is resolved via chunked descent
-/// instead of one full-path cap-std call (see [`HostFsBackend::at`]). Set
-/// comfortably below the host kernel's `PATH_MAX` so every host path string —
-/// a flushed chunk or the tail, each at most this bound plus one ≤`NAME_MAX`
-/// (255) component — stays legal.
-///
-/// Linux `openat2(RESOLVE_BENEATH)` and FreeBSD `openat(O_RESOLVE_BENEATH)`
-/// both resolve a whole relative path in ONE syscall, so cap-std's containment
-/// call is `getname()`/`PATH_MAX`-bounded on both (Linux 4096, FreeBSD 1024).
-/// macOS and NetBSD lack RESOLVE_BENEATH, so cap-std walks component-by-
-/// component there and never hits the limit — the deep branch is compiled out.
-#[cfg(target_os = "linux")]
-const DEEP_PATH_CHUNK: usize = 3000;
-// FreeBSD `PATH_MAX` is 1024: keep a chunk (≤ this + one 255-byte component)
-// safely under it.
-#[cfg(target_os = "freebsd")]
-const DEEP_PATH_CHUNK: usize = 512;
-
-/// A borrowed-or-anchored cap-std dir handle, paired with the (possibly
-/// shortened) path to use against it — produced by [`HostFsBackend::at`].
-/// Derefs to `cap_std::fs::Dir` so call sites read like `self.dir`.
-enum DirAt<'a> {
-    /// Short path: the sandbox root itself, no extra handle opened.
-    Root(&'a cap_std::fs::Dir),
-    /// The path's parent, served from the kernel directory cache, with the
-    /// operation running on the single remaining leaf component. This is the
-    /// case that stops cap-std re-walking a path it has already resolved.
-    #[cfg(target_os = "macos")]
-    Cached(std::sync::Arc<cap_std::fs::Dir>),
-    /// Deep path (Linux / FreeBSD): an intermediate directory opened by chunked
-    /// descent; operations run on the short tail relative to it.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    Anchor(cap_std::fs::Dir),
-}
-
-impl std::ops::Deref for DirAt<'_> {
-    type Target = cap_std::fs::Dir;
-    fn deref(&self) -> &cap_std::fs::Dir {
-        match self {
-            DirAt::Root(dir) => dir,
-            #[cfg(target_os = "macos")]
-            DirAt::Cached(dir) => dir,
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            DirAt::Anchor(dir) => dir,
-        }
-    }
-}
-
-/// Adopt a freshly-opened directory fd as a cap-std `Dir`.
-///
-/// The fd's containment is the CALLER's proof obligation: `Dir` is an
-/// authority handle, and cap-std will resolve beneath whatever it is given.
-/// Every construction site here is a single `O_NOFOLLOW | O_DIRECTORY`
-/// component opened beneath an already-proven directory, starting at the
-/// sandbox root — see [`HostFsBackend::dir_cache`].
-///
-/// # Safety
-/// `raw` must be a freshly-opened, owned directory fd that nothing else
-/// closes; the returned `Dir` takes ownership.
-#[cfg(target_os = "macos")]
-fn dir_from_raw_fd(raw: i32) -> cap_std::fs::Dir {
-    use std::os::fd::FromRawFd;
-    // SAFETY: by this function's contract `raw` is owned and not aliased.
-    cap_std::fs::Dir::from_std_file(unsafe { std::fs::File::from_raw_fd(raw) })
 }
 
 impl FsBackend for HostFsBackend {
@@ -5404,8 +5340,7 @@ impl FsBackend for HostFsBackend {
             return Some(OverlayEntry::Dir);
         }
         let rel = Self::rel_path(&normalized)?;
-        // Fast contained dir stat (no cap-std per-component walk) — the glob
-        // hot path. Non-dirs fall through to the cap-std logic below.
+        // Fast contained dir stat (no per-component walk) — the glob hot path.
         if let Some((_, RootFsEntryKind::Directory)) = self.fast_lstat_contained(rel, false) {
             return if self.name_matches_on_disk(rel) {
                 Some(OverlayEntry::Dir)
@@ -5413,49 +5348,58 @@ impl FsBackend for HostFsBackend {
                 None
             };
         }
-        let (dir, at_rel) = self.at(rel).ok()?;
-        let meta = dir.symlink_metadata(&at_rel).ok()?;
-        // Reject a host-aliased (Unicode-normalized) name: present the Linux
-        // byte-exact view, where a differently-normalized name is a different
-        // (non-existent) file. See `name_matches_on_disk`.
-        if !self.name_matches_on_disk(rel) {
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 || !self.name_matches_on_disk(rel) {
             return None;
         }
-        // After seed_from_rootfs the whole rootfs lives on disk under
-        // the cap-std root. Every file/dir present in the sandbox is
-        // authoritative — that's the "rootfs on host APFS" architecture.
-        if meta.is_dir() {
+        let mode = st.st_mode as u32;
+        let file_type = mode & (libc::S_IFMT as u32);
+        if file_type == libc::S_IFDIR as u32 {
             return Some(OverlayEntry::Dir);
         }
-        if meta.is_file() {
-            let mut buf = Vec::with_capacity(meta.len() as usize);
-            let mut file = dir.open(&at_rel).ok()?;
+        if file_type == libc::S_IFREG as u32 {
+            let raw_fd = unsafe {
+                libc::openat(
+                    parent_fd.as_raw_fd(),
+                    leaf_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if raw_fd < 0 {
+                return None;
+            }
+            let mut file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+            let mut buf = Vec::with_capacity(st.st_size.max(0) as usize);
             file.read_to_end(&mut buf).ok()?;
             return Some(OverlayEntry::File(buf));
         }
-        // A symlink: `OverlayEntry` has no Symlink variant, but the path
-        // DOES exist, so report it as present rather than `None` (which
-        // would make the layered lookup fall through and lose the entry).
-        // Hand back the link target bytes so a content read is sensible;
-        // `metadata`/`real_stat` carry the true `Symlink` kind for stat.
-        if meta.is_symlink() {
-            let target = dir.read_link_contents(&at_rel).ok()?;
-            // The stored target is already in the host's canonical (escape-
-            // encoded or plain-UTF-8) form; hand back those bytes. readlink
-            // goes through `read_link` (above) + a guest-facing decode.
-            return Some(OverlayEntry::File(
-                target.to_string_lossy().into_owned().into_bytes(),
-            ));
-        }
-        // A FIFO is present but unreadable as bytes (opening it would block).
-        // Report it as a (empty) File-shaped entry so the layered lookup
-        // treats the path as existing; `metadata`/`RootFsVfs::lookup` carry
-        // the true `Fifo` kind. Crucially, do NOT open the node here.
-        {
-            use cap_std::fs::MetadataExt;
-            if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
-                return Some(OverlayEntry::File(Vec::new()));
+        if file_type == libc::S_IFLNK as u32 {
+            let mut buf = vec![0u8; 1024];
+            let len = unsafe {
+                libc::readlinkat(
+                    parent_fd.as_raw_fd(),
+                    leaf_c.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            };
+            if len < 0 {
+                return None;
             }
+            buf.truncate(len as usize);
+            return Some(OverlayEntry::File(buf));
+        }
+        if file_type == libc::S_IFIFO as u32 {
+            return Some(OverlayEntry::File(Vec::new()));
         }
         None
     }
@@ -5469,14 +5413,6 @@ impl FsBackend for HostFsBackend {
             return Some(OverlayEntryKind::Dir);
         }
         let rel = Self::rel_path(&normalized)?;
-        // `lookup_kind` is the first overlay probe in every ordinary
-        // `open_for_dispatch`. On Darwin, cap-std's `symlink_metadata` walks
-        // each component with multiple `openat` calls; the cold-Go workload
-        // measured 35,235 host opens in this function alone. Use the same
-        // one-open + F_GETPATH containment path as `lookup`/`metadata` for the
-        // common regular-file and directory cases. Symlinks, non-regular host
-        // file types, Unicode aliases, and escapes return `None` from the fast
-        // helper and retain the cap-std path below.
         #[cfg(target_os = "macos")]
         if let Some((_, kind)) = self.fast_lstat_contained(rel, false) {
             if !self.name_matches_on_disk(rel) {
@@ -5491,30 +5427,29 @@ impl FsBackend for HostFsBackend {
         if self.sparse_upper_nofollow_absent(path) {
             return None;
         }
-        let (dir, at_rel) = self.at(rel).ok()?;
-        let meta = dir.symlink_metadata(&at_rel).ok()?;
-        // Reject a host-aliased (Unicode-normalized) name (see `lookup`).
-        if !self.name_matches_on_disk(rel) {
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 || !self.name_matches_on_disk(rel) {
             return None;
         }
-        if meta.is_dir() {
+        let mode = st.st_mode as u32;
+        let file_type = mode & (libc::S_IFMT as u32);
+        if file_type == libc::S_IFDIR as u32 {
             return Some(OverlayEntryKind::Dir);
         }
-        if meta.is_file() {
-            return Some(OverlayEntryKind::File);
-        }
-        // Symlink: present (treated as a File-shaped entry in the
-        // `OverlayEntryKind` vocabulary, which has no Symlink variant).
-        if meta.is_symlink() {
-            return Some(OverlayEntryKind::File);
-        }
-        // FIFO: present (File-shaped in the kind vocabulary; the true `Fifo`
-        // kind is carried by `metadata`). Never opens the node.
+        if file_type == libc::S_IFREG as u32
+            || file_type == libc::S_IFLNK as u32
+            || file_type == libc::S_IFIFO as u32
         {
-            use cap_std::fs::MetadataExt;
-            if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
-                return Some(OverlayEntryKind::File);
-            }
+            return Some(OverlayEntryKind::File);
         }
         None
     }
@@ -5550,10 +5485,6 @@ impl FsBackend for HostFsBackend {
         if self.is_whiteouted_normalized(&normalized) {
             return None;
         }
-        // The sandbox root ("/") is always a directory. rel_path refuses
-        // to yield a relative path for it, so report it directly — once
-        // the rootfs layer is dropped (--fs host) this is the only source
-        // of truth for root metadata (statfs/open/mkdir-parent checks).
         if normalized.as_os_str().is_empty() {
             return Some(RootFsMetadata {
                 path: std::path::Path::new("/").to_path_buf(),
@@ -5563,11 +5494,6 @@ impl FsBackend for HostFsBackend {
             });
         }
         let rel = Self::rel_path(&normalized)?;
-        // Fast contained dir/file stat (no cap-std per-component walk) — the
-        // bulk of glob/stat cost. One open serves the stat (fstat), containment
-        // (F_GETPATH) and mode/socket (flistxattr-gated fgetxattr). Symlinks/
-        // FIFOs fall through to cap-std below. macOS-only (the non-macOS fast
-        // path is a no-op), so the fd-centric core is used directly.
         #[cfg(target_os = "macos")]
         if let Some(metadata) = self.fast_metadata_contained(&normalized, rel) {
             return Some(metadata);
@@ -5575,59 +5501,53 @@ impl FsBackend for HostFsBackend {
         if self.sparse_upper_nofollow_absent(path) {
             return None;
         }
-        let (dir, at_rel) = self.at(rel).ok()?;
-        let meta = dir.symlink_metadata(&at_rel).ok()?;
-        // Reject a host-aliased (Unicode-normalized) name (see `lookup`).
-        if !self.name_matches_on_disk(rel) {
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 || !self.name_matches_on_disk(rel) {
             return None;
         }
-        // FIFO (named pipe): symlink_metadata reports neither dir/file/symlink.
-        // Detect it from the raw type bits and report S_IFIFO. The mode lives on
-        // the real node (create_fifo set it exactly), NOT in an xattr — reading
-        // the xattr would open() the FIFO and an O_RDONLY open of a writer-less
-        // FIFO blocks, wedging the dispatcher. `symlink_metadata` is fstatat,
-        // so this never opens the node.
-        {
-            use cap_std::fs::MetadataExt;
-            if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
-                let mode = meta.mode() & 0o7777;
-                return Some(RootFsMetadata {
-                    path: normalized,
-                    kind: RootFsEntryKind::Fifo,
-                    mode: if mode == 0 { 0o644 } else { mode },
-                    size: 0,
-                });
-            }
+        let mode = st.st_mode as u32;
+        let file_type = mode & (libc::S_IFMT as u32);
+        if file_type == libc::S_IFIFO as u32 {
+            let m = mode & 0o7777;
+            return Some(RootFsMetadata {
+                path: normalized,
+                kind: RootFsEntryKind::Fifo,
+                mode: if m == 0 { 0o644 } else { m },
+                size: 0,
+            });
         }
-        // A guest-mode xattr is the guest-visible mode (see CARRICK_MODE_XATTR);
-        // the real file's mode was forced owner-accessible and isn't faithful.
-        // Symlinks always report 0777, so skip the (link-following) xattr read.
-        let override_mode = if meta.is_symlink() {
+        let is_symlink = file_type == libc::S_IFLNK as u32;
+        let is_dir = file_type == libc::S_IFDIR as u32;
+        let is_file = file_type == libc::S_IFREG as u32;
+        let override_mode = if is_symlink {
             None
         } else {
-            read_mode_xattr(&dir, &at_rel, meta.is_dir())
+            read_mode_xattr(&self.root_path, rel, is_dir)
         };
-        let mode = override_mode.unwrap_or_else(|| {
-            use cap_std::fs::MetadataExt;
-            meta.mode() & 0o7777
-        });
-        if meta.is_dir() {
+        let m = override_mode.unwrap_or(mode & 0o7777);
+        if is_dir {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::Directory,
-                mode: if override_mode.is_none() && mode == 0 {
+                mode: if override_mode.is_none() && m == 0 {
                     0o755
                 } else {
-                    mode
+                    m
                 },
                 size: 0,
             });
         }
-        if meta.is_file() {
-            // An AF_UNIX socket node materialised by `create_socket` is a
-            // regular file flagged with the socket-marker xattr → report
-            // S_IFSOCK so getdents/stat see DT_SOCK/S_IFSOCK, not a plain file.
-            let kind = if read_socket_xattr(&dir, &at_rel) {
+        if is_file {
+            let kind = if read_socket_xattr(&self.root_path, rel) {
                 RootFsEntryKind::Socket
             } else {
                 RootFsEntryKind::File
@@ -5635,23 +5555,20 @@ impl FsBackend for HostFsBackend {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind,
-                mode: if override_mode.is_none() && mode == 0 {
+                mode: if override_mode.is_none() && m == 0 {
                     0o644
                 } else {
-                    mode
+                    m
                 },
-                size: meta.len() as usize,
+                size: st.st_size.max(0) as usize,
             });
         }
-        // Symlink: report `kind: Symlink` so callers that build a stat
-        // from this metadata emit S_IFLNK. `symlink_metadata` did NOT
-        // follow the link, so this is the link's own metadata.
-        if meta.is_symlink() {
+        if is_symlink {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::Symlink,
-                mode: if mode == 0 { 0o777 } else { mode },
-                size: meta.len() as usize,
+                mode: if m == 0 { 0o777 } else { m },
+                size: st.st_size.max(0) as usize,
             });
         }
         None
@@ -5791,13 +5708,21 @@ impl FsBackend for HostFsBackend {
         if self.is_whiteouted_normalized(&typed) {
             return None;
         }
-        // Follow symlinks by hand so an absolute target resolves under the
-        // guest root (cap-std won't traverse it). See `resolve_following`.
         let normalized = self.resolve_following(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let (dir, at_rel) = self.at(rel).ok()?;
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
+        let fd = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let mut buf = Vec::new();
-        let mut file = dir.open(&at_rel).ok()?;
         file.read_to_end(&mut buf).ok()?;
         Some(buf)
     }
@@ -5807,15 +5732,21 @@ impl FsBackend for HostFsBackend {
         if self.is_whiteouted_normalized(&typed) {
             return None;
         }
-        // Bounded sibling of `file_contents`: same resolution, but reads at
-        // most `max` bytes. The execve path probes existence and the `#!`
-        // head this way, so a 20 MB `go` tool no longer costs a full read
-        // per probe.
         let normalized = self.resolve_following(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let (dir, at_rel) = self.at(rel).ok()?;
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
+        let fd = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
         let mut buf = Vec::new();
-        let file = dir.open(&at_rel).ok()?;
         let mut bounded = std::io::Read::take(file, max as u64);
         bounded.read_to_end(&mut buf).ok()?;
         Some(buf)
@@ -5826,15 +5757,20 @@ impl FsBackend for HostFsBackend {
         if self.is_whiteouted_normalized(&typed) {
             return None;
         }
-        // Same contained resolution as `file_contents`/`file_head`; the fd is
-        // handed to the execve image mapper, so only REGULAR files qualify.
         let normalized = self.resolve_following(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let (dir, at_rel) = self.at(rel).ok()?;
-        use cap_std::fs::OpenOptionsExt as _;
-        let mut opts = cap_std::fs::OpenOptions::new();
-        opts.read(true).custom_flags(libc::O_NONBLOCK);
-        let file = dir.open_with(&at_rel, &opts).ok()?.into_std();
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
+        let fd = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
         let metadata = file.metadata().ok()?;
         metadata.is_file().then_some(file)
     }
@@ -5843,37 +5779,31 @@ impl FsBackend for HostFsBackend {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
-        // Try the directory itself FIRST. Parents are still created on demand
-        // below so the guest's mkdir-deep paths keep working (apt does
-        // mkdir(/var/lib/apt/lists/partial) without checking parents), but
-        // only when they are actually missing.
-        //
-        // Doing the `create_dir_all(parent)` walk unconditionally cost ~31
-        // host syscalls per guest `mkdirat` on a cold `go build` — cap-std
-        // re-opens every ancestor component, with O_NOFOLLOW containment, on
-        // every call, and the parent almost always already exists. That made
-        // `mkdirat` the worst per-operation ratio in the run at 90.96 host
-        // syscalls per guest call.
-        match dir.create_dir(&at_rel) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Only now pay for the ancestor walk, then retry once.
-                if let Some(parent) = at_rel.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
-                }
-                match dir.create_dir(&at_rel) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(_) => return Err(BackendError::Io),
-                }
+        let parent_fd = match self.ensure_parent_dirs(rel) {
+            Ok(fd) => fd,
+            Err(errno) => {
+                return match host_open_refusal(errno) {
+                    Some(refused) => Err(BackendError::Host(refused)),
+                    None => Err(BackendError::Io),
+                };
             }
-            Err(_) => return Err(BackendError::Io),
+        };
+        let leaf_name = rel
+            .file_name()
+            .and_then(cstring_from_osstr)
+            .ok_or(BackendError::Invalid)?;
+        let rc = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), 0o755) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::AlreadyExists {
+                return match io_open_refusal(&err) {
+                    Some(refused) => Err(BackendError::Host(refused)),
+                    None => Err(BackendError::Io),
+                };
+            }
         }
         self.clear_whiteout_normalized(&normalized);
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -5881,181 +5811,166 @@ impl FsBackend for HostFsBackend {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
-        let mut opts = cap_std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(false);
-        // Optimistic first, ancestor walk only on a genuinely missing parent —
-        // the same reason as `make_dir` above: cap-std re-opens every ancestor
-        // component on every call, and the parent almost always exists.
-        let host_error = |error: std::io::Error| match io_open_refusal(&error) {
-            Some(refused) => BackendError::Host(refused),
-            None => BackendError::Io,
+        let parent_fd = match self.ensure_parent_dirs(rel) {
+            Ok(fd) => fd,
+            Err(errno) => {
+                return match host_open_refusal(errno) {
+                    Some(refused) => Err(BackendError::Host(refused)),
+                    None => Err(BackendError::Io),
+                };
+            }
         };
-        if let Err(error) = self.open_with_for_guest(&dir, &at_rel, &opts) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(host_error(error));
-            }
-            if let Some(parent) = at_rel.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                dir.create_dir_all(parent).map_err(host_error)?;
-            }
-            self.open_with_for_guest(&dir, &at_rel, &opts)
-                .map_err(host_error)?;
+        let leaf_name = rel
+            .file_name()
+            .and_then(cstring_from_osstr)
+            .ok_or(BackendError::Invalid)?;
+        let flags = libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0o644) };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return match io_open_refusal(&err) {
+                Some(refused) => Err(BackendError::Host(refused)),
+                None => Err(BackendError::Io),
+            };
         }
+        unsafe { libc::close(fd) };
         self.clear_whiteout_normalized(&normalized);
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     fn create_fifo(&self, path: &str, mode: u32) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
-        use std::os::fd::AsRawFd;
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        // mknod(2) does NOT create intermediate directories (unlike the
-        // overlay's create_file). A missing parent must surface as ENOENT —
-        // mkfifoat below reports it; the dispatcher maps the failure.
-        //
-        // Operate on a CONFINED parent handle + slash-free leaf so the raw
-        // *at primitives cannot resolve any symlink against the HOST root and
-        // cannot escape the sandbox. cap_std::fs::Dir::open_dir follows only
-        // in-sandbox symlink components and returns Err on an absolute or
-        // net-`..` escape. The fchmodat below is still PATH-BASED (it never
-        // opens the FIFO node), preserving the no-open property below.
-        let parent_rel = rel.parent();
-        let file_name = rel.file_name().ok_or(BackendError::Invalid)?;
-        // Build the C name from the raw OsStr bytes — `to_str()` would reject a
-        // legitimate non-UTF-8 (undecodable) filename that the guest is allowed
-        // to create on Linux.
-        let c_name = cstring_from_osstr(file_name).ok_or(BackendError::Invalid)?;
-        // For a non-empty parent, open it through cap-std (confined); for a
-        // top-level FIFO (empty parent), the sandbox root self.dir is the parent.
-        let parent_dir = match parent_rel {
-            Some(p) if !p.as_os_str().is_empty() => {
-                Some(self.dir.open_dir(p).map_err(|_| BackendError::Io)?)
+        let (parent_fd, leaf_c) = match self.namei_leaf_res(rel) {
+            Ok(pair) => pair,
+            Err(errno) => {
+                return match host_open_refusal(errno) {
+                    Some(refused) => Err(BackendError::Host(refused)),
+                    None => Err(BackendError::Invalid),
+                };
             }
-            _ => None,
         };
-        let dirfd = match &parent_dir {
-            Some(pdir) => pdir.as_raw_fd(),
-            None => self.dir.as_raw_fd(),
-        };
-        // Ordering is load-bearing: (1) stamp the durable root marker, (2)
-        // bump the shared fs generation (invalidating every process's cached
-        // "no FIFOs" reading — the dispatch choke point bumps for guest
-        // mknodat too, but direct backend callers must be covered as well),
-        // (3) only then create the node. No process can observe the FIFO
-        // while `may_have_fifo_nodes` still answers false. A failed mkfifoat
-        // leaves a conservative stale-true marker behind — harmless (the
-        // per-open probe runs, as it always did before the marker existed).
         self.stamp_fifo_marker();
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();
-        // Real named pipe on the cap-std scratch (fork-shareable, stats as
-        // S_IFIFO). mkfifoat applies the host process umask; override it below
-        // with the exact guest-requested mode so stat reports it faithfully.
-        let rc = unsafe { libc::mkfifoat(dirfd, c_name.as_ptr(), (mode & 0o7777) as libc::mode_t) };
+        let rc = unsafe {
+            libc::mkfifoat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                (mode & 0o7777) as libc::mode_t,
+            )
+        };
         if rc != 0 {
             return Err(BackendError::Io);
         }
-        // Force the exact mode via PATH-BASED fchmodat — NOT cap-std's
-        // set_permissions, which opens the node first: an O_RDONLY open of a
-        // writer-less FIFO blocks and would wedge the single dispatcher thread.
-        // Likewise the guest-mode xattr (CARRICK_MODE_XATTR) is skipped for
-        // FIFOs because reading it back would also have to open the node;
-        // `symlink_metadata` reads the on-disk mode without opening it.
         unsafe {
-            libc::fchmodat(dirfd, c_name.as_ptr(), (mode & 0o7777) as libc::mode_t, 0);
+            libc::fchmodat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                (mode & 0o7777) as libc::mode_t,
+                0,
+            );
         }
         Ok(())
     }
 
     fn create_socket(&self, path: &str, mode: u32) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
-        // macOS can't `mknod(S_IFSOCK)` as a non-root process, and the real
-        // host socket the guest bound lives at a HASHED scratch path (so its
-        // sun_path fits macOS's 104-byte limit, see net::support). To give the
-        // guest a stat-able node at its OWN path, materialise a regular file on
-        // the scratch and flag it with the socket-marker xattr — `real_stat`/
-        // `metadata` then report `S_IFSOCK` (not `S_IFREG`). The real file is
-        // fork-coherent (lives on the cap-std scratch shared across fork), so a
-        // forkserver child that re-stats the path sees the same node.
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        if let Some(parent) = rel.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            self.dir
-                .create_dir_all(parent)
-                .map_err(|_| BackendError::Io)?;
-        }
-        // Ordering is load-bearing (mirrors `create_fifo`): (1) stamp the
-        // durable root marker, (2) bump the shared fs generation, (3) only
-        // then create the node — so no process can stream a getdents batch
-        // that misreports this node's type while
-        // `dir_has_overlay_interference` still answers false.
+        let parent_fd = match self.ensure_parent_dirs(rel) {
+            Ok(fd) => fd,
+            Err(errno) => {
+                return match host_open_refusal(errno) {
+                    Some(refused) => Err(BackendError::Host(refused)),
+                    None => Err(BackendError::Io),
+                };
+            }
+        };
+        let leaf_name = rel
+            .file_name()
+            .and_then(cstring_from_osstr)
+            .ok_or(BackendError::Invalid)?;
         self.stamp_marker_node_marker();
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();
-        let mut opts = cap_std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        self.dir
-            .open_with(rel, &opts)
-            .map_err(|_| BackendError::Io)?;
-        // Mark it as a socket and stamp the guest-visible mode (bind applied the
-        // umask; net.rs passes the resulting bits) so stat reports it faithfully.
-        let _ = with_entry_fd(&self.dir, rel, false, true, |fd| {
-            fset_u32_xattr(fd, CARRICK_SOCKET_XATTR, 1);
-            fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode & 0o7777);
-        });
+        let flags =
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0o600) };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return match io_open_refusal(&err) {
+                Some(refused) => Err(BackendError::Host(refused)),
+                None => Err(BackendError::Io),
+            };
+        }
+        fset_u32_xattr(fd, CARRICK_SOCKET_XATTR, 1);
+        fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode & 0o7777);
+        unsafe { libc::close(fd) };
         Ok(())
     }
 
     fn create_device(&self, path: &str, full_mode: u32, dev: u64) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
-        // macOS can't `mknod(S_IFCHR|S_IFBLK)` as a non-root process, so the
-        // guest-facing node is a MARKER regular file on the scratch (mirrors
-        // `create_socket`): a real, fork-coherent file the guest can stat/unlink,
-        // tagged with the device xattrs. The stat reconstruction reads the full
-        // mode (type bits) + raw dev_t back and reports S_IFCHR/S_IFBLK + st_rdev.
-        // Unlike create_file, mknod(2) does NOT create intermediate directories;
-        // the dispatcher already vetted the parent (ENOENT) before calling here.
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
-        // Marker + generation BEFORE the node exists (see `create_socket`).
+        let (parent_fd, leaf_c) = match self.namei_leaf_res(rel) {
+            Ok(pair) => pair,
+            Err(errno) => {
+                return match host_open_refusal(errno) {
+                    Some(refused) => Err(BackendError::Host(refused)),
+                    None => Err(BackendError::Invalid),
+                };
+            }
+        };
         self.stamp_marker_node_marker();
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();
-        let mut opts = cap_std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        dir.open_with(&at_rel, &opts)
-            .map_err(|_| BackendError::Io)?;
-        write_device_xattrs(&dir, &at_rel, full_mode, dev);
+        let flags =
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o600) };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            return match io_open_refusal(&err) {
+                Some(refused) => Err(BackendError::Host(refused)),
+                None => Err(BackendError::Io),
+            };
+        }
+        write_device_xattrs(&self.root_path, rel, full_mode, dev);
+        unsafe { libc::close(fd) };
         Ok(())
     }
 
     fn device_node(&self, path: &str) -> Option<(u32, u64)> {
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let (dir, at_rel) = self.at(rel).ok()?;
-        // Only a plain regular file can be a device-node marker; skip dirs and
-        // symlinks (a symlink's xattr read would follow the link). A real
-        // S_IFCHR/S_IFBLK device can never exist on the cap-std scratch, so the
-        // host on-disk type is always regular for a marker.
-        let meta = dir.symlink_metadata(&at_rel).ok()?;
-        if !meta.is_file() {
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
             return None;
         }
-        // The full mode (type + perms) lives in CARRICK_MODE_XATTR; only treat the
-        // file as a device when those type bits are S_IFCHR/S_IFBLK. A regular
-        // file's mode xattr carries no type bits, so it returns None here and
-        // normal stat is untouched.
-        let full_mode = read_mode_xattr(&dir, &at_rel, false)?;
+        let mode = st.st_mode as u32;
+        if (mode & (libc::S_IFMT as u32)) != libc::S_IFREG as u32 {
+            return None;
+        }
+        let full_mode = read_mode_xattr(&self.root_path, rel, false)?;
         let type_bits = full_mode & crate::linux_abi::LINUX_S_IFMT;
         if type_bits != crate::linux_abi::LINUX_S_IFCHR
             && type_bits != crate::linux_abi::LINUX_S_IFBLK
         {
             return None;
         }
-        let dev = read_rdev_xattr(&dir, &at_rel).unwrap_or(0);
+        let dev = read_rdev_xattr(&self.root_path, rel).unwrap_or(0);
         Some((type_bits, dev))
     }
 
@@ -6063,30 +5978,28 @@ impl FsBackend for HostFsBackend {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
-        // Materialising a lower-only path into the sparse upper changes which
-        // backing object the layered namespace must serve, even though the
-        // guest-visible pathname already existed. Invalidate inherited lower
-        // dirfd anchors only for that first copy-up; content rewrites of an
-        // existing upper file remain non-structural and keep caches hot.
-        let creates_upper_shadow = dir.symlink_metadata(&at_rel).is_err();
-        if let Some(parent) = at_rel.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
+        let (parent_fd, leaf_c) = match self.namei_leaf(rel) {
+            Some(pair) => pair,
+            None => {
+                let p = self.ensure_parent_dirs(rel).map_err(|_| BackendError::Io)?;
+                let l = rel
+                    .file_name()
+                    .and_then(cstring_from_osstr)
+                    .ok_or(BackendError::Invalid)?;
+                (p, l)
+            }
+        };
+        let flags =
+            libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o666) };
+        if fd < 0 {
+            return Err(BackendError::Io);
         }
-        let mut opts = cap_std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        let mut file = dir
-            .open_with(&at_rel, &opts)
-            .map_err(|_| BackendError::Io)?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|_| BackendError::Io)?;
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
         self.clear_whiteout_normalized(&normalized);
-        if creates_upper_shadow {
-            crate::fs_resolve_cache::bump_generation();
-        }
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
+        crate::fs_resolve_cache::bump_generation();
         Ok(())
     }
 
@@ -6168,64 +6081,53 @@ impl FsBackend for HostFsBackend {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        // The cap-std scratch is the source of truth (readdir/lookup hit
-        // it), so remove from disk unconditionally.
-        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
-        // Discriminate file from directory rather than testing `is_ok()` on
-        // either: only a DIRECTORY removal can invalidate a cached dirfd, and
-        // charging the directory generation for every file unlink would flush
-        // the cache thousands of times on a build for no reason.
-        let file_error = dir.remove_file(&at_rel).err();
-        let dir_error = if file_error.is_some() {
-            dir.remove_dir(&at_rel).err()
-        } else {
-            None
+        let (parent_fd, leaf_c) = match self.namei_leaf(rel) {
+            Some(pair) => pair,
+            None => return Ok(false),
         };
-        let removed_file = file_error.is_none();
-        let removed_dir = file_error.is_some() && dir_error.is_none();
-        if removed_dir {
-            crate::fs_resolve_cache::bump_dir_generation();
-            self.drop_dir_cache();
-        }
-        let removed = removed_file || removed_dir;
-        if !removed {
-            let absent = file_error
-                .as_ref()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                && dir_error
-                    .as_ref()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-            if absent {
-                return Ok(false);
+        let mut rc = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0) };
+        let mut removed_dir = false;
+        if rc != 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EISDIR || err == libc::EPERM {
+                rc = unsafe {
+                    libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), libc::AT_REMOVEDIR)
+                };
+                if rc == 0 {
+                    removed_dir = true;
+                }
             }
-            return Err(BackendError::Io);
         }
-        // Clean up any per-symlink xattr sidecars (non-macOS owner store) so a
-        // later entry that reuses the name does not inherit a stale owner.
-        #[cfg(not(target_os = "macos"))]
-        if removed {
-            remove_link_xattr_sidecars(&dir, &at_rel);
+        if rc == 0 {
+            self.structural_gen.fetch_add(1, Ordering::SeqCst);
+            if removed_dir {
+                self.dir_generation.fetch_add(1, Ordering::SeqCst);
+                crate::fs_resolve_cache::bump_dir_generation();
+                self.drop_dir_cache();
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                remove_link_xattr_sidecars(&self.root_path, rel);
+            }
+            return Ok(true);
         }
-        Ok(true)
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if err == libc::ENOENT {
+            Ok(false)
+        } else {
+            Err(BackendError::Io)
+        }
     }
 
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        // Also evict any in-scratch entry so the scratch tree matches
-        // the tombstoned view.
-        if let Some(rel) = Self::rel_path(&normalized)
-            && let Ok((dir, at_rel)) = self.at(rel)
-        {
-            let removed_file = dir.remove_file(&at_rel).is_ok();
-            // Only the directory case invalidates cached dirfds; see
-            // `remove_entry`.
-            if !removed_file && dir.remove_dir(&at_rel).is_ok() {
-                crate::fs_resolve_cache::bump_dir_generation();
-                self.drop_dir_cache();
-            }
+        let _ = self.remove_entry_checked(path);
+        let res = self.write_whiteout_normalized(&normalized);
+        if res.is_ok() {
+            self.structural_gen.fetch_add(1, Ordering::SeqCst);
         }
-        self.write_whiteout_normalized(&normalized)
+        res
     }
 
     fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)> {
@@ -6241,60 +6143,28 @@ impl FsBackend for HostFsBackend {
         let Some(normalized) = normalize(dir) else {
             return Ok(Vec::new());
         };
-        // Read the LIVE cap-std directory. Files created via open_raw_fd
-        // (which hands back a raw fd) and directories created via mkdir
-        // both land on the scratch disk, and the whole rootfs is
-        // materialised there too. The disk is the single source of truth,
-        // so readdir/glob see everything that exists by path — including
-        // apt's downloaded .deb that dpkg later needs to find.
-        let read = match Self::rel_path(&normalized) {
-            Some(rel) => match self.at(rel) {
-                Ok((dir, at_rel)) => dir.read_dir(&at_rel),
-                Err(e) => Err(e),
-            },
-            None => self.dir.entries(), // scratch root == guest "/"
-        };
-        let Ok(read) = read else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::with_capacity(limit.checked_add(1).unwrap_or(0));
-        for entry in read.flatten() {
-            // The on-disk name is already the host's canonical (escape-encoded
-            // or plain-UTF-8) form; carry it through unchanged. The guest-facing
-            // getdents decodes the escape back to the raw opaque bytes.
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // Hide carrick's per-symlink xattr sidecars (non-macOS owner store):
-            // an internal metadata file, not a guest-visible directory entry.
-            if is_internal_sidecar_name(&name) {
-                continue;
-            }
-            let (kind, size) = match entry.file_type() {
-                Ok(ft) if ft.is_dir() => (RootFsEntryKind::Directory, None),
-                Ok(ft) if ft.is_symlink() => (RootFsEntryKind::Symlink, None),
-                _ => {
-                    // cap-std's FileType only distinguishes dir/symlink, so a
-                    // FIFO falls here. It MUST be classified as Fifo (via the
-                    // raw mode — fstatat, no open): downstream readdir size
-                    // lookup reads File contents, and opening a writer-less
-                    // FIFO O_RDONLY blocks the dispatcher forever (the tst_test
-                    // framework-hang). S_IFIFO check keeps it path-based. The
-                    // same stat carries st_size; hand it to the caller so
-                    // directory materialization needs no second walk per file.
-                    use cap_std::fs::MetadataExt;
-                    match entry.metadata() {
-                        Ok(m) if m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 => {
-                            (RootFsEntryKind::Fifo, Some(0))
-                        }
-                        Ok(m) => (RootFsEntryKind::File, Some(m.len())),
-                        Err(_) => (RootFsEntryKind::File, None),
-                    }
+        let rel = Self::rel_path(&normalized).unwrap_or_else(|| Path::new(""));
+        let entries = self
+            .read_dir_entries(rel, |d_name, d_type, size| {
+                let name = d_name.to_string_lossy().into_owned();
+                if is_internal_sidecar_name(&name) {
+                    return None;
                 }
-            };
-            out.push((name, kind, size));
-            if out.len() > limit {
-                return Ok(out);
-            }
+                let kind = match d_type {
+                    libc::DT_DIR => RootFsEntryKind::Directory,
+                    libc::DT_LNK => RootFsEntryKind::Symlink,
+                    libc::DT_FIFO => RootFsEntryKind::Fifo,
+                    _ => RootFsEntryKind::File,
+                };
+                Some((name, kind, size))
+            })
+            .map_err(|_| BackendError::Io)?;
+        let bound = limit.saturating_add(1);
+        let mut out = entries;
+        if out.len() > bound {
+            out.truncate(bound);
         }
+        out.shrink_to_fit();
         Ok(out)
     }
 
@@ -6315,46 +6185,58 @@ impl FsBackend for HostFsBackend {
         let Some(normalized) = normalize(dir) else {
             return Ok(Vec::new());
         };
-        let read = match Self::rel_path(&normalized) {
-            Some(rel) => match self.at(rel) {
-                Ok((dir, at_rel)) => dir.read_dir(&at_rel),
-                Err(error) => Err(error),
-            },
-            None => self.dir.entries(),
-        };
-        let Ok(read) = read else {
+        let rel = Self::rel_path(&normalized).unwrap_or_else(|| Path::new(""));
+        let Ok(entries) = self.read_dir_entries(rel, |d_name, _, _| {
+            let name = d_name.to_string_lossy();
+            if !name.starts_with(HOST_WHITEOUT_SIDECAR_PREFIX) {
+                return None;
+            }
+            Some(d_name.to_bytes().to_vec())
+        }) else {
             return Ok(Vec::new());
         };
-        let mut deleted = Vec::with_capacity(limit.checked_add(1).unwrap_or(0));
-        for entry in read.flatten() {
-            let marker_name = entry.file_name().to_string_lossy().into_owned();
-            if !marker_name.starts_with(HOST_WHITEOUT_SIDECAR_PREFIX) {
+        let parent_fd = match self.dir_fd_for(rel) {
+            Ok(fd) => fd,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let bound = limit.saturating_add(1);
+        let mut deleted = Vec::with_capacity(entries.len().min(bound));
+        for marker_bytes in entries {
+            let Ok(marker_c) = std::ffi::CString::new(marker_bytes) else {
+                continue;
+            };
+            let fd = unsafe {
+                libc::openat(
+                    parent_fd.as_raw_fd(),
+                    marker_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
                 continue;
             }
-            let marker_path = if normalized.as_os_str().is_empty() {
-                PathBuf::from(&marker_name)
-            } else {
-                normalized.join(&marker_name)
-            };
-            let Ok((marker_dir, at_marker)) = self.at(&marker_path) else {
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let mut leaf = Vec::new();
+            if file.read_to_end(&mut leaf).is_err() {
                 continue;
-            };
-            let Ok(leaf) = marker_dir.read(&at_marker) else {
-                continue;
-            };
+            }
             let leaf_path = PathBuf::from(std::ffi::OsString::from_vec(leaf));
             if leaf_path.components().count() == 1
                 && matches!(leaf_path.components().next(), Some(Component::Normal(_)))
                 && host_whiteout_sidecar_rel(&normalized.join(&leaf_path))
                     .and_then(|path| path.file_name().map(ToOwned::to_owned))
-                    .is_some_and(|expected| expected == entry.file_name())
+                    .is_some_and(|expected| {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        expected.as_os_str().as_bytes() == marker_c.as_bytes()
+                    })
             {
                 deleted.push(leaf_path.to_string_lossy().into_owned());
-                if deleted.len() > limit {
-                    return Ok(deleted);
+                if deleted.len() >= bound {
+                    break;
                 }
             }
         }
+        deleted.shrink_to_fit();
         Ok(deleted)
     }
 
@@ -6362,56 +6244,69 @@ impl FsBackend for HostFsBackend {
         let _mutation = self.archive_mutation_gate.mutation();
         let src = normalize(from).ok_or(BackendError::Invalid)?;
         let dst = normalize(to).ok_or(BackendError::Invalid)?;
-        let src_rel = Self::rel_path(&src)
-            .ok_or(BackendError::Invalid)?
-            .to_path_buf();
-        let dst_rel = Self::rel_path(&dst)
-            .ok_or(BackendError::Invalid)?
-            .to_path_buf();
-        // The cap-std scratch is the source of truth: an entry is
-        // renameable iff it actually exists on disk. (open_raw_fd
-        // creations and seeded rootfs entries are all on disk.)
-        let Ok((src_dir, src_at)) = self.at(&src_rel) else {
-            return Ok(false); // deep-descent miss == source doesn't exist
+        let src_rel = Self::rel_path(&src).ok_or(BackendError::Invalid)?;
+        let dst_rel = Self::rel_path(&dst).ok_or(BackendError::Invalid)?;
+        let (src_parent_fd, src_leaf) = match self.namei_leaf(src_rel) {
+            Some(pair) => pair,
+            None => return Ok(false),
         };
-        if src_dir.symlink_metadata(&src_at).is_err() {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                src_parent_fd.as_raw_fd(),
+                src_leaf.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
             return Ok(false);
         }
-        let (dst_dir, dst_at) = self.at(&dst_rel).map_err(|_| BackendError::Io)?;
-        if let Some(parent) = dst_at.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            dst_dir
-                .create_dir_all(parent)
-                .map_err(|_| BackendError::Io)?;
-        }
-        src_dir
-            .rename(&src_at, &dst_dir, &dst_at)
+        let dst_parent_fd = self
+            .ensure_parent_dirs(dst_rel)
             .map_err(|_| BackendError::Io)?;
-        // Carry a symlink's xattr sidecars (non-macOS owner store) across the
-        // rename — they are keyed by name, so they must move with the link.
-        // Best-effort: only `lchown`ed symlinks have any; a missing one is a
-        // no-op, and a stale sidecar at the destination name is removed first.
+        let dst_leaf = dst_rel
+            .file_name()
+            .and_then(cstring_from_osstr)
+            .ok_or(BackendError::Invalid)?;
+        let rc = unsafe {
+            libc::renameat(
+                src_parent_fd.as_raw_fd(),
+                src_leaf.as_ptr(),
+                dst_parent_fd.as_raw_fd(),
+                dst_leaf.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(BackendError::Io);
+        }
         #[cfg(not(target_os = "macos"))]
         {
-            remove_link_xattr_sidecars(&dst_dir, &dst_at);
+            remove_link_xattr_sidecars(&self.root_path, dst_rel);
             for key in ["uid", "gid", "socket"] {
                 if let (Some(s), Some(d)) = (
-                    link_xattr_sidecar_rel(&src_at, key),
-                    link_xattr_sidecar_rel(&dst_at, key),
-                ) && src_dir.symlink_metadata(&s).is_ok()
-                {
-                    let _ = src_dir.rename(&s, &dst_dir, &d);
+                    link_xattr_sidecar_rel(src_rel, key),
+                    link_xattr_sidecar_rel(dst_rel, key),
+                ) {
+                    if let (Some((sp, sl)), Some(dp)) =
+                        (self.namei_leaf(&s), self.ensure_parent_dirs(&d))
+                    {
+                        if let Some(dl) = d.file_name().and_then(cstring_from_osstr) {
+                            unsafe {
+                                libc::renameat(
+                                    sp.as_raw_fd(),
+                                    sl.as_ptr(),
+                                    dp.as_raw_fd(),
+                                    dl.as_ptr(),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
-        // A rename can move a directory that the kernel directory cache holds
-        // an fd for; a cached fd silently follows the inode to its new
-        // location, so a later resolution of the OLD path would wrongly land
-        // under the new one — the single case per-hit identity revalidation
-        // cannot detect, since ino/ctime are unchanged. Bump the shared
-        // directory-topology generation so EVERY process re-resolves, then drop
-        // this process's own entries so it cannot serve them in the meantime.
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
+        self.dir_generation.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_dir_generation();
         self.drop_dir_cache();
         if self.use_stat_cache {
@@ -6424,40 +6319,24 @@ impl FsBackend for HostFsBackend {
         let _mutation = self.archive_mutation_gate.mutation();
         let a_norm = normalize(a).ok_or(BackendError::Invalid)?;
         let b_norm = normalize(b).ok_or(BackendError::Invalid)?;
-        let a_rel = Self::rel_path(&a_norm)
-            .ok_or(BackendError::Invalid)?
-            .to_path_buf();
-        let b_rel = Self::rel_path(&b_norm)
-            .ok_or(BackendError::Invalid)?
-            .to_path_buf();
-        // Both entries must exist on disk in the cap-std scratch (the source of
-        // truth). A missing side means a rootfs-only entry the dispatcher must
-        // materialise first → Ok(false).
-        let Ok((a_dir, a_at)) = self.at(&a_rel) else {
-            return Ok(false);
+        let a_rel = Self::rel_path(&a_norm).ok_or(BackendError::Invalid)?;
+        let b_rel = Self::rel_path(&b_norm).ok_or(BackendError::Invalid)?;
+        let (a_parent_fd, a_leaf) = match self.namei_leaf(a_rel) {
+            Some(pair) => pair,
+            None => return Ok(false),
         };
-        if a_dir.symlink_metadata(&a_at).is_err() {
-            return Ok(false);
-        }
-        let Ok((b_dir, b_at)) = self.at(&b_rel) else {
-            return Ok(false);
+        let (b_parent_fd, b_leaf) = match self.namei_leaf(b_rel) {
+            Some(pair) => pair,
+            None => return Ok(false),
         };
-        if b_dir.symlink_metadata(&b_at).is_err() {
-            return Ok(false);
-        }
-        // macOS exposes a TRUE atomic swap via renameatx_np(RENAME_SWAP); both
-        // entries' inodes (and thus all metadata) are exchanged in one step.
         #[cfg(target_os = "macos")]
         {
-            use std::os::fd::AsRawFd;
-            let a_c = cstring_from_osstr(a_at.as_os_str()).ok_or(BackendError::Invalid)?;
-            let b_c = cstring_from_osstr(b_at.as_os_str()).ok_or(BackendError::Invalid)?;
             let rc = unsafe {
                 libc::renameatx_np(
-                    a_dir.as_raw_fd(),
-                    a_c.as_ptr(),
-                    b_dir.as_raw_fd(),
-                    b_c.as_ptr(),
+                    a_parent_fd.as_raw_fd(),
+                    a_leaf.as_ptr(),
+                    b_parent_fd.as_raw_fd(),
+                    b_leaf.as_ptr(),
                     libc::RENAME_SWAP,
                 )
             };
@@ -6465,43 +6344,70 @@ impl FsBackend for HostFsBackend {
                 return Err(BackendError::Io);
             }
         }
-        // Portable fallback (Linux/BSD host backends): a three-step rename dance
-        // through a unique temp name in A's directory. Not atomic, but each
-        // step moves a WHOLE entry, so every inode/mode/owner follows its data
-        // — no metadata is lost. (A native renameat2(RENAME_EXCHANGE) atomic
-        // path on Linux hosts is a possible follow-up.)
         #[cfg(not(target_os = "macos"))]
         {
             let seq = ANON_FD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let pid = unsafe { libc::getpid() } as u64;
             let tmp_name = format!(".carrick_exchange.{pid}.{seq}");
-            let tmp_rel = match a_at.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => parent.join(&tmp_name),
-                _ => PathBuf::from(&tmp_name),
+            let tmp_c = std::ffi::CString::new(tmp_name).map_err(|_| BackendError::Invalid)?;
+            let rc1 = unsafe {
+                libc::renameat(
+                    a_parent_fd.as_raw_fd(),
+                    a_leaf.as_ptr(),
+                    a_parent_fd.as_raw_fd(),
+                    tmp_c.as_ptr(),
+                )
             };
-            // A -> tmp (in A's dir)
-            a_dir
-                .rename(&a_at, &a_dir, &tmp_rel)
-                .map_err(|_| BackendError::Io)?;
-            // B -> A
-            if let Err(e) = b_dir.rename(&b_at, &a_dir, &a_at) {
-                // Roll back A so a failure leaves the namespace intact.
-                let _ = a_dir.rename(&tmp_rel, &a_dir, &a_at);
-                let _ = e;
+            if rc1 != 0 {
                 return Err(BackendError::Io);
             }
-            // tmp -> B
-            if let Err(e) = a_dir.rename(&tmp_rel, &b_dir, &b_at) {
-                // Best-effort rollback: A (now holding B's data) back to B, tmp
-                // (A's data) back to A.
-                let _ = b_dir.rename(&a_at, &b_dir, &b_at);
-                let _ = a_dir.rename(&tmp_rel, &a_dir, &a_at);
-                let _ = e;
+            let rc2 = unsafe {
+                libc::renameat(
+                    b_parent_fd.as_raw_fd(),
+                    b_leaf.as_ptr(),
+                    a_parent_fd.as_raw_fd(),
+                    a_leaf.as_ptr(),
+                )
+            };
+            if rc2 != 0 {
+                unsafe {
+                    libc::renameat(
+                        a_parent_fd.as_raw_fd(),
+                        tmp_c.as_ptr(),
+                        a_parent_fd.as_raw_fd(),
+                        a_leaf.as_ptr(),
+                    );
+                }
+                return Err(BackendError::Io);
+            }
+            let rc3 = unsafe {
+                libc::renameat(
+                    a_parent_fd.as_raw_fd(),
+                    tmp_c.as_ptr(),
+                    b_parent_fd.as_raw_fd(),
+                    b_leaf.as_ptr(),
+                )
+            };
+            if rc3 != 0 {
+                unsafe {
+                    libc::renameat(
+                        a_parent_fd.as_raw_fd(),
+                        a_leaf.as_ptr(),
+                        b_parent_fd.as_raw_fd(),
+                        b_leaf.as_ptr(),
+                    );
+                    libc::renameat(
+                        a_parent_fd.as_raw_fd(),
+                        tmp_c.as_ptr(),
+                        a_parent_fd.as_raw_fd(),
+                        a_leaf.as_ptr(),
+                    );
+                }
                 return Err(BackendError::Io);
             }
         }
-        // Same reasoning as `rename_overlay_entry`: an exchange re-points both
-        // paths, so every process must re-resolve them.
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
+        self.dir_generation.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_dir_generation();
         self.drop_dir_cache();
         if self.use_stat_cache {
@@ -6543,7 +6449,7 @@ impl FsBackend for HostFsBackend {
                 FastGuestOpen::SymlinkLeaf | FastGuestOpen::Missing | FastGuestOpen::Fallback => {}
             }
         }
-        self.open_raw_fd_capstd(path, write, create, trunc)
+        self.open_raw_fd_impl(path, write, create, trunc)
     }
 
     #[cfg(target_os = "macos")]
@@ -6621,7 +6527,7 @@ impl FsBackend for HostFsBackend {
                 HostFdOpen::Unavailable => {}
             }
         }
-        self.open_raw_fd_capstd(path, true, true, trunc)
+        self.open_raw_fd_impl(path, true, true, trunc)
             .map(|fd| (fd, false))
     }
 
@@ -6686,7 +6592,7 @@ impl FsBackend for HostFsBackend {
                 FastGuestOpen::SymlinkLeaf | FastGuestOpen::Missing | FastGuestOpen::Fallback => {}
             }
         }
-        let fd = match self.open_raw_fd_capstd(path, write, create, trunc) {
+        let fd = match self.open_raw_fd_impl(path, write, create, trunc) {
             HostFdOpen::Served(fd) => fd,
             HostFdOpen::Unavailable => return HostFdOpen::Unavailable,
             HostFdOpen::Refused(refused) => return HostFdOpen::Refused(refused),
@@ -6834,22 +6740,6 @@ impl FsBackend for HostFsBackend {
     }
 
     fn open_anon_fd(&self, mode: u32) -> Option<i32> {
-        use std::os::fd::IntoRawFd;
-        // O_TMPFILE = an unnamed regular file. macOS has no O_TMPFILE flag, so
-        // synthesize the same semantics: create a uniquely-named file in the
-        // scratch root, open it O_RDWR, then unlink the name immediately. The
-        // open fd keeps the now-nameless inode alive (POSIX), and because it is
-        // a real kernel fd it is inherited across fork(2) AND exec(2) — exactly
-        // what makes a forked+exec'd child's write visible to the parent's read
-        // (tempfile.TemporaryFile + faulthandler subprocess). The transient
-        // name is never visible to the guest: it lives only between create and
-        // unlink, and the guest namespace lookup never sees it.
-        //
-        // Build a per-(pid, counter, nanos) unique name so concurrent guest
-        // threads/processes don't collide. O_RDWR (not the guest access mode)
-        // so HVF can mmap the result with write max-protection if needed; the
-        // dispatcher records the guest-visible writability separately in
-        // OpenDescription::HostFile.
         let pid = unsafe { libc::getpid() } as u64;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6857,64 +6747,59 @@ impl FsBackend for HostFsBackend {
             .unwrap_or(0);
         let seq = ANON_FD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let name = format!(".carrick_o_tmpfile.{pid}.{seq}.{nanos}");
-        let rel = Path::new(&name);
-
-        let mut opts = cap_std::fs::OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        let file = self.dir.open_with(rel, &opts).ok()?;
-        let raw_fd = file.into_std().into_raw_fd();
-
-        // Force the guest-requested mode (the create above used the host umask)
-        // via fchmod on the now-open fd. Best-effort: O_TMPFILE files are
-        // unnamed, so the mode only matters for a later linkat(AT_EMPTY_PATH)
-        // materialization and for fstat. fchmod operates on the inode directly,
-        // so it still works after the unlink below.
+        let c_name = std::ffi::CString::new(name).ok()?;
+        // O_RDWR (not the guest access mode) so HVF can mmap the result with
+        // write max-protection if needed; the dispatcher records writability.
+        let raw_fd = unsafe {
+            libc::openat(
+                self.root_fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if raw_fd < 0 {
+            return None;
+        }
         unsafe {
             libc::fchmod(raw_fd, (mode & 0o7777) as libc::mode_t);
+            libc::unlinkat(self.root_fd.as_raw_fd(), c_name.as_ptr(), 0);
         }
-
-        // Unlink the name NOW so the file is anonymous; the open fd keeps the
-        // inode alive. If the unlink fails we still proceed — the file would
-        // just leak a name in scratch (cleaned on run teardown), not a
-        // correctness bug, but it should not normally fail (we just created the
-        // name with O_EXCL).
-        let _ = self.dir.remove_file(rel);
-
         Some(raw_fd)
     }
 
     fn open_fifo_nonblock(&self, path: &str, access: u32) -> Option<i32> {
-        use std::os::fd::AsRawFd;
-        // resolve_following won't open the node; it just resolves the path.
         let normalized = self.resolve_following(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let c_rel = cstring_from_osstr(rel.as_os_str())?;
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let host_access = match access {
             0 => libc::O_RDONLY,
             1 => libc::O_WRONLY,
             _ => libc::O_RDWR,
         };
-        // O_NONBLOCK is the whole point: an O_RDONLY open of a writer-less FIFO
-        // returns immediately instead of blocking the dispatcher thread. The
-        // resulting fd stays non-blocking; read_host_pipe/write_host_pipe route
-        // EAGAIN to the kqueue WaitOnFds park for guest blocking semantics.
         let fd = unsafe {
             libc::openat(
-                self.dir.as_raw_fd(),
-                c_rel.as_ptr(),
-                host_access | libc::O_NONBLOCK,
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                host_access | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         };
         if fd < 0 { None } else { Some(fd) }
     }
 
     fn fifo_identity(&self, path: &str) -> Option<(u64, u64)> {
-        use std::os::fd::AsRawFd;
         let normalized = self.resolve_following(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let c_rel = cstring_from_osstr(rel.as_os_str())?;
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::fstatat(self.dir.as_raw_fd(), c_rel.as_ptr(), &mut st, 0) };
+        let rc = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
         if rc != 0 {
             return None;
         }
@@ -6925,122 +6810,115 @@ impl FsBackend for HostFsBackend {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(linkpath).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        if let Some(parent) = rel.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            self.dir
-                .create_dir_all(parent)
-                .map_err(|_| BackendError::Io)?;
-        }
-        // Publish the conservative truth BEFORE the symlink itself. The
-        // generation edge invalidates every process's cached marker absence;
-        // a failed creation merely leaves the fast miss path safely disarmed.
+        let parent_fd = self.ensure_parent_dirs(rel).map_err(|_| BackendError::Io)?;
+        let leaf_name = rel
+            .file_name()
+            .and_then(cstring_from_osstr)
+            .ok_or(BackendError::Invalid)?;
+        let target_c = std::ffi::CString::new(target).map_err(|_| BackendError::Invalid)?;
         self.stamp_root_marker(CARRICK_HAS_SYMLINKS_XATTR, &self.symlink_seen);
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
         crate::fs_resolve_cache::bump_generation();
-        // symlink_contents stores `target` verbatim (it may be absolute or
-        // dangling), which is the Linux symlinkat(2) semantic.
-        self.dir
-            .symlink_contents(target, rel)
-            .map_err(|_| BackendError::Io)
+        let rc = unsafe {
+            libc::symlinkat(target_c.as_ptr(), parent_fd.as_raw_fd(), leaf_name.as_ptr())
+        };
+        if rc != 0 {
+            return Err(BackendError::Io);
+        }
+        Ok(())
     }
 
     fn hard_link(&self, src: &str, linkpath: &str) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
         let src_norm = normalize(src).ok_or(BackendError::Invalid)?;
         let dst_norm = normalize(linkpath).ok_or(BackendError::Invalid)?;
-        let src_rel = Self::rel_path(&src_norm)
-            .ok_or(BackendError::Invalid)?
-            .to_path_buf();
-        let dst_rel = Self::rel_path(&dst_norm)
-            .ok_or(BackendError::Invalid)?
-            .to_path_buf();
-        if let Some(parent) = dst_rel.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            self.dir
-                .create_dir_all(parent)
-                .map_err(|_| BackendError::Io)?;
+        let src_rel = Self::rel_path(&src_norm).ok_or(BackendError::Invalid)?;
+        let dst_rel = Self::rel_path(&dst_norm).ok_or(BackendError::Invalid)?;
+        let (src_parent_fd, src_leaf) = self.namei_leaf(src_rel).ok_or(BackendError::Invalid)?;
+        let dst_parent_fd = self
+            .ensure_parent_dirs(dst_rel)
+            .map_err(|_| BackendError::Io)?;
+        let dst_leaf = dst_rel
+            .file_name()
+            .and_then(cstring_from_osstr)
+            .ok_or(BackendError::Invalid)?;
+        let rc = unsafe {
+            libc::linkat(
+                src_parent_fd.as_raw_fd(),
+                src_leaf.as_ptr(),
+                dst_parent_fd.as_raw_fd(),
+                dst_leaf.as_ptr(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(BackendError::Io);
         }
-        self.dir
-            .hard_link(&src_rel, &self.dir, &dst_rel)
-            .map_err(|_| BackendError::Io)
+        self.structural_gen.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
-        use cap_std::fs::MetadataExt;
-        use cap_std::fs::Permissions;
-        use cap_std::fs::PermissionsExt;
-        use std::os::fd::AsRawFd;
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
-        let rel = &*at_rel;
+        let (parent_fd, leaf_c) = self.namei_leaf(rel).ok_or(BackendError::Invalid)?;
         let mode = mode & 0o7777;
-        let meta = dir.symlink_metadata(rel);
-        // A FIFO's mode lives on the real node (not an xattr); set it via
-        // PATH-BASED fchmodat — neither set_permissions nor the xattr write may
-        // open the node, since an O_RDONLY open of a writer-less FIFO blocks.
-        // Operate on a CONFINED parent handle + slash-free leaf so the raw
-        // fchmodat cannot resolve a symlink component against the HOST root and
-        // cannot escape the sandbox (same guard as create_fifo). fchmodat stays
-        // PATH-BASED, so it never opens the FIFO node.
-        if let Ok(m) = &meta
-            && m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32
-            && let Some(file_name) = rel.file_name()
-            && let Some(c_name) = cstring_from_osstr(file_name)
-        {
-            let parent_dir = match rel.parent() {
-                Some(p) if !p.as_os_str().is_empty() => dir.open_dir(p).ok(),
-                _ => None,
-            };
-            let dirfd = match &parent_dir {
-                Some(pdir) => pdir.as_raw_fd(),
-                None => dir.as_raw_fd(),
-            };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(BackendError::Io);
+        }
+        let raw_type = (st.st_mode as u32) & (libc::S_IFMT as u32);
+        if raw_type == libc::S_IFIFO as u32 {
             unsafe {
-                libc::fchmodat(dirfd, c_name.as_ptr(), mode as libc::mode_t, 0);
+                libc::fchmodat(
+                    parent_fd.as_raw_fd(),
+                    leaf_c.as_ptr(),
+                    mode as libc::mode_t,
+                    0,
+                );
             }
             return Ok(());
         }
-        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let is_symlink = meta.as_ref().map(|m| m.is_symlink()).unwrap_or(false);
-        // An owner-representable mode (carrick keeps read+search on its own
-        // scratch entry) is applied NATIVELY: the on-disk bits ARE the guest
-        // answer, no xattr, and — load-bearing for the walk fast lanes — no
-        // metadata-xattr root marker gets stamped, so `serves_plain_metadata`
-        // survives ordinary boot-time chmods (mkdir -m 1777 /tmp and friends).
-        // Mirrors the extraction policy in rootfs.rs. Any stale override from
-        // an earlier unrepresentable chmod is removed so stat cannot keep
-        // serving it.
-        // Native only when the OWNER keeps full use of the entry: carrick (a
-        // non-root macOS process) must always be able to re-open its own
-        // scratch files for WRITING too - a root guest ignores permission
-        // bits, so chmod 444 followed by open(O_WRONLY) must succeed, which
-        // the host would refuse if 444 were applied natively. Anything less
-        // than owner-rw (files) / owner-rwx (dirs) keeps the xattr override.
+        let is_dir = raw_type == libc::S_IFDIR as u32;
+        let is_symlink = raw_type == libc::S_IFLNK as u32;
         let owner_ok = if is_dir {
             mode & 0o700 == 0o700
         } else {
             mode & 0o600 == 0o600
         };
-        if owner_ok
-            && !is_symlink
-            && dir
-                .set_permissions(rel, Permissions::from_mode(mode))
-                .is_ok()
-        {
-            let _ = with_entry_fd(&dir, rel, is_dir, true, |fd| {
-                fremove_xattr(fd, CARRICK_MODE_XATTR);
-            });
-            return Ok(());
+        if owner_ok && !is_symlink {
+            let res = unsafe {
+                libc::fchmodat(
+                    parent_fd.as_raw_fd(),
+                    leaf_c.as_ptr(),
+                    mode as libc::mode_t,
+                    0,
+                )
+            };
+            if res == 0 {
+                fremove_mode_xattr(&self.root_path, rel);
+                return Ok(());
+            }
         }
-        // Force owner rwx on the REAL file so carrick (a non-root macOS
-        // process) can always still open/stat/unlink it, then record the
-        // guest-visible mode in an xattr ON the file (see CARRICK_MODE_XATTR).
-        let _ = dir.set_permissions(rel, Permissions::from_mode(mode | 0o700));
+        unsafe {
+            libc::fchmodat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                (mode | 0o700) as libc::mode_t,
+                0,
+            );
+        }
         self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
-        write_mode_xattr(&dir, rel, is_dir, mode);
+        write_mode_xattr(&self.root_path, rel, is_dir, mode);
         Ok(())
     }
 
@@ -7054,54 +6932,60 @@ impl FsBackend for HostFsBackend {
         self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
-        // carrick is not root on macOS, so it can't chown(2) the scratch file
-        // to an arbitrary uid — record the guest-visible owner in xattrs ON the
-        // file (durable, fork-coherent) and report it from stat.
-        let m = dir.symlink_metadata(&at_rel).ok();
-        let is_dir = m.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let symlink = m.as_ref().map(|m| m.is_symlink()).unwrap_or(false);
-        // A FIFO can't be opened to fset the xattr (O_RDONLY blocks a
-        // writer-less FIFO and would wedge the dispatcher). On macOS, stamp the
-        // owner via PATH-based setxattr (no open) so a freshly mknod'd FIFO
-        // still records its guest owner (LTP mknod08 reads st_gid back).
+        let (parent_fd, leaf_c) = self.namei_leaf(rel).ok_or(BackendError::Invalid)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(BackendError::Io);
+        }
+        let raw_type = (st.st_mode as u32) & (libc::S_IFMT as u32);
+        let is_dir = raw_type == libc::S_IFDIR as u32;
+        let is_symlink = raw_type == libc::S_IFLNK as u32;
         #[cfg(target_os = "macos")]
         {
-            use cap_std::fs::MetadataExt as _;
-            let is_fifo = m
-                .as_ref()
-                .map(|m| m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32)
-                .unwrap_or(false);
-            if !symlink && is_fifo {
+            if !is_symlink && raw_type == libc::S_IFIFO as u32 {
                 if let Some(uid) = uid {
-                    path_set_u32_xattr(&dir, &at_rel, CARRICK_UID_XATTR, uid.raw());
+                    path_set_u32_xattr(&self.root_path, rel, CARRICK_UID_XATTR, uid.raw());
                 }
                 if let Some(gid) = gid {
-                    path_set_u32_xattr(&dir, &at_rel, CARRICK_GID_XATTR, gid.raw());
+                    path_set_u32_xattr(&self.root_path, rel, CARRICK_GID_XATTR, gid.raw());
                 }
                 return Ok(());
             }
         }
-        write_owner_xattr(&dir, &at_rel, is_dir, symlink, uid, gid);
+        write_owner_xattr(&self.root_path, rel, is_dir, is_symlink, uid, gid);
         Ok(())
     }
 
     fn get_owner(&self, path: &str) -> Option<(NsUid, NsGid)> {
-        use cap_std::fs::MetadataExt;
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let (dir, at_rel) = self.at(rel).ok()?;
-        let meta = dir.symlink_metadata(&at_rel).ok()?;
-        // A FIFO must NOT be opened to read its owner xattr (O_RDONLY blocks a
-        // writer-less FIFO and would wedge the dispatcher). On macOS, read the
-        // owner via PATH-based getxattr (no open) so a mknod'd FIFO reports the
-        // guest owner stamped by set_owner (LTP mknod08). Elsewhere the fd-based
-        // path would block, so report root (0,0) as before.
-        if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let raw_type = (st.st_mode as u32) & (libc::S_IFMT as u32);
+        if raw_type == libc::S_IFIFO as u32 {
             #[cfg(target_os = "macos")]
             {
-                let uid = path_get_u32_xattr(&dir, &at_rel, CARRICK_UID_XATTR, false);
-                let gid = path_get_u32_xattr(&dir, &at_rel, CARRICK_GID_XATTR, false);
+                let uid = path_get_u32_xattr(&self.root_path, rel, CARRICK_UID_XATTR, false);
+                let gid = path_get_u32_xattr(&self.root_path, rel, CARRICK_GID_XATTR, false);
                 return Some((
                     uid.map(NsUid::new).unwrap_or(NsUid::ROOT),
                     gid.map(NsGid::new).unwrap_or(NsGid::ROOT),
@@ -7110,7 +6994,9 @@ impl FsBackend for HostFsBackend {
             #[cfg(not(target_os = "macos"))]
             return Some((NsUid::ROOT, NsGid::ROOT));
         }
-        let (uid, gid) = read_owner_xattr(&dir, &at_rel, meta.is_dir(), meta.is_symlink());
+        let is_dir = raw_type == libc::S_IFDIR as u32;
+        let is_symlink = raw_type == libc::S_IFLNK as u32;
+        let (uid, gid) = read_owner_xattr(&self.root_path, rel, is_dir, is_symlink);
         Some((uid.unwrap_or(NsUid::ROOT), gid.unwrap_or(NsGid::ROOT)))
     }
 
@@ -7123,7 +7009,6 @@ impl FsBackend for HostFsBackend {
     ) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        // `None` (UTIME_OMIT) leaves the component untouched.
         let to_ts = |t: Option<(i64, i64)>| match t {
             Some((sec, nsec)) => libc::timespec {
                 tv_sec: sec as libc::time_t,
@@ -7136,20 +7021,12 @@ impl FsBackend for HostFsBackend {
         };
         let times = [to_ts(atime), to_ts(mtime)];
         if nofollow {
-            // AT_SYMLINK_NOFOLLOW (lutimes): set the SYMLINK's OWN times, not
-            // the target's. open()+futimens follows the link, so issue a
-            // path-based utimensat RELATIVE to the scratch dir fd — the kernel
-            // leaves the final component unfollowed and the dirfd keeps us
-            // sandboxed within the cap-std root. (libuv fs_lutime.)
-            use std::os::fd::AsRawFd;
-            use std::os::unix::ffi::OsStrExt;
             let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-            let c = std::ffi::CString::new(rel.as_os_str().as_bytes())
-                .map_err(|_| BackendError::Invalid)?;
+            let (parent_fd, leaf_c) = self.namei_leaf(rel).ok_or(BackendError::Invalid)?;
             let rc = unsafe {
                 libc::utimensat(
-                    self.dir.as_raw_fd(),
-                    c.as_ptr(),
+                    parent_fd.as_raw_fd(),
+                    leaf_c.as_ptr(),
                     times.as_ptr(),
                     libc::AT_SYMLINK_NOFOLLOW,
                 )
@@ -7161,13 +7038,6 @@ impl FsBackend for HostFsBackend {
                 Ok(())
             };
         }
-        // Follow path: open a real kernel fd for the materialised file and
-        // drive `futimens(2)`. cap-std has no set-times API, but the whole
-        // rootfs lives on the cap-std scratch, so a raw fd lets us persist
-        // atime/mtime where a later stat (real_stat) will see them. Open
-        // O_RDONLY (write=false): futimens needs only the fd + ownership, not
-        // write mode, and O_RDWR would EISDIR on a DIRECTORY (test_os
-        // test_utime_directory) and EACCES on a read-only file the guest owns.
         let host_fd = match self.open_raw_fd(path, false, false, false) {
             HostFdOpen::Served(fd) => fd,
             HostFdOpen::Refused(refused) => return Err(BackendError::Host(refused)),
@@ -7190,9 +7060,6 @@ impl FsBackend for HostFsBackend {
     fn allocate(&self, path: &str, size: u64) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
         let _normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        // mode-0 fallocate only ever grows the file. Open the real fd and
-        // `ftruncate` up to `size` if the file is currently smaller; never
-        // shrink (posix_fallocate semantics).
         let host_fd = self
             .open_raw_fd(path, true, false, false)
             .into_backend_result()?;
@@ -7224,12 +7091,22 @@ impl FsBackend for HostFsBackend {
         if self.sparse_upper_nofollow_absent(path) {
             return None;
         }
-        let (dir, at_rel) = self.at(rel).ok()?;
-        let target = dir.read_link_contents(&at_rel).ok()?;
-        // The stored target is already in the host's canonical (escape-encoded
-        // or plain-UTF-8) form — both valid UTF-8. Return it unchanged; the
-        // guest-facing readlinkat decodes the escape back to the raw bytes.
-        Some(target.to_string_lossy().into_owned())
+        let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
+        use std::os::fd::AsRawFd as _;
+        let mut buf = vec![0u8; 1024];
+        let len = unsafe {
+            libc::readlinkat(
+                parent_fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        };
+        if len < 0 {
+            return None;
+        }
+        buf.truncate(len as usize);
+        String::from_utf8(buf).ok()
     }
 
     fn set_xattr(
@@ -7277,7 +7154,7 @@ impl FsBackend for HostFsBackend {
             use std::os::unix::ffi::OsStrExt;
             let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
             let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
-            let abs = sandbox_abs_path(&self.dir, rel).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let abs = self.root_path.join(rel);
             let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
                 .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
             let rc = unsafe {
@@ -7321,7 +7198,7 @@ impl FsBackend for HostFsBackend {
             use std::os::unix::ffi::OsStrExt;
             let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
             let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
-            let abs = sandbox_abs_path(&self.dir, rel).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let abs = self.root_path.join(rel);
             let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
                 .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
             let needed = unsafe {
@@ -7418,7 +7295,7 @@ impl FsBackend for HostFsBackend {
             use std::os::unix::ffi::OsStrExt;
             let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
             let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
-            let abs = sandbox_abs_path(&self.dir, rel).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let abs = self.root_path.join(rel);
             let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
                 .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
             let needed =
@@ -7435,18 +7312,25 @@ impl FsBackend for HostFsBackend {
             .resolve_following(path)
             .ok_or(crate::linux_abi::LINUX_ENODATA)?;
         let Some(rel) = Self::rel_path(&normalized) else {
-            use std::os::fd::AsRawFd;
-            let root = self
-                .dir
-                .open_dir(".")
-                .map_err(|_| crate::linux_abi::LINUX_ENODATA)?;
-            return list_xattr_fd(root.as_raw_fd());
+            return list_xattr_fd(self.root_fd.as_raw_fd());
         };
-        let meta = self
-            .dir
-            .symlink_metadata(rel)
-            .map_err(|_| crate::linux_abi::LINUX_ENODATA)?;
-        with_entry_fd(&self.dir, rel, meta.is_dir(), false, list_xattr_fd)
+        use std::os::fd::AsRawFd as _;
+        let is_dir = match self.namei_leaf(rel) {
+            Some((parent_fd, leaf_c)) => {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::fstatat(
+                        parent_fd.as_raw_fd(),
+                        leaf_c.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                rc == 0 && (st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32)
+            }
+            None => false,
+        };
+        with_entry_fd(&self.root_path, rel, is_dir, false, list_xattr_fd)
             .ok_or(crate::linux_abi::LINUX_ENODATA)?
     }
 
@@ -7468,7 +7352,7 @@ impl FsBackend for HostFsBackend {
             use std::os::unix::ffi::OsStrExt;
             let normalized = normalize(path).ok_or(crate::linux_abi::LINUX_EINVAL)?;
             let rel = Self::rel_path(&normalized).ok_or(crate::linux_abi::LINUX_ENODATA)?;
-            let abs = sandbox_abs_path(&self.dir, rel).ok_or(crate::linux_abi::LINUX_ENODATA)?;
+            let abs = self.root_path.join(rel);
             let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes())
                 .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
             let rc = unsafe { carrick_portable::lremovexattr(cpath.as_ptr(), cname.as_ptr()) };
@@ -7520,10 +7404,10 @@ impl FsBackend for HostFsBackend {
             // intermediate symlink, a parent the sparse upper does not hold)
             // takes the explicit proof below, whose verdict also classifies
             // the miss.
-            if self.dir_fd_for(parent).is_some() {
+            if self.dir_fd_for(parent).is_ok() {
                 return ParentResolve::AllDirsNoSymlink;
             }
-            let dir_fd = self.dir.as_raw_fd();
+            let dir_fd = self.root_fd.as_raw_fd();
             // ONE openat: the kernel walks every intermediate. O_DIRECTORY makes a
             // non-directory parent (or any non-dir intermediate) fail ENOTDIR.
             // Symlinks ARE followed; F_GETPATH below reveals any redirection.
@@ -7580,7 +7464,7 @@ impl FsBackend for HostFsBackend {
             }
             let root_prefix = self.root_prefix.as_deref()?;
             let normalized = normalize(path)?;
-            let dir_fd = self.dir.as_raw_fd();
+            let dir_fd = self.root_fd.as_raw_fd();
             // O_NOFOLLOW: the dispatcher hands us an already symlink-resolved
             // path, so a symlink leaf here is unexpected — reject rather than
             // traverse. O_NONBLOCK is moot for a directory but harmless.
@@ -7638,16 +7522,8 @@ impl FsBackend for HostFsBackend {
         }
     }
 
-    fn dir_fd_for(&self, dir: &Path) -> Option<std::sync::Arc<cap_std::fs::Dir>> {
-        #[cfg(target_os = "macos")]
-        {
-            Self::dir_fd_for(self, dir)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = dir;
-            None
-        }
+    fn dir_fd_for(&self, dir: &Path) -> Option<std::sync::Arc<std::os::fd::OwnedFd>> {
+        Self::dir_fd_for(self, dir).ok()
     }
 
     fn is_shared(&self) -> bool {
@@ -7672,88 +7548,61 @@ impl FsBackend for HostFsBackend {
     }
 
     fn real_stat(&self, path: &str, follow: bool) -> Option<RealStat> {
-        use cap_std::fs::MetadataExt;
-        let mut normalized = normalize(path)?;
-        // Reject a host-aliased (Unicode-normalized) leaf: stat/lstat of a
-        // differently-normalized name must report ENOENT, exactly as on Linux
-        // (see `name_matches_on_disk`). Checked on the guest-typed leaf BEFORE
-        // any symlink following — that final component is where a freshly
-        // normalized guest name aliases an on-disk entry.
+        let normalized = if follow {
+            self.resolve_following(path)?
+        } else {
+            normalize(path)?
+        };
+
         if let Some(rel) = Self::rel_path(&normalized)
             && !self.name_matches_on_disk(rel)
         {
             return None;
         }
-        // Fast path (--fs host): a single fstatat + openat/F_GETPATH containment
-        // for the common regular-file/dir case, skipping cap-std's per-component
-        // walk. Falls through to cap-std for symlinks/FIFOs/escapes/errors.
+
         if let Some(rs) = self.fast_real_stat(&normalized, follow) {
             return Some(rs);
         }
-        // lstat (`follow == false`) reports the link itself; stat
-        // (`follow == true`) reports the target. We follow symlinks
-        // MANUALLY rather than via cap-std's `metadata`, because cap-std
-        // refuses to traverse an ABSOLUTE symlink target (it treats it as
-        // a sandbox escape). Resolving by hand lets an absolute target
-        // like `/tmp/dd` be interpreted relative to the guest root.
-        let meta = if follow {
-            let mut hops = 0u32;
-            loop {
-                let Some(rel) = Self::rel_path(&normalized) else {
-                    break self.dir.dir_metadata().ok()?;
-                };
-                let (dir, at_rel) = self.at(rel).ok()?;
-                let m = dir.symlink_metadata(&at_rel).ok()?;
-                if !m.is_symlink() {
-                    break m;
+
+        use std::os::fd::AsRawFd as _;
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        let rel = Self::rel_path(&normalized);
+        let rc = match rel {
+            Some(r) => {
+                let (parent_fd, leaf_c) = self.namei_leaf(r)?;
+                unsafe {
+                    libc::fstatat(
+                        parent_fd.as_raw_fd(),
+                        leaf_c.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
                 }
-                if hops >= 40 {
-                    // ELOOP guard.
-                    return None;
-                }
-                hops += 1;
-                let target = dir.read_link_contents(&at_rel).ok()?;
-                // `target` is raw host bytes; normalize WITHOUT a String round-
-                // trip so an undecodable symlink target isn't corrupted.
-                normalized = if target.is_absolute() {
-                    // Absolute target → relative to the guest root.
-                    normalize_raw(&target)?
-                } else {
-                    // Relative target → relative to the link's parent dir.
-                    let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
-                    normalize_raw(&parent.join(&target))?
-                };
             }
-        } else {
-            match Self::rel_path(&normalized) {
-                Some(rel) => {
-                    let (dir, at_rel) = self.at(rel).ok()?;
-                    dir.symlink_metadata(&at_rel).ok()?
-                }
-                None => self.dir.dir_metadata().ok()?,
-            }
+            None => unsafe { libc::fstat(self.root_fd.as_raw_fd(), &mut st) },
         };
-        // One anchored handle serves every xattr peek below: a deep path's
-        // per-peek full-path cap-std call would exceed PATH_MAX on Linux
-        // (see `at`). `None` only for the scratch root itself.
-        let anchored = match Self::rel_path(&normalized) {
-            Some(rel) => self.at(rel).ok(),
-            None => None,
-        };
-        let kind = if meta.is_dir() {
+        if rc != 0 {
+            return None;
+        }
+
+        let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+        let is_dir = typ == libc::S_IFDIR as u32;
+        let is_symlink = typ == libc::S_IFLNK as u32;
+        let is_fifo = typ == libc::S_IFIFO as u32;
+
+        let kind = if is_dir {
             RootFsEntryKind::Directory
-        } else if meta.is_symlink() {
+        } else if is_symlink {
             RootFsEntryKind::Symlink
-        } else if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
+        } else if is_fifo {
             RootFsEntryKind::Fifo
-        } else if matches!(&anchored, Some((dir, at_rel)) if read_socket_xattr(dir, at_rel)) {
-            // A regular scratch file flagged as an AF_UNIX socket node by
-            // `create_socket` (see CARRICK_SOCKET_XATTR) → report S_IFSOCK.
+        } else if rel.is_some_and(|r| read_socket_xattr(&self.root_path, r)) {
             RootFsEntryKind::Socket
         } else {
             RootFsEntryKind::File
         };
-        let mode = meta.mode() & 0o7777;
+
+        let mode = st.st_mode as u32 & 0o7777;
         let default_mode = match kind {
             RootFsEntryKind::Directory => 0o755,
             RootFsEntryKind::Symlink => 0o777,
@@ -7762,28 +7611,17 @@ impl FsBackend for HostFsBackend {
             | RootFsEntryKind::Fifo
             | RootFsEntryKind::Socket => 0o644,
         };
-        // The real file's mode was forced owner-accessible; the guest-visible
-        // mode lives in an xattr on the (symlink-resolved) target. Symlinks
-        // report 0777, and a FIFO's xattr read would have to open() the node
-        // (O_RDONLY blocks a writer-less FIFO and wedges the dispatcher) — its
-        // mode lives on the real node (set by create_fifo). Skip the xattr for
-        // both; use the real on-disk mode.
+
         let (override_mode, owner) = if kind == RootFsEntryKind::Fifo {
-            // A FIFO must NOT be opened to read its xattrs (O_RDONLY blocks a
-            // writer-less FIFO and wedges the dispatcher); its MODE lives on the
-            // real node (set by create_fifo), so override_mode stays None. On
-            // macOS the OWNER can still be read via PATH-based getxattr (no
-            // open), so a mknod'd FIFO reports the guest owner that
-            // stamp_new_node_owner recorded (LTP mknod08 reads st_gid back).
             #[cfg(target_os = "macos")]
             {
-                match &anchored {
-                    Some((dir, at_rel)) => (
+                match rel {
+                    Some(r) => (
                         None,
                         (
-                            path_get_u32_xattr(dir, at_rel, CARRICK_UID_XATTR, false)
+                            path_get_u32_xattr(&self.root_path, r, CARRICK_UID_XATTR, false)
                                 .map(NsUid::new),
-                            path_get_u32_xattr(dir, at_rel, CARRICK_GID_XATTR, false)
+                            path_get_u32_xattr(&self.root_path, r, CARRICK_GID_XATTR, false)
                                 .map(NsGid::new),
                         ),
                     ),
@@ -7795,42 +7633,45 @@ impl FsBackend for HostFsBackend {
                 (None, (None, None))
             }
         } else if kind == RootFsEntryKind::Symlink {
-            // A symlink's mode is always 0o777; its owner lives on the link
-            // itself (XATTR_NOFOLLOW), so lchown round-trips through lstat.
-            match &anchored {
-                Some((dir, at_rel)) => (
+            match rel {
+                Some(r) => (
                     None,
                     (
-                        symlink_get_u32_xattr(dir, at_rel, CARRICK_UID_XATTR).map(NsUid::new),
-                        symlink_get_u32_xattr(dir, at_rel, CARRICK_GID_XATTR).map(NsGid::new),
+                        symlink_get_u32_xattr(&self.root_path, r, CARRICK_UID_XATTR)
+                            .map(NsUid::new),
+                        symlink_get_u32_xattr(&self.root_path, r, CARRICK_GID_XATTR)
+                            .map(NsGid::new),
                     ),
                 ),
                 None => (None, (None, None)),
             }
         } else {
-            match &anchored {
-                Some((dir, at_rel)) => {
-                    let is_dir = matches!(kind, RootFsEntryKind::Directory);
-                    (
-                        read_mode_xattr(dir, at_rel, is_dir),
-                        read_owner_xattr(dir, at_rel, is_dir, false),
-                    )
-                }
+            match rel {
+                Some(r) => (
+                    read_mode_xattr(&self.root_path, r, is_dir),
+                    read_owner_xattr(&self.root_path, r, is_dir, false),
+                ),
                 None => (None, (None, None)),
             }
         };
+
         Some(RealStat {
             kind,
-            ino: meta.ino(),
-            nlink: meta.nlink() as u32,
+            ino: st.st_ino,
+            nlink: st.st_nlink as u32,
             mode: override_mode.unwrap_or(if mode == 0 { default_mode } else { mode }),
             uid: owner.0.unwrap_or(NsUid::ROOT),
             gid: owner.1.unwrap_or(NsGid::ROOT),
-            size: meta.len(),
-            atime: (meta.atime(), meta.atime_nsec()),
-            mtime: (meta.mtime(), meta.mtime_nsec()),
-            ctime: (meta.ctime(), meta.ctime_nsec()),
+            size: st.st_size as u64,
+            atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
+            mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
+            ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
         })
+    }
+
+    fn structural_generation(&self) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.structural_gen.load(SeqCst)
     }
 
     fn name(&self) -> &'static str {
@@ -8674,9 +8515,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn host_backend() -> (HostFsBackend, tempfile::TempDir) {
         let scratch = tempfile::TempDir::new().unwrap();
-        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .unwrap();
-        (HostFsBackend::from_existing_dir(dir), scratch)
+        (HostFsBackend::from_path(scratch.path()).unwrap(), scratch)
     }
 
     #[cfg(target_os = "macos")]
@@ -8895,11 +8734,11 @@ mod tests {
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
         assert!(b.stat_cache_active());
-        b.dir.create_dir("work").unwrap();
+        std::fs::create_dir(b.root_path.join("work")).unwrap();
         // 0o555 keeps the owner below rwx, so the guest mode lives in the
         // xattr override -- the field a refill would re-read.
         b.set_mode("/work", 0o555).unwrap();
-        b.dir.write("work/log", b"x").unwrap();
+        std::fs::write(b.root_path.join("work/log"), b"x").unwrap();
         b.set_mode("/work/log", 0o444).unwrap();
 
         assert_eq!(b.stat_cache_lookup("/work").unwrap().mode, 0o555);
@@ -8907,9 +8746,9 @@ mod tests {
 
         // Churn: the directory's mtime/ctime/size move, the file's mtime/
         // ctime/size move. Neither inode's identity or guest metadata does.
-        b.dir.write("work/child", b"y").unwrap();
-        b.dir.remove_file("work/child").unwrap();
-        b.dir.write("work/log", b"hello").unwrap();
+        std::fs::write(b.root_path.join("work/child"), b"y").unwrap();
+        std::fs::remove_file(b.root_path.join("work/child")).unwrap();
+        std::fs::write(b.root_path.join("work/log"), b"hello").unwrap();
 
         // Rewrite the overrides BEHIND the backend -- no carrick writer, so no
         // generation bump. A refill would read these; a cache hit must not.
@@ -8979,9 +8818,9 @@ mod tests {
             b.stat_cache_active(),
             "the --fs host stat cache must be live for this assertion to mean anything"
         );
-        b.dir.create_dir("pkg").unwrap();
+        std::fs::create_dir(b.root_path.join("pkg")).unwrap();
         for index in 0..24 {
-            b.dir.write(format!("pkg/f{index}"), b"x").unwrap();
+            std::fs::write(b.root_path.join(format!("pkg/f{index}")), b"x").unwrap();
         }
 
         for index in 0..24 {
@@ -9016,8 +8855,8 @@ mod tests {
 
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-        b.dir.create_dir("pkg").unwrap();
-        b.dir.create_dir("pkg/inner").unwrap();
+        std::fs::create_dir(b.root_path.join("pkg")).unwrap();
+        std::fs::create_dir(b.root_path.join("pkg/inner")).unwrap();
 
         let first = b.dir_fd_for(Path::new("pkg")).expect("pkg resolves");
         let again = b.dir_fd_for(Path::new("pkg")).expect("pkg resolves again");
@@ -9052,7 +8891,7 @@ mod tests {
 
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-        b.dir.create_dir("pkg").unwrap();
+        std::fs::create_dir(b.root_path.join("pkg")).unwrap();
         let before = b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd();
 
         for index in 0..64 {
@@ -9081,17 +8920,17 @@ mod tests {
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
         assert!(b.stat_cache_active());
-        b.dir.create_dir("pkg").unwrap();
-        b.dir.write("pkg/a", b"x").unwrap();
+        std::fs::create_dir(b.root_path.join("pkg")).unwrap();
+        std::fs::write(b.root_path.join("pkg/a"), b"x").unwrap();
 
         // Warm both caches on the pre-rename topology.
         assert!(b.stat_cache_lookup("/pkg/a").is_some());
-        assert!(b.dir_fd_for(Path::new("pkg")).is_some());
+        assert!(b.dir_fd_for(Path::new("pkg")).is_ok());
 
         assert!(b.rename_overlay_entry("/pkg", "/moved").unwrap());
 
         assert!(
-            b.dir_fd_for(Path::new("pkg")).is_none(),
+            b.dir_fd_for(Path::new("pkg")).is_err(),
             "the old directory path must not resolve after its rename"
         );
         assert!(
@@ -9120,11 +8959,11 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), scratch_root.path().join("escape")).unwrap();
 
         assert!(
-            b.dir_fd_for(Path::new("escape")).is_none(),
+            b.dir_fd_for(Path::new("escape")).is_err(),
             "a symlink leaf must not be resolved as a directory (O_NOFOLLOW)"
         );
         assert!(
-            b.dir_fd_for(Path::new("escape/target")).is_none(),
+            b.dir_fd_for(Path::new("escape/target")).is_err(),
             "a path through a symlink out of the sandbox must be refused"
         );
         let cache = b.dir_cache.lock();
@@ -9346,9 +9185,7 @@ mod tests {
     #[test]
     fn host_deep_path_ops_beyond_path_max() {
         let scratch = tempfile::TempDir::new().unwrap();
-        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .unwrap();
-        let b = HostFsBackend::from_existing_dir(dir);
+        let b = HostFsBackend::from_path(scratch.path()).unwrap();
         let name = "a".repeat(200);
         let mut path = String::new();
         for depth in 0..25 {
@@ -9631,9 +9468,7 @@ mod tests {
         std::fs::write(scratch.path().join("file"), b"x").unwrap();
         std::fs::create_dir(scratch.path().join("dir")).unwrap();
         std::os::unix::fs::symlink("file", scratch.path().join("link")).unwrap();
-        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .unwrap();
-        let b = HostFsBackend::from_existing_dir(dir);
+        let b = HostFsBackend::from_path(scratch.path()).unwrap();
 
         assert_eq!(b.lookup_kind("/file"), Some(OverlayEntryKind::File));
         assert_eq!(b.lookup_kind("/dir"), Some(OverlayEntryKind::Dir));
@@ -9755,9 +9590,7 @@ mod tests {
 
         let scratch = outer.path().join("scratch");
         std::fs::create_dir(&scratch).unwrap();
-        let dir =
-            cap_std::fs::Dir::open_ambient_dir(&scratch, cap_std::ambient_authority()).unwrap();
-        let b = HostFsBackend::from_existing_dir(dir);
+        let b = HostFsBackend::from_path(&scratch).unwrap();
         // Try to escape via `..`. cap-std rejects this at the path-
         // walking layer, not via a Rust-level check, which is exactly
         // the secure-by-default guarantee we wanted.
@@ -9788,9 +9621,7 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         std::os::unix::fs::symlink("b", scratch.path().join("a")).unwrap();
         std::os::unix::fs::symlink("a", scratch.path().join("b")).unwrap();
-        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
-            .unwrap();
-        let b = HostFsBackend::from_existing_dir(dir);
+        let b = HostFsBackend::from_path(scratch.path()).unwrap();
 
         assert_eq!(b.file_contents("/a"), None);
     }
@@ -9941,11 +9772,12 @@ mod tests {
     fn create_raw_fd_applies_the_guest_mode_on_the_held_fd() {
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-        b.dir.create_dir("d").unwrap();
+        std::fs::create_dir(b.root_path.join("d")).unwrap();
 
         let host_mode = |name: &str| -> u32 {
-            let st = b.dir.metadata(name).unwrap();
-            use cap_std::fs::MetadataExt as _;
+            use std::os::unix::fs::MetadataExt as _;
+            let st =
+                std::fs::symlink_metadata(b.root_path.join(name.trim_start_matches('/'))).unwrap();
             st.mode() & 0o7777
         };
 
@@ -9986,7 +9818,7 @@ mod tests {
         let (fd, applied) = b.create_raw_fd("/nope/f", 0o644, false).served().unwrap();
         assert!(!applied);
         unsafe { libc::close(fd) };
-        assert!(b.dir.exists("nope/f"));
+        assert!(b.root_path.join("nope/f").exists());
 
         // A directory at the path is not a file the lane can hand out.
         assert!(b.create_raw_fd("/d", 0o644, false).served().is_none());
@@ -10042,60 +9874,73 @@ mod tests {
     /// enforced that first), so the honest Linux errno is `ENFILE`.
     #[test]
     fn host_descriptor_exhaustion_is_refused_not_unavailable() {
-        let scratch_root = tempfile::TempDir::new().unwrap();
-        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-        b.dir.create_dir("d").unwrap();
-        b.dir.write("d/existing", b"x").unwrap();
-        // Nothing cached: a reclaim under exhaustion must find nothing to
-        // free, so the refusal is the only possible outcome.
-        b.drop_dir_cache();
+        // Fork a child process so setrlimit(RLIMIT_NOFILE) is confined to the child
+        // and cannot starve parallel test threads running in the parent process.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let scratch_root = tempfile::TempDir::new().unwrap();
+            let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+            std::fs::create_dir(b.root_path.join("d")).unwrap();
+            std::fs::write(b.root_path.join("d/existing"), b"x").unwrap();
+            // Nothing cached: a reclaim under exhaustion must find nothing to
+            // free, so the refusal is the only possible outcome.
+            b.drop_dir_cache();
 
-        {
-            let _shut = DescriptorTableShut::new();
-            match b.create_raw_fd("/d/new", 0o644, false) {
-                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
-                HostFdOpen::Served((fd, _)) => {
-                    unsafe { libc::close(fd) };
-                    panic!("create served with the descriptor table shut");
+            {
+                let _shut = DescriptorTableShut::new();
+                match b.create_raw_fd("/d/new", 0o644, false) {
+                    HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                    HostFdOpen::Served((fd, _)) => {
+                        unsafe { libc::close(fd) };
+                        panic!("create served with the descriptor table shut");
+                    }
+                    HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
                 }
-                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
-            }
-            match b.open_raw_fd("/d/existing", false, false, false) {
-                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
-                HostFdOpen::Served(fd) => {
-                    unsafe { libc::close(fd) };
-                    panic!("open served with the descriptor table shut");
+                match b.open_raw_fd("/d/existing", false, false, false) {
+                    HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                    HostFdOpen::Served(fd) => {
+                        unsafe { libc::close(fd) };
+                        panic!("open served with the descriptor table shut");
+                    }
+                    HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
                 }
-                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
-            }
-            match b.open_raw_fd_with_metadata("/d/existing", false, false, false) {
-                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
-                HostFdOpen::Served((fd, _)) => {
-                    unsafe { libc::close(fd) };
-                    panic!("open-with-metadata served with the descriptor table shut");
+                match b.open_raw_fd_with_metadata("/d/existing", false, false, false) {
+                    HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                    HostFdOpen::Served((fd, _)) => {
+                        unsafe { libc::close(fd) };
+                        panic!("open-with-metadata served with the descriptor table shut");
+                    }
+                    HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
                 }
-                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+                assert_eq!(
+                    b.create_file("/d/new2"),
+                    Err(BackendError::Host(LINUX_ENFILE)),
+                    "create_file must carry the host refusal, not a bare Io"
+                );
             }
-            assert_eq!(
-                b.create_file("/d/new2"),
-                Err(BackendError::Host(LINUX_ENFILE)),
-                "create_file must carry the host refusal, not a bare Io"
-            );
-        }
 
-        // With the table open again the same calls serve, and a genuine
-        // miss stays Unavailable (path semantics belong to the resolver).
-        let (fd, _) = b.create_raw_fd("/d/new", 0o644, false).served().unwrap();
-        unsafe { libc::close(fd) };
-        let fd = b
-            .open_raw_fd("/d/existing", false, false, false)
-            .served()
-            .unwrap();
-        unsafe { libc::close(fd) };
-        assert!(
-            b.open_raw_fd("/d/missing", false, false, false)
+            // With the table open again the same calls serve, and a genuine
+            // miss stays Unavailable (path semantics belong to the resolver).
+            let (fd, _) = b.create_raw_fd("/d/new", 0o644, false).served().unwrap();
+            unsafe { libc::close(fd) };
+            let fd = b
+                .open_raw_fd("/d/existing", false, false, false)
                 .served()
-                .is_none()
+                .unwrap();
+            unsafe { libc::close(fd) };
+            assert!(
+                b.open_raw_fd("/d/missing", false, false, false)
+                    .served()
+                    .is_none()
+            );
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child failed with status {status}"
         );
     }
 
@@ -10108,8 +9953,8 @@ mod tests {
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
         assert!(b.stat_cache_active());
-        b.dir.create_dir("pkg").unwrap();
-        b.dir.write("pkg/f", b"hello").unwrap();
+        std::fs::create_dir(b.root_path.join("pkg")).unwrap();
+        std::fs::write(b.root_path.join("pkg/f"), b"hello").unwrap();
         b.set_mode("/pkg/f", 0o640).unwrap();
 
         let (kind, md) = b.lookup_kind_and_metadata("/pkg/f");
@@ -10130,12 +9975,12 @@ mod tests {
         assert_eq!(md.size, 0);
 
         // The revalidating fstatat sees a change made behind the cache.
-        b.dir.write("pkg/f", b"hello, world").unwrap();
+        std::fs::write(b.root_path.join("pkg/f"), b"hello, world").unwrap();
         let (_, md) = b.lookup_kind_and_metadata("/pkg/f");
         assert_eq!(md.unwrap().size, 12);
 
         // Deleted behind the cache: absent, not a stale hit.
-        b.dir.remove_file("pkg/f").unwrap();
+        std::fs::remove_file(b.root_path.join("pkg/f")).unwrap();
         assert_eq!(b.lookup_kind_and_metadata("/pkg/f"), (None, None));
     }
 
@@ -10154,15 +9999,16 @@ mod tests {
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
         assert!(b.stat_cache_active());
         assert!(b.serves_plain_metadata(), "fresh scratch is plain");
-        b.dir.create_dir("pkg").unwrap();
-        b.dir.write("pkg/f", b"hello").unwrap();
-        let on_disk = b.dir.metadata("pkg/f").unwrap();
-        let on_disk_mode = cap_std::fs::MetadataExt::mode(&on_disk) & 0o7777;
+        std::fs::create_dir(b.root_path.join("pkg")).unwrap();
+        std::fs::write(b.root_path.join("pkg/f"), b"hello").unwrap();
+        let on_disk = std::fs::symlink_metadata(b.root_path.join("pkg/f")).unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let on_disk_mode = on_disk.mode() & 0o7777;
         assert_ne!(on_disk_mode, 0o400);
 
         // Plant an override xattr WITHOUT stamping the root marker.
         {
-            let f = b.dir.open("pkg/f").unwrap();
+            let f = std::fs::File::open(b.root_path.join("pkg/f")).unwrap();
             fset_u32_xattr(f.as_raw_fd(), CARRICK_MODE_XATTR, 0o400);
         }
         let real = b.stat_cache_get_or_fill(Path::new("pkg/f")).unwrap();
@@ -10174,11 +10020,11 @@ mod tests {
 
         // The first metadata writer stamps the marker before its xattr; the
         // planted override is now honoured, even for the cached entry.
-        b.dir.write("pkg/g", b"x").unwrap();
+        std::fs::write(b.root_path.join("pkg/g"), b"x").unwrap();
         b.set_owner("/pkg/g", Some(NsUid::new(7)), None).unwrap();
         assert!(!b.serves_plain_metadata());
         // A ctime bump makes the cached plain entry revalidate stale.
-        b.dir.write("pkg/f", b"hello!").unwrap();
+        std::fs::write(b.root_path.join("pkg/f"), b"hello!").unwrap();
         let real = b.stat_cache_get_or_fill(Path::new("pkg/f")).unwrap();
         assert_eq!(real.mode, 0o400, "marked tree honours the override");
         let g = b.stat_cache_get_or_fill(Path::new("pkg/g")).unwrap();
@@ -10191,7 +10037,7 @@ mod tests {
     /// immutable-lower open, so the dispatcher's install sites never pay a
     /// `fcntl` to establish its host-fd invariant.
     #[test]
-    fn backend_fds_arrive_nonblocking() {
+    fn host_all_opens_are_nonblocking() {
         fn is_nonblocking(fd: i32) -> bool {
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             flags >= 0 && flags & libc::O_NONBLOCK != 0
@@ -10203,8 +10049,8 @@ mod tests {
         }
         let scratch_root = tempfile::TempDir::new().unwrap();
         let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-        b.dir.create_dir("d").unwrap();
-        b.dir.write("d/f", b"hello").unwrap();
+        std::fs::create_dir(b.root_path.join("d")).unwrap();
+        std::fs::write(b.root_path.join("d/f"), b"hello").unwrap();
 
         // Non-creating reads and writes (fast lane on macOS, cap-std elsewhere).
         assert!(

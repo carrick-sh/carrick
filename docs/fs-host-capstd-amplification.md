@@ -277,3 +277,22 @@ identical counts cache on/off; a dir-rename leaves the old path correctly ENOENT
 | + `CARRICK_FS_STATCACHE` (default ON, `=0` opts out) | ~3.5 µs | ~2.5× | **1** |
 | HVF trap floor (hard limit) | ~1.8 µs | ~2× | 0 (cached) |
 | native (APFS, no VM) | ~1.0–1.4 µs | 1× | 1 |
+
+## UPDATE 4 (2026-09-05) — Retirement of `cap-std` / `cap-primitives` in favor of Carrick `namei_leaf`
+
+`cap-std` and `cap-primitives` have been completely removed from Carrick and banned in `Cargo.toml` and `deny.toml`.
+
+### Architecture & Motivation
+Previously, `HostFsBackend` relied on `cap-std` for certain host path operations and writes, which imposed a linear component-by-component walk (`openat(O_NOFOLLOW)`) for path resolution on macOS where `openat2` / `RESOLVE_BENEATH` is unavailable. This caused path re-walk amplification and complex dual-authority resolution.
+
+With the unified HVPatch architecture, Carrick's own `namei` resolver is the sole authority for guest path resolution. All operations in `HostFsBackend` now resolve via `namei_leaf` into:
+`(parent_dir_fd: Arc<OwnedFd>, leaf_name: CString)`
+
+Each host filesystem mutation or inspection executes directly against `parent_dir_fd` with a single host `*at` syscall (`openat`, `fstatat`, `unlinkat`, `renameat`, `fchmodat`, `mkdirat`, etc.) using `O_NOFOLLOW` / `AT_SYMLINK_NOFOLLOW`.
+
+### Security & Containment Invariants
+- `namei` enforces guest root containment, symlink hop limits (ELOOP guard at 40 hops), and `..` clamping / containment before handing the parent dir and leaf component to the backend.
+- Single-syscall `*at` operations with `AT_SYMLINK_NOFOLLOW` / `O_NOFOLLOW` operate exclusively on the immediate leaf component relative to the verified parent directory descriptor.
+- Verified with the `namei_escape` conformance probe covering `..` chains, absolute symlinks, swapped symlink loops, and relative symlink traversal.
+- IO safety: all file descriptor lifecycles are strictly managed via `OwnedFd` / `HostFdRef`, eliminating double-close and descriptor recycling races across concurrent test and runtime workloads.
+

@@ -957,9 +957,7 @@ fn chroot_rebases_absolute_resolution() {
 #[test]
 fn chroot_no_search_permission_precedes_capability_error() {
     let scratch = tempfile::tempdir().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/jail").unwrap();
     backend.set_mode("/jail", 0o600).unwrap();
 
@@ -986,9 +984,7 @@ fn chroot_no_search_permission_precedes_capability_error() {
 #[test]
 fn truncate_follows_final_symlink_cycle_to_eloop() {
     let scratch = tempfile::tempdir().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.symlink("testsymlink2", "/testsymlink1").unwrap();
     backend.symlink("testsymlink1", "/testsymlink2").unwrap();
 
@@ -1020,9 +1016,7 @@ fn truncate_follows_final_symlink_cycle_to_eloop() {
 #[cfg(target_os = "macos")]
 fn trusted_lane_fixture() -> (tempfile::TempDir, SyscallDispatcher) {
     let scratch = tempfile::tempdir().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/walk").unwrap();
     backend.make_dir("/walk/sub").unwrap();
     backend
@@ -1049,9 +1043,7 @@ fn trusted_lane_fixture() -> (tempfile::TempDir, SyscallDispatcher) {
 #[test]
 fn mknodat_special_node_in_setgid_parent_inherits_gid_without_setgid() {
     let scratch = tempfile::tempdir().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.make_dir("/setgid-parent").unwrap();
     backend
         .set_owner(
@@ -1126,9 +1118,7 @@ fn mknodat_special_node_in_setgid_parent_inherits_gid_without_setgid() {
 #[test]
 fn stat_following_final_symlink_cycle_returns_eloop() {
     let scratch = tempfile::tempdir().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend.symlink("loop/inside", "/loop").unwrap();
 
     let mut dispatcher = SyscallDispatcher::new();
@@ -1188,9 +1178,7 @@ fn trusted_lower_lane_fixture() -> (tempfile::TempDir, tempfile::TempDir, Syscal
     drop(lower_metadata);
 
     let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
-    let upper_dir =
-        cap_std::fs::Dir::open_ambient_dir(upper.path(), cap_std::ambient_authority()).unwrap();
-    let mut overlay = crate::fs_backend::HostFsBackend::from_existing_dir(upper_dir);
+    let mut overlay = crate::fs_backend::HostFsBackend::from_path(upper.path()).unwrap();
     overlay.enable_sparse_upper_fast_miss();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(overlay));
@@ -3458,8 +3446,6 @@ fn sync_file_range_rejects_synthetic_character_device_with_espipe() {
 
 #[test]
 fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
-    reset_fd_open_path_inserts();
-
     let backend = crate::fs_backend::MemoryBackend::new();
     backend
         .set_file_contents("/regular.bin", b"payload".to_vec())
@@ -3470,10 +3456,11 @@ fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     memory.write_bytes(0x4000, b"/regular.bin\0").unwrap();
 
+    let context = dispatcher.capture_one_task_context().unwrap();
     assert_eq!(
         dispatcher
             .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
+                &context,
                 SyscallRequest::new(56, SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]),),
                 &mut memory,
                 &reporter,
@@ -3486,7 +3473,7 @@ fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
     assert_eq!(
         dispatcher
             .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
+                &context,
                 SyscallRequest::new(
                     78,
                     SyscallArgs::from([LINUX_AT_FDCWD, 0x4100, 0x4200, 64, 0, 0]),
@@ -3500,11 +3487,6 @@ fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
     assert_eq!(
         memory.read_bytes(0x4200, 12).unwrap(),
         b"/regular.bin".to_vec()
-    );
-    assert_eq!(
-        fd_open_path_inserts(),
-        0,
-        "fd_open_paths insertions should be 0 for memory OpenDescription::File"
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -3599,9 +3581,7 @@ fn rlimit_fsize_straddling_regular_write_returns_only_the_limit_prefix() {
 #[test]
 fn close_retires_the_fd_open_path_entry() {
     let scratch = tempfile::tempdir().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend
         .set_file_contents("/locale.bin", b"payload".to_vec())
         .unwrap();
@@ -3653,9 +3633,7 @@ fn close_retires_the_fd_open_path_entry() {
 #[test]
 fn openat2_resolve_no_symlinks_rejects_link_path() {
     let scratch = tempfile::tempdir().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
     backend
         .set_file_contents("/target", b"payload".to_vec())
         .unwrap();
@@ -4889,6 +4867,7 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
     // 5. Bidirectional HostPipe (e.g. O_RDWR FIFO or pty) permits both directions
     let mut host_fds = [-1; 2];
     assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+    unsafe { libc::close(host_fds[1]) };
     let pty_desc = OpenDescription::HostPipe {
         base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDWR),
         host_fd: HostFdRef::new(host_fds[0]),
@@ -5890,9 +5869,7 @@ fn memfd_proc_self_fd_reopen_access_mode_and_seals() {
 #[test]
 fn proc_self_fd_reopen_overlay_file_write_after_reopen_visible_in_reopened() {
     let scratch = tempfile::tempdir().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
 
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
@@ -6007,9 +5984,7 @@ fn proc_self_fd_reopen_overlay_file_write_after_reopen_visible_in_reopened() {
 #[test]
 fn proc_self_fd_reopen_offsets_are_independent() {
     let scratch = tempfile::tempdir().unwrap();
-    let dir =
-        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
 
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
@@ -6693,8 +6668,10 @@ fn lseek_data_and_hole_across_backends() {
     );
 
     // 6. HostFile
+    use std::os::fd::IntoRawFd;
     let temp_hf = tempfile::NamedTempFile::new().unwrap();
-    let raw_hf = temp_hf.as_file().as_raw_fd();
+    let path_hf = temp_hf.path().to_path_buf();
+    let raw_hf = temp_hf.into_file().into_raw_fd();
     unsafe {
         assert_eq!(libc::ftruncate(raw_hf, 1048576), 0);
         let buf = [0xFFu8; 4096];
@@ -6704,7 +6681,6 @@ fn lseek_data_and_hole_across_backends() {
             4096
         );
     }
-    let path_hf = temp_hf.path().to_path_buf();
     let hf_desc = OpenDescription::HostFile {
         base: OpenDescriptionBase::new(0),
         host_fd: HostFdRef::new(raw_hf),

@@ -922,12 +922,10 @@ impl TrustedHostDir {
         self.anchor == TrustedAnchor::MergedUpper
     }
 
-    pub(super) fn namespace_is_current(&self) -> bool {
+    pub(super) fn namespace_is_current_against(&self, current_gen: u64) -> bool {
         match self.anchor {
             TrustedAnchor::MergedUpper => true,
-            TrustedAnchor::ImmutableLower { generation } => {
-                crate::fs_resolve_cache::current_generation() == generation
-            }
+            TrustedAnchor::ImmutableLower { generation } => generation == current_gen,
         }
     }
 }
