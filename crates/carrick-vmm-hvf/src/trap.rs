@@ -10575,6 +10575,195 @@ mod task_only_carrier_directory_tests {
     }
 
     #[test]
+    fn unregister_alias_does_not_scan_foreign_owners() {
+        let _test_lock = ALIAS_TEST_LOCK.lock();
+        clear_alias_registry();
+        clear_replay_mappings();
+        const FOREIGN: usize = 512;
+        let mine = alias(0x9999_0000, 1);
+        let scope = match mine.ownership_scope {
+            AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
+            _ => None,
+        };
+        let mut foreign_rows = Vec::new();
+        {
+            let mut registry = alias_registry().lock();
+            for index in 0..FOREIGN {
+                let mut row = alias(0x3000_0000 + index, 1);
+                row.start = 0x1000_0000 + index as u64 * 0x4000;
+                row.ipa += index as u64 * 0x4000;
+                row.physical_ipa += (index as u64 + 1) * 0x4000;
+                row.ownership_scope = AliasOwnershipScope::MmRootSlot {
+                    base: 0x1000_0000_0000 + index as u64 * 0x4000,
+                    size: 0x4000,
+                };
+                foreign_rows.push(row);
+                registry.push(row);
+            }
+            registry.push(mine);
+        }
+        let before = alias_state_rows_scanned();
+        let retired = unregister_alias(mine.start, mine.size, scope, ContainerRootToken::ROOT);
+        let scanned = alias_state_rows_scanned() - before;
+        assert!(retired.contains(&(mine.physical_ipa, mine.physical_size as u64)));
+        assert_eq!(alias_registry().lock().len(), FOREIGN);
+        for row in foreign_rows {
+            assert!(alias_registry().lock().contains(&row));
+        }
+        clear_alias_registry();
+        clear_replay_mappings();
+        assert!(
+            scanned <= 16,
+            "unregister of one alias visited {scanned} rows with {FOREIGN} foreign owners"
+        );
+    }
+
+    #[test]
+    fn unregister_alias_matches_full_snapshot_invalidation() {
+        let directory = HvpatchCarrierTaskStateDirectory::default();
+        let owner = owner_key(&directory, 88, 1);
+        let mut root = alias(0x9000_0000, 3);
+        root.size = 0x4000;
+        let scope = match root.ownership_scope {
+            AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
+            _ => None,
+        };
+        let mut foreign = root;
+        foreign.start -= 0x100000;
+        foreign.ipa -= 0x100000;
+        foreign.physical_ipa -= 0x100000;
+        foreign.ownership_scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x1234_0000,
+            size: 0x4000,
+        };
+        let ranges = [
+            (0, 0x4000),
+            (0, 0x1000),
+            (0x3000, 0x1000),
+            (0x1000, 0x1000),
+            (0, 0),
+            (0x5000, 0x1000),
+        ];
+        for variant in 0..5 {
+            for (offset, len) in ranges {
+                let va = root.start + offset;
+                let mut rows = vec![root, foreign];
+                if variant == 1 || variant == 2 {
+                    let mut duplicate = root;
+                    duplicate.size = if variant == 1 { 0x1000 } else { 0x8000 };
+                    duplicate.physical_ipa += 0x100000;
+                    rows.push(duplicate);
+                }
+                if variant == 3 || variant == 4 {
+                    let mut collision = root;
+                    collision.start = va + len as u64;
+                    collision.ipa += offset + len as u64;
+                    collision.physical_ipa += 0x200000;
+                    if variant == 3 {
+                        rows.insert(0, collision);
+                    } else {
+                        rows.push(collision);
+                    }
+                }
+                let mut registry = AliasRegistry::default();
+                let mut replay = std::collections::BTreeSet::new();
+                let mut versions = AliasVersionRegistry::default();
+                for (index, row) in rows.into_iter().enumerate() {
+                    registry.push(row);
+                    replay.insert(replay_mapping_key(row));
+                    let key = alias_version_key(&row);
+                    let id = AliasPublicationVersionId {
+                        owner,
+                        ordinal: index as u32,
+                    };
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        versions.aliases.entry(key)
+                    {
+                        let mut preimage = row;
+                        preimage.host_addr += 0x4000;
+                        entry.insert(AliasVersionChain {
+                            base: Some(preimage),
+                            versions: vec![OwnedAliasVersion {
+                                id,
+                                value: row,
+                                epoch: 7,
+                            }],
+                        });
+                        versions.alias_epochs.insert(key, 7);
+                        versions.alias_version_owner.insert(id, key);
+                    }
+                    let id = AliasPublicationVersionId {
+                        owner,
+                        ordinal: index as u32 + 100,
+                    };
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        versions.replays.entry(row.physical_ipa)
+                    {
+                        entry.insert(ReplayVersionChain {
+                            base: vec![],
+                            versions: vec![OwnedReplayVersion {
+                                id,
+                                value: replay_mapping_key(row),
+                                epoch: 9,
+                            }],
+                        });
+                        versions.replay_epochs.insert(row.physical_ipa, 9);
+                        versions.replay_version_owner.insert(id, row.physical_ipa);
+                    }
+                }
+                let mut reference_registry = registry.clone();
+                let mut reference_replay = replay.clone();
+                let mut reference_versions = versions.clone();
+                let expected = mutate_external_alias_state_in(
+                    &mut reference_replay,
+                    &mut reference_registry,
+                    &mut reference_versions,
+                    |_, registry| {
+                        unregister_alias_entries(registry, va, len, scope, ContainerRootToken::ROOT)
+                    },
+                );
+                let actual = unregister_alias_in(
+                    &mut registry,
+                    &replay,
+                    &mut versions,
+                    va,
+                    len,
+                    scope,
+                    ContainerRootToken::ROOT,
+                );
+                assert_eq!(
+                    actual, expected,
+                    "retired extents variant={variant} offset={offset}"
+                );
+                assert_eq!(
+                    registry.iter().copied().collect::<Vec<_>>(),
+                    reference_registry.iter().copied().collect::<Vec<_>>()
+                );
+                assert_eq!(replay, reference_replay);
+                assert_eq!(
+                    versions, reference_versions,
+                    "version invalidation variant={variant} offset={offset}"
+                );
+                // A checked-add overflow must leave even live receipts untouched.
+                let before = versions.clone();
+                assert!(
+                    unregister_alias_in(
+                        &mut registry,
+                        &replay,
+                        &mut versions,
+                        u64::MAX - 1,
+                        4,
+                        scope,
+                        ContainerRootToken::ROOT
+                    )
+                    .is_empty()
+                );
+                assert_eq!(versions, before);
+            }
+        }
+    }
+
+    #[test]
     fn external_unregister_and_clear_invalidate_owned_versions() {
         let _test_lock = ALIAS_TEST_LOCK.lock();
         let preimage = alias(0xf666_0000, 1);
@@ -17506,9 +17695,91 @@ fn unregister_alias(
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
 ) -> std::collections::BTreeSet<(u64, u64)> {
-    mutate_external_alias_state(|_, registry| {
-        unregister_alias_entries(registry, va, len, mm_root_slot, container_root)
-    })
+    let replay = replay_mappings().lock();
+    let mut registry = alias_registry().lock();
+    let mut versions = alias_version_registry().lock();
+    unregister_alias_in(
+        &mut registry,
+        &replay,
+        &mut versions,
+        va,
+        len,
+        mm_root_slot,
+        container_root,
+    )
+}
+
+/// Invalidate only keys whose effective first alias changed. Replay versions
+/// for their physical owners must also be invalidated even though unmap does
+/// not change replay rows; otherwise retiring an old receipt can resurrect an
+/// alias removed or split here.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn unregister_alias_in(
+    registry: &mut AliasRegistry,
+    replay: &std::collections::BTreeSet<ReplayMappingKey>,
+    versions: &mut AliasVersionRegistry,
+    va: u64,
+    len: usize,
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+) -> std::collections::BTreeSet<(u64, u64)> {
+    let Some(end) = va.checked_add(len as u64).filter(|&end| end > va) else {
+        return std::collections::BTreeSet::new();
+    };
+    let lower = va.saturating_sub(registry.widest_va);
+    let mut keys = std::collections::BTreeSet::new();
+    for (_, rows) in registry.by_va_start.range(lower..end) {
+        note_alias_state_rows_scanned(rows.len());
+        for (_, entry) in rows {
+            let entry_end = entry.start.saturating_add(entry.size as u64);
+            if !alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
+                || entry_end <= va
+            {
+                continue;
+            }
+            keys.insert(alias_version_key(entry));
+            if entry_end > end {
+                keys.insert((
+                    end,
+                    entry.ipa.saturating_add(end.saturating_sub(entry.start)),
+                    entry.ownership_scope,
+                ));
+            }
+        }
+    }
+    // Snapshot suffix keys too: an existing row can collide with a fragment,
+    // and duplicate keys retain historical first-row semantics.
+    let before = keys
+        .into_iter()
+        .map(|key| (key, registry.find_by_key(key.0, key.1, key.2)))
+        .collect::<Vec<_>>();
+    let retired = unregister_alias_entries(registry, va, len, mm_root_slot, container_root);
+    let mut physical_ipas = std::collections::BTreeSet::new();
+    for (key, old) in before {
+        let after = registry.find_by_key(key.0, key.1, key.2);
+        if old == after {
+            continue;
+        }
+        physical_ipas.extend(old.into_iter().chain(after).map(|alias| alias.physical_ipa));
+        bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: external alias mutation epoch exhausted");
+            std::process::abort();
+        });
+        for id in reset_alias_chain(&mut versions.aliases, key, after) {
+            versions.alias_version_owner.remove(&id);
+        }
+    }
+    for physical_ipa in physical_ipas {
+        bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
+            std::process::abort();
+        });
+        let base = replay_rows_for_ipa(replay, physical_ipa);
+        for id in reset_replay_chain(&mut versions.replays, physical_ipa, base) {
+            versions.replay_version_owner.remove(&id);
+        }
+    }
+    retired
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -31808,6 +32079,7 @@ struct AliasPublicationVersionId {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
 struct OwnedAliasVersion {
     id: AliasPublicationVersionId,
     value: AliasBacking,
@@ -31815,6 +32087,7 @@ struct OwnedAliasVersion {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
 struct AliasVersionChain {
     // The `(start, ipa, scope)` tuple is the map key; it is deliberately not
     // duplicated into the value, so the key and the row can never disagree.
@@ -31831,6 +32104,7 @@ fn alias_version_key(alias: &AliasBacking) -> AliasVersionKey {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
 struct OwnedReplayVersion {
     id: AliasPublicationVersionId,
     value: ReplayMappingKey,
@@ -31838,6 +32112,7 @@ struct OwnedReplayVersion {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
 struct ReplayVersionChain {
     // `physical_ipa` is the map key; see `AliasVersionChain`.
     base: Vec<ReplayMappingKey>,
@@ -31856,6 +32131,7 @@ struct ReplayVersionChain {
 /// exist so `AliasPublicationReceipt::retire_exact` can find the chain owning
 /// a version id without walking every chain's version list.
 #[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
 struct AliasVersionRegistry {
     aliases: std::collections::BTreeMap<AliasVersionKey, AliasVersionChain>,
     replays: std::collections::BTreeMap<u64, ReplayVersionChain>,
@@ -32213,10 +32489,20 @@ fn mutate_external_alias_state<R>(
     // base and invalidates every older receipt version for the touched key.
     let mut replay = replay_mappings().lock();
     let mut registry = alias_registry().lock();
+    let mut versions = alias_version_registry().lock();
+    mutate_external_alias_state_in(&mut replay, &mut registry, &mut versions, mutate)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mutate_external_alias_state_in<R>(
+    replay: &mut std::collections::BTreeSet<ReplayMappingKey>,
+    registry: &mut AliasRegistry,
+    versions: &mut AliasVersionRegistry,
+    mutate: impl FnOnce(&mut std::collections::BTreeSet<ReplayMappingKey>, &mut AliasRegistry) -> R,
+) -> R {
     let replay_before = replay.clone();
     let registry_before = registry.clone();
-    let result = mutate(&mut replay, &mut registry);
-    let mut versions = alias_version_registry().lock();
+    let result = mutate(replay, registry);
 
     // Index the FIRST alias per (start, ipa, scope) on each side once. The previous
     // shape rescanned the whole registry per key (two linear `find`s plus a

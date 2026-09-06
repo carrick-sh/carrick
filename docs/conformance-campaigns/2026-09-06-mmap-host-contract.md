@@ -99,3 +99,33 @@ notifications. No pointer survives this publication call.
 Both tests failed before the fix (`pt-resolve-red.log`); all 190 carrick-mem
 lib tests passed afterward (`pt-resolve-green.log`). These are host tests,
 not the required signed page-table integration acceptance.
+
+
+Signed `d7920a810` artifact SHA-256
+`3841daa9542d26c96060d95c4f7abf159c8144b3da9bc2e871abb424e0b07610`
+passed Ubuntu `sh -c /bin/true` and Python `print(1)` with scoped cleanup
+(`pt-launch.json`). The unchanged five-trial benchmark measured 352.008 us
+whole-file mmap+close and 276.501 us anonymous mmap+close, versus 551.981 and
+410.885 us before arena preflight. This is a useful reduction, still a failed
+10/6 us gate. Run `eco-mmap-immutable-bench-1788713258061447000`, receipt
+`pt-bench.log`; earlier benchmark files are preserved as
+`immutable-before-pt-bench.*`.
+
+
+## Alias unregistration amplification
+
+The full `unregister_alias` wrapper visited 2,052 rows when removing one alias
+with 512 unrelated owners live (`unregister-red.log`). The bounded path
+snapshots overlapping old keys and possible suffix keys, compares their
+first effective rows, and invalidates only changed alias keys plus their old
+and new physical replay owners. Replay epochs still advance on an alias-only
+change even when replay rows themselves are unchanged. The remaining scope
+bucket scan is not claimed constant-time.
+
+The work-count test passes with a bound of 16 visited rows. Thirty split,
+full-removal, duplicate-key, suffix-collision and no-op cases compare all alias,
+replay and live version state against the old full-snapshot algorithm; overflow
+also leaves state untouched. The signed full HVF library suite passed
+437 tests with 3 ignored (`hvf-lib-signed.log`, run
+`eco-mmap-hvf-lib-1788713559871706000`). Full runtime and probe acceptance,
+latency gates and main landing are still pending.
