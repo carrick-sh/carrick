@@ -2831,8 +2831,20 @@ impl HostFsBackend {
     /// keeps its exact existing fallback, which re-roots absolute targets under
     /// the guest root.
     fn dir_fd_for(&self, dir: &Path) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, i32> {
+        self.dir_fd_for_hops(dir, 0)
+    }
+
+    fn dir_fd_for_hops(
+        &self,
+        dir: &Path,
+        hops: u32,
+    ) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, i32> {
         use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering::Relaxed;
+
+        if hops >= 40 {
+            return Err(libc::ELOOP);
+        }
 
         if !self.fast_fs {
             return Err(libc::ENOSYS);
@@ -2919,11 +2931,48 @@ impl HostFsBackend {
                     .raw_os_error()
                     .unwrap_or(libc::EIO);
                 let out_of_fds = matches!(err, libc::EMFILE | libc::ENFILE);
-                if !out_of_fds {
-                    return Err(err);
+                if out_of_fds {
+                    self.drop_dir_cache();
+                    return self.dir_fd_for_after_reclaim(dir, generation, hops);
                 }
-                self.drop_dir_cache();
-                return self.dir_fd_for_after_reclaim(dir, generation);
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                let is_symlink = unsafe {
+                    libc::fstatat(
+                        current.as_raw_fd(),
+                        component_c.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    ) == 0
+                        && (st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32)
+                };
+                if is_symlink {
+                    let mut buf = [0u8; libc::PATH_MAX as usize];
+                    let n = unsafe {
+                        libc::readlinkat(
+                            current.as_raw_fd(),
+                            component_c.as_ptr(),
+                            buf.as_mut_ptr() as *mut libc::c_char,
+                            buf.len(),
+                        )
+                    };
+                    if n <= 0 || n as usize >= buf.len() {
+                        return Err(err);
+                    }
+                    use std::os::unix::ffi::OsStrExt as _;
+                    let target = std::ffi::OsStr::from_bytes(&buf[..n as usize]);
+                    let target_path = Path::new(target);
+                    let resolved_target = if target_path.is_absolute() {
+                        normalize_raw(target_path).ok_or(libc::EACCES)?
+                    } else {
+                        let parent = walked.parent().unwrap_or_else(|| Path::new(""));
+                        normalize_raw(&parent.join(target_path)).ok_or(libc::EACCES)?
+                    };
+                    let target_fd = self.dir_fd_for_hops(&resolved_target, hops + 1)?;
+                    self.publish_dir_fd(&walked, &target_fd, generation);
+                    current = target_fd;
+                    continue;
+                }
+                return Err(err);
             }
             // SAFETY: `raw` is a freshly-opened owned dir fd.
             let fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
@@ -2941,8 +2990,13 @@ impl HostFsBackend {
         &self,
         dir: &Path,
         generation: u64,
+        hops: u32,
     ) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, i32> {
         use std::os::fd::AsRawFd;
+
+        if hops >= 40 {
+            return Err(libc::ELOOP);
+        }
 
         let mut current = self.root_fd.clone();
         self.publish_dir_fd(Path::new(""), &current, generation);
@@ -2962,6 +3016,43 @@ impl HostFsBackend {
                 let err = std::io::Error::last_os_error()
                     .raw_os_error()
                     .unwrap_or(libc::EIO);
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                let is_symlink = unsafe {
+                    libc::fstatat(
+                        current.as_raw_fd(),
+                        component_c.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    ) == 0
+                        && (st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32)
+                };
+                if is_symlink {
+                    let mut buf = [0u8; libc::PATH_MAX as usize];
+                    let n = unsafe {
+                        libc::readlinkat(
+                            current.as_raw_fd(),
+                            component_c.as_ptr(),
+                            buf.as_mut_ptr() as *mut libc::c_char,
+                            buf.len(),
+                        )
+                    };
+                    if n <= 0 || n as usize >= buf.len() {
+                        return Err(err);
+                    }
+                    use std::os::unix::ffi::OsStrExt as _;
+                    let target = std::ffi::OsStr::from_bytes(&buf[..n as usize]);
+                    let target_path = Path::new(target);
+                    let resolved_target = if target_path.is_absolute() {
+                        normalize_raw(target_path).ok_or(libc::EACCES)?
+                    } else {
+                        let parent = walked.parent().unwrap_or_else(|| Path::new(""));
+                        normalize_raw(&parent.join(target_path)).ok_or(libc::EACCES)?
+                    };
+                    let target_fd = self.dir_fd_for_hops(&resolved_target, hops + 1)?;
+                    self.publish_dir_fd(&walked, &target_fd, generation);
+                    current = target_fd;
+                    continue;
+                }
                 return Err(err);
             }
             // SAFETY: `raw` is a freshly-opened owned dir fd.
