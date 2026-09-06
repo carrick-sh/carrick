@@ -351,3 +351,413 @@ impl MmAccessState {
         Ok(published)
     }
 }
+
+/// Carries the local caller's already-acquired mutation exclusion into the
+/// executor-independent publication algorithm. No inner quiesce acquisition.
+pub(super) struct PublicationContext<'a> {
+    pub(super) state: &'a MmAccessState,
+    pub(super) custody: &'a std::sync::Arc<CarrierVmCustody>,
+    pub(super) authority: &'a dyn carrick_hal::FrameCowAuthority,
+    pub(super) mm_root_slot: Option<(u64, u64)>,
+    pub(super) container_root: ContainerRootToken,
+    pub(super) _exclusion: &'a dyn carrick_hal::FrameCowQuiesce,
+}
+
+pub(super) struct PublishedSparseExtent {
+    pub(super) region: HvfMappedRegion,
+    pub(super) extension_regions: Vec<HvfMappedRegion>,
+    pub(super) page_granular_arm: bool,
+}
+
+/// Publish backing, inventory and stage-1 through one MM-owned implementation.
+/// The local adapter only updates its cache and completes deferred protection.
+pub(super) fn publish(
+    context: &PublicationContext<'_>,
+    start: u64,
+    end: u64,
+    backing: SparseExtentBacking<'_>,
+    flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+) -> Result<PublishedSparseExtent, TrapError> {
+    #[cfg(debug_assertions)]
+    const PAGE_SIZE: u64 = 4096;
+    #[cfg(debug_assertions)]
+    const VALID: u64 = 1;
+    #[cfg(debug_assertions)]
+    const AP_MASK: u64 = 0b11 << 6;
+    #[cfg(debug_assertions)]
+    const AP_USER_RO: u64 = 0b11 << 6;
+    #[cfg(debug_assertions)]
+    const NON_GLOBAL: u64 = 1 << 11;
+    let semantic_len = usize::try_from(
+        end.checked_sub(start)
+            .filter(|len| *len != 0)
+            .ok_or_else(|| TrapError::Hypervisor("invalid sparse publication range".to_owned()))?,
+    )
+    .map_err(|_| TrapError::MappingTooLarge(end - start))?;
+    let mut extension_regions = Vec::new();
+    let mut reservation = context.authority.reserve(1, 1, 2).map_err(|error| {
+        TrapError::Hypervisor(format!("reserve sparse HVPatch mmap inventory: {error}"))
+    })?;
+
+    let PreparedSparseBacking {
+        physical_host,
+        semantic_host,
+        physical_ipa,
+        semantic_ipa,
+        physical_len,
+        physical_size,
+        stage2_perms,
+        inventory_backing,
+        page_granular_arm,
+        owner_generation,
+        owner_rollback,
+    } = prepare(std::sync::Arc::clone(context.custody), start, end, backing)?;
+    const TWO_MIB: u64 = 2 * 1024 * 1024;
+
+    let inventory_mapping = {
+        let mut inventory = context.state.frame_inventory.ledger.lock();
+        HvfVmState::stage_mapping_in(
+            context.custody,
+            &mut inventory,
+            &mut reservation,
+            InventoryMappingStage {
+                gpa: physical_ipa,
+                length: physical_len,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: !page_granular_arm,
+                    exec: true,
+                },
+                backing: inventory_backing,
+                inherited_frame: None,
+                stage2_lease: Some((physical_ipa, physical_len)),
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: physical_host as usize,
+                    generation: owner_generation,
+                },
+            },
+        )?
+    };
+    let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
+    // Journal this transaction's descriptor pre-images rather than
+    // cloning the whole 1.75 MiB table region (see `begin_undo`).
+    let publication = {
+        let page_tables_authority = context.state.page_tables_authority();
+        let has_source = page_tables_authority.has_source();
+        page_tables_authority
+            .edit(
+                || {
+                    Err(TrapError::Hypervisor(
+                        "sparse HVPatch mmap page tables are absent".to_owned(),
+                    ))
+                },
+                |editor| -> Result<(), TrapError> {
+                    editor.begin_undo();
+                    HvfVmState::refresh_stage1_exclusivity(editor.manager);
+                    let aligned_start = align_up(start, TWO_MIB)?.min(end);
+                    if start < aligned_start {
+                        editor
+                            .map_private_aliased(start, semantic_ipa, aligned_start - start, false)
+                            .map_err(|error| {
+                                sparse_mmap_stage1_error(editor.manager, "leading", error, has_source)
+                            })?;
+                    }
+                    let aligned_len = (end - aligned_start) / TWO_MIB * TWO_MIB;
+                    if aligned_len != 0 {
+                        editor
+                            .map_private_aliased(
+                                aligned_start,
+                                semantic_ipa + (aligned_start - start),
+                                aligned_len,
+                                false,
+                            )
+                            .map_err(|error| {
+                                sparse_mmap_stage1_error(editor.manager, "bulk", error, has_source)
+                            })?;
+                    }
+                    let tail_start = aligned_start + aligned_len;
+                    if tail_start < end {
+                        editor
+                            .map_private_aliased(
+                                tail_start,
+                                semantic_ipa + (tail_start - start),
+                                end - tail_start,
+                                false,
+                            )
+                            .map_err(|error| {
+                                sparse_mmap_stage1_error(editor.manager, "trailing", error, has_source)
+                            })?;
+                    }
+                    editor
+                        .set_prot_none(start, semantic_len)
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "keep sparse HVPatch mmap stage-1 invalid: {error:?}"
+                            ))
+                        })?;
+                    extension_regions.extend(context.state.publish_stage1_extension_arenas(
+                        context.custody, editor.manager, applevisor::memory::MemPerms::ReadWrite,
+                    )?);
+                    let page_table_resolver =
+                        context.state.pinned_stage1_arenas(context.custody)?;
+                    unsafe { editor.sync_to_host(&page_table_resolver) }.map_err(|e| {
+                        TrapError::Hypervisor(format!(
+                            "sparse HVPatch mmap sync_to_host failed: {e:?}"
+                        ))
+                    })?;
+                    #[cfg(debug_assertions)]
+                    {
+                        let mut page = start;
+                        while page < end {
+                            let expected_ipa = semantic_ipa + (page - start);
+                            let shadow = editor.debug_walk(page);
+                            let live = unsafe {
+                                editor.debug_walk_host(&page_table_resolver, page)
+                            }
+                            .map_err(|e| {
+                                TrapError::Hypervisor(format!(
+                                    "sparse HVPatch mmap debug_walk_host failed: {e:?}"
+                                ))
+                            })?;
+                            let leaf = carrick_mem::page_table::terminal_descriptor(live);
+                            if shadow != live
+                                || editor.translate(page).is_some()
+                                || editor.translate_retained_output(page) != Some(expected_ipa)
+                                || leaf & VALID != 0
+                                || leaf & AP_MASK != AP_USER_RO
+                                || leaf & NON_GLOBAL == 0
+                            {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "sparse HVPatch mmap publication failed at VA 0x{page:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
+                                )));
+                            }
+                            page = page.saturating_add(PAGE_SIZE);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+    };
+    if let Err(error) = publication {
+        let _ = context.state.page_tables_authority().edit(
+            || Err(()),
+            |editor| {
+                let page_table_resolver = context
+                    .state
+                    .pinned_stage1_arenas(context.custody)
+                    .unwrap_or_else(|_| std::process::abort());
+                // SAFETY: the COW quiesce and topology guards remain held,
+                // so no vCPU can walk or edit this mm while the journalled
+                // pre-images are replayed into its live backing.
+                unsafe { editor.rollback_undo(&page_table_resolver) };
+                Ok::<(), ()>(())
+            },
+        );
+        if let Err(flush_error) = flush_stage1() {
+            eprintln!("carrick: FATAL: sparse HVPatch mmap rollback TLBI failed: {flush_error}");
+            std::process::abort();
+        }
+        HvfVmState::rollback_unpublished_mappings(
+            &mut context.state.frame_inventory.ledger.lock(),
+            &[inventory_entry],
+        )?;
+        return Err(error);
+    }
+    // Publication succeeded: the journalled pre-images are no longer needed.
+    let _ = context.state.page_tables_authority().edit(
+        || Err(()),
+        |editor| {
+            editor.commit_undo();
+            Ok::<(), ()>(())
+        },
+    );
+    if let Err(error) = flush_stage1() {
+        eprintln!("carrick: FATAL: sparse HVPatch mmap TLBI failed: {error}");
+        std::process::abort();
+    }
+    if let Err(error) = context.authority.apply(reservation.commit(())) {
+        eprintln!("carrick: FATAL: sparse HVPatch mmap inventory commit failed: {error}");
+        std::process::abort();
+    }
+    owner_rollback.commit();
+
+    match context.authority.mapping_is_live(
+        inventory_mapping.mapping,
+        inventory_mapping.frame,
+        carrick_guest_mem::Gpa(physical_ipa),
+        carrick_hal::FrameLength::from_mapping_extent(
+            std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| std::process::abort()),
+        ),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("carrick: FATAL: sparse HVPatch mmap absent after commit");
+            std::process::abort();
+        }
+        Err(error) => {
+            eprintln!("carrick: FATAL: authenticate sparse HVPatch mmap: {error}");
+            std::process::abort();
+        }
+    }
+
+    let sharing = GuestMappingSharing::Private;
+    register_shared_alias(AliasBacking {
+        start,
+        ipa: semantic_ipa,
+        host_addr: semantic_host as usize,
+        size: semantic_len,
+        physical_ipa,
+        physical_host_addr: physical_host as usize,
+        physical_size,
+        perms: u64::from(stage2_perms),
+        guest_writable: true,
+        sharing,
+        ownership_scope: alias_ownership_scope(
+            sharing,
+            context.mm_root_slot,
+            context.container_root,
+        ),
+        inventory_backing,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation,
+    });
+    let region = HvfMappedRegion {
+        start,
+        ipa: semantic_ipa,
+        physical_ipa,
+        end,
+        host_addr: semantic_host,
+        size: semantic_len,
+        physical_size,
+        perms: stage2_perms,
+        memory: None,
+        host_mapping: None,
+        structural_owner: None,
+        stage2_lease: None,
+        is_dynamic_alias: true,
+        sharing,
+        guest_writable: true,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation,
+    };
+    Ok(PublishedSparseExtent {
+        region,
+        extension_regions,
+        page_granular_arm,
+    })
+}
+
+/// Retain exact structural owners and stage-2 pins for a complete table edit.
+/// Raw pointers remain valid even if another holder requests retirement.
+struct PinnedStage1Arenas {
+    owners:
+        std::collections::BTreeMap<u64, (std::sync::Arc<StructuralBackingOwner>, CarrierStage2Pin)>,
+}
+impl carrick_mem::page_table::HostArenaResolver for &PinnedStage1Arenas {
+    fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
+        self.owners.get(&base).map(|(owner, _)| owner.ptr())
+    }
+    fn record_populated_prefix(&self, base: u64, prefix: usize) {
+        if let Some((owner, _)) = self.owners.get(&base) {
+            owner.record_populated_prefix(prefix);
+        }
+    }
+}
+impl MmAccessState {
+    fn pinned_stage1_arenas(
+        &self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+    ) -> Result<PinnedStage1Arenas, TrapError> {
+        let mut owners = std::collections::BTreeMap::new();
+        for (&(base, size), owner) in self.structural_owners.read().iter() {
+            if size != carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize {
+                continue;
+            }
+            let pin = custody
+                .pin_stage2_record(owner.record_identity())
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("pin exact stage-1 arena: {error:?}"))
+                })?;
+            owners.insert(base, (std::sync::Arc::clone(owner), pin));
+        }
+        Ok(PinnedStage1Arenas { owners })
+    }
+}
+
+#[cfg(test)]
+mod arena_pin_tests {
+    use super::*;
+    use carrick_mem::page_table::HostArenaResolver;
+
+    #[test]
+    fn publication_resolver_pins_exact_structural_owner_until_edit_finishes() {
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let base = 0x7d00_3000_0000;
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .unwrap();
+        let mut lease = GlobalFrameStage2Lease::fixed(base, size as u64);
+        lease.mark_test_mapped_without_backend();
+        let owner = StructuralBackingOwner::new_in(
+            &custody,
+            host,
+            lease,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            next_structural_epoch().unwrap(),
+            base,
+            size,
+        )
+        .unwrap();
+        let identity = owner.record_identity();
+        let pointer = owner.ptr();
+        let state = MmAccessState::new(
+            carrick_aarch64::Stage1Authority::new(),
+            std::sync::Arc::new(MemoryProtections::default()),
+            std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        );
+        state.install_structural_owner(owner);
+        let wrong_custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let other_generation = wrong_custody.begin_create().unwrap();
+        wrong_custody.commit_create(other_generation).unwrap();
+        assert!(state.pinned_stage1_arenas(&wrong_custody).is_err());
+        let resolver = state.pinned_stage1_arenas(&custody).unwrap();
+        assert_eq!((&resolver).host_ptr_for_base(base), Some(pointer));
+        assert_eq!((&resolver).host_ptr_for_base(base + size as u64), None);
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .unwrap()
+                .pin_count,
+            1
+        );
+        state.structural_owners.write().clear();
+        assert_eq!((&resolver).host_ptr_for_base(base), Some(pointer));
+        assert_eq!(
+            custody.retire_stage2_record_using(identity, |_, _| panic!(
+                "pinned backing must not unmap"
+            )),
+            CarrierStage2RetireOutcome::DeferredActivePins
+        );
+        drop(resolver);
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .unwrap()
+                .pin_count,
+            0
+        );
+        assert_eq!(
+            custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+    }
+}

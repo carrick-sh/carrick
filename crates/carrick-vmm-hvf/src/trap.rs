@@ -37851,14 +37851,6 @@ impl HvfVmState {
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<u64, TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
-        #[cfg(debug_assertions)]
-        const VALID: u64 = 1;
-        #[cfg(debug_assertions)]
-        const AP_MASK: u64 = 0b11 << 6;
-        #[cfg(debug_assertions)]
-        const AP_USER_RO: u64 = 0b11 << 6;
-        #[cfg(debug_assertions)]
-        const NON_GLOBAL: u64 = 1 << 11;
 
         if start >= end || !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE) {
             return Err(TrapError::Hypervisor(format!(
@@ -37951,270 +37943,25 @@ impl HvfVmState {
 
         let semantic_len =
             usize::try_from(end - start).map_err(|_| TrapError::MappingTooLarge(end - start))?;
-        let page_table_host = self
-            .mapping_for_range(
-                crate::memory::LINUX_PAGE_TABLES_BASE,
-                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-            )
-            .map(|mapping| mapping.host_addr)
-            .ok_or_else(|| {
-                TrapError::Hypervisor("sparse HVPatch mmap has no page-table backing".to_owned())
-            })?;
-        if self.page_tables_authority().is_none() {
-            return Err(TrapError::Hypervisor(
-                "sparse HVPatch mmap page tables are absent".to_owned(),
-            ));
-        }
-        let mut reservation = authority.reserve(1, 1, 2).map_err(|error| {
-            TrapError::Hypervisor(format!("reserve sparse HVPatch mmap inventory: {error}"))
-        })?;
-
-        let sparse_materialization::PreparedSparseBacking {
-            physical_host,
-            semantic_host,
-            physical_ipa,
-            semantic_ipa,
-            physical_len,
-            physical_size,
-            stage2_perms,
-            inventory_backing,
-            page_granular_arm,
-            owner_generation,
-            owner_rollback,
-        } = sparse_materialization::prepare(self.carrier_vm_custody(), start, end, backing)?;
-        const TWO_MIB: u64 = 2 * 1024 * 1024;
-
-        let inventory_mapping = {
-            let mut inventory = self.frame_inventory.lock();
-            Self::stage_mapping_in(
-                self.custody(),
-                &mut inventory,
-                &mut reservation,
-                InventoryMappingStage {
-                    gpa: physical_ipa,
-                    length: physical_len,
-                    permissions: carrick_hal::MemPerms {
-                        read: true,
-                        write: !page_granular_arm,
-                        exec: true,
-                    },
-                    backing: inventory_backing,
-                    inherited_frame: None,
-                    stage2_lease: Some((physical_ipa, physical_len)),
-                    stage2_owner: InventoryStage2OwnerIdentity {
-                        host_addr: physical_host as usize,
-                        generation: owner_generation,
-                    },
-                },
-            )?
-        };
-        let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
-        // Journal this transaction's descriptor pre-images rather than
-        // cloning the whole 1.75 MiB table region (see `begin_undo`).
-        let publication = {
-            let page_tables_authority = self.page_tables_authority();
-            let has_source = page_tables_authority.has_source();
-            page_tables_authority
-                .edit(
-                    || {
-                        Err(TrapError::Hypervisor(
-                            "sparse HVPatch mmap page tables are absent".to_owned(),
-                        ))
-                    },
-                    |editor| -> Result<(), TrapError> {
-                        editor.begin_undo();
-                        Self::refresh_stage1_exclusivity(editor.manager);
-                        let aligned_start = align_up(start, TWO_MIB)?.min(end);
-                        if start < aligned_start {
-                            editor
-                                .map_private_aliased(start, semantic_ipa, aligned_start - start, false)
-                                .map_err(|error| {
-                                    sparse_mmap_stage1_error(editor.manager, "leading", error, has_source)
-                                })?;
-                        }
-                        let aligned_len = (end - aligned_start) / TWO_MIB * TWO_MIB;
-                        if aligned_len != 0 {
-                            editor
-                                .map_private_aliased(
-                                    aligned_start,
-                                    semantic_ipa + (aligned_start - start),
-                                    aligned_len,
-                                    false,
-                                )
-                                .map_err(|error| {
-                                    sparse_mmap_stage1_error(editor.manager, "bulk", error, has_source)
-                                })?;
-                        }
-                        let tail_start = aligned_start + aligned_len;
-                        if tail_start < end {
-                            editor
-                                .map_private_aliased(
-                                    tail_start,
-                                    semantic_ipa + (tail_start - start),
-                                    end - tail_start,
-                                    false,
-                                )
-                                .map_err(|error| {
-                                    sparse_mmap_stage1_error(editor.manager, "trailing", error, has_source)
-                                })?;
-                        }
-                        editor
-                            .set_prot_none(start, semantic_len)
-                            .map_err(|error| {
-                                TrapError::Hypervisor(format!(
-                                    "keep sparse HVPatch mmap stage-1 invalid: {error:?}"
-                                ))
-                            })?;
-                        self.publish_stage1_extension_arenas(editor.manager)?;
-                        let page_table_resolver =
-                            self.page_table_resolver(editor.base(), Some(page_table_host));
-                        unsafe { editor.sync_to_host(page_table_resolver) }.map_err(|e| {
-                            TrapError::Hypervisor(format!(
-                                "sparse HVPatch mmap sync_to_host failed: {e:?}"
-                            ))
-                        })?;
-                        #[cfg(debug_assertions)]
-                        {
-                            let mut page = start;
-                            while page < end {
-                                let expected_ipa = semantic_ipa + (page - start);
-                                let shadow = editor.debug_walk(page);
-                                let live = unsafe {
-                                    editor.debug_walk_host(page_table_resolver, page)
-                                }
-                                .map_err(|e| {
-                                    TrapError::Hypervisor(format!(
-                                        "sparse HVPatch mmap debug_walk_host failed: {e:?}"
-                                    ))
-                                })?;
-                                let leaf = carrick_mem::page_table::terminal_descriptor(live);
-                                if shadow != live
-                                    || editor.translate(page).is_some()
-                                    || editor.translate_retained_output(page) != Some(expected_ipa)
-                                    || leaf & VALID != 0
-                                    || leaf & AP_MASK != AP_USER_RO
-                                    || leaf & NON_GLOBAL == 0
-                                {
-                                    return Err(TrapError::Hypervisor(format!(
-                                        "sparse HVPatch mmap publication failed at VA 0x{page:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x}"
-                                    )));
-                                }
-                                page = page.saturating_add(PAGE_SIZE);
-                            }
-                        }
-                        Ok(())
-                    },
-                )
-        };
-        if let Err(error) = publication {
-            let _ = self.page_tables_authority().edit(
-                || Err(()),
-                |editor| {
-                    let manager_base = editor.base();
-                    let page_table_resolver = |base: u64| {
-                        (base == manager_base)
-                            .then_some(page_table_host)
-                            .or_else(|| {
-                                self.host_ptr(
-                                    base,
-                                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-                                )
-                            })
-                    };
-                    // SAFETY: the COW quiesce and topology guards remain held,
-                    // so no vCPU can walk or edit this mm while the journalled
-                    // pre-images are replayed into its live backing.
-                    unsafe { editor.rollback_undo(page_table_resolver) };
-                    Ok::<(), ()>(())
-                },
-            );
-            if let Err(flush_error) = flush_stage1() {
-                eprintln!(
-                    "carrick: FATAL: sparse HVPatch mmap rollback TLBI failed: {flush_error}"
-                );
-                std::process::abort();
-            }
-            Self::rollback_unpublished_mappings(
-                &mut self.frame_inventory.lock(),
-                &[inventory_entry],
-            )?;
-            return Err(error);
-        }
-        // Publication succeeded: the journalled pre-images are no longer needed.
-        let _ = self.page_tables_authority().edit(
-            || Err(()),
-            |editor| {
-                editor.commit_undo();
-                Ok::<(), ()>(())
+        let custody = self.carrier_vm_custody();
+        let published = sparse_materialization::publish(
+            &sparse_materialization::PublicationContext {
+                state: &self.mm_access,
+                custody: &custody,
+                authority: authority.as_ref(),
+                mm_root_slot: self.mm_root_slot,
+                container_root: self.container_root,
+                _exclusion: _quiesce.as_ref(),
             },
-        );
-        if let Err(error) = flush_stage1() {
-            eprintln!("carrick: FATAL: sparse HVPatch mmap TLBI failed: {error}");
-            std::process::abort();
-        }
-        if let Err(error) = authority.apply(reservation.commit(())) {
-            eprintln!("carrick: FATAL: sparse HVPatch mmap inventory commit failed: {error}");
-            std::process::abort();
-        }
-        owner_rollback.commit();
-
-        match authority.mapping_is_live(
-            inventory_mapping.mapping,
-            inventory_mapping.frame,
-            carrick_guest_mem::Gpa(physical_ipa),
-            carrick_hal::FrameLength::from_mapping_extent(
-                std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| std::process::abort()),
-            ),
-        ) {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!("carrick: FATAL: sparse HVPatch mmap absent after commit");
-                std::process::abort();
-            }
-            Err(error) => {
-                eprintln!("carrick: FATAL: authenticate sparse HVPatch mmap: {error}");
-                std::process::abort();
-            }
-        }
-
-        let sharing = GuestMappingSharing::Private;
-        register_shared_alias(AliasBacking {
             start,
-            ipa: semantic_ipa,
-            host_addr: semantic_host as usize,
-            size: semantic_len,
-            physical_ipa,
-            physical_host_addr: physical_host as usize,
-            physical_size,
-            perms: u64::from(stage2_perms),
-            guest_writable: true,
-            sharing,
-            ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
-            inventory_backing,
-            shared_key_base: 0,
-            shared_key_offset: 0,
-            owner_generation,
-        });
-        self.mappings.push(HvfMappedRegion {
-            start,
-            ipa: semantic_ipa,
-            physical_ipa,
             end,
-            host_addr: semantic_host,
-            size: semantic_len,
-            physical_size,
-            perms: stage2_perms,
-            memory: None,
-            host_mapping: None,
-            structural_owner: None,
-            stage2_lease: None,
-            is_dynamic_alias: true,
-            sharing,
-            guest_writable: true,
-            shared_key_base: 0,
-            shared_key_offset: 0,
-            owner_generation,
-        });
+            backing,
+            flush_stage1,
+        )?;
+        let page_granular_arm = published.page_granular_arm;
+        let semantic_ipa = published.region.ipa;
+        self.mappings.extend(published.extension_regions);
+        self.mappings.push(published.region);
         if page_granular_arm {
             // Every page of the view starts clean: the first guest (or host
             // syscall) write to a page must move THAT page, and only that
