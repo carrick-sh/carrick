@@ -623,4 +623,41 @@ mod exit_code_tests {
             b"api-host\n"
         );
     }
+
+    #[test]
+    fn seed_guest_baseline_does_not_shadow_rootfs_symlinks() {
+        use tar::{Builder, EntryType, Header};
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_bytes);
+            let mut header = Header::new_gnu();
+            header.set_path("usr/bin").unwrap();
+            header.set_entry_type(EntryType::Directory);
+            header.set_mode(0o755);
+            header.set_size(0);
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+
+            let mut header = Header::new_gnu();
+            header.set_path("bin").unwrap();
+            header.set_entry_type(EntryType::Symlink);
+            header.set_link_name("usr/bin").unwrap();
+            header.set_mode(0o777);
+            header.set_size(0);
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+            builder.finish().unwrap();
+        }
+        let rootfs =
+            crate::rootfs::RootFs::from_layers([crate::rootfs::LayerSource::Tar(tar_bytes)])
+                .unwrap();
+        let mut backend = MemoryBackend::new();
+        let network = NetworkNamespaceSpec::default();
+        seed_guest_baseline(&mut backend, Some(&rootfs), &network, &[], &[], "api-host");
+        assert!(
+            backend.metadata("/bin").is_none(),
+            "/bin was created as a directory on backend, shadowing rootfs symlink: {:?}",
+            backend.metadata("/bin")
+        );
+    }
 }
