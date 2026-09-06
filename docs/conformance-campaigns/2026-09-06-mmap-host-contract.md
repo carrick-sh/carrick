@@ -368,3 +368,16 @@ foreign writes into pristine unbacked memory still require a new exact-target
 materialization transaction, and writable syscall-buffer validation must accept
 explicit pristine provenance without allocating or changing residency. Runtime
 integration remains uncommitted; the signed timing artifact is still fd2121d51.
+
+
+### Executor-independent backing preparation
+
+Extracted the existing sparse backing allocation and provisional stage-2
+owner into `trap/sparse_materialization.rs`. This step preserves allocation
+shape and file-view behavior; the returned owner rollback keeps preparation
+provisional until the existing caller publishes inventory and stage-1.
+The full signed HVF lib suite passes 442 / 3 ignored on the in-progress source
+(`eco-mmap-resume/materializer-extract.log`, run
+`eco-mmap-materializer-extract-1788718992648724000`), scoped cleanup zero.
+The extraction is staged separately from the still-uncommitted anonymous
+integration. No new release binary or main landing is claimed.
