@@ -1361,3 +1361,7 @@ fast-forward from the main tree only.
   every mutator maintains it inside the method and dispatch cannot reach
   the cache at all; briefed as the cap-std worker's round-3 add-on
   (`scratchpad/review-capstd-vfs-owned-dcache.md`).
+- **Gate after the node-creation fix**: all three probe shards green
+  (shard 2 in 249 s under worker load); the only red row was the CLI
+  suite's closure-inventory denominator, still at 467/490/980 after the
+  `dentrycache` probe was added (fixed `af1a1f752`).
