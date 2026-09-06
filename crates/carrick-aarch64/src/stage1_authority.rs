@@ -776,6 +776,29 @@ impl<'a> Stage1Editor<'a> {
         }
     }
 
+    /// Restore descriptors, then retire external backing before returning arena
+    /// addresses to the allocator. On retirement failure the addresses remain
+    /// quarantined; the caller must retain backing or fail-stop safely.
+    ///
+    /// # Safety
+    /// `resolver` must provide live writable arena pointers. The caller must
+    /// hold mutation exclusion and make `retire` flush stale translations and
+    /// retire every supplied arena's backing before returning success.
+    pub unsafe fn rollback_undo_retiring<E>(
+        &mut self,
+        resolver: impl carrick_mem::page_table::HostArenaResolver,
+        retire: impl FnOnce(&[u64]) -> Result<(), E>,
+    ) -> Result<Vec<u64>, E> {
+        let popped = unsafe { self.manager.rollback_undo(resolver, None) };
+        retire(&popped)?;
+        if let Some(source) = self.arena_source.as_deref_mut() {
+            for &base in &popped {
+                source.return_arena(carrick_guest_mem::Gpa(base));
+            }
+        }
+        Ok(popped)
+    }
+
     /// Restore a pre-transaction image over the live manager, adopting extension arenas,
     /// preserving the arena source, and firing `stage1_arena_replace`.
     pub fn restore_image(&mut self, mut image: PageTableManager, site: u32, authority: u64) {
@@ -864,6 +887,20 @@ mod tests {
 
     #[test]
     fn rollback_returns_allocated_extension_arena_to_source() {
+        exercise_rollback_retirement(false, false);
+    }
+
+    #[test]
+    fn rollback_retires_backing_before_returning_arena_to_source() {
+        exercise_rollback_retirement(true, false);
+    }
+
+    #[test]
+    fn rollback_retirement_failure_quarantines_arena_address() {
+        exercise_rollback_retirement(true, true);
+    }
+
+    fn exercise_rollback_retirement(retire_first: bool, fail_retirement: bool) {
         let root = Gpa(LINUX_PAGE_TABLES_BASE);
         let ext_base = Gpa(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
@@ -946,7 +983,28 @@ mod tests {
                     let va2 = va + 0x1000;
                     editor.set_rw(va2, 0x1000, false).expect("subsequent edit");
 
-                    let popped = unsafe { editor.rollback_undo(resolver) };
+                    let popped = if retire_first {
+                        let result = unsafe {
+                            editor.rollback_undo_retiring(resolver, |bases| {
+                                assert_eq!(bases, &[ext_base.0]);
+                                assert!(
+                                    returned.lock().unwrap().is_empty(),
+                                    "arena address escaped before backing retirement"
+                                );
+                                assert!(available.lock().unwrap().is_empty());
+                                if fail_retirement { Err(()) } else { Ok(()) }
+                            })
+                        };
+                        if fail_retirement {
+                            assert!(result.is_err());
+                            assert!(returned.lock().unwrap().is_empty());
+                            assert_eq!(editor.pool_stats().3, 1);
+                            return Ok(());
+                        }
+                        result.unwrap()
+                    } else {
+                        unsafe { editor.rollback_undo(resolver) }
+                    };
                     assert_eq!(popped, vec![ext_base.0], "rollback popped extension arena");
                     assert_eq!(editor.pool_stats().3, 1, "manager restored to 1 arena");
                     Ok::<(), ()>(())
@@ -955,9 +1013,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            returned.lock().unwrap().as_slice(),
-            &[ext_base],
-            "counting source received the popped extension arena back"
+            *returned.lock().unwrap(),
+            if fail_retirement {
+                Vec::new()
+            } else {
+                vec![ext_base]
+            },
+            "only retired backing may return its arena address"
         );
     }
 }

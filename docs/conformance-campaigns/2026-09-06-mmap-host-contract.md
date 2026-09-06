@@ -579,3 +579,17 @@ remains part of unfinished anonymous integration; no main landing claimed.
 Full serial carrick-runtime lib suite on the same integration also passes:
 2472 passed / 2 ignored, `pristine-runtime.log`, run
 eco-pristine-runtime-20260906a. No filtered worker suite substituted.
+
+
+### Arena rollback retirement ordering primitive
+
+Added `Stage1Editor::rollback_undo_retiring`: restore descriptor preimages,
+invoke the caller's invalidation/backing-retirement step, then return popped
+arena addresses. A retirement error keeps those addresses unavailable; callers
+must retain backing or fail-stop. Existing rollback callers are unchanged until
+explicit integration. Two new tests are red with the old early-return ordering
+(`arena-retire-red2.log`, run eco-arena-retire-red2-20260906a): arena addresses
+were returned before the retirement callback. All 45 AArch64 lib tests pass
+with delayed return (`arena-retire-green.log`, run eco-arena-retire-green-20260906a).
+The first harness attempt had a Rust temporary-lifetime compile error and is
+not counted as red evidence. Sparse publisher integration remains next.
