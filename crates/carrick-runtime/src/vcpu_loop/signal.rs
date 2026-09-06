@@ -313,6 +313,35 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     }
 }
 
+fn apply_first_touch(
+    prot: u64,
+    access: Option<carrick_mem::page_table::LeafAccess>,
+    protect: impl FnOnce() -> bool,
+    commit: impl FnOnce(),
+) -> Option<bool> {
+    use carrick_mem::page_table::LeafAccess;
+    let required = match access {
+        // Preserve the current protection lowering: any accessible leaf is
+        // readable, including write-only and execute-only Linux requests.
+        Some(LeafAccess::Read) => {
+            crate::linux_abi::LINUX_PROT_READ
+                | crate::linux_abi::LINUX_PROT_WRITE
+                | crate::linux_abi::LINUX_PROT_EXEC
+        }
+        Some(LeafAccess::Write) => crate::linux_abi::LINUX_PROT_WRITE,
+        Some(LeafAccess::Execute) => crate::linux_abi::LINUX_PROT_EXEC,
+        None => return Some(false),
+    };
+    if prot & required == 0 {
+        return Some(false);
+    }
+    if !protect() {
+        return None;
+    }
+    commit();
+    Some(true)
+}
+
 /// Resolve a fault whose read-only outer classification placed it inside a
 /// first-touch or grow-down extent. This entry point cannot be called without
 /// structural mutation authority and is kept separate from ordinary signal
@@ -334,17 +363,21 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
 ) -> Result<bool, TrapError> {
     {
         let permit = mutation.host_alias_permit();
-        if let Some(plan) = dispatcher.resident_fault_plan(&permit, address)
-            && engine
-                .protect_range(
-                    plan.page(),
-                    crate::linux_abi::LINUX_PAGE_SIZE as usize,
-                    plan.prot(),
-                )
-                .is_ok()
-        {
-            dispatcher.commit_resident_fault(plan);
-            return Ok(true);
+        if let Some(plan) = dispatcher.resident_fault_plan(&permit, address) {
+            let page = plan.page();
+            let prot = plan.prot();
+            if let Some(resolved) = apply_first_touch(
+                prot,
+                access,
+                || {
+                    engine
+                        .protect_range(page, crate::linux_abi::LINUX_PAGE_SIZE as usize, prot)
+                        .is_ok()
+                },
+                || dispatcher.commit_resident_fault(plan),
+            ) {
+                return Ok(resolved);
+            }
         }
     }
     {
@@ -1242,6 +1275,89 @@ mod tests {
             .expect("pending handler");
             assert_eq!(delivered.term_signal, None);
             assert_eq!(trap.restart, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod first_touch_access_tests {
+    use super::*;
+    use carrick_mem::page_table::LeafAccess;
+
+    #[test]
+    fn denied_first_touch_does_not_edit_or_commit_residency() {
+        for (prot, access) in [
+            (1, Some(LeafAccess::Write)),
+            (3, Some(LeafAccess::Execute)),
+            (1, None),
+        ] {
+            let dispatcher = SyscallDispatcher::new();
+            let page = 0x4000_0000;
+            dispatcher.seed_resident_fault_for_test(page, prot);
+            let edits = std::cell::Cell::new(0);
+            dispatcher
+                .with_resident_fault_plan_for_test(page, |plan| {
+                    assert_eq!(
+                        apply_first_touch(
+                            plan.prot(),
+                            access,
+                            || {
+                                edits.set(edits.get() + 1);
+                                true
+                            },
+                            || dispatcher.commit_resident_fault(plan)
+                        ),
+                        Some(false)
+                    );
+                })
+                .expect("pending first touch");
+            assert_eq!(edits.get(), 0);
+            assert!(
+                dispatcher
+                    .with_resident_fault_plan_for_test(page, |plan| drop(plan))
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_first_touch_commits_only_after_successful_protection() {
+        for (prot, access) in [
+            (1, LeafAccess::Read),
+            (2, LeafAccess::Read),
+            (4, LeafAccess::Read),
+            (3, LeafAccess::Write),
+            (5, LeafAccess::Execute),
+        ] {
+            for succeeds in [false, true] {
+                let dispatcher = SyscallDispatcher::new();
+                let page = 0x4000_0000;
+                dispatcher.seed_resident_fault_for_test(page, prot);
+                let edits = std::cell::Cell::new(0);
+                dispatcher
+                    .with_resident_fault_plan_for_test(page, |plan| {
+                        assert_eq!(
+                            apply_first_touch(
+                                plan.prot(),
+                                Some(access),
+                                || {
+                                    edits.set(edits.get() + 1);
+                                    succeeds
+                                },
+                                || dispatcher.commit_resident_fault(plan)
+                            ),
+                            succeeds.then_some(true)
+                        );
+                    })
+                    .expect("pending first touch");
+                assert_eq!(edits.get(), 1);
+                assert_eq!(
+                    dispatcher
+                        .with_resident_fault_plan_for_test(page, |plan| drop(plan))
+                        .is_some(),
+                    !succeeds
+                );
+            }
         }
     }
 }

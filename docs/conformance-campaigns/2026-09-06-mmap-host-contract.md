@@ -284,3 +284,18 @@ not a replacement or speedup of the previous Python measurement. Run
 `counter.{json,out,err}` retains command, exact executable hashes and raw trials.
 The current source HEAD was `b57b5ff34`, but the measured binary was explicitly
 not rebuilt from that source; its producing source remains `4856777d6`.
+
+## First-touch access gate
+
+The canonical resident-fault handler now checks the decoded access before
+materialization or residency commit. A denied write/execute or unknown access
+leaves the pending plan intact. Existing effective read access for WRITE-only
+and EXEC-only mappings is preserved; a backend protection failure preserves
+the existing fallback path. The real dispatcher-plan regression failed red
+with an incorrectly successful denied access. Final full serial runtime suite
+passed 2,470 tests, 2 ignored, run `eco-first-touch-runtime-final`.
+Receipts: `target/conformance/first-touch-access-{red,green}.log` and
+`first-touch-runtime-final.log`. An initial unprivileged full run failed on
+host socket/directory permissions; the final full run used host authority.
+This prerequisite does not enable anonymous lazy backing or satisfy a guest
+landing gate.
