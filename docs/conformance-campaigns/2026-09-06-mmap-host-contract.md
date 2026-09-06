@@ -630,3 +630,23 @@ Scope: these tests exercise actual custody retirement and its production helper,
 not a full publish invocation with every failure stage injected. End-to-end
 publication failures, foreign materialization and post-publication commit error
 handling remain open. No main landing or latency acceptance is claimed.
+
+
+### Local publication acquires MM-owned exclusion
+
+The publication context now has private fields and acquires its own quiesce
+from MmAccessState's bound runtime authority. It checks nonzero matching MM/ASID
+and rechecks authority identity and scope after acquisition. Callers cannot
+supply an arbitrary FrameCowQuiesce marker. Missing/wrong/zero MM and ASID
+cases are rejected; full signed HVF suite passes 450 / 3 ignored
+(`mm-permit.log`, run eco-mmap-mm-permit-1788723446323126000, cleanup zero).
+
+Ubuntu sh true and Python print(1) pass on the rebuilt diagnostic artifact,
+SHA256 1769c931eee097923a396115b4f70b5eccf3a963a6abdd7b885607a24d8a4a2a.
+Source HEAD 8bcdf2f44d96d06eb8f2fbb70d9c8390c27ed56b, tracked diff
+1a228e308a3dc2737b274cd0360ea4069d34258abde7849768ebc649f546b7a0.
+Exact signature, UUID, entitlement, DOF and scoped cleanup receipts are in
+`mm-permit-integration-smoke.json`. This includes unfinished anonymous changes
+and is not clean-tree landing acceptance. Foreign entry must consume its
+existing runtime-held exclusion instead of reacquiring local quiesce; root
+permission derivation and complete publication failure coverage remain open.

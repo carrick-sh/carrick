@@ -363,15 +363,61 @@ impl MmAccessState {
     }
 }
 
-/// Carries the local caller's already-acquired mutation exclusion into the
-/// executor-independent publication algorithm. No inner quiesce acquisition.
-pub(super) struct PublicationContext<'a> {
-    pub(super) state: &'a MmAccessState,
-    pub(super) custody: &'a std::sync::Arc<CarrierVmCustody>,
-    pub(super) authority: &'a dyn carrick_hal::FrameCowAuthority,
-    pub(super) mm_root_slot: Option<(u64, u64)>,
-    pub(super) container_root: ContainerRootToken,
-    pub(super) _exclusion: &'a dyn carrick_hal::FrameCowQuiesce,
+/// Exact-MM local publication permit. Only this constructor acquires exclusion;
+/// callers cannot substitute an arbitrary FrameCowQuiesce implementation.
+pub(super) struct PublicationContext {
+    state: std::sync::Arc<MmAccessState>,
+    custody: std::sync::Arc<CarrierVmCustody>,
+    authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+    mm_root_slot: Option<(u64, u64)>,
+    container_root: ContainerRootToken,
+    _exclusion: Box<dyn carrick_hal::FrameCowQuiesce>,
+}
+
+impl PublicationContext {
+    pub(super) fn for_local(
+        state: std::sync::Arc<MmAccessState>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+        identity: carrick_hal::FrameCowIdentity,
+    ) -> Result<Self, TrapError> {
+        let binding = state.cow_runtime.read().clone().ok_or_else(|| {
+            TrapError::Hypervisor("sparse publication has no MM authority binding".to_owned())
+        })?;
+        if identity.mm == 0
+            || identity.asid == 0
+            || identity.mm != binding.identity.mm
+            || identity.asid != binding.identity.asid
+        {
+            return Err(TrapError::Hypervisor(
+                "sparse publication MM identity mismatch".to_owned(),
+            ));
+        }
+        let exclusion = binding.authority.quiesce().map_err(|error| {
+            TrapError::Hypervisor(format!("quiesce sparse publication MM: {error}"))
+        })?;
+        {
+            let current = state.cow_runtime.read();
+            if !current.as_ref().is_some_and(|current| {
+                current.identity.mm == identity.mm
+                    && current.identity.asid == identity.asid
+                    && std::sync::Arc::ptr_eq(&current.authority, &binding.authority)
+                    && current.mm_root_slot == binding.mm_root_slot
+                    && current.container_root == binding.container_root
+            }) {
+                return Err(TrapError::Hypervisor(
+                    "sparse publication MM changed during quiesce".to_owned(),
+                ));
+            }
+        }
+        Ok(Self {
+            state,
+            custody,
+            authority: binding.authority,
+            mm_root_slot: binding.mm_root_slot,
+            container_root: binding.container_root,
+            _exclusion: exclusion,
+        })
+    }
 }
 
 pub(super) struct PublishedSparseExtent {
@@ -383,7 +429,7 @@ pub(super) struct PublishedSparseExtent {
 /// Publish backing, inventory and stage-1 through one MM-owned implementation.
 /// The local adapter only updates its cache and completes deferred protection.
 pub(super) fn publish(
-    context: &PublicationContext<'_>,
+    context: &PublicationContext,
     start: u64,
     end: u64,
     backing: SparseExtentBacking<'_>,
@@ -422,13 +468,13 @@ pub(super) fn publish(
         page_granular_arm,
         owner_generation,
         owner_rollback,
-    } = prepare(std::sync::Arc::clone(context.custody), start, end, backing)?;
+    } = prepare(std::sync::Arc::clone(&context.custody), start, end, backing)?;
     const TWO_MIB: u64 = 2 * 1024 * 1024;
 
     let inventory_mapping = {
         let mut inventory = context.state.frame_inventory.ledger.lock();
         HvfVmState::stage_mapping_in(
-            context.custody,
+            &context.custody,
             &mut inventory,
             &mut reservation,
             InventoryMappingStage {
@@ -507,11 +553,11 @@ pub(super) fn publish(
                             ))
                         })?;
                     context.state.publish_stage1_extension_arenas_into(
-                        context.custody, editor.manager, applevisor::memory::MemPerms::ReadWrite,
+                        &context.custody, editor.manager, applevisor::memory::MemPerms::ReadWrite,
                         &mut extension_regions,
                     )?;
                     let page_table_resolver =
-                        context.state.pinned_stage1_arenas(context.custody)?;
+                        context.state.pinned_stage1_arenas(&context.custody)?;
                     unsafe { editor.sync_to_host(&page_table_resolver) }.map_err(|e| {
                         TrapError::Hypervisor(format!(
                             "sparse HVPatch mmap sync_to_host failed: {e:?}"
@@ -558,7 +604,7 @@ pub(super) fn publish(
                 ))
             },
             |editor| {
-                let resolver = context.state.pinned_stage1_arenas(context.custody)?;
+                let resolver = context.state.pinned_stage1_arenas(&context.custody)?;
                 // The owned resolver drops its pins before retirement. Exact-MM
                 // exclusion remains held through descriptor restore and TLBI.
                 unsafe {
@@ -574,7 +620,7 @@ pub(super) fn publish(
                             })
                             .collect();
                         context.state.retire_rolled_back_arenas(
-                            context.custody,
+                            &context.custody,
                             popped,
                             &journal,
                             &mut unmap_global_frame_stage2_record,
@@ -868,6 +914,62 @@ mod arena_pin_tests {
             .retire_rolled_back_arenas(
                 &custody,
                 &[base],
+                &journal,
+                &mut |_, _| Ok(()),
+                &mut |_, _| Ok(()),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn local_publication_permit_requires_the_bound_mm_and_asid() {
+        let (state, custody, owner) = rollback_fixture();
+        let identity = carrick_hal::FrameCowIdentity {
+            linux_pid: 7,
+            linux_tid: 8,
+            mm: 9,
+            asid: 10,
+        };
+        assert!(PublicationContext::for_local(state.clone(), custody.clone(), identity).is_err());
+        state.bind_cow_runtime(MmCowRuntimeBinding {
+            authority: std::sync::Arc::new(
+                super::super::task_only_carrier_directory_tests::TestCowAuthority,
+            ),
+            identity,
+            mm_root_slot: Some((owner.physical_ipa, owner.physical_size as u64)),
+            container_root: ContainerRootToken::ROOT,
+            persistent_vm_lifecycle: true,
+        });
+        for invalid in [
+            carrick_hal::FrameCowIdentity { mm: 0, ..identity },
+            carrick_hal::FrameCowIdentity {
+                asid: 0,
+                ..identity
+            },
+            carrick_hal::FrameCowIdentity { mm: 11, ..identity },
+            carrick_hal::FrameCowIdentity {
+                asid: 11,
+                ..identity
+            },
+        ] {
+            assert!(
+                PublicationContext::for_local(state.clone(), custody.clone(), invalid).is_err()
+            );
+        }
+        let permit =
+            PublicationContext::for_local(state.clone(), custody.clone(), identity).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&permit.state, &state));
+        assert!(std::sync::Arc::ptr_eq(&permit.custody, &custody));
+        assert_eq!(
+            permit.mm_root_slot,
+            Some((owner.physical_ipa, owner.physical_size as u64))
+        );
+        drop(permit);
+        let journal = std::collections::BTreeMap::from([(owner.physical_ipa, owner.clone())]);
+        state
+            .retire_rolled_back_arenas(
+                &custody,
+                &[owner.physical_ipa],
                 &journal,
                 &mut |_, _| Ok(()),
                 &mut |_, _| Ok(()),
