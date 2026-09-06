@@ -73,6 +73,30 @@ pub struct PositiveDentry {
     pub is_lower: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InodeIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl InodeIdentity {
+    pub const fn new(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+}
+
+impl From<(u64, u64)> for InodeIdentity {
+    fn from((dev, ino): (u64, u64)) -> Self {
+        Self { dev, ino }
+    }
+}
+
+impl From<InodeIdentity> for (u64, u64) {
+    fn from(id: InodeIdentity) -> Self {
+        (id.dev, id.ino)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InodeRecord {
     pub mode: u32,
@@ -1359,153 +1383,69 @@ impl DentryCache {
             .copied()
     }
 
-    /// Invalidate a specific path from the cache.
-    pub fn invalidate_path(&self, path: &str) {
-        self.bump_mutation();
-        if let Some((parent_path, name)) = Self::split_parent_and_name(path)
-            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
-        {
-            let mut entries = self.entries.write();
-            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
-            {
-                self.inodes.write().remove(&(pos.dev, pos.ino));
-            }
-        }
-    }
-
-    /// Notify that a file/node was unlinked.
-    pub fn notify_unlink(&self, path: &str) {
-        self.bump_mutation();
-        if let Some((parent_path, name)) = Self::split_parent_and_name(path)
-            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
-        {
-            let mut entries = self.entries.write();
-            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
-            {
-                self.inodes.write().remove(&(pos.dev, pos.ino));
-            }
-            if !self.is_shared {
-                let dirs = self.dirs.read();
-                if let Some(d) = dirs.get(&parent_id) {
-                    let parent_gen = d.dir_gen.load(Ordering::SeqCst);
-                    entries.insert(
-                        (parent_id, name.to_string()),
-                        DentryNode::Negative(NegativeDentry { parent_gen }),
-                    );
-                }
-            }
-        }
-    }
-
-    /// Notify that a directory was removed.
-    pub fn notify_rmdir(&self, path: &str) {
-        self.bump_mutation();
-        let norm = path.trim_end_matches('/');
-        if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
-            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
-        {
-            let removed_dir_id = {
-                let mut path_map = self.path_to_dir_id.write();
-                path_map.remove(norm)
-            };
-            if let Some(dir_id) = removed_dir_id {
-                let dirs = self.dirs.read();
-                if let Some(d) = dirs.get(&dir_id) {
-                    d.dir_gen.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            let mut entries = self.entries.write();
-            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
-            {
-                self.inodes.write().remove(&(pos.dev, pos.ino));
-            }
-            if !self.is_shared {
-                let dirs = self.dirs.read();
-                if let Some(d) = dirs.get(&parent_id) {
-                    let parent_gen = d.dir_gen.load(Ordering::SeqCst);
-                    entries.insert(
-                        (parent_id, name.to_string()),
-                        DentryNode::Negative(NegativeDentry { parent_gen }),
-                    );
-                }
-            }
-        }
-    }
-
-    /// Invalidate the cached inode record for `(dev, ino)`.
-    pub fn invalidate_inode(&self, dev: u64, ino: u64) {
-        self.bump_mutation();
-        self.inodes.write().remove(&(dev, ino));
-    }
-
-    /// Update the cached inode record in place (e.g. for in-memory file mutations).
-    pub fn update_inode(&self, dev: u64, ino: u64, record: InodeRecord) {
-        self.bump_mutation();
-        self.inodes.write().insert((dev, ino), record);
-    }
-
-    /// Invalidate the inode record corresponding to `path` while retaining dentry structure.
-    pub fn invalidate_path_inode(&self, path: &str) {
-        self.bump_mutation();
-        if let Some((parent_path, name)) = Self::split_parent_and_name(path)
-            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
-        {
-            let entries = self.entries.read();
-            if let Some(DentryNode::Positive(pos)) = entries.get(&(parent_id, name.to_string())) {
-                self.inodes.write().remove(&(pos.dev, pos.ino));
-            }
-        }
-    }
-
-    /// Notify that a file or directory was created.
-    pub fn notify_create(&self, path: &str) {
-        self.bump_mutation();
-        // Creating `a/b/c` can materialize `a` and `a/b` too (the overlay's
-        // mkdir-with-parents, `O_CREAT` under a not-yet-seen directory), and
-        // an earlier failed lookup may have cached a NEGATIVE entry for any of
-        // those components. Drop the entry for every component on the path,
-        // not just the leaf, so a later lookup re-walks the real tree
-        // (`mkdirat_creates_overlay_dir_and_fstatat_sees_it`).
-        let mut entries = self.entries.write();
-        let mut parent_path = String::from("/");
-        for component in path.split('/').filter(|c| !c.is_empty()) {
-            let Some(parent_id) = self.find_parent_dir_id(&parent_path) else {
-                break;
-            };
-            entries.remove(&(parent_id, component.to_string()));
-            if parent_path == "/" {
-                parent_path = format!("/{component}");
-            } else {
-                parent_path = format!("{parent_path}/{component}");
-            }
-        }
-    }
-
-    /// Notify that a directory was created.
-    pub fn notify_mkdir(&self, path: &str) {
-        self.notify_create(path);
-    }
-
-    /// Notify that a symlink was created.
-    pub fn notify_symlink(&self, path: &str) {
-        self.notify_create(path);
-    }
-
-    /// Bump the generation of a directory, invalidating negative lookups within it.
-    pub fn bump_dir_generation(&self, path: &str) {
+    /// Notify that an entry was created at `path`.
+    pub fn entry_created(&self, path: &str, inode: Option<InodeIdentity>) {
         self.bump_mutation();
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
+        if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
+            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
+        {
+            let mut entries = self.entries.write();
+            entries.remove(&(parent_id, name.to_string()));
+        }
         if let Some(dir_id) = self.path_to_dir_id.read().get(norm) {
             let dirs = self.dirs.read();
             if let Some(d) = dirs.get(dir_id) {
                 d.dir_gen.fetch_add(1, Ordering::SeqCst);
             }
         }
+        if let Some(id) = inode {
+            self.inodes.write().remove(&(id.dev, id.ino));
+        }
     }
 
-    /// Notify that a path was renamed.
-    pub fn notify_rename(&self, old_path: &str, new_path: &str) {
+    /// Notify that an entry at `path` was removed (unlinked or rmdir'd).
+    pub fn entry_removed(&self, path: &str, inode: Option<InodeIdentity>) {
+        self.bump_mutation();
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        let removed_dir_id = {
+            let mut path_map = self.path_to_dir_id.write();
+            path_map.remove(norm)
+        };
+        if let Some(dir_id) = removed_dir_id {
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(&dir_id) {
+                d.dir_gen.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
+            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
+        {
+            let mut entries = self.entries.write();
+            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
+            {
+                self.inodes.write().remove(&(pos.dev, pos.ino));
+            }
+            if !self.is_shared {
+                let dirs = self.dirs.read();
+                if let Some(d) = dirs.get(&parent_id) {
+                    let parent_gen = d.dir_gen.load(Ordering::SeqCst);
+                    entries.insert(
+                        (parent_id, name.to_string()),
+                        DentryNode::Negative(NegativeDentry { parent_gen }),
+                    );
+                }
+            }
+        }
+        if let Some(id) = inode {
+            self.inodes.write().remove(&(id.dev, id.ino));
+        }
+    }
+
+    /// Notify that an entry was moved from `old_path` to `new_path`.
+    pub fn entry_moved(&self, old_path: &str, new_path: &str, inode: Option<InodeIdentity>) {
         self.bump_mutation();
         let norm_old = old_path.trim_end_matches('/');
         let norm_new = new_path.trim_end_matches('/');
@@ -1549,7 +1489,46 @@ impl DentryCache {
             && let Some(new_parent_id) = self.find_parent_dir_id(new_parent_path)
         {
             let mut entries = self.entries.write();
-            entries.remove(&(new_parent_id, new_name.to_string()));
+            if let Some(DentryNode::Positive(pos)) =
+                entries.remove(&(new_parent_id, new_name.to_string()))
+            {
+                self.inodes.write().remove(&(pos.dev, pos.ino));
+            }
+        }
+        if let Some(id) = inode {
+            self.inodes.write().remove(&(id.dev, id.ino));
+        }
+    }
+
+    /// Invalidate cached inode or path metadata when file attributes/contents changed.
+    pub fn inode_changed(&self, path: &str, inode: Option<InodeIdentity>) {
+        self.bump_mutation();
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
+            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
+        {
+            let mut entries = self.entries.write();
+            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
+            {
+                self.inodes.write().remove(&(pos.dev, pos.ino));
+            }
+        }
+        if let Some(id) = inode {
+            self.inodes.write().remove(&(id.dev, id.ino));
+        }
+    }
+
+    /// Bump the generation of a directory, invalidating negative lookups within it.
+    pub fn bump_dir_generation(&self, path: &str) {
+        self.bump_mutation();
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        if let Some(dir_id) = self.path_to_dir_id.read().get(norm) {
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(dir_id) {
+                d.dir_gen.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -1591,7 +1570,7 @@ mod tests {
         assert_eq!(err2, LINUX_ENOENT);
 
         // 3. Create after negative lookup invalidates negative dentry
-        cache.notify_create("/bar.txt");
+        cache.entry_created("/bar.txt", None);
         fs::write(tmp.path().join("bar.txt"), b"bar content").unwrap();
         let stat_bar = cache
             .stat("/bar.txt", true, &backend, None)
@@ -1599,7 +1578,7 @@ mod tests {
         assert_eq!(stat_bar.size, 11);
 
         // 4. Unlink
-        cache.notify_unlink("/foo.txt");
+        cache.entry_removed("/foo.txt", None);
         fs::remove_file(&file_path).unwrap();
         let err3 = cache.stat("/foo.txt", true, &backend, None).unwrap_err();
         assert_eq!(err3, LINUX_ENOENT);
@@ -1738,9 +1717,10 @@ mod tests {
 
         use std::os::unix::fs::MetadataExt;
         let meta1 = fs::metadata(&file_path).unwrap();
+        let ino_ident = Some(InodeIdentity::new(meta1.dev(), meta1.ino()));
 
         // 2. Invalidate inode, simulate fd-based write of 6 more bytes (total 11)
-        cache.invalidate_inode(meta1.dev(), meta1.ino());
+        cache.inode_changed("/foo.txt", ino_ident);
         fs::write(&file_path, b"hello world").unwrap();
 
         let st2 = cache
@@ -1752,8 +1732,8 @@ mod tests {
         // 3. Hard link: link /foo.txt -> /ln.txt
         let link_path = tmp.path().join("ln.txt");
         fs::hard_link(&file_path, &link_path).unwrap();
-        cache.notify_create("/ln.txt");
-        cache.invalidate_path_inode("/foo.txt");
+        cache.entry_created("/ln.txt", ino_ident);
+        cache.inode_changed("/foo.txt", ino_ident);
 
         // Both /foo.txt and /ln.txt must observe nlink == 2 and size == 11
         let st_foo = cache
@@ -1770,7 +1750,7 @@ mod tests {
         assert_eq!(st_ln.ino, st_foo.ino);
 
         // 4. Invalidate inode, write 3 bytes to file via hard link
-        cache.invalidate_inode(meta1.dev(), meta1.ino());
+        cache.inode_changed("/ln.txt", ino_ident);
         fs::write(&link_path, b"abc").unwrap();
 
         // Both aliases must observe the updated size 3

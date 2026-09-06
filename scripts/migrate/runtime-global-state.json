@@ -970,6 +970,14 @@
       "rationale": "Carrier-wide host infrastructure static scratch_cleanup_sender::SENDER in crates/carrick-runtime/src/fs_backend.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "tests::FS_RLIMIT_TEST_LOCK",
+      "fingerprint": "7773663f610e1202f0096166c01a64cc03201032928b18a2e5395a7ab6b584ef",
+      "classification": "test_only",
+      "rationale": "The cfg(test) mutex serializes host descriptor exhaustion tests that manipulate process rlimits."
+    },
+    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/fs_backend.rs",
       "symbol": "stat_cache_enabled::CARRICK_FS_STATCACHE",

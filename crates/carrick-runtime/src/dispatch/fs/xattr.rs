@@ -131,7 +131,6 @@ impl SyscallDispatcher {
         }
         self.fs
             .rootfs_vfs
-            .overlay
             .set_xattr(&resolved, &name, &value, flags, follow)?;
         Ok(DispatchOutcome::Returned { value: 0 })
     }
