@@ -955,12 +955,30 @@ impl PageTableManager {
         resolver: impl HostArenaResolver,
     ) -> Result<(), PageTableError> {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
-        let mut touched_arenas = [false; 8];
+        // Resolve once per touched arena for this publication only. Resolving
+        // each descriptor repeats the carrier's mapping search thousands of
+        // times. Preflight also keeps a missing extension from publishing half
+        // an edit or consuming its retry journal.
+        let mut inline_hosts = [None; 8];
+        let mut overflow_hosts;
+        let hosts = if self.arenas.len() <= inline_hosts.len() {
+            &mut inline_hosts[..self.arenas.len()]
+        } else {
+            overflow_hosts = vec![None; self.arenas.len()];
+            &mut overflow_hosts[..]
+        };
+        for (loc, _) in &self.dirty {
+            if hosts[loc.arena].is_none() {
+                let base = self.arenas[loc.arena].base;
+                hosts[loc.arena] = Some(
+                    resolver
+                        .host_ptr_for_base(base)
+                        .ok_or(PageTableError::UnresolvedArena(base))?,
+                );
+            }
+        }
         for (loc, is_ptr) in self.dirty.drain(..) {
             let arena = &self.arenas[loc.arena];
-            if loc.arena < touched_arenas.len() {
-                touched_arenas[loc.arena] = true;
-            }
             let mut a = [0u8; 8];
             a.copy_from_slice(&arena.bytes[loc.offset..loc.offset + 8]);
             let v = u64::from_le_bytes(a);
@@ -969,9 +987,8 @@ impl PageTableManager {
                 // visible before the pointer that exposes them.
                 fence(Ordering::SeqCst);
             }
-            let host = resolver
-                .host_ptr_for_base(arena.base)
-                .ok_or(PageTableError::UnresolvedArena(arena.base))?;
+            // Every dirty arena was resolved before the first store.
+            let host = hosts[loc.arena].ok_or(PageTableError::UnresolvedArena(arena.base))?;
             // Offsets are 8-byte aligned (index*8), so this is a single atomic
             // store the guest walker observes whole.
             unsafe {
@@ -980,8 +997,8 @@ impl PageTableManager {
             }
         }
         fence(Ordering::SeqCst);
-        for (i, &touched) in touched_arenas.iter().enumerate() {
-            if touched && i < self.arenas.len() {
+        for (i, host) in hosts.iter().enumerate() {
+            if host.is_some() {
                 resolver.record_populated_prefix(
                     self.arenas[i].base,
                     (self.arenas[i].next_free as usize).min(self.arenas[i].capacity),
@@ -4218,6 +4235,48 @@ mod tests {
     }
 
     #[test]
+    fn sync_to_host_resolves_each_arena_once() {
+        use crate::memory::LINUX_PAGE_TABLES_SIZE;
+        use std::cell::Cell;
+
+        let mut mgr = hvpatch_manager();
+        mgr.set_rw(LINUX_MMAP_BASE + 0x1000, 64 * 0x1000, true, None)
+            .unwrap();
+        assert_eq!(mgr.arenas.len(), 1);
+        assert!(mgr.dirty.len() > 64);
+        let mut host = vec![0u64; LINUX_PAGE_TABLES_SIZE as usize / 8];
+        let ptr = host.as_mut_ptr().cast::<u8>();
+        let calls = Cell::new(0);
+        let expected: Vec<_> = mgr
+            .dirty
+            .iter()
+            .map(|(loc, _)| {
+                let bytes = &mgr.arenas[loc.arena].bytes[loc.offset..loc.offset + 8];
+                (
+                    loc.offset / 8,
+                    u64::from_le_bytes(bytes.try_into().unwrap()),
+                )
+            })
+            .collect();
+        unsafe {
+            mgr.sync_to_host(|_| {
+                calls.set(calls.get() + 1);
+                Some(ptr)
+            })
+            .unwrap();
+        }
+        for (offset, word) in expected {
+            assert_eq!(host[offset], word);
+        }
+        assert!(mgr.dirty.is_empty());
+        assert_eq!(
+            calls.get(),
+            1,
+            "resolve backing once per arena, not per descriptor"
+        );
+    }
+
+    #[test]
     fn sync_to_host_errors_on_unresolved_arena() {
         use crate::memory::LINUX_PAGE_TABLES_SIZE;
         use carrick_guest_mem::Gpa;
@@ -4245,8 +4304,25 @@ mod tests {
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         // Only provide host mapping for root arena, omitting ext_base!
         let resolver = [(mgr.base(), host_arena0.as_mut_ptr())];
+        let dirty_len = mgr.dirty.len();
         let res = unsafe { mgr.sync_to_host(&resolver[..]) };
         assert_eq!(res, Err(PageTableError::UnresolvedArena(ext_base.0)));
+        assert!(
+            host_arena0.iter().all(|&byte| byte == 0),
+            "failed preflight must not publish descriptors"
+        );
+        assert_eq!(
+            mgr.dirty.len(),
+            dirty_len,
+            "failed preflight preserves the edit for retry"
+        );
+        let mut host_arena1 = vec![0u64; LINUX_PAGE_TABLES_SIZE as usize / 8];
+        let resolver = [
+            (mgr.base(), host_arena0.as_mut_ptr()),
+            (ext_base.0, host_arena1.as_mut_ptr().cast()),
+        ];
+        unsafe { mgr.sync_to_host(&resolver[..]).unwrap() };
+        assert!(mgr.dirty.is_empty());
     }
 
     #[test]
