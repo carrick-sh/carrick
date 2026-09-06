@@ -182,3 +182,56 @@ work-count test passes with the prefix scan plus a 16-row bound; a full index
 rebuild is also compared after every existing differential unmap case. Full
 signed HVF lib suite: 438 passed, 3 ignored (`index-hvf-lib.log`). This is a
 local source checkpoint; fresh signed CLI timing and launch receipts follow.
+
+
+## Handoff after scope-index measurement
+
+Source `4856777d6`, signed SHA-256
+`aa9249dd2963f78c37a1558af86bc3ad9c6ede9be100511b95a1d5e6e02e23a0`:
+whole-file mmap+close 125.426 us and anonymous 1 MiB mmap+close 54.370 us
+(`index-bench.*`, run `eco-mmap-immutable-bench-1788714494457057000`).
+Ubuntu shell true and Python print pass (`index-launch.{json,log}`). Still
+fails the 10/6 us contracts. All processes were scoped-reaped.
+
+A new structural red receipt uses 100 untouched 255-page anonymous mappings
+(the unusual length excludes CPython's own 1 MiB allocator arenas).
+`scripts/dtrace/mmap-anon-host-allocation.d` observed exactly 100 successful
+guest mappings, **100 host mmap calls requesting 281,804,800 bytes**, with zero
+DTrace errors. Run `eco-mmap-immutable-anon-allocation-1788714737804181000`,
+`anon-allocation.{json,out,err}` and driver log. This counts requested host
+virtual mapping bytes, not resident memory. The initial attempt used the
+reserved D identifier `count` and failed compilation before a guest ran;
+the corrected probe ABI fired live. Never cite instrumented elapsed time.
+
+The current anonymous branch calls `memory.protect_range(..., prot)` in
+`dispatch/mem.rs`, then may call it again with PROT_NONE for mincore first-touch
+tracking. AArch64 `protect_range` unconditionally calls
+`ensure_sparse_mmap_backing` for accessible protection. Thus the parked
+`zero_anonymous_reuse` scrub skip does not make mmap lazy. The branch already
+has a demand-zero path in `HvfVmState::resolve_frame_cow_fault`, but wiring
+metadata-only mmap into it requires correctness proof, not just deleting the
+eager call. In particular:
+
+- Preserve permission/executable and sharing metadata, MAP_POPULATE/mlock,
+  MAP_FIXED failure handling, full/partial reuse zero-fill and neighboring
+  mappings within a 16 KiB compound.
+- Keep unmaterialized stage-1 descriptors invalid. `apply_protection_edit`
+  cannot blindly make an old identity/retained output accessible.
+- Verify mincore first-touch accounting: the runtime currently records a
+  resident-fault range, while the backend demand-zero resolver runs before
+  that runtime fallback. Do not let a resolved backend fault lose residency.
+- Existing anonymous MAP_FIXED code discards `unmap_range` errors; review
+  failure atomicity before relying on that operation to prove a hole.
+- Guest buffer reads/writes, mprotect after partial materialization and fork
+  must retain exact owner generation and logical permissions.
+
+For the file path, samples also show per-page
+`observe_frame_cow_protection` authentication (shadow walk, live walk and
+translation repeated at 4 KiB even when a block descriptor covers more), plus
+fd-stat xattrs. Any block-wise authentication must prove the same descriptor
+covers every skipped address and stop at COW permission boundaries; validation
+must not be weakened. These are next investigations, not implemented changes.
+
+Full serial runtime, full probe family, inventory reconciliation/lint and
+mmap main landing remain pending, followed by the quiet-host fork and fresh
+2,127-row cached-only ecosystem ledger. Cap-std remains accepted on main.
