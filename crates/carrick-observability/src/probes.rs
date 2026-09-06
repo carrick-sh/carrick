@@ -39,6 +39,20 @@ use std::ops::Range;
 
 use carrick_guest_mem::HostVa;
 
+/// Result of attempting to install a private file view rather than copying it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MmapLoweringOutcome {
+    /// A file view was installed and the dispatcher skips its byte snapshot.
+    Installed = 1,
+    /// This mapping is unsupported by the memory implementation.
+    Refused = 2,
+    /// Installation failed and the dispatcher falls back to a byte snapshot.
+    Error = 3,
+    /// The host file length could not be obtained.
+    MetadataUnavailable = 5,
+}
+
 /// Failure returned by `register_dtrace_probes`.
 ///
 /// Deliberately a crate-local type rather than `usdt::Error`. `usdt` is
@@ -4873,6 +4887,12 @@ mod real {
         /// Args: requested IPA/length/host VA and the current owner's host VA
         /// for that exact IPA/length (zero when the lease is retired).
         fn hvpatch__global__frame__owner__miss(_: u64, _: u64, _: u64, _: u64) {}
+        /// Lowering verdict for MAP_PRIVATE file mapping.
+        /// Args: VA, length, offset, MmapLoweringOutcome (1/2/3/5).
+        fn mmap__lowering__verdict(_: u64, _: u64, _: u64, _: u32) {}
+        /// Lowering error for MAP_PRIVATE file mapping.
+        /// Args: VA, length, offset, error message.
+        fn mmap__lowering__error(_: u64, _: u64, _: u64, _: &str) {}
         /// Address-space provenance: guest PID, ASID, root-slot base and size,
         /// TTBR0. Five scalars keep the complete record reliable on macOS.
         fn hvpatch__guest__address__space(_: i32, _: u32, _: u64, _: u64, _: u64) {}
@@ -6127,6 +6147,21 @@ mod real {
             host_addr,
             owner_host_addr
         ));
+    }
+
+    #[inline(never)]
+    pub fn mmap_lowering_verdict(
+        va: u64,
+        len: u64,
+        offset: u64,
+        outcome: super::MmapLoweringOutcome,
+    ) {
+        carrick_usdt::mmap__lowering__verdict!(|| (va, len, offset, outcome as u32));
+    }
+
+    #[inline(never)]
+    pub fn mmap_lowering_error(va: u64, len: u64, offset: u64, error: &dyn std::fmt::Display) {
+        carrick_usdt::mmap__lowering__error!(|| (va, len, offset, format!("{error}")));
     }
 
     #[inline(never)]
@@ -7906,6 +7941,8 @@ mod stub {
         result: super::HvpatchCloneTidWriteResult
     ));
     stub!(lifecycle(phase: u32));
+    stub!(mmap_lowering_verdict(va: u64, len: u64, offset: u64, outcome: super::MmapLoweringOutcome));
+    stub!(mmap_lowering_error(va: u64, len: u64, offset: u64, error: &dyn std::fmt::Display));
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
     stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));

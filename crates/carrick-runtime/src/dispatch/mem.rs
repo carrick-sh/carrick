@@ -5444,6 +5444,8 @@ impl SyscallDispatcher {
                         LINUX_EBADF,
                     ));
                 };
+                use carrick_observability::probes::MmapLoweringOutcome;
+                let lowering_outcome;
                 if let Some(file_len) = host_fd_file_len(host_fd) {
                     bus_fault_offset =
                         shared_file_bus_offset(file_len, offset, length, page_size);
@@ -5451,13 +5453,33 @@ impl SyscallDispatcher {
                     // owning fd (a `HostFdRef`, or the memfd's `OwnedFd`) alive
                     // across the borrow.
                     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd) };
-                    if matches!(
-                        memory.map_private_file_backed(address, length_usize, borrowed, offset),
-                        Ok(true)
-                    ) {
-                        lowered_file_backed = true;
+                    match memory.map_private_file_backed(address, length_usize, borrowed, offset) {
+                        Ok(true) => {
+                            lowered_file_backed = true;
+                            lowering_outcome = MmapLoweringOutcome::Installed;
+                        }
+                        Ok(false) => {
+                            lowering_outcome = MmapLoweringOutcome::Refused;
+                        }
+                        Err(e) => {
+                            lowering_outcome = MmapLoweringOutcome::Error;
+                            carrick_observability::probes::mmap_lowering_error(
+                                address,
+                                length,
+                                offset,
+                                &e,
+                            );
+                        }
                     }
+                } else {
+                    lowering_outcome = MmapLoweringOutcome::MetadataUnavailable;
                 }
+                carrick_observability::probes::mmap_lowering_verdict(
+                    address,
+                    length,
+                    offset,
+                    lowering_outcome,
+                );
                 if !lowered_file_backed {
                     if reuse_scrub_needed
                         && let Err(error) = memory.zero_anonymous_reuse(
