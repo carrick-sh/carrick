@@ -4647,9 +4647,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 467);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 490);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 980);
+    assert_eq!(generic.len(), 468);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 491);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 982);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
