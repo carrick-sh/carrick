@@ -1728,4 +1728,229 @@ mod tests {
             "symlink -> hardlink chain must resolve"
         );
     }
+
+    #[test]
+    fn layer_extraction_rejects_parent_escape() {
+        use tar::{Builder, Header};
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let scratch = sandbox.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut b = Builder::new(&mut buf);
+            let mut h = Header::new_gnu();
+            let bytes = h.as_mut_bytes();
+            let name = b"../escape";
+            bytes[..name.len()].copy_from_slice(name);
+            h.set_size(4);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append(&h, b"fail".as_slice()).unwrap();
+            b.finish().unwrap();
+        }
+        let mut archive = tar::Archive::new(std::io::Cursor::new(buf));
+        let mut stats = ExtractStats::default();
+        let res = apply_tar_to_dir(&mut archive, &scratch, &mut stats);
+        assert!(
+            matches!(res, Err(RootFsError::UnsafePath(_))),
+            "entry named ../escape must be refused with UnsafePath, got: {:?}",
+            res
+        );
+        assert!(
+            !sandbox.path().join("escape").exists(),
+            "escape file must not exist outside scratch root"
+        );
+    }
+
+    #[test]
+    fn layer_extraction_rejects_relative_symlink_escape() {
+        use tar::{Builder, EntryType, Header};
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let scratch = sandbox.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut b = Builder::new(&mut buf);
+            let mut h = Header::new_gnu();
+            h.set_path("sub/link_escape").unwrap();
+            h.set_entry_type(EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_link_name("../../outside").unwrap();
+            h.set_cksum();
+            b.append(&h, std::io::empty()).unwrap();
+            b.finish().unwrap();
+        }
+        let mut archive = tar::Archive::new(std::io::Cursor::new(buf));
+        let mut stats = ExtractStats::default();
+        let res = apply_tar_to_dir(&mut archive, &scratch, &mut stats);
+        assert!(
+            matches!(res, Err(RootFsError::UnsafePath(_))),
+            "relative symlink escaping root must be refused with UnsafePath, got: {:?}",
+            res
+        );
+        assert!(
+            !sandbox.path().join("outside").exists(),
+            "outside path must not exist"
+        );
+    }
+
+    #[test]
+    fn layer_extraction_refuses_absolute_symlink_escape() {
+        use tar::{Builder, EntryType, Header};
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let scratch = sandbox.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let outside_target = sandbox.path().join("outside_target");
+        std::fs::create_dir_all(&outside_target).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut b = Builder::new(&mut buf);
+            let mut h = Header::new_gnu();
+            h.set_path("link_abs").unwrap();
+            h.set_entry_type(EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            // Absolute target pointing to outside_target
+            h.set_link_name(outside_target.to_str().unwrap()).unwrap();
+            h.set_cksum();
+            b.append(&h, std::io::empty()).unwrap();
+
+            let data = b"payload";
+            let mut h2 = Header::new_gnu();
+            h2.set_path("link_abs/owned_file").unwrap();
+            h2.set_size(data.len() as u64);
+            h2.set_mode(0o644);
+            h2.set_cksum();
+            b.append(&h2, data.as_slice()).unwrap();
+            b.finish().unwrap();
+        }
+        let mut archive = tar::Archive::new(std::io::Cursor::new(buf));
+        let mut stats = ExtractStats::default();
+        let _ = apply_tar_to_dir(&mut archive, &scratch, &mut stats);
+        assert!(
+            !outside_target.join("owned_file").exists(),
+            "file must NEVER be written to absolute host target outside scratch root"
+        );
+    }
+
+    #[test]
+    fn layer_extraction_directory_symlink_traversal() {
+        use tar::{Builder, EntryType, Header};
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let scratch_c = sandbox.path().join("scratch_c");
+        std::fs::create_dir_all(&scratch_c).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut b = Builder::new(&mut buf);
+            // Directory usr/bin
+            let mut h0 = Header::new_gnu();
+            h0.set_path("usr/bin").unwrap();
+            h0.set_entry_type(EntryType::Directory);
+            h0.set_mode(0o755);
+            h0.set_size(0);
+            h0.set_cksum();
+            b.append(&h0, std::io::empty()).unwrap();
+
+            // Symlink bin -> usr/bin
+            let mut h1 = Header::new_gnu();
+            h1.set_path("bin").unwrap();
+            h1.set_entry_type(EntryType::Symlink);
+            h1.set_size(0);
+            h1.set_mode(0o777);
+            h1.set_link_name("usr/bin").unwrap();
+            h1.set_cksum();
+            b.append(&h1, std::io::empty()).unwrap();
+
+            // Regular file bin/true
+            let data = b"binary-content";
+            let mut h2 = Header::new_gnu();
+            h2.set_path("bin/true").unwrap();
+            h2.set_size(data.len() as u64);
+            h2.set_mode(0o755);
+            h2.set_cksum();
+            b.append(&h2, data.as_slice()).unwrap();
+            b.finish().unwrap();
+        }
+        let mut archive = tar::Archive::new(std::io::Cursor::new(buf));
+        let mut stats = ExtractStats::default();
+        apply_tar_to_dir(&mut archive, &scratch_c, &mut stats).unwrap();
+
+        let bin_path = scratch_c.join("bin");
+        let bin_meta = std::fs::symlink_metadata(&bin_path).unwrap();
+        assert!(
+            bin_meta.file_type().is_symlink(),
+            "bin must be a symlink, not a directory"
+        );
+        assert_eq!(
+            std::fs::read_link(&bin_path).unwrap(),
+            std::path::Path::new("usr/bin")
+        );
+        let target_file = scratch_c.join("usr/bin/true");
+        assert!(
+            target_file.exists(),
+            "bin/true must be written at usr/bin/true through the contained directory symlink"
+        );
+        assert_eq!(std::fs::read(&target_file).unwrap(), b"binary-content");
+    }
+
+    #[test]
+    fn rootfs_extract_to_dir_directory_symlink_traversal() {
+        use tar::{Builder, EntryType, Header};
+        let mut buf = Vec::new();
+        {
+            let mut b = Builder::new(&mut buf);
+            let mut h0 = Header::new_gnu();
+            h0.set_path("usr/bin").unwrap();
+            h0.set_entry_type(EntryType::Directory);
+            h0.set_mode(0o755);
+            h0.set_size(0);
+            h0.set_cksum();
+            b.append(&h0, std::io::empty()).unwrap();
+
+            let mut h1 = Header::new_gnu();
+            h1.set_path("bin").unwrap();
+            h1.set_entry_type(EntryType::Symlink);
+            h1.set_size(0);
+            h1.set_mode(0o777);
+            h1.set_link_name("usr/bin").unwrap();
+            h1.set_cksum();
+            b.append(&h1, std::io::empty()).unwrap();
+
+            let data = b"true-binary";
+            let mut h2 = Header::new_gnu();
+            h2.set_path("bin/true").unwrap();
+            h2.set_size(data.len() as u64);
+            h2.set_mode(0o755);
+            h2.set_cksum();
+            b.append(&h2, data.as_slice()).unwrap();
+            b.finish().unwrap();
+        }
+        let rootfs = RootFs::from_layers([LayerSource::Tar(buf)]).unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let scratch = sandbox.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        rootfs.extract_to_dir(&scratch).unwrap();
+
+        let bin_path = scratch.join("bin");
+        assert!(
+            std::fs::symlink_metadata(&bin_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "bin must be a symlink"
+        );
+        let true_path = scratch.join("usr/bin/true");
+        assert!(
+            true_path.exists(),
+            "usr/bin/true must exist when extracted through rootfs.extract_to_dir"
+        );
+    }
 }
