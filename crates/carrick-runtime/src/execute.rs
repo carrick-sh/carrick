@@ -281,7 +281,7 @@ pub(crate) fn seed_guest_baseline(
         "/usr/local/bin",
         "/usr/local/sbin",
     ] {
-        let _ = backend.make_dir(dir);
+        set_baseline_dir_if_missing(backend, rootfs, dir);
     }
     let _ = backend.set_mode("/tmp", 0o1777);
     let _ = backend.set_mode("/var/tmp", 0o1777);
@@ -380,6 +380,17 @@ pub(crate) fn seed_guest_baseline(
         "/etc/hostname",
         format!("{}\n", guest_hostname).into_bytes(),
     );
+}
+
+fn set_baseline_dir_if_missing(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>, path: &str) {
+    if backend.metadata(path).is_some()
+        || rootfs
+            .and_then(|rootfs| rootfs.symlink_metadata(path).ok())
+            .is_some()
+    {
+        return;
+    }
+    let _ = backend.make_dir(path);
 }
 
 fn set_baseline_file_if_missing(
