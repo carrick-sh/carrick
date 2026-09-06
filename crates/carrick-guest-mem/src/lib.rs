@@ -64,6 +64,12 @@
 //! `serde::Serialize`, and `thiserror::Error` — precisely so it sits at the
 //! bottom of the build graph and almost never has to be rebuilt.
 
+mod deferred_anonymous;
+pub use deferred_anonymous::{
+    DeferredAnonymousError, DeferredAnonymousSnapshot, DeferredAnonymousState,
+    DeferredAnonymousTransition,
+};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -747,6 +753,10 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Bind the pristine backing authority of this exact MM. Copied MMs must
+    /// receive a fork-private state before guest execution; shared MMs share it.
+    fn bind_deferred_anonymous_state(&mut self, _state: std::sync::Arc<DeferredAnonymousState>) {}
+
     /// Whether private anonymous mappings can start with no physical backing
     /// and be populated through the runtime's first-touch fault plan. Other
     /// backends keep eager protection publication. MAP_POPULATE and locked
@@ -754,8 +764,7 @@ pub trait GuestMemory {
     /// support kernel copyin/copyout and authenticated foreign reads before a
     /// guest first touch, preserve exact VMA permissions, and materialize only
     /// the faulted range without replacing live neighboring pages. Missing
-    /// translations alone never authorize reading zeros. No production
-    /// backend opts in until those contracts are implemented and verified.
+    /// translations alone never authorize reading zeros.
     fn supports_lazy_anonymous_mmap(&self) -> bool {
         false
     }
