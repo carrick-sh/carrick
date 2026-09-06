@@ -15,13 +15,13 @@ Ubuntu shell/Python launches, exact signed artifact and 10/6 us measurements.
 
 ## Backing preparation
 
-- [ ] Extract the allocation block from HvfVmState::materialize_sparse_mmap_extent
+- [x] Extract the allocation block from HvfVmState::materialize_sparse_mmap_extent
   into `crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs`.
-- [ ] Return a PreparedSparseBacking owning GlobalFrameOwnerRollback plus the
+- [x] Return a PreparedSparseBacking owning GlobalFrameOwnerRollback plus the
   exact physical and semantic host/IPA extents, permissions, backing identity
   and owner generation. The caller cannot accidentally release staged ownership.
-- [ ] Preserve existing behavior during extraction; full signed HVF lib suite.
-- [ ] Red allocation-shape assertion: a 4 KiB anonymous extent starting 4 KiB
+- [x] Preserve existing behavior during extraction; full signed HVF lib suite.
+- [x] Red allocation-shape assertion: a 4 KiB anonymous extent starting 4 KiB
   before a 2 MiB boundary requires one 16 KiB host allocation, not 2 MiB.
   Keep file and bulk-anonymous congruence unchanged. Prove green and commit.
 

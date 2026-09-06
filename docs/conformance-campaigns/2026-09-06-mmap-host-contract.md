@@ -381,3 +381,19 @@ The full signed HVF lib suite passes 442 / 3 ignored on the in-progress source
 `eco-mmap-materializer-extract-1788718992648724000`), scoped cleanup zero.
 The extraction is staged separately from the still-uncommitted anonymous
 integration. No new release binary or main landing is claimed.
+
+
+### Bounded anonymous fault allocation
+
+Red: `anonymous_first_touch_never_allocates_a_block_of_padding` requested
+2097152 host bytes for the 4096-byte semantic extent at offset 0x1ff000;
+expected 16384 (`target/conformance/materializer-shape-red-bytes.log`).
+The allocator now uses 16 KiB congruence for anonymous extents smaller than
+2 MiB; file views and bulk anonymous extents retain 2 MiB congruence. The
+test checks every 4 KiB offset in a 2 MiB span, not only the failing endpoint.
+
+Full signed HVF lib suite passes 445 / 3 ignored in
+`eco-mmap-resume/materializer-shape-green.log`, with scoped cleanup zero.
+This proves the allocation-shape correction and host tests, not a guest
+first-touch timing or the final 10/6 us contracts. The shared publication
+transaction and lazy anonymous integration are still in progress.
