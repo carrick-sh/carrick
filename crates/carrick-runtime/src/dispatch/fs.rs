@@ -1913,6 +1913,10 @@ impl SyscallDispatcher {
         // raw path before resolve_at_path normalizes the slash away.
         let requires_dir = path.ends_with('/') || path.ends_with("/.");
 
+        // Linux length limits apply before any lookup; the dentry fast path
+        // below skips `resolve_at_path`, which is where they were enforced.
+        check_path_length(path)?;
+
         // Dentry-cache fast path: a stat of a plain absolute path is served
         // from the dentry cache (resolving symlinks and negative entries in-memory).
         if (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
@@ -16433,6 +16437,11 @@ impl SyscallDispatcher {
             // overlay everywhere thereafter; the injection isn't a real overlay
             // file, so "unlink" just means stop injecting. If the overlay DOES
             // happen to carry the path, also run the normal overlay delete.
+            // Learn the target's inode identity BEFORE it goes away so the
+            // removal also drops the inode record every other hard link of it
+            // shares (`legacyfs`: unlink of the second name must lower the
+            // first name's nlink). One `fstatat` on a cache miss.
+            let _ = this.fs.rootfs_vfs.dentry_stat(&resolved, false);
             if let Some(m) = this.fs.vfs_mounts.resolve(&resolved)
                 && m.vfs.overridable()
             {
