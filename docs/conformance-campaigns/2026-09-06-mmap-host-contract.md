@@ -397,3 +397,18 @@ Full signed HVF lib suite passes 445 / 3 ignored in
 This proves the allocation-shape correction and host tests, not a guest
 first-touch timing or the final 10/6 us contracts. The shared publication
 transaction and lazy anonymous integration are still in progress.
+
+
+### MM-owned structural arena preparation
+
+Moved extension arena publication to MmAccessState. Existing exact structural
+owner entries now determine whether backing already exists; the local executor
+only extends its mapping cache with newly published rows. This removes the
+executor dependency from arena allocation, a prerequisite for sharing sparse
+publication with a foreign writer. Descriptor/inventory transaction extraction
+and structural rollback journaling remain unfinished.
+
+Full signed HVF lib suite passes 445 / 3 ignored in
+`eco-mmap-resume/mm-arenas.log`; scoped cleanup reports zero. This mechanical
+extraction is committed separately from anonymous integration and has not
+landed on main. No new guest latency result is claimed.
