@@ -39,8 +39,8 @@
 //! contract the dispatcher relies on.
 
 use crate::fs_backend::{
-    FsBackend, ImmutableHostFileOpen, MemoryBackend, OverlayEntry, OverlayEntryKind, RealStat,
-    SharedFileContents,
+    BackendError, FsBackend, ImmutableHostFileOpen, MemoryBackend, OverlayEntry, OverlayEntryKind,
+    RealStat, SharedFileContents,
 };
 use crate::linux_abi::LinuxErrno;
 use crate::linux_abi::{
@@ -51,8 +51,8 @@ use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
 use std::sync::Arc;
 
 use super::{
-    DirEnt, EntryKind, MAX_IN_MEMORY_FILE_SIZE, Metadata, OpenContext, OpenFlags, Vfs, VfsError,
-    VfsHandle, WatchFd,
+    DirEnt, EntryKind, InodeIdentity, MAX_IN_MEMORY_FILE_SIZE, Metadata, OpenContext, OpenFlags,
+    Vfs, VfsError, VfsHandle, WatchFd,
 };
 
 /// The `/` mount. Owns the immutable OCI rootfs (`rootfs`) and the
@@ -64,7 +64,7 @@ use super::{
 pub struct RootFsVfs {
     pub rootfs: Option<RootFs>,
     pub overlay: Box<dyn FsBackend>,
-    pub dentry_cache: Arc<crate::vfs::DentryCache>,
+    dentry_cache: Arc<crate::vfs::DentryCache>,
 }
 
 /// Richer result from [`RootFsVfs::open_for_dispatch`]. Carries the
@@ -187,6 +187,241 @@ impl RootFsVfs {
         }
         self.dentry_cache
             .fast_open(path, write, &*self.overlay, self.rootfs.as_ref())
+    }
+
+    fn host_fd_inode_identity(raw_fd: i32) -> Option<InodeIdentity> {
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+            Some(InodeIdentity::new(st.st_dev as u64, st.st_ino as u64))
+        } else {
+            None
+        }
+    }
+
+    fn path_inode_identity(&self, path: &str) -> Option<InodeIdentity> {
+        if let Ok(dentry) =
+            self.dentry_cache
+                .lookup_path(path, false, &*self.overlay, self.rootfs.as_ref())
+        {
+            Some(InodeIdentity::new(dentry.dentry.dev, dentry.dentry.ino))
+        } else {
+            None
+        }
+    }
+
+    /// Invalidate dentry/inode cache entry for an open host fd.
+    pub fn invalidate_host_fd(&self, raw_fd: i32) {
+        if let Some(inode) = Self::host_fd_inode_identity(raw_fd) {
+            self.dentry_cache.inode_changed("", Some(inode));
+        }
+    }
+
+    /// Notify that an inode's attributes or contents changed.
+    pub fn notify_inode_changed(&self, path: &str, inode: Option<InodeIdentity>) {
+        self.dentry_cache.inode_changed(path, inode);
+    }
+
+    /// Reset dentry cache on rootfs layer mutation.
+    pub fn reset_dentry_cache(&mut self) {
+        let is_shared = self.dentry_cache.is_shared();
+        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(is_shared));
+    }
+
+    /// Create raw host fd in writable overlay and announce creation to dentry cache.
+    pub fn create_raw_fd(
+        &self,
+        path: &str,
+        create_mode: u32,
+        want_trunc: bool,
+    ) -> crate::fs_backend::HostFdOpen<(i32, bool)> {
+        let res = self.overlay.create_raw_fd(path, create_mode, want_trunc);
+        if let crate::fs_backend::HostFdOpen::Served((host_fd, _)) = &res {
+            let inode = Self::host_fd_inode_identity(*host_fd);
+            self.dentry_cache.entry_created(path, inode);
+            if want_trunc {
+                self.dentry_cache.inode_changed(path, inode);
+            }
+        }
+        res
+    }
+
+    /// Create regular file in writable overlay and announce creation to dentry cache.
+    pub fn create_file(&self, path: &str) -> Result<(), BackendError> {
+        self.overlay.create_file(path)?;
+        self.dentry_cache.entry_created(path, None);
+        Ok(())
+    }
+
+    /// Create FIFO in writable overlay and announce creation to dentry cache.
+    pub fn create_fifo(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        self.overlay.create_fifo(path, mode)?;
+        self.dentry_cache.entry_created(path, None);
+        Ok(())
+    }
+
+    /// Create socket node in writable overlay and announce creation to dentry cache.
+    pub fn create_socket(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        self.overlay.create_socket(path, mode)?;
+        self.dentry_cache.entry_created(path, None);
+        Ok(())
+    }
+
+    /// Create device node in writable overlay and announce creation to dentry cache.
+    pub fn create_device(&self, path: &str, full_mode: u32, dev: u64) -> Result<(), BackendError> {
+        self.overlay.create_device(path, full_mode, dev)?;
+        self.dentry_cache.entry_created(path, None);
+        Ok(())
+    }
+
+    /// Create hard link in writable overlay and update dentry cache.
+    pub fn link(&self, from: &str, to: &str) -> Result<(), LinuxErrno> {
+        let inode = self.path_inode_identity(from);
+        match self.overlay.hard_link(from, to) {
+            Ok(()) => {
+                self.dentry_cache.entry_created(to, inode);
+                self.dentry_cache.inode_changed(from, inode);
+                Ok(())
+            }
+            Err(crate::fs_backend::BackendError::Unsupported) => {
+                let contents = self
+                    .overlay
+                    .file_contents(from)
+                    .or_else(|| self.rootfs.as_ref().and_then(|r| r.read(from).ok()))
+                    .unwrap_or_default();
+                match self.overlay.set_file_contents(to, contents) {
+                    Ok(()) => {
+                        self.dentry_cache.entry_created(to, inode);
+                        self.dentry_cache.inode_changed(from, inode);
+                        Ok(())
+                    }
+                    Err(_) => Err(LINUX_EROFS),
+                }
+            }
+            Err(_) => Err(LINUX_EROFS),
+        }
+    }
+
+    /// Create symlink in writable overlay and update dentry cache.
+    pub fn symlink(&self, target: &str, link: &str) -> Result<(), LinuxErrno> {
+        match self.overlay.symlink(target, link) {
+            Ok(()) => {
+                self.dentry_cache.entry_created(link, None);
+                Ok(())
+            }
+            Err(crate::fs_backend::BackendError::Unsupported) => Err(LINUX_EROFS),
+            Err(_) => Err(LINUX_EROFS),
+        }
+    }
+
+    /// Truncate path-based file and update dentry cache.
+    pub fn truncate_path(&self, path: &str, length: u64) -> Result<(), LinuxErrno> {
+        use crate::dispatch::HostSyscallResult as _;
+        match self.overlay.open_raw_fd(path, true, false, false) {
+            crate::fs_backend::HostFdOpen::Served(host_fd) => {
+                let inode = Self::host_fd_inode_identity(host_fd);
+                let err = unsafe { libc::ftruncate(host_fd, length as libc::off_t) }
+                    .host_syscall_errno()
+                    .err();
+                unsafe { libc::close(host_fd) };
+                if let Some(err) = err {
+                    Err(err)
+                } else {
+                    self.dentry_cache.inode_changed(path, inode);
+                    Ok(())
+                }
+            }
+            crate::fs_backend::HostFdOpen::Refused(refused) => Err(refused),
+            crate::fs_backend::HostFdOpen::Unavailable => Err(LINUX_EROFS),
+        }
+    }
+
+    /// Set mode on path and update dentry cache.
+    pub fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        let inode = self.path_inode_identity(path);
+        let res = self.overlay.set_mode(path, mode);
+        match &res {
+            Ok(()) | Err(BackendError::Unsupported) => {
+                self.dentry_cache.inode_changed(path, inode);
+            }
+            _ => {}
+        }
+        res
+    }
+
+    /// Set owner on path and update dentry cache.
+    pub fn set_owner(
+        &self,
+        path: &str,
+        uid: Option<carrick_abi::NsUid>,
+        gid: Option<carrick_abi::NsGid>,
+    ) -> Result<(), BackendError> {
+        let inode = self.path_inode_identity(path);
+        let res = self.overlay.set_owner(path, uid, gid);
+        match &res {
+            Ok(()) | Err(BackendError::Unsupported) => {
+                self.dentry_cache.inode_changed(path, inode);
+            }
+            _ => {}
+        }
+        res
+    }
+
+    /// Set times on path and update dentry cache.
+    pub fn set_times(
+        &self,
+        path: &str,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+        nofollow: bool,
+    ) -> Result<(), BackendError> {
+        let inode = self.path_inode_identity(path);
+        let res = self.overlay.set_times(path, atime, mtime, nofollow);
+        match &res {
+            Ok(()) | Err(BackendError::Unsupported) => {
+                self.dentry_cache.inode_changed(path, inode);
+            }
+            _ => {}
+        }
+        res
+    }
+
+    /// Set xattr on path and update dentry cache.
+    pub fn set_xattr(
+        &self,
+        path: &str,
+        name: &str,
+        value: &[u8],
+        flags: i32,
+        follow: bool,
+    ) -> Result<(), LinuxErrno> {
+        let inode = self.path_inode_identity(path);
+        self.overlay.set_xattr(path, name, value, flags, follow)?;
+        self.dentry_cache.inode_changed(path, inode);
+        Ok(())
+    }
+
+    /// Set file contents and update dentry cache.
+    pub fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
+        let inode = self.path_inode_identity(path);
+        self.overlay.set_file_contents(path, contents)?;
+        self.dentry_cache.entry_created(path, inode);
+        self.dentry_cache.inode_changed(path, inode);
+        Ok(())
+    }
+
+    /// Write file range and update dentry cache.
+    pub fn write_file_range(
+        &self,
+        path: &str,
+        offset: usize,
+        bytes: &[u8],
+        final_size: usize,
+    ) -> Result<(), BackendError> {
+        let inode = self.path_inode_identity(path);
+        self.overlay
+            .write_file_range(path, offset, bytes, final_size)?;
+        self.dentry_cache.inode_changed(path, inode);
+        Ok(())
     }
 
     /// Non-following metadata lookup (the `lstat`/`AT_SYMLINK_NOFOLLOW`
@@ -341,6 +576,15 @@ impl RootFsVfs {
         // Cross from the backends' sandbox-relative path domain into the
         // guest-absolute one exactly once — see `anchor_metadata_at`.
         result.anchor_metadata_at(path);
+        if want_trunc && !matches!(result, OpenDispatchResult::NotFoundCreate) {
+            let inode = match &result {
+                OpenDispatchResult::HostFile { host_fd, .. } => {
+                    Self::host_fd_inode_identity(*host_fd)
+                }
+                _ => self.path_inode_identity(path),
+            };
+            self.dentry_cache.inode_changed(path, inode);
+        }
         Ok(result)
     }
 
@@ -741,6 +985,8 @@ impl RootFsVfs {
                 if rootfs_has_src {
                     self.overlay.mark_deleted(from).map_err(|_| LINUX_EINVAL)?;
                 }
+                let inode = self.path_inode_identity(to);
+                self.dentry_cache.entry_moved(from, to, inode);
                 return Ok(());
             }
             Ok(false) => {}
@@ -775,6 +1021,8 @@ impl RootFsVfs {
         if rootfs_has_src {
             self.overlay.mark_deleted(from).map_err(|_| LINUX_EINVAL)?;
         }
+        let inode = self.path_inode_identity(to);
+        self.dentry_cache.entry_moved(from, to, inode);
         Ok(())
     }
 
@@ -826,7 +1074,13 @@ impl RootFsVfs {
         materialise(a)?;
         materialise(b)?;
         match self.overlay.exchange_overlay_entries(a, b) {
-            Ok(true) => Ok(()),
+            Ok(true) => {
+                let inode_a = self.path_inode_identity(a);
+                let inode_b = self.path_inode_identity(b);
+                self.dentry_cache.entry_moved(a, b, inode_b);
+                self.dentry_cache.entry_moved(b, a, inode_a);
+                Ok(())
+            }
             // Backend couldn't own both sides even after materialise (Ok(false)),
             // or has no swap primitive (Unsupported), or the swap I/O failed:
             // surface a coherent errno rather than corrupt the namespace.
@@ -1179,7 +1433,9 @@ impl Vfs for RootFsVfs {
         }
         self.overlay
             .make_dir(path)
-            .map_err(|_| crate::linux_abi::LINUX_EINVAL)
+            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+        self.dentry_cache.entry_created(path, None);
+        Ok(())
     }
 
     fn unlink(&self, path: &str) -> Result<(), VfsError> {
@@ -1204,6 +1460,7 @@ impl Vfs for RootFsVfs {
         if matches!(kind, RootFsEntryKind::Directory) {
             return Err(LINUX_EISDIR);
         }
+        let inode = self.path_inode_identity(path);
         if in_overlay {
             self.overlay.remove_entry(path);
             // Tombstone only if the rootfs also has this path, so a
@@ -1223,6 +1480,7 @@ impl Vfs for RootFsVfs {
                 .mark_deleted(path)
                 .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         }
+        self.dentry_cache.entry_removed(path, inode);
         Ok(())
     }
 
@@ -1254,6 +1512,7 @@ impl Vfs for RootFsVfs {
         {
             return Err(LINUX_ENOTEMPTY);
         }
+        let inode = self.path_inode_identity(path);
         if in_overlay {
             self.overlay.remove_entry(path);
             let rootfs_has_it = self
@@ -1271,6 +1530,7 @@ impl Vfs for RootFsVfs {
                 .mark_deleted(path)
                 .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         }
+        self.dentry_cache.entry_removed(path, inode);
         Ok(())
     }
 
@@ -1278,10 +1538,66 @@ impl Vfs for RootFsVfs {
         self.rename_with_flags(from, to, false)
     }
 
+    fn symlink(&self, target: &str, link: &str) -> Result<(), VfsError> {
+        self.symlink(target, link).map_err(|e| match e {
+            LINUX_EROFS => LINUX_EROFS,
+            _ => LINUX_EINVAL,
+        })
+    }
+
+    fn link(&self, from: &str, to: &str) -> Result<(), VfsError> {
+        self.link(from, to).map_err(|e| match e {
+            LINUX_EROFS => LINUX_EROFS,
+            _ => LINUX_EINVAL,
+        })
+    }
+
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), VfsError> {
+        self.set_mode(path, mode).map_err(|e| match e {
+            BackendError::Unsupported => LINUX_EROFS,
+            _ => LINUX_EINVAL,
+        })
+    }
+
+    fn create_socket(&self, path: &str, mode: u32) -> Result<(), VfsError> {
+        self.create_socket(path, mode).map_err(|e| match e {
+            BackendError::Unsupported => LINUX_EROFS,
+            _ => LINUX_EINVAL,
+        })
+    }
+
+    fn chown(
+        &self,
+        path: &str,
+        uid: Option<carrick_abi::NsUid>,
+        gid: Option<carrick_abi::NsGid>,
+        _nofollow: bool,
+    ) -> Result<(), VfsError> {
+        self.set_owner(path, uid, gid).map_err(|e| match e {
+            BackendError::Unsupported => LINUX_EROFS,
+            _ => LINUX_EINVAL,
+        })
+    }
+
+    fn set_times(
+        &self,
+        path: &str,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+        nofollow: bool,
+    ) -> Result<(), VfsError> {
+        self.set_times(path, atime, mtime, nofollow)
+            .map_err(|e| match e {
+                BackendError::Unsupported => LINUX_EROFS,
+                _ => LINUX_EINVAL,
+            })
+    }
+
     fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
         if len > MAX_IN_MEMORY_FILE_SIZE {
             return Err(LINUX_EFBIG);
         }
+        let inode = self.path_inode_identity(path);
         // Materialise the file into the overlay (if it's only in
         // rootfs), then truncate.
         let mut contents = match self.overlay.lookup(path) {
@@ -1300,7 +1616,9 @@ impl Vfs for RootFsVfs {
         contents.resize(len, 0);
         self.overlay
             .set_file_contents(path, contents)
-            .map_err(|_| LINUX_EACCES)
+            .map_err(|_| LINUX_EACCES)?;
+        self.dentry_cache.inode_changed(path, inode);
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -2258,5 +2576,79 @@ mod tests {
         // Confirm the overlay was also truncated.
         let md = v.lookup("/etc/hosts").unwrap();
         assert_eq!(md.size, 0);
+    }
+
+    #[test]
+    fn test_rootfs_vfs_create_node_kinds_after_negative_lookup() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut vfs = RootFsVfs::new();
+        vfs.set_overlay(Box::new(HostFsBackend::from_path(scratch.path()).unwrap()));
+
+        // 1. Regular file
+        assert!(vfs.dentry_stat("/file", false).is_err());
+        vfs.create_file("/file").unwrap();
+        vfs.set_mode("/file", 0o644).unwrap();
+        let st_file = vfs
+            .dentry_stat("/file", false)
+            .expect("file must be present immediately after creation");
+        assert_eq!(st_file.kind, RootFsEntryKind::File);
+        assert_ne!(st_file.ino, 0);
+        assert_eq!(st_file.mode & 0o777, 0o644);
+
+        // 2. Directory
+        assert!(vfs.dentry_stat("/dir", false).is_err());
+        vfs.mkdir("/dir", 0o755).unwrap();
+        let st_dir = vfs
+            .dentry_stat("/dir", false)
+            .expect("dir must be present immediately after creation");
+        assert_eq!(st_dir.kind, RootFsEntryKind::Directory);
+        assert_ne!(st_dir.ino, 0);
+        assert_eq!(st_dir.mode & 0o777, 0o755);
+
+        // 3. Symlink
+        assert!(vfs.dentry_stat("/link", false).is_err());
+        vfs.symlink("/file", "/link").unwrap();
+        let st_link = vfs
+            .dentry_stat("/link", false)
+            .expect("symlink must be present immediately after creation");
+        assert_eq!(st_link.kind, RootFsEntryKind::Symlink);
+        assert_ne!(st_link.ino, 0);
+        assert_eq!(vfs.dentry_readlink("/link").unwrap(), "/file");
+
+        // 4. FIFO
+        assert!(vfs.dentry_stat("/fifo", false).is_err());
+        vfs.create_fifo("/fifo", 0o620).unwrap();
+        let st_fifo = vfs
+            .dentry_stat("/fifo", false)
+            .expect("fifo must be present immediately after creation");
+        assert_eq!(st_fifo.kind, RootFsEntryKind::Fifo);
+        assert_ne!(st_fifo.ino, 0);
+        assert_eq!(st_fifo.mode & 0o777, 0o620);
+
+        // 5. Socket
+        assert!(vfs.dentry_stat("/sock", false).is_err());
+        vfs.create_socket("/sock", 0o660).unwrap();
+        let st_sock = vfs
+            .dentry_stat("/sock", false)
+            .expect("socket must be present immediately after creation");
+        assert_eq!(st_sock.kind, RootFsEntryKind::Socket);
+        assert_ne!(st_sock.ino, 0);
+        assert_eq!(st_sock.mode & 0o777, 0o660);
+
+        // 6. Hard link
+        assert!(vfs.dentry_stat("/hardlink", false).is_err());
+        vfs.link("/file", "/hardlink").unwrap();
+        let st_hl = vfs
+            .dentry_stat("/hardlink", false)
+            .expect("hardlink must be present");
+        assert_eq!(st_hl.ino, st_file.ino);
+
+        // 7. Unlink
+        vfs.unlink("/hardlink").unwrap();
+        assert!(vfs.dentry_stat("/hardlink", false).is_err());
+
+        // 8. Rmdir
+        vfs.rmdir("/dir").unwrap();
+        assert!(vfs.dentry_stat("/dir", false).is_err());
     }
 }

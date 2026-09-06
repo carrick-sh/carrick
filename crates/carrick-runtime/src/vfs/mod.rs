@@ -95,7 +95,7 @@ pub mod rootfs;
 pub mod sys;
 
 pub use bind::BindVfs;
-pub use dentry::DentryCache;
+pub use dentry::{DentryCache, InodeIdentity};
 pub use dev::DevVfs;
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use etc_services::EtcServicesVfs;

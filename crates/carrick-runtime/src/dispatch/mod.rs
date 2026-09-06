@@ -7172,8 +7172,7 @@ impl SyscallDispatcher {
     /// dispatcher before the layer cache is acquired.
     pub fn set_rootfs_layer(&mut self, rootfs: RootFs) {
         let vfs = self.fs.rootfs_vfs_mut();
-        let is_shared = vfs.dentry_cache.is_shared();
-        vfs.dentry_cache = std::sync::Arc::new(crate::vfs::DentryCache::new(is_shared));
+        vfs.reset_dentry_cache();
         vfs.rootfs = Some(rootfs);
         self.exec_host_fs_fallback = false;
     }
@@ -7188,8 +7187,7 @@ impl SyscallDispatcher {
     /// whose overlay starts empty and relies on the rootfs for reads.
     pub fn drop_rootfs_layer(&mut self) {
         let vfs = self.fs.rootfs_vfs_mut();
-        let is_shared = vfs.dentry_cache.is_shared();
-        vfs.dentry_cache = std::sync::Arc::new(crate::vfs::DentryCache::new(is_shared));
+        vfs.reset_dentry_cache();
         vfs.rootfs = None;
     }
 

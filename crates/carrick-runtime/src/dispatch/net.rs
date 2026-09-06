@@ -7813,11 +7813,9 @@ impl SyscallDispatcher {
                 let mode = 0o777 & !umask;
                 if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
                     let _ = m.vfs.create_socket(&m.full_path, mode);
-                    this.fs.rootfs_vfs.dentry_cache.notify_create(&m.full_path);
                 } else if this
                     .fs
                     .rootfs_vfs
-                    .overlay
                     .create_socket(&resolved, mode)
                     .is_ok()
                 {
@@ -7828,7 +7826,6 @@ impl SyscallDispatcher {
                     // `pipe_set_chmod` saw EPERM and skipped, where Linux (whose
                     // socket inode is owned by the uid that bound it) runs.
                     this.stamp_new_node_owner(&resolved, mode);
-                this.fs.rootfs_vfs.dentry_cache.notify_create(&resolved);
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
