@@ -456,6 +456,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _len: usize,
         _fd: std::os::fd::BorrowedFd<'_>,
         _offset: u64,
+        _source: carrick_guest_mem::PrivateFileSource,
         _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
     ) -> Result<bool, TrapError> {
         Ok(false)

@@ -4486,6 +4486,7 @@ impl GuestMemory for NativeMappedMemory {
         len: usize,
         host_fd: BorrowedFd<'_>,
         offset: u64,
+        _source: carrick_guest_mem::PrivateFileSource,
     ) -> Result<bool, MemoryError> {
         if len == 0 || self.uses_linux4k_subpages() {
             return Ok(false);

@@ -1277,7 +1277,15 @@ impl DentryCache {
         write: bool,
         backend: &dyn FsBackend,
         rootfs: Option<&RootFs>,
-    ) -> Result<(std::os::fd::OwnedFd, RealStat, String), LinuxErrno> {
+    ) -> Result<
+        (
+            std::os::fd::OwnedFd,
+            RealStat,
+            String,
+            carrick_guest_mem::PrivateFileSource,
+        ),
+        LinuxErrno,
+    > {
         let resolved = self.lookup_path(path, true, backend, rootfs)?;
         if resolved.dentry.kind == RootFsEntryKind::Directory {
             return Err(LINUX_EISDIR);
@@ -1312,6 +1320,11 @@ impl DentryCache {
             fd,
             resolved.dentry.to_real_stat(&record),
             resolved.canonical_path,
+            if resolved.dentry.is_lower {
+                carrick_guest_mem::PrivateFileSource::ImmutableLower
+            } else {
+                carrick_guest_mem::PrivateFileSource::Mutable
+            },
         ))
     }
 
@@ -1720,11 +1733,12 @@ mod tests {
         assert_eq!(target, "python3.12");
 
         // 3. Fast open read-only in lower
-        let (fd, st_open, path) = cache
+        let (fd, st_open, path, source) = cache
             .fast_open("/usr/bin/python3", false, &backend, Some(&rootfs))
             .expect("fast open lower readonly");
         assert_eq!(path, "/usr/bin/python3.12");
         assert_eq!(st_open.size, 6);
+        assert_eq!(source, carrick_guest_mem::PrivateFileSource::ImmutableLower);
         drop(fd);
 
         // 4. Fast open writable on lower must return LINUX_EXDEV (to trigger copy-up)
@@ -1748,11 +1762,15 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink("python3.12", lower_tmp.path().join("usr/local/bin/python3"))
             .unwrap();
-        let (fd_deep, st_deep, path_deep) = cache
+        let (fd_deep, st_deep, path_deep, source_deep) = cache
             .fast_open("/usr/local/bin/python3", false, &backend, Some(&rootfs))
             .expect("fast open lower /usr/local/bin/python3");
         assert_eq!(path_deep, "/usr/local/bin/python3.12");
         assert_eq!(st_deep.size, 9);
+        assert_eq!(
+            source_deep,
+            carrick_guest_mem::PrivateFileSource::ImmutableLower
+        );
         drop(fd_deep);
     }
 

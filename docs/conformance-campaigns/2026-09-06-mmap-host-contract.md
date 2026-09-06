@@ -50,3 +50,37 @@ lowering: actual error events confirm the unresolved fallback. Logs are in the
 mmap worktree's `target/conformance/eco-mmap-resume/director-instrumentation-*`
 and `director-diagnostic-receipt.log`. This is an instrumentation checkpoint,
 not a runtime-fix or branch-landing receipt.
+
+## Immutable lower view checkpoint
+
+The VFS now carries immutable-lower provenance with host descriptors from its
+cached dentry and immutable absolute-open paths. The memory trait passes that
+provenance to HVF; immutable inodes use a host private view, while mutable
+inodes retain the shared page-cache view. No writable descriptor is obtained
+for the immutable cache. Guest page permissions and Carrick's first-write COW
+remain in force.
+
+Signed candidate SHA-256:
+`47c2ef6cc8c92270f10c3179c950642e7bc66f0452608feabf994b68c7acb647`.
+Python `print(1)` passed and all eight loader lowerings changed from error to
+installed. The exact 100-mmap fixture recorded zero internal-copy bytes;
+`CARRICK_MMAP_FILE_BACKED=0` on the same binary/fixture recorded 661,504,000
+bytes and 161,500 copy chunks. Both selected exactly 100 mmap returns, with no
+errors and scoped cleanup reporting zero remaining processes. The trace needs
+the service-begin probe enabled before its argument companion will fire.
+
+Receipts in the mmap worktree's `target/conformance/eco-mmap-resume/`:
+`immutable-launch.log`, `lazy.{json,out,err}`, `eager.{json,out,err}`,
+`mmap-copy-fixture.py`, and `run-mmap-check.py`. The successful run IDs are
+`eco-mmap-immutable-lazy-1788712014738617000` and
+`eco-mmap-immutable-eager-1788712049506751000`. Compile check, signed build,
+and six serial runtime dentry tests passed.
+
+This checkpoint is still NOT ready to land. Untraced five-trial medians for
+mmap plus close were 551.981 us (whole libpython file), 610.702 us (6 MiB mutable
+file), and 410.885 us (1 MiB anonymous). These fail the requested 10/6 us gate.
+The resolved carrier samples identify repeated host arena resolution during
+page-table synchronization and whole alias-registry cloning/diffing during
+unmap as further amplification. Raw/resolved samples and LLDB image slides are
+in `symbol-stacks2.log`, `resolved-stacks.json`, and `profile-images2.lldb.log`.
+The full serial runtime suite and whole probe-family acceptance remain pending.

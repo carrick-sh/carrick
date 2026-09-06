@@ -1409,6 +1409,7 @@ impl GuestMemory for FileBackedLoweringMemory {
         len: usize,
         _host_fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
+        _source: carrick_guest_mem::PrivateFileSource,
     ) -> Result<bool, MemoryError> {
         self.offers.borrow_mut().push((address, len, offset));
         Ok(self.accept)

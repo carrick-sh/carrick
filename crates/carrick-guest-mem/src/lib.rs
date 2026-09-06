@@ -107,6 +107,17 @@ pub struct X8664SyscallFrame {
     pub r9: u64,
 }
 
+/// Coherence authority carried with a private file mapping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrivateFileSource {
+    /// The inode may change; clean pages must observe its live page cache.
+    #[default]
+    Mutable,
+    /// The filesystem owns a published immutable lower inode. A host private
+    /// view is safe because that inode cannot change; writes copy up elsewhere.
+    ImmutableLower,
+}
+
 // ─── Address-domain newtypes (the mapping/translation seam) ─────────────────
 //
 // The three address domains a mapping call juggles — guest VIRTUAL, guest
@@ -841,6 +852,7 @@ pub trait GuestMemory {
         _len: usize,
         _host_fd: std::os::fd::BorrowedFd<'_>,
         _offset: u64,
+        _source: PrivateFileSource,
     ) -> Result<bool, MemoryError> {
         Ok(false)
     }

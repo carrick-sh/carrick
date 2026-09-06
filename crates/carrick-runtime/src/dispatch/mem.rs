@@ -5444,6 +5444,10 @@ impl SyscallDispatcher {
                         LINUX_EBADF,
                     ));
                 };
+                let source = match open.as_deref() {
+                    Some(OpenDescription::HostFile { host_fd, .. }) => host_fd.private_file_source(),
+                    _ => carrick_guest_mem::PrivateFileSource::Mutable,
+                };
                 use carrick_observability::probes::MmapLoweringOutcome;
                 let lowering_outcome;
                 if let Some(file_len) = host_fd_file_len(host_fd) {
@@ -5453,7 +5457,7 @@ impl SyscallDispatcher {
                     // owning fd (a `HostFdRef`, or the memfd's `OwnedFd`) alive
                     // across the borrow.
                     let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(host_fd) };
-                    match memory.map_private_file_backed(address, length_usize, borrowed, offset) {
+                    match memory.map_private_file_backed(address, length_usize, borrowed, offset, source) {
                         Ok(true) => {
                             lowered_file_backed = true;
                             lowering_outcome = MmapLoweringOutcome::Installed;
