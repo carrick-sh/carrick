@@ -433,3 +433,30 @@ after release. Full signed HVF suite: 446 passed / 3 ignored,
 `eco-mmap-resume/shared-publish-final.log`, run
 `eco-mmap-shared-publish-final-1788720196445898000`; scoped cleanup zero.
 No main landing or new latency acceptance is claimed.
+
+
+### In-progress integration launch regression
+
+A diagnostic signed build of 7f3d64a7a plus tracked diff SHA256
+446a11d1d43d8bf2fd32a4506a3bfd8aa4db46879ff522a49a15b8a42b7936ae
+fails Ubuntu shell true with exit 139. Full artifact metadata is in
+`eco-mmap-resume/shared-publish-integration-smoke.json`; source patch retained
+alongside it. This is a failed launch receipt, not a main acceptance artifact.
+
+The shipped stage1-faults instrument records mmap(8192, RW, PRIVATE|ANON)
+returning 0x6000000000, then a write translation fault at 0x6000000008,
+ESR 0x92000045, PC 0x8c00006490. The alias-map transaction is entered before
+SIGSEGV delivery. Trace child status is not propagated by this instrument's
+consumer rc=0; the direct launch exit139 and fault events are authoritative.
+Raw `shared-publish-fault.*`, run eco-shared-publish-fault-1788720495705699000.
+Scoped cleanup zero. The stopped-process LLDB attempt did not complete attach;
+no core claim is made. Exact debugger children were terminated after the
+verified target became a zombie; scoped runner cleanup zero.
+
+Added a failure-only resident-fault-protection-error USDT event to preserve
+the backend error previously discarded by the first-touch resolver. No normal
+path logging or unconditional formatting. Full serial runtime suite after
+instrumentation: 2472 passed / 2 ignored (`resident-error-runtime.log`, run
+eco-resident-error-runtime-20260906a). Live qualification and attribution follow
+on the rebuilt artifact. The shared publisher also needs exact extension-arena
+rollback before allocator reuse and a stronger exact-MM permit for foreign entry.
