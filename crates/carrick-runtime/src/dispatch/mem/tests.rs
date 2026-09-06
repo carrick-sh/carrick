@@ -179,6 +179,7 @@ fn readonly_host_fd_cannot_carry_a_writable_shared_file_mapping() {
 }
 
 struct CountingMmapMemory {
+    defer_anon: bool,
     base: u64,
     bytes: Vec<u8>,
     write_calls: Cell<usize>,
@@ -251,6 +252,7 @@ fn hvpatch_sparse_semantic_arena_stays_identity_while_low_fixed_hole_aliases() {
 impl CountingMmapMemory {
     fn new(base: u64, len: usize) -> Self {
         Self {
+            defer_anon: false,
             base,
             bytes: vec![0u8; len],
             write_calls: Cell::new(0),
@@ -278,6 +280,10 @@ impl CountingMmapMemory {
 }
 
 impl GuestMemory for CountingMmapMemory {
+    fn supports_lazy_anonymous_mmap(&self) -> bool {
+        self.defer_anon
+    }
+
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         let offset = self.range_offset(address, length)?;
         Ok(self.bytes[offset..offset + length].to_vec())
@@ -815,6 +821,60 @@ where
             thread.join().expect("join blocked operation thread");
         })
         .expect("claim pending host alias install");
+}
+
+#[test]
+fn lazy_anonymous_mmap_arms_first_touch_without_accessible_backing() {
+    for populate in [false, true] {
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
+        let reporter = CompatReporter::default();
+        let length = 1024 * 1024;
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, length);
+        memory.defer_anon = true;
+        let prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+        let flags = LINUX_MAP_PRIVATE
+            | LINUX_MAP_ANONYMOUS
+            | if populate {
+                LinuxMmapFlags::POPULATE.bits()
+            } else {
+                0
+            };
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                222,
+                SyscallArgs([0, length as u64, prot, flags, u64::MAX, 0]),
+            ),
+        );
+        let DispatchOutcome::Returned { value } = outcome else {
+            panic!("mmap failed: {outcome:?}")
+        };
+        let address = value as u64;
+        if populate {
+            assert!(
+                memory
+                    .protect_log
+                    .borrow()
+                    .iter()
+                    .any(|call| call.2 == prot)
+            );
+        } else {
+            assert_eq!(
+                *memory.protect_log.borrow(),
+                vec![(address, length, 0)],
+                "untouched mmap must never transiently publish accessible backing"
+            );
+            assert_eq!(
+                dispatcher.with_resident_fault_plan_for_test(address, |plan| plan.prot()),
+                Some(prot)
+            );
+        }
+    }
 }
 
 #[test]

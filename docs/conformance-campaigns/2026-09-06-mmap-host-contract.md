@@ -235,3 +235,31 @@ must not be weakened. These are next investigations, not implemented changes.
 Full serial runtime, full probe family, inventory reconciliation/lint and
 mmap main landing remain pending, followed by the quiet-host fork and fresh
 2,127-row cached-only ecosystem ledger. Cap-std remains accepted on main.
+
+## Anonymous dispatcher first-touch preparation
+
+The red test `lazy_anonymous_mmap_arms_first_touch_without_accessible_backing`
+observed RW publication followed by PROT_NONE for an untouched private mapping
+(`lazy-anon-red.log`). The dispatcher now supports publishing PROT_NONE once
+and recording the existing first-touch plan when a backend explicitly supports
+unbacked anonymous mmap. MAP_POPULATE, MAP_LOCKED and fixed replacement retain
+the eager path. The regression passes (`lazy-anon-green.log`); full serial
+runtime lib suite: 2,468 passed, 2 ignored (`lazy-anon-runtime.log`).
+
+**No production backend enables this capability yet; this is not a latency
+improvement or a landing receipt.** The existing parked backend demand-zero
+handler cannot be accepted unchanged: its 16 KiB compound publication can
+replace neighboring live pages, lacks exact executable-permission handling,
+and commits its undo journal before all fallible publication steps finish.
+Anonymous faults should use the canonical resident-fault transaction instead.
+
+Kernel copyin also needs an explicit proof for unmaterialized anonymous bytes.
+The current foreign-reader fallback fills zeros for any readable VMA whose
+translation fails, and its owner-generation receipt can contain only page-table
+owners. Readability is not anonymous-zero provenance. Track exact deferred-zero
+ranges by retained MM/VMA identity and authenticate every copied or zero-filled
+span; never infer anonymous zeros from a failed translation. Preserve logical
+residency separately from pending physical allocation through mprotect, fork,
+unmap/replacement and exec. Do not relax the existing rejection of nonempty
+foreign reads without owner generations. These are unresolved prerequisites to
+production opt-in, not completed features.

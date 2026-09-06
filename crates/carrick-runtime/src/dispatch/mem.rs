@@ -5033,9 +5033,19 @@ impl SyscallDispatcher {
                     !prot_flags.contains(LinuxProtFlags::WRITE),
                     map_sharing.guest_mapping_sharing(),
                 );
+                // A backend opting in must service kernel copyin as well as
+                // guest faults from unmaterialized anonymous ranges. Keep
+                // fixed replacement eager until its unmap transaction proves
+                // that the previous backing has actually been retired.
+                let defer_anonymous = memory.supports_lazy_anonymous_mmap()
+                    && map_flags.contains(LinuxMmapFlags::PRIVATE)
+                    && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
+                    && !fixed_anonymous
+                    && in_arena;
+                let initial_prot = if defer_anonymous { 0 } else { prot };
                 // Unconditional (see the PROT_NONE arm above): reserve across
                 // the whole arena for demand-paged backends; fatal only in-arena.
-                if let Err(error) = memory.protect_range(address, length_usize, prot)
+                if let Err(error) = memory.protect_range(address, length_usize, initial_prot)
                     && (in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
@@ -5066,7 +5076,8 @@ impl SyscallDispatcher {
                 // touch -- paid deliberately, and it is the same mechanism the
                 // shared-anonymous path already uses. `CARRICK_MINCORE_EXACT=0`
                 // turns it off for bisection.
-                if map_flags.contains(LinuxMmapFlags::PRIVATE)
+                if defer_anonymous
+                    || (map_flags.contains(LinuxMmapFlags::PRIVATE)
                     && !map_flags.contains(LinuxMmapFlags::POPULATE)
                     && !prot_flags.is_empty()
                     && in_arena
@@ -5074,7 +5085,7 @@ impl SyscallDispatcher {
                     && memory
                         .resident_pages(GuestVa(address), 1, this.linux_page_size())
                         .is_none()
-                    && memory.protect_range(address, length_usize, 0).is_ok()
+                    && memory.protect_range(address, length_usize, 0).is_ok())
                 {
                     this.track_resident_fault_range(address, length, prot_flags);
                     // The temporary inaccessible backing is NOT the guest's VMA
