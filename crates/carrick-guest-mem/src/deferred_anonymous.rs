@@ -3,6 +3,8 @@
 use crate::GuestVa;
 use parking_lot::{Mutex, MutexGuard};
 use std::ops::Range;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
 
 const PAGE: u64 = 4096;
 
@@ -10,12 +12,24 @@ const PAGE: u64 = 4096;
 pub enum DeferredAnonymousError {
     #[error("deferred anonymous range is empty, unaligned, or overflows")]
     InvalidRange,
+    #[error("could not retain private file view fd: errno {0}")]
+    DuplicateFile(i32),
+    #[error("could not read deferred private file view: errno {0}")]
+    ReadFile(i32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredAnonymousSnapshot {
     pub pristine: Vec<Range<GuestVa>>,
     pub zero_read_resident: Vec<Range<GuestVa>>,
+    pub private_file: Vec<DeferredPrivateFileSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredPrivateFileSnapshot {
+    pub range: Range<GuestVa>,
+    pub file_offset: u64,
+    pub source: crate::PrivateFileSource,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -24,11 +38,25 @@ struct State {
     resident: Vec<Range<u64>>,
 }
 
+#[derive(Debug, Clone)]
+struct DeferredPrivateFileView {
+    range: Range<u64>,
+    file: Arc<OwnedFd>,
+    file_offset: u64,
+    source: crate::PrivateFileSource,
+}
+
+#[derive(Debug, Default, Clone)]
+struct FileState {
+    views: Vec<DeferredPrivateFileView>,
+}
+
 /// Share only within one MM; use `fork_private` for a copied MM. Never hold
 /// this lock while acquiring quiesce or calling back into runtime authorities.
 #[derive(Debug, Default)]
 pub struct DeferredAnonymousState {
     state: Mutex<State>,
+    files: Mutex<FileState>,
 }
 
 fn extent(start: GuestVa, len: usize) -> Result<Range<u64>, DeferredAnonymousError> {
@@ -70,6 +98,57 @@ fn insert(ranges: &mut Vec<Range<u64>>, mut added: Range<u64>) {
     ranges.splice(first..last, [added]);
 }
 
+fn copy_file_view(
+    view: &DeferredPrivateFileView,
+    start: GuestVa,
+    dst: &mut [u8],
+) -> Result<(), DeferredAnonymousError> {
+    let len = u64::try_from(dst.len()).map_err(|_| DeferredAnonymousError::InvalidRange)?;
+    let end = start
+        .raw()
+        .checked_add(len)
+        .ok_or(DeferredAnonymousError::InvalidRange)?;
+    if start.raw() < view.range.start || end > view.range.end {
+        return Err(DeferredAnonymousError::InvalidRange);
+    }
+    let file_offset = view
+        .file_offset
+        .checked_add(start.raw() - view.range.start)
+        .ok_or(DeferredAnonymousError::InvalidRange)?;
+    dst.fill(0);
+    let mut copied = 0usize;
+    while copied < dst.len() {
+        let copied_offset =
+            u64::try_from(copied).map_err(|_| DeferredAnonymousError::InvalidRange)?;
+        let offset = file_offset
+            .checked_add(copied_offset)
+            .and_then(|value| libc::off_t::try_from(value).ok())
+            .ok_or(DeferredAnonymousError::InvalidRange)?;
+        let read = unsafe {
+            libc::pread(
+                view.file.as_raw_fd(),
+                dst[copied..].as_mut_ptr().cast(),
+                dst.len() - copied,
+                offset,
+            )
+        };
+        if read < 0 {
+            return Err(DeferredAnonymousError::ReadFile(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            ));
+        }
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(usize::try_from(read).map_err(|_| DeferredAnonymousError::InvalidRange)?)
+            .ok_or(DeferredAnonymousError::InvalidRange)?;
+    }
+    Ok(())
+}
+
 impl DeferredAnonymousState {
     pub fn new() -> Self {
         Self::default()
@@ -87,7 +166,113 @@ impl DeferredAnonymousState {
         let mut state = self.state.lock();
         remove(&mut state.pristine, &range);
         remove(&mut state.resident, &range);
+        drop(state);
+        let mut files = self.files.lock();
+        let mut retained = Vec::with_capacity(files.views.len() + 1);
+        for view in files.views.drain(..) {
+            if view.range.end <= range.start || view.range.start >= range.end {
+                retained.push(view);
+                continue;
+            }
+            if view.range.start < range.start {
+                let mut left = view.clone();
+                left.range.end = range.start;
+                retained.push(left);
+            }
+            if view.range.end > range.end {
+                let mut right = view;
+                right.file_offset = right
+                    .file_offset
+                    .saturating_add(range.end.saturating_sub(right.range.start));
+                right.range.start = range.end;
+                retained.push(right);
+            }
+        }
+        retained.sort_by_key(|view| view.range.start);
+        files.views = retained;
         Ok(())
+    }
+
+    /// Retain an exact private file-view recipe without publishing backing.
+    /// The duplicated descriptor is mapping-owned and therefore survives a
+    /// guest close; copied MMs share that immutable open-file reference.
+    pub fn reserve_private_file(
+        &self,
+        start: GuestVa,
+        len: usize,
+        fd: BorrowedFd<'_>,
+        file_offset: u64,
+        source: crate::PrivateFileSource,
+    ) -> Result<(), DeferredAnonymousError> {
+        let range = extent(start, len)?;
+        let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicated < 0 {
+            return Err(DeferredAnonymousError::DuplicateFile(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            ));
+        }
+        let file = Arc::new(unsafe { OwnedFd::from_raw_fd(duplicated) });
+        let mut files = self.files.lock();
+        if files
+            .views
+            .iter()
+            .any(|view| view.range.start < range.end && range.start < view.range.end)
+        {
+            return Err(DeferredAnonymousError::InvalidRange);
+        }
+        files.views.push(DeferredPrivateFileView {
+            range,
+            file,
+            file_offset,
+            source,
+        });
+        files.views.sort_by_key(|view| view.range.start);
+        Ok(())
+    }
+
+    /// Copy a page-local syscall read directly from the retained file recipe.
+    /// This preserves zero-copy mmap while giving kernel copyin the same bytes
+    /// a guest first touch would materialize. Short reads zero-fill the page
+    /// tail, matching a private mapping's partial-EOF page.
+    pub fn copy_pristine_file(
+        &self,
+        start: GuestVa,
+        dst: &mut [u8],
+    ) -> Result<bool, DeferredAnonymousError> {
+        if dst.is_empty() {
+            return Ok(true);
+        }
+        let end = start
+            .raw()
+            .checked_add(dst.len() as u64)
+            .ok_or(DeferredAnonymousError::InvalidRange)?;
+        let files = self.files.lock();
+        let Some(view) = files
+            .views
+            .iter()
+            .find(|view| view.range.start <= start.raw() && end <= view.range.end)
+        else {
+            return Ok(false);
+        };
+        copy_file_view(view, start, dst)?;
+        Ok(true)
+    }
+
+    /// Lock the exact file recipe covering `address` through backing
+    /// publication. Callers already own MM mutation exclusion.
+    pub fn begin_private_file_materialization(
+        &self,
+        address: GuestVa,
+    ) -> Option<DeferredPrivateFileTransition<'_>> {
+        let files = self.files.lock();
+        let index = files
+            .views
+            .iter()
+            .position(|view| view.range.start <= address.raw() && address.raw() < view.range.end)?;
+        let view = files.views[index].clone();
+        Some(DeferredPrivateFileTransition { files, index, view })
     }
     /// Clear logical read residency without changing pristine provenance.
     pub fn clear_zero_read_residency(
@@ -149,6 +334,21 @@ impl DeferredAnonymousState {
             .get(index)
             .is_some_and(|r| r.start <= start.raw() && end <= r.end)
     }
+    /// Check whether one retained private-file recipe covers the range.
+    /// Callers separately authenticate the exact MM and access permission.
+    pub fn covers_private_file(&self, start: GuestVa, len: usize) -> bool {
+        let Ok(len) = u64::try_from(len) else {
+            return false;
+        };
+        let Some(end) = start.raw().checked_add(len).filter(|_| len != 0) else {
+            return false;
+        };
+        self.files
+            .lock()
+            .views
+            .iter()
+            .any(|view| view.range.start <= start.raw() && end <= view.range.end)
+    }
     pub fn snapshot(&self) -> DeferredAnonymousSnapshot {
         let state = self.state.lock();
         DeferredAnonymousSnapshot {
@@ -162,11 +362,23 @@ impl DeferredAnonymousState {
                 .iter()
                 .map(|r| GuestVa(r.start)..GuestVa(r.end))
                 .collect(),
+            private_file: self
+                .files
+                .lock()
+                .views
+                .iter()
+                .map(|view| DeferredPrivateFileSnapshot {
+                    range: GuestVa(view.range.start)..GuestVa(view.range.end),
+                    file_offset: view.file_offset,
+                    source: view.source,
+                })
+                .collect(),
         }
     }
     pub fn fork_private(&self) -> Self {
         Self {
             state: Mutex::new(self.state.lock().clone()),
+            files: Mutex::new(self.files.lock().clone()),
         }
     }
     /// Acquire only AFTER caller quiescence/exclusion. On failure, prove complete
@@ -180,6 +392,94 @@ impl DeferredAnonymousState {
             state: self.state.lock(),
             range: extent(start, len)?,
         })
+    }
+}
+
+#[must_use]
+pub struct DeferredPrivateFileTransition<'a> {
+    files: MutexGuard<'a, FileState>,
+    index: usize,
+    view: DeferredPrivateFileView,
+}
+
+impl DeferredPrivateFileTransition<'_> {
+    pub fn start(&self) -> GuestVa {
+        GuestVa(self.view.range.start)
+    }
+
+    pub fn len(&self) -> usize {
+        usize::try_from(self.view.range.end - self.view.range.start)
+            .unwrap_or_else(|_| std::process::abort())
+    }
+
+    pub fn file_offset(&self) -> u64 {
+        self.view.file_offset
+    }
+
+    pub fn source(&self) -> crate::PrivateFileSource {
+        self.view.source
+    }
+
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        self.view.file.as_fd()
+    }
+
+    /// Seed a private page from the retained live file view while this exact
+    /// recipe is locked against retirement or a competing publication.
+    pub fn copy_pristine(
+        &self,
+        start: GuestVa,
+        dst: &mut [u8],
+    ) -> Result<(), DeferredAnonymousError> {
+        copy_file_view(&self.view, start, dst)
+    }
+
+    /// Commit publication of only one subrange, retaining the untouched
+    /// pieces with their original file offsets.
+    pub fn commit_range(
+        mut self,
+        start: GuestVa,
+        len: usize,
+    ) -> Result<(), DeferredAnonymousError> {
+        let published = extent(start, len)?;
+        if published.start < self.view.range.start || published.end > self.view.range.end {
+            return Err(DeferredAnonymousError::InvalidRange);
+        }
+        if self.files.views.get(self.index).is_none_or(|current| {
+            current.range != self.view.range
+                || current.file_offset != self.view.file_offset
+                || !Arc::ptr_eq(&current.file, &self.view.file)
+        }) {
+            std::process::abort();
+        }
+        let mut retained = Vec::with_capacity(2);
+        if self.view.range.start < published.start {
+            let mut left = self.view.clone();
+            left.range.end = published.start;
+            retained.push(left);
+        }
+        if self.view.range.end > published.end {
+            let mut right = self.view;
+            right.file_offset = right
+                .file_offset
+                .checked_add(published.end - right.range.start)
+                .ok_or(DeferredAnonymousError::InvalidRange)?;
+            right.range.start = published.end;
+            retained.push(right);
+        }
+        self.files.views.splice(self.index..=self.index, retained);
+        Ok(())
+    }
+
+    pub fn commit(mut self) {
+        if self.files.views.get(self.index).is_none_or(|current| {
+            current.range != self.view.range
+                || current.file_offset != self.view.file_offset
+                || !Arc::ptr_eq(&current.file, &self.view.file)
+        }) {
+            std::process::abort();
+        }
+        self.files.views.remove(self.index);
     }
 }
 
@@ -198,6 +498,7 @@ impl DeferredAnonymousTransition<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     #[test]
     fn pristine_validation_is_nonmutating_and_rejects_holes_and_overflow() {
         let state = DeferredAnonymousState::new();
@@ -360,5 +661,107 @@ mod tests {
         rx.recv().unwrap();
         guard.commit();
         assert_eq!(reader.join().unwrap(), (false, [5; 4]));
+    }
+
+    #[test]
+    fn deferred_file_recipe_survives_close_forks_and_trims_offsets() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-deferred-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let bytes: Vec<u8> = (0..0x3000)
+            .map(|index| (index / 0x1000) as u8 + 1)
+            .collect();
+        file.write_all(&bytes).unwrap();
+
+        let state = DeferredAnonymousState::new();
+        state
+            .reserve_private_file(
+                GuestVa(0x1000),
+                0x3000,
+                file.as_fd(),
+                0,
+                crate::PrivateFileSource::ImmutableLower,
+            )
+            .unwrap();
+        let child = state.fork_private();
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+
+        let mut copied = [0; 8];
+        assert!(
+            state
+                .copy_pristine_file(GuestVa(0x2000), &mut copied)
+                .unwrap()
+        );
+        assert_eq!(copied, [2; 8], "the mapping-owned dup survives guest close");
+
+        state.retire(GuestVa(0x2000), 0x1000).unwrap();
+        assert_eq!(
+            state.snapshot().private_file,
+            vec![
+                DeferredPrivateFileSnapshot {
+                    range: GuestVa(0x1000)..GuestVa(0x2000),
+                    file_offset: 0,
+                    source: crate::PrivateFileSource::ImmutableLower,
+                },
+                DeferredPrivateFileSnapshot {
+                    range: GuestVa(0x3000)..GuestVa(0x4000),
+                    file_offset: 0x2000,
+                    source: crate::PrivateFileSource::ImmutableLower,
+                },
+            ]
+        );
+        assert_eq!(
+            child.snapshot().private_file,
+            vec![DeferredPrivateFileSnapshot {
+                range: GuestVa(0x1000)..GuestVa(0x4000),
+                file_offset: 0,
+                source: crate::PrivateFileSource::ImmutableLower,
+            }],
+            "fork-private metadata must not follow the parent's trim"
+        );
+        let mut page = [0; 0x1000];
+        child
+            .begin_private_file_materialization(GuestVa(0x2000))
+            .unwrap()
+            .copy_pristine(GuestVa(0x2000), &mut page)
+            .unwrap();
+        assert_eq!(page, [2; 0x1000]);
+        child
+            .begin_private_file_materialization(GuestVa(0x2000))
+            .unwrap()
+            .commit_range(GuestVa(0x2000), 0x1000)
+            .unwrap();
+        assert_eq!(
+            child.snapshot().private_file,
+            vec![
+                DeferredPrivateFileSnapshot {
+                    range: GuestVa(0x1000)..GuestVa(0x2000),
+                    file_offset: 0,
+                    source: crate::PrivateFileSource::ImmutableLower,
+                },
+                DeferredPrivateFileSnapshot {
+                    range: GuestVa(0x3000)..GuestVa(0x4000),
+                    file_offset: 0x2000,
+                    source: crate::PrivateFileSource::ImmutableLower,
+                },
+            ]
+        );
+        state
+            .begin_private_file_materialization(GuestVa(0x3000))
+            .unwrap()
+            .commit();
+        assert_eq!(state.snapshot().private_file.len(), 1);
     }
 }

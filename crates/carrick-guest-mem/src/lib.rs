@@ -67,7 +67,7 @@
 mod deferred_anonymous;
 pub use deferred_anonymous::{
     DeferredAnonymousError, DeferredAnonymousSnapshot, DeferredAnonymousState,
-    DeferredAnonymousTransition,
+    DeferredAnonymousTransition, DeferredPrivateFileSnapshot, DeferredPrivateFileTransition,
 };
 
 use serde::{Deserialize, Serialize};
@@ -769,6 +769,15 @@ pub trait GuestMemory {
         false
     }
 
+    /// Whether an accepted private mapping of an immutable file can retain only
+    /// its semantic file-view recipe until the first permitted access. Mmap
+    /// itself publishes an invalid stage-1 reservation; the backend's MM-owned
+    /// fault transaction later installs the private view. Backends must preserve
+    /// fork, partial-unmap and first-write COW semantics before opting in.
+    fn supports_lazy_private_file_mmap(&self) -> bool {
+        false
+    }
+
     /// Whether this backend can safely publish executable protection changes
     /// while sibling guest threads remain live. Backends default to the
     /// conservative answer; translation-backed execution can opt in when
@@ -847,28 +856,30 @@ pub trait GuestMemory {
         Ok(())
     }
 
-    /// Back `[address, address+len)` with a demand-paged view of `host_fd` at
-    /// `offset` for a guest `mmap(MAP_PRIVATE, fd)`, instead of eagerly
-    /// materializing it (full-length zeroed buffer + `pread` + copy — three
-    /// whole-length amplifications per guest call; Move-3 E1). The Linux
-    /// contract the backing must honour is the full one: a page the guest has
-    /// not written keeps tracking later `write(2)`s to the file
-    /// (`mmapprivatefiletrack`), and a written page detaches. On Darwin a host
-    /// `MAP_PRIVATE` file view is a map-time snapshot (see
-    /// `overlay_shared_file_view_tracks_later_file_writes`), so an
-    /// implementation that lowers to one does NOT honour that clause; the
-    /// HVPatch stage-2 backing instead overlays a `MAP_SHARED` read-only
-    /// page-cache view and privatizes written pages itself. Returns `Ok(true)`
-    /// when the backing was installed: the caller then publishes protection,
-    /// sharing and the beyond-EOF `BUS_ADRERR` tail exactly as it would after
-    /// an eager load. `Ok(false)` means this backend (or this range) cannot
-    /// take the lowering and the caller MUST fall back to the eager snapshot —
-    /// the default for every backend without an identity host mapping it owns
-    /// (VMM stage-2 backings must never be `MAP_FIXED`-replaced under a live
-    /// `hv_vm_map`). Failure is deliberately non-fatal: the snapshot path is
-    /// always a correct fallback, so an unexpected host `mmap` error degrades
-    /// to the old cost, never to a guest-visible error.
+    /// Back `[address,address+len)` with a file view of `host_fd` at `offset`,
+    /// avoiding the eager zero buffer, `pread`, and guest copy. Immutable lower
+    /// files may use a host-private snapshot. Mutable files need a live shared
+    /// host view plus backend-owned guest-page COW so clean pages observe later
+    /// file writes while guest stores remain private. `Ok(true)` means backing
+    /// is installed; the caller then publishes protection, sharing, and the
+    /// beyond-EOF `BUS_ADRERR` tail. Errors degrade to the eager fallback rather
+    /// than becoming guest-visible mmap errors.
     fn map_private_file_backed(
+        &mut self,
+        _address: u64,
+        _len: usize,
+        _host_fd: std::os::fd::BorrowedFd<'_>,
+        _offset: u64,
+        _source: PrivateFileSource,
+    ) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
+
+    /// Retain an immutable private file-view recipe without publishing physical
+    /// backing. Called only when `supports_lazy_private_file_mmap` is true and
+    /// the map is neither fixed, populated nor locked. Its first permitted
+    /// access must materialize through the backend's MM-owned transaction.
+    fn defer_private_file_backed(
         &mut self,
         _address: u64,
         _len: usize,

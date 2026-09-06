@@ -29,9 +29,12 @@ pub(super) fn prepare(
         ));
     }
     const TWO_MIB: u64 = 2 * 1024 * 1024;
-    let block_congruence =
-        matches!(backing, SparseExtentBacking::FileView { .. }) || end - start >= TWO_MIB;
-    let layout = allocation_layout(start, end, block_congruence)?;
+    let layout = match backing {
+        SparseExtentBacking::FileView { offset, .. } => {
+            file_view_allocation_layout(start, end, offset)?
+        }
+        _ => allocation_layout(start, end, end - start >= TWO_MIB)?,
+    };
     let physical_offset = layout.offset;
     let physical_len = layout.length;
     let physical_size =
@@ -80,65 +83,66 @@ pub(super) fn prepare(
         if can_pool {
             carrick_observability::probes::hvpatch_frame_pool_miss(1, 0);
         }
-        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-            physical_size,
-            crate::host_mapping::HostMappingKind::PrivateAnon,
-        )
-        .map_err(|error| {
-            TrapError::Hypervisor(format!("allocate sparse HVPatch mmap backing: {error}"))
-        })?;
+        let host_mapping = match backing {
+            SparseExtentBacking::FileView {
+                fd, offset, source, ..
+            } => {
+                let delta = layout.offset;
+                let file_offset = libc::off_t::try_from(offset - delta).map_err(|_| {
+                    TrapError::Hypervisor(format!("private file view offset 0x{offset:x} overflow"))
+                })?;
+                match source {
+                    carrick_guest_mem::PrivateFileSource::ImmutableLower => {
+                        crate::host_mapping::OwnedHostMapping::map_private_file(
+                            fd.as_raw_fd(),
+                            file_offset,
+                            physical_size,
+                        )
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "map immutable private-file view at VA 0x{start:x}: {error}"
+                            ))
+                        })?
+                    }
+                    carrick_guest_mem::PrivateFileSource::Mutable => {
+                        crate::host_mapping::OwnedHostMapping::map_shared_file(
+                            fd.as_raw_fd(),
+                            file_offset,
+                            physical_size,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                        )
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "map writable shared private-file view at VA 0x{start:x}: {error}"
+                            ))
+                        })?
+                    }
+                }
+            }
+            SparseExtentBacking::Anon | SparseExtentBacking::SeededAnon { .. } => {
+                crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    physical_size,
+                    crate::host_mapping::HostMappingKind::PrivateAnon,
+                )
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("allocate sparse HVPatch mmap backing: {error}"))
+                })?
+            }
+        };
         let physical_host = host_mapping.as_ptr();
         let semantic_host = unsafe { physical_host.add(physical_offset as usize) };
-        // A file view replaces whole 16 KiB host pages of the anonymous
-        // backing with a read-only page-cache view BEFORE stage-2 sees the
-        // range: the physical host bytes under a live `hv_vm_map` are never
-        // remapped. Congruence (`start ≡ offset mod 16 KiB`, enforced by the
-        // driver) makes the host page containing `start` the host page
-        // containing the file page at `offset`.
         let (stage2_perms, inventory_backing, page_granular_arm) = match backing {
-            SparseExtentBacking::Anon => (
+            SparseExtentBacking::Anon | SparseExtentBacking::SeededAnon { .. } => (
                 applevisor::memory::MemPerms::ReadWriteExec,
                 HvfVmState::private_backing_identity(),
                 false,
             ),
-            SparseExtentBacking::FileView {
-                fd,
-                offset,
-                view_len,
-                source,
-            } => {
-                let delta = start & (HVF_PAGE_SIZE - 1);
-                if offset & (HVF_PAGE_SIZE - 1) != delta {
-                    return Err(TrapError::Hypervisor(format!(
-                        "private file view VA 0x{start:x} not congruent with offset 0x{offset:x}"
-                    )));
-                }
-                let host_at = physical_offset - delta;
-                let view_len = view_len.min(end - start);
-                let view_host_len =
-                    align_up(delta + view_len, HVF_PAGE_SIZE)?.min(physical_len - host_at);
-                let view_host_size = usize::try_from(view_host_len)
-                    .map_err(|_| TrapError::MappingTooLarge(view_host_len))?;
-                let file_offset = libc::off_t::try_from(offset - delta).map_err(|_| {
-                    TrapError::Hypervisor(format!("private file view offset 0x{offset:x} overflow"))
-                })?;
-                host_mapping
-                    .overlay_file_view(
-                        usize::try_from(host_at)
-                            .map_err(|_| TrapError::MappingTooLarge(host_at))?,
-                        fd,
-                        file_offset,
-                        view_host_size,
-                        source == carrick_guest_mem::PrivateFileSource::ImmutableLower,
-                    )
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "overlay private file view at VA 0x{start:x}: {error}"
-                        ))
-                    })?;
-                // Stage-2 is RWX on the frame; stage-1 carries the guest
-                // permission (AP_RO/UXN) and armed page-granular COW until
-                // privatized on first write.
+            SparseExtentBacking::FileView { .. } => {
+                // Mutable files use a writable host MAP_SHARED view so HVF can
+                // access the VM object and clean pages follow file writes.
+                // Immutable lower files use a writable MAP_PRIVATE view. In
+                // both cases stage-1 stays page-granular COW armed, so guest
+                // and foreign writes first create Carrick-owned private pages.
                 (
                     applevisor::memory::MemPerms::ReadWriteExec,
                     HvfVmState::private_file_view_backing_identity(),
@@ -146,6 +150,18 @@ pub(super) fn prepare(
                 )
             }
         };
+        if let SparseExtentBacking::SeededAnon { bytes } = backing {
+            let semantic_len = usize::try_from(end - start)
+                .map_err(|_| TrapError::MappingTooLarge(end - start))?;
+            if bytes.len() > semantic_len {
+                return Err(TrapError::Hypervisor(
+                    "seeded sparse backing exceeds its semantic extent".to_owned(),
+                ));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), semantic_host, bytes.len());
+            }
+        }
         let mut lease = GlobalFrameStage2Lease::reserve(physical_len, layout.alignment)?;
         let physical_ipa = lease.base;
         let semantic_ipa = physical_ipa
@@ -218,7 +234,7 @@ fn allocation_layout(
     }
     // Single-page demand allocation needs only host-page congruence. Using
     // the VA's 2 MiB offset here allocates up to 2 MiB for each 4 KiB fault.
-    // Bulk mappings and file views retain their existing block congruence.
+    // Bulk anonymous mappings retain their existing block congruence.
     let alignment = if block_congruence {
         2 * 1024 * 1024
     } else {
@@ -238,6 +254,35 @@ fn allocation_layout(
     })
 }
 
+fn file_view_allocation_layout(
+    start: u64,
+    end: u64,
+    offset: u64,
+) -> Result<AllocationLayout, TrapError> {
+    if start >= end
+        || !start.is_multiple_of(4096)
+        || !end.is_multiple_of(4096)
+        || !offset.is_multiple_of(4096)
+        || start & (HVF_PAGE_SIZE - 1) != offset & (HVF_PAGE_SIZE - 1)
+    {
+        return Err(TrapError::Hypervisor(
+            "invalid sparse private-file view range".to_owned(),
+        ));
+    }
+    let delta = start & (HVF_PAGE_SIZE - 1);
+    let length = align_up(
+        delta
+            .checked_add(end - start)
+            .ok_or_else(|| TrapError::Hypervisor("private file view overflow".to_owned()))?,
+        HVF_PAGE_SIZE,
+    )?;
+    Ok(AllocationLayout {
+        offset: delta,
+        length,
+        alignment: HVF_PAGE_SIZE,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn block_and_file_views_preserve_block_congruence() {
+    fn bulk_anonymous_views_preserve_block_congruence() {
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         for start in [0, 4096, TWO_MIB - 4096, TWO_MIB] {
             let layout = allocation_layout(start, start + 3 * TWO_MIB, true).unwrap();
@@ -263,6 +308,22 @@ mod tests {
             assert!(layout.length >= layout.offset + 3 * TWO_MIB);
             assert!(layout.length < layout.offset + 3 * TWO_MIB + HVF_PAGE_SIZE);
         }
+    }
+
+    #[test]
+    fn file_view_layout_is_one_host_mapping_with_semantic_delta() {
+        for (start, offset, semantic_len, expected_len) in [
+            (0, 0, 4096, HVF_PAGE_SIZE),
+            (4096, 4096, 4096, HVF_PAGE_SIZE),
+            (3 * 4096, 3 * 4096, 8192, 2 * HVF_PAGE_SIZE),
+            (HVF_PAGE_SIZE, 0, 5 * 4096, 2 * HVF_PAGE_SIZE),
+        ] {
+            let layout = file_view_allocation_layout(start, start + semantic_len, offset).unwrap();
+            assert_eq!(layout.offset, start & (HVF_PAGE_SIZE - 1));
+            assert_eq!(layout.length, expected_len);
+            assert_eq!(layout.alignment, HVF_PAGE_SIZE);
+        }
+        assert!(file_view_allocation_layout(0, 4096, 4096).is_err());
     }
 
     #[test]

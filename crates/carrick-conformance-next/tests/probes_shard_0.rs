@@ -445,6 +445,14 @@ fn generic_probe_shard_0() {
                 // read as if every shard-0 probe matched.
                 eprintln!("DIFF generic probe shard 0 {target}:{probe_name}");
                 eprintln!(
+                    "guest termination: exit_code={} signal={:?} trap_limit_hit={} terminal_reason={:?} traps={}",
+                    result.exit_code,
+                    result.signal,
+                    result.trap_limit_hit,
+                    result.terminal_reason,
+                    result.traps,
+                );
+                eprintln!(
                     "--- observed ---\n{normalized_carrick}\n--- oracle ---\n{cached_oracle}"
                 );
                 observed_mismatches.insert(*probe_name);
