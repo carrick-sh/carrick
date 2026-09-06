@@ -30755,6 +30755,52 @@ fn sparse_mmap_stage1_error(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn next_deferred_cow_authentication_page(
+    walk: [u64; 4],
+    page: u64,
+    end: u64,
+    armed: &[carrick_aarch64::vmm::ForkCowRange],
+) -> u64 {
+    // Called only AFTER authenticating the live walk against the shadow and
+    // exact expected output while retaining the page-table authority. A valid
+    // block has one descriptor and linear outputs throughout its aligned span;
+    // an L3 table still requires every leaf to be read. Invalid retained leaves
+    // stay on the conservative page path. Never infer coverage from endpoints.
+    const PAGE: u64 = 4096;
+    let mut span = PAGE;
+    for (level, descriptor) in walk.into_iter().enumerate() {
+        if descriptor & 1 == 0 {
+            break;
+        }
+        if descriptor & 3 == 1 {
+            span = match level {
+                1 => 1 << 30,
+                2 => 1 << 21,
+                _ => PAGE,
+            };
+            break;
+        }
+    }
+    let mut next = (page & !(span - 1)).saturating_add(span).min(end);
+    // AP_RO is authentic for an armed page even when PROT_WRITE was requested.
+    // Stop at every arm boundary so an unarmed interior page cannot inherit
+    // that exception. Overlapping arms merely cause extra authentication.
+    for range in armed {
+        let Some(range_end) = range.va.checked_add(range.len as u64) else {
+            continue;
+        };
+        for boundary in [range.va, range_end] {
+            if boundary > page && boundary < next {
+                // The caller authenticates page starts; an unaligned arm
+                // boundary first changes that classification on the next page.
+                next = boundary.saturating_add(PAGE - 1) & !(PAGE - 1);
+            }
+        }
+    }
+    next.min(end)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn deferred_cow_leaf_authenticates(
     leaf: u64,
     translated: Option<u64>,
@@ -40870,7 +40916,7 @@ impl HvfVmState {
                             )));
                         }
                         first_leaf.get_or_insert((page, leaf, expected_ipa));
-                        page = page.saturating_add(PAGE_SIZE);
+                        page = next_deferred_cow_authentication_page(live, page, overlap_end, &armed);
                     }
                     if let Some((page, leaf, expected_ipa)) = first_leaf {
                         crate::probes::pt_alias_receipt(page, leaf, expected_ipa, expected_ap, phase);
@@ -54398,6 +54444,147 @@ mod memory_protection_tests {
         assert_eq!(ExecLevel::from_pstate(0b0100), ExecLevel::Kernel); // EL1t
         assert_eq!(ExecLevel::from_pstate(0b0101), ExecLevel::Kernel); // EL1h
         assert!(!ExecLevel::from_pstate(0b0101).is_guest());
+    }
+
+    #[test]
+    fn deferred_cow_block_authentication_visits_each_descriptor_once() {
+        let base = 0x6000_0000_u64;
+        let end = base + 4 * 1024 * 1024;
+        let mut page = base;
+        let mut visits = 0;
+        // Authenticated L0/L1 tables and one L2 block. Adjacent 4 KiB
+        // addresses in that block share the exact same terminal descriptor.
+        let walk = [0x1003, 0x2003, 0x6000_0001, 0];
+        while page < end {
+            visits += 1;
+            page = next_deferred_cow_authentication_page(walk, page, end, &[]);
+        }
+        assert_eq!(visits, 2, "one authenticated descriptor per 2 MiB block");
+    }
+
+    #[test]
+    fn deferred_cow_authentication_stops_at_cow_and_leaf_boundaries() {
+        use carrick_aarch64::vmm::{CowGranule, ForkCowRange};
+        let base = 0x6000_0000_u64;
+        let end = base + 2 * 1024 * 1024;
+        let block = [0x1003, 0x2003, base | 1, 0];
+        let armed = [ForkCowRange {
+            va: base + 4096,
+            len: 4096,
+            executable: false,
+            kernel_only: false,
+            granule: CowGranule::Page,
+        }];
+        assert_eq!(
+            next_deferred_cow_authentication_page(block, base, end, &armed),
+            base + 4096
+        );
+        assert_eq!(
+            next_deferred_cow_authentication_page(block, base + 4096, end, &armed),
+            base + 8192
+        );
+        assert_eq!(
+            next_deferred_cow_authentication_page(block, base + 8192, end, &armed),
+            end
+        );
+        // A split block can contain a corrupt interior leaf. Never skip any
+        // L3 descriptor, including when its neighbors have identical outputs.
+        let split = [0x1003, 0x2003, 0x3003, base | 3];
+        assert_eq!(
+            next_deferred_cow_authentication_page(split, base, end, &[]),
+            base + 4096
+        );
+        let invalid = [0x1003, 0x2003, base, 0];
+        assert_eq!(
+            next_deferred_cow_authentication_page(invalid, base, end, &[]),
+            base + 4096
+        );
+        assert_eq!(
+            next_deferred_cow_authentication_page(block, base, base + 8192, &[]),
+            base + 8192
+        );
+    }
+
+    #[test]
+    fn deferred_cow_block_step_preserves_overlapping_unaligned_arm_classification() {
+        use carrick_aarch64::vmm::{CowGranule, ForkCowRange};
+        let base = 0x6000_0000_u64;
+        let end = base + 65536;
+        let walk = [0x1003, base | 1, 0, 0]; // genuine L1 terminal shape
+        let mut arms = vec![
+            ForkCowRange {
+                va: base + 17,
+                len: 9000,
+                executable: false,
+                kernel_only: false,
+                granule: CowGranule::Page,
+            },
+            ForkCowRange {
+                va: base + 5000,
+                len: 13000,
+                executable: false,
+                kernel_only: false,
+                granule: CowGranule::Page,
+            },
+        ];
+        assert_eq!(
+            next_deferred_cow_authentication_page(walk, base, end, &[]),
+            end
+        );
+        for _ in 0..2 {
+            let covers = |page| {
+                arms.iter()
+                    .any(|r| page >= r.va && page < r.va + r.len as u64)
+            };
+            let mut page = base;
+            while page < end {
+                let next = next_deferred_cow_authentication_page(walk, page, end, &arms);
+                assert!(next > page && next <= end && next.is_multiple_of(4096));
+                for skipped in (page..next).step_by(4096) {
+                    assert_eq!(covers(skipped), covers(page));
+                }
+                page = next;
+            }
+            arms.reverse();
+        }
+    }
+
+    #[test]
+    fn deferred_cow_walk_detects_interior_live_leaf_corruption() {
+        let base = crate::memory::LINUX_MMAP_BASE;
+        let bad_va = base + 4096;
+        let mut manager = carrick_mem::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        manager.set_readonly(bad_va, 4096, false, None).unwrap();
+        let shadow = manager.debug_walk(bad_va);
+        assert_ne!(shadow[3], 0, "fixture must contain an L3 split");
+        let table = shadow[2] & 0x0000_ffff_ffff_f000;
+        let slot =
+            ((table - manager.base()) / 8) as usize + carrick_mem::page_table::indices(bad_va)[3];
+        let pristine: Vec<u64> = manager
+            .as_bytes()
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        for corruption in [1 << 12, 1 << 7, 1 << 54] {
+            // IPA, AP, UXN
+            let mut host = pristine.clone();
+            host[slot] ^= corruption;
+            let resolver = (manager.base(), host.as_ptr().cast::<u8>());
+            let mut page = base;
+            let mut mismatch = None;
+            while page < base + 3 * 4096 {
+                let live = unsafe { manager.debug_walk_host(resolver, page).unwrap() };
+                if live != manager.debug_walk(page) {
+                    mismatch = Some(page);
+                    break;
+                }
+                page = next_deferred_cow_authentication_page(live, page, base + 3 * 4096, &[]);
+            }
+            assert_eq!(mismatch, Some(bad_va));
+        }
     }
 
     #[test]

@@ -299,3 +299,20 @@ Receipts: `target/conformance/first-touch-access-{red,green}.log` and
 host socket/directory permissions; the final full run used host authority.
 This prerequisite does not enable anonymous lazy backing or satisfy a guest
 landing gate.
+
+## Authenticate block coverage once
+
+The deferred protection observer authenticated the same L2 descriptor once
+per 4 KiB address. A red work-count test required two checks for two 2 MiB
+blocks and observed 1,024 (`block-auth-red.log`). After the unchanged live /
+shadow / expected output / AP / UXN checks succeed under Stage1Authority,
+the observer now advances to the earliest block, receipt or COW-arm boundary.
+Invalid descriptors and L3 tables retain per-page checks. No owner cache,
+barrier or publication change was introduced.
+
+Tests cover arm entry/exit, overlapping unaligned arms in both orders, L1
+receipt bounds, and actual interior live L3 IPA/AP/UXN corruption. Independent
+read-only review found no blocker. Full signed HVF lib suite passed 442 tests,
+3 ignored (`block-auth-final.log`), using the shipped post-link signer and
+scoped cleanup. Runtime timing has not yet been remeasured on this source;
+the structural count is not a latency or landing claim.
