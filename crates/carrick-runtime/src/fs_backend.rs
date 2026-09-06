@@ -4840,6 +4840,10 @@ pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
     fget_u32_xattr(fd, CARRICK_MODE_XATTR)
 }
 
+pub(crate) fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
+    fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode);
+}
+
 /// 8-byte little-endian xattr write/read, mirroring the u32 helpers above. Used
 /// for the device-node `st_rdev` (a 64-bit `dev_t`).
 #[allow(dead_code)]
