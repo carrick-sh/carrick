@@ -747,6 +747,19 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Whether private anonymous mappings can start with no physical backing
+    /// and be populated through the runtime's first-touch fault plan. Other
+    /// backends keep eager protection publication. MAP_POPULATE and locked
+    /// mappings must not use this capability. An opting-in backend must also
+    /// support kernel copyin/copyout and authenticated foreign reads before a
+    /// guest first touch, preserve exact VMA permissions, and materialize only
+    /// the faulted range without replacing live neighboring pages. Missing
+    /// translations alone never authorize reading zeros. No production
+    /// backend opts in until those contracts are implemented and verified.
+    fn supports_lazy_anonymous_mmap(&self) -> bool {
+        false
+    }
+
     /// Whether this backend can safely publish executable protection changes
     /// while sibling guest threads remain live. Backends default to the
     /// conservative answer; translation-backed execution can opt in when
