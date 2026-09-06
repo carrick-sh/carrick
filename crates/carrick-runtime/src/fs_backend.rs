@@ -9866,6 +9866,8 @@ mod tests {
         }
     }
 
+    static FS_RLIMIT_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     /// A host `EMFILE` on the guest's own open is the guest's answer, not a
     /// "not servable from here" that the dispatcher lowers to a create (and
     /// then `EINVAL`). LTP `fork09` opens files until `EMFILE` and TBROKs on
@@ -9874,73 +9876,61 @@ mod tests {
     /// enforced that first), so the honest Linux errno is `ENFILE`.
     #[test]
     fn host_descriptor_exhaustion_is_refused_not_unavailable() {
-        // Fork a child process so setrlimit(RLIMIT_NOFILE) is confined to the child
-        // and cannot starve parallel test threads running in the parent process.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed");
-        if pid == 0 {
-            let scratch_root = tempfile::TempDir::new().unwrap();
-            let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
-            std::fs::create_dir(b.root_path.join("d")).unwrap();
-            std::fs::write(b.root_path.join("d/existing"), b"x").unwrap();
-            // Nothing cached: a reclaim under exhaustion must find nothing to
-            // free, so the refusal is the only possible outcome.
-            b.drop_dir_cache();
+        let _serial = FS_RLIMIT_TEST_LOCK.lock();
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        std::fs::create_dir(b.root_path.join("d")).unwrap();
+        std::fs::write(b.root_path.join("d/existing"), b"x").unwrap();
+        // Nothing cached: a reclaim under exhaustion must find nothing to
+        // free, so the refusal is the only possible outcome.
+        b.drop_dir_cache();
 
-            {
-                let _shut = DescriptorTableShut::new();
-                match b.create_raw_fd("/d/new", 0o644, false) {
-                    HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
-                    HostFdOpen::Served((fd, _)) => {
-                        unsafe { libc::close(fd) };
-                        panic!("create served with the descriptor table shut");
-                    }
-                    HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+        {
+            let _shut = DescriptorTableShut::new();
+            match b.create_raw_fd("/d/new", 0o644, false) {
+                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                HostFdOpen::Served((fd, _)) => {
+                    unsafe { libc::close(fd) };
+                    panic!("create served with the descriptor table shut");
                 }
-                match b.open_raw_fd("/d/existing", false, false, false) {
-                    HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
-                    HostFdOpen::Served(fd) => {
-                        unsafe { libc::close(fd) };
-                        panic!("open served with the descriptor table shut");
-                    }
-                    HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
-                }
-                match b.open_raw_fd_with_metadata("/d/existing", false, false, false) {
-                    HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
-                    HostFdOpen::Served((fd, _)) => {
-                        unsafe { libc::close(fd) };
-                        panic!("open-with-metadata served with the descriptor table shut");
-                    }
-                    HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
-                }
-                assert_eq!(
-                    b.create_file("/d/new2"),
-                    Err(BackendError::Host(LINUX_ENFILE)),
-                    "create_file must carry the host refusal, not a bare Io"
-                );
+                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
             }
-
-            // With the table open again the same calls serve, and a genuine
-            // miss stays Unavailable (path semantics belong to the resolver).
-            let (fd, _) = b.create_raw_fd("/d/new", 0o644, false).served().unwrap();
-            unsafe { libc::close(fd) };
-            let fd = b
-                .open_raw_fd("/d/existing", false, false, false)
-                .served()
-                .unwrap();
-            unsafe { libc::close(fd) };
-            assert!(
-                b.open_raw_fd("/d/missing", false, false, false)
-                    .served()
-                    .is_none()
+            match b.open_raw_fd("/d/existing", false, false, false) {
+                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                HostFdOpen::Served(fd) => {
+                    unsafe { libc::close(fd) };
+                    panic!("open served with the descriptor table shut");
+                }
+                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+            }
+            match b.open_raw_fd_with_metadata("/d/existing", false, false, false) {
+                HostFdOpen::Refused(errno) => assert_eq!(errno, LINUX_ENFILE),
+                HostFdOpen::Served((fd, _)) => {
+                    unsafe { libc::close(fd) };
+                    panic!("open-with-metadata served with the descriptor table shut");
+                }
+                HostFdOpen::Unavailable => panic!("host EMFILE erased to Unavailable"),
+            }
+            assert_eq!(
+                b.create_file("/d/new2"),
+                Err(BackendError::Host(LINUX_ENFILE)),
+                "create_file must carry the host refusal, not a bare Io"
             );
-            unsafe { libc::_exit(0) };
         }
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        // With the table open again the same calls serve, and a genuine
+        // miss stays Unavailable (path semantics belong to the resolver).
+        let (fd, _) = b.create_raw_fd("/d/new", 0o644, false).served().unwrap();
+        unsafe { libc::close(fd) };
+        let fd = b
+            .open_raw_fd("/d/existing", false, false, false)
+            .served()
+            .unwrap();
+        unsafe { libc::close(fd) };
         assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "child failed with status {status}"
+            b.open_raw_fd("/d/missing", false, false, false)
+                .served()
+                .is_none()
         );
     }
 
