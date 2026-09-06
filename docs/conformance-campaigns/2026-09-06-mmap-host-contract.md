@@ -344,3 +344,27 @@ and correct first-touch residency; residual file-map cost; complete latency
 contracts; full final serial runtime and whole probe family on the final
 artifact; line inventory reconciliation/commit/lint; only then mmap FF from
 main, quiet-host fork and fresh full cached-only ecosystem ledger.
+
+
+### Deferred anonymous state foundation (not a landing)
+
+Added an exact-MM pristine-range authority in `carrick-guest-mem`: explicit
+reservation and retirement, logical zero-read residency, fork-private copying,
+and a locked materialization transition consumed only after publication.
+Missing translation alone does not authorize zeros. The caller must acquire
+quiescence before the transition lock and completely roll back backend changes
+before dropping an uncommitted transition.
+
+Red lifecycle/concurrency tests are retained in
+`target/conformance/deferred-state-red.log`; independent full guest-memory
+validation passes 42 tests (`deferred-state-root.log`,
+`CARRICK_RUN_ID=eco-deferred-state-20260906b`). The foundation's binding hook is
+default-noop and does not itself enable production lazy mmap.
+
+The in-progress integration passed the full serial runtime library suite,
+2470 passed / 2 ignored (`deferred-runtime.log`,
+`CARRICK_RUN_ID=eco-deferred-runtime-20260906a`). This is not guest acceptance:
+foreign writes into pristine unbacked memory still require a new exact-target
+materialization transaction, and writable syscall-buffer validation must accept
+explicit pristine provenance without allocating or changing residency. Runtime
+integration remains uncommitted; the signed timing artifact is still fd2121d51.
