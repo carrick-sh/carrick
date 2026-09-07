@@ -1611,3 +1611,134 @@ Carrick time; the >=10x matches consume 30.03%. Aggregate matched time is
 rows (77.76%) currently satisfy both semantic match and <2x. The live backlog
 to the combined goal is therefore 473 rows: 76 semantic/nonexecution rows plus
 397 matching but slow rows.
+
+## 2026-09-06 evening: the 2x campaign — baseline attributed, five workers dispatched
+
+Owner directive: drive the pathological ratios to 2x, fork and memory first,
+clean baseline then cluster and fix; Antigravity workers on Gemini 3.8 high
+do the code, the director reviews and lands.
+
+**Baseline.** `ledger-3889fde8e.jsonl` (section above) is the clean run:
+main `48629d304` differs from `3889fde8e` only in documentation, and the
+shipped binary still carries SHA-256 `82c8bb49…`, so re-running would have
+measured the same artifact. Its ratios are load-inflated (four workers): the
+same `cpython-re` row is 19.2 s in the ledger, 8.1 s standalone, 0.4 s in
+Docker. Standalone quiet-host numbers are the campaign's working figures;
+the full ledger is re-run only after landings.
+
+**Instrument that found the clusters.** Attach the user-stack ranker to the
+live carrier ~2.5 s after launch:
+
+    sudo dtrace -qs scripts/dtrace/hvpatch-carrier-user-cpu-ranking.d -p "$(pgrep -f 'carrick:<run-id>:' | head -1)"
+
+(direct `sudo`, never under `timeout`: sudo then has no tty and the attach
+fails silently with rc=1). `carrick trace -s hvpatch-phase4-whole-cpu.d`
+first showed that syscall services were NOT the cost (3,713 services, 0.2 s,
+of ~10 CPU-s), which is what pointed at the fault path.
+
+**Clusters, each reproduced standalone on the baseline binary:**
+
+1. *AliasRegistry batch removal is O(rows-in-mm) per fault.* ~90% of carrier
+   user CPU in `test_re` is `remove_exact_values_in_batch` →
+   `rebuild_scope_rows`, which clones the whole scope bucket, filters it,
+   un-indexes and re-indexes every row across five secondary indexes and
+   rebuilds the exact-first index, once per retired stage-2 projection —
+   i.e. per COW fault and per first-touch fault. The compile-suite "hang"
+   (`test_compiler_recursion_limit`) is the same cost: 45k sequential 4 KiB
+   first-touch write faults at ~270 µs each (`hvpatch-phase4-guest-fault.d`).
+   Worker `alias-batch`.
+2. *Semantic VMA maintenance is O(n) per mmap.* `ltp-munmap04` (65k maps)
+   spends 90% in `trim_semantic_vmas` + `coalesce_semantic_vmas` (a whole-Vec
+   sort per mmap). The same list's coalesce compares every attribute except
+   `dump_policy`, so a `MADV_DONTDUMP` sub-range is re-merged and loses its
+   policy. Worker `vma-map` (a `VmaMap` type owning split/adjust/merge).
+3. *Guest-created symlink-to-directory as an intermediate component.*
+   `open07` (creat via `symdir1/`), `lstat02`/`readlink03` (ELOOP cases
+   succeed), `chroot02` (absolute path after chroot), `fcntl01` and siblings
+   (tmpdir cleanup EISDIR), CPython shutil/zipfile/tarfile. All entered with
+   the cap-std retirement. Worker `namei-symdir`.
+4. *Parallel fork+exec from a multithreaded process kills the carrier.*
+   Go `testing.TestFlag` (three parallel subtests re-exec the binary) →
+   "task projection manager root … does not match CPU TTBR root" on every
+   executor, then "published HVPatch inventory dropped before exact
+   retirement". Twelve Go rows and `cpython-regrtest`. Worker `exec-ttbr`.
+5. *Storage interface cannot report host errors.* `FileContents::read_at`
+   turns a `pread` error into a short/empty result (EOF), `resize` ignores
+   `ftruncate` failure. Worker `storage-fallible` (from the owner's static
+   review; verified in source).
+
+Queued from the same review, verified in source, not yet dispatched: the
+mixed/synthetic `ppoll` path (`net.rs` ~7340) sleeps in 10 ms slices,
+estimates elapsed time by counting sleeps and returns 0 after ~60 s to an
+indefinite waiter — needs a kernel wait set with owned registrations; the
+host-operation fd capability type; file-operation policy behind
+`FileDescriptionBacking` (`write_shared_supported` keeps a second list of
+writable variants); in-kernel AF_UNIX for guest-local sockets.
+
+**Found while verifying worker binaries (queued, not yet dispatched):**
+- `*getxattr` on any lower-layer (image) path returns ENOENT instead of
+  ENODATA (`HostFsBackend::get_xattr` → `metadata_fd` only finds upper-layer
+  entries). Debian's GNU `ls -l` reports the unexpected errno per entry, which
+  is how `ls -la` "fails" in every image directory on the Go image and why
+  `fs.WalkDir`/`go list` rows fail (`go-build`, `go-io_fs`, `go-path_filepath`,
+  `crypto/internal/fips140test`). Handed to the namei worker.
+- Trailing `/.` and `/` path forms (`stat("dir/.")`, `stat("dir/")`,
+  `stat("file/")` must be ENOTDIR) fail; Go `os` `TestRootConsistency{Stat,Lstat}`,
+  `TestCopyFSWithSymlinks`. Handed to the namei worker.
+- With the exec crash fixed, `go-syscall` runs into `TestSetpgid` and hangs
+  to the 300 s cap (twice), and `go-types` runs `TestSelf` past 300 s
+  (previously both crashed in under a second, so these were masked).
+- A one-off `scheduler generation observer lost exact transition … run queue
+  publication authority does not match the submitted generation` abort in
+  `TestUnshareMountNameSpaceChroot` under concurrent load; not reproduced in
+  two quiet re-runs on either binary.
+
+**Landing receipts so far (director-verified on each worker's binary):**
+- alias-batch (two rounds; round 2 finished by the director after a
+  transport timeout): registry tests 9/9, clippy/fmt clean, `test_re`
+  user CPU 7.7 → 2.5 s standalone (3.5 s under four concurrent worker
+  builds), `test_os` 39 → 17.7 s under load. Landed as `5ed36c064` +
+  `79499d032`; the abort shard re-blessed by hand (`upsert_by_key` gained a
+  fourth carrier-fault site, `rebuild_scope_rows` is test-only).
+- exec-ttbr (two rounds): the vfork share state is a counter on
+  `Stage1AuthorityInner`; the runtime's predecessor-sharing hint is a
+  warn-only witness, never a decision input. `testing.test` 5/5 and 2/2,
+  `forkexecstorm` probe green, `os_exec`/`os_signal`/`net_netip` PASS.
+  Landed as `135bc3b42`.
+- vma-map (two rounds): `dump_policy` merge fix + `VmaMap`/`VmaAttributes`
+  with O(log n + affected) mutations (partition_point + splice + neighbour
+  merge; global coalesce only in bulk constructors, debug-asserted
+  otherwise). `ltp-munmap04` 30 s timeout → 2.6 s and now reproduces the
+  oracle's own `tst_test.c:1948` SIGSEGV TBROK exactly (Docker: 1.2 s).
+  `vma_map` tests 5/5 re-run by the director.
+- namei (two rounds, both turns ended on transport timeouts with the code
+  complete; the director gated and committed): intermediate symlink-to-dir
+  via `validate_parents_fast`, ELOOP on loops, chroot-aware stat/access
+  fast paths, dentry-cache inode/nlink invalidation on child create/unlink/
+  rename (the EISDIR cleanup failures), xattrs served through the dentry
+  cache across layers (ENODATA, not ENOENT, on image paths), trailing `/.`
+  and `/` normalization with the directory requirement preserved. Receipts:
+  open07/lstat02/readlink03/chroot02/stat03 all pass, `ls -la /usr/lib` on
+  the Go image 32 → 0 errors, Go `os` `TestRootConsistency|TestCopyFS`
+  PASS, CPython shutil/zipfile/pathlib/tarfile subsets SUCCESS. Landed as
+  `2582ea944` + `52357bf57`.
+- Attribution after the exec fix: `go-syscall` `TestSetpgid` passes in 70 ms
+  without `-t` and wedges under `-t` — all executors idle, the `pty-relay`
+  thread spinning in `poll` at ~85% CPU (it only handles POLLIN/POLLHUP);
+  `go-types` `TestSelf` passes standalone in 34 s with 30% of carrier CPU in
+  that same relay `poll` and most of the rest in dentry slow-path `openat`s.
+  Worker `pty-jobctl` dispatched for both relay defects; the dentry
+  slow path is the next fs perf item.
+- storage-fallible (two rounds; round 2 ended on a transport timeout with
+  the code complete): `FileContents` is `read_at(&mut [u8]) -> Result<usize,
+  LinuxErrno>` / `write_at` / `len() -> Result` / `resize() -> Result`, host
+  errors are typed errnos, partial progress follows Linux (bytes moved, else
+  the errno), and the mmap populate path refuses with the errno instead of
+  zero-filling. Serial runtime suite 2,491 passed after landing; LTP
+  read/pread/pwrite/ftruncate/readv/memfd rows 6/6 on the branch binary.
+  Landed as `01424766a`.
+
+Main after these five landings is `HEAD` of this section's commit. The
+landed rows are re-verified standalone on that binary in the next section;
+the full cached ecosystem ledger is re-run once the first-touch, ppoll and
+pty-jobctl workers land, so a single artifact carries all of it.
