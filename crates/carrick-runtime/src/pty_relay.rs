@@ -620,7 +620,7 @@ fn relay_loop(
             revents: 0,
         },
         libc::pollfd {
-            fd: real_out,
+            fd: -1,
             events: 0,
             revents: 0,
         },
@@ -634,7 +634,7 @@ fn relay_loop(
     // size changes directly. `read_winsize` is cheap and this is the robust,
     // signal-independent path; the SIGWINCH self-pipe (when it fires) just
     // makes a resize take effect a little sooner.
-    let mut last_ws = if winch_r >= 0 {
+    let mut last_ws = if winch_r >= 0 && fds[IDX_REAL_IN].fd >= 0 {
         read_winsize(real_in)
     } else {
         None
@@ -643,11 +643,13 @@ fn relay_loop(
     // 250ms to check for resizes; the test path (-1) blocks indefinitely.
     let poll_timeout = if winch_r >= 0 { 250 } else { -1 };
     loop {
-        fds[IDX_REAL_OUT].events = if pending_echo.is_empty() {
-            0
+        if pending_echo.is_empty() {
+            fds[IDX_REAL_OUT].fd = -1;
+            fds[IDX_REAL_OUT].events = 0;
         } else {
-            libc::POLLOUT
-        };
+            fds[IDX_REAL_OUT].fd = real_out;
+            fds[IDX_REAL_OUT].events = libc::POLLOUT;
+        }
         // SAFETY: fds is a valid pollfd array.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout) };
         if n < 0 {
@@ -657,33 +659,48 @@ fn relay_loop(
             }
             break;
         }
-        // Shutdown pipe readable → stop.
-        if n > 0 && fds[IDX_SHUTDOWN].revents & libc::POLLIN != 0 {
+        // Shutdown pipe readable / hangup / error → stop.
+        if n > 0
+            && fds[IDX_SHUTDOWN].revents
+                & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                != 0
+        {
             break;
         }
-        // SIGWINCH self-pipe readable → drain it (the size-change check below
-        // does the actual propagation). Draining stops the level-triggered
-        // poll from spinning.
-        if n > 0 && fds[IDX_WINCH].revents & libc::POLLIN != 0 {
-            let mut drain_buf = [0u8; 64];
-            loop {
-                let r =
-                    unsafe { libc::read(winch_r, drain_buf.as_mut_ptr().cast(), drain_buf.len()) };
-                if r <= 0 {
-                    break;
+        // SIGWINCH self-pipe: drain or disable on error.
+        if n > 0 {
+            if fds[IDX_WINCH].revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0 {
+                fds[IDX_WINCH].fd = -1;
+                fds[IDX_WINCH].events = 0;
+            } else if fds[IDX_WINCH].revents & libc::POLLIN != 0 {
+                let mut drain_buf = [0u8; 64];
+                loop {
+                    let r = unsafe {
+                        libc::read(winch_r, drain_buf.as_mut_ptr().cast(), drain_buf.len())
+                    };
+                    if r <= 0 {
+                        break;
+                    }
                 }
             }
         }
-        if n > 0 && fds[IDX_WINSIZE].revents & libc::POLLIN != 0 {
-            while let Some(ws) = read_winsize_message(winsize_r) {
-                apply_winsize(winsize_target, &ws);
-                last_ws = Some(ws);
-                crate::kernel::tty::route_foreground_signal(crate::linux_abi::LINUX_SIGWINCH);
+        // Winsize message pipe: read or disable on error.
+        if n > 0 {
+            if fds[IDX_WINSIZE].revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0 {
+                fds[IDX_WINSIZE].fd = -1;
+                fds[IDX_WINSIZE].events = 0;
+            } else if fds[IDX_WINSIZE].revents & libc::POLLIN != 0 {
+                while let Some(ws) = read_winsize_message(winsize_r) {
+                    apply_winsize(winsize_target, &ws);
+                    last_ws = Some(ws);
+                    crate::kernel::tty::route_foreground_signal(crate::linux_abi::LINUX_SIGWINCH);
+                }
             }
         }
         // Robust resize handling: on every wakeup (data, timeout, or SIGWINCH)
         // re-read the terminal size and propagate if it changed.
         if winch_r >= 0
+            && fds[IDX_REAL_IN].fd >= 0
             && let Some(cur) = read_winsize(real_in)
         {
             let changed = last_ws
@@ -696,23 +713,55 @@ fn relay_loop(
             }
         }
         // real_in readable → copy to master.
-        if fds[IDX_REAL_IN].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            match read_fd(real_in, &mut buf) {
-                Some(0) | None => break,
-                Some(k) => {
-                    if !forward_input_bytes(
-                        &buf[..k],
-                        &mut line_discipline,
-                        winsize_target,
-                        master,
-                        &mut pending_echo,
-                    ) {
-                        break;
+        if fds[IDX_REAL_IN].fd >= 0 {
+            if fds[IDX_REAL_IN].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                // On POLLNVAL or POLLERR (e.g. /dev/null or non-pollable fd on Darwin),
+                // drain any existing data and fail-closed: stop polling real_in so we
+                // never busy-poll.
+                loop {
+                    match read_fd(real_in, &mut buf) {
+                        Some(0) | None => break,
+                        Some(k) => {
+                            if !forward_input_bytes(
+                                &buf[..k],
+                                &mut line_discipline,
+                                winsize_target,
+                                master,
+                                &mut pending_echo,
+                            ) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                fds[IDX_REAL_IN].fd = -1;
+                fds[IDX_REAL_IN].events = 0;
+            } else if fds[IDX_REAL_IN].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                match read_fd(real_in, &mut buf) {
+                    Some(0) | None => {
+                        // EOF or error on real_in: stop polling real_in but keep
+                        // relaying guest output from master to real_out until guest exits.
+                        fds[IDX_REAL_IN].fd = -1;
+                        fds[IDX_REAL_IN].events = 0;
+                    }
+                    Some(k) => {
+                        if !forward_input_bytes(
+                            &buf[..k],
+                            &mut line_discipline,
+                            winsize_target,
+                            master,
+                            &mut pending_echo,
+                        ) {
+                            break;
+                        }
                     }
                 }
             }
         }
         // master readable → copy to real_out.
+        if fds[IDX_MASTER].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            break;
+        }
         if fds[IDX_MASTER].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             match read_fd(master, &mut buf) {
                 Some(0) | None => break,
@@ -723,8 +772,13 @@ fn relay_loop(
                 }
             }
         }
-        if fds[IDX_REAL_OUT].revents & libc::POLLOUT != 0 {
-            flush_pending_echo(real_out, &mut pending_echo);
+        if fds[IDX_REAL_OUT].fd >= 0 {
+            if fds[IDX_REAL_OUT].revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0 {
+                break;
+            }
+            if fds[IDX_REAL_OUT].revents & libc::POLLOUT != 0 {
+                flush_pending_echo(real_out, &mut pending_echo);
+            }
         }
     }
     // SAFETY: shutdown_r is the relay-local read end of the shutdown pipe;
@@ -1285,6 +1339,40 @@ mod tests {
             libc::close(from.1);
             libc::close(to.0);
             libc::close(to.1);
+        }
+    }
+
+    #[test]
+    fn relay_does_not_spin_on_dev_null_stdin() {
+        let null_fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY) };
+        assert!(null_fd >= 0, "open /dev/null failed");
+        let (real_app, real_term) = socketpair();
+
+        let relay = PtyRelay::start_for_test(null_fd, real_term).expect("start_for_test");
+        let slave = relay.slave_fd();
+
+        // Write from guest side to verify relay still forwards output to real_out
+        unsafe {
+            let msg = b"hello from guest";
+            assert_eq!(
+                libc::write(slave, msg.as_ptr().cast(), msg.len()),
+                msg.len() as isize
+            );
+        }
+
+        let mut buf = [0u8; 16];
+        let n = unsafe { libc::read(real_app, buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(n, 16);
+        assert_eq!(&buf, b"hello from guest");
+
+        // Sleep for 50ms while relay runs to ensure it does not spin
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        relay.stop();
+        unsafe {
+            libc::close(null_fd);
+            libc::close(real_app);
+            libc::close(real_term);
         }
     }
 }
