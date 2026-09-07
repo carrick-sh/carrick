@@ -635,60 +635,6 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 1,
-      "fingerprint": "5da92fa8d5757caefb221d9117b0a52baf7bce52a7abae34018aafe6a8e287d8",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed during sparse mmap rollback, leaving stale stage-1 translations cached in hardware vCPU TLB. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 2,
-      "fingerprint": "6915e0db907a2a25f76504bc62d96ba50e2a6f2920a0bbf0cca0e819d5b7ea62",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_authority",
-      "rationale": "Stage-1 TLB invalidation failed after publishing sparse mmap stage-1 page tables, leaving hardware TLB out of sync with published stage-1 state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 3,
-      "fingerprint": "03bee4f0de9ebcb5ae49b9c9c499adcff0bcd49983b508be3926a6e8d597698c",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Committing frame inventory reservation failed after stage-1 and stage-2 mappings were installed, desynchronizing carrier memory from Kernel inventory authority."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 4,
-      "fingerprint": "5ff9cb42d634ff3630b29749dc118013e4e01e4232428f9953afa5ad5faa8421",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Zero physical extent length when authenticating committed sparse mmap mapping indicates corrupted mapping extent metadata."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 5,
-      "fingerprint": "5ff9cb42d634ff3630b29749dc118013e4e01e4232428f9953afa5ad5faa8421",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Sparse mmap mapping is absent from COW authority immediately after inventory commit, indicating lost or unauthenticated frame mapping state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::materialize_sparse_mmap_extent",
-      "ordinal_in_function": 6,
-      "fingerprint": "5ff9cb42d634ff3630b29749dc118013e4e01e4232428f9953afa5ad5faa8421",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Error authenticating newly committed sparse mmap mapping against COW authority indicates corrupted COW registry state."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::observe_frame_cow_protection",
       "ordinal_in_function": 1,
       "fingerprint": "b92ca23c0b682d437109c0dae42169c1561d18fc984cf816f98fdcb4a7d555fa",
@@ -929,24 +875,6 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Physical stage-2 mapping or unmapping transition already completed in the hypervisor while typed receipt construction failed, leaving the physical boundary unpublishable and unverifiable."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "mutate_external_alias_state",
-      "ordinal_in_function": 1,
-      "fingerprint": "b9cb966a83c16a140af604c58059830341fc29a0fe8323a6d3d49fb0b223938b",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "Counter overflow in alias version epoch during external alias state mutation risks alias version collision and invalid receipt invalidation. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "mutate_external_alias_state",
-      "ordinal_in_function": 2,
-      "fingerprint": "a5a945583edc3df0039bdb8e36b685890c3599ca48ae8558c454fbc1bbb00df8",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "Counter overflow in replay version epoch during external alias state mutation risks replay version collision and invalid alias replay. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -1235,6 +1163,267 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_commit",
       "rationale": "Re-installing predecessor stage-2 mappings failed during exec transaction rollback, leaving predecessor memory unmapped."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 1,
+      "fingerprint": "35af18808756199586eb3cabfb12ec2681f3b6bcc1acbea2711a16217bdcc5ee",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_rollback",
+      "rationale": "Sparse page-table publication failed and restoring its descriptor journal or retiring extension arenas also failed; continuing would retain a partial stage-1 mapping or recycle live structural backing."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 2,
+      "fingerprint": "6915e0db907a2a25f76504bc62d96ba50e2a6f2920a0bbf0cca0e819d5b7ea62",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_tlbi",
+      "rationale": "Sparse page-table descriptors were committed but exact-ASID invalidation failed; continuing could execute through stale stage-1 translations."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 3,
+      "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_inventory",
+      "rationale": "A validated nonempty sparse publication produced a zero semantic length after stage-1 and stage-2 publication, so a kernel inventory receipt cannot describe the committed mapping."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 4,
+      "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_inventory",
+      "rationale": "Prepared sparse backing produced a zero physical extent after stage-2 and stage-1 publication, violating the frame-length contract needed to authenticate the committed owner."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 5,
+      "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_inventory",
+      "rationale": "Kernel foreign-MM inventory application failed after stage-2 and stage-1 publication committed, leaving carrier mappings without matching kernel frame authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 6,
+      "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_mm_authority",
+      "rationale": "A retained foreign-MM snapshot supplied a zero MM identity after sparse publication committed; continuing would authenticate the mapping against no address-space owner."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 7,
+      "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_inventory",
+      "rationale": "The committed foreign-MM inventory receipt has the wrong owner generation, fails its challenge, or does not authorize the published mapping and frame; carrier and kernel authority have diverged."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 8,
+      "fingerprint": "7df09cebf797bab16616bd4deafc3f358025ebbe51f53a36c610689ce15e3c75",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_inventory",
+      "rationale": "Local kernel frame-inventory application failed after sparse stage-2 and stage-1 publication committed, leaving live translations without kernel-owned mapping authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 9,
+      "fingerprint": "c7d8981e7f7bb0ed08916f05ab40779c0149cdfe3ace82828721c0f2d2ed0873",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_inventory",
+      "rationale": "Post-commit authentication observed a zero physical extent for a mapping already published to stage-2, stage-1 and kernel inventory."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 10,
+      "fingerprint": "c7d8981e7f7bb0ed08916f05ab40779c0149cdfe3ace82828721c0f2d2ed0873",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_inventory",
+      "rationale": "Post-commit kernel authentication reported the newly published sparse mapping absent, proving carrier translation and kernel frame inventory disagree."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish",
+      "ordinal_in_function": 11,
+      "fingerprint": "c7d8981e7f7bb0ed08916f05ab40779c0149cdfe3ace82828721c0f2d2ed0873",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::sparse_materialization_inventory",
+      "rationale": "Post-commit kernel authentication errored for the newly published sparse mapping, so the carrier cannot prove the live translation has matching frame authority."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "unregister_alias_in",
+      "ordinal_in_function": 1,
+      "fingerprint": "e3d58e95bf344c606eed8f2b194f959528291c91cdf3ea8c1d0921c66db8706d",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Alias epoch exhaustion while unregistering an effective alias would allow a changed mapping to reuse an older receipt version."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "unregister_alias_in",
+      "ordinal_in_function": 2,
+      "fingerprint": "174e14e7dfe0d0181ec492c3956a71aa719243df4d0f55e9defef361253b66c9",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Replay epoch exhaustion while unregistering an alias would allow stale physical replay receipts to authenticate after the effective alias changed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "MmAccessState::bind_cow_runtime",
+      "ordinal_in_function": 1,
+      "fingerprint": "b3a6bdb69caa9951318503468c3f89b32279d644906c0dbb26c08462ba332690",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::deferred_materialization_binding",
+      "rationale": "A COW runtime binding supplied a zero MM identity while installing its deferred-memory authority, so the retained state cannot be scoped to an address space."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "MmAccessState::bind_cow_runtime",
+      "ordinal_in_function": 2,
+      "fingerprint": "b3a6bdb69caa9951318503468c3f89b32279d644906c0dbb26c08462ba332690",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::deferred_materialization_binding",
+      "rationale": "An MM access state was rebound to a different MM or deferred-memory authority while its prior binding remained live, which would authorize materialization from the wrong address space."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_pristine_write",
+      "ordinal_in_function": 1,
+      "fingerprint": "be57e741855012effce5146195ea4c125faf972400b88734647f9cdbb17c4eaf",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_sparse_materialization",
+      "rationale": "A foreign sparse publication completed without its required foreign-MM receipt, leaving the committed mapping unauthenticated to the requesting address space."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_pristine_write",
+      "ordinal_in_function": 2,
+      "fingerprint": "971a5e14d11b0f405b41e104c68b79fae011e3fb12db6b77f642ff83592be689",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_sparse_materialization",
+      "rationale": "The newly committed anonymous sparse frame disappeared from the global owner registry before its foreign lease could retain the backing."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_pristine_write",
+      "ordinal_in_function": 3,
+      "fingerprint": "fac7946a108f9e0bcb66fbfdc1491d1b0c0b8d6ef7e80cafdf1d85e38ea1c12a",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_sparse_materialization",
+      "rationale": "The global owner generation no longer matches the committed anonymous sparse receipt before foreign lease retention, indicating owner reuse or registry corruption."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_pristine_write",
+      "ordinal_in_function": 4,
+      "fingerprint": "38b64e32b64d1e94c1629dcfaa4f905ea5c15a05965536c603ff86dd9ba29b59",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_sparse_materialization",
+      "rationale": "Pinning the newly committed anonymous sparse owner failed before the foreign lease retained it, so the live mapping has no stable physical lifetime."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_pristine_write",
+      "ordinal_in_function": 5,
+      "fingerprint": "91de871178f787f050f561c06a942ec422b41f44912c57a194b267d5794c92ab",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_sparse_materialization",
+      "rationale": "A newly published stage-1 extension region lacks its structural owner, so the foreign lease cannot retain page-table backing for the live mapping."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_private_file_write",
+      "ordinal_in_function": 1,
+      "fingerprint": "be57e741855012effce5146195ea4c125faf972400b88734647f9cdbb17c4eaf",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_file_materialization",
+      "rationale": "A foreign private-file publication completed without its required foreign-MM receipt, leaving the committed mapping unauthenticated to the requesting address space."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_private_file_write",
+      "ordinal_in_function": 2,
+      "fingerprint": "971a5e14d11b0f405b41e104c68b79fae011e3fb12db6b77f642ff83592be689",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_file_materialization",
+      "rationale": "The newly committed private-file sparse frame disappeared from the global owner registry before its foreign lease could retain the backing."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_private_file_write",
+      "ordinal_in_function": 3,
+      "fingerprint": "fac7946a108f9e0bcb66fbfdc1491d1b0c0b8d6ef7e80cafdf1d85e38ea1c12a",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_file_materialization",
+      "rationale": "The global owner generation no longer matches the committed private-file sparse receipt before foreign lease retention, indicating owner reuse or registry corruption."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_private_file_write",
+      "ordinal_in_function": 4,
+      "fingerprint": "38b64e32b64d1e94c1629dcfaa4f905ea5c15a05965536c603ff86dd9ba29b59",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_file_materialization",
+      "rationale": "Pinning the newly committed private-file sparse owner failed before the foreign lease retained it, so the live mapping has no stable physical lifetime."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "materialize_foreign_private_file_write",
+      "ordinal_in_function": 5,
+      "fingerprint": "91de871178f787f050f561c06a942ec422b41f44912c57a194b267d5794c92ab",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::foreign_file_materialization",
+      "rationale": "A stage-1 extension created for private-file materialization lacks its structural owner, so the foreign lease cannot retain page-table backing for the live mapping."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::bind_deferred_anonymous_state",
+      "ordinal_in_function": 1,
+      "fingerprint": "1d9fc94ece43aa68ab047cb5867e4616bd3b62ee78b9f67023710a5227a59924",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::deferred_materialization_binding",
+      "rationale": "The local HVF state has no nonzero COW MM identity while binding deferred-memory authority, so materialization cannot be scoped to an exact address space."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::bind_deferred_anonymous_state",
+      "ordinal_in_function": 2,
+      "fingerprint": "3ef1717587e3a34dd5386182ca2d93e5d861f9a71149e7587ad4634e94df71df",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::deferred_materialization_binding",
+      "rationale": "The local HVF state already holds a different MM or deferred-memory authority, and replacing it would authorize future materialization from the wrong address space."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "mutate_external_alias_state_in",
+      "ordinal_in_function": 1,
+      "fingerprint": "b9cb966a83c16a140af604c58059830341fc29a0fe8323a6d3d49fb0b223938b",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Alias epoch exhaustion after an external alias mutation prevents issuance of a distinct version for changed mapping state, allowing stale receipt authentication."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "mutate_external_alias_state_in",
+      "ordinal_in_function": 2,
+      "fingerprint": "a5a945583edc3df0039bdb8e36b685890c3599ca48ae8558c454fbc1bbb00df8",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Replay epoch exhaustion after an external alias mutation prevents distinct versioning of changed physical replay state, allowing stale replay authentication."
     }
   ]
 }
