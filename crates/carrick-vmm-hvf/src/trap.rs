@@ -28919,22 +28919,17 @@ impl HvfTaskState {
             return Some(mapping.view());
         }
         if !self.protections.range_no_access(address, length) {
-            if let Some(alias) = alias_registry().lock().newest_matching_for_process(
+            if let Some(alias) = alias_registry().lock().newest_process_alias_containing_va(
+                address,
                 self.mm_root_slot,
                 self.container_root,
                 |alias| {
-                    alias_matches_process_scope(
-                        alias.ownership_scope,
-                        self.mm_root_slot,
-                        self.container_root,
-                    ) && address >= alias.start
-                        && address.checked_add(length as u64).is_some_and(|end| {
-                            alias
-                                .start
-                                .checked_add(alias.size as u64)
-                                .is_some_and(|limit| end <= limit)
-                        })
-                        && alias_is_live(alias)
+                    address.checked_add(length as u64).is_some_and(|end| {
+                        alias
+                            .start
+                            .checked_add(alias.size as u64)
+                            .is_some_and(|limit| end <= limit)
+                    }) && alias_is_live(alias)
                 },
             ) {
                 return Some(MappingView::from_alias(&alias));
@@ -38459,12 +38454,10 @@ impl HvfVmState {
                     let mut window_end = vma_end.min(next_2mb).min(w_end).min(arena_end);
                     window_end = window_end.max(end);
 
-                    let next_local = self
-                        .mappings
-                        .iter()
-                        .filter(|m| m.start > current && m.start < window_end)
-                        .map(|m| m.start)
-                        .min();
+                    let idx = self.mappings.partition_point(|m| m.start <= current);
+                    let next_local = self.mappings.get(idx).and_then(|m| {
+                        (m.start > current && m.start < window_end).then_some(m.start)
+                    });
                     let next_alias = alias_registry()
                         .lock()
                         .first_matching_process_alias_start_between(
@@ -38483,37 +38476,32 @@ impl HvfVmState {
                     let compound_start = align_down(current, COMPOUND);
                     let window_start = if compound_start >= p_start
                         && compound_start >= arena_start
-                        && !self
-                            .mappings
-                            .iter()
-                            .any(|m| m.start < current && m.end > compound_start)
                         && !alias_registry().lock().has_live_process_alias_overlapping(
                             compound_start,
                             current,
                             self.mm_root_slot,
                             self.container_root,
                         ) {
-                        compound_start
+                        let lower_idx = self.mappings.partition_point(|m| m.start < current);
+                        let lower_has_local = if lower_idx > 0 {
+                            self.mappings[..lower_idx]
+                                .iter()
+                                .rev()
+                                .take_while(|m| m.end > compound_start)
+                                .any(|m| m.start < current && m.end > compound_start)
+                        } else {
+                            false
+                        };
+                        if !lower_has_local {
+                            compound_start
+                        } else {
+                            current
+                        }
                     } else {
                         current
                     };
 
-                    let has_conflict = self
-                        .mappings
-                        .iter()
-                        .any(|m| m.start < window_end && m.end > window_start)
-                        || alias_registry().lock().has_live_process_alias_overlapping(
-                            window_start,
-                            window_end,
-                            self.mm_root_slot,
-                            self.container_root,
-                        );
-
-                    if !has_conflict
-                        && window_start < window_end
-                        && window_start <= current
-                        && end <= window_end
-                    {
+                    if window_start < window_end && window_start <= current && end <= window_end {
                         let mut chunk_start = window_start;
                         while chunk_start < window_end {
                             let chunk_limit = if chunk_start.is_multiple_of(COMPOUND) {
@@ -38793,16 +38781,14 @@ impl HvfVmState {
         // The caller found this hole before quiescing. Recompute its upper
         // boundary under the topology lock so a sibling publication between
         // those two points cannot be overlapped.
-        let next_local = self
+        let idx = self
             .mappings
+            .partition_point(|mapping| mapping.start <= start);
+        let next_local = self.mappings[idx..]
             .iter()
-            .filter(|mapping| {
-                mapping.start > start
-                    && mapping.start < end
-                    && global_frame_region_owner_matches_in(self.custody(), mapping)
-            })
-            .map(|mapping| mapping.start)
-            .min();
+            .take_while(|mapping| mapping.start < end)
+            .find(|mapping| global_frame_region_owner_matches_in(self.custody(), mapping))
+            .map(|mapping| mapping.start);
         let next_alias = alias_registry()
             .lock()
             .first_matching_process_alias_start_between(
@@ -38843,8 +38829,14 @@ impl HvfVmState {
             sparse_materialization::publish(&publication, start, end, backing, flush_stage1)?;
         let page_granular_arm = published.page_granular_arm;
         let semantic_ipa = published.region.ipa;
-        self.mappings.extend(published.extension_regions);
-        self.mappings.push(published.region);
+        for ext in published.extension_regions {
+            let pos = self.mappings.partition_point(|m| m.start < ext.start);
+            self.mappings.insert(pos, ext);
+        }
+        let pos = self
+            .mappings
+            .partition_point(|m| m.start < published.region.start);
+        self.mappings.insert(pos, published.region);
         if page_granular_arm {
             // Every page of the view starts clean: the first guest (or host
             // syscall) write to a page must move THAT page, and only that
@@ -43057,34 +43049,33 @@ impl HvfVmState {
         }
         alias_registry()
             .lock()
-            .newest_matching_for_process(self.mm_root_slot, self.container_root, |alias| {
-                let alias_end = alias.ipa.checked_add(alias.size as u64);
-                semantic_va >= alias.start
-                    && semantic_end <= alias.start.saturating_add(alias.size as u64)
-                    && alias
-                        .ipa
-                        .checked_add(semantic_va.saturating_sub(alias.start))
-                        == Some(ipa)
-                    && ipa >= alias.ipa
-                    && alias_end.is_some_and(|limit| end <= limit)
-                    && alias_matches_process_scope(
-                        alias.ownership_scope,
-                        self.mm_root_slot,
-                        self.container_root,
-                    )
-                    && (!self.persistent_vm_lifecycle
-                        || !is_reusable_global_frame_extent(
-                            alias.physical_ipa,
-                            alias.physical_size as u64,
-                        )
-                        || global_frame_host_owner_matches_in(
-                            self.custody(),
-                            alias.physical_ipa,
-                            alias.physical_size as u64,
-                            alias.physical_host_addr,
-                            alias.owner_generation,
-                        ))
-            })
+            .newest_process_alias_containing_va(
+                semantic_va,
+                self.mm_root_slot,
+                self.container_root,
+                |alias| {
+                    let alias_end = alias.ipa.checked_add(alias.size as u64);
+                    semantic_end <= alias.start.saturating_add(alias.size as u64)
+                        && alias
+                            .ipa
+                            .checked_add(semantic_va.saturating_sub(alias.start))
+                            == Some(ipa)
+                        && ipa >= alias.ipa
+                        && alias_end.is_some_and(|limit| end <= limit)
+                        && (!self.persistent_vm_lifecycle
+                            || !is_reusable_global_frame_extent(
+                                alias.physical_ipa,
+                                alias.physical_size as u64,
+                            )
+                            || global_frame_host_owner_matches_in(
+                                self.custody(),
+                                alias.physical_ipa,
+                                alias.physical_size as u64,
+                                alias.physical_host_addr,
+                                alias.owner_generation,
+                            ))
+                },
+            )
             .map(|alias| MappingView::from_alias(&alias))
     }
 
