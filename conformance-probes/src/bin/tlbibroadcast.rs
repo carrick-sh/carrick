@@ -6,6 +6,11 @@
 //! - Thread A mprotects / munmaps the page.
 //! - Thread B reports whether it observes the change within N iterations,
 //!   and whether any stale translation faults occur.
+//!
+//! Expected oracle lines:
+//! broadcast_mprotect_observed=true
+//! broadcast_munmap_observed=true
+//! no_stale_fault=true
 
 use conformance_probes::report;
 use std::os::raw::c_void;

@@ -67,7 +67,7 @@ thread_local! {
 #[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 pub(super) fn enter_guest_or_park(
     in_guest: &carrick_hal::InGuestFlag,
-    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    barrier: &crate::fork_quiesce::PtQuiesce,
 ) -> bool {
     in_guest.enter_guest();
     if !barrier.is_quiescing() {
@@ -81,7 +81,7 @@ pub(super) fn enter_guest_or_park(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn enter_hvpatch_guest_or_service_invalidation(
     in_guest: &carrick_hal::InGuestFlag,
-    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    barrier: &crate::fork_quiesce::PtQuiesce,
     tid: carrick_hal::ThreadId,
     engine: &mut dyn std::any::Any,
     control: &crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
@@ -107,7 +107,7 @@ pub(super) fn enter_hvpatch_guest_or_service_invalidation(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn enter_hvpatch_guest_or_service_invalidation_inner(
     in_guest: &carrick_hal::InGuestFlag,
-    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    barrier: &crate::fork_quiesce::PtQuiesce,
     tid: carrick_hal::ThreadId,
     cow_binding: Option<(
         crate::kernel::objects::ExecutorId,
@@ -187,6 +187,7 @@ fn enter_hvpatch_guest_or_service_invalidation_inner(
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn enter_hvpatch_guest_or_service_invalidation_for_test(
     in_guest: &carrick_hal::InGuestFlag,
+    barrier: &crate::fork_quiesce::PtQuiesce,
     tid: carrick_hal::ThreadId,
     executor: crate::kernel::objects::ExecutorId,
     binding: &Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
@@ -195,7 +196,7 @@ pub(crate) fn enter_hvpatch_guest_or_service_invalidation_for_test(
 ) -> Result<bool, carrick_hal::TrapError> {
     enter_hvpatch_guest_or_service_invalidation_inner(
         in_guest,
-        pt_barrier(),
+        barrier,
         tid,
         Some((executor, binding, observer)),
         invalidate,
@@ -414,9 +415,10 @@ pub(super) fn acquire_mm_stage1_authority<'participant>(
         }));
     }
     drop(census);
-    begin_pt_pause(pt_barrier(), tid, budget)?;
+    let pt_quiesce = Arc::clone(participation.pt_quiesce());
+    begin_pt_pause(&pt_quiesce, tid, budget)?;
     let census = participation.participation_mut().lock_exact_mm();
-    drain_exact_mm(pt_barrier(), mm, Some(coordinator), census, tid, budget)
+    drain_exact_mm(&pt_quiesce, mm, Some(coordinator), census, tid, budget)
         .map(MmStage1Authority::Paused)
 }
 
@@ -536,7 +538,8 @@ fn try_begin_hvpatch_process_fork_with_admission(
 }
 
 /// Process-wide page-table-edit Pause-Modify-Resume barrier.
-pub(crate) fn pt_barrier() -> &'static crate::fork_quiesce::PtQuiesce {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn pt_barrier() -> &'static Arc<crate::fork_quiesce::PtQuiesce> {
     crate::fork_quiesce::pt_barrier()
 }
 
@@ -586,7 +589,7 @@ impl PtPauseBudget {
 /// Acquire and hold exact-MM admission while every registered participant is
 /// kicked and observed out of guest across all process-local registries.
 fn begin_pt_pause(
-    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    barrier: &crate::fork_quiesce::PtQuiesce,
     tid: ThreadId,
     budget: PtPauseBudget,
 ) -> Result<(), PtPauseError> {
@@ -627,7 +630,7 @@ fn begin_pt_pause(
 }
 
 fn drain_exact_mm<'mm>(
-    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
     mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
     census: crate::kernel::ExactMmCensusGuard,
@@ -672,7 +675,7 @@ fn drain_exact_mm<'mm>(
 
 #[cfg(test)]
 pub(super) fn acquire_pt_pause<'participant>(
-    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     participation: &'participant mut crate::kernel::GuestExecutorParticipation,
     tid: ThreadId,
     budget: PtPauseBudget,
@@ -691,8 +694,7 @@ pub(super) fn with_real_mutation_pause_for_test<T>(
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
     run: impl FnOnce(&mut PtPauseGuard<'_>) -> T,
 ) -> T {
-    let barrier: &'static crate::fork_quiesce::PtQuiesce =
-        Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+    let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
     let registry: Arc<dyn carrick_hal::VcpuRegistry> =
         Arc::new(carrick_hal::GenericVcpuRegistry::new());
     let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
@@ -700,12 +702,12 @@ pub(super) fn with_real_mutation_pause_for_test<T>(
     let mut participation = census
         .enter_with_pause_endpoint(None, registry, tid)
         .expect("test exact-MM participation");
-    begin_pt_pause(barrier, tid, PtPauseBudget::DEFAULT)
+    begin_pt_pause(&barrier, tid, PtPauseBudget::DEFAULT)
         .expect("test must elect a real page-table pause");
     let mm = coordinator.mm();
     let census = participation.lock_exact_mm();
     let mut authority = drain_exact_mm(
-        barrier,
+        &barrier,
         mm,
         Some(coordinator),
         census,
@@ -830,7 +832,7 @@ pub(crate) enum ForeignCowInvalidationError {
 }
 
 pub(super) fn acquire_frame_cow_quiesce(
-    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
     census: &crate::kernel::GuestExecutorCensus,
     tid: ThreadId,
@@ -841,7 +843,7 @@ pub(super) fn acquire_frame_cow_quiesce(
 
 #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
 pub(super) fn acquire_foreign_mm_mutation_quiesce(
-    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
     census: &crate::kernel::GuestExecutorCensus,
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
@@ -878,7 +880,7 @@ pub(super) fn acquire_foreign_mm_mutation_quiesce(
 }
 
 fn acquire_frame_cow_quiesce_inner(
-    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
     census: &crate::kernel::GuestExecutorCensus,
     mutation_coordinator: Option<Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>>,
@@ -2128,6 +2130,7 @@ where
             guest_executors: child_kernel.dispatcher.mm_executor_census(),
             tid: child_tid,
             identity: cow_identity,
+            pt_quiesce: child_kernel.dispatcher.pt_quiesce(),
         });
         let child_token = Arc::clone(&cow_authority)
             .issue_hvpatch_child_token(&child_context)
@@ -2444,7 +2447,7 @@ mod pt_pause_tests {
     }
 
     fn acquire_mutation_pause_for_test<'participant>(
-        barrier: &'static crate::fork_quiesce::PtQuiesce,
+        barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
         participation: &'participant mut crate::kernel::GuestExecutorParticipation,
         tid: ThreadId,
         mm: crate::kernel::MmId,
@@ -2459,7 +2462,7 @@ mod pt_pause_tests {
     #[test]
     fn foreign_cow_active_target_acks_then_inactive_caller_resident_defers_to_reentry() {
         let _test_lock = foreign_cow_handshake_test_lock();
-        let barrier = pt_barrier();
+        let barrier = Arc::clone(pt_barrier());
         assert!(!barrier.is_quiescing());
         let registry = Arc::new(GenericVcpuRegistry::new());
         let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
@@ -2492,6 +2495,7 @@ mod pt_pause_tests {
             coordinator,
             Arc::clone(&census),
             Arc::clone(&stage1),
+            Arc::clone(&barrier),
         );
         let identity = stage1.foreign_stage1_identity(mm);
         let worker_stage1 = Arc::clone(&stage1);
@@ -2572,6 +2576,7 @@ mod pt_pause_tests {
             coordinator,
             census,
             Arc::clone(&stage1),
+            Arc::clone(pt_barrier()),
         );
         let identity = stage1.foreign_stage1_identity(mm);
 
@@ -2602,8 +2607,7 @@ mod pt_pause_tests {
 
     #[test]
     fn mm_mutation_alias_waiter_cannot_enter_inner_before_real_pt_pause() {
-        let barrier: &'static crate::fork_quiesce::PtQuiesce =
-            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
         let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
         let mut first_executor = enter_for_test(&census, &registry, tid(1591));
@@ -2612,7 +2616,7 @@ mod pt_pause_tests {
         let coordinator = Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm));
 
         let mut outer = acquire_mutation_pause_for_test(
-            barrier,
+            &barrier,
             &mut first_executor,
             tid(1591),
             mm,
@@ -2628,12 +2632,13 @@ mod pt_pause_tests {
         let alias = coordinator.begin_alias(&permit);
 
         let worker_coordinator = Arc::clone(&coordinator);
+        let worker_barrier = Arc::clone(&barrier);
         let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
             attempted_tx.send(()).expect("announce outer acquisition");
             let mut outer = acquire_mutation_pause_for_test(
-                barrier,
+                &worker_barrier,
                 &mut second_executor,
                 tid(1592),
                 mm,
@@ -3136,8 +3141,7 @@ mod pt_pause_tests {
 
     #[test]
     fn pt_pause_timeout_skips_backend_and_resumes_parked_sibling() {
-        let barrier: &'static crate::fork_quiesce::PtQuiesce =
-            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
@@ -3154,16 +3158,17 @@ mod pt_pause_tests {
 
         let resumed = Arc::new(AtomicBool::new(false));
         let sibling_resumed = Arc::clone(&resumed);
+        let sibling_barrier = Arc::clone(&barrier);
         let sibling_thread = std::thread::spawn(move || {
-            while !barrier.is_quiescing() {
+            while !sibling_barrier.is_quiescing() {
                 std::thread::yield_now();
             }
-            barrier.park();
+            sibling_barrier.park();
             sibling_resumed.store(true, Ordering::SeqCst);
         });
         let backend_repoint_calls = AtomicUsize::new(0);
         let result = acquire_pt_pause(
-            barrier,
+            &barrier,
             &mut coordinator_participation,
             coordinator,
             PtPauseBudget {
@@ -3195,8 +3200,7 @@ mod pt_pause_tests {
     /// `park()` was an unbounded `Condvar::wait` with no deadline to re-check.
     #[test]
     fn pt_pause_election_timeout_gives_up_without_disturbing_the_coordinator() {
-        let barrier: &'static crate::fork_quiesce::PtQuiesce =
-            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
@@ -3211,7 +3215,7 @@ mod pt_pause_tests {
         barrier.set_quiescing();
 
         let result = acquire_pt_pause(
-            barrier,
+            &barrier,
             &mut waiter_participation,
             waiter,
             PtPauseBudget {
@@ -3241,8 +3245,7 @@ mod pt_pause_tests {
 
     #[test]
     fn pt_pause_exact_drain_returns_guard_and_allows_backend() {
-        let barrier: &'static crate::fork_quiesce::PtQuiesce =
-            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
@@ -3267,7 +3270,7 @@ mod pt_pause_tests {
 
         assert!(!current_thread_holds_pt_pause());
         let guard = acquire_pt_pause(
-            barrier,
+            &barrier,
             &mut coordinator_participation,
             coordinator,
             PtPauseBudget {
@@ -3291,8 +3294,7 @@ mod pt_pause_tests {
 
     #[test]
     fn nested_frame_cow_borrows_exact_mm_lease_and_extends_real_pause() {
-        let barrier: &'static crate::fork_quiesce::PtQuiesce =
-            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
         let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
         let coordinator = tid(1513);
@@ -3302,7 +3304,7 @@ mod pt_pause_tests {
         );
 
         let outer = acquire_pt_pause(
-            barrier,
+            &barrier,
             &mut participation,
             coordinator,
             PtPauseBudget {
@@ -3312,7 +3314,7 @@ mod pt_pause_tests {
         )
         .expect("outer exact-MM pause");
         let nested = acquire_frame_cow_quiesce(
-            barrier,
+            &barrier,
             mm,
             &census,
             coordinator,
@@ -3334,8 +3336,7 @@ mod pt_pause_tests {
 
     #[test]
     fn exact_mm_pause_drains_distinct_dispatcher_registries_and_blocks_admission() {
-        let barrier: &'static crate::fork_quiesce::PtQuiesce =
-            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
         let coordinator_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
         let child_registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
@@ -3373,9 +3374,10 @@ mod pt_pause_tests {
 
         let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let pause_barrier = Arc::clone(&barrier);
         let pause_worker = std::thread::spawn(move || {
             let guard = acquire_pt_pause(
-                barrier,
+                &pause_barrier,
                 &mut coordinator,
                 coordinator_tid,
                 PtPauseBudget {
@@ -3436,8 +3438,7 @@ mod pt_pause_tests {
 
     #[test]
     fn standalone_frame_cow_sole_witness_blocks_exact_mm_admission() {
-        let barrier: &'static crate::fork_quiesce::PtQuiesce =
-            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let census = Arc::new(crate::kernel::GuestExecutorCensus::default());
         let registry: Arc<dyn VcpuRegistry> = Arc::new(GenericVcpuRegistry::new());
         let _existing = census
@@ -3445,7 +3446,7 @@ mod pt_pause_tests {
             .expect("existing frame-COW executor");
 
         let guard = acquire_frame_cow_quiesce(
-            barrier,
+            &barrier,
             crate::kernel::MmId::from_registry_allocation(std::num::NonZeroU64::new(1531).unwrap()),
             &census,
             tid(1531),
@@ -3489,10 +3490,9 @@ mod pt_pause_tests {
                 < production.find("engine.next_syscall()").unwrap(),
             "production must re-check the pause after publishing in-guest and before engine entry"
         );
-        let barrier: &'static crate::fork_quiesce::PtQuiesce =
-            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         begin_pt_pause(
-            barrier,
+            &barrier,
             tid(1541),
             PtPauseBudget {
                 election: Duration::from_secs(1),
@@ -3502,9 +3502,10 @@ mod pt_pause_tests {
         .expect("raise page-table pause");
         let in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
         let worker_flag = Arc::clone(&in_guest);
+        let worker_barrier = Arc::clone(&barrier);
         let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
-            let entered = enter_guest_or_park(&worker_flag, barrier);
+            let entered = enter_guest_or_park(&worker_flag, &worker_barrier);
             completed_tx
                 .send(entered)
                 .expect("announce re-entry result");
@@ -3543,8 +3544,7 @@ mod pt_pause_tests {
     /// complete (here the sibling never leaves, so it is a clean timeout).
     #[test]
     fn pt_pause_drain_sees_a_sibling_that_reregistered_after_a_block() {
-        let barrier: &'static crate::fork_quiesce::PtQuiesce =
-            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let barrier = Arc::new(crate::fork_quiesce::PtQuiesce::new());
         let registry = Arc::new(GenericVcpuRegistry::new());
         // Recorded into `pt-pause-begin` beside the waiting lease identity; these
         // tests exercise the DRAIN, which reads the registry.
@@ -3568,7 +3568,7 @@ mod pt_pause_tests {
         sibling_in_guest.enter_guest();
 
         let result = acquire_pt_pause(
-            barrier,
+            &barrier,
             &mut coordinator_participation,
             coordinator,
             PtPauseBudget {

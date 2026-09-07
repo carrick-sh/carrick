@@ -115,6 +115,7 @@ pub struct Mm {
     io_uring_mappings: RwLock<Vec<crate::dispatch::ioring::IoUringMapping>>,
     legacy_aio_contexts: RwLock<BTreeSet<crate::dispatch::LegacyAioContextId>>,
     next_legacy_aio_context: AtomicU64,
+    pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
     revision: ObjectRevision,
 }
 
@@ -131,6 +132,7 @@ impl Mm {
             io_uring_mappings: RwLock::new(Vec::new()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
+            pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             revision: ObjectRevision::new(),
         }
     }
@@ -144,6 +146,7 @@ impl Mm {
             io_uring_mappings: RwLock::new(Vec::new()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
+            pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             revision: ObjectRevision::new(),
         }
     }
@@ -158,6 +161,7 @@ impl Mm {
             io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
+            pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             revision: ObjectRevision::new(),
         }
     }
@@ -171,8 +175,13 @@ impl Mm {
             io_uring_mappings: RwLock::new(parent.io_uring_mappings.read().clone()),
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
+            pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             revision: ObjectRevision::new(),
         }
+    }
+
+    pub fn pt_quiesce(&self) -> &Arc<carrick_thread::fork_quiesce::PtQuiesce> {
+        &self.pt_quiesce
     }
 
     #[cfg(test)]

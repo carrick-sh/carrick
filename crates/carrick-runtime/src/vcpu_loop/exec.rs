@@ -1830,6 +1830,7 @@ where
                         mm: committed_mm.raw(),
                         asid: binding.asid.raw(),
                     },
+                    pt_quiesce: kernel.dispatcher.pt_quiesce(),
                 });
             engine.bind_frame_cow(
                 authority,

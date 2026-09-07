@@ -2461,6 +2461,7 @@ pub(crate) mod tests {
                     Arc::new(crate::dispatch::mm_mutation::MmMutationCoordinator::new(mm)),
                     Arc::new(crate::kernel::GuestExecutorCensus::default()),
                     stage1,
+                    Arc::clone(child.shared().mm().pt_quiesce()),
                 ),
             );
         (child, backend, owner_generation, bytes, counters)
@@ -3063,6 +3064,7 @@ pub(crate) mod tests {
         let entered =
             crate::vcpu_loop::quiesce::enter_hvpatch_guest_or_service_invalidation_for_test(
                 &in_guest,
+                fixture.dispatch_mm.pt_quiesce().as_ref(),
                 caller_tid,
                 caller_executor,
                 &binding,
@@ -3136,6 +3138,8 @@ pub(crate) mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
         let hardware_calls = Arc::new(AtomicUsize::new(0));
         let worker_calls = Arc::clone(&hardware_calls);
+        let target_quiesce = Arc::clone(fixture.dispatch_mm.pt_quiesce());
+        let worker_quiesce = Arc::clone(&target_quiesce);
         let worker = std::thread::spawn(move || {
             let _participation = census
                 .enter_with_pause_endpoint(None, endpoint, active_tid)
@@ -3143,7 +3147,7 @@ pub(crate) mod tests {
             in_guest.enter_guest();
             ready_tx.send(()).expect("publish active target entry");
             let deadline = Instant::now() + Duration::from_secs(1);
-            while !crate::vcpu_loop::quiesce::pt_barrier().is_quiescing() {
+            while !worker_quiesce.is_quiescing() {
                 assert!(
                     Instant::now() < deadline,
                     "production target pause was never raised"
@@ -3153,6 +3157,7 @@ pub(crate) mod tests {
             let entered =
                 crate::vcpu_loop::quiesce::enter_hvpatch_guest_or_service_invalidation_for_test(
                     &in_guest,
+                    &worker_quiesce,
                     active_tid,
                     active_executor,
                     &binding,
