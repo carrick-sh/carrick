@@ -146,6 +146,7 @@ pub(super) struct EventFdState {
     local: std::sync::atomic::AtomicU64,
     pub(super) read_fd: Option<HostFdRef>,
     pub(super) write_fd: Option<HostFdRef>,
+    pub(super) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 
 impl EventFdState {
@@ -164,6 +165,7 @@ impl EventFdState {
             local: std::sync::atomic::AtomicU64::new(counter),
             read_fd,
             write_fd,
+            wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
         }
     }
 
@@ -217,6 +219,7 @@ pub(super) struct TimerFdState {
     /// re-evaluated from poll/epoll paths that carry no `KernelContext`, so
     /// the domain is captured here rather than looked up per evaluation.
     pub(super) clock: std::sync::Arc<crate::kernel::container::ClockDomain>,
+    pub(super) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 
 impl TimerFdState {
@@ -233,6 +236,7 @@ impl TimerFdState {
             }),
             changed: Condvar::new(),
             clock,
+            wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
         }
     }
 }
@@ -1420,6 +1424,20 @@ impl OpenDescription {
         }
     }
 
+    /// Return the wait queue embedded in this description, if it is a Carrick-owned
+    /// readiness publisher (pipe, eventfd, timerfd, in-memory socket).
+    pub(crate) fn wait_queue(&self) -> Option<Arc<crate::kernel::WaitQueue>> {
+        match self {
+            Self::PipeReader { pipe, .. } | Self::PipeWriter { pipe, .. } => {
+                Some(Arc::clone(&pipe.wait_queue))
+            }
+            Self::EventFd { state, .. } => Some(Arc::clone(&state.wait_queue)),
+            Self::TimerFd { state, .. } => Some(Arc::clone(&state.wait_queue)),
+            Self::InMemorySocket { socket, .. } => Some(Arc::clone(&socket.wait_queue)),
+            _ => None,
+        }
+    }
+
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     #[allow(dead_code)]
     pub(super) fn reexec_kind_name(&self) -> &'static str {
@@ -2130,6 +2148,23 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             }
             _ => Err(crate::kernel::objects::PipeCapacityMutationError::NotPipe),
         }
+    }
+
+    fn wait_queue(&self) -> Option<Arc<crate::kernel::WaitQueue>> {
+        self.read().wait_queue()
+    }
+
+    fn timerfd_remaining_timeout(&self) -> Option<std::time::Duration> {
+        let open = self.read();
+        if let OpenDescription::TimerFd { state, .. } = &*open {
+            let timer = state.inner.lock();
+            if let Some(deadline) = timer.deadline {
+                let now = super::linux_clock_duration(&state.clock, timer.clock_id)
+                    .unwrap_or(std::time::Duration::ZERO);
+                return Some(deadline.saturating_sub(now));
+            }
+        }
+        None
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

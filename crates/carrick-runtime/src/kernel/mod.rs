@@ -24,6 +24,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod snapshot;
 pub(crate) mod tty;
+pub mod wait_set;
 
 #[cfg(test)]
 mod tests;
@@ -125,3 +126,4 @@ pub use snapshot::{
     ThreadResourcesSnapshotRow, ThreadSignalSnapshotRow, ThreadSnapshotClass, ThreadSnapshotRow,
     VmaSnapshotRow, ZombieSnapshotRow,
 };
+pub use wait_set::{WaitEnrollment, WaitQueue, WaitSet, WaitSetOutcome};

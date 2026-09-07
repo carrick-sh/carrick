@@ -91,6 +91,7 @@ pub struct PureSocketInner {
     pub(crate) protocol: i32,
     pub(crate) state: Mutex<PureSocketState>,
     pub(crate) changed: Condvar,
+    pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 
 impl std::fmt::Debug for PureSocketInner {
@@ -107,6 +108,11 @@ pub(crate) type UnixSocketState = PureSocketState;
 pub(crate) type UnixSocketInner = PureSocketInner;
 
 impl PureSocketInner {
+    pub(crate) fn notify_waiters(&self) {
+        self.changed.notify_all();
+        self.wait_queue.wake_all();
+    }
+
     pub(crate) fn new(socket_type: i32, creds: LinuxUcred) -> Arc<Self> {
         Self::new_with_family(LINUX_AF_UNIX, socket_type, 0, creds)
     }
@@ -146,6 +152,7 @@ impl PureSocketInner {
                 request_buf: Vec::new(),
             }),
             changed: Condvar::new(),
+            wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
         })
     }
 
@@ -187,6 +194,7 @@ impl PureSocketInner {
                 request_buf: Vec::new(),
             }),
             changed: Condvar::new(),
+            wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
         })
     }
 
@@ -244,7 +252,7 @@ impl PureSocketInner {
                 }
             }
         }
-        self.changed.notify_all();
+        self.notify_waiters();
     }
 
     pub(crate) fn buffered_bytes(&self) -> usize {
@@ -265,7 +273,7 @@ impl PureSocketInner {
 
     pub(crate) fn set_so_error(&self, err: i32) {
         self.state.lock().so_error = Some(err);
-        self.changed.notify_all();
+        self.notify_waiters();
     }
 
     pub(crate) fn set_rcvtimeo(&self, dur: Option<Duration>) {
@@ -312,7 +320,7 @@ impl PureSocketInner {
         };
 
         state.bound_addr = Some(bound);
-        self.changed.notify_all();
+        self.notify_waiters();
         Ok(())
     }
 
@@ -323,7 +331,7 @@ impl PureSocketInner {
         }
         state.listening = true;
         state.backlog_limit = backlog.max(0) as usize;
-        self.changed.notify_all();
+        self.notify_waiters();
         Ok(())
     }
 
@@ -385,7 +393,7 @@ impl PureSocketInner {
         }
 
         target_state.accept_queue.push_back(server_side);
-        target.changed.notify_all();
+        target.notify_waiters();
         Ok(())
     }
 
@@ -453,7 +461,7 @@ impl PureSocketInner {
             }
 
             drop(state);
-            self.changed.notify_all();
+            self.notify_waiters();
             return Ok(to_write);
         }
 
@@ -484,7 +492,7 @@ impl PureSocketInner {
         if !rights.is_empty() {
             peer_state.stream_rights.extend(rights);
         }
-        peer_arc.changed.notify_all();
+        peer_arc.notify_waiters();
         Ok(to_write)
     }
 
@@ -530,7 +538,7 @@ impl PureSocketInner {
         }
 
         if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
-            peer.changed.notify_all();
+            peer.notify_waiters();
         }
 
         Ok((to_read, rights))
@@ -586,7 +594,7 @@ impl PureSocketInner {
             rights,
         });
 
-        target.changed.notify_all();
+        target.notify_waiters();
         Ok(len)
     }
 
@@ -616,9 +624,9 @@ impl PureSocketInner {
         }
 
         if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
-            peer.changed.notify_all();
+            peer.notify_waiters();
         }
-        self.changed.notify_all();
+        self.notify_waiters();
         Ok(())
     }
 
@@ -694,7 +702,7 @@ impl Drop for PureSocketInner {
             rec.completed = true;
         }
         if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
-            peer.changed.notify_all();
+            peer.notify_waiters();
         }
     }
 }

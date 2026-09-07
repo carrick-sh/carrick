@@ -9979,7 +9979,7 @@ fn dynamic_cpu_clock(clock_id: u64) -> Option<DynamicCpuClock> {
     }
 }
 
-fn linux_clock_duration(
+pub(super) fn linux_clock_duration(
     clock: &crate::kernel::container::ClockDomain,
     clock_id: u64,
 ) -> Option<Duration> {
@@ -11147,6 +11147,7 @@ fn read_eventfd(
             current as u32 as i32,
             (current - taken) as u32 as i32,
         );
+        state.wait_queue.wake_all();
         return DispatchOutcome::Returned {
             value: core::mem::size_of::<LinuxEventfdValue>() as i64,
         };
@@ -11207,6 +11208,7 @@ fn write_eventfd(this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) -
             }
             this.notify_inmem_epoll();
         }
+        state.wait_queue.wake_all();
         return DispatchOutcome::Returned {
             value: core::mem::size_of::<LinuxEventfdValue>() as i64,
         };
