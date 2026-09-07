@@ -32963,7 +32963,7 @@ fn mutate_external_alias_state_in<R>(
             eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
             std::process::abort();
         });
-        let base = replay_rows_for_ipa(&replay, physical_ipa);
+        let base = replay_rows_for_ipa(replay, physical_ipa);
         for id in reset_replay_chain(&mut versions.replays, physical_ipa, base) {
             versions.replay_version_owner.remove(&id);
         }
