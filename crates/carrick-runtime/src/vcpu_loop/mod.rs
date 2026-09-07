@@ -549,6 +549,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         Ok(self.kernel.frame_inventory().frame_mapping_count(frame))
     }
 
+    #[allow(clippy::type_complexity)]
     fn retirement_batch_query(
         &self,
         candidate_extents: &[(
