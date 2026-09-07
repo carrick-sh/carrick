@@ -223,7 +223,7 @@ impl DentryCache {
             .ok()
             .or_else(|| std::env::var("CARRICK_DENTRY_LRU_EVICT").ok())
             .or_else(|| std::env::var("CARRICK_DENTRY_PER_ENTRY_EVICT").ok())
-            .map_or(true, |v| v != "0");
+            .is_none_or(|v| v != "0");
 
         let capacity_bytes = std::env::var("CARRICK_DENTRY_CACHE_CAPACITY_BYTES")
             .ok()
@@ -1099,7 +1099,9 @@ impl DentryCache {
                 }
 
                 // Evict this leaf directory
-                let dir = dirs.remove(&dir_id).unwrap();
+                let Some(dir) = dirs.remove(&dir_id) else {
+                    continue;
+                };
                 let dir_bytes = dir_entry_approx_bytes(&dir);
                 self.sub_approx_bytes(dir_bytes);
 
