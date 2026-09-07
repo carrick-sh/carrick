@@ -661,8 +661,9 @@ pub(super) fn publish(
                         applevisor::memory::MemPerms::ReadWrite,
                         &mut extension_regions,
                     )?;
-                    let page_table_resolver =
-                        context.state.pinned_stage1_arenas(&context.custody)?;
+                    let page_table_resolver = context
+                        .state
+                        .pinned_stage1_arenas(&context.custody, editor.base())?;
                     unsafe { editor.sync_to_host(&page_table_resolver) }.map_err(|e| {
                         TrapError::Hypervisor(format!(
                             "sparse HVPatch mmap sync_to_host failed: {e:?}"
@@ -709,7 +710,9 @@ pub(super) fn publish(
                 ))
             },
             |editor| {
-                let resolver = context.state.pinned_stage1_arenas(&context.custody)?;
+                let resolver = context
+                    .state
+                    .pinned_stage1_arenas(&context.custody, editor.base())?;
                 // The owned resolver drops its pins before retirement. Exact-MM
                 // exclusion remains held through descriptor restore and TLBI.
                 unsafe {
@@ -897,8 +900,9 @@ pub(super) fn publish(
 /// Retain exact structural owners and stage-2 pins for a complete table edit.
 /// Raw pointers remain valid even if another holder requests retirement.
 struct PinnedStage1Arenas {
-    owners:
+    structural:
         std::collections::BTreeMap<u64, (std::sync::Arc<StructuralBackingOwner>, CarrierStage2Pin)>,
+    relocated_primary: Option<(u64, GlobalFrameOwnerPin)>,
 }
 impl carrick_mem::page_table::HostArenaResolver for PinnedStage1Arenas {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
@@ -912,10 +916,18 @@ impl carrick_mem::page_table::HostArenaResolver for PinnedStage1Arenas {
 }
 impl carrick_mem::page_table::HostArenaResolver for &PinnedStage1Arenas {
     fn host_ptr_for_base(&self, base: u64) -> Option<*mut u8> {
-        self.owners.get(&base).map(|(owner, _)| owner.ptr())
+        self.structural
+            .get(&base)
+            .map(|(owner, _)| owner.ptr())
+            .or_else(|| {
+                self.relocated_primary
+                    .as_ref()
+                    .filter(|(primary, _)| *primary == base)
+                    .map(|(_, pin)| pin.owner().as_ptr())
+            })
     }
     fn record_populated_prefix(&self, base: u64, prefix: usize) {
-        if let Some((owner, _)) = self.owners.get(&base) {
+        if let Some((owner, _)) = self.structural.get(&base) {
             owner.record_populated_prefix(prefix);
         }
     }
@@ -963,8 +975,9 @@ impl MmAccessState {
     fn pinned_stage1_arenas(
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
+        primary_base: u64,
     ) -> Result<PinnedStage1Arenas, TrapError> {
-        let mut owners = std::collections::BTreeMap::new();
+        let mut structural = std::collections::BTreeMap::new();
         for (&(base, size), owner) in self.structural_owners.read().iter() {
             // Boot primary tables use 0x1c0000 bytes, while reusable roots
             // and extension arenas retain complete 2 MiB structural owners.
@@ -980,9 +993,42 @@ impl MmAccessState {
                 .map_err(|error| {
                     TrapError::Hypervisor(format!("pin exact stage-1 arena: {error:?}"))
                 })?;
-            owners.insert(base, (std::sync::Arc::clone(owner), pin));
+            structural.insert(base, (std::sync::Arc::clone(owner), pin));
         }
-        Ok(PinnedStage1Arenas { owners })
+        // A later container's bootstrap root is relocated through the same
+        // global-frame plan as exec. Its primary table therefore has a live
+        // global-frame owner rather than a StructuralBackingOwner, while all
+        // extension arenas remain structural. Pin the exact current global
+        // owner so retirement or IPA reuse cannot invalidate this edit.
+        let mut relocated_primary = None;
+        if !structural.contains_key(&primary_base) {
+            for length in [carrick_mem::memory::LINUX_PAGE_TABLES_SIZE, 2 * 1024 * 1024] {
+                let Some((host_addr, generation)) =
+                    global_frame_host_owner_identity_in(custody, primary_base, length)
+                else {
+                    continue;
+                };
+                let pin = pin_exact_live_global_frame_owner_in(
+                    custody,
+                    primary_base,
+                    length,
+                    host_addr,
+                    generation,
+                )
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "relocated stage-1 primary owner changed while acquiring its pin"
+                            .to_owned(),
+                    )
+                })?;
+                relocated_primary = Some((primary_base, pin));
+                break;
+            }
+        }
+        Ok(PinnedStage1Arenas {
+            structural,
+            relocated_primary,
+        })
     }
 }
 
@@ -999,6 +1045,44 @@ mod arena_pin_tests {
     #[test]
     fn publication_resolver_pins_exact_full_slot_until_edit_finishes() {
         check_pinned_arena(2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn publication_resolver_pins_relocated_root_global_owner() {
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let carrier_generation = custody.begin_create().unwrap();
+        custody.commit_create(carrier_generation).unwrap();
+        let base = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x4000_0000;
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .unwrap();
+        let pointer = host.as_ptr();
+        let mut lease = GlobalFrameStage2Lease::fixed(base, size as u64);
+        lease.mark_test_mapped_without_backend();
+        register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            host,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .unwrap();
+        let state = MmAccessState::new(
+            carrick_aarch64::Stage1Authority::new(),
+            std::sync::Arc::new(MemoryProtections::default()),
+            std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        );
+
+        let resolver = state.pinned_stage1_arenas(&custody, base).unwrap();
+        assert_eq!(
+            (&resolver).host_ptr_for_base(base),
+            Some(pointer),
+            "a carrier-reuse root allocated in the global-frame arena must remain writable by its MM's page-table publisher",
+        );
     }
 
     #[test]
@@ -1217,8 +1301,8 @@ mod arena_pin_tests {
         let wrong_custody = std::sync::Arc::new(CarrierVmCustody::new());
         let other_generation = wrong_custody.begin_create().unwrap();
         wrong_custody.commit_create(other_generation).unwrap();
-        assert!(state.pinned_stage1_arenas(&wrong_custody).is_err());
-        let resolver = state.pinned_stage1_arenas(&custody).unwrap();
+        assert!(state.pinned_stage1_arenas(&wrong_custody, base).is_err());
+        let resolver = state.pinned_stage1_arenas(&custody, base).unwrap();
         assert_eq!((&resolver).host_ptr_for_base(base), Some(pointer));
         assert_eq!((&resolver).host_ptr_for_base(base + size as u64), None);
         assert_eq!(
