@@ -51,8 +51,8 @@ use std::time::Duration;
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::linux_abi::{
-    LINUX_EFBIG, LINUX_S_IFCHR, LINUX_S_IFIFO, LINUX_S_IFMT, LINUX_S_IFREG, LINUX_S_IFSOCK,
-    LinuxEpollEvent,
+    LINUX_EFBIG, LINUX_EINVAL, LINUX_EOVERFLOW, LINUX_S_IFCHR, LINUX_S_IFIFO, LINUX_S_IFMT,
+    LINUX_S_IFREG, LINUX_S_IFSOCK, LinuxEpollEvent,
 };
 use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
@@ -537,16 +537,6 @@ pub(super) fn create_unlinked_host_file(prefix: &str) -> Option<std::os::fd::Own
     Some(owned)
 }
 
-fn host_file_len(fd: &std::os::fd::OwnedFd) -> usize {
-    use std::os::fd::AsRawFd;
-    let mut st: libc::stat = unsafe { core::mem::zeroed() };
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0 {
-        usize::try_from(st.st_size).unwrap_or(0)
-    } else {
-        0
-    }
-}
-
 impl FileContents {
     pub(super) fn dense(bytes: Vec<u8>) -> Self {
         Self::Dense(bytes)
@@ -586,131 +576,156 @@ impl FileContents {
         Self::RootFsBacked { base, dirty, len }
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(super) fn len(&self) -> Result<u64, LinuxErrno> {
         match self {
-            Self::Dense(bytes) => bytes.len(),
-            Self::RootFsBacked { len, .. } => *len,
-            Self::HostBacked { fd } => host_file_len(fd),
+            Self::Dense(bytes) => Ok(bytes.len() as u64),
+            Self::RootFsBacked { len, .. } => Ok(*len as u64),
+            Self::HostBacked { fd } => {
+                use std::os::fd::AsRawFd;
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0 {
+                    if st.st_size < 0 {
+                        return Err(LINUX_EINVAL);
+                    }
+                    u64::try_from(st.st_size).map_err(|_| LINUX_EOVERFLOW)
+                } else {
+                    let errno = std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO);
+                    Err(crate::host_to_linux_errno(errno))
+                }
+            }
         }
     }
 
-    pub(super) fn read_at(&self, offset: usize, length: usize) -> Vec<u8> {
+    pub(super) fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, LinuxErrno> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         match self {
             Self::HostBacked { fd } => {
                 use std::os::fd::AsRawFd;
-                let Ok(start) = libc::off_t::try_from(offset) else {
-                    return Vec::new();
-                };
-                let mut out = vec![0u8; length];
+                let start = libc::off_t::try_from(offset).map_err(|_| LINUX_EINVAL)?;
                 let mut filled = 0usize;
-                while filled < length {
+                while filled < buf.len() {
                     let n = unsafe {
                         libc::pread(
                             fd.as_raw_fd(),
-                            out[filled..].as_mut_ptr().cast(),
-                            length - filled,
+                            buf[filled..].as_mut_ptr().cast(),
+                            buf.len() - filled,
                             start.saturating_add(filled as libc::off_t),
                         )
                     };
-                    if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
-                    {
-                        continue;
+                    if n < 0 {
+                        let errno = std::io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or(libc::EIO);
+                        if errno == libc::EINTR {
+                            continue;
+                        }
+                        if filled > 0 {
+                            return Ok(filled);
+                        }
+                        return Err(crate::host_to_linux_errno(errno));
                     }
-                    if n <= 0 {
+                    if n == 0 {
                         break;
                     }
                     filled += n as usize;
                 }
-                out.truncate(filled);
-                out
+                Ok(filled)
             }
-            Self::Dense(bytes) => bytes
-                .get(offset..)
-                .unwrap_or_default()
-                .iter()
-                .take(length)
-                .copied()
-                .collect(),
+            Self::Dense(bytes) => {
+                let Ok(offset_usize) = usize::try_from(offset) else {
+                    return Ok(0);
+                };
+                let available = bytes.get(offset_usize..).unwrap_or(&[]);
+                let copy_len = available.len().min(buf.len());
+                buf[..copy_len].copy_from_slice(&available[..copy_len]);
+                Ok(copy_len)
+            }
             Self::RootFsBacked { base, dirty, len } => {
-                if offset >= *len || length == 0 {
-                    return Vec::new();
+                let Ok(offset_usize) = usize::try_from(offset) else {
+                    return Ok(0);
+                };
+                if offset_usize >= *len {
+                    return Ok(0);
                 }
-                let read_len = length.min(*len - offset);
-                let mut out = vec![0; read_len];
-                if offset < base.len() {
-                    let base_len = read_len.min(base.len() - offset);
-                    out[..base_len].copy_from_slice(&base[offset..offset + base_len]);
+                let read_len = buf.len().min(*len - offset_usize);
+                buf[..read_len].fill(0);
+                if offset_usize < base.len() {
+                    let base_len = read_len.min(base.len() - offset_usize);
+                    buf[..base_len].copy_from_slice(&base[offset_usize..offset_usize + base_len]);
                 }
-                let end = offset + read_len;
+                let end = offset_usize + read_len;
                 for (&start, bytes) in dirty.range(..end) {
                     let dirty_end = start.saturating_add(bytes.len());
-                    if dirty_end <= offset {
+                    if dirty_end <= offset_usize {
                         continue;
                     }
-                    let copy_start = start.max(offset);
+                    let copy_start = start.max(offset_usize);
                     let copy_end = dirty_end.min(end);
-                    let dst_start = copy_start - offset;
+                    let dst_start = copy_start - offset_usize;
                     let src_start = copy_start - start;
                     let copy_len = copy_end - copy_start;
-                    out[dst_start..dst_start + copy_len]
+                    buf[dst_start..dst_start + copy_len]
                         .copy_from_slice(&bytes[src_start..src_start + copy_len]);
                 }
-                out
+                Ok(read_len)
             }
         }
     }
 
-    pub(super) fn to_vec(&self) -> Vec<u8> {
-        self.read_at(0, self.len())
-    }
-
-    pub(super) fn resize(&mut self, new_len: usize) {
+    pub(super) fn resize(&mut self, new_len: u64) -> Result<(), LinuxErrno> {
+        let new_len_usize = usize::try_from(new_len).map_err(|_| LINUX_EFBIG)?;
+        if !self.accepts_len(new_len) {
+            return Err(LINUX_EFBIG);
+        }
         match self {
-            Self::Dense(bytes) => bytes.resize(new_len, 0),
+            Self::Dense(bytes) => {
+                bytes.resize(new_len_usize, 0);
+                Ok(())
+            }
             Self::RootFsBacked { dirty, len, .. } => {
-                *len = new_len;
-                prune_dirty_ranges(dirty, new_len);
+                *len = new_len_usize;
+                prune_dirty_ranges(dirty, new_len_usize);
+                Ok(())
             }
             Self::HostBacked { fd } => {
                 use std::os::fd::AsRawFd;
-                if let Ok(len) = libc::off_t::try_from(new_len) {
-                    unsafe { libc::ftruncate(fd.as_raw_fd(), len) };
+                let off = libc::off_t::try_from(new_len).map_err(|_| LINUX_EFBIG)?;
+                let ret = unsafe { libc::ftruncate(fd.as_raw_fd(), off) };
+                if ret != 0 {
+                    let errno = std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO);
+                    return Err(crate::host_to_linux_errno(errno));
                 }
+                Ok(())
             }
         }
     }
 
-    pub(super) fn truncate(&mut self, new_len: usize) {
-        match self {
-            Self::Dense(bytes) => bytes.truncate(new_len),
-            Self::RootFsBacked { dirty, len, .. } => {
-                *len = (*len).min(new_len);
-                prune_dirty_ranges(dirty, *len);
-            }
-            Self::HostBacked { .. } => {
-                if new_len < self.len() {
-                    self.resize(new_len);
-                }
-            }
+    pub(super) fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, LinuxErrno> {
+        if data.is_empty() {
+            return Ok(0);
         }
-    }
-
-    pub(super) fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), LinuxErrno> {
-        let end = offset.checked_add(bytes.len()).ok_or(LINUX_EFBIG)?;
+        let offset_usize = usize::try_from(offset).map_err(|_| LINUX_EFBIG)?;
+        let end = offset_usize.checked_add(data.len()).ok_or(LINUX_EFBIG)?;
         if !self.accepts_len(end as u64) {
-            return Err(crate::linux_abi::LINUX_EFBIG);
+            return Err(LINUX_EFBIG);
         }
         match self {
             Self::HostBacked { fd } => {
                 use std::os::fd::AsRawFd;
                 let start = libc::off_t::try_from(offset).map_err(|_| LINUX_EFBIG)?;
                 let mut written = 0usize;
-                while written < bytes.len() {
+                while written < data.len() {
                     let n = unsafe {
                         libc::pwrite(
                             fd.as_raw_fd(),
-                            bytes[written..].as_ptr().cast(),
-                            bytes.len() - written,
+                            data[written..].as_ptr().cast(),
+                            data.len() - written,
                             start.saturating_add(written as libc::off_t),
                         )
                     };
@@ -721,25 +736,33 @@ impl FileContents {
                         if errno == libc::EINTR {
                             continue;
                         }
+                        if written > 0 {
+                            return Ok(written);
+                        }
                         return Err(crate::host_to_linux_errno(errno));
+                    }
+                    if n == 0 {
+                        break;
                     }
                     written += n as usize;
                 }
+                Ok(written)
             }
             Self::Dense(contents) => {
                 if end > contents.len() {
                     contents.resize(end, 0);
                 }
-                contents[offset..end].copy_from_slice(bytes);
+                contents[offset_usize..end].copy_from_slice(data);
+                Ok(data.len())
             }
             Self::RootFsBacked { dirty, len, .. } => {
                 if end > *len {
                     *len = end;
                 }
-                insert_dirty_range(dirty, offset, bytes)?;
+                insert_dirty_range(dirty, offset_usize, data)?;
+                Ok(data.len())
             }
         }
-        Ok(())
     }
 }
 
@@ -2611,4 +2634,216 @@ pub(crate) fn closed_test_description() -> Arc<crate::kernel::FileDescription> {
         )
         .expect("closed description"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::{
+        CompatReporter, DispatchOutcome, LinearMemory, SyscallArgs, SyscallDispatcher,
+        SyscallRequest,
+    };
+    use crate::linux_abi::{LINUX_EINVAL, LINUX_EISDIR};
+    use std::os::fd::FromRawFd;
+
+    const SYS_READ: u64 = 63;
+    const SYS_FTRUNCATE: u64 = 46;
+
+    #[test]
+    fn fd_table_host_backed_pread_failure_surfaces_errno_in_read() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let reporter = CompatReporter::default();
+
+        let dir_fd = unsafe { libc::open(c".".as_ptr(), libc::O_RDONLY) };
+        assert!(dir_fd >= 0);
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dir_fd) };
+        let desc = OpenDescription::File {
+            path: "/dir_file".to_string(),
+            contents: FileContents::host_backed(owned),
+            offset: 0,
+            writable: false,
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/dir_file"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 0,
+            },
+            base: OpenDescriptionBase::new(0),
+        };
+        let outcome = dispatcher.install_fd(desc, 0);
+        let fd = match outcome {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("install_fd failed: {other:?}"),
+        };
+
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let read_outcome = dispatcher
+            .dispatch(
+                &kernel,
+                SyscallRequest::new(SYS_READ, SyscallArgs([fd as u64, 0x1000, 16, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(read_outcome, DispatchOutcome::errno(LINUX_EISDIR));
+    }
+
+    #[test]
+    fn fd_table_host_backed_resize_failure_surfaces_errno_in_ftruncate() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let reporter = CompatReporter::default();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"0123456789").unwrap();
+        let ro_fd = unsafe {
+            libc::open(
+                std::ffi::CString::new(tmp.path().to_str().unwrap())
+                    .unwrap()
+                    .as_ptr(),
+                libc::O_RDONLY,
+            )
+        };
+        assert!(ro_fd >= 0);
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(ro_fd) };
+        let desc = OpenDescription::File {
+            path: "/ro_file".to_string(),
+            contents: FileContents::host_backed(owned),
+            offset: 0,
+            writable: true,
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/ro_file"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 10,
+            },
+            base: OpenDescriptionBase::new(0),
+        };
+        let outcome = dispatcher.install_fd(desc, 0);
+        let fd = match outcome {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("install_fd failed: {other:?}"),
+        };
+
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let trunc_outcome = dispatcher
+            .dispatch(
+                &kernel,
+                SyscallRequest::new(SYS_FTRUNCATE, SyscallArgs([fd as u64, 20, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(trunc_outcome, DispatchOutcome::errno(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn file_contents_dense_lifecycle() {
+        let mut contents = FileContents::dense(b"hello world".to_vec());
+        assert_eq!(contents.len().unwrap(), 11);
+
+        let mut buf = [0u8; 5];
+        assert_eq!(contents.read_at(0, &mut buf).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
+
+        assert_eq!(contents.read_at(6, &mut buf).unwrap(), 5);
+        assert_eq!(&buf, b"world");
+
+        // Read past end
+        assert_eq!(contents.read_at(20, &mut buf).unwrap(), 0);
+
+        // Write
+        assert_eq!(contents.write_at(6, b"there").unwrap(), 5);
+        let mut full_buf = [0u8; 11];
+        assert_eq!(contents.read_at(0, &mut full_buf).unwrap(), 11);
+        assert_eq!(&full_buf, b"hello there");
+
+        // Resize shrink
+        contents.resize(5).unwrap();
+        assert_eq!(contents.len().unwrap(), 5);
+        assert_eq!(contents.read_at(0, &mut buf).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
+
+        // Resize grow
+        contents.resize(8).unwrap();
+        assert_eq!(contents.len().unwrap(), 8);
+        let mut grow_buf = [0u8; 8];
+        assert_eq!(contents.read_at(0, &mut grow_buf).unwrap(), 8);
+        assert_eq!(&grow_buf, b"hello\0\0\0");
+    }
+
+    #[test]
+    fn file_contents_rootfs_backed_lifecycle() {
+        let mut contents = FileContents::shared_backed(
+            std::sync::Arc::from(&b"initial base data"[..]),
+            std::collections::BTreeMap::new(),
+            17,
+        );
+        assert_eq!(contents.len().unwrap(), 17);
+
+        let mut buf = [0u8; 7];
+        assert_eq!(contents.read_at(0, &mut buf).unwrap(), 7);
+        assert_eq!(&buf, b"initial");
+
+        // Write overlay
+        assert_eq!(contents.write_at(8, b"dirty").unwrap(), 5);
+        let mut full = [0u8; 17];
+        assert_eq!(contents.read_at(0, &mut full).unwrap(), 17);
+        assert_eq!(&full, b"initial dirtydata");
+
+        // Resize shrink
+        contents.resize(10).unwrap();
+        assert_eq!(contents.len().unwrap(), 10);
+        let mut ten = [0u8; 10];
+        assert_eq!(contents.read_at(0, &mut ten).unwrap(), 10);
+        assert_eq!(&ten, b"initial di");
+
+        // Resize grow within base
+        contents.resize(14).unwrap();
+        assert_eq!(contents.len().unwrap(), 14);
+        let mut fourteen = [0u8; 14];
+        assert_eq!(contents.read_at(0, &mut fourteen).unwrap(), 14);
+        assert_eq!(&fourteen, b"initial dise d");
+
+        // Resize grow past base
+        contents.resize(20).unwrap();
+        assert_eq!(contents.len().unwrap(), 20);
+        let mut twenty = [0u8; 20];
+        assert_eq!(contents.read_at(0, &mut twenty).unwrap(), 20);
+        assert_eq!(&twenty, b"initial dise data\0\0\0");
+    }
+
+    #[test]
+    fn file_contents_host_backed_lifecycle() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"host storage data").unwrap();
+        let rw_fd = unsafe {
+            libc::open(
+                std::ffi::CString::new(tmp.path().to_str().unwrap())
+                    .unwrap()
+                    .as_ptr(),
+                libc::O_RDWR,
+            )
+        };
+        assert!(rw_fd >= 0);
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(rw_fd) };
+        let mut contents = FileContents::host_backed(owned);
+
+        assert_eq!(contents.len().unwrap(), 17);
+
+        let mut buf = [0u8; 4];
+        assert_eq!(contents.read_at(0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"host");
+
+        assert_eq!(contents.write_at(5, b"buffer").unwrap(), 6);
+        let mut full = [0u8; 17];
+        assert_eq!(contents.read_at(0, &mut full).unwrap(), 17);
+        assert_eq!(&full, b"host buffere data");
+
+        contents.resize(4).unwrap();
+        assert_eq!(contents.len().unwrap(), 4);
+        assert_eq!(contents.read_at(0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"host");
+    }
 }

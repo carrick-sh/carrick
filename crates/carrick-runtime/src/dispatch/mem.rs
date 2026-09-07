@@ -2960,9 +2960,9 @@ impl SyscallDispatcher {
         let offset_usize = usize::try_from(offset).map_err(|_| linux_errno::EOVERFLOW)?;
         let bus_fault_offset = match &*open {
             OpenDescription::File { contents, .. } => {
-                let available = contents.read_at(offset_usize, length);
-                bytes[..available.len()].copy_from_slice(&available);
-                shared_file_bus_offset(contents.len() as u64, offset, length_u64, page_size)
+                contents.read_at(offset, &mut bytes)?;
+                let file_len = contents.len()?;
+                shared_file_bus_offset(file_len, offset, length_u64, page_size)
             }
             OpenDescription::SyntheticFile { contents, .. } => {
                 if offset_usize < contents.len() {
@@ -5636,18 +5636,24 @@ impl SyscallDispatcher {
                 let offset_usize =
                     usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
                 match &*open {
-                    OpenDescription::File {
-                        contents,
-                        path,
-                        ..
-                    } => {
+                    OpenDescription::File { contents, .. } => {
+                        let file_len = match contents.len() {
+                            Ok(len) => len,
+                            Err(errno) => {
+                                return Ok(request.refused(
+                                    MmapRefusal::Internal(
+                                        "file length lookup failed during mmap populate",
+                                    ),
+                                    errno,
+                                ));
+                            }
+                        };
                         if let Some(bus_offset) = shared_file_bus_offset(
-                                contents.len() as u64,
-                                offset,
-                                length,
-                                page_size,
-                            )
-                        {
+                            file_len,
+                            offset,
+                            length,
+                            page_size,
+                        ) {
                             bus_fault_offset = Some(bus_offset);
                         }
                         if map_sharing == MmapSharing::Shared
@@ -5672,8 +5678,12 @@ impl SyscallDispatcher {
                             writable_memfd_desc =
                                 Some(std::sync::Arc::clone(&open_file.description));
                         }
-                        let available = contents.read_at(offset_usize, length_usize);
-                        bytes[..available.len()].copy_from_slice(&available);
+                        if let Err(errno) = contents.read_at(offset, &mut bytes[..length_usize]) {
+                            return Ok(request.refused(
+                                MmapRefusal::Internal("file read failed during mmap populate"),
+                                errno,
+                            ));
+                        }
                     }
                     OpenDescription::SyntheticFile { contents, path, .. } => {
                         if let Some(bus_offset) = shared_file_bus_offset(
