@@ -358,3 +358,52 @@ mod tests {
         assert!(Arc::ptr_eq(&container.interceptors[1], &second));
     }
 }
+
+/// A trusted interceptor that stretches the scheduling window around the
+/// syscalls a race reproducer names, by sleeping on the executor thread
+/// BEFORE dispatch. It never changes a result: it only lets the rest of the
+/// carrier run while one task sits at its syscall boundary, which is what a
+/// preempted executor looks like under host load — without the host load.
+/// Deterministic given the same syscall stream: the delay for the `n`-th
+/// matching call is `(n * 7919) % (max_micros + 1)` microseconds.
+#[derive(Debug)]
+pub struct SyscallJitter {
+    names: Vec<&'static str>,
+    max_micros: u64,
+    matched: std::sync::atomic::AtomicU64,
+}
+
+impl SyscallJitter {
+    /// Jitter every syscall whose name is in `names` by up to `max_micros`.
+    pub fn new(names: impl IntoIterator<Item = &'static str>, max_micros: u64) -> Self {
+        Self {
+            names: names.into_iter().collect(),
+            max_micros,
+            matched: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// How many syscalls this jitter has stretched so far.
+    pub fn matched(&self) -> u64 {
+        self.matched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl SyscallInterceptor for SyscallJitter {
+    fn intercept(
+        &self,
+        _process: &carrick_runtime::observe::ProcessInfo<'_>,
+        call: &carrick_runtime::observe::InterceptedSyscall<'_>,
+    ) -> carrick_runtime::observe::InterceptAction {
+        if self.names.contains(&call.name()) {
+            let n = self
+                .matched
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let micros = n.wrapping_mul(7919) % (self.max_micros + 1);
+            if micros > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(micros));
+            }
+        }
+        carrick_runtime::observe::InterceptAction::Continue
+    }
+}
