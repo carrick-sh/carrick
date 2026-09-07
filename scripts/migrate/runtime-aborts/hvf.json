@@ -448,7 +448,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "2fd8860b7fdec58cdf722608008a41ad486beb781b7c1a57017a4527e90a1aaf",
+      "fingerprint": "b3e1e4827d8f0fb95951344c6168d82b0777514bb968fa7a5facc4f090690224",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_commit",
       "rationale": "Pre-exec authority rollback verification failed after switch_exec_stage2_transaction error, leaving carrier stage-2 authority corrupted."
@@ -457,7 +457,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 2,
-      "fingerprint": "2fd8860b7fdec58cdf722608008a41ad486beb781b7c1a57017a4527e90a1aaf",
+      "fingerprint": "b3e1e4827d8f0fb95951344c6168d82b0777514bb968fa7a5facc4f090690224",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Staging frame inventory retirement failed after stage-2 physical unmap was committed, desynchronizing stage-2 state from frame inventory."
@@ -682,7 +682,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::retire_task_state_process_mappings_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "a8f1ff5732753749d832cbfaf5304fea9aa42788382ad96c46b0858ae8176245",
+      "fingerprint": "cf798743e905d0440e600f972a52c07de65f96eede7c7755f9749a35bf0a33a7",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Validated retirement reservation disappeared from inventory ledger during process mapping retirement, indicating concurrent state mutation or broken transaction atomicity."

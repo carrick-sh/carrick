@@ -2010,6 +2010,29 @@ pub trait FrameCowAuthority: Send + Sync {
         &self,
         frame: crate::FrameId,
     ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Batch query mapping exact-liveness for candidate extents and mapping counts
+    /// for candidate frames under a single authority synchronization.
+    fn retirement_batch_query(
+        &self,
+        candidate_extents: &[(
+            crate::MappingId,
+            crate::FrameId,
+            carrick_guest_mem::Gpa,
+            crate::FrameLength,
+        )],
+        candidate_frames: &[crate::FrameId],
+    ) -> Result<(Vec<bool>, Vec<Option<usize>>), Box<dyn std::error::Error + Send + Sync>> {
+        let mut extent_liveness = Vec::with_capacity(candidate_extents.len());
+        for &(mapping, frame, gpa, length) in candidate_extents {
+            extent_liveness.push(self.mapping_is_live(mapping, frame, gpa, length)?);
+        }
+        let mut frame_counts = Vec::with_capacity(candidate_frames.len());
+        for &frame in candidate_frames {
+            frame_counts.push(self.frame_mapping_count(frame)?);
+        }
+        Ok((extent_liveness, frame_counts))
+    }
 }
 
 /// One pinned incarnation from the carrier's existing host-owner directory.

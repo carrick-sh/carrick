@@ -548,6 +548,23 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
     ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.kernel.frame_inventory().frame_mapping_count(frame))
     }
+
+    fn retirement_batch_query(
+        &self,
+        candidate_extents: &[(
+            carrick_hal::MappingId,
+            carrick_hal::FrameId,
+            carrick_guest_mem::Gpa,
+            carrick_hal::FrameLength,
+        )],
+        candidate_frames: &[carrick_hal::FrameId],
+    ) -> Result<(Vec<bool>, Vec<Option<usize>>), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.kernel.frame_inventory().retirement_batch_query(
+            self.mm,
+            candidate_extents,
+            candidate_frames,
+        ))
+    }
 }
 
 /// HVPatch multiplexes every Linux process inside one carrier, so no guest exit
