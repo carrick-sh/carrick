@@ -906,6 +906,14 @@
       "rationale": "Carrier-wide monotonic allocator ANON_FD_COUNTER in crates/carrick-runtime/src/fs_backend.rs generating unique IDs across the host process."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "HOST_XATTR_READS",
+      "fingerprint": "7c214600b35d2b01f0bc7f2b286479655384d920343399de997e2bad88e5cd0b",
+      "classification": "test_only",
+      "rationale": "cfg(test)-only atomic counter of host xattr reads, backing the fstat dentry cache regression test to verify zero host xattr reads on repeat fstat."
+    },
+    {
       "kind": "thread_local",
       "file": "crates/carrick-runtime/src/fs_backend.rs",
       "symbol": "EXCLUSIVE_ARCHIVE_GATES",

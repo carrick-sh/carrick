@@ -4858,8 +4858,24 @@ fn fremove_xattr(fd: std::os::fd::RawFd, name: &[u8]) {
     crate::fs_resolve_cache::bump_meta_generation();
 }
 
+#[cfg(test)]
+pub static HOST_XATTR_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn host_xattr_read_count() -> usize {
+    HOST_XATTR_READS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub fn reset_host_xattr_read_count() -> usize {
+    HOST_XATTR_READS.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
 #[cfg(target_os = "macos")]
 fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
+    #[cfg(test)]
+    HOST_XATTR_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut v = [0u8; 4];
     let n = unsafe {
         carrick_portable::fgetxattr(
@@ -4889,6 +4905,8 @@ fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
 
 #[cfg(not(target_os = "macos"))]
 fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
+    #[cfg(test)]
+    HOST_XATTR_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut v = [0u8; 4];
     let n = unsafe {
         carrick_portable::fgetxattr(
@@ -4928,6 +4946,8 @@ fn fset_u64_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u64) {
 }
 
 fn fget_u64_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u64> {
+    #[cfg(test)]
+    HOST_XATTR_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut v = [0u8; 8];
     let n = unsafe {
         carrick_portable::fgetxattr(
@@ -4991,6 +5011,20 @@ pub(crate) fn fget_owner_xattr(fd: std::os::fd::RawFd) -> (Option<NsUid>, Option
         fget_u32_xattr(fd, CARRICK_UID_XATTR).map(NsUid::new),
         fget_u32_xattr(fd, CARRICK_GID_XATTR).map(NsGid::new),
     )
+}
+
+/// Set the (uid, gid) owner xattrs on an open fd.
+pub(crate) fn fset_owner_xattr(
+    fd: std::os::fd::RawFd,
+    uid: Option<carrick_abi::NsUid>,
+    gid: Option<carrick_abi::NsGid>,
+) {
+    if let Some(u) = uid {
+        fset_u32_xattr(fd, CARRICK_UID_XATTR, u.raw());
+    }
+    if let Some(g) = gid {
+        fset_u32_xattr(fd, CARRICK_GID_XATTR, g.raw());
+    }
 }
 
 /// Open a short-lived fd for `rel` (file or dir) and run `f` on it.

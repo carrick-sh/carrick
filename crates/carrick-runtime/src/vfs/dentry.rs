@@ -107,6 +107,8 @@ pub struct InodeRecord {
     pub mtime: (i64, i64),
     pub ctime: (i64, i64),
     pub nlink: u32,
+    pub rdev: u64,
+    pub dev_type: u32,
 }
 
 impl PositiveDentry {
@@ -407,6 +409,8 @@ impl DentryCache {
                 mtime: (0, 0),
                 ctime: (0, 0),
                 nlink: 2,
+                rdev: 0,
+                dev_type: 0,
             };
             self.inodes.write().insert((dev, ino), record);
 
@@ -617,6 +621,8 @@ impl DentryCache {
                                             carrick_portable::stat_ctime_nsec(&st),
                                         ),
                                         nlink: st.st_nlink as u32,
+                                        rdev: 0,
+                                        dev_type: 0,
                                     };
                                     self.inodes
                                         .write()
@@ -860,6 +866,8 @@ impl DentryCache {
                 mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
                 ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
                 nlink: st.st_nlink as u32,
+                rdev: 0,
+                dev_type: 0,
             };
             self.inodes
                 .write()
@@ -919,6 +927,8 @@ impl DentryCache {
                 mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
                 ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
                 nlink: st.st_nlink as u32,
+                rdev: 0,
+                dev_type: 0,
             };
             self.inodes
                 .write()
@@ -975,6 +985,8 @@ impl DentryCache {
             mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
             ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
             nlink: st.st_nlink as u32,
+            rdev: 0,
+            dev_type: 0,
         };
         self.inodes
             .write()
@@ -1099,6 +1111,8 @@ impl DentryCache {
                 mtime: rs.mtime,
                 ctime: rs.ctime,
                 nlink: rs.nlink,
+                rdev: 0,
+                dev_type: 0,
             };
             self.inodes.write().insert((0, rs.ino), record);
             let pos = PositiveDentry {
@@ -1158,6 +1172,8 @@ impl DentryCache {
                 } else {
                     1
                 },
+                rdev: 0,
+                dev_type: 0,
             };
             self.inodes.write().insert((0, ino), record);
             let pos = PositiveDentry {
@@ -1258,6 +1274,8 @@ impl DentryCache {
                     mtime,
                     ctime,
                     nlink,
+                    rdev: 0,
+                    dev_type: 0,
                 };
                 self.inodes.write().insert((dev, ino), record);
                 let pos = PositiveDentry {
@@ -1467,6 +1485,18 @@ impl DentryCache {
         Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
     }
 
+    /// Get cached inode record for `(dev, ino)`.
+    pub fn get_inode_record(&self, dev: u64, ino: u64) -> Option<InodeRecord> {
+        self.check_fork();
+        self.inodes.read().get(&(dev, ino)).copied()
+    }
+
+    /// Insert or update inode record for `(dev, ino)`.
+    pub fn insert_inode_record(&self, dev: u64, ino: u64, record: InodeRecord) {
+        self.check_fork();
+        self.inodes.write().insert((dev, ino), record);
+    }
+
     /// Get cached inode record or refresh it from disk/backend.
     pub fn get_or_refresh_inode(
         &self,
@@ -1527,6 +1557,8 @@ impl DentryCache {
                     mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
                     ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
                     nlink: st.st_nlink as u32,
+                    rdev: 0,
+                    dev_type: 0,
                 };
                 self.inodes.write().insert(key, record);
                 return Ok(record);
@@ -1544,6 +1576,8 @@ impl DentryCache {
                 mtime: rs.mtime,
                 ctime: rs.ctime,
                 nlink: rs.nlink,
+                rdev: 0,
+                dev_type: 0,
             };
             self.inodes.write().insert(key, record);
             return Ok(record);
@@ -1561,6 +1595,8 @@ impl DentryCache {
                     mtime: rs.mtime,
                     ctime: rs.ctime,
                     nlink: rs.nlink,
+                    rdev: 0,
+                    dev_type: 0,
                 };
                 self.inodes.write().insert(key, record);
                 return Ok(record);
