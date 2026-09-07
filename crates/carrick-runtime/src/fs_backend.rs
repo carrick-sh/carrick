@@ -4603,7 +4603,24 @@ impl HostFsBackend {
                 continue;
             }
             let d_type = unsafe { (*entry).d_type };
-            let size = None;
+            let size = if d_type == libc::DT_REG {
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        parent_fd.as_raw_fd(),
+                        d_name.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                {
+                    Some(st.st_size as u64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if let Some(item) = f(d_name, d_type, size) {
                 results.push(item);
             }

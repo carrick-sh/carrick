@@ -4183,11 +4183,9 @@ impl SyscallDispatcher {
         dir_path: &str,
         trusted: Option<&TrustedHostDir>,
     ) -> Vec<RootFsDirEntry> {
-        let current_gen = self.fs.rootfs_vfs.overlay.structural_generation();
         let streamed = match trusted {
             Some(trusted)
-                if (trusted.is_merged_upper()
-                    || trusted.namespace_is_current_against(current_gen))
+                if trusted.is_merged_upper()
                     && !self
                         .fs
                         .rootfs_vfs
@@ -4197,10 +4195,6 @@ impl SyscallDispatcher {
                 read_host_dir_entries(trusted.fd.raw(), dir_path)
             }
             _ => None,
-        };
-        let is_lower = match trusted {
-            Some(t) => !t.is_merged_upper(),
-            None => true,
         };
         let mut entries = match streamed {
             Some(list) => list,
@@ -4217,9 +4211,6 @@ impl SyscallDispatcher {
             .unwrap_or_default(),
         };
         self.inject_mount_dir_entries(dir_path, &mut entries);
-        self.fs
-            .rootfs_vfs
-            .seed_dir_children(dir_path, &entries, is_lower);
         entries
     }
 

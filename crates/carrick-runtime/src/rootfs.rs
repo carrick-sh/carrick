@@ -1325,21 +1325,26 @@ impl RootFs {
                 .into_iter()
                 .map(|(name, kind, known_size)| {
                     let child = dir.join(&name);
+                    let child_text = display_rootfs_path(&child);
+                    let stat = host.backend.real_stat(&child_text, false);
                     Ok(RootFsDirEntry {
                         name,
                         metadata: RootFsMetadata {
                             path: child,
-                            kind,
-                            mode: if kind == RootFsEntryKind::Directory {
-                                0o755
-                            } else {
-                                0o644
-                            },
-                            size: known_size
-                                .and_then(|size| usize::try_from(size).ok())
+                            kind: stat.map(|value| value.kind).unwrap_or(kind),
+                            mode: stat.map(|value| value.mode).unwrap_or(
+                                if kind == RootFsEntryKind::Directory {
+                                    0o755
+                                } else {
+                                    0o644
+                                },
+                            ),
+                            size: stat
+                                .and_then(|value| usize::try_from(value.size).ok())
+                                .or_else(|| known_size.and_then(|size| usize::try_from(size).ok()))
                                 .unwrap_or(0),
                         },
-                        ino: 0,
+                        ino: stat.map(|value| value.ino).unwrap_or(0),
                     })
                 })
                 .collect();
@@ -1394,21 +1399,26 @@ impl RootFs {
                 .into_iter()
                 .map(|(name, kind, known_size)| {
                     let child = dir.join(&name);
+                    let child_text = display_rootfs_path(&child);
+                    let stat = host.backend.real_stat(&child_text, false);
                     Ok(RootFsDirEntry {
                         name,
                         metadata: RootFsMetadata {
                             path: child,
-                            kind,
-                            mode: if kind == RootFsEntryKind::Directory {
-                                0o755
-                            } else {
-                                0o644
-                            },
-                            size: known_size
-                                .and_then(|size| usize::try_from(size).ok())
+                            kind: stat.map(|value| value.kind).unwrap_or(kind),
+                            mode: stat.map(|value| value.mode).unwrap_or(
+                                if kind == RootFsEntryKind::Directory {
+                                    0o755
+                                } else {
+                                    0o644
+                                },
+                            ),
+                            size: stat
+                                .and_then(|value| usize::try_from(value.size).ok())
+                                .or_else(|| known_size.and_then(|size| usize::try_from(size).ok()))
                                 .unwrap_or(0),
                         },
-                        ino: 0,
+                        ino: stat.map(|value| value.ino).unwrap_or(0),
                     })
                 })
                 .collect();
