@@ -2372,11 +2372,13 @@ impl SyscallDispatcher {
         // dentry cache fast open: when serving the dentry cache, resolve directly
         // from memory and open the leaf from the cached parent directory fd (0 host
         // syscalls per intermediate component, <= 1 host openat at the leaf).
+        let mut dentry_fast_attempted = false;
         if !want_create
             && !want_trunc
             && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
             && path.starts_with('/')
         {
+            dentry_fast_attempted = true;
             if let Some(outcome) = self.try_dentry_fast_open(path, flags, access, writable_request)
             {
                 return Ok(outcome);
@@ -2442,7 +2444,12 @@ impl SyscallDispatcher {
             }
         }
 
-        if !want_create && !want_trunc && !ends_with_dot && !had_trailing_slash {
+        if !dentry_fast_attempted
+            && !want_create
+            && !want_trunc
+            && !ends_with_dot
+            && !had_trailing_slash
+        {
             if let Some(outcome) = self.try_dentry_fast_open(&path, flags, access, writable_request)
             {
                 return Ok(outcome);

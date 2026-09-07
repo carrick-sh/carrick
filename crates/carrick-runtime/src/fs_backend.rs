@@ -7530,7 +7530,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn is_shared(&self) -> bool {
-        self._scratch.is_none()
+        false
     }
 
     fn stat_cache_lookup(&self, path: &str) -> Option<RealStat> {
