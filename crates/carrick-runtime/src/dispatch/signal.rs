@@ -450,6 +450,7 @@ impl SyscallDispatcher {
         } else {
             authority.enqueue_thread_standard(signal, None);
         }
+        context.task().wake();
     }
 
     fn signal_dispatch_pending_possible(
@@ -1046,6 +1047,7 @@ impl SyscallDispatcher {
         } else {
             task_pending.enqueue_standard(signal, siginfo);
         }
+        context.task().wake();
     }
 
     /// Publish an asynchronous signal from another Linux process multiplexed
