@@ -1178,15 +1178,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 58674,
-        "byte_start": 58659,
+        "byte_end": 59321,
+        "byte_start": 59306,
         "column": 15,
         "column_end": 30,
         "column_start": 15,
         "file": "crates/carrick-runtime/src/dispatch/time.rs",
-        "line": 1178,
-        "line_end": 1178,
-        "line_start": 1178
+        "line": 1199,
+        "line_end": 1199,
+        "line_start": 1199
       }
     },
     {
@@ -1492,15 +1492,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 61981,
-        "byte_start": 61966,
+        "byte_end": 62628,
+        "byte_start": 62613,
         "column": 9,
         "column_end": 24,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/dispatch/time.rs",
-        "line": 1247,
-        "line_end": 1247,
-        "line_start": 1247
+        "line": 1268,
+        "line_end": 1268,
+        "line_start": 1268
       }
     },
     {
@@ -4523,15 +4523,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 73551,
-        "byte_start": 73538,
+        "byte_end": 76733,
+        "byte_start": 76720,
         "column": 16,
         "column_end": 29,
         "column_start": 16,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 2017,
-        "line_end": 2017,
-        "line_start": 2017
+        "line": 2086,
+        "line_end": 2086,
+        "line_start": 2086
       }
     },
     {
@@ -4543,15 +4543,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 74030,
-        "byte_start": 74017,
+        "byte_end": 77212,
+        "byte_start": 77199,
         "column": 29,
         "column_end": 42,
         "column_start": 29,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 2025,
-        "line_end": 2025,
-        "line_start": 2025
+        "line": 2094,
+        "line_end": 2094,
+        "line_start": 2094
       }
     },
     {
@@ -5034,15 +5034,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 60423,
-        "byte_start": 60406,
+        "byte_end": 61070,
+        "byte_start": 61053,
         "column": 5,
         "column_end": 22,
         "column_start": 5,
         "file": "crates/carrick-runtime/src/dispatch/time.rs",
-        "line": 1214,
-        "line_end": 1214,
-        "line_start": 1214
+        "line": 1235,
+        "line_end": 1235,
+        "line_start": 1235
       }
     },
     {
@@ -9999,15 +9999,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 67675,
-        "byte_start": 67659,
+        "byte_end": 67953,
+        "byte_start": 67937,
         "column": 51,
         "column_end": 67,
         "column_start": 51,
         "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-        "line": 1547,
-        "line_end": 1547,
-        "line_start": 1547
+        "line": 1556,
+        "line_end": 1556,
+        "line_start": 1556
       }
     },
     {
@@ -10019,15 +10019,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 107608,
-        "byte_start": 107592,
+        "byte_end": 107893,
+        "byte_start": 107877,
         "column": 24,
         "column_end": 40,
         "column_start": 24,
         "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-        "line": 2346,
-        "line_end": 2346,
-        "line_start": 2346
+        "line": 2355,
+        "line_end": 2355,
+        "line_start": 2355
       }
     },
     {
@@ -10039,15 +10039,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 124728,
-        "byte_start": 124712,
+        "byte_end": 125013,
+        "byte_start": 124997,
         "column": 20,
         "column_end": 36,
         "column_start": 20,
         "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-        "line": 2711,
-        "line_end": 2711,
-        "line_start": 2711
+        "line": 2720,
+        "line_end": 2720,
+        "line_start": 2720
       }
     },
     {
@@ -10259,15 +10259,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 57549,
-        "byte_start": 57533,
+        "byte_end": 60731,
+        "byte_start": 60715,
         "column": 44,
         "column_end": 60,
         "column_start": 44,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 1575,
-        "line_end": 1575,
-        "line_start": 1575
+        "line": 1644,
+        "line_end": 1644,
+        "line_start": 1644
       }
     },
     {
@@ -11263,15 +11263,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 10907,
-        "byte_start": 10882,
+        "byte_end": 12040,
+        "byte_start": 12015,
         "column": 17,
         "column_end": 42,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 340,
-        "line_end": 340,
-        "line_start": 340
+        "line": 370,
+        "line_end": 370,
+        "line_start": 370
       }
     },
     {
@@ -11283,15 +11283,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 11718,
-        "byte_start": 11693,
+        "byte_end": 14910,
+        "byte_start": 14885,
         "column": 21,
         "column_end": 46,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 365,
-        "line_end": 365,
-        "line_start": 365
+        "line": 434,
+        "line_end": 434,
+        "line_start": 434
       }
     },
     {
@@ -11525,15 +11525,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 1434,
-        "byte_start": 1409,
+        "byte_end": 1829,
+        "byte_start": 1804,
         "column": 17,
         "column_end": 42,
         "column_start": 17,
         "file": "crates/carrick-vmm-hvf/src/posix_timer.rs",
-        "line": 30,
-        "line_end": 30,
-        "line_start": 30
+        "line": 36,
+        "line_end": 36,
+        "line_start": 36
       }
     },
     {
@@ -11834,15 +11834,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 9619,
-        "byte_start": 9601,
+        "byte_end": 10663,
+        "byte_start": 10645,
         "column": 21,
         "column_end": 39,
         "column_start": 21,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 291,
-        "line_end": 291,
-        "line_start": 291
+        "line": 320,
+        "line_end": 320,
+        "line_start": 320
       }
     },
     {
@@ -11854,15 +11854,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 9739,
-        "byte_start": 9721,
+        "byte_end": 10783,
+        "byte_start": 10765,
         "column": 9,
         "column_end": 27,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 296,
-        "line_end": 296,
-        "line_start": 296
+        "line": 325,
+        "line_end": 325,
+        "line_start": 325
       }
     },
     {
@@ -11874,15 +11874,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 10127,
-        "byte_start": 10109,
+        "byte_end": 11260,
+        "byte_start": 11242,
         "column": 13,
         "column_end": 31,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-        "line": 309,
-        "line_end": 309,
-        "line_start": 309
+        "line": 339,
+        "line_end": 339,
+        "line_start": 339
       }
     },
     {
@@ -12078,15 +12078,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 9233,
-        "byte_start": 9215,
+        "byte_end": 11476,
+        "byte_start": 11458,
         "column": 5,
         "column_end": 23,
         "column_start": 5,
         "file": "crates/carrick-timer-core/src/posix.rs",
-        "line": 226,
-        "line_end": 226,
-        "line_start": 226
+        "line": 277,
+        "line_end": 277,
+        "line_start": 277
       }
     },
     {
@@ -12099,15 +12099,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 9441,
-        "byte_start": 9423,
+        "byte_end": 11684,
+        "byte_start": 11666,
         "column": 9,
         "column_end": 27,
         "column_start": 9,
         "file": "crates/carrick-timer-core/src/posix.rs",
-        "line": 235,
-        "line_end": 235,
-        "line_start": 235
+        "line": 286,
+        "line_end": 286,
+        "line_start": 286
       }
     },
     {
@@ -12120,15 +12120,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 10552,
-        "byte_start": 10534,
+        "byte_end": 13145,
+        "byte_start": 13127,
         "column": 13,
         "column_end": 31,
         "column_start": 13,
         "file": "crates/carrick-timer-core/src/posix.rs",
-        "line": 265,
-        "line_end": 265,
-        "line_start": 265
+        "line": 332,
+        "line_end": 332,
+        "line_start": 332
       }
     },
     {
@@ -12558,9 +12558,9 @@
       }
     }
   ],
-  "rows_sha256": "89d42239610906089161829bd232a9e5cc53a340942773f260be19621cf5c9bf",
+  "rows_sha256": "3dbabff957394149b484928c1c785b735e720de3937bf6101c2e74238f6fc6a6",
   "schema": 1,
-  "source_head": "5e09c51d7184131fce571896bfd0f365d4c3c389",
+  "source_head": "d7cfefdf57b6a5742c26f6cfc808906a068e0930",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
