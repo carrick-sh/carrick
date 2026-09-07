@@ -153,6 +153,11 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// fault per page as the copy touches it, and a `munmap`/`madvise` on drop.
     /// A successful commit hands the buffer back here instead of freeing it.
     pt_snapshot_scratch: Option<PageTableManager>,
+
+    /// When set, records the runtime's exec predecessor-sharing expectation
+    /// (`mark_exec_predecessor_shared`) to cross-check against the stage-1
+    /// authority's own share decision.
+    exec_predecessor_shared: Option<bool>,
 }
 
 pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
@@ -248,6 +253,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_process_fork: None,
             pt_snapshot_scratch: None,
+            exec_predecessor_shared: None,
         }
     }
 
@@ -361,6 +367,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_process_fork,
             pt_snapshot_scratch,
+            ..
         } = self;
         (
             Aarch64TaskEngineState {
@@ -419,6 +426,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_process_fork,
             pt_snapshot_scratch,
+            exec_predecessor_shared: None,
         }
     }
 }
@@ -673,6 +681,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_process_fork: None,
             pt_snapshot_scratch: None,
+            exec_predecessor_shared: None,
         }
     }
 
@@ -736,16 +745,23 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     }
 
     /// Replace this mm's stage-1 manager without splitting the engine/backend
-    /// authority.  The HVPatch backend resolves permission faults itself, so
+    /// authority. The HVPatch backend resolves permission faults itself, so
     /// every fresh authority must be rebound before the stopped vCPU can resume.
-    fn replace_page_tables(&mut self, manager: Option<PageTableManager>) -> Result<(), TrapError> {
-        let new_authority = self.page_tables.replace_for_exec(
+    ///
+    /// The sharing decision is governed strictly by the authority's own
+    /// `vfork_shares` count. Returns `true` if the predecessor authority was
+    /// shared (and therefore preserved for other siblings/parent).
+    fn replace_page_tables(
+        &mut self,
+        manager: Option<PageTableManager>,
+    ) -> Result<bool, TrapError> {
+        let (new_authority, was_shared) = self.page_tables.replace_for_exec_internal(
             || Ok(manager),
             |old| self.vm.retire_stage1_extension_arenas(old),
         )?;
         self.vm.bind_stage1_page_tables(new_authority.clone());
         self.page_tables = new_authority;
-        Ok(())
+        Ok(was_shared)
     }
 
     /// The shared PROT_NONE EFAULT gate (cloned across `CLONE_THREAD` siblings,
@@ -784,6 +800,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_process_fork: None,
             pt_snapshot_scratch: None,
+            exec_predecessor_shared: None,
         }
     }
 
@@ -2356,6 +2373,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     }
 
     fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+        let expected_shared = self.exec_predecessor_shared.take();
+        let authority_id = self.page_tables.authority_id();
         // Delegate the image replacement to the backend (remap slots / rebuild VM +
         // reprogram the live vCPU's sysregs). PRESERVE is_forked_child across execve:
         // a descendant of a forked child keeps the `_exit`-without-report shutdown
@@ -2365,7 +2384,17 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // `execve_rebuild` installed a fresh table image. Drop the manager for
         // the old image before the hvpatch ASID configuration reserves its
         // per-mm root-slot aperture in the NEW tables.
-        self.replace_page_tables(self.vm.exec_page_tables())?;
+        let was_shared = self.replace_page_tables(self.vm.exec_page_tables())?;
+        if let Some(expected) = expected_shared
+            && expected != was_shared
+        {
+            tracing::warn!(
+                authority_id,
+                expected_shared = expected,
+                actual_shared = was_shared,
+                "execve stage-1 authority sharing expectation mismatch"
+            );
+        }
         if let Some(protections) = self.vm.exec_protections() {
             self.protections = protections;
         }
@@ -3018,6 +3047,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn mark_exec_predecessor_shared(&mut self, shared: bool) {
+        self.exec_predecessor_shared = Some(shared);
         self.vm.mark_exec_predecessor_shared(shared);
     }
 
@@ -4702,6 +4732,147 @@ mod tests {
         // Child must have detached to a distinct authority and have no source.
         assert!(!parent_authority.shares_exact_authority(&child_authority));
         assert!(!child_authority.has_source());
+    }
+
+    #[test]
+    fn replace_page_tables_authority_preserves_parent_under_concurrent_vfork_children() {
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x1000));
+        let parent_authority = Stage1Authority::new_with_manager(Some(manager));
+        parent_authority
+            .install_source(Box::new(DummyArenaSource(source_id)))
+            .expect("set arena source on parent authority");
+
+        // Two concurrent vfork children are created from parent
+        parent_authority.share_with_vfork_child();
+        parent_authority.share_with_vfork_child();
+        let mut child1_authority = parent_authority.clone();
+        let mut child2_authority = parent_authority.clone();
+        assert!(child1_authority.is_shared_with_vfork_child());
+        assert!(child2_authority.is_shared_with_vfork_child());
+
+        // Child 1 execs first
+        let mut retired1 = false;
+        let mut bound1 = false;
+        replace_page_tables_authority(
+            &mut child1_authority,
+            None,
+            |_| {
+                retired1 = true;
+                Ok(())
+            },
+            |_| {
+                bound1 = true;
+            },
+        )
+        .expect("replace child1 authority");
+
+        assert!(
+            !retired1,
+            "parent extension arenas must not be retired by child1"
+        );
+        assert!(bound1, "must bind fresh child1 authority");
+        assert!(!parent_authority.shares_exact_authority(&child1_authority));
+
+        // Parent must STILL have its manager and source, and STILL be shared with child2!
+        assert!(
+            parent_authority.is_present(),
+            "parent manager must not be stolen"
+        );
+        assert!(
+            parent_authority.has_source(),
+            "parent source must not be stolen"
+        );
+        assert!(
+            parent_authority.is_shared_with_vfork_child(),
+            "parent must still be shared with child2"
+        );
+        assert!(!parent_authority.is_exclusive());
+
+        // Child 2 execs second
+        let mut retired2 = false;
+        let mut bound2 = false;
+        replace_page_tables_authority(
+            &mut child2_authority,
+            None,
+            |_| {
+                retired2 = true;
+                Ok(())
+            },
+            |_| {
+                bound2 = true;
+            },
+        )
+        .expect("replace child2 authority");
+
+        assert!(
+            !retired2,
+            "parent extension arenas must not be retired by child2"
+        );
+        assert!(bound2, "must bind fresh child2 authority");
+        assert!(!parent_authority.shares_exact_authority(&child2_authority));
+
+        // Now that child2 has exec'd, parent is restored to Exclusive!
+        assert!(parent_authority.is_present(), "parent manager preserved");
+        assert!(parent_authority.has_source(), "parent source preserved");
+        assert!(
+            parent_authority.is_exclusive(),
+            "parent restored to Exclusive"
+        );
+        assert!(!parent_authority.is_shared_with_vfork_child());
+    }
+
+    #[test]
+    fn execve_sharing_governed_solely_by_authority_even_on_disagreement() {
+        let bytes = carrick_mem::memory::stage1_identity_page_tables();
+        let manager = PageTableManager::new(bytes, carrick_mem::memory::LINUX_PAGE_TABLES_BASE);
+        let source_id = carrick_mem::page_table::TableArenaSourceId(carrick_guest_mem::Gpa(0x1000));
+        let parent_authority = Stage1Authority::new_with_manager(Some(manager));
+        parent_authority
+            .install_source(Box::new(DummyArenaSource(source_id)))
+            .expect("set arena source on parent authority");
+
+        // Authority is shared with a vfork child (vfork_shares > 0)
+        parent_authority.share_with_vfork_child();
+        let mut child_authority = parent_authority.clone();
+
+        let mut retired = false;
+        let mut bound = false;
+        // Even if external caller/runtime expected exclusive (disagreement),
+        // replace_page_tables_authority drives through replace_for_exec where
+        // vfork_shares > 0 guarantees the exclusive path is NOT taken.
+        replace_page_tables_authority(
+            &mut child_authority,
+            None,
+            |_| {
+                retired = true;
+                Ok(())
+            },
+            |_| {
+                bound = true;
+            },
+        )
+        .expect("replace child authority");
+
+        assert!(
+            !retired,
+            "parent arenas must NOT be retired while vfork_shares > 0"
+        );
+        assert!(bound, "new child authority must be bound");
+        assert!(
+            parent_authority.is_present(),
+            "parent manager must not be stolen"
+        );
+        assert!(
+            parent_authority.has_source(),
+            "parent source must not be stolen"
+        );
+        assert_eq!(
+            parent_authority.root_base(),
+            Some(carrick_mem::memory::LINUX_PAGE_TABLES_BASE)
+        );
+        assert!(!parent_authority.shares_exact_authority(&child_authority));
     }
 
     #[test]

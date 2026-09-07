@@ -28,7 +28,7 @@ pub enum ShareState {
 struct Stage1AuthorityInner {
     manager: Option<PageTableManager>,
     arena_source: Option<Box<dyn TableArenaSource>>,
-    share_state: ShareState,
+    vfork_shares: usize,
     engines: usize,
 }
 
@@ -55,7 +55,8 @@ impl std::fmt::Debug for Stage1Authority {
             .field("authority_id", &self.authority_id())
             .field("has_manager", &inner.manager.is_some())
             .field("has_source", &inner.arena_source.is_some())
-            .field("share_state", &inner.share_state)
+            .field("share_state", &self.share_state())
+            .field("vfork_shares", &inner.vfork_shares)
             .field("engines", &inner.engines)
             .finish()
     }
@@ -68,7 +69,7 @@ impl Stage1Authority {
             inner: Arc::new(Mutex::new(Stage1AuthorityInner {
                 manager: None,
                 arena_source: None,
-                share_state: ShareState::Exclusive,
+                vfork_shares: 0,
                 engines: 1,
             })),
         }
@@ -80,7 +81,7 @@ impl Stage1Authority {
             inner: Arc::new(Mutex::new(Stage1AuthorityInner {
                 manager,
                 arena_source: None,
-                share_state: ShareState::Exclusive,
+                vfork_shares: 0,
                 engines: 1,
             })),
         }
@@ -140,27 +141,32 @@ impl Stage1Authority {
 
     /// Current share state (`Exclusive` vs `SharedWithVforkChild`).
     pub fn share_state(&self) -> ShareState {
-        self.inner.lock().share_state
+        if self.inner.lock().vfork_shares > 0 {
+            ShareState::SharedWithVforkChild
+        } else {
+            ShareState::Exclusive
+        }
     }
 
     /// True if solely owned (`Exclusive`).
     pub fn is_exclusive(&self) -> bool {
-        self.inner.lock().share_state == ShareState::Exclusive
+        self.inner.lock().vfork_shares == 0
     }
 
     /// True if currently shared with an in-flight `CLONE_VM` / `vfork` child.
     pub fn is_shared_with_vfork_child(&self) -> bool {
-        self.inner.lock().share_state == ShareState::SharedWithVforkChild
+        self.inner.lock().vfork_shares > 0
     }
 
     /// Mark this authority as shared with a newly created `vfork` child.
     pub fn share_with_vfork_child(&self) {
-        self.inner.lock().share_state = ShareState::SharedWithVforkChild;
+        self.inner.lock().vfork_shares += 1;
     }
 
     /// Explicit release when the `vfork` child completes `execve` or `_exit`.
     pub fn child_exec_or_exit_released(&self) {
-        self.inner.lock().share_state = ShareState::Exclusive;
+        let mut inner = self.inner.lock();
+        inner.vfork_shares = inner.vfork_shares.saturating_sub(1);
     }
 
     /// Pool statistics: `(in_use, free, capacity, arenas)`.
@@ -409,10 +415,11 @@ impl Stage1Authority {
 
     /// Replace the stage-1 authority for `execve`.
     ///
-    /// - If `SharedWithVforkChild`: the shared authority belongs to the parent!
-    ///   Transitions the parent's authority back to `Exclusive` without touching
-    ///   its manager or extension arenas; creates and returns a brand-new `Stage1Authority`
-    ///   with `builder()?` for the child.
+    /// - If `SharedWithVforkChild` (or `predecessor_shared` is true): the shared authority
+    ///   belongs to the parent! Decrements the parent's vfork-shares count (restoring
+    ///   the parent to `Exclusive` once all shared children have detached) without
+    ///   touching its manager or extension arenas; creates and returns a brand-new
+    ///   `Stage1Authority` with `builder()?` for the child.
     /// - If `Exclusive`: retires the old image's extension arenas via `retirer`,
     ///   retires its arena source WITH it (the source belongs to the lease of
     ///   the mm being replaced; the runtime installs the replacement lease's
@@ -422,16 +429,30 @@ impl Stage1Authority {
     pub fn replace_for_exec<B, R, E>(
         &mut self,
         builder: B,
-        mut retirer: R,
+        retirer: R,
     ) -> Result<Stage1Authority, E>
+    where
+        B: FnOnce() -> Result<Option<PageTableManager>, E>,
+        R: FnMut(&mut PageTableManager) -> Result<(), E>,
+    {
+        self.replace_for_exec_internal(builder, retirer)
+            .map(|(auth, _)| auth)
+    }
+
+    /// Pure transition for `execve` authority replacement returning `(new_authority, was_shared)`.
+    pub(crate) fn replace_for_exec_internal<B, R, E>(
+        &mut self,
+        builder: B,
+        mut retirer: R,
+    ) -> Result<(Stage1Authority, bool), E>
     where
         B: FnOnce() -> Result<Option<PageTableManager>, E>,
         R: FnMut(&mut PageTableManager) -> Result<(), E>,
     {
         let is_shared = {
             let mut inner = self.inner.lock();
-            if inner.share_state == ShareState::SharedWithVforkChild {
-                inner.share_state = ShareState::Exclusive;
+            if inner.vfork_shares > 0 {
+                inner.vfork_shares -= 1;
                 true
             } else {
                 false
@@ -442,7 +463,7 @@ impl Stage1Authority {
             let new_manager = builder()?;
             let new_authority = Stage1Authority::new_with_manager(new_manager);
             *self = new_authority.clone();
-            Ok(new_authority)
+            Ok((new_authority, true))
         } else {
             let (mut old_mgr, old_source) = {
                 let mut inner = self.inner.lock();
@@ -462,7 +483,7 @@ impl Stage1Authority {
             if inner.manager.is_some() {
                 carrick_observability::probes::stage1_arena_install(5, 0, 0, authority);
             }
-            Ok(self.clone())
+            Ok((self.clone(), false))
         }
     }
 
@@ -1025,5 +1046,180 @@ mod tests {
             },
             "only retired backing may return its arena address"
         );
+    }
+
+    #[test]
+    fn concurrent_vfork_children_share_authority_and_detach_independently() {
+        let root = Gpa(LINUX_PAGE_TABLES_BASE);
+        let available = Arc::new(Mutex::new(Vec::new()));
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let source = CountingArenaSource {
+            id: TableArenaSourceId(root),
+            available,
+            returned,
+        };
+
+        let manager = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let parent = Stage1Authority::new_with_manager(Some(manager));
+        parent
+            .install_source(Box::new(source))
+            .expect("install source");
+        assert!(parent.is_exclusive());
+        assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
+
+        // Two concurrent vfork children are spawned.
+        parent.share_with_vfork_child();
+        assert!(parent.is_shared_with_vfork_child());
+        assert!(!parent.is_exclusive());
+
+        parent.share_with_vfork_child();
+        assert!(parent.is_shared_with_vfork_child());
+        assert!(!parent.is_exclusive());
+
+        let mut child1 = parent.clone();
+        let mut child2 = parent.clone();
+
+        // Child 1 execs first.
+        let mut retired1 = false;
+        let new_child1 = child1
+            .replace_for_exec(
+                || {
+                    Ok::<_, ()>(Some(PageTableManager::new(
+                        stage1_hvpatch_page_tables(),
+                        0x9a_0020_0000,
+                    )))
+                },
+                |_| {
+                    retired1 = true;
+                    Ok(())
+                },
+            )
+            .expect("child1 exec");
+
+        assert!(
+            !retired1,
+            "parent extension arenas must not be retired by child1"
+        );
+        assert!(!new_child1.shares_exact_authority(&parent));
+        assert_eq!(new_child1.root_base(), Some(0x9a_0020_0000));
+        assert!(!new_child1.has_source());
+
+        // Parent must STILL have its original root and source, and STILL be shared with child2!
+        assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
+        assert!(parent.has_source());
+        assert!(parent.is_shared_with_vfork_child());
+        assert!(!parent.is_exclusive());
+
+        // Child 2 execs second.
+        let mut retired2 = false;
+        let new_child2 = child2
+            .replace_for_exec(
+                || {
+                    Ok::<_, ()>(Some(PageTableManager::new(
+                        stage1_hvpatch_page_tables(),
+                        0x9a_0040_0000,
+                    )))
+                },
+                |_| {
+                    retired2 = true;
+                    Ok(())
+                },
+            )
+            .expect("child2 exec");
+
+        assert!(
+            !retired2,
+            "parent extension arenas must not be retired by child2"
+        );
+        assert!(!new_child2.shares_exact_authority(&parent));
+        assert_eq!(new_child2.root_base(), Some(0x9a_0040_0000));
+        assert!(!new_child2.has_source());
+
+        // Now that all children detached, parent is back to Exclusive!
+        assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
+        assert!(parent.has_source());
+        assert!(parent.is_exclusive());
+        assert!(!parent.is_shared_with_vfork_child());
+
+        // Parent itself execs exclusively.
+        let mut retired_parent = false;
+        let mut parent_exec = parent.clone();
+        let exec_parent = parent_exec
+            .replace_for_exec(
+                || {
+                    Ok::<_, ()>(Some(PageTableManager::new(
+                        stage1_hvpatch_page_tables(),
+                        0x9a_0060_0000,
+                    )))
+                },
+                |_| {
+                    retired_parent = true;
+                    Ok(())
+                },
+            )
+            .expect("parent exec");
+
+        assert!(
+            retired_parent,
+            "parent old arenas must be retired on exclusive exec"
+        );
+        assert!(exec_parent.shares_exact_authority(&parent));
+        assert_eq!(exec_parent.root_base(), Some(0x9a_0060_0000));
+        assert!(
+            !exec_parent.has_source(),
+            "source retired on exclusive exec"
+        );
+    }
+
+    #[test]
+    fn vfork_shares_prevents_exclusive_path_even_if_called_as_first_or_only_child() {
+        let root = Gpa(LINUX_PAGE_TABLES_BASE);
+        let available = Arc::new(Mutex::new(Vec::new()));
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let source = CountingArenaSource {
+            id: TableArenaSourceId(root),
+            available,
+            returned,
+        };
+
+        let manager = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let parent = Stage1Authority::new_with_manager(Some(manager));
+        parent
+            .install_source(Box::new(source))
+            .expect("install source");
+
+        // Authority is shared with a vfork child
+        parent.share_with_vfork_child();
+        assert!(parent.is_shared_with_vfork_child());
+
+        let mut child = parent.clone();
+        let mut retired = false;
+
+        // Child execs: the internal decision sees vfork_shares > 0
+        let (new_child, was_shared) = child
+            .replace_for_exec_internal(
+                || {
+                    Ok::<_, ()>(Some(PageTableManager::new(
+                        stage1_hvpatch_page_tables(),
+                        0x9a_0020_0000,
+                    )))
+                },
+                |_| {
+                    retired = true;
+                    Ok(())
+                },
+            )
+            .expect("child exec");
+
+        assert!(was_shared, "internal decision must report shared");
+        assert!(
+            !retired,
+            "parent arenas must NOT be retired while vfork_shares > 0"
+        );
+        assert!(parent.is_present(), "parent manager must not be stolen");
+        assert!(parent.has_source(), "parent source must not be stolen");
+        assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
+        assert!(!new_child.shares_exact_authority(&parent));
+        assert_eq!(new_child.root_base(), Some(0x9a_0020_0000));
     }
 }
