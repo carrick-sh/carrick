@@ -10078,7 +10078,7 @@ mod task_only_carrier_directory_tests {
             .collect();
         assert_eq!(scope_a_actual, scope_a_expected);
 
-        // Verify exact_first_by_scope positions and sequences against a from-scratch reindex
+        // Verify exact_first_by_scope sequences and entries against a from-scratch reindex
         let mut from_scratch = registry.clone();
         from_scratch.reindex();
         assert_eq!(
@@ -10141,9 +10141,12 @@ mod task_only_carrier_directory_tests {
 
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0], target);
+        let k = 1;
+        let log2_n = (TOTAL_ROWS as f64).log2().ceil() as u64;
+        let bound = 16 * k + 4 * log2_n;
         assert!(
-            scanned <= 16,
-            "k=1 removal visited {scanned} rows in a {TOTAL_ROWS}-row scope; must be O(k), not O(N)"
+            scanned <= bound,
+            "k={k} removal visited {scanned} rows in a {TOTAL_ROWS}-row scope (bound {bound}); must be O(k log N), not O(N)"
         );
     }
 
@@ -12861,17 +12864,16 @@ fn alias_registry() -> &'static parking_lot::Mutex<AliasRegistry> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 type AliasExactFirstIndex = std::collections::BTreeMap<
     AliasOwnershipScope,
-    std::collections::BTreeMap<(u64, u64), (usize, u64, AliasBacking)>,
+    std::collections::BTreeMap<(u64, u64), (u64, AliasBacking)>,
 >;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default, Clone)]
 struct AliasRegistry {
     by_scope: std::collections::BTreeMap<AliasOwnershipScope, Vec<(u64, AliasBacking)>>,
-    /// First row for each exact semantic key inside a scope: bucket position,
-    /// insertion sequence and value. Receipt publication asks exactly this
-    /// question for every row; locating it through the scope `Vec` made a
-    /// k-row publication O(k * rows-in-mm).
+    /// First row for each exact semantic key inside a scope: insertion sequence
+    /// and value. Receipt publication asks exactly this question for every row;
+    /// locating it through the scope `Vec` made a k-row publication O(k * rows-in-mm).
     exact_first_by_scope: AliasExactFirstIndex,
     next_seq: u64,
     /// Monotonic semantic-mutation revision used only to prove that a fork
@@ -12934,16 +12936,56 @@ impl AliasRegistry {
         };
         let mut exact = std::collections::BTreeMap::new();
         note_alias_state_rows_scanned(rows.len());
-        for (position, &(seq, alias)) in rows.iter().enumerate() {
+        for &(seq, alias) in rows {
             exact
                 .entry((alias.start, alias.ipa))
-                .or_insert((position, seq, alias));
+                .or_insert((seq, alias));
         }
         if exact.is_empty() {
             self.exact_first_by_scope.remove(&scope);
         } else {
             self.exact_first_by_scope.insert(scope, exact);
         }
+    }
+
+    /// Binary search for `seq` in `rows` and locate the matching `alias`.
+    /// The scope bucket is in monotonic insertion sequence order in production.
+    /// A single row split into fragments shares the parent's sequence, so
+    /// equal keys walk the equal-seq run. Probes are instrumented with
+    /// [`note_alias_state_rows_scanned`].
+    fn bucket_position_in(
+        rows: &[(u64, AliasBacking)],
+        seq: u64,
+        alias: &AliasBacking,
+        removed_positions: Option<&std::collections::BTreeSet<usize>>,
+    ) -> Option<usize> {
+        let Ok(pos) = rows.binary_search_by(|r| {
+            note_alias_state_rows_scanned(1);
+            r.0.cmp(&seq)
+        }) else {
+            return None;
+        };
+        let is_removed = |idx: usize| removed_positions.is_some_and(|set| set.contains(&idx));
+        if rows[pos].1 == *alias && !is_removed(pos) {
+            return Some(pos);
+        }
+        let mut i = pos + 1;
+        while i < rows.len() && rows[i].0 == seq {
+            note_alias_state_rows_scanned(1);
+            if rows[i].1 == *alias && !is_removed(i) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        let mut j = pos;
+        while j > 0 && rows[j - 1].0 == seq {
+            j -= 1;
+            note_alias_state_rows_scanned(1);
+            if rows[j].1 == *alias && !is_removed(j) {
+                return Some(j);
+            }
+        }
+        None
     }
 
     /// Refresh only positions affected by a scope-bucket edit. Earlier first
@@ -12959,21 +13001,28 @@ impl AliasRegistry {
             self.exact_first_by_scope.remove(&scope);
             return;
         };
-        let exact = self.exact_first_by_scope.entry(scope).or_default();
-        note_alias_state_rows_scanned(old_keys.len());
-        for key in old_keys {
-            if exact
-                .get(key)
-                .is_some_and(|&(position, _, _)| position >= first_changed)
-            {
-                exact.remove(key);
+        let mut to_remove = Vec::new();
+        if let Some(exact) = self.exact_first_by_scope.get(&scope) {
+            note_alias_state_rows_scanned(old_keys.len());
+            let prefix_rows = &rows[..first_changed.min(rows.len())];
+            for key in old_keys {
+                if let Some(&(seq, alias)) = exact.get(key) {
+                    if Self::bucket_position_in(prefix_rows, seq, &alias, None).is_none() {
+                        to_remove.push(*key);
+                    }
+                }
             }
         }
+        let exact = self.exact_first_by_scope.entry(scope).or_default();
+        for key in to_remove {
+            exact.remove(&key);
+        }
+        let rows = &self.by_scope[&scope];
         note_alias_state_rows_scanned(rows.len().saturating_sub(first_changed));
-        for (position, &(seq, alias)) in rows.iter().enumerate().skip(first_changed) {
+        for &(seq, alias) in rows.iter().skip(first_changed) {
             exact
                 .entry((alias.start, alias.ipa))
-                .or_insert((position, seq, alias));
+                .or_insert((seq, alias));
         }
         if exact.is_empty() {
             self.exact_first_by_scope.remove(&scope);
@@ -13184,13 +13233,12 @@ impl AliasRegistry {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         let rows = self.by_scope.entry(alias.ownership_scope).or_default();
-        let position = rows.len();
         rows.push((seq, alias));
         self.exact_first_by_scope
             .entry(alias.ownership_scope)
             .or_default()
             .entry((alias.start, alias.ipa))
-            .or_insert((position, seq, alias));
+            .or_insert((seq, alias));
         self.rows = self.rows.saturating_add(1);
         self.index_insert(seq, alias);
     }
@@ -13535,7 +13583,7 @@ impl AliasRegistry {
             .exact_first_by_scope
             .get(&scope)
             .and_then(|exact| exact.get(&(start, ipa)))
-            .map(|(_, _, entry)| *entry);
+            .map(|(_, entry)| *entry);
         note_alias_state_rows_scanned(usize::from(found.is_some()));
         found
     }
@@ -13552,13 +13600,15 @@ impl AliasRegistry {
             .get(&scope)
             .and_then(|rows| rows.get(&(alias.start, alias.ipa)))
             .copied();
-        if let Some((position, seq, previous)) = exact {
+        if let Some((seq, previous)) = exact {
             note_alias_state_rows_scanned(1);
-            let slot = self
+            let rows = self
                 .by_scope
                 .get_mut(&scope)
-                .and_then(|rows| rows.get_mut(position))
                 .unwrap_or_else(|| std::process::abort());
+            let pos = Self::bucket_position_in(rows, seq, &previous, None)
+                .unwrap_or_else(|| std::process::abort());
+            let slot = &mut rows[pos];
             if slot.0 != seq || slot.1 != previous {
                 std::process::abort();
             }
@@ -13572,7 +13622,7 @@ impl AliasRegistry {
                 .get_mut(&scope)
                 .and_then(|rows| rows.get_mut(&(alias.start, alias.ipa)))
                 .unwrap_or_else(|| std::process::abort())
-                .2 = alias;
+                .1 = alias;
             return Some(previous);
         }
         self.push(alias);
@@ -13652,69 +13702,37 @@ impl AliasRegistry {
                 }
 
                 for alias in scope_expected {
+                    note_alias_state_rows_scanned(1);
                     let first_in_exact = self
                         .exact_first_by_scope
                         .get(&scope)
                         .and_then(|exact| exact.get(&(alias.start, alias.ipa)))
                         .copied();
                     let mut found_pos = None;
-                    if let Some((pos, seq, entry)) = first_in_exact {
-                        if entry == alias
-                            && !removed_positions.contains(&pos)
-                            && pos < rows.len()
-                            && rows[pos].0 == seq
-                            && rows[pos].1 == alias
-                        {
-                            found_pos = Some((pos, seq, alias));
+                    if let Some((seq, entry)) = first_in_exact {
+                        if entry == alias {
+                            if let Some(pos) = Self::bucket_position_in(
+                                rows,
+                                seq,
+                                &alias,
+                                Some(&removed_positions),
+                            ) {
+                                found_pos = Some((pos, seq, alias));
+                            }
                         }
                     }
                     if found_pos.is_none() {
                         if let Some(va_rows) = self.by_va_start.get(&alias.start) {
                             for &(seq, a) in va_rows {
                                 if a == alias && a.ipa == alias.ipa && a.ownership_scope == scope {
-                                    let search_result = rows.binary_search_by_key(&seq, |r| r.0);
-                                    match search_result {
-                                        Ok(p) => {
-                                            let mut candidate_pos = None;
-                                            let mut i = p;
-                                            while i < rows.len() && rows[i].0 == seq {
-                                                if rows[i].1 == alias
-                                                    && !removed_positions.contains(&i)
-                                                {
-                                                    candidate_pos = Some(i);
-                                                    break;
-                                                }
-                                                i += 1;
-                                            }
-                                            if candidate_pos.is_none() {
-                                                let mut j = p;
-                                                while j > 0 && rows[j - 1].0 == seq {
-                                                    j -= 1;
-                                                    if rows[j].1 == alias
-                                                        && !removed_positions.contains(&j)
-                                                    {
-                                                        candidate_pos = Some(j);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            if let Some(pos) = candidate_pos {
-                                                found_pos = Some((pos, seq, alias));
-                                                break;
-                                            }
-                                        }
-                                        Err(_) => {
-                                            if let Some(pos) =
-                                                rows.iter().enumerate().position(|(i, r)| {
-                                                    r.0 == seq
-                                                        && r.1 == alias
-                                                        && !removed_positions.contains(&i)
-                                                })
-                                            {
-                                                found_pos = Some((pos, seq, alias));
-                                                break;
-                                            }
-                                        }
+                                    if let Some(pos) = Self::bucket_position_in(
+                                        rows,
+                                        seq,
+                                        &alias,
+                                        Some(&removed_positions),
+                                    ) {
+                                        found_pos = Some((pos, seq, alias));
+                                        break;
                                     }
                                 }
                             }
@@ -13735,9 +13753,9 @@ impl AliasRegistry {
 
             let mut promoted_keys = Vec::new();
             if let Some(exact) = self.exact_first_by_scope.get(&scope) {
-                for &(pos, _seq, alias) in &removed_in_scope {
-                    if let Some(&(first_pos, _, _)) = exact.get(&(alias.start, alias.ipa)) {
-                        if first_pos == pos {
+                for &(_pos, seq, alias) in &removed_in_scope {
+                    if let Some(&(first_seq, first_alias)) = exact.get(&(alias.start, alias.ipa)) {
+                        if first_seq == seq && first_alias == alias {
                             promoted_keys.push((alias.start, alias.ipa));
                         }
                     }
@@ -13748,6 +13766,7 @@ impl AliasRegistry {
 
             for &(_, seq, alias) in &removed_in_scope {
                 self.index_remove(seq, alias);
+                note_alias_state_rows_scanned(1);
                 removed.push(alias);
             }
             self.rows = self.rows.saturating_sub(removed_in_scope.len());
@@ -13769,15 +13788,6 @@ impl AliasRegistry {
                 rows.truncate(write);
             }
 
-            if let Some(exact) = self.exact_first_by_scope.get_mut(&scope) {
-                for entry in exact.values_mut() {
-                    if entry.0 > first_removed {
-                        let shift = removed_in_scope.partition_point(|c| c.0 < entry.0);
-                        entry.0 = entry.0.saturating_sub(shift);
-                    }
-                }
-            }
-
             for (start, ipa) in promoted_keys {
                 let next_remaining = self.by_va_start.get(&start).and_then(|va_rows| {
                     va_rows
@@ -13787,39 +13797,10 @@ impl AliasRegistry {
                         .copied()
                 });
                 if let Some((next_seq, next_alias)) = next_remaining {
-                    let new_pos = self
-                        .by_scope
-                        .get(&scope)
-                        .and_then(|rows| {
-                            rows.binary_search_by_key(&next_seq, |r| r.0)
-                                .ok()
-                                .and_then(|p| {
-                                    let mut i = p;
-                                    while i < rows.len() && rows[i].0 == next_seq {
-                                        if rows[i].1 == next_alias {
-                                            return Some(i);
-                                        }
-                                        i += 1;
-                                    }
-                                    let mut j = p;
-                                    while j > 0 && rows[j - 1].0 == next_seq {
-                                        j -= 1;
-                                        if rows[j].1 == next_alias {
-                                            return Some(j);
-                                        }
-                                    }
-                                    None
-                                })
-                                .or_else(|| {
-                                    rows.iter()
-                                        .position(|r| r.0 == next_seq && r.1 == next_alias)
-                                })
-                        })
-                        .unwrap_or_else(|| std::process::abort());
                     self.exact_first_by_scope
                         .entry(scope)
                         .or_default()
-                        .insert((start, ipa), (new_pos, next_seq, next_alias));
+                        .insert((start, ipa), (next_seq, next_alias));
                 } else if let Some(exact) = self.exact_first_by_scope.get_mut(&scope) {
                     exact.remove(&(start, ipa));
                 }
@@ -13899,13 +13880,12 @@ impl AliasRegistry {
     /// Used when staging a planned mutation subset without cloning or reindexing the whole registry.
     fn insert_indexed_row(&mut self, seq: u64, alias: AliasBacking) {
         let rows = self.by_scope.entry(alias.ownership_scope).or_default();
-        let position = rows.len();
         rows.push((seq, alias));
         self.exact_first_by_scope
             .entry(alias.ownership_scope)
             .or_default()
             .entry((alias.start, alias.ipa))
-            .or_insert((position, seq, alias));
+            .or_insert((seq, alias));
         self.rows = self.rows.saturating_add(1);
         self.next_seq = self.next_seq.max(seq.saturating_add(1));
         self.index_insert(seq, alias);
