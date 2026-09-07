@@ -1749,6 +1749,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "procselffdfail": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "procselfpid": {
     "class": "conformance",
     "excluded": false,
