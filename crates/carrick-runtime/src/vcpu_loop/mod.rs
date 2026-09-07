@@ -2201,7 +2201,9 @@ fn core_note_resume_pair(
     registers: &carrick_hal::Aarch64CoreRegisters,
     synchronous_fatal_owner: bool,
 ) -> (u64, u64) {
-    if synchronous_fatal_owner {
+    if synchronous_fatal_owner
+        && !carrick_hal::aarch64::ExecLevel::from_pstate(registers.pstate).is_guest()
+    {
         (registers.elr_el1, registers.spsr_el1)
     } else {
         (registers.resume_pc, registers.resume_pstate)
@@ -11820,22 +11822,38 @@ mod tests {
 
     #[test]
     fn core_note_uses_exception_pair_only_for_synchronous_fatal_owner() {
-        let registers = carrick_hal::Aarch64CoreRegisters {
+        let vector_registers = carrick_hal::Aarch64CoreRegisters {
             resume_pc: 0x1111,
             resume_pstate: 0x2222,
+            pstate: 0x3c5,
             elr_el1: 0x3333,
             spsr_el1: 0x4444,
             ..carrick_hal::Aarch64CoreRegisters::default()
         };
         assert_eq!(
-            core_note_resume_pair(&registers, false),
+            core_note_resume_pair(&vector_registers, false),
             (0x1111, 0x2222),
             "running and syscall-blocked siblings use the engine-selected EL0 pair"
         );
         assert_eq!(
-            core_note_resume_pair(&registers, true),
+            core_note_resume_pair(&vector_registers, true),
             (0x3333, 0x4444),
             "a positive si_code binds the fatal owner to the synchronous exception pair"
+        );
+
+        let direct_registers = carrick_hal::Aarch64CoreRegisters {
+            resume_pc: 0x5555,
+            resume_pstate: 0x3c0,
+            pc: 0x5555,
+            pstate: 0x3c0,
+            elr_el1: 0x6666,
+            spsr_el1: 0x7777,
+            ..carrick_hal::Aarch64CoreRegisters::default()
+        };
+        assert_eq!(
+            core_note_resume_pair(&direct_registers, true),
+            (0x5555, 0x3c0),
+            "a direct HVF EL0 abort must not publish stale ELR_EL1 state"
         );
     }
 
