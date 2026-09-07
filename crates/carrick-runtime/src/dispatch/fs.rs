@@ -1344,6 +1344,31 @@ fn proc_component_is_self(pid: &str, visible_self: Option<u32>) -> bool {
             .is_some_and(|(pid, visible_self)| pid == visible_self)
 }
 
+fn is_proc_self_fd_dir(path: &str, visible_self: Option<u32>) -> bool {
+    let p = path.strip_suffix('/').unwrap_or(path);
+    if p == "/dev/fd" {
+        return true;
+    }
+    let Some(rest) = p.strip_prefix("/proc/") else {
+        return false;
+    };
+    let Some((pid, sub)) = rest.split_once('/') else {
+        return false;
+    };
+    sub == "fd" && proc_component_is_self(pid, visible_self)
+}
+
+fn is_proc_self_fdinfo_dir(path: &str, visible_self: Option<u32>) -> bool {
+    let p = path.strip_suffix('/').unwrap_or(path);
+    let Some(rest) = p.strip_prefix("/proc/") else {
+        return false;
+    };
+    let Some((pid, sub)) = rest.split_once('/') else {
+        return false;
+    };
+    sub == "fdinfo" && proc_component_is_self(pid, visible_self)
+}
+
 fn proc_self_fd_number(path: &str, visible_self: Option<u32>) -> Option<i32> {
     let rest = path
         .strip_prefix("/proc/self/fd/")
@@ -4248,6 +4273,31 @@ impl SyscallDispatcher {
                 });
             }
         }
+    }
+
+    fn proc_self_fd_entries(&self, path: &str, is_fdinfo: bool) -> Vec<RootFsDirEntry> {
+        let fds = self.open_fd_numbers();
+        let dir_path = std::path::Path::new(path);
+        let (kind, mode) = if is_fdinfo {
+            (RootFsEntryKind::File, 0o400)
+        } else {
+            (RootFsEntryKind::Symlink, 0o777)
+        };
+        fds.into_iter()
+            .map(|fd| {
+                let name = fd.to_string();
+                RootFsDirEntry {
+                    metadata: RootFsMetadata {
+                        path: dir_path.join(&name),
+                        kind,
+                        mode,
+                        size: 0,
+                    },
+                    name,
+                    ino: 0,
+                }
+            })
+            .collect()
     }
 
     /// Render `/proc/self/fdinfo/N` (proc_pid_fdinfo(5)): pos, the open flags
@@ -10841,7 +10891,14 @@ impl SyscallDispatcher {
             // getdents time, and a walk anchor that never reads pays
             // nothing): streamed off a trusted host dirfd when nothing
             // interferes, the exact layered merge otherwise.
-            if matches!(listing, DirListing::Pending) {
+            let visible_self = proc_visible_self(cx.kernel);
+            let is_self_fd = is_proc_self_fd_dir(path, visible_self);
+            let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
+            if (is_self_fd || is_self_fdinfo)
+                && (*offset == 0 || matches!(listing, DirListing::Pending))
+            {
+                *listing = DirListing::Fixed(this.proc_self_fd_entries(path, is_self_fdinfo));
+            } else if matches!(listing, DirListing::Pending) {
                 *listing = DirListing::Loaded(
                     this.list_directory_entries(path, trusted_host_dir.as_ref()),
                 );
@@ -10995,9 +11052,16 @@ impl SyscallDispatcher {
                 } = &mut *open
                 && matches!(listing, DirListing::Pending)
             {
-                *listing = DirListing::Loaded(
-                    this.list_directory_entries(path, trusted_host_dir.as_ref()),
-                );
+                let visible_self = proc_visible_self(cx.kernel);
+                let is_self_fd = is_proc_self_fd_dir(path, visible_self);
+                let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
+                if is_self_fd || is_self_fdinfo {
+                    *listing = DirListing::Fixed(this.proc_self_fd_entries(path, is_self_fdinfo));
+                } else {
+                    *listing = DirListing::Loaded(
+                        this.list_directory_entries(path, trusted_host_dir.as_ref()),
+                    );
+                }
             }
 
             let (current, end) = match &mut *open {
@@ -11209,9 +11273,12 @@ impl SyscallDispatcher {
             // A rewind drops a read-time snapshot so the next getdents64
             // lists a FRESH view (Linux re-reads the directory after
             // rewinddir). A synthetic mount's fixed listing replays.
+            let visible_self = proc_visible_self(cx.kernel);
             if next == 0
-                && let OpenDescription::Directory { listing, .. } = &mut *open
-                && matches!(listing, DirListing::Loaded(_))
+                && let OpenDescription::Directory { listing, path, .. } = &mut *open
+                && (matches!(listing, DirListing::Loaded(_))
+                    || is_proc_self_fd_dir(path, visible_self)
+                    || is_proc_self_fdinfo_dir(path, visible_self))
             {
                 *listing = DirListing::Pending;
             }
