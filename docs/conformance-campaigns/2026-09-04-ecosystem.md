@@ -1797,3 +1797,24 @@ pty-jobctl workers land, so a single artifact carries all of it.
   path_filepath PASS. One load-coupled flake recorded: a child SIGSEGV in
   `runtime.memmove` during `crypto/internal/fips140test` `TestCASTFailures`
   under three concurrent builds, 0/6 quiet reruns.
+
+## 2026-09-07: seventh landing — the kernel wait set
+
+Landed `cc136d016`, `4d16538c1`, `ef46cef07` (main `1ff55a204`): mixed and
+synthetic `ppoll`/`pselect6` sets enroll on carrick-owned readiness queues
+(pipes, eventfd, timerfd, pure AF_UNIX sockets, epoll instances) with RAII
+registrations, park on one wake pipe per executor multiplexed with the host
+fds, and use monotonic deadlines. The 10 ms `nanosleep` slicing loop and its
+~60 s "give up and return 0" ceiling are gone. Signal publication wakes a
+parked wait set through the task-wake subscription, and process-directed
+signals prefer the thread-group leader so a watchdog thread cannot steal
+them from the parked leader. Receipts on the landed binary under host load
+~15: pipe wake 2.3 ms (0.29 ms on a quieter host; was 5–7 ms), `SIGALRM`
+armed at 100 ms interrupts the wait at 107.9 ms with EINTR, a sibling's
+`SIGUSR1` interrupts in 0.13 ms, a blocked `SIGALRM` correctly does not
+interrupt, 30 ms timeouts land at 30.6 ms, an 85 s infinite wait no longer
+returns at 60 s; LTP poll01/ppoll01/select01/pselect01/alarm02/setitimer01
+pass; CPython test_signal/test_selectors/test_poll/test_select SUCCESS;
+2,491 runtime tests. Open follow-up recorded by the worker: a long mixed
+wait still holds its executor host thread (parity with the old loop), to be
+routed through the lease-release helper other long host waits use.
