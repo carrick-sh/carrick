@@ -38,6 +38,10 @@ pub enum RunQueueError {
     SubmissionRejected,
     #[error("run queue publication authority does not match the submitted generation")]
     AuthorityMismatch,
+    #[error("generation observer has no binding record for the predecessor generation")]
+    ObserverBindingMissing,
+    #[error("generation observer outlived its scheduler")]
+    ObserverSchedulerGone,
     #[error("executor identifiers are exhausted")]
     ExecutorIdExhausted,
     #[error("executor is already running another exact generation")]
