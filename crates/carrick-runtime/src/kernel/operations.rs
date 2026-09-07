@@ -3097,7 +3097,7 @@ impl Kernel {
         diagnostic_name: String,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<ForkReservation, KernelOperationError> {
-        self.sweep_retired_threads();
+        self.sweep_retired_threads_for_process(Some(parent.task.key().id));
         if !Arc::ptr_eq(self, &parent.kernel) {
             return Err(KernelOperationError::ForeignContext);
         }
@@ -4804,8 +4804,8 @@ impl Kernel {
         job_control: WaitJobControl,
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
-        self.sweep_retired_threads();
-        let mut state = self.registry().state.write();
+        self.sweep_retired_threads_for_process(Some(parent_id));
+        let state = self.registry().state.read();
         if mode == WaitMode::Consume {
             ensure_task_unreserved(&state, parent_id)?;
         }
@@ -4844,6 +4844,9 @@ impl Kernel {
         });
         if let Some((id, zombie)) = exited {
             if mode == WaitMode::Consume {
+                drop(state);
+                let mut state = self.registry().state.write();
+                ensure_task_unreserved(&state, parent_id)?;
                 ensure_task_unreserved(&state, id)?;
                 let parent_revision = state
                     .tasks
@@ -9196,6 +9199,72 @@ mod tests {
         drop(dead_leader);
         assert_eq!(kernel.sweep_retired_threads(), 2);
         assert_eq!(kernel.ids().counts().thread_claims, 1);
+    }
+
+    #[test]
+    fn sweep_retired_threads_for_process_sweeps_only_matching_process() {
+        let (kernel, root) = bootstrap(198);
+        let child1 = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_198),
+                "child1".to_string(),
+                None,
+            )
+            .expect("child1 task");
+        let child1_id = child1.task.key().id;
+        let thread1 = kernel
+            .clone_thread(
+                &child1,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .expect("thread plan"),
+                ThreadId::synthetic_for_tests(9_199),
+                None,
+            )
+            .expect("child1 thread");
+        let child2 = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_200),
+                "child2".to_string(),
+                None,
+            )
+            .expect("child2 task");
+        let child2_id = child2.task.key().id;
+        let thread2 = kernel
+            .clone_thread(
+                &child2,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .expect("thread plan"),
+                ThreadId::synthetic_for_tests(9_201),
+                None,
+            )
+            .expect("child2 thread");
+
+        kernel.exit_thread(&thread1, None).expect("exit thread 1");
+        kernel.exit_thread(&thread2, None).expect("exit thread 2");
+        drop(thread1);
+        drop(thread2);
+
+        assert_eq!(kernel.registry().retired_thread_count(), 2);
+
+        // Sweeping child1 only reaps child1's retired thread.
+        assert_eq!(kernel.sweep_retired_threads_for_process(Some(child1_id)), 1);
+        assert_eq!(kernel.registry().retired_thread_count(), 1);
+
+        // A second sweep of child1 takes the read-fast-path and returns 0 without writing.
+        assert_eq!(kernel.sweep_retired_threads_for_process(Some(child1_id)), 0);
+        assert_eq!(kernel.registry().retired_thread_count(), 1);
+
+        // Sweeping child2 reaps child2's retired thread.
+        assert_eq!(kernel.sweep_retired_threads_for_process(Some(child2_id)), 1);
+        assert_eq!(kernel.registry().retired_thread_count(), 0);
     }
 
     #[test]
