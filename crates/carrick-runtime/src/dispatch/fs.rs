@@ -1909,7 +1909,12 @@ impl SyscallDispatcher {
         {
             let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
             match self.fs.rootfs_vfs.dentry_stat(path, follow) {
-                Ok(real) => return Ok(self.stat_record_with_device(path, &real)),
+                Ok(real) => {
+                    if requires_dir && real.kind != RootFsEntryKind::Directory {
+                        return Err(LINUX_ENOTDIR);
+                    }
+                    return Ok(self.stat_record_with_device(path, &real));
+                }
                 Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
                 Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
                 Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
@@ -1952,7 +1957,12 @@ impl SyscallDispatcher {
             && self.fs.vfs_mounts.resolve(&path).is_none()
         {
             match self.fs.rootfs_vfs.dentry_stat(&path, follow) {
-                Ok(real) => return Ok(self.stat_record_with_device(&path, &real)),
+                Ok(real) => {
+                    if requires_dir && real.kind != RootFsEntryKind::Directory {
+                        return Err(LINUX_ENOTDIR);
+                    }
+                    return Ok(self.stat_record_with_device(&path, &real));
+                }
                 Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
                 Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
                 Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
@@ -2052,6 +2062,9 @@ impl SyscallDispatcher {
             path
         };
         if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
+            if requires_dir && real.kind != RootFsEntryKind::Directory {
+                return Err(LINUX_ENOTDIR);
+            }
             return Ok(self.stat_record_with_device(&path, &real));
         }
         // Dangling only if resolution never got PAST the link: on success
@@ -2072,6 +2085,9 @@ impl SyscallDispatcher {
         use crate::vfs::Vfs as _;
         if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
             if let Some(real) = m.vfs.real_stat(&m.full_path, follow) {
+                if requires_dir && real.kind != RootFsEntryKind::Directory {
+                    return Err(LINUX_ENOTDIR);
+                }
                 return Ok(StatRecord::from_real(&path, &real));
             }
             if let Ok(md) = if follow {
@@ -2079,6 +2095,9 @@ impl SyscallDispatcher {
             } else {
                 m.vfs.lookup_nofollow(&m.full_path)
             } {
+                if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
+                    return Err(LINUX_ENOTDIR);
+                }
                 return Ok(StatRecord::from_metadata(&vfs_md_to_rootfs_md(&path, &md)));
             }
         }
@@ -2088,8 +2107,12 @@ impl SyscallDispatcher {
         } else {
             self.fs.rootfs_vfs.lookup_nofollow(&path)
         };
-        lookup
-            .map(|md| self.layered_identity_record(&path, follow, &vfs_md_to_rootfs_md(&path, &md)))
+        lookup.and_then(|md| {
+            if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
+                return Err(LINUX_ENOTDIR);
+            }
+            Ok(self.layered_identity_record(&path, follow, &vfs_md_to_rootfs_md(&path, &md)))
+        })
     }
 
     fn statfs(
@@ -16659,6 +16682,9 @@ impl SyscallDispatcher {
                 let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
                 match this.fs.rootfs_vfs.dentry_stat(&path, follow) {
                     Ok(real) => {
+                        if requires_dir && real.kind != RootFsEntryKind::Directory {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                        }
                         return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
                     }
                     Err(LINUX_ENOENT) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
@@ -16694,6 +16720,9 @@ impl SyscallDispatcher {
             {
                 match this.fs.rootfs_vfs.dentry_stat(&path, follow) {
                     Ok(real) => {
+                        if requires_dir && real.kind != RootFsEntryKind::Directory {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                        }
                         return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
                     }
                     Err(LINUX_ENOENT) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
@@ -16768,6 +16797,9 @@ impl SyscallDispatcher {
                 path
             };
             if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
+                if requires_dir && real.kind != RootFsEntryKind::Directory {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                }
                 return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
             }
             // DANGLING SYMLINK: resolution never got past the link (a resolved
@@ -16785,6 +16817,9 @@ impl SyscallDispatcher {
             // /dev/ptmx, /dev/pts/N, /dev/tty resolve (mirrors the open path).
             if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
                 if let Some(real) = m.vfs.real_stat(&m.full_path, follow) {
+                    if requires_dir && real.kind != RootFsEntryKind::Directory {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                    }
                     return Ok(write_statx_real(memory, statxbuf, &path, &real));
                 }
                 if let Ok(md) = if follow {
@@ -16792,6 +16827,9 @@ impl SyscallDispatcher {
                 } else {
                     m.vfs.lookup_nofollow(&m.full_path)
                 } {
+                    if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                    }
                     return Ok(write_statx(
                         memory,
                         statxbuf,
@@ -16809,6 +16847,9 @@ impl SyscallDispatcher {
             };
             match lookup {
                 Ok(md) => {
+                    if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+                    }
                     // Same identity reconciliation newfstatat performs, so
                     // statx and stat cannot report different inodes for one
                     // immutable-lower file.

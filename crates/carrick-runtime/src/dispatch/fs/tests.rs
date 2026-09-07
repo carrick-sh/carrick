@@ -7202,6 +7202,8 @@ fn test_stat_and_lookup_dot_leaf() {
         .set_file_contents("/mydir/myfile", b"data".to_vec())
         .unwrap();
     backend.symlink(".", "/mydir/dotsym").unwrap();
+    backend.symlink("/mydir/myfile", "/mydir/filesym").unwrap();
+    backend.symlink("/mydir", "/mydir/dirsym").unwrap();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
@@ -7255,4 +7257,111 @@ fn test_stat_and_lookup_dot_leaf() {
             .unwrap(),
     );
     assert_eq!(mode & 0o170000, 0o040000, "dotsym followed must be S_IFDIR");
+
+    // 4. stat and lstat on "/mydir/myfile/" fails with ENOTDIR
+    memory.write_bytes(0x4000, b"/mydir/myfile/\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [LINUX_AT_FDCWD, 0x4000, 0x7000, 0, 0, 0],
+    );
+    assert_eq!(
+        rc,
+        -i64::from(crate::linux_abi::LINUX_ENOTDIR.get()),
+        "stat(/mydir/myfile/) should be ENOTDIR"
+    );
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            0x7000,
+            crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW as u64,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        rc,
+        -i64::from(crate::linux_abi::LINUX_ENOTDIR.get()),
+        "lstat(/mydir/myfile/) should be ENOTDIR"
+    );
+
+    // 5. symlink to file with trailing slash: stat and lstat must be ENOTDIR
+    memory.write_bytes(0x4000, b"/mydir/filesym/\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [LINUX_AT_FDCWD, 0x4000, 0x7000, 0, 0, 0],
+    );
+    assert_eq!(
+        rc,
+        -i64::from(crate::linux_abi::LINUX_ENOTDIR.get()),
+        "stat(/mydir/filesym/) should be ENOTDIR"
+    );
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            0x7000,
+            crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW as u64,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        rc,
+        -i64::from(crate::linux_abi::LINUX_ENOTDIR.get()),
+        "lstat(/mydir/filesym/) should be ENOTDIR"
+    );
+
+    // 6. symlink to dir with trailing slash: lstat must follow and report S_IFDIR
+    memory.write_bytes(0x4000, b"/mydir/dirsym/\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            0x7000,
+            crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW as u64,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(rc, 0, "lstat(/mydir/dirsym/) should follow and succeed");
+    let mode = u32::from_ne_bytes(
+        memory
+            .read_bytes(0x7000 + 16, 4)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(mode & 0o170000, 0o040000, "dirsym/ must be S_IFDIR");
+
+    // 7. symlink to dir with /.: stat must report S_IFDIR
+    memory.write_bytes(0x4000, b"/mydir/dirsym/.\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [LINUX_AT_FDCWD, 0x4000, 0x7000, 0, 0, 0],
+    );
+    assert_eq!(rc, 0, "stat(/mydir/dirsym/.) should succeed");
+    let mode = u32::from_ne_bytes(
+        memory
+            .read_bytes(0x7000 + 16, 4)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(mode & 0o170000, 0o040000, "dirsym/. must be S_IFDIR");
 }

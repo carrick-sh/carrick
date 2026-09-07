@@ -98,17 +98,19 @@ impl SyscallDispatcher {
                     )
                 })
             } else {
-                self.fs
+                let stat = self
+                    .fs
                     .rootfs_vfs
-                    .overlay
-                    .real_stat(&resolved, follow)
-                    .map(|real| {
-                        let type_bits = real.mode & LINUX_S_IFMT;
-                        matches!(real.kind, RootFsEntryKind::Directory)
-                            || (matches!(real.kind, RootFsEntryKind::File)
-                                && type_bits != LINUX_S_IFCHR
-                                && type_bits != LINUX_S_IFBLK)
-                    })
+                    .dentry_stat(&resolved, follow)
+                    .ok()
+                    .or_else(|| self.fs.rootfs_vfs.overlay.real_stat(&resolved, follow));
+                stat.map(|real| {
+                    let type_bits = real.mode & LINUX_S_IFMT;
+                    matches!(real.kind, RootFsEntryKind::Directory)
+                        || (matches!(real.kind, RootFsEntryKind::File)
+                            && type_bits != LINUX_S_IFCHR
+                            && type_bits != LINUX_S_IFBLK)
+                })
             };
             if regular_or_dir == Some(false) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
@@ -149,11 +151,7 @@ impl SyscallDispatcher {
         let name = read_guest_c_string(memory, name_ptr.0)?;
         let buf_addr = value_ptr.0;
         let size = size as usize;
-        let value = self
-            .fs
-            .rootfs_vfs
-            .overlay
-            .get_xattr(&resolved, &name, follow)?;
+        let value = self.fs.rootfs_vfs.get_xattr(&resolved, &name, follow)?;
         // size == 0 is the "tell me how big" probe: return the length without
         // copying anything.
         if size == 0 {
@@ -184,7 +182,7 @@ impl SyscallDispatcher {
         let resolved = self.xattr_target_path(memory, target)?;
         let buf_addr = list_ptr.0;
         let size = size as usize;
-        let names = self.fs.rootfs_vfs.overlay.list_xattr(&resolved, follow)?;
+        let names = self.fs.rootfs_vfs.list_xattr(&resolved, follow)?;
         // Assemble the NUL-separated, NUL-terminated name list Linux returns.
         let mut list = Vec::new();
         for n in &names {
@@ -220,10 +218,7 @@ impl SyscallDispatcher {
         // absent attribute on a file that DOES exist; removexattr02 checks
         // both) is now enforced centrally in xattr_target_path.
         let name = read_guest_c_string(memory, name_ptr.0)?;
-        self.fs
-            .rootfs_vfs
-            .overlay
-            .remove_xattr(&resolved, &name, follow)?;
+        self.fs.rootfs_vfs.remove_xattr(&resolved, &name, follow)?;
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 }
