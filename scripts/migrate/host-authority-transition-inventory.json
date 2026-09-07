@@ -388,18 +388,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3784 in `synthetic_proc_pid_file`, the host result from `libc::getpgrp` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3799 in `synthetic_proc_pid_file`, the host result from `libc::getpgrp` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000015",
     "source": {
-      "byte_end": 156119,
-      "byte_start": 156106,
+      "byte_end": 156448,
+      "byte_start": 156435,
       "column": 34,
       "column_end": 47,
       "column_start": 34,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3784,
-      "line_end": 3784,
-      "line_start": 3784
+      "line": 3799,
+      "line_end": 3799,
+      "line_start": 3799
     }
   },
   {
@@ -1371,18 +1371,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3245 in `synthetic_proc_self_stat`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_self_stat`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3260 in `synthetic_proc_self_stat`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_self_stat`.",
     "review_id": "HA-000054",
     "source": {
-      "byte_end": 136048,
-      "byte_start": 136035,
+      "byte_end": 136377,
+      "byte_start": 136364,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3245,
-      "line_end": 3245,
-      "line_start": 3245
+      "line": 3260,
+      "line_end": 3260,
+      "line_start": 3260
     }
   },
   {
@@ -1398,18 +1398,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3663 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3678 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000055",
     "source": {
-      "byte_end": 150897,
-      "byte_start": 150884,
+      "byte_end": 151226,
+      "byte_start": 151213,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3663,
-      "line_end": 3663,
-      "line_start": 3663
+      "line": 3678,
+      "line_end": 3678,
+      "line_start": 3678
     }
   },
   {
@@ -1425,18 +1425,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3715 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3730 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000056",
     "source": {
-      "byte_end": 152994,
-      "byte_start": 152981,
+      "byte_end": 153323,
+      "byte_start": 153310,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3715,
-      "line_end": 3715,
-      "line_start": 3715
+      "line": 3730,
+      "line_end": 3730,
+      "line_start": 3730
     }
   },
   {
@@ -1824,18 +1824,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:2364 in `enumerate_guest_pids`, the host result from `libc::proc_listallpids` determines the guest /proc process enumeration count used by `enumerate_guest_pids`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:2410 in `enumerate_guest_pids`, the host result from `libc::proc_listallpids` determines the guest /proc process enumeration count used by `enumerate_guest_pids`.",
     "review_id": "HA-000072",
     "source": {
-      "byte_end": 101803,
-      "byte_start": 101781,
+      "byte_end": 103178,
+      "byte_start": 103156,
       "column": 26,
       "column_end": 48,
       "column_start": 26,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 2364,
-      "line_end": 2364,
-      "line_start": 2364
+      "line": 2410,
+      "line_end": 2410,
+      "line_start": 2410
     }
   },
   {
@@ -1851,18 +1851,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:2370 in `enumerate_guest_pids`, the host result from `libc::proc_listallpids` determines the guest /proc process enumeration table used by `enumerate_guest_pids`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:2416 in `enumerate_guest_pids`, the host result from `libc::proc_listallpids` determines the guest /proc process enumeration table used by `enumerate_guest_pids`.",
     "review_id": "HA-000073",
     "source": {
-      "byte_end": 102054,
-      "byte_start": 102032,
+      "byte_end": 103429,
+      "byte_start": 103407,
       "column": 24,
       "column_end": 46,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 2370,
-      "line_end": 2370,
-      "line_start": 2370
+      "line": 2416,
+      "line_end": 2416,
+      "line_start": 2416
     }
   },
   {
@@ -14665,18 +14665,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:1313 in `proc_pid_dir_host_pid`, the host result from `std::process::id` determines the guest /proc process identity fallback used by `proc_pid_dir_host_pid`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:1314 in `proc_pid_dir_host_pid`, the host result from `std::process::id` determines the guest /proc process identity fallback used by `proc_pid_dir_host_pid`.",
     "review_id": "HA-000562",
     "source": {
-      "byte_end": 58027,
-      "byte_start": 58011,
-      "column": 19,
-      "column_end": 35,
-      "column_start": 19,
+      "byte_end": 58116,
+      "byte_start": 58100,
+      "column": 20,
+      "column_end": 36,
+      "column_start": 20,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 1313,
-      "line_end": 1313,
-      "line_start": 1313
+      "line": 1314,
+      "line_end": 1314,
+      "line_start": 1314
     }
   },
   {
@@ -14692,18 +14692,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:1791 in `proc_pid_dir_entries`, the host result from `std::process::id` determines the guest /proc process-directory contents used by `proc_pid_dir_entries`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:1835 in `proc_pid_dir_entries`, the host result from `std::process::id` determines the guest /proc process-directory contents used by `proc_pid_dir_entries`.",
     "review_id": "HA-000563",
     "source": {
-      "byte_end": 79914,
-      "byte_start": 79898,
+      "byte_end": 81155,
+      "byte_start": 81139,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 1791,
-      "line_end": 1791,
-      "line_start": 1791
+      "line": 1835,
+      "line_end": 1835,
+      "line_start": 1835
     }
   },
   {
@@ -14719,18 +14719,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:2114 in `synthetic_proc_self_stat`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_self_stat`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:2158 in `synthetic_proc_self_stat`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_self_stat`.",
     "review_id": "HA-000564",
     "source": {
-      "byte_end": 91846,
-      "byte_start": 91830,
+      "byte_end": 93087,
+      "byte_start": 93071,
       "column": 62,
       "column_end": 78,
       "column_start": 62,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 2114,
-      "line_end": 2114,
-      "line_start": 2114
+      "line": 2158,
+      "line_end": 2158,
+      "line_start": 2158
     }
   },
   {
@@ -14746,18 +14746,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3243 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3258 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000565",
     "source": {
-      "byte_end": 135950,
-      "byte_start": 135934,
+      "byte_end": 136279,
+      "byte_start": 136263,
       "column": 36,
       "column_end": 52,
       "column_start": 36,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3243,
-      "line_end": 3243,
-      "line_start": 3243
+      "line": 3258,
+      "line_end": 3258,
+      "line_start": 3258
     }
   },
   {
@@ -14773,18 +14773,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3664 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3679 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000566",
     "source": {
-      "byte_end": 150943,
-      "byte_start": 150927,
+      "byte_end": 151272,
+      "byte_start": 151256,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3664,
-      "line_end": 3664,
-      "line_start": 3664
+      "line": 3679,
+      "line_end": 3679,
+      "line_start": 3679
     }
   },
   {
@@ -14800,18 +14800,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3716 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc parent-process metadata used by `synthetic_proc_pid_file`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3731 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc parent-process metadata used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000567",
     "source": {
-      "byte_end": 153040,
-      "byte_start": 153024,
+      "byte_end": 153369,
+      "byte_start": 153353,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3716,
-      "line_end": 3716,
-      "line_start": 3716
+      "line": 3731,
+      "line_end": 3731,
+      "line_start": 3731
     }
   },
   {
@@ -14827,18 +14827,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3783 in `parse_proc_pid_path`, the host result from `std::process::id` determines the guest /proc self-directory identity used by `parse_proc_pid_path`.",
+    "rationale": "At crates/carrick-runtime/src/vfs/proc.rs:3798 in `parse_proc_pid_path`, the host result from `std::process::id` determines the guest /proc self-directory identity used by `parse_proc_pid_path`.",
     "review_id": "HA-000568",
     "source": {
-      "byte_end": 156069,
-      "byte_start": 156053,
+      "byte_end": 156398,
+      "byte_start": 156382,
       "column": 25,
       "column_end": 41,
       "column_start": 25,
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 3783,
-      "line_end": 3783,
-      "line_start": 3783
+      "line": 3798,
+      "line_end": 3798,
+      "line_start": 3798
     }
   },
   {
