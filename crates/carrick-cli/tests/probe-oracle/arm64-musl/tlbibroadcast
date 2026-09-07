@@ -1,0 +1,4 @@
+a93500b8fba32064
+broadcast_mprotect_observed=true
+broadcast_munmap_observed=true
+no_stale_fault=true
