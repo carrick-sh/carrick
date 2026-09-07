@@ -764,8 +764,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 285977,
-        "byte_start": 285965,
+        "byte_end": 285999,
+        "byte_start": 285987,
         "column": 28,
         "column_end": 40,
         "column_start": 28,
@@ -2196,15 +2196,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 319915,
-        "byte_start": 319890,
+        "byte_end": 319225,
+        "byte_start": 319200,
         "column": 16,
         "column_end": 41,
         "column_start": 16,
         "file": "crates/carrick-runtime/src/fs_backend.rs",
-        "line": 7647,
-        "line_end": 7647,
-        "line_start": 7647
+        "line": 7638,
+        "line_end": 7638,
+        "line_start": 7638
       }
     },
     {
@@ -2216,15 +2216,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 322365,
-        "byte_start": 322340,
+        "byte_end": 321675,
+        "byte_start": 321650,
         "column": 24,
         "column_end": 49,
         "column_start": 24,
         "file": "crates/carrick-runtime/src/fs_backend.rs",
-        "line": 7710,
-        "line_end": 7710,
-        "line_start": 7710
+        "line": 7701,
+        "line_end": 7701,
+        "line_start": 7701
       }
     },
     {
@@ -2649,15 +2649,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 320019,
-        "byte_start": 320015,
+        "byte_end": 319329,
+        "byte_start": 319325,
         "column": 10,
         "column_end": 14,
         "column_start": 10,
         "file": "crates/carrick-runtime/src/fs_backend.rs",
-        "line": 7652,
-        "line_end": 7652,
-        "line_start": 7652
+        "line": 7643,
+        "line_end": 7643,
+        "line_start": 7643
       }
     },
     {
@@ -2669,15 +2669,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 322434,
-        "byte_start": 322430,
+        "byte_end": 321744,
+        "byte_start": 321740,
         "column": 14,
         "column_end": 18,
         "column_start": 14,
         "file": "crates/carrick-runtime/src/fs_backend.rs",
-        "line": 7713,
-        "line_end": 7713,
-        "line_start": 7713
+        "line": 7704,
+        "line_end": 7704,
+        "line_start": 7704
       }
     },
     {
@@ -3823,15 +3823,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 16322,
-        "byte_start": 16305,
+        "byte_end": 16508,
+        "byte_start": 16491,
         "column": 20,
         "column_end": 37,
         "column_start": 20,
         "file": "crates/carrick-runtime/src/dispatch/fs/access.rs",
-        "line": 367,
-        "line_end": 367,
-        "line_start": 367
+        "line": 375,
+        "line_end": 375,
+        "line_start": 375
       }
     },
     {
@@ -5094,8 +5094,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 285492,
-        "byte_start": 285475,
+        "byte_end": 285514,
+        "byte_start": 285497,
         "column": 22,
         "column_end": 39,
         "column_start": 22,
@@ -5114,15 +5114,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 321356,
-        "byte_start": 321339,
+        "byte_end": 320666,
+        "byte_start": 320649,
         "column": 23,
         "column_end": 40,
         "column_start": 23,
         "file": "crates/carrick-runtime/src/fs_backend.rs",
-        "line": 7685,
-        "line_end": 7685,
-        "line_start": 7685
+        "line": 7676,
+        "line_end": 7676,
+        "line_start": 7676
       }
     },
     {
@@ -7741,8 +7741,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 283725,
-        "byte_start": 283700,
+        "byte_end": 283747,
+        "byte_start": 283722,
         "column": 24,
         "column_end": 49,
         "column_start": 24,
@@ -12558,9 +12558,9 @@
       }
     }
   ],
-  "rows_sha256": "0fb582a0ce5e52a050ab64e1e94fc0657381893dd699eb554b25765bf47a46ae",
+  "rows_sha256": "b24a136e4bb4af1635982a0164437b78a4cc320f7659a5f951dcf859180858f9",
   "schema": 1,
-  "source_head": "c67cab85925619f5f4488fadbd4cc612883ece8a",
+  "source_head": "52357bf57c4e23bd4f88ef7b7d5eafb53c535a60",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

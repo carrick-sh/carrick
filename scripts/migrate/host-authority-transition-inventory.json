@@ -929,8 +929,8 @@
     "rationale": "At crates/carrick-runtime/src/fs_backend.rs:6803 in `open_anon_fd`, `libc::getpid` accesses only the anonymous regular-file object beneath the capability-rooted hostfs used by `open_anon_fd`.",
     "review_id": "HA-000038",
     "source": {
-      "byte_end": 285977,
-      "byte_start": 285965,
+      "byte_end": 285999,
+      "byte_start": 285987,
       "column": 28,
       "column_end": 40,
       "column_start": 28,
@@ -2862,18 +2862,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7647 in `acquire_lockfile`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `acquire_lockfile`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7638 in `acquire_lockfile`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `acquire_lockfile`.",
     "review_id": "HA-000112",
     "source": {
-      "byte_end": 319915,
-      "byte_start": 319890,
+      "byte_end": 319225,
+      "byte_start": 319200,
       "column": 16,
       "column_end": 41,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7647,
-      "line_end": 7647,
-      "line_start": 7647
+      "line": 7638,
+      "line_end": 7638,
+      "line_start": 7638
     }
   },
   {
@@ -2889,18 +2889,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7710 in `sweep_orphans`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7701 in `sweep_orphans`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
     "review_id": "HA-000113",
     "source": {
-      "byte_end": 322365,
-      "byte_start": 322340,
+      "byte_end": 321675,
+      "byte_start": 321650,
       "column": 24,
       "column_end": 49,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7710,
-      "line_end": 7710,
-      "line_start": 7710
+      "line": 7701,
+      "line_end": 7701,
+      "line_start": 7701
     }
   },
   {
@@ -3476,18 +3476,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7652 in `acquire_lockfile`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `acquire_lockfile`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7643 in `acquire_lockfile`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `acquire_lockfile`.",
     "review_id": "HA-000135",
     "source": {
-      "byte_end": 320019,
-      "byte_start": 320015,
+      "byte_end": 319329,
+      "byte_start": 319325,
       "column": 10,
       "column_end": 14,
       "column_start": 10,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7652,
-      "line_end": 7652,
-      "line_start": 7652
+      "line": 7643,
+      "line_end": 7643,
+      "line_start": 7643
     }
   },
   {
@@ -3503,18 +3503,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7713 in `sweep_orphans`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7704 in `sweep_orphans`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
     "review_id": "HA-000136",
     "source": {
-      "byte_end": 322434,
-      "byte_start": 322430,
+      "byte_end": 321744,
+      "byte_start": 321740,
       "column": 14,
       "column_end": 18,
       "column_start": 14,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7713,
-      "line_end": 7713,
-      "line_start": 7713
+      "line": 7704,
+      "line_end": 7704,
+      "line_start": 7704
     }
   },
   {
@@ -5070,18 +5070,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/fs/access.rs:367 in `check_exec_target`, `std::fs::metadata` accesses only the user-selected bare run-elf executable path used by `check_exec_target`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/fs/access.rs:375 in `check_exec_target`, `std::fs::metadata` accesses only the user-selected bare run-elf executable path used by `check_exec_target`.",
     "review_id": "HA-000195",
     "source": {
-      "byte_end": 16322,
-      "byte_start": 16305,
+      "byte_end": 16508,
+      "byte_start": 16491,
       "column": 20,
       "column_end": 37,
       "column_start": 20,
       "file": "crates/carrick-runtime/src/dispatch/fs/access.rs",
-      "line": 367,
-      "line_end": 367,
-      "line_start": 367
+      "line": 375,
+      "line_end": 375,
+      "line_start": 375
     }
   },
   {
@@ -6799,8 +6799,8 @@
     "rationale": "At crates/carrick-runtime/src/fs_backend.rs:6790 in `watch_fds`, `std::fs::read_dir` accesses only the active capability-rooted hostfs backing tree used by `watch_fds`.",
     "review_id": "HA-000259",
     "source": {
-      "byte_end": 285492,
-      "byte_start": 285475,
+      "byte_end": 285514,
+      "byte_start": 285497,
       "column": 22,
       "column_end": 39,
       "column_start": 22,
@@ -6823,18 +6823,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7685 in `sweep_orphans`, `std::fs::read_dir` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7676 in `sweep_orphans`, `std::fs::read_dir` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
     "review_id": "HA-000260",
     "source": {
-      "byte_end": 321356,
-      "byte_start": 321339,
+      "byte_end": 320666,
+      "byte_start": 320649,
       "column": 23,
       "column_end": 40,
       "column_start": 23,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7685,
-      "line_end": 7685,
-      "line_start": 7685
+      "line": 7676,
+      "line_end": 7676,
+      "line_start": 7676
     }
   },
   {
@@ -10384,8 +10384,8 @@
     "rationale": "At crates/carrick-runtime/src/fs_backend.rs:6748 in `watch_fds`, `std::fs::symlink_metadata` accesses only the active capability-rooted hostfs backing tree used by `watch_fds`.",
     "review_id": "HA-000393",
     "source": {
-      "byte_end": 283725,
-      "byte_start": 283700,
+      "byte_end": 283747,
+      "byte_start": 283722,
       "column": 24,
       "column_end": 49,
       "column_start": 24,
