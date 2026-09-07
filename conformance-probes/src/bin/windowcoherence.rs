@@ -77,6 +77,60 @@ fn fragment_mappings() {
     }
 }
 
+fn test_out_of_order_window() {
+    let size = 2 * 1024 * 1024;
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return;
+    }
+    let base = ptr as *mut u8;
+
+    // Step 1: Touch offset 128 KiB (0x20000) so a mapping at 0x20000 is created first in self.mappings
+    let p_128k = unsafe { base.add(128 * 1024) as *mut u64 };
+    unsafe { p_128k.write_volatile(0xAAAA_1111_2222_3333) };
+
+    // Step 2: Touch offset 16 KiB (0x4000, chunk 1 of window 0).
+    // This mapping at 0x4000 is pushed AFTER 0x20000 in self.mappings!
+    let p_16k = unsafe { base.add(16 * 1024) as *mut u64 };
+    unsafe { p_16k.write_volatile(0xBBBB_4444_5555_6666) };
+
+    // Step 3: Touch offset 0 KiB (0x0000, chunk 0 of window 0).
+    // Fault at 0x0000 widens window to 64 KiB (0x0000..0x10000).
+    // Because self.mappings is [0x20000, 0x4000], partition_point(|m| m.start <= 0) returns 0.
+    // Index 0 has start=0x20000, which is >= 0x10000, so next_local is None!
+    // Window end stays 0x10000 and materializes 0x4000..0x8000 again, wiping offset 16 KiB!
+    let p_0k = base as *mut u64;
+    unsafe { p_0k.write_volatile(0xCCCC_7777_8888_9999) };
+
+    // Step 4: Verify offset 16 KiB
+    let val_16k = unsafe { p_16k.read_volatile() };
+    if val_16k != 0xBBBB_4444_5555_6666 {
+        eprintln!(
+            "REPRODUCED CORRUPTION: offset 16K expected 0xBBBB444455556666, got 0x{val_16k:x}"
+        );
+        PATTERN_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let val_128k = unsafe { p_128k.read_volatile() };
+    if val_128k != 0xAAAA_1111_2222_3333 {
+        eprintln!(
+            "REPRODUCED CORRUPTION: offset 128K expected 0xAAAA111122223333, got 0x{val_128k:x}"
+        );
+        PATTERN_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    unsafe { libc::munmap(ptr, size) };
+}
+
 struct WorkerArg {
     thread_id: usize,
 }
@@ -86,6 +140,7 @@ extern "C" fn worker_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
     let tid = arg.thread_id;
     let mut rng = XorShift::new(0x1234_5678_9ABC_DEF0 ^ ((tid as u64 + 1) * 0x517C_C1B7_2722_0A95));
 
+    test_out_of_order_window();
     fragment_mappings();
 
     let region = unsafe {
