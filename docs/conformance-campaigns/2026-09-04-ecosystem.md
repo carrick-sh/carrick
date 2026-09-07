@@ -1923,3 +1923,76 @@ constraint (brief in the session scratchpad, `brief-first-touch-v2.md`);
 (3) the exec-generation race (go-syscall, go-net under load); (4) the
 Docker-only bless of the three new probes; (5) the per-suite fixed cost
 on small CPython rows (abc 0.70 → 0.90 s), to be attributed standalone.
+
+## 2026-09-07: load coupling measured — the goal's third leg
+
+Owner goal (2026-09-07 morning): the fork/memory rows match at ≤2x on the
+standard cached ledger with `--workers 4`; fork-to-wait under four sibling
+guests ≤2x Linux; nothing that matched in `ledger-ed3a42c85` regresses; any
+row whose ratio moves more than 1.5x between an idle host and the 4-worker
+run is a load-coupling defect to be fixed, not excused.
+
+**Idle vs ledger.** Same binary (`a4c5c672…`, main `b82dd2b7c` is docs-only
+on top of the ledger's source), same harness invocation, one suite at a
+time on a quiet host (`target/conformance/eco-idle/`):
+
+| row | idle s | 4-worker ledger s | loaded/idle | Docker s | idle/Docker |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cpython-itertools | 28.1 | 80.4 | **2.86** | 1.0 | 27.2 |
+| cpython-importlib | 10.9 | 30.8 | **2.83** | 2.7 | 4.05 |
+| cpython-multiprocessing_main_handling | 32.9 | 98.0 | **2.98** | 2.9 | 11.4 |
+| cpython-tarfile | 80.4 | 142.5 | **1.77** | 4.8 | 16.9 |
+| cpython-threading | 27.0 | 42.4 | **1.57** | 13.8 | 1.95 |
+| cpython-subprocess | 71.1 | 111.0 | **1.56** | 20.7 | 3.44 (2 diffs) |
+| cpython-asyncio | 108.8 | 176.0 | **1.62** | 72.1 | 1.51 |
+| go-go_types | 22.6 | 31.0 | 1.37 | 6.2 | 3.65 |
+| go-net_http | 22.0 | 25.6 | 1.16 | 4.1 | 5.36 |
+| go-runtime_pprof | 41.8 | 49.4 | 1.18 | 17.2 | 2.44 (TestTimeVDSO) |
+| cpython-compile | 300 cap | 300 cap | — | 2.7 | hang |
+
+Seven of the eleven rows exceed the 1.5x coupling bar; every CPython row
+does, no Go row does.
+
+**What the coupling is.** `target/conformance/eco-load/coupling.sh` runs a
+row's exact ledger argv under `/usr/bin/time -l` in controlled conditions:
+L0 idle; L1 three host `yes` hogs (pure CPU, no HVF, default QoS); L1B the
+same hogs at background QoS; L1P six hogs; L2 three sibling carrick guests
+running a fault+fork loop. Wall / (user+sys) CPU-seconds:
+
+| row | L0 | L1 | L1B | L1P | L2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| itertools | 28.0 / 27.9 | 35.7 / 35.6 | 27.5 / 27.5 | 44.3 / 44.1 | 48.7 / 48.3 |
+| multiprocessing_main_handling | 33.4 / 40.5 | 59.2 / 70.7 | | | 65.5 / 78.0 |
+| importlib | 12.8 / 18.2 | 22.2 / 33.1 | | | 22.3 / 35.1 |
+
+The carrier's own CPU-seconds inflate under pure-CPU host load with
+`sys` flat, and background-QoS hogs cost nothing, so the coupling is host
+scheduling of carrick's threads against equal-priority competitors, not
+host-kernel serialization. Raising the executor threads to
+`QOS_CLASS_USER_INITIATED` measured no gain (L1 34.5 s, L1P 55.2 s — worse)
+and was discarded. The attached off-CPU capture on `importlib`
+(`target/perf/ivcs/importlib-offcpu-attached.txt`, 8 s window, symbolized
+by attaching to the live carrier) shows the mechanism candidates:
+`run_executor_loop` ends EVERY executor boundary with an unconditional
+`std::thread::yield_now()` (`executor.rs:4437`, from the persistent
+executor landing) — 5.6 s of `swtch_pri` in the window — and the scheduler's
+run-queue mutex is contended by all ten executors (`lock_slow` under
+`GuestExecutorCensus::enter_inner`, `WakeAdmission::drop`,
+`settle_blocked_continuation`) because every wake/park/release calls
+`notify_all`. `importlib` shows ~44k involuntary context switches per
+second idle. A no-yield experiment binary is being measured.
+
+**Where the base ratios come from** (three read-only code maps this
+session; every line verified at the cited spots): the first-touch fault
+materializes ONE 4 KiB page per transaction and the pre-mapped frame pool
+serves only 16 KiB-aligned pages (`can_pool` needs `physical_offset == 0`),
+so three of four sequential first touches pay `mmap` + `hv_vm_map`; the
+hole computation walks every alias of every process twice
+(`alias_registry().lock().iter()`); `PtQuiesce`'s coordinator election is
+carrier-global for every `mmap`/`munmap`/`mprotect`/`brk`; the topology
+lock is one carrier mutex shared by fork, COW, alias map/unmap, retire and
+exec; the continuation reactor rebuilds its whole `pollfd` vector per
+cycle; exit takes the carrier inventory mutex once per extent. Seven
+workers (`AGY_RUN_ID=perf2x-sep07`) hold the briefs: fault-window,
+mm-scope, exit-scaling, reactor, pprof-vdso (SIGPROF never lands in the
+vDSO), subprocess-fdleak, dentry-evict.
