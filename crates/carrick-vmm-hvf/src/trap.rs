@@ -33183,12 +33183,12 @@ fn retire_process_aliases_in(
     // Removing a whole scope leaves every key in it with no successor; the
     // `Global` half keeps the generic path's first-occurrence semantics for
     // duplicate keys exactly.
-    let mut affected: Vec<(AliasVersionKey, AliasBacking, Option<AliasBacking>)> = Vec::new();
+    let mut affected: Vec<(AliasVersionKey, Option<AliasBacking>)> = Vec::new();
     let mut seen_keys = std::collections::BTreeSet::new();
     for alias in &removed_owned {
         let key = alias_version_key(alias);
         if seen_keys.insert(key) {
-            affected.push((key, *alias, None));
+            affected.push((key, None));
         }
     }
     for key in dropped_global_order {
@@ -33197,14 +33197,23 @@ fn retire_process_aliases_in(
         if after == Some(before) {
             continue;
         }
-        affected.push((key, before, after));
+        affected.push((key, after));
     }
+    let global_first_before = dropped_global_first;
 
     let mut affected_physical: Vec<u64> = Vec::new();
     let mut affected_physical_seen: std::collections::BTreeSet<u64> =
         std::collections::BTreeSet::new();
-    for (key, before, after) in affected {
-        for alias in std::iter::once(before).chain(after) {
+    for (key, after) in affected {
+        let before_rows = if key.2 == owned_scope {
+            removed_owned
+                .iter()
+                .find(|alias| alias_version_key(alias) == key)
+                .copied()
+        } else {
+            global_first_before.get(&key).copied()
+        };
+        for alias in before_rows.into_iter().chain(after) {
             if affected_physical_seen.insert(alias.physical_ipa) {
                 affected_physical.push(alias.physical_ipa);
             }
