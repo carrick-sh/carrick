@@ -153,6 +153,7 @@ pub struct DirEntry {
     pub ino: u64,
     pub child_dir_count: usize,
     pub accessed: Arc<AtomicBool>,
+    pub pin_count: Arc<AtomicUsize>,
 }
 
 fn entry_node_approx_bytes(name: &str, node: &DentryNode) -> usize {
@@ -250,6 +251,7 @@ impl DentryCache {
             ino: 1,
             child_dir_count: 0,
             accessed: Arc::new(AtomicBool::new(true)),
+            pin_count: Arc::new(AtomicUsize::new(0)),
         };
         let initial_bytes = dir_entry_approx_bytes(&root_dir);
 
@@ -342,6 +344,7 @@ impl DentryCache {
                 ino: 1,
                 child_dir_count: 0,
                 accessed: Arc::new(AtomicBool::new(true)),
+                pin_count: Arc::new(AtomicUsize::new(0)),
             };
             self.approx_bytes
                 .store(dir_entry_approx_bytes(&root_dir), Ordering::Relaxed);
@@ -987,6 +990,7 @@ impl DentryCache {
                         ino: 1,
                         child_dir_count: 0,
                         accessed: Arc::new(AtomicBool::new(true)),
+                        pin_count: Arc::new(AtomicUsize::new(0)),
                     };
                     dirs.insert(DentryId::ROOT, root_dir);
                     path_map.insert("/".to_string(), DentryId::ROOT);
@@ -1007,6 +1011,7 @@ impl DentryCache {
             ino,
             child_dir_count: 0,
             accessed: Arc::new(AtomicBool::new(true)),
+            pin_count: Arc::new(AtomicUsize::new(0)),
         };
 
         let dir_bytes = dir_entry_approx_bytes(&dir_entry);
@@ -1078,16 +1083,8 @@ impl DentryCache {
                     continue;
                 }
 
-                // Check open fds
-                let has_open_upper = dir
-                    .upper_dir_fd
-                    .as_ref()
-                    .is_some_and(|fd| Arc::strong_count(fd) > 1);
-                let has_open_lower = dir
-                    .lower_dir_fd
-                    .as_ref()
-                    .is_some_and(|fd| Arc::strong_count(fd) > 1);
-                if has_open_upper || has_open_lower {
+                // Evict only unpinned directories (pinned by open fds)
+                if dir.pin_count.load(Ordering::Relaxed) > 0 {
                     dir_q.push_back(dir_id);
                     continue;
                 }
@@ -2371,6 +2368,69 @@ impl DentryCache {
             }
         }
     }
+
+    /// Pin a cached directory by path to prevent eviction while an open fd exists on it.
+    pub fn pin_dir(&self, path: &str) {
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        let dir_id = self.path_to_dir_id.read().get(norm).copied();
+        if let Some(dir_id) = dir_id {
+            self.pin_dir_id(dir_id);
+        }
+    }
+
+    /// Unpin a cached directory by path when an open fd on it is closed.
+    pub fn unpin_dir(&self, path: &str) {
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        let dir_id = self.path_to_dir_id.read().get(norm).copied();
+        if let Some(dir_id) = dir_id {
+            self.unpin_dir_id(dir_id);
+        }
+    }
+
+    /// Pin a cached directory by DentryId.
+    pub fn pin_dir_id(&self, dir_id: DentryId) {
+        let dirs = self.dirs.read();
+        if let Some(dir) = dirs.get(&dir_id) {
+            dir.pin_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Unpin a cached directory by DentryId.
+    pub fn unpin_dir_id(&self, dir_id: DentryId) {
+        let dirs = self.dirs.read();
+        if let Some(dir) = dirs.get(&dir_id) {
+            dir.pin_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Check whether a directory is currently pinned.
+    pub fn is_dir_pinned(&self, dir_id: DentryId) -> bool {
+        let dirs = self.dirs.read();
+        dirs.get(&dir_id)
+            .is_some_and(|d| d.pin_count.load(Ordering::Relaxed) > 0)
+    }
+
+    /// Check whether a directory is currently cached.
+    pub fn has_dir(&self, path: &str) -> bool {
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        self.path_to_dir_id.read().contains_key(norm)
+    }
+
+    /// Check whether an entry is currently cached under a directory.
+    pub fn has_entry(&self, dir_path: &str, child_name: &str) -> bool {
+        let norm = dir_path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        let dir_id = match self.path_to_dir_id.read().get(norm).copied() {
+            Some(id) => id,
+            None => return false,
+        };
+        self.entries
+            .read()
+            .contains_key(&(dir_id, child_name.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -2773,5 +2833,125 @@ mod tests {
         let st_b_new = cache.stat("/file_b.txt", true, &backend, None).unwrap();
         assert_eq!(st_a_new.size, 6);
         assert_eq!(st_b_new.size, 3);
+    }
+
+    #[test]
+    fn test_dentry_cache_pinned_directory_survives_eviction() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        // 64 KiB capacity so eviction triggers quickly
+        let cache = DentryCache::new_with_capacity(false, 64 * 1024, true);
+
+        // 1. Create a pinned directory with an entry
+        let pinned_dir = tmp.path().join("pinned_dir");
+        fs::create_dir_all(&pinned_dir).unwrap();
+        fs::write(pinned_dir.join("inside.txt"), b"data").unwrap();
+
+        cache.entry_created("/pinned_dir", None);
+        cache.entry_created("/pinned_dir/inside.txt", None);
+        assert!(
+            cache
+                .lookup_path("/pinned_dir/inside.txt", false, &backend, None)
+                .is_ok()
+        );
+
+        // Open directory fd -> pin directory through cache mutator
+        cache.pin_dir("/pinned_dir");
+
+        // Churn past capacity with many other directories
+        for i in 0..500 {
+            let dname = format!("churn_pin_{i}");
+            let disk = tmp.path().join(&dname);
+            fs::create_dir_all(&disk).unwrap();
+            fs::write(disk.join("f.txt"), b"x").unwrap();
+            let gdir = format!("/churn_pin_{i}");
+            let gfile = format!("/churn_pin_{i}/f.txt");
+            cache.entry_created(&gdir, None);
+            cache.entry_created(&gfile, None);
+            let _ = cache.stat(&gfile, true, &backend, None);
+        }
+
+        // The pinned directory and its cached entries MUST survive
+        assert!(
+            cache.has_dir("/pinned_dir"),
+            "pinned directory must survive eviction"
+        );
+        assert!(
+            cache.has_entry("/pinned_dir", "inside.txt"),
+            "entries in pinned directory must survive eviction"
+        );
+
+        // Close directory fd -> unpin directory through cache mutator
+        cache.unpin_dir("/pinned_dir");
+
+        // Churn past capacity again
+        for i in 500..1000 {
+            let dname = format!("churn_pin_{i}");
+            let disk = tmp.path().join(&dname);
+            fs::create_dir_all(&disk).unwrap();
+            fs::write(disk.join("f.txt"), b"x").unwrap();
+            let gdir = format!("/churn_pin_{i}");
+            let gfile = format!("/churn_pin_{i}/f.txt");
+            cache.entry_created(&gdir, None);
+            cache.entry_created(&gfile, None);
+            let _ = cache.stat(&gfile, true, &backend, None);
+        }
+
+        // Now that it is unpinned, it is evicted
+        assert!(
+            !cache.has_dir("/pinned_dir"),
+            "unpinned directory must be evicted after churn past capacity"
+        );
+    }
+
+    #[test]
+    fn test_dentry_concurrent_eviction_lookup_fallback_no_enoent() {
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        let tmp = tempdir().unwrap();
+        let cache = Arc::new(DentryCache::new_with_capacity(false, 64 * 1024, true));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let target_dir = tmp.path().join("target");
+        fs::create_dir_all(&target_dir).unwrap();
+
+        // Thread 1: churns and triggers eviction continuously
+        let cache_clone1 = Arc::clone(&cache);
+        let stop_clone1 = Arc::clone(&stop);
+        let tmp_path = tmp.path().to_path_buf();
+        let churn_handle = thread::spawn(move || {
+            let mut idx = 0;
+            let b = HostFsBackend::from_path(&tmp_path).unwrap();
+            while !stop_clone1.load(Ordering::Relaxed) {
+                let dir_name = format!("churn_race_{}", idx % 50);
+                let p = tmp_path.join(&dir_name);
+                let _ = fs::create_dir_all(&p);
+                let file_p = p.join("test.txt");
+                let _ = fs::write(&file_p, b"data");
+                let lookup_path = format!("/{}/test.txt", dir_name);
+                let _ = cache_clone1.lookup_path(&lookup_path, false, &b, None);
+                idx += 1;
+            }
+        });
+
+        // Thread 2: creates files in target_dir and looks them up concurrently with eviction
+        let b2 = HostFsBackend::from_path(tmp.path()).unwrap();
+        for i in 0..150 {
+            let file_name = format!("file_{i}.txt");
+            let file_p = target_dir.join(&file_name);
+            fs::write(&file_p, b"hello").unwrap();
+
+            let lookup_path = format!("/target/{file_name}");
+            let res = cache.lookup_path(&lookup_path, false, &b2, None);
+            assert!(
+                res.is_ok(),
+                "lookup of existing file {lookup_path} must not fail with ENOENT during concurrent eviction, got: {:?}",
+                res.err()
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        churn_handle.join().unwrap();
     }
 }
