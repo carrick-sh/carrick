@@ -1644,6 +1644,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "ppollwaitset": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "prctldumpable": {
     "class": "conformance",
     "excluded": false,

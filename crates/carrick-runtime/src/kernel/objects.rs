@@ -697,6 +697,14 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
         Err(PipeCapacityMutationError::NotPipe)
     }
 
+    fn wait_queue(&self) -> Option<Arc<super::wait_set::WaitQueue>> {
+        None
+    }
+
+    fn timerfd_remaining_timeout(&self) -> Option<Duration> {
+        None
+    }
+
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -1307,6 +1315,20 @@ impl FileDescription {
         }
     }
 
+    pub(crate) fn wait_queue(&self) -> Option<Arc<super::wait_set::WaitQueue>> {
+        match &self.kind {
+            FileDescriptionKind::Concrete(backing) => backing.0.wait_queue(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn timerfd_remaining_timeout(&self) -> Option<Duration> {
+        match &self.kind {
+            FileDescriptionKind::Concrete(backing) => backing.0.timerfd_remaining_timeout(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn register_epoll_owner(self: &Arc<Self>, owner: &Arc<Self>, registration_fd: i32) {
         self.epoll_registrations
             .lock()
@@ -1543,6 +1565,14 @@ impl FileSlot {
     pub fn close_on_exec(&self) -> bool {
         carrick_abi::LinuxFdFlags::from_bits_truncate(self.fd_flags)
             .contains(carrick_abi::LinuxFdFlags::CLOEXEC)
+    }
+
+    pub(crate) fn wait_queue(&self) -> Option<Arc<super::wait_set::WaitQueue>> {
+        self.description.wait_queue()
+    }
+
+    pub(crate) fn timerfd_remaining_timeout(&self) -> Option<Duration> {
+        self.description.timerfd_remaining_timeout()
     }
 }
 

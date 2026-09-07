@@ -48,6 +48,7 @@ pub(crate) struct PipeInner {
     write_pipe_ready: OnceLock<Option<(HostFdRef, HostFdRef)>>,
     read_notified: std::sync::atomic::AtomicBool,
     write_notified: std::sync::atomic::AtomicBool,
+    pub(crate) wait_queue: Arc<crate::kernel::WaitQueue>,
 }
 
 pub(crate) type PipeRef = Arc<PipeInner>;
@@ -74,6 +75,7 @@ impl PipeInner {
             write_pipe_ready: OnceLock::new(),
             read_notified: std::sync::atomic::AtomicBool::new(false),
             write_notified: std::sync::atomic::AtomicBool::new(false),
+            wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
         }
     }
 
@@ -113,6 +115,8 @@ impl PipeInner {
                 let _ = unsafe { libc::read(r.raw(), buf.as_mut_ptr() as *mut _, buf.len()) };
             }
         }
+
+        self.wait_queue.wake_all();
     }
 
     /// The host fd a waiter polls (`POLLIN`) for "this pipe is readable",

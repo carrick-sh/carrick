@@ -6969,8 +6969,34 @@ impl SyscallDispatcher {
                     };
                 }
             } else {
-                // Mixed/synthetic: per-fd readiness with nanosleep slicing.
-                let mut deadline_attempts = 0u32;
+                // Mixed / synthetic fds: kernel WaitSet.
+                let wait_set = crate::kernel::WaitSet::with_wake_pipe();
+                let mut _enrollments = Vec::new();
+                let mut host_fds: Vec<(i32, i16)> = Vec::new();
+
+                for (i, (fd, _)) in owners.iter().enumerate() {
+                    if *fd < 0 {
+                        continue;
+                    }
+                    if let Some(open_file) = this.open_file(*fd) {
+                        if let Some(wq) = open_file.wait_queue() {
+                            _enrollments.push(wait_set.enroll(&wq));
+                        }
+                        if let Some(target) = this.host_poll_target(*fd, events_list[i]) {
+                            host_fds.push((target.host_fd, target.host_events));
+                        }
+                    } else if is_stdio_fd(*fd) {
+                        host_fds.push((*fd, events_list[i]));
+                    }
+                }
+
+                let start_instant = std::time::Instant::now();
+                let base_timeout = if timeout_ms < 0 {
+                    None
+                } else {
+                    Some(std::time::Duration::from_millis(timeout_ms as u64))
+                };
+
                 loop {
                     let mut any = false;
                     for (i, (fd, _)) in owners.iter().enumerate() {
@@ -6983,30 +7009,51 @@ impl SyscallDispatcher {
                     if any || timeout_ms == 0 {
                         break;
                     }
-                    const SLICE_MS: u32 = 10;
-                    unsafe {
-                        let ts = libc::timespec {
-                            tv_sec: 0,
-                            tv_nsec: (SLICE_MS as i64) * 1_000_000,
-                        };
-                        libc::nanosleep(&ts, std::ptr::null_mut());
-                    }
-                    deadline_attempts += 1;
-                    if timeout_ms > 0 {
-                        if deadline_attempts.saturating_mul(SLICE_MS) as i32 >= timeout_ms {
-                            break;
+
+                    let mut remaining_timeout = match base_timeout {
+                        None => None,
+                        Some(dur) => {
+                            let elapsed = start_instant.elapsed();
+                            if elapsed >= dur {
+                                break;
+                            }
+                            Some(dur - elapsed)
                         }
-                    } else if deadline_attempts > 6000 {
-                        // Blocked ~60 s with no fd ever ready: almost certainly a
-                        // missing readiness signal, not a real idle wait. Make it
-                        // loud in `carrick trace` instead of silently returning 0.
-                        reporter.record(CompatEvent::partial_syscall(
-                            request_number,
-                            "pselect6",
-                            request_args,
-                            "blocked ~60s with no fd ready (possible poll deadlock)",
-                        ));
-                        break;
+                    };
+
+                    for (fd, _) in &owners {
+                        if *fd < 0 {
+                            continue;
+                        }
+                        if let Some(open_file) = this.open_file(*fd) {
+                            if let Some(rem) = open_file.timerfd_remaining_timeout() {
+                                remaining_timeout = match remaining_timeout {
+                                    None => Some(rem),
+                                    Some(prev) => Some(prev.min(rem)),
+                                };
+                            }
+                        }
+                    }
+
+                    let outcome = wait_set.wait(&host_fds, remaining_timeout, || {
+                        this.has_deliverable_dispatch_pending_for_wait(kernel, tid, sig_mask)
+                    });
+
+                    match outcome {
+                        crate::kernel::WaitSetOutcome::Woken => {}
+                        crate::kernel::WaitSetOutcome::Timeout => {
+                            if let Some(dur) = base_timeout {
+                                if start_instant.elapsed() >= dur {
+                                    break;
+                                }
+                            }
+                        }
+                        crate::kernel::WaitSetOutcome::Interrupted => {
+                            if let carrick_abi::WaitSigMask::Replace(mask) = sig_mask {
+                                this.begin_sigsuspend(kernel, tid, mask);
+                            }
+                            return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                        }
                     }
                 }
             }
@@ -7337,10 +7384,35 @@ impl SyscallDispatcher {
                 });
             }
 
-            // Mixed / synthetic fds: fall back to the per-fd readiness check
-            // loop. Slow because of nanosleep slicing but correct.
+            // Mixed / synthetic fds: kernel WaitSet.
+            let wait_set = crate::kernel::WaitSet::with_wake_pipe();
+            let mut _enrollments = Vec::new();
+            let mut host_fds: Vec<(i32, i16)> = Vec::new();
+
+            for pollfd in &fds {
+                if pollfd.fd < 0 {
+                    continue;
+                }
+                if let Some(open_file) = this.open_file(pollfd.fd) {
+                    if let Some(wq) = open_file.wait_queue() {
+                        _enrollments.push(wait_set.enroll(&wq));
+                    }
+                    if let Some(target) = this.host_poll_target(pollfd.fd, pollfd.events) {
+                        host_fds.push((target.host_fd, target.host_events));
+                    }
+                } else if is_stdio_fd(pollfd.fd) {
+                    host_fds.push((pollfd.fd, pollfd.events));
+                }
+            }
+
+            let start_instant = std::time::Instant::now();
+            let base_timeout = if timeout_ms < 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(timeout_ms as u64))
+            };
+
             let mut ready: i64;
-            let mut deadline_attempts = 0u32;
             loop {
                 ready = 0;
                 for (index, pollfd) in fds.iter_mut().enumerate() {
@@ -7355,31 +7427,51 @@ impl SyscallDispatcher {
                 if ready > 0 || timeout_ms == 0 {
                     break;
                 }
-                const SLICE_MS: u32 = 10;
-                unsafe {
-                    let ts = libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: (SLICE_MS as i64) * 1_000_000,
-                    };
-                    libc::nanosleep(&ts, std::ptr::null_mut());
-                }
-                deadline_attempts += 1;
-                if timeout_ms > 0 {
-                    let elapsed_ms = deadline_attempts.saturating_mul(SLICE_MS);
-                    if elapsed_ms as i32 >= timeout_ms {
-                        break;
+
+                let mut remaining_timeout = match base_timeout {
+                    None => None,
+                    Some(dur) => {
+                        let elapsed = start_instant.elapsed();
+                        if elapsed >= dur {
+                            break;
+                        }
+                        Some(dur - elapsed)
                     }
-                } else if deadline_attempts > 6000 {
-                    // ~60 s ceiling for "block forever" callers. Reaching it means
-                    // no fd ever became ready — surface it loudly in carrick trace
-                    // rather than silently returning 0 (a likely poll deadlock).
-                    reporter.record(CompatEvent::partial_syscall(
-                        request_number,
-                        "ppoll",
-                        request_args,
-                        "blocked ~60s with no fd ready (possible poll deadlock)",
-                    ));
-                    break;
+                };
+
+                for pollfd in &fds {
+                    if pollfd.fd < 0 {
+                        continue;
+                    }
+                    if let Some(open_file) = this.open_file(pollfd.fd) {
+                        if let Some(rem) = open_file.timerfd_remaining_timeout() {
+                            remaining_timeout = match remaining_timeout {
+                                None => Some(rem),
+                                Some(prev) => Some(prev.min(rem)),
+                            };
+                        }
+                    }
+                }
+
+                let outcome = wait_set.wait(&host_fds, remaining_timeout, || {
+                    this.has_deliverable_dispatch_pending_for_wait(kernel, tid, sig_mask)
+                });
+
+                match outcome {
+                    crate::kernel::WaitSetOutcome::Woken => {}
+                    crate::kernel::WaitSetOutcome::Timeout => {
+                        if let Some(dur) = base_timeout {
+                            if start_instant.elapsed() >= dur {
+                                break;
+                            }
+                        }
+                    }
+                    crate::kernel::WaitSetOutcome::Interrupted => {
+                        if let carrick_abi::WaitSigMask::Replace(mask) = sig_mask {
+                            this.begin_sigsuspend(kernel, tid, mask);
+                        }
+                        return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                    }
                 }
             }
 
