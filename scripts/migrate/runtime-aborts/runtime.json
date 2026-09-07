@@ -300,6 +300,15 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "MemAuthority::fork_private_with_policy",
+      "ordinal_in_function": 1,
+      "fingerprint": "b804ddcec8828a4d06f58e88bb72c4ca64c0776a8217906fb633de6c804fadf0",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::deferred_anonymous_fork",
+      "rationale": "A WIPEONFORK projection supplied an invalid or unaligned range after the child memory authority was cloned; continuing would leave stale logical residency attached to the child's zeroed mapping."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "MemAuthority::bump_revision",
       "ordinal_in_function": 1,
       "fingerprint": "ba8397ea38cf5e3fe19feedb109e5aa226cac3928810396cdaa6a663bb81eb23",
@@ -486,6 +495,15 @@
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_shared",
       "rationale": "mark_identity_restored failed in shared aperture tracking after backend identity restore succeeded during mmap."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::mmap",
+      "ordinal_in_function": 10,
+      "fingerprint": "5752fdeef66c44b5c3925b8ff33cb82feae5f93ff0dd12e645e7257c3a20fc52",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::deferred_anonymous_mmap",
+      "rationale": "A validated private anonymous mmap was published before its deferred pristine range was recorded; rejecting an invalid or unaligned range at this point would split guest VMA authority from zero-read provenance."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
