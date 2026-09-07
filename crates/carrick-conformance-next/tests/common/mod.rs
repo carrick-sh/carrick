@@ -609,8 +609,6 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "iouring",
     "iouringenterflag",
     "itimer",
-    // The committed Docker result is only `Terminated`, so the old lane's
-    // apparent match is not assertion-level evidence.
     "kernelidentity",
     "manythreads",
     "mmapfileforkwriteback",
@@ -621,6 +619,7 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "pidnsinitreap",
     "posixtimers",
     "ppollsig",
+    "procselffdfail",
     "pselecteintr",
     "selecttimeout",
     "sigchld",
