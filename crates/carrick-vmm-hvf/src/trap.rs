@@ -10004,6 +10004,150 @@ mod task_only_carrier_directory_tests {
     }
 
     #[test]
+    fn alias_registry_batch_removal_matches_rebuilt_state() {
+        let scope_a = AliasOwnershipScope::MmRootSlot {
+            base: 0x3500_0000,
+            size: 0x4000,
+        };
+        let scope_b = AliasOwnershipScope::MmRootSlot {
+            base: 0x3600_0000,
+            size: 0x4000,
+        };
+        let mut registry = AliasRegistry::default();
+
+        let row = |scope, start: u64, ipa: u64, phys: u64, host: usize, phys_size: usize| {
+            let mut entry = alias(host, 1);
+            entry.ownership_scope = scope;
+            entry.start = start;
+            entry.ipa = ipa;
+            entry.physical_ipa = phys;
+            entry.physical_host_addr = host;
+            entry.physical_size = phys_size;
+            entry
+        };
+
+        // Populate scope_a with many rows, including duplicate (start, ipa) keys.
+        let r0 = row(scope_a, 0x1000, 0x5000, 0x9000, 0x10, 0x4000); // first occurrence of (0x1000, 0x5000)
+        let r1 = row(scope_a, 0x2000, 0x6000, 0x9000, 0x20, 0x4000);
+        let r2 = row(scope_a, 0x3000, 0x7000, 0xa000, 0x30, 0x8000);
+        let r3 = row(scope_a, 0x1000, 0x5000, 0xb000, 0x40, 0x4000); // duplicate of r0
+        let r4 = row(scope_a, 0x4000, 0x8000, 0xc000, 0x50, 0x4000);
+        let r5 = row(scope_a, 0x2000, 0x6000, 0xd000, 0x60, 0x4000); // duplicate of r1
+        let r6 = row(scope_a, 0x5000, 0x9000, 0xe000, 0x70, 0x10000);
+        let r7 = row(scope_a, 0x1000, 0x5000, 0xf000, 0x80, 0x4000); // 2nd duplicate of r0
+        let r8 = row(scope_a, 0x6000, 0xa000, 0x10000, 0x90, 0x4000);
+
+        // Populate scope_b to ensure foreign scopes remain completely intact.
+        let foreign = row(scope_b, 0x7000, 0xb000, 0x20000, 0xa0, 0x4000);
+
+        let initial_rows = [r0, r1, r2, r3, r4, r5, r6, r7, r8];
+        for r in initial_rows {
+            registry.push(r);
+        }
+        registry.push(foreign);
+
+        let rev_before = registry.revision();
+
+        // Remove a batch that includes a first-occurrence row (r0) and middle rows (r4, r5 which is duplicate of r1).
+        let to_remove = vec![r0, r4, r5];
+        let removed = registry.remove_exact_values_in_batch(&to_remove);
+        assert_eq!(removed.len(), 3);
+        assert_eq!(removed, to_remove);
+
+        // Expected remaining rows in scope_a in insertion order:
+        // [r1, r2, r3 (now first occurrence of (0x1000, 0x5000)!), r6, r7, r8]
+        let remaining_scope_a = vec![r1, r2, r3, r6, r7, r8];
+
+        // Build a fresh reference registry from scratch with the expected surviving rows:
+        let mut reference = AliasRegistry::default();
+        for r in remaining_scope_a {
+            reference.push(r);
+        }
+        reference.push(foreign);
+
+        // Verify by_scope order
+        let scope_a_actual: Vec<AliasBacking> = registry
+            .scope_rows(scope_a)
+            .iter()
+            .map(|(_, a)| *a)
+            .collect();
+        let scope_a_expected: Vec<AliasBacking> = reference
+            .scope_rows(scope_a)
+            .iter()
+            .map(|(_, a)| *a)
+            .collect();
+        assert_eq!(scope_a_actual, scope_a_expected);
+
+        // Verify exact_first_by_scope positions and sequences against a from-scratch reindex
+        let mut from_scratch = registry.clone();
+        from_scratch.reindex();
+        assert_eq!(
+            registry.exact_first_by_scope,
+            from_scratch.exact_first_by_scope
+        );
+
+        // Verify all 5 secondary indexes
+        assert_eq!(registry.by_va_start, from_scratch.by_va_start);
+        assert_eq!(registry.by_ipa_start, from_scratch.by_ipa_start);
+        assert_eq!(registry.by_physical_start, from_scratch.by_physical_start);
+        assert_eq!(
+            registry.by_scope_physical_start,
+            from_scratch.by_scope_physical_start
+        );
+        assert_eq!(
+            registry.physical_size_counts_by_scope,
+            from_scratch.physical_size_counts_by_scope
+        );
+
+        // Verify row count and revision
+        assert_eq!(registry.len(), from_scratch.len());
+        assert_eq!(registry.rows, 7);
+        assert_eq!(registry.revision(), rev_before + 1);
+
+        // Also verify removing an absent row does not bump revision or alter state
+        let rev_after = registry.revision();
+        let absent = row(scope_a, 0x9999, 0x9999, 0x9999, 0x99, 0x4000);
+        let removed_absent = registry.remove_exact_values_in_batch(&[absent]);
+        assert!(removed_absent.is_empty());
+        assert_eq!(registry.revision(), rev_after);
+    }
+
+    #[test]
+    fn alias_registry_batch_removal_does_not_scan_scope_rows() {
+        const TOTAL_ROWS: usize = 10_000;
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x3400_0000,
+            size: 0x4000,
+        };
+        let mut registry = AliasRegistry::default();
+        let mut target = alias(0x7500_0000 + 5000, 1);
+        target.ownership_scope = scope;
+        target.start = 0x4000_0000 + 5000 * 0x4000;
+        target.ipa = 0x6000_0000 + 5000 * 0x4000;
+        target.physical_ipa = 0x8000_0000 + 5000 * 0x4000;
+
+        for i in 0..TOTAL_ROWS {
+            let mut row = alias(0x7500_0000 + i, 1);
+            row.ownership_scope = scope;
+            row.start = 0x4000_0000 + i as u64 * 0x4000;
+            row.ipa = 0x6000_0000 + i as u64 * 0x4000;
+            row.physical_ipa = 0x8000_0000 + i as u64 * 0x4000;
+            registry.push(row);
+        }
+
+        let before = alias_state_rows_scanned();
+        let removed = registry.remove_exact_values_in_batch(&[target]);
+        let scanned = alias_state_rows_scanned() - before;
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0], target);
+        assert!(
+            scanned <= 16,
+            "k=1 removal visited {scanned} rows in a {TOTAL_ROWS}-row scope; must be O(k), not O(N)"
+        );
+    }
+
+    #[test]
     fn cow_retention_physical_index_does_not_scan_foreign_alias_rows() {
         const FOREIGN_OWNERS: usize = 512;
         let root_slot = (0x3300_0000_u64, 0x4000_u64);
@@ -13337,6 +13481,7 @@ impl AliasRegistry {
     /// exact. A VA unmap splits rows into fragments that must inherit their
     /// parent's sequence, so the caller needs the sequences, not just the
     /// aliases.
+    #[cfg(test)]
     fn rebuild_scope_rows(
         &mut self,
         scope: AliasOwnershipScope,
@@ -13434,7 +13579,7 @@ impl AliasRegistry {
         None
     }
 
-    /// Replace several exact semantic keys with one scan per affected scope.
+    /// Replace several exact semantic keys without rebuilding unaffected rows.
     /// Values are appended in slice order, preserving the historical
     /// retirement behavior where a restored preimage receives a fresh global
     /// sequence after the rows that survived.
@@ -13455,12 +13600,17 @@ impl AliasRegistry {
             keys_by_scope.entry(scope).or_default().insert((start, ipa));
         }
         for (scope, keys) in keys_by_scope {
-            self.rebuild_scope_rows(scope, |rows| {
-                note_alias_state_rows_scanned(rows.len());
-                rows.into_iter()
-                    .filter(|(_, alias)| !keys.contains(&(alias.start, alias.ipa)))
-                    .collect()
-            });
+            let mut to_remove = Vec::new();
+            for &(start, ipa) in &keys {
+                if let Some(va_rows) = self.by_va_start.get(&start) {
+                    for &(_, alias) in va_rows {
+                        if alias.ipa == ipa && alias.ownership_scope == scope {
+                            to_remove.push(alias);
+                        }
+                    }
+                }
+            }
+            let _ = self.remove_exact_values_in_batch(&to_remove);
         }
         for &(_, replacement) in replacements {
             if let Some(alias) = replacement {
@@ -13472,37 +13622,217 @@ impl AliasRegistry {
     /// Remove only values captured from an older semantic publication. A
     /// delayed exec cleanup must not interpret `(VA, IPA, scope)` as immutable:
     /// an exec successor can reuse all three while carrying a new physical
-    /// owner generation. Each affected scope is rebuilt once, so retiring k
-    /// captured rows remains O(rows-in-scope + k log k), not O(k * rows).
+    /// owner generation. Retiring k captured rows touches only the k rows in
+    /// the secondary indexes and updates the scope bucket and exact-first index
+    /// in O(k log N) without rebuilding the scope from scratch.
     fn remove_exact_values_in_batch(&mut self, expected: &[AliasBacking]) -> Vec<AliasBacking> {
-        let mut expected_by_scope = std::collections::BTreeMap::<
-            AliasOwnershipScope,
-            std::collections::BTreeMap<(u64, u64), Vec<AliasBacking>>,
-        >::new();
+        if expected.is_empty() {
+            return Vec::new();
+        }
+        let mut expected_by_scope =
+            std::collections::BTreeMap::<AliasOwnershipScope, Vec<AliasBacking>>::new();
         for &alias in expected {
             expected_by_scope
                 .entry(alias.ownership_scope)
                 .or_default()
-                .entry((alias.start, alias.ipa))
-                .or_default()
                 .push(alias);
         }
         let mut removed = Vec::new();
-        for (scope, expected_by_key) in expected_by_scope {
-            self.rebuild_scope_rows(scope, |rows| {
-                note_alias_state_rows_scanned(rows.len());
-                rows.into_iter()
-                    .filter(|(_, alias)| {
-                        let retires = expected_by_key
-                            .get(&(alias.start, alias.ipa))
-                            .is_some_and(|expected| expected.contains(alias));
-                        if retires {
-                            removed.push(*alias);
+        for (scope, scope_expected) in expected_by_scope {
+            let mut removed_in_scope = Vec::new();
+            let mut removed_positions = std::collections::BTreeSet::new();
+
+            {
+                let Some(rows) = self.by_scope.get(&scope) else {
+                    continue;
+                };
+                if rows.is_empty() {
+                    self.drop_empty_scope(scope);
+                    continue;
+                }
+
+                for alias in scope_expected {
+                    let first_in_exact = self
+                        .exact_first_by_scope
+                        .get(&scope)
+                        .and_then(|exact| exact.get(&(alias.start, alias.ipa)))
+                        .copied();
+                    let mut found_pos = None;
+                    if let Some((pos, seq, entry)) = first_in_exact {
+                        if entry == alias
+                            && !removed_positions.contains(&pos)
+                            && pos < rows.len()
+                            && rows[pos].0 == seq
+                            && rows[pos].1 == alias
+                        {
+                            found_pos = Some((pos, seq, alias));
                         }
-                        !retires
-                    })
-                    .collect()
-            });
+                    }
+                    if found_pos.is_none() {
+                        if let Some(va_rows) = self.by_va_start.get(&alias.start) {
+                            for &(seq, a) in va_rows {
+                                if a == alias && a.ipa == alias.ipa && a.ownership_scope == scope {
+                                    let search_result = rows.binary_search_by_key(&seq, |r| r.0);
+                                    match search_result {
+                                        Ok(p) => {
+                                            let mut candidate_pos = None;
+                                            let mut i = p;
+                                            while i < rows.len() && rows[i].0 == seq {
+                                                if rows[i].1 == alias
+                                                    && !removed_positions.contains(&i)
+                                                {
+                                                    candidate_pos = Some(i);
+                                                    break;
+                                                }
+                                                i += 1;
+                                            }
+                                            if candidate_pos.is_none() {
+                                                let mut j = p;
+                                                while j > 0 && rows[j - 1].0 == seq {
+                                                    j -= 1;
+                                                    if rows[j].1 == alias
+                                                        && !removed_positions.contains(&j)
+                                                    {
+                                                        candidate_pos = Some(j);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if let Some(pos) = candidate_pos {
+                                                found_pos = Some((pos, seq, alias));
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => {
+                                            if let Some(pos) =
+                                                rows.iter().enumerate().position(|(i, r)| {
+                                                    r.0 == seq
+                                                        && r.1 == alias
+                                                        && !removed_positions.contains(&i)
+                                                })
+                                            {
+                                                found_pos = Some((pos, seq, alias));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some((pos, seq, alias)) = found_pos {
+                        removed_positions.insert(pos);
+                        removed_in_scope.push((pos, seq, alias));
+                    }
+                }
+            }
+
+            if removed_in_scope.is_empty() {
+                continue;
+            }
+
+            removed_in_scope.sort_by_key(|(pos, _, _)| *pos);
+
+            let mut promoted_keys = Vec::new();
+            if let Some(exact) = self.exact_first_by_scope.get(&scope) {
+                for &(pos, _seq, alias) in &removed_in_scope {
+                    if let Some(&(first_pos, _, _)) = exact.get(&(alias.start, alias.ipa)) {
+                        if first_pos == pos {
+                            promoted_keys.push((alias.start, alias.ipa));
+                        }
+                    }
+                }
+            }
+            promoted_keys.sort_unstable();
+            promoted_keys.dedup();
+
+            for &(_, seq, alias) in &removed_in_scope {
+                self.index_remove(seq, alias);
+                removed.push(alias);
+            }
+            self.rows = self.rows.saturating_sub(removed_in_scope.len());
+            self.bump_revision();
+
+            let first_removed = removed_in_scope[0].0;
+            if let Some(rows) = self.by_scope.get_mut(&scope) {
+                let mut remove_idx = 0;
+                let mut write = first_removed;
+                for read in first_removed..rows.len() {
+                    if remove_idx < removed_in_scope.len() && read == removed_in_scope[remove_idx].0
+                    {
+                        remove_idx += 1;
+                    } else {
+                        rows[write] = rows[read];
+                        write += 1;
+                    }
+                }
+                rows.truncate(write);
+            }
+
+            if let Some(exact) = self.exact_first_by_scope.get_mut(&scope) {
+                for entry in exact.values_mut() {
+                    if entry.0 > first_removed {
+                        let shift = removed_in_scope.partition_point(|c| c.0 < entry.0);
+                        entry.0 = entry.0.saturating_sub(shift);
+                    }
+                }
+            }
+
+            for (start, ipa) in promoted_keys {
+                let next_remaining = self.by_va_start.get(&start).and_then(|va_rows| {
+                    va_rows
+                        .iter()
+                        .filter(|r| r.1.ownership_scope == scope && r.1.ipa == ipa)
+                        .min_by_key(|r| r.0)
+                        .copied()
+                });
+                if let Some((next_seq, next_alias)) = next_remaining {
+                    let new_pos = self
+                        .by_scope
+                        .get(&scope)
+                        .and_then(|rows| {
+                            rows.binary_search_by_key(&next_seq, |r| r.0)
+                                .ok()
+                                .and_then(|p| {
+                                    let mut i = p;
+                                    while i < rows.len() && rows[i].0 == next_seq {
+                                        if rows[i].1 == next_alias {
+                                            return Some(i);
+                                        }
+                                        i += 1;
+                                    }
+                                    let mut j = p;
+                                    while j > 0 && rows[j - 1].0 == next_seq {
+                                        j -= 1;
+                                        if rows[j].1 == next_alias {
+                                            return Some(j);
+                                        }
+                                    }
+                                    None
+                                })
+                                .or_else(|| {
+                                    rows.iter()
+                                        .position(|r| r.0 == next_seq && r.1 == next_alias)
+                                })
+                        })
+                        .unwrap_or_else(|| std::process::abort());
+                    self.exact_first_by_scope
+                        .entry(scope)
+                        .or_default()
+                        .insert((start, ipa), (new_pos, next_seq, next_alias));
+                } else if let Some(exact) = self.exact_first_by_scope.get_mut(&scope) {
+                    exact.remove(&(start, ipa));
+                }
+            }
+
+            if self
+                .exact_first_by_scope
+                .get(&scope)
+                .is_some_and(|e| e.is_empty())
+            {
+                self.exact_first_by_scope.remove(&scope);
+            }
+            self.drop_empty_scope(scope);
         }
         removed
     }
