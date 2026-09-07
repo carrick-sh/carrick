@@ -9952,9 +9952,9 @@ fn linux_min_fd(value: u64) -> Result<i32, LinuxErrno> {
 /// from `clock_getcpuclockid`/`pthread_getcpuclockid`. CPython's
 /// test_pthread_getcpuclockid does clock_gettime() on one — carrick rejected it.
 enum DynamicCpuClock {
-    /// Per-thread CPU clock → host CLOCK_THREAD_CPUTIME_ID (current thread).
+    /// Per-thread CPU clock → target thread kernel CPU accounting.
     PerThread,
-    /// Per-process CPU clock → host CLOCK_PROCESS_CPUTIME_ID (current process).
+    /// Per-process CPU clock → target task kernel CPU accounting.
     PerProcess,
 }
 
@@ -9993,28 +9993,12 @@ pub(super) fn linux_clock_duration(
         }
         // BOOTTIME includes suspend time; on macOS that is CLOCK_MONOTONIC.
         LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Some(clock.boottime_now()),
-        // Linux↔macOS clock-id numbering DIFFERS, so map the Linux ids to
-        // the host's symbolic libc constants rather than passing through.
-        LINUX_CLOCK_PROCESS_CPUTIME_ID => {
-            let (u, s) = time::task_self_cpu_us();
-            Some(Duration::from_micros(u.saturating_add(s)))
-        }
-        LINUX_CLOCK_THREAD_CPUTIME_ID => {
-            let (u, s) = time::task_thread_cpu_us();
-            Some(Duration::from_micros(u.saturating_add(s)))
-        }
-        // A dynamic per-task CPU-clock id (negative) → best-effort current
-        // thread/process CPU time (CLOCK_PROCESS_CPUTIME_ID may be unimplemented
-        // on some hosts, so fall back to the thread clock).
+        LINUX_CLOCK_PROCESS_CPUTIME_ID => Some(Duration::from_nanos(time::task_process_cpu_ns())),
+        LINUX_CLOCK_THREAD_CPUTIME_ID => Some(Duration::from_nanos(time::task_thread_cpu_ns())),
+        // A dynamic per-task CPU-clock id (negative) → current thread/process CPU time.
         _ => match dynamic_cpu_clock(clock_id)? {
-            DynamicCpuClock::PerThread => {
-                let (u, s) = time::task_thread_cpu_us();
-                Some(Duration::from_micros(u.saturating_add(s)))
-            }
-            DynamicCpuClock::PerProcess => {
-                let (u, s) = time::task_self_cpu_us();
-                Some(Duration::from_micros(u.saturating_add(s)))
-            }
+            DynamicCpuClock::PerThread => Some(Duration::from_nanos(time::task_thread_cpu_ns())),
+            DynamicCpuClock::PerProcess => Some(Duration::from_nanos(time::task_process_cpu_ns())),
         },
     }
 }

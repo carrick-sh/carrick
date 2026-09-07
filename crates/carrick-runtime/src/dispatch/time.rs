@@ -1305,12 +1305,29 @@ pub(crate) fn task_self_cpu_us() -> (u64, u64) {
     .unwrap_or((0, 0))
 }
 
+pub(crate) fn task_process_cpu_ns() -> u64 {
+    super::resources::with_active_context(|context| {
+        let task = context.task();
+        task.self_cpu_ns_including_active()
+            .saturating_add(task.self_system_cpu_us().saturating_mul(1000))
+    })
+    .unwrap_or(0)
+}
+
 pub(crate) fn task_thread_cpu_us() -> (u64, u64) {
     super::resources::with_active_context(|context| {
         let thread = context.thread();
         (thread.cpu_us(), thread.system_cpu_us())
     })
     .unwrap_or((0, 0))
+}
+
+pub(crate) fn task_thread_cpu_ns() -> u64 {
+    super::resources::with_active_context(|context| {
+        let thread = context.thread();
+        thread.total_cpu_ns_including_active()
+    })
+    .unwrap_or(0)
 }
 
 /// The calling Linux process's CHILDREN ledger as (user µs, system µs) — the

@@ -16,10 +16,11 @@
 //! timer_fired=1
 //! timer_pc_in_vdso=1
 //! timer_pc_in_text=1
+//! timer_idle_signals=0
 //! timer_after_disarm=0
 //! ```
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
@@ -32,6 +33,8 @@ const PF_X: u32 = 1;
 static SIGPROF_HITS: AtomicU32 = AtomicU32::new(0);
 static SIGPROF_VDSO_HITS: AtomicU32 = AtomicU32::new(0);
 static SIGPROF_TEXT_HITS: AtomicU32 = AtomicU32::new(0);
+static IDLE_THREAD_HITS: AtomicU32 = AtomicU32::new(0);
+static IDLE_THREAD_TID: AtomicI32 = AtomicI32::new(0);
 
 const MAX_TEXT_RANGES: usize = 8;
 static mut VDSO_RANGE: (u64, u64) = (0, 0);
@@ -76,6 +79,11 @@ unsafe fn is_in_text(pc: u64) -> bool {
 }
 
 extern "C" fn on_sigprof(_sig: i32, _info: *mut libc::siginfo_t, ucontext: *mut libc::c_void) {
+    let tid: i32 = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+    if tid != 0 && tid == IDLE_THREAD_TID.load(Ordering::SeqCst) {
+        IDLE_THREAD_HITS.fetch_add(1, Ordering::SeqCst);
+        return;
+    }
     let pc = unsafe { ucontext_pc(ucontext) };
     SIGPROF_HITS.fetch_add(1, Ordering::SeqCst);
     if unsafe { is_in_vdso(pc) } {
@@ -223,6 +231,65 @@ fn test_posix_timer() {
     SIGPROF_HITS.store(0, Ordering::SeqCst);
     SIGPROF_VDSO_HITS.store(0, Ordering::SeqCst);
     SIGPROF_TEXT_HITS.store(0, Ordering::SeqCst);
+    IDLE_THREAD_HITS.store(0, Ordering::SeqCst);
+    IDLE_THREAD_TID.store(0, Ordering::SeqCst);
+
+    let (idle_ready_tx, idle_ready_rx) = std::sync::mpsc::channel();
+    let idle_handle = std::thread::spawn(move || {
+        let tid: i32 = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        IDLE_THREAD_TID.store(tid, Ordering::SeqCst);
+
+        let mut sev: libc::sigevent = unsafe { std::mem::zeroed() };
+        sev.sigev_notify = 4; // SIGEV_THREAD_ID
+        sev.sigev_signo = libc::SIGPROF;
+        let sev_bytes = &mut sev as *mut _ as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(&tid as *const _ as *const u8, sev_bytes.add(16), 4);
+        }
+
+        let mut timer_id: libc::timer_t = std::ptr::null_mut();
+        let create_rc =
+            unsafe { libc::timer_create(libc::CLOCK_THREAD_CPUTIME_ID, &mut sev, &mut timer_id) };
+        if create_rc != 0 {
+            let _ = idle_ready_tx.send(false);
+            return false;
+        }
+
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000,
+            },
+        };
+        let arm_rc =
+            unsafe { libc::timer_settime(timer_id, 0, &spec, std::ptr::null_mut()) };
+        if arm_rc != 0 {
+            unsafe { libc::timer_delete(timer_id) };
+            let _ = idle_ready_tx.send(false);
+            return false;
+        }
+
+        let _ = idle_ready_tx.send(true);
+
+        // Sleep 300 ms while armed (idle thread burning no CPU).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let disarm_spec = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        };
+        unsafe {
+            libc::timer_settime(timer_id, 0, &disarm_spec, std::ptr::null_mut());
+            libc::timer_delete(timer_id);
+        }
+        true
+    });
+
+    let _ = idle_ready_rx.recv();
 
     let mut sev: libc::sigevent = unsafe { std::mem::zeroed() };
     sev.sigev_notify = 4; // SIGEV_THREAD_ID
@@ -238,9 +305,11 @@ fn test_posix_timer() {
         unsafe { libc::timer_create(libc::CLOCK_THREAD_CPUTIME_ID, &mut sev, &mut timer_id) };
 
     if create_rc != 0 {
+        let _ = idle_handle.join();
         println!("timer_fired=0");
         println!("timer_pc_in_vdso=0");
         println!("timer_pc_in_text=0");
+        println!("timer_idle_signals=0");
         println!("timer_after_disarm=0");
         return;
     }
@@ -259,9 +328,11 @@ fn test_posix_timer() {
         unsafe { libc::timer_settime(timer_id, 0, &spec, std::ptr::null_mut()) };
     if arm_rc != 0 {
         unsafe { libc::timer_delete(timer_id) };
+        let _ = idle_handle.join();
         println!("timer_fired=0");
         println!("timer_pc_in_vdso=0");
         println!("timer_pc_in_text=0");
+        println!("timer_idle_signals=0");
         println!("timer_after_disarm=0");
         return;
     }
@@ -284,6 +355,9 @@ fn test_posix_timer() {
     let pre_vdso = SIGPROF_VDSO_HITS.load(Ordering::SeqCst);
     let pre_text = SIGPROF_TEXT_HITS.load(Ordering::SeqCst);
 
+    let _ = idle_handle.join();
+    let idle_hits = IDLE_THREAD_HITS.load(Ordering::SeqCst);
+
     spin_clock_gettime(50);
     let post_disarm_hits = SIGPROF_HITS.load(Ordering::SeqCst);
     let after_disarm = post_disarm_hits.saturating_sub(pre_disarm_hits);
@@ -297,6 +371,7 @@ fn test_posix_timer() {
     println!("timer_fired={fired}");
     println!("timer_pc_in_vdso={pc_in_vdso}");
     println!("timer_pc_in_text={pc_in_text}");
+    println!("timer_idle_signals={idle_hits}");
     println!("timer_after_disarm={after_disarm}");
 }
 

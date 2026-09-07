@@ -7604,6 +7604,17 @@ impl Thread {
         self.cpu_accounting.system_ns.load(Ordering::Acquire) / 1000
     }
 
+    /// Guest SYSTEM CPU (ns) this thread has accumulated.
+    pub fn system_cpu_ns(&self) -> u64 {
+        self.cpu_accounting.system_ns.load(Ordering::Acquire)
+    }
+
+    /// Guest USER + SYSTEM CPU (ns) including any active guest run.
+    pub fn total_cpu_ns_including_active(&self) -> u64 {
+        self.cpu_ns_including_active()
+            .saturating_add(self.system_cpu_ns())
+    }
+
     /// Charge `delta_ns` of syscall-service CPU to this thread. Called once per
     /// guest syscall from the dispatch boundary, with the delta measured on the
     /// host thread's own CPU clock so blocked time is excluded.
