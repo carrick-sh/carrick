@@ -6884,6 +6884,11 @@ impl FsBackend for HostFsBackend {
         if rc != 0 {
             return Err(BackendError::Io);
         }
+        crate::fs_resolve_cache::bump_dir_generation();
+        self.drop_dir_cache();
+        if self.use_stat_cache {
+            self.drop_stat_cache_after_rename();
+        }
         Ok(())
     }
 
@@ -7337,20 +7342,6 @@ impl FsBackend for HostFsBackend {
             let Ok(parent_c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
                 return ParentResolve::Slow;
             };
-            // The kernel directory cache first: a hit is a dirfd for exactly
-            // this parent that was reached one `O_NOFOLLOW | O_DIRECTORY`
-            // component at a time from the sandbox root and is still current
-            // at the directory-topology generation — which is the
-            // `AllDirsNoSymlink` verdict, already proven, for zero host calls.
-            // Before this every path resolution re-proved it with
-            // `openat`+`F_GETPATH`+`close` even when the same directory had
-            // just been resolved for the previous call. A miss (an
-            // intermediate symlink, a parent the sparse upper does not hold)
-            // takes the explicit proof below, whose verdict also classifies
-            // the miss.
-            if self.dir_fd_for(parent).is_ok() {
-                return ParentResolve::AllDirsNoSymlink;
-            }
             let dir_fd = self.root_fd.as_raw_fd();
             // ONE openat: the kernel walks every intermediate. O_DIRECTORY makes a
             // non-directory parent (or any non-dir intermediate) fail ENOTDIR.

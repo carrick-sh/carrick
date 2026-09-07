@@ -122,6 +122,14 @@ impl SyscallDispatcher {
         if dirfd != LINUX_AT_FDCWD || mode != 0 || flags != 0 {
             return None;
         }
+        if self
+            .captured_fs_context()
+            .chroot_root()
+            .as_deref()
+            .is_some_and(|r| r != "/")
+        {
+            return None;
+        }
         if !path.starts_with('/')
             || path.starts_with("/proc")
             || path.starts_with("/sys")
