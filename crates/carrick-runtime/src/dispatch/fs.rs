@@ -16000,17 +16000,28 @@ impl SyscallDispatcher {
             // synthetic /proc and /sys are no-op success, rootfs is no-op
             // success (tmpfs semantics). Record the guest-visible owner on the
             // backend (durably, via xattr on --fs host) so a later stat reports it.
-            match this.layered_metadata(&resolved) {
+            let lookup = if nofollow {
+                this.layered_lstat(&resolved).map(|_| ())
+            } else {
+                this.layered_metadata(&resolved).map(|_| ())
+            };
+            match lookup {
                 Ok(_) => {
                     if let Some(errno) = this.chown_permission_errno(uid, gid) {
                         return Ok(DispatchOutcome::errno(errno));
                     }
+                    let target_path = if nofollow {
+                        resolved.clone()
+                    } else {
+                        this.canonicalize_following(&resolved)
+                            .unwrap_or_else(|_| resolved.clone())
+                    };
                     let _ = this.fs.rootfs_vfs.set_owner(
-                        &resolved,
+                        &target_path,
                         uid,
                         gid,
                     );
-                    this.clear_setid_on_chown(&resolved);
+                    this.clear_setid_on_chown(&target_path);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => {
