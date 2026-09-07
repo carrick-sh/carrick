@@ -3263,7 +3263,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 1666,
+      "line": 1675,
       "categories": [
         "description_guard"
       ],
