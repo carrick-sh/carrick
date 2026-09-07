@@ -2146,6 +2146,14 @@
       "rationale": "Host thread-local cell THREAD_VCPU_CREATED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs maintaining per-host-thread execution state for the carrier."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "VMA_VISIT_COUNT",
+      "fingerprint": "1c4d18b8e7c751bce669e8f2b97b9fc31f1e40bb69697754f820f8138a20edcc",
+      "classification": "carrier_infra",
+      "rationale": "cfg(test)-only host thread-local counter of SemanticVma entries visited by one VmaMap mutation, backing the vma_map mutation-complexity test (single insert/remove/modify on 20,000 disjoint VMAs visits O(log n + affected) entries). Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED: it measures the mutating thread's own work and carries no Linux process semantics."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "VCPU_CREATED_TOTAL",
