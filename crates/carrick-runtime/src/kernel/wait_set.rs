@@ -256,11 +256,6 @@ impl WaitSet {
         Self::with_executor_pipe(current_executor_wake_pipe())
     }
 
-    /// Legacy / compatibility constructor: aliases [`Self::for_current_executor`].
-    pub fn with_wake_pipe() -> Self {
-        Self::for_current_executor()
-    }
-
     /// Wake this wait set immediately.
     pub fn wake(&self) {
         self.inner.wake();
@@ -536,7 +531,7 @@ mod tests {
 
     #[test]
     fn wake_pipe_host_poll_integration() {
-        let wait_set = WaitSet::with_wake_pipe();
+        let wait_set = WaitSet::for_current_executor();
         let mut fds = [-1i32; 2];
         let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(rc, 0);

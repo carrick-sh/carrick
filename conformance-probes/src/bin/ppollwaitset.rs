@@ -428,6 +428,254 @@ fn run_case_e() {
     close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
 }
 
+static USR1_COUNT: AtomicU64 = AtomicU64::new(0);
+static SIBLING_SEND_TIME_NS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn sigusr1_handler(_sig: libc::c_int) {
+    USR1_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+fn run_case_f() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigusr1_handler as *const () as usize;
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        let rc = libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+        assert_eq!(rc, 0, "sigaction failed");
+    }
+
+    let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
+
+    let unblock_fired = Arc::new(AtomicBool::new(false));
+    let unblock_fired_clone = Arc::clone(&unblock_fired);
+
+    // Watchdog to prevent hanging forever on a broken binary:
+    let watchdog = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(2500));
+        if !unblock_fired_clone.load(Ordering::SeqCst) {
+            unblock_fired_clone.store(true, Ordering::SeqCst);
+            let b = [1u8];
+            unsafe {
+                libc::write(pipe_wr, b.as_ptr() as *const _, 1);
+            }
+        }
+    });
+
+    let mut pfds = [
+        libc::pollfd {
+            fd: pipe_rd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: efd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: tfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: sock,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    USR1_COUNT.store(0, Ordering::SeqCst);
+    SIBLING_SEND_TIME_NS.store(0, Ordering::SeqCst);
+
+    let sender = thread::spawn(|| {
+        unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGUSR1);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+        }
+        thread::sleep(Duration::from_millis(50));
+        let t_send = get_monotonic_ns();
+        SIBLING_SEND_TIME_NS.store(t_send, Ordering::SeqCst);
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGUSR1);
+        }
+    });
+
+    let t0 = get_monotonic_ns();
+    let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, std::ptr::null(), std::ptr::null()) };
+    let t1 = get_monotonic_ns();
+    let errno = if rc == -1 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    } else {
+        0
+    };
+
+    let elapsed_ms = (t1 - t0) as f64 / 1_000_000.0;
+    let t_send = SIBLING_SEND_TIME_NS.load(Ordering::SeqCst);
+    let wake_latency_ms = if t_send > 0 && t1 >= t_send {
+        (t1 - t_send) as f64 / 1_000_000.0
+    } else {
+        (elapsed_ms - 50.0).max(0.0)
+    };
+
+    let usr1_fired = USR1_COUNT.load(Ordering::SeqCst);
+    let watchdog_tripped = unblock_fired.load(Ordering::SeqCst);
+
+    unblock_fired.store(true, Ordering::SeqCst);
+
+    let returned_eintr = rc == -1 && errno == libc::EINTR && !watchdog_tripped;
+    let under_10ms = returned_eintr && wake_latency_ms < 10.0;
+
+    println!("ppoll_sibling_sigusr1_returned_eintr={}", returned_eintr);
+    println!("ppoll_sibling_sigusr1_wake_latency_under_10ms={}", under_10ms);
+    println!("ppoll_sibling_sigusr1_wake_latency_ms={:.2}", wake_latency_ms);
+    println!("ppoll_sibling_sigusr1_total_elapsed_ms={:.2}", elapsed_ms);
+    println!("ppoll_sibling_sigusr1_handler_fired={}", usr1_fired > 0);
+    println!("ppoll_sibling_sigusr1_errno={}", errno);
+
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+    }
+
+    let _ = sender.join();
+    let _ = watchdog.join();
+    close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
+}
+
+fn run_case_g() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigalrm_handler as *const () as usize;
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        let rc = libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
+        assert_eq!(rc, 0, "sigaction failed");
+    }
+
+    let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
+
+    let unblock_fired = Arc::new(AtomicBool::new(false));
+    let unblock_fired_clone = Arc::clone(&unblock_fired);
+
+    // Watchdog to prevent hanging forever on a broken binary:
+    let watchdog = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(2500));
+        if !unblock_fired_clone.load(Ordering::SeqCst) {
+            unblock_fired_clone.store(true, Ordering::SeqCst);
+            let b = [1u8];
+            unsafe {
+                libc::write(pipe_wr, b.as_ptr() as *const _, 1);
+            }
+        }
+    });
+
+    let mut pfds = [
+        libc::pollfd {
+            fd: pipe_rd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: efd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: tfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: sock,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    ALARM_COUNT.store(0, Ordering::SeqCst);
+
+    // Construct a signal mask that blocks SIGALRM
+    let mut sigmask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut sigmask);
+        libc::sigaddset(&mut sigmask, libc::SIGALRM);
+    }
+
+    // Arm SIGALRM after 50 ms
+    let itv = libc::itimerval {
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 50_000,
+        },
+    };
+    let rc_itv = unsafe { libc::setitimer(libc::ITIMER_REAL, &itv, std::ptr::null_mut()) };
+    assert_eq!(rc_itv, 0, "setitimer failed");
+
+    // ppoll with 100 ms timeout and sigmask blocking SIGALRM:
+    // If blocked signal correctly does NOT interrupt ppoll, ppoll will wait the
+    // full 100 ms timeout and return 0 (no fds ready).
+    let ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 100_000_000,
+    };
+
+    let t0 = get_monotonic_ns();
+    let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, &ts, &sigmask) };
+    let t1 = get_monotonic_ns();
+    let errno = if rc == -1 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    } else {
+        0
+    };
+
+    let elapsed_ms = (t1 - t0) as f64 / 1_000_000.0;
+    let watchdog_tripped = unblock_fired.load(Ordering::SeqCst);
+
+    // Disarm timer and disarm watchdog
+    let disarm = libc::itimerval {
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    unsafe {
+        libc::setitimer(libc::ITIMER_REAL, &disarm, std::ptr::null_mut());
+    }
+    unblock_fired.store(true, Ordering::SeqCst);
+
+    let not_interrupted = rc == 0 && !watchdog_tripped && elapsed_ms >= 85.0;
+    let alarm_fired = ALARM_COUNT.load(Ordering::SeqCst);
+
+    println!("ppoll_blocked_sigalrm_not_interrupted={}", not_interrupted);
+    println!("ppoll_blocked_sigalrm_timed_out={}", rc == 0);
+    println!("ppoll_blocked_sigalrm_elapsed_ms={:.2}", elapsed_ms);
+    println!("ppoll_blocked_sigalrm_handler_fired={}", alarm_fired > 0);
+    println!("ppoll_blocked_sigalrm_errno={}", errno);
+
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
+    }
+
+    let _ = watchdog.join();
+    close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let run_all = args.len() <= 1;
@@ -446,5 +694,11 @@ fn main() {
     }
     if run_all || args.iter().any(|a| a == "e") {
         run_case_e();
+    }
+    if run_all || args.iter().any(|a| a == "f") {
+        run_case_f();
+    }
+    if run_all || args.iter().any(|a| a == "g") {
+        run_case_g();
     }
 }

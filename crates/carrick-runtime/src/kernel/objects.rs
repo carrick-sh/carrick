@@ -5029,7 +5029,7 @@ impl Task {
         true
     }
 
-    pub(super) fn shared(&self) -> Arc<TaskShared> {
+    pub(crate) fn shared(&self) -> Arc<TaskShared> {
         self.shared.load_full()
     }
 
@@ -5244,7 +5244,7 @@ impl Task {
         self.threads.lock().values().map(|(key, _)| *key).collect()
     }
 
-    pub(super) fn thread(&self, tid: LinuxTid) -> Option<ThreadRef> {
+    pub(crate) fn thread(&self, tid: LinuxTid) -> Option<ThreadRef> {
         self.threads
             .lock()
             .get(&tid)
@@ -7954,6 +7954,15 @@ impl SignalAuthority {
         temporary: WaitSigMask,
         host_slot: Option<(i32, i32)>,
     ) -> Option<SignalWaitReservation> {
+        let leader_tid = LinuxTid::for_task_leader(self.task.key().id);
+        let is_leader = self.thread.key().tid == leader_tid;
+        let leader_blocked = if !is_leader {
+            self.task
+                .thread(leader_tid)
+                .map(|l| l.signal_state().blocked())
+        } else {
+            None
+        };
         let generation_guard = self.task.lock_signal_generation();
         let mut thread = self.thread.signal_state.lock();
         let mut task = self.task_pending.queue.lock();
@@ -7994,10 +8003,15 @@ impl SignalAuthority {
         );
         let mask_generation = self.thread.revision.load();
         let action_generation = self.sighand.revision.load();
+        let available_task = if let Some(leader_mask) = leader_blocked {
+            task.present().intersect(leader_mask)
+        } else {
+            task.present()
+        };
         loop {
             let candidates = thread
                 .pending()
-                .union(task.present())
+                .union(available_task)
                 .difference(effective_mask);
             let signum = candidates.lowest_signum()?;
             let signal = LinuxSignal::for_signal_number(signum).ok()?;

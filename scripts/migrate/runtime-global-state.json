@@ -1202,6 +1202,14 @@
       "rationale": "Carrier-wide host infrastructure static slot::SLOT in crates/carrick-runtime/src/kernel/tty.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/kernel/wait_set.rs",
+      "symbol": "CURRENT_EXECUTOR_WAKE_PIPE",
+      "fingerprint": "cb7846bd41688a56bc8e86f6ba760acb8179e9c6bd41c665c9ad45eda5034c64",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure thread_local CURRENT_EXECUTOR_WAKE_PIPE in crates/carrick-runtime/src/kernel/wait_set.rs maintaining host process lifecycle or VM resources (cached wake pipe per executor host thread)."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/layer_cache.rs",
       "symbol": "reflink_or_copy_file::FALLBACK_FLAGGED",
