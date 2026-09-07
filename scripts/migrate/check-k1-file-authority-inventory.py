@@ -37,6 +37,12 @@ PATTERNS = {
     ),
 }
 
+# Text that matches a category word but is not a file-authority operation.
+# `Vec::splice` on the semantic VMA vector (`VmaMap`) is std vector surgery,
+# not a pipe/stream transfer; the "stream" word match would otherwise record
+# it as a K1 stream site and force a false classification at every landing.
+NON_AUTHORITY_TEXT = (re.compile(r"\bself\.vmas\.splice\("),)
+
 
 def brace_deltas(source: str) -> list[int]:
     """Per-line `{`/`}` balance of `source`, skipping braces inside line and
@@ -166,6 +172,8 @@ def generate() -> dict[str, Any]:
         test_lines = cfg_test_module_lines(lines)
         whole_file_test = is_out_of_line_test_module(path)
         for number, line in enumerate(lines, 1):
+            if any(pattern.search(line) for pattern in NON_AUTHORITY_TEXT):
+                continue
             categories = [name for name, pattern in PATTERNS.items() if pattern.search(line)]
             if categories:
                 text = line.strip()
