@@ -148,7 +148,12 @@ answers "which guest CPU, which task next", the mechanism does the rest.
 1. **Symptoms (worker `sched-herd`, in flight):** remove the boundary
    yield; exact wakes (`notify_one` to a runnable waiter; close waiters on
    their own condvar); shorten the census/admission holds.
-2. **Per-CPU queues and affinity:** `GuestCpu` with local queues, executor
+2. **Per-CPU queues, affinity, and the policy hook** — whose first consumer
+   is an adversarial/record-replay policy in `carrick-embed`'s signed tests
+   that pins the load-coupled `lost exact transition` abort
+   deterministically (owner, 2026-09-07: races in the scheduler's own
+   transitions are reproduced through the scheduler interface, not through
+   host load or syscall jitter alone): `GuestCpu` with local queues, executor
    count = `nproc`, `last_cpu` placement, work stealing, `notify_one`.
    Gate: two-process concurrent suites, `cpython-importlib`/`itertools`
    CPU-seconds flat under three default-QoS hogs (the coupling driver's
