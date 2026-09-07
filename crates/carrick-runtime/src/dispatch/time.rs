@@ -623,6 +623,12 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             }
+            if clock_id == crate::linux_abi::LINUX_CLOCK_THREAD_CPUTIME_ID && target_tid.is_none() {
+                let tid = cx.kernel.thread().key().tid.raw();
+                if tid > 0 {
+                    target_tid = Some(tid);
+                }
+            }
             let timer_id = crate::posix_timer::create_with_target(clock_id as i32, signum, target_tid);
             // The raw timer_create(2) ABI writes a kernel `timer_t`, which is a
             // 4-byte `int` (`__kernel_timer_t`) — NOT glibc's 8-byte opaque
