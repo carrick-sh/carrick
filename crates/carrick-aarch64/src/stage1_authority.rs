@@ -238,8 +238,10 @@ impl Stage1Authority {
             ref mut arena_source,
             ..
         } = *inner;
+        let manager = manager.as_mut().ok_or(on_absent)?;
+        manager.declare_live_hardware_image();
         let mut editor = Stage1Editor {
-            manager: manager.as_mut().ok_or(on_absent)?,
+            manager,
             arena_source,
         };
         f(&mut editor)
@@ -338,10 +340,12 @@ impl Stage1Authority {
             ref mut arena_source,
             ..
         } = *inner;
+        let manager = manager
+            .as_mut()
+            .expect("manager must be present after lazy initialization");
+        manager.declare_live_hardware_image();
         let mut editor = Stage1Editor {
-            manager: manager
-                .as_mut()
-                .expect("manager must be present after lazy initialization"),
+            manager,
             arena_source,
         };
         f(&mut editor)
