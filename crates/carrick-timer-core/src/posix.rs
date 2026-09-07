@@ -38,6 +38,9 @@ pub struct PosixTimerSpec {
 
 pub struct PosixTimerSlot {
     pub clock_id: i32,
+    /// Optional thread target (e.g. SIGEV_THREAD_ID). If set, expiries are
+    /// directed to this specific guest tid rather than process-wide.
+    pub target_tid: Option<i32>,
     /// The current arm's spec (for replay if pump path is later wired up).
     pub spec: Mutex<PosixTimerSpec>,
     /// Host monotonic timestamp (ns since `BASE_INSTANT`) the current arm
@@ -54,9 +57,10 @@ pub struct PosixTimerSlot {
 }
 
 impl PosixTimerSlot {
-    fn new(clock_id: i32, signum: i32) -> Self {
+    fn new(clock_id: i32, signum: i32, target_tid: Option<i32>) -> Self {
         Self {
             clock_id,
+            target_tid,
             spec: Mutex::new(PosixTimerSpec {
                 signum,
                 spec: TimerSpecNs::DISARM,
@@ -100,14 +104,20 @@ fn now_ns() -> u64 {
         .saturating_add(1)
 }
 
-/// Allocate a new timer (no arm yet). Returns the new id.
+/// Allocate a new timer (no arm yet) targeting the process. Returns the new id.
 pub fn create(clock_id: i32, signum: i32) -> i32 {
+    create_with_target(clock_id, signum, None)
+}
+
+/// Allocate a new timer (no arm yet) optionally targeting a specific thread `target_tid`
+/// (e.g. from `SIGEV_THREAD_ID`). Returns the new id.
+pub fn create_with_target(clock_id: i32, signum: i32, target_tid: Option<i32>) -> i32 {
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let mut guard = registry();
     let map = ensure_registry(&mut guard);
     map.insert(
         id,
-        std::sync::Arc::new(PosixTimerSlot::new(clock_id, signum)),
+        std::sync::Arc::new(PosixTimerSlot::new(clock_id, signum, target_tid)),
     );
     id
 }
@@ -121,6 +131,8 @@ pub struct PosixArm {
     pub generation: u64,
     /// Signum to publish on each expiry.
     pub signum: i32,
+    /// Optional thread target (from `SIGEV_THREAD_ID`).
+    pub target_tid: Option<i32>,
     /// The slot, so the backend's firing thread can check `generation` /
     /// bump `overruns` without re-locking the registry.
     pub slot: std::sync::Arc<PosixTimerSlot>,
@@ -157,6 +169,7 @@ pub fn arm(id: i32, spec: TimerSpecNs) -> Option<PosixArm> {
         old,
         generation: new_gen,
         signum: old.signum, // signum doesn't change on arm; carried from create.
+        target_tid: slot.target_tid,
         slot,
     })
 }
@@ -420,5 +433,24 @@ mod tests {
         assert!(!exists(id));
         assert_eq!(getoverrun(id), None);
         assert!(remaining(id).is_none());
+    }
+
+    #[test]
+    fn create_with_target_carries_target_tid() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let id = create_with_target(3, 27, Some(42)); // CLOCK_THREAD_CPUTIME_ID=3, SIGPROF=27, tid=42
+        assert!(exists(id));
+        let armed = arm(
+            id,
+            TimerSpecNs {
+                value: 1_000_000,
+                interval: 1_000_000,
+            },
+        )
+        .expect("known id");
+        assert_eq!(armed.target_tid, Some(42));
+        assert_eq!(armed.signum, 27);
+        assert_eq!(armed.slot.target_tid, Some(42));
+        assert!(delete(id));
     }
 }
