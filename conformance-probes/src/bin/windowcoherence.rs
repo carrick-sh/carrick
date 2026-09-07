@@ -77,7 +77,58 @@ fn fragment_mappings() {
     }
 }
 
-fn test_out_of_order_window() {
+struct CrossThreadArg {
+    base: *mut u8,
+    step: *const AtomicUsize,
+    pipe_fd: libc::c_int,
+    thread_id: usize,
+}
+
+unsafe impl Send for CrossThreadArg {}
+unsafe impl Sync for CrossThreadArg {}
+
+extern "C" fn cross_thread_worker(arg_ptr: *mut libc::c_void) -> *mut libc::c_void {
+    let arg = unsafe { &*(arg_ptr as *const CrossThreadArg) };
+    let base = arg.base;
+    let step = unsafe { &*arg.step };
+    let pipe_fd = arg.pipe_fd;
+
+    if arg.thread_id == 0 {
+        // Step 1: Thread 0 touches offset 0 KiB (chunk 0 of 64 KiB window)
+        let p_0k = base as *mut u64;
+        unsafe { p_0k.write_volatile(0xCCCC_7777_8888_9999) };
+
+        // Signal Thread 1
+        step.store(1, Ordering::Release);
+    } else {
+        // Wait for Thread 0 (step 1)
+        while step.load(Ordering::Acquire) != 1 {
+            std::hint::spin_loop();
+        }
+
+        // Thread 1: read from pipe into offset 16 KiB (chunk 1 of the 64 KiB window that Thread 0 widened)
+        let p_16k = unsafe { base.add(16 * 1024) as *mut libc::c_void };
+        let n = unsafe { libc::read(pipe_fd, p_16k, 8) };
+        if n != 8 {
+            let err = unsafe { *libc::__errno_location() };
+            eprintln!(
+                "REPRODUCED CORRUPTION: sibling read into offset 16K returned {n}, errno={err}"
+            );
+            PATTERN_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let val = unsafe { *(p_16k as *const u64) };
+            if val != 0x1122_3344_5566_7788 {
+                eprintln!(
+                    "REPRODUCED CORRUPTION: sibling read expected 0x1122334455667788, got 0x{val:x}"
+                );
+                PATTERN_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    std::ptr::null_mut()
+}
+
+fn test_cross_thread_window() {
     let size = 2 * 1024 * 1024;
     let ptr = unsafe {
         libc::mmap(
@@ -93,42 +144,50 @@ fn test_out_of_order_window() {
         return;
     }
     let base = ptr as *mut u8;
+    eprintln!("test_cross_thread_window: ptr = {:p}", ptr);
+    let step = AtomicUsize::new(0);
 
-    // Step 1: Touch offset 128 KiB (0x20000) so a mapping at 0x20000 is created first in self.mappings
-    let p_128k = unsafe { base.add(128 * 1024) as *mut u64 };
-    unsafe { p_128k.write_volatile(0xAAAA_1111_2222_3333) };
-
-    // Step 2: Touch offset 16 KiB (0x4000, chunk 1 of window 0).
-    // This mapping at 0x4000 is pushed AFTER 0x20000 in self.mappings!
-    let p_16k = unsafe { base.add(16 * 1024) as *mut u64 };
-    unsafe { p_16k.write_volatile(0xBBBB_4444_5555_6666) };
-
-    // Step 3: Touch offset 0 KiB (0x0000, chunk 0 of window 0).
-    // Fault at 0x0000 widens window to 64 KiB (0x0000..0x10000).
-    // Because self.mappings is [0x20000, 0x4000], partition_point(|m| m.start <= 0) returns 0.
-    // Index 0 has start=0x20000, which is >= 0x10000, so next_local is None!
-    // Window end stays 0x10000 and materializes 0x4000..0x8000 again, wiping offset 16 KiB!
-    let p_0k = base as *mut u64;
-    unsafe { p_0k.write_volatile(0xCCCC_7777_8888_9999) };
-
-    // Step 4: Verify offset 16 KiB
-    let val_16k = unsafe { p_16k.read_volatile() };
-    if val_16k != 0xBBBB_4444_5555_6666 {
-        eprintln!(
-            "REPRODUCED CORRUPTION: offset 16K expected 0xBBBB444455556666, got 0x{val_16k:x}"
-        );
-        PATTERN_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+    let mut pipe_fds = [0 as libc::c_int; 2];
+    unsafe {
+        libc::pipe(pipe_fds.as_mut_ptr());
+        let val: u64 = 0x1122_3344_5566_7788;
+        libc::write(pipe_fds[1], &val as *const u64 as *const libc::c_void, 8);
     }
 
-    let val_128k = unsafe { p_128k.read_volatile() };
-    if val_128k != 0xAAAA_1111_2222_3333 {
-        eprintln!(
-            "REPRODUCED CORRUPTION: offset 128K expected 0xAAAA111122223333, got 0x{val_128k:x}"
-        );
-        PATTERN_MISMATCHES.fetch_add(1, Ordering::Relaxed);
-    }
+    let mut t0: libc::pthread_t = 0 as libc::pthread_t;
+    let mut t1: libc::pthread_t = 0 as libc::pthread_t;
+    let arg0 = CrossThreadArg {
+        base,
+        step: &step as *const AtomicUsize,
+        pipe_fd: pipe_fds[0],
+        thread_id: 0,
+    };
+    let arg1 = CrossThreadArg {
+        base,
+        step: &step as *const AtomicUsize,
+        pipe_fd: pipe_fds[0],
+        thread_id: 1,
+    };
 
-    unsafe { libc::munmap(ptr, size) };
+    unsafe {
+        libc::pthread_create(
+            &mut t0,
+            std::ptr::null(),
+            cross_thread_worker,
+            &arg0 as *const CrossThreadArg as *mut libc::c_void,
+        );
+        libc::pthread_create(
+            &mut t1,
+            std::ptr::null(),
+            cross_thread_worker,
+            &arg1 as *const CrossThreadArg as *mut libc::c_void,
+        );
+        libc::pthread_join(t0, std::ptr::null_mut());
+        libc::pthread_join(t1, std::ptr::null_mut());
+        libc::close(pipe_fds[0]);
+        libc::close(pipe_fds[1]);
+        libc::munmap(ptr, size);
+    }
 }
 
 struct WorkerArg {
@@ -140,7 +199,6 @@ extern "C" fn worker_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
     let tid = arg.thread_id;
     let mut rng = XorShift::new(0x1234_5678_9ABC_DEF0 ^ ((tid as u64 + 1) * 0x517C_C1B7_2722_0A95));
 
-    test_out_of_order_window();
     fragment_mappings();
 
     let region = unsafe {
@@ -375,6 +433,8 @@ extern "C" fn worker_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
 }
 
 fn main() {
+    test_cross_thread_window();
+
     let mut threads = [0 as libc::pthread_t; NUM_THREADS];
     let mut args: Vec<WorkerArg> = (0..NUM_THREADS)
         .map(|i| WorkerArg { thread_id: i })
