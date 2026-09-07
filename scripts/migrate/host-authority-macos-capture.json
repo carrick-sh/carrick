@@ -974,8 +974,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 1948529,
-        "byte_start": 1948517,
+        "byte_end": 1948528,
+        "byte_start": 1948516,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
@@ -995,8 +995,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 1951160,
-        "byte_start": 1951148,
+        "byte_end": 1951159,
+        "byte_start": 1951147,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
@@ -1016,8 +1016,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 1953477,
-        "byte_start": 1953465,
+        "byte_end": 1953476,
+        "byte_start": 1953464,
         "column": 25,
         "column_end": 37,
         "column_start": 25,
@@ -12558,9 +12558,9 @@
       }
     }
   ],
-  "rows_sha256": "4889c4894f0d6e9fcb6a886b5783d9f94ec48e10a235fb493d1bc2e6d2930752",
+  "rows_sha256": "2ac0884e28d0a654bfa103118a035da445bd2a2b1fe434ca4cc4982ee2d711a0",
   "schema": 1,
-  "source_head": "f64e04be77f3537051de5403b31f7f7758810015",
+  "source_head": "5667d25dae8de72441369b25fbbfdc3d172f4b46",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

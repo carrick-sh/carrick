@@ -1420,7 +1420,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "mutate_external_alias_state_in",
       "ordinal_in_function": 2,
-      "fingerprint": "a5a945583edc3df0039bdb8e36b685890c3599ca48ae8558c454fbc1bbb00df8",
+      "fingerprint": "176045bf76199b42ad4ceca272342f35fb39cb3999d97c05fea3ad139fbc1c5f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Replay epoch exhaustion after an external alias mutation prevents distinct versioning of changed physical replay state, allowing stale replay authentication."

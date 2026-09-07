@@ -1209,8 +1209,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:46554 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000048",
     "source": {
-      "byte_end": 1948529,
-      "byte_start": 1948517,
+      "byte_end": 1948528,
+      "byte_start": 1948516,
       "column": 21,
       "column_end": 33,
       "column_start": 21,
@@ -1237,8 +1237,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:46600 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000049",
     "source": {
-      "byte_end": 1951160,
-      "byte_start": 1951148,
+      "byte_end": 1951159,
+      "byte_start": 1951147,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
@@ -1265,8 +1265,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:46641 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000050",
     "source": {
-      "byte_end": 1953477,
-      "byte_start": 1953465,
+      "byte_end": 1953476,
+      "byte_start": 1953464,
       "column": 25,
       "column_end": 37,
       "column_start": 25,
