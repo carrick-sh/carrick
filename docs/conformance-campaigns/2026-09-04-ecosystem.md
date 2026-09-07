@@ -2114,3 +2114,29 @@ binary with `CARRICK_FAULT_WINDOW_BYTES=65536` forced is
 the 64 KiB default returns. Lesson for the inventories: a `Vec` that one
 site binary-searches needs a single sorted-insert path and a debug
 assertion, or the search is a bug waiting for the next `push`.
+
+## 2026-09-07 evening: where the perf lives, and who holds what
+
+On the fixed binary (`a1fd9ad94`, load 12–17), `cpython-itertools` runs in
+**6.3 s** with `CARRICK_FAULT_WINDOW_BYTES=65536` and **47.8 s** with the
+4 KiB default — the compound-aligned pooled first touch alone buys
+nothing measurable on this row; the whole win is the wide window, which
+still corrupts guest memory (Go `allocCount != nelems`, 2 of 3 runs at
+64 KiB on the fixed binary, 0 of 6 at 4 KiB). The `partition_point`
+searches on the unsorted mapping vector (`a1fd9ad94`) were a real latent
+bug but not this one; the per-chunk receipt clamping was verified
+correct. A one-minute reducer exists:
+`target/conformance/eco-load/gobuild-loop.sh <label> <window> [iters] [bin]`
+(a `go build fmt net/http` loop in the Go image; the fatal appears in the
+first builds at 64 KiB).
+
+Owner directions during the day: the scheduler (design phase 2, with the
+embed-pluggable policy whose first consumer is an adversarial race
+reproducer) is the top priority and is finished by an Opus subagent in
+`.worktrees/agy-guest-cpu-sep07` (the Antigravity worker's policy types
+and draft run queue are its base); the window corruption is hunted by a
+Fable subagent in `.worktrees/agy-window-corruption-sep07` (brief in the
+session scratchpad, `fable-window.md`). The captured reaped-thread wake
+abort (previous section) is part of the scheduler work. Remaining
+Antigravity workers: reactor (poll deadline regression); sched-herd is
+prior art only.
