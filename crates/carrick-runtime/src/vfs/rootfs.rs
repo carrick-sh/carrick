@@ -276,6 +276,16 @@ impl RootFsVfs {
         self.dentry_cache.inode_changed(path, inode);
     }
 
+    /// Pin a cached directory to prevent eviction while an fd is open on it.
+    pub fn pin_dir(&self, path: &str) {
+        self.dentry_cache.pin_dir(path);
+    }
+
+    /// Unpin a cached directory when an fd opened on it is closed.
+    pub fn unpin_dir(&self, path: &str) {
+        self.dentry_cache.unpin_dir(path);
+    }
+
     /// Reset dentry cache on rootfs layer mutation.
     pub fn reset_dentry_cache(&mut self) {
         let is_shared = self.dentry_cache.is_shared();
