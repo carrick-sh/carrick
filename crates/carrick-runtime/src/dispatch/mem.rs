@@ -434,13 +434,601 @@ pub struct SemanticVma {
     pub file_page_offset: Option<u64>,
 }
 
+impl SemanticVma {
+    pub(crate) fn attributes(&self) -> VmaAttributes {
+        VmaAttributes {
+            read: self.read,
+            write: self.write,
+            execute: self.execute,
+            provenance: self.provenance,
+            fork_policy: self.fork_policy,
+            dump_policy: self.dump_policy,
+            droppable: self.droppable,
+            path: self.path.clone(),
+            file_page_offset: self.file_page_offset,
+        }
+    }
+
+    pub(crate) fn with_range_and_attrs(start: u64, end: u64, attrs: VmaAttributes) -> Self {
+        Self {
+            start,
+            end,
+            read: attrs.read,
+            write: attrs.write,
+            execute: attrs.execute,
+            provenance: attrs.provenance,
+            fork_policy: attrs.fork_policy,
+            dump_policy: attrs.dump_policy,
+            droppable: attrs.droppable,
+            path: attrs.path,
+            file_page_offset: attrs.file_page_offset,
+        }
+    }
+}
+
+/// Attributes of a semantic VMA excluding its virtual address range (`start`..`end`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmaAttributes {
+    pub read: bool,
+    pub write: bool,
+    pub execute: bool,
+    pub provenance: VmaBackingProvenance,
+    pub fork_policy: carrick_abi::VmaForkPolicy,
+    pub dump_policy: carrick_abi::VmaDumpPolicy,
+    pub droppable: bool,
+    pub path: String,
+    pub file_page_offset: Option<u64>,
+}
+
+impl VmaAttributes {
+    pub fn offset_by(&self, delta_bytes: u64) -> Self {
+        let mut cloned = self.clone();
+        if let Some(base) = cloned.file_page_offset {
+            cloned.file_page_offset = Some(base + (delta_bytes >> 12));
+        }
+        cloned
+    }
+
+    pub fn can_merge_with(&self, next: &Self, prev_len_bytes: u64) -> bool {
+        let offset_contiguous = match (self.file_page_offset, next.file_page_offset) {
+            (None, None) => true,
+            (Some(o1), Some(o2)) => o1.checked_add(prev_len_bytes >> 12) == Some(o2),
+            _ => false,
+        };
+        if !offset_contiguous {
+            return false;
+        }
+        // Full equality merge compatibility: any non-offset attribute difference
+        // prevents merging.
+        let mut expected = next.clone();
+        expected.file_page_offset = self.file_page_offset;
+        *self == expected
+    }
+}
+
+/// Error returned when an `insert` operation detects an overlapping VMA range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VmaOverlapError {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl std::fmt::Display for VmaOverlapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot insert VMA [0x{:x}, 0x{:x}): overlaps with existing range",
+            self.start, self.end
+        )
+    }
+}
+
+impl std::error::Error for VmaOverlapError {}
+
+#[cfg(test)]
+thread_local! {
+    static VMA_VISIT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Sorted, non-overlapping collection of `SemanticVma` entries for an address space.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VmaMap {
+    vmas: Vec<SemanticVma>,
+}
+
+impl VmaMap {
+    pub const fn new() -> Self {
+        Self { vmas: Vec::new() }
+    }
+
+    #[cfg(test)]
+    pub fn reset_visit_count() {
+        VMA_VISIT_COUNT.with(|c| c.set(0));
+    }
+
+    #[cfg(test)]
+    pub fn visit_count() -> usize {
+        VMA_VISIT_COUNT.with(|c| c.get())
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn record_visit() {
+        VMA_VISIT_COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn from_vec(vmas: Vec<SemanticVma>) -> Self {
+        let mut map = Self { vmas: Vec::new() };
+        map.insert_many_replacing(vmas);
+        map
+    }
+
+    pub fn into_vec(self) -> Vec<SemanticVma> {
+        self.vmas
+    }
+
+    #[allow(dead_code)]
+    pub fn as_slice(&self) -> &[SemanticVma] {
+        &self.vmas
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, SemanticVma> {
+        self.vmas.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, SemanticVma> {
+        self.vmas.iter_mut()
+    }
+
+    pub fn len(&self) -> usize {
+        self.vmas.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vmas.is_empty()
+    }
+
+    fn check_range(start: u64, end: u64) -> bool {
+        start < end
+    }
+
+    fn try_merge_adjacent(&mut self, left_idx: usize) -> bool {
+        if left_idx + 1 >= self.vmas.len() {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            Self::record_visit();
+            Self::record_visit();
+        }
+        let can_merge = self.vmas[left_idx].end == self.vmas[left_idx + 1].start
+            && self.vmas[left_idx].attributes().can_merge_with(
+                &self.vmas[left_idx + 1].attributes(),
+                self.vmas[left_idx].end - self.vmas[left_idx].start,
+            );
+        if can_merge {
+            let new_end = self.vmas[left_idx + 1].end;
+            self.vmas[left_idx].end = new_end;
+            self.vmas.remove(left_idx + 1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Coalesce adjacent, compatible VMAs.
+    ///
+    /// In debug mode, verifies the sorted and non-overlapping invariant.
+    pub fn coalesce(&mut self) {
+        if self.vmas.len() <= 1 {
+            return;
+        }
+        let mut coalesced: Vec<SemanticVma> = Vec::with_capacity(self.vmas.len());
+        for vma in self.vmas.drain(..) {
+            if let Some(last) = coalesced.last_mut() {
+                debug_assert!(
+                    last.start <= vma.start && last.end <= vma.start,
+                    "VMA collection must be sorted and non-overlapping"
+                );
+                if last.end == vma.start
+                    && last
+                        .attributes()
+                        .can_merge_with(&vma.attributes(), last.end - last.start)
+                {
+                    last.end = vma.end;
+                    continue;
+                }
+            }
+            coalesced.push(vma);
+        }
+        self.vmas = coalesced;
+    }
+
+    /// Remove any portion of VMAs intersecting `[start, end)`.
+    ///
+    /// Slices partial VMAs, adjusts `file_page_offset` on right-hand remainders,
+    /// and drops fully covered VMAs. Sub-range operations on non-existent ranges
+    /// are safe no-ops. Operates in O(log n + affected) time.
+    pub fn remove_range(&mut self, start: u64, end: u64) {
+        if !Self::check_range(start, end) {
+            return;
+        }
+
+        let first = self.vmas.partition_point(|v| {
+            #[cfg(test)]
+            Self::record_visit();
+            v.end <= start
+        });
+        let last = self.vmas.partition_point(|v| {
+            #[cfg(test)]
+            Self::record_visit();
+            v.start < end
+        });
+
+        if first >= last {
+            return;
+        }
+
+        let mut replacements = Vec::with_capacity(2);
+
+        #[cfg(test)]
+        Self::record_visit();
+        let left_vma = &self.vmas[first];
+        if left_vma.start < start {
+            let left_attrs = left_vma.attributes();
+            replacements.push(SemanticVma::with_range_and_attrs(
+                left_vma.start,
+                start,
+                left_attrs,
+            ));
+        }
+
+        #[cfg(test)]
+        Self::record_visit();
+        let right_vma = &self.vmas[last - 1];
+        if right_vma.end > end {
+            let right_attrs = right_vma.attributes().offset_by(end - right_vma.start);
+            replacements.push(SemanticVma::with_range_and_attrs(
+                end,
+                right_vma.end,
+                right_attrs,
+            ));
+        }
+
+        self.vmas.splice(first..last, replacements);
+    }
+
+    /// Modify attributes of any VMAs overlapping `[start, end)`.
+    ///
+    /// Slices VMAs as needed, adjusts `file_page_offset`, invokes `modify` on the
+    /// middle slice's attributes, and coalesces the result. Sub-range operations on
+    /// non-existent ranges are safe no-ops. Operates in O(log n + affected) time.
+    pub fn modify_range<F>(&mut self, start: u64, end: u64, mut modify: F)
+    where
+        F: FnMut(&mut VmaAttributes),
+    {
+        if !Self::check_range(start, end) {
+            return;
+        }
+
+        let first = self.vmas.partition_point(|v| {
+            #[cfg(test)]
+            Self::record_visit();
+            v.end <= start
+        });
+        let last = self.vmas.partition_point(|v| {
+            #[cfg(test)]
+            Self::record_visit();
+            v.start < end
+        });
+
+        if first >= last {
+            return;
+        }
+
+        let affected_count = last - first;
+        let mut replacements = Vec::with_capacity(affected_count + 2);
+
+        for i in first..last {
+            #[cfg(test)]
+            Self::record_visit();
+            let vma = &self.vmas[i];
+
+            if vma.start < start {
+                let left_attrs = vma.attributes();
+                replacements.push(SemanticVma::with_range_and_attrs(
+                    vma.start, start, left_attrs,
+                ));
+            }
+
+            let mid_start = vma.start.max(start);
+            let mid_end = vma.end.min(end);
+            let mut mid_attrs = vma.attributes().offset_by(mid_start - vma.start);
+            modify(&mut mid_attrs);
+            replacements.push(SemanticVma::with_range_and_attrs(
+                mid_start, mid_end, mid_attrs,
+            ));
+
+            if end < vma.end {
+                let right_attrs = vma.attributes().offset_by(end - vma.start);
+                replacements.push(SemanticVma::with_range_and_attrs(end, vma.end, right_attrs));
+            }
+        }
+
+        if replacements.len() > 1 {
+            let mut coalesced: Vec<SemanticVma> = Vec::with_capacity(replacements.len());
+            for vma in replacements {
+                if let Some(last_vma) = coalesced.last_mut() {
+                    if last_vma.end == vma.start
+                        && last_vma
+                            .attributes()
+                            .can_merge_with(&vma.attributes(), last_vma.end - last_vma.start)
+                    {
+                        last_vma.end = vma.end;
+                        continue;
+                    }
+                }
+                coalesced.push(vma);
+            }
+            replacements = coalesced;
+        }
+
+        let repl_count = replacements.len();
+        self.vmas.splice(first..last, replacements);
+
+        if repl_count > 0 {
+            if first + repl_count < self.vmas.len() {
+                self.try_merge_adjacent(first + repl_count - 1);
+            }
+            if first > 0 {
+                self.try_merge_adjacent(first - 1);
+            }
+        }
+    }
+
+    /// Insert a VMA into the map.
+    ///
+    /// # Invariants
+    /// - Inserts out-of-order VMAs into ascending address order.
+    /// - Rejects overlapping insertions with `Err(VmaOverlapError)`.
+    ///   To overwrite existing mappings, use [`VmaMap::insert_replacing`].
+    /// - Automatically coalesces adjacent VMAs if all attributes match and
+    ///   file page offsets are contiguous.
+    /// - Operates in O(log n) time.
+    pub fn insert(&mut self, vma: SemanticVma) -> Result<(), VmaOverlapError> {
+        if !Self::check_range(vma.start, vma.end) {
+            return Ok(());
+        }
+        let idx = self.vmas.partition_point(|v| {
+            #[cfg(test)]
+            Self::record_visit();
+            v.start < vma.start
+        });
+
+        if idx > 0 {
+            #[cfg(test)]
+            Self::record_visit();
+            if self.vmas[idx - 1].end > vma.start {
+                return Err(VmaOverlapError {
+                    start: vma.start,
+                    end: vma.end,
+                });
+            }
+        }
+
+        if idx < self.vmas.len() {
+            #[cfg(test)]
+            Self::record_visit();
+            if self.vmas[idx].start < vma.end {
+                return Err(VmaOverlapError {
+                    start: vma.start,
+                    end: vma.end,
+                });
+            }
+        }
+
+        self.vmas.insert(idx, vma);
+
+        self.try_merge_adjacent(idx);
+        if idx > 0 {
+            self.try_merge_adjacent(idx - 1);
+        }
+
+        Ok(())
+    }
+
+    /// Insert a VMA, unmapping any overlapping ranges and coalescing.
+    /// Operates in O(log n + affected) time.
+    pub fn insert_replacing(&mut self, vma: SemanticVma) {
+        if !Self::check_range(vma.start, vma.end) {
+            return;
+        }
+        self.remove_range(vma.start, vma.end);
+        let idx = self.vmas.partition_point(|v| {
+            #[cfg(test)]
+            Self::record_visit();
+            v.start < vma.start
+        });
+        self.vmas.insert(idx, vma);
+        self.try_merge_adjacent(idx);
+        if idx > 0 {
+            self.try_merge_adjacent(idx - 1);
+        }
+    }
+
+    /// Insert multiple non-overlapping VMAs.
+    pub fn insert_many<I>(&mut self, vmas: I) -> Result<(), VmaOverlapError>
+    where
+        I: IntoIterator<Item = SemanticVma>,
+    {
+        for vma in vmas {
+            self.insert(vma)?;
+        }
+        Ok(())
+    }
+
+    /// Insert multiple VMAs, unmapping overlapping ranges and coalescing.
+    pub fn insert_many_replacing<I>(&mut self, vmas: I)
+    where
+        I: IntoIterator<Item = SemanticVma>,
+    {
+        for vma in vmas {
+            self.insert_replacing(vma);
+        }
+    }
+
+    /// Find the VMA containing `addr`.
+    pub fn find(&self, addr: u64) -> Option<&SemanticVma> {
+        let idx = self.vmas.partition_point(|v| {
+            #[cfg(test)]
+            Self::record_visit();
+            v.end <= addr
+        });
+        if let Some(v) = self.vmas.get(idx) {
+            #[cfg(test)]
+            Self::record_visit();
+            if v.start <= addr && addr < v.end {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Query VMAs overlapping `[start, end)`.
+    pub fn overlapping(&self, start: u64, end: u64) -> impl Iterator<Item = &SemanticVma> {
+        let valid = start < end;
+        let (first, last) = if valid {
+            let first = self.vmas.partition_point(|v| {
+                #[cfg(test)]
+                Self::record_visit();
+                v.end <= start
+            });
+            let last = self.vmas.partition_point(|v| {
+                #[cfg(test)]
+                Self::record_visit();
+                v.start < end
+            });
+            (first, last)
+        } else {
+            (0, 0)
+        };
+        let slice = if first < last {
+            &self.vmas[first..last]
+        } else {
+            &[]
+        };
+        slice.iter()
+    }
+
+    /// Transform for child address space on fork (dropping MADV_DONTFORK VMAs).
+    pub fn fork_wipe(&self) -> Self {
+        let mut child = self.clone();
+        child.apply_fork_wipe();
+        child
+    }
+
+    pub fn apply_fork_wipe(&mut self) {
+        self.vmas
+            .retain(|vma| vma.fork_policy.copy != carrick_abi::VmaForkCopyPolicy::Omit);
+    }
+
+    /// Update protection flags for `[start, end)`.
+    pub fn update_prot(&mut self, start: u64, end: u64, read: bool, write: bool, execute: bool) {
+        self.modify_range(start, end, |attrs| {
+            attrs.read = read;
+            attrs.write = write;
+            attrs.execute = execute;
+        });
+    }
+
+    /// Update fork/dump policies for `[start, end)`.
+    pub fn update_policy(
+        &mut self,
+        start: u64,
+        end: u64,
+        copy_update: Option<carrick_abi::VmaForkCopyPolicy>,
+        child_update: Option<carrick_abi::VmaForkChildPolicy>,
+        dump_update: Option<carrick_abi::VmaDumpPolicy>,
+    ) {
+        self.modify_range(start, end, |attrs| {
+            if let Some(c) = copy_update {
+                attrs.fork_policy.copy = c;
+            }
+            if let Some(ch) = child_update {
+                attrs.fork_policy.child_contents = ch;
+            }
+            if let Some(d) = dump_update {
+                attrs.dump_policy = d;
+            }
+        });
+    }
+
+    /// Grow or trim the program break heap pages.
+    pub fn update_heap_pages(&mut self, old_page_end: u64, new_page_end: u64) {
+        if new_page_end < old_page_end {
+            self.remove_range(new_page_end, old_page_end);
+        } else if new_page_end > old_page_end {
+            let grown = SemanticVma {
+                start: old_page_end,
+                end: new_page_end,
+                read: true,
+                write: true,
+                execute: false,
+                provenance: VmaBackingProvenance::PrivateAnonymous,
+                fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+                dump_policy: carrick_abi::VmaDumpPolicy::Include,
+                droppable: false,
+                path: "[heap]".to_owned(),
+                file_page_offset: None,
+            };
+            let _ = self.insert(grown);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn push(&mut self, vma: SemanticVma) {
+        self.vmas.push(vma);
+    }
+
+    #[cfg(test)]
+    pub fn push_unaligned_for_test(&mut self, vma: SemanticVma) {
+        self.vmas.push(vma);
+    }
+}
+
+impl std::ops::Deref for VmaMap {
+    type Target = [SemanticVma];
+
+    fn deref(&self) -> &Self::Target {
+        &self.vmas
+    }
+}
+
+impl<'a> IntoIterator for &'a VmaMap {
+    type Item = &'a SemanticVma;
+    type IntoIter = std::slice::Iter<'a, SemanticVma>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.vmas.iter()
+    }
+}
+
+impl IntoIterator for VmaMap {
+    type Item = SemanticVma;
+    type IntoIter = std::vec::IntoIter<SemanticVma>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.vmas.into_iter()
+    }
+}
+
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
 #[derive(Clone)]
 pub(crate) struct MemState {
     pub(super) deferred_anonymous: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
     pub layout: MemoryLayout,
     /// Canonical semantic VMAs owned by this address space.
-    pub semantic_vmas: Vec<SemanticVma>,
+    pub semantic_vmas: VmaMap,
     /// Current program break (`brk`/`sbrk`).
     pub brk_current: u64,
     /// Bump cursor for the anonymous mmap arena.
@@ -603,7 +1191,7 @@ impl MemState {
     pub(super) fn new_with_layout(layout: MemoryLayout) -> Self {
         Self {
             layout,
-            semantic_vmas: Vec::new(),
+            semantic_vmas: VmaMap::new(),
             brk_current: layout.heap_base,
             mmap_next: layout.mmap_base,
             mmap_writable_high: layout.mmap_base,
@@ -644,6 +1232,11 @@ impl MemState {
         *self = Self::new_with_layout(layout);
         self.address_space_regions = address_space_regions;
         self.linux_auxv_image = linux_auxv_image;
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn semantic_vmas(&self) -> &[SemanticVma] {
+        self.semantic_vmas.as_slice()
     }
 }
 
@@ -1375,40 +1968,21 @@ pub(super) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
     maps
 }
 
-fn trim_semantic_vmas(vmas: &mut Vec<SemanticVma>, start: u64, len: u64) {
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) fn trim_semantic_vmas(vmas: &mut Vec<SemanticVma>, start: u64, len: u64) {
     let Some(end) = start.checked_add(len) else {
         vmas.clear();
         return;
     };
-    let mut next = Vec::with_capacity(vmas.len());
-    for vma in vmas.drain(..) {
-        if !ranges_overlap(start, len, vma.start, vma.end) {
-            next.push(vma);
-            continue;
-        }
-        if vma.start < start {
-            let mut left = vma.clone();
-            left.end = start;
-            next.push(left);
-        }
-        if end < vma.end {
-            let offset_delta = if vma.file_page_offset.is_some() {
-                Some((end - vma.start) >> 12)
-            } else {
-                None
-            };
-            let mut right = vma;
-            right.start = end;
-            if let (Some(base_off), Some(delta)) = (right.file_page_offset, offset_delta) {
-                right.file_page_offset = Some(base_off + delta);
-            }
-            next.push(right);
-        }
-    }
-    *vmas = next;
+    let mut map = VmaMap::from_vec(std::mem::take(vmas));
+    map.remove_range(start, end);
+    *vmas = map.into_vec();
 }
 
-fn update_semantic_vma_prot(
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) fn update_semantic_vma_prot(
     vmas: &mut Vec<SemanticVma>,
     start: u64,
     len: u64,
@@ -1419,54 +1993,13 @@ fn update_semantic_vma_prot(
     let Some(end) = start.checked_add(len) else {
         return;
     };
-    let mut next = Vec::with_capacity(vmas.len() + 2);
-    for vma in vmas.drain(..) {
-        if !ranges_overlap(start, len, vma.start, vma.end) {
-            next.push(vma);
-            continue;
-        }
-        if vma.start < start {
-            let mut left = vma.clone();
-            left.end = start;
-            next.push(left);
-        }
-        let mid_start = vma.start.max(start);
-        let mid_end = vma.end.min(end);
-        let mid_offset = if let Some(base_off) = vma.file_page_offset {
-            Some(base_off + ((mid_start - vma.start) >> 12))
-        } else {
-            None
-        };
-        next.push(SemanticVma {
-            start: mid_start,
-            end: mid_end,
-            read,
-            write,
-            execute,
-            provenance: vma.provenance,
-            fork_policy: vma.fork_policy,
-            dump_policy: vma.dump_policy,
-            droppable: vma.droppable,
-            path: vma.path.clone(),
-            file_page_offset: mid_offset,
-        });
-        if end < vma.end {
-            let right_offset = if let Some(base_off) = vma.file_page_offset {
-                Some(base_off + ((end - vma.start) >> 12))
-            } else {
-                None
-            };
-            let mut right = vma;
-            right.start = end;
-            right.file_page_offset = right_offset;
-            next.push(right);
-        }
-    }
-    coalesce_semantic_vmas(&mut next);
-    *vmas = next;
+    let mut map = VmaMap::from_vec(std::mem::take(vmas));
+    map.update_prot(start, end, read, write, execute);
+    *vmas = map.into_vec();
 }
 
-fn update_semantic_vma_policy(
+#[cfg(test)]
+pub(super) fn update_semantic_vma_policy(
     vmas: &mut Vec<SemanticVma>,
     start: u64,
     len: u64,
@@ -1477,124 +2010,21 @@ fn update_semantic_vma_policy(
     let Some(end) = start.checked_add(len) else {
         return;
     };
-    let mut next = Vec::with_capacity(vmas.len() + 2);
-    for vma in vmas.drain(..) {
-        if !ranges_overlap(start, len, vma.start, vma.end) {
-            next.push(vma);
-            continue;
-        }
-        if vma.start < start {
-            let mut left = vma.clone();
-            left.end = start;
-            next.push(left);
-        }
-        let mid_start = vma.start.max(start);
-        let mid_end = vma.end.min(end);
-        let mid_offset = if let Some(base_off) = vma.file_page_offset {
-            Some(base_off + ((mid_start - vma.start) >> 12))
-        } else {
-            None
-        };
-        let mut fork_policy = vma.fork_policy;
-        if let Some(c) = copy_update {
-            fork_policy.copy = c;
-        }
-        if let Some(ch) = child_update {
-            fork_policy.child_contents = ch;
-        }
-        let dump_policy = dump_update.unwrap_or(vma.dump_policy);
-        next.push(SemanticVma {
-            start: mid_start,
-            end: mid_end,
-            read: vma.read,
-            write: vma.write,
-            execute: vma.execute,
-            provenance: vma.provenance,
-            fork_policy,
-            dump_policy,
-            droppable: vma.droppable,
-            path: vma.path.clone(),
-            file_page_offset: mid_offset,
-        });
-        if end < vma.end {
-            let right_offset = if let Some(base_off) = vma.file_page_offset {
-                Some(base_off + ((end - vma.start) >> 12))
-            } else {
-                None
-            };
-            let mut right = vma;
-            right.start = end;
-            right.file_page_offset = right_offset;
-            next.push(right);
-        }
-    }
-    coalesce_semantic_vmas(&mut next);
-    *vmas = next;
+    let mut map = VmaMap::from_vec(std::mem::take(vmas));
+    map.update_policy(start, end, copy_update, child_update, dump_update);
+    *vmas = map.into_vec();
 }
 
-fn coalesce_semantic_vmas(vmas: &mut Vec<SemanticVma>) {
-    vmas.sort_by_key(|vma| (vma.start, vma.end));
-    let mut coalesced: Vec<SemanticVma> = Vec::with_capacity(vmas.len());
-    for vma in vmas.drain(..) {
-        if let Some(last) = coalesced.last_mut() {
-            let offset_contiguous = match (last.file_page_offset, vma.file_page_offset) {
-                (None, None) => true,
-                (Some(o1), Some(o2)) => o1 + ((last.end - last.start) >> 12) == o2,
-                _ => false,
-            };
-            if last.end == vma.start
-                && last.read == vma.read
-                && last.write == vma.write
-                && last.execute == vma.execute
-                && last.provenance == vma.provenance
-                && last.fork_policy == vma.fork_policy
-                && last.dump_policy == vma.dump_policy
-                && last.droppable == vma.droppable
-                && last.path == vma.path
-                && offset_contiguous
-            {
-                last.end = vma.end;
-                continue;
-            }
-        }
-        coalesced.push(vma);
-    }
-    *vmas = coalesced;
+#[cfg(test)]
+pub(super) fn coalesce_semantic_vmas(vmas: &mut Vec<SemanticVma>) {
+    let mut map = VmaMap::from_vec(std::mem::take(vmas));
+    map.coalesce();
+    *vmas = map.into_vec();
 }
 
 pub(super) fn update_semantic_heap_pages(mem: &mut MemState, old_page_end: u64, new_page_end: u64) {
-    if new_page_end < old_page_end {
-        trim_semantic_vmas(
-            &mut mem.semantic_vmas,
-            new_page_end,
-            old_page_end - new_page_end,
-        );
-    } else if new_page_end > old_page_end {
-        // Linux's do_brk_flags(..., EMPTY_VMA_FLAGS) gives newly allocated
-        // data pages default heap semantics. A modified tail VMA may merge
-        // only when those semantics already match; it must not lend its
-        // mprotect or MADV_* flags to pages that did not exist yet.
-        let grown = SemanticVma {
-            start: old_page_end,
-            end: new_page_end,
-            read: true,
-            write: true,
-            execute: false,
-            provenance: VmaBackingProvenance::PrivateAnonymous,
-            fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
-            dump_policy: carrick_abi::VmaDumpPolicy::Include,
-            droppable: false,
-            path: "[heap]".to_owned(),
-            file_page_offset: None,
-        };
-        trim_semantic_vmas(
-            &mut mem.semantic_vmas,
-            old_page_end,
-            new_page_end - old_page_end,
-        );
-        mem.semantic_vmas.push(grown);
-    }
-    coalesce_semantic_vmas(&mut mem.semantic_vmas);
+    mem.semantic_vmas
+        .update_heap_pages(old_page_end, new_page_end);
 }
 
 pub(super) fn semantic_vmas_from_boot_regions(
@@ -1602,7 +2032,7 @@ pub(super) fn semantic_vmas_from_boot_regions(
     file_mappings: &[crate::core_dump::FileMapping],
     layout: MemoryLayout,
     brk_current: u64,
-) -> Vec<SemanticVma> {
+) -> VmaMap {
     let mut semantic_vmas = Vec::with_capacity(regions.len());
     for region in regions {
         if boot_region_is_carrick_kernel_hole(region) {
@@ -1671,8 +2101,7 @@ pub(super) fn semantic_vmas_from_boot_regions(
             file_page_offset,
         });
     }
-    coalesce_semantic_vmas(&mut semantic_vmas);
-    semantic_vmas
+    VmaMap::from_vec(semantic_vmas)
 }
 
 fn boot_region_source_intersects_hidden_backing(
@@ -2136,7 +2565,9 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     if len != 0 {
         let _ = mem.deferred_anonymous.retire(GuestVa(start), len as usize);
     }
-    trim_semantic_vmas(&mut mem.semantic_vmas, start, len);
+    if let Some(end) = start.checked_add(len) {
+        mem.semantic_vmas.remove_range(start, end);
+    }
     trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
     trim_core_file_mappings_for_range(&mut mem.core_file_mappings, start, len);
     trim_live_boot_regions_for_range(mem, start, len);
@@ -2495,13 +2926,12 @@ impl SyscallDispatcher {
                 mem.layout,
                 mem.brk_current,
             );
-            for vma in &mut semantic {
+            for vma in semantic.iter_mut() {
                 vma.droppable = commit.droppable;
             }
-            semantic
+            semantic.into_vec()
         };
-        mem.semantic_vmas.extend(semantic);
-        coalesce_semantic_vmas(&mut mem.semantic_vmas);
+        mem.semantic_vmas.insert_many_replacing(semantic);
         let idx = mem
             .dynamic_maps
             .partition_point(|map| map.start < commit.start);
@@ -2585,13 +3015,6 @@ impl SyscallDispatcher {
     fn madvise_range_meta(&self, start: u64, end: u64) -> MadviseRangeMeta {
         let mem_authority_2 = self.mem();
         let mem = mem_authority_2.lock();
-        let mut intervals: Vec<&SemanticVma> = mem
-            .semantic_vmas
-            .iter()
-            .filter(|vma| vma.start < end && vma.end > start)
-            .collect();
-        intervals.sort_by_key(|vma| vma.start);
-
         let mut covered_to = start;
         let mut covered: Vec<MadviseCoveredSegment> = Vec::new();
         let mut fully_mapped = true;
@@ -2601,7 +3024,7 @@ impl SyscallDispatcher {
         let mut any_special = false;
         let mut any_droppable = false;
 
-        for vma in intervals {
+        for vma in mem.semantic_vmas.overlapping(start, end) {
             if vma.start > covered_to {
                 // Gap before this interval → unmapped hole. Keep walking:
                 // the VMAs past the hole still decide the per-VMA verdict.
@@ -2676,16 +3099,13 @@ impl SyscallDispatcher {
         child_update: Option<carrick_abi::VmaForkChildPolicy>,
         dump_update: Option<carrick_abi::VmaDumpPolicy>,
     ) {
+        let Some(end) = start.checked_add(len) else {
+            return;
+        };
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
-        update_semantic_vma_policy(
-            &mut mem.semantic_vmas,
-            start,
-            len,
-            copy_update,
-            child_update,
-            dump_update,
-        );
+        mem.semantic_vmas
+            .update_policy(start, end, copy_update, child_update, dump_update);
     }
 
     /// Whether `[start, start + len)` is fully covered by VMAs whose contents
@@ -2697,8 +3117,7 @@ impl SyscallDispatcher {
         self.mem()
             .lock()
             .semantic_vmas
-            .iter()
-            .filter(|vma| vma.start < end && start < vma.end)
+            .overlapping(start, end)
             .all(|vma| vma.dump_policy == carrick_abi::VmaDumpPolicy::Omit)
     }
 
@@ -2997,21 +3416,22 @@ impl SyscallDispatcher {
             sharing,
             path,
         };
-        let semantic = semantic_vmas.unwrap_or_else(|| {
+        let semantic = semantic_vmas.map(VmaMap::from_vec).unwrap_or_else(|| {
             let mut semantic = semantic_vmas_from_boot_regions(
                 std::slice::from_ref(&entry),
                 &mem.core_file_mappings,
                 mem.layout,
                 mem.brk_current,
             );
-            for vma in &mut semantic {
+            for vma in semantic.iter_mut() {
                 vma.droppable = droppable;
             }
             semantic
         });
-        trim_semantic_vmas(&mut mem.semantic_vmas, start, len);
-        mem.semantic_vmas.extend(semantic);
-        coalesce_semantic_vmas(&mut mem.semantic_vmas);
+        if let Some(end) = start.checked_add(len) {
+            mem.semantic_vmas.remove_range(start, end);
+        }
+        mem.semantic_vmas.insert_many_replacing(semantic);
 
         if !dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len) {
             let idx = mem.dynamic_maps.partition_point(|map| map.start < start);
@@ -3283,11 +3703,13 @@ impl SyscallDispatcher {
     fn update_dynamic_mapping_prot(&self, start: u64, len: u64, prot: LinuxProtFlags) {
         let mem_authority_8 = self.mem();
         let mut mem = mem_authority_8.lock();
+        let Some(end) = start.checked_add(len) else {
+            return;
+        };
         update_proc_map_prot(&mut mem.dynamic_maps, start, len, prot);
-        update_semantic_vma_prot(
-            &mut mem.semantic_vmas,
+        mem.semantic_vmas.update_prot(
             start,
-            len,
+            end,
             prot.contains(LinuxProtFlags::READ),
             prot.contains(LinuxProtFlags::WRITE),
             prot.contains(LinuxProtFlags::EXEC),
