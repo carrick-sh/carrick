@@ -2059,3 +2059,36 @@ three `go_types` runs on the landed binary ended in a Go runtime
 corruption), seen on neither the 4 KiB-window hatch nor the ledger
 binary in the same window; a larger sample is running before the window
 default is decided.
+
+## 2026-09-07: the exec-generation abort, captured
+
+With the observer's failure sources named (`e0899dde9`) and the registry's
+view logged at the abort (`19235a09a`), `go-go_types` under eight
+default-QoS CPU hogs reproduced it on the first run:
+
+    scheduler generation observer lost exact transition
+      thread=ThreadKey { tid: LinuxTid(1864), serial: ThreadSerial(225511) }
+      predecessor=ExecutionGeneration(84) successor=ExecutionGeneration(85)
+      kind=Runnable
+      error=run queue publication authority does not match the submitted generation
+      kernel_view=thread absent from registry; same-tid threads=[]
+
+The transition is a WAKE (`Runnable`, 84 → 85) for a thread the Kernel
+registry no longer holds: the wake was published after the thread's
+terminal transition and its registry record had been reaped, while a
+`Thread` handle still drove the transition. `rollover_exact` then fails
+its liveness check (`with_live_active_scheduler_thread` finds no thread)
+and the carrier aborts. Linux semantics: waking an already-exited task is
+a no-op; carrick must either make the terminal transition revoke every
+pending wake for that generation, or make a wake for a thread whose
+registry record is gone a rejected, non-fatal publication. The load
+coupling is only the window: a preempted executor between "thread exits
+and is reaped" and "its last wake is published". Reproducer options, in
+order of exactness: the adversarial scheduling policy (design phase 2,
+in flight), then `SyscallJitter` (`crates/carrick-embed/tests/scheduler_race.rs`),
+then `target/conformance/eco-load/gotypes-capture3.sh` (eight hogs).
+Three sibling fault+fork guests did NOT reproduce it (6 of 6 pass), so
+the coupling is host CPU starvation, not guest traffic. Note also that
+`with_live_active_scheduler_thread` scans every task in the carrier on
+every generation transition — an O(live tasks) cost on the wake/park
+path that the per-CPU scheduler must not inherit.
