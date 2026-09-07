@@ -166,17 +166,17 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "threadspawn",
     "timeclock",
     "timeschildren",
-    "tmpfilewrite",
-    "udpconnectunspec",
-    "uffdpolicy",
-    "usernsisolation",
-    "vdsogtod",
-    "vforkpid",
-    "vmsplicepipe",
-    "waitidsiuid",
-    "waitrestart",
-    "xprocsigign",
-    "zerolenio",
+    "tmpfileatime",
+    "ttyencoding",
+    "udpreuseaddr",
+    "unlinkatbindmount",
+    "usernswrite",
+    "vforkexecthread",
+    "vfs_mount_rw",
+    "waitidcputime",
+    "waitpgid",
+    "writevpartial",
+    "xthreadsig",
 ];
 
 /// Exact materialized Shard 1 probe list: index % 3 == 1 over generic conformance probes.
@@ -327,17 +327,18 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "threadcommname",
     "threadstatstate",
     "timeextra",
-    "tlsswitch",
-    "traceexecstop",
-    "udplitesock",
-    "unicodenorm",
-    "usernsmap",
-    "vdsosymbols",
-    "vforkvmshare",
-    "waitexitstorm",
-    "waitidspec",
-    "waitsiblingsigchld",
-    "xsignal",
+    "tlbibroadcast",
+    "tmpfilewrite",
+    "udpconnectunspec",
+    "uffdpolicy",
+    "usernsisolation",
+    "vdsogtod",
+    "vforkpid",
+    "vmsplicepipe",
+    "waitidsiuid",
+    "waitrestart",
+    "xprocsigign",
+    "zerolenio",
 ];
 
 /// Exact materialized list of generic conformance probes for shard 2 (index % 3 == 2).
@@ -489,17 +490,17 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "threadrecycle",
     "threadstatuscount",
     "timersettimeabs",
-    "tmpfileatime",
-    "ttyencoding",
-    "udpreuseaddr",
-    "unlinkatbindmount",
-    "usernswrite",
-    "vforkexecthread",
-    "vfs_mount_rw",
-    "waitidcputime",
-    "waitpgid",
-    "writevpartial",
-    "xthreadsig",
+    "tlsswitch",
+    "traceexecstop",
+    "udplitesock",
+    "unicodenorm",
+    "usernsmap",
+    "vdsosymbols",
+    "vforkvmshare",
+    "waitexitstorm",
+    "waitidspec",
+    "waitsiblingsigchld",
+    "xsignal",
 ];
 
 /// Per-probe additions to the generic container launch request.
@@ -629,6 +630,7 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "timeclock",
     "timeextra",
     "timersettimeabs",
+    "tlbibroadcast",
     "waitexitstorm",
     "waitsiblingsigchld",
 ];
@@ -724,7 +726,7 @@ fn special_policy_names_are_unique_in_the_generic_shard_union() {
         SHARD_0_PROBES.len() + SHARD_1_PROBES.len() + SHARD_2_PROBES.len(),
         "generic shard arrays must form a unique union"
     );
-    assert_eq!(union.len(), 472, "generic shard union must remain complete");
+    assert_eq!(union.len(), 473, "generic shard union must remain complete");
 
     for (special, _) in SPECIAL_PROBE_LAUNCH_POLICIES {
         let occurrences = shards
