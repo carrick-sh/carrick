@@ -388,8 +388,8 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
             let target_tid = armed.target_tid;
             let target_cpu = target.clone();
             let cpu_now: Option<std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>> =
-                if slot.clock_id == 2 {
-                    // CLOCK_PROCESS_CPUTIME_ID
+                if carrick_timer_core::posix::is_process_cpu_clock(slot.clock_id) {
+                    // CLOCK_PROCESS_CPUTIME_ID or dynamic per-process clock
                     Some(std::sync::Arc::new(move || {
                         let task = target_cpu.task()?;
                         Some(
@@ -397,8 +397,8 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
                                 .saturating_add(task.self_system_cpu_us().saturating_mul(1000)),
                         )
                     }))
-                } else if slot.clock_id == 3 {
-                    // CLOCK_THREAD_CPUTIME_ID
+                } else if carrick_timer_core::posix::is_thread_cpu_clock(slot.clock_id) {
+                    // CLOCK_THREAD_CPUTIME_ID or dynamic per-thread clock
                     Some(std::sync::Arc::new(move || {
                         let task = target_cpu.task()?;
                         if let Some(tid) = target_tid {

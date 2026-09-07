@@ -9951,14 +9951,14 @@ fn linux_min_fd(value: u64) -> Result<i32, LinuxErrno> {
 /// (viewed as a signed 32-bit int) and encode a tid/pid; glibc/musl return them
 /// from `clock_getcpuclockid`/`pthread_getcpuclockid`. CPython's
 /// test_pthread_getcpuclockid does clock_gettime() on one — carrick rejected it.
-enum DynamicCpuClock {
+pub(crate) enum DynamicCpuClock {
     /// Per-thread CPU clock → target thread kernel CPU accounting.
     PerThread,
     /// Per-process CPU clock → target task kernel CPU accounting.
     PerProcess,
 }
 
-fn dynamic_cpu_clock(clock_id: u64) -> Option<DynamicCpuClock> {
+pub(crate) fn dynamic_cpu_clock(clock_id: u64) -> Option<DynamicCpuClock> {
     // clockid_t is a 32-bit `int`; the guest may zero- OR sign-extend it into
     // x0 (the vDSO __kernel_clock_gettime fast-path loads only w0, so a dynamic
     // id arrives as a LARGE positive u64, not sign-extended). Interpret as i32:

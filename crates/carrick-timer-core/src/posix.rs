@@ -210,10 +210,22 @@ pub fn seed_overrun(id: i32, count: u32) {
 }
 
 /// Linux CPU-time clocks whose POSIX timers must fire off AGGREGATE GUEST CPU
-/// time, not wall-clock: `CLOCK_PROCESS_CPUTIME_ID` (2) / `CLOCK_THREAD_CPUTIME_ID`
-/// (3).
-fn is_cpu_clock(clock_id: i32) -> bool {
-    clock_id == 2 || clock_id == 3
+/// time, not wall-clock: `CLOCK_PROCESS_CPUTIME_ID` (2), `CLOCK_THREAD_CPUTIME_ID`
+/// (3), or Linux dynamic CPU clock IDs (negative).
+pub fn is_cpu_clock(clock_id: i32) -> bool {
+    clock_id < 0 || clock_id == 2 || clock_id == 3
+}
+
+/// Linux per-thread CPU-time clock: `CLOCK_THREAD_CPUTIME_ID` (3) or dynamic
+/// per-thread CPU clock IDs (negative with `CPUCLOCK_PERTHREAD_MASK` bit 2 set).
+pub fn is_thread_cpu_clock(clock_id: i32) -> bool {
+    clock_id == 3 || (clock_id < 0 && (clock_id & 4) != 0)
+}
+
+/// Linux per-process CPU-time clock: `CLOCK_PROCESS_CPUTIME_ID` (2) or dynamic
+/// per-process CPU clock IDs (negative with `CPUCLOCK_PERTHREAD_MASK` bit 2 clear).
+pub fn is_process_cpu_clock(clock_id: i32) -> bool {
+    clock_id == 2 || (clock_id < 0 && (clock_id & 4) == 0)
 }
 
 /// Drive a POSIX per-process timer's expiries on a backend firing thread. SHARED
@@ -299,7 +311,7 @@ fn run_fallback_cpu(
         };
         if now < due {
             let remaining = CpuNs(due - now);
-            let delay = if clock == 3 {
+            let delay = if is_thread_cpu_clock(clock) {
                 WallNs(remaining.raw().clamp(1, 1_000_000))
             } else {
                 crate::itimer::cpu_timer_recheck_delay_ns(remaining)
