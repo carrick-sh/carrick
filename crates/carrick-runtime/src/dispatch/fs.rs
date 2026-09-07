@@ -1633,9 +1633,13 @@ impl SyscallDispatcher {
     }
 
     fn tty_ioctl_fd_kind(&self, fd: i32) -> Result<TtyFdKind, LinuxErrno> {
-        if is_stdio_fd(fd) && !self.stdio_is_closed(fd) {
+        if is_stdio_fd(fd)
+            && !self.stdio_is_closed(fd)
+            && !self.fd_table_contains(fd)
+            && crate::host_tty::host_isatty(fd)
+        {
             Ok(TtyFdKind::Stdio)
-        } else if self.fd_table_contains(fd) {
+        } else if self.fd_is_valid(fd) {
             Ok(TtyFdKind::Other)
         } else {
             Err(LINUX_EBADF)
@@ -1656,13 +1660,36 @@ impl SyscallDispatcher {
             })
     }
 
-    fn fd_is_controlling_tty(&self, fd: i32) -> bool {
-        let controlling = self.pty_table().lock().controlling();
-        match self.pty_info(fd) {
-            Some((role, _)) => controlling == Some(role.index),
-            None => {
-                controlling.is_some() && matches!(self.tty_ioctl_fd_kind(fd), Ok(TtyFdKind::Stdio))
+    fn fd_is_controlling_tty(&self, cx_kernel: &crate::kernel::KernelContext, fd: i32) -> bool {
+        let session = cx_kernel.task().session();
+        let controlling_index = self.pty_table().lock().controlling();
+        if let Some((role, _)) = self.pty_info(fd) {
+            if role.is_master {
+                return false;
             }
+            if crate::kernel::tty::session(crate::kernel::tty::TtyKey::Pty(role.index))
+                == Some(session)
+            {
+                return true;
+            }
+            if controlling_index == Some(role.index)
+                && (crate::kernel::tty::session(crate::kernel::tty::TtyKey::Launch)
+                    == Some(session)
+                    || cx_kernel.kernel().tty_session(cx_kernel) == Ok(session))
+            {
+                return true;
+            }
+            false
+        } else if is_stdio_fd(fd)
+            && !self.stdio_is_closed(fd)
+            && !self.fd_table_contains(fd)
+            && crate::host_tty::host_isatty(fd)
+            && controlling_index.is_some()
+        {
+            crate::kernel::tty::session(crate::kernel::tty::TtyKey::Launch) == Some(session)
+                || cx_kernel.kernel().tty_session(cx_kernel) == Ok(session)
+        } else {
+            false
         }
     }
 
@@ -9028,15 +9055,24 @@ impl SyscallDispatcher {
                     | LINUX_TCSETSW2
                     | LINUX_TCSETSF2
                     | LINUX_TIOCSPGRP
-                    | LINUX_TIOCSCTTY
-                    | LINUX_TIOCNOTTY
                     | LINUX_TIOCSWINSZ
             );
             if changes_tty_state
+                && this.fd_is_controlling_tty(cx.kernel, fd.0)
                 && cx.kernel.kernel().tty_caller_is_background(cx.kernel)
                 && !block_ttou
             {
-                this.mark_process_signal_pending(cx.kernel, LINUX_SIGTTOU);
+                let orphaned = cx.kernel.kernel().caller_process_group_is_orphaned(cx.kernel);
+                if orphaned {
+                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+                }
+                if let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(LINUX_SIGTTOU) {
+                    cx.kernel.kernel().post_signal_to_process_group(
+                        cx.kernel.container().id(),
+                        cx.kernel.task().process_group(),
+                        signal,
+                    );
+                }
                 return Ok(DispatchOutcome::errno(LINUX_EINTR));
             }
 
@@ -9183,6 +9219,9 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_TIOCGPGRP => {
+                        if role.is_master {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
+                        }
                         let session = cx.kernel.task().session();
                         let group_res = crate::kernel::tty::foreground_process_group(
                             crate::kernel::tty::TtyKey::Pty(role.index),
@@ -9209,6 +9248,9 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_TIOCSPGRP => {
+                        if role.is_master {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTTY));
+                        }
                         let mut buf = [0u8; 4];
                         match cx.memory.read_bytes(arg, 4) {
                             Ok(b) => buf.copy_from_slice(&b),
@@ -11151,15 +11193,24 @@ impl SyscallDispatcher {
             if this.fd_is_secretmem(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if this.fd_is_controlling_tty(fd.0) {
+            if this.fd_is_controlling_tty(cx.kernel, fd.0)
+                && cx.kernel.kernel().tty_caller_is_background(cx.kernel)
+            {
                 let tid = Self::ctx_tid(cx);
-                if cx.kernel.kernel().tty_caller_is_background(cx.kernel)
-                    && !this.signal_is_ignored(cx.kernel, crate::linux_abi::LINUX_SIGTTIN)
-                    && !this.signal_blocked(cx.kernel, tid, crate::linux_abi::LINUX_SIGTTIN)
-                {
-                    this.mark_process_signal_pending(cx.kernel, crate::linux_abi::LINUX_SIGTTIN);
-                    return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                let orphaned = cx.kernel.kernel().caller_process_group_is_orphaned(cx.kernel);
+                let ign_ttin = this.signal_is_ignored(cx.kernel, crate::linux_abi::LINUX_SIGTTIN);
+                let blk_ttin = this.signal_blocked(cx.kernel, tid, crate::linux_abi::LINUX_SIGTTIN);
+                if orphaned || ign_ttin || blk_ttin {
+                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
                 }
+                if let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGTTIN) {
+                    cx.kernel.kernel().post_signal_to_process_group(
+                        cx.kernel.container().id(),
+                        cx.kernel.task().process_group(),
+                        signal,
+                    );
+                }
+                return Ok(DispatchOutcome::errno(LINUX_EINTR));
             }
             let address = buf.0;
             let length =
@@ -14260,18 +14311,39 @@ impl SyscallDispatcher {
             if this.fd_is_secretmem(fd) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if this.fd_is_controlling_tty(fd) {
-                let tid = Self::ctx_tid(cx);
-                let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-                let tostop = unsafe { libc::tcgetattr(fd, &mut termios) } == 0
-                    && termios.c_lflag & libc::TOSTOP != 0;
-                if tostop
-                    && cx.kernel.kernel().tty_caller_is_background(cx.kernel)
-                    && !this.signal_is_ignored(cx.kernel, crate::linux_abi::LINUX_SIGTTOU)
-                    && !this.signal_blocked(cx.kernel, tid, crate::linux_abi::LINUX_SIGTTOU)
-                {
-                    this.mark_process_signal_pending(cx.kernel, crate::linux_abi::LINUX_SIGTTOU);
-                    return Ok(DispatchOutcome::errno(LINUX_EINTR));
+            if this.fd_is_controlling_tty(cx.kernel, fd)
+                && cx.kernel.kernel().tty_caller_is_background(cx.kernel)
+            {
+                let host_fd_opt = match this.pty_info(fd) {
+                    Some((_, host_fd)) => Some(host_fd),
+                    None if is_stdio_fd(fd) && !this.stdio_is_closed(fd) => Some(fd),
+                    _ => None,
+                };
+                let tostop = if let Some(hfd) = host_fd_opt {
+                    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+                    let rc = unsafe { libc::tcgetattr(hfd, &mut termios) };
+                    rc == 0 && (termios.c_lflag & libc::TOSTOP) != 0
+                } else {
+                    false
+                };
+                if tostop {
+                    let tid = Self::ctx_tid(cx);
+                    let ign_ttou = this.signal_is_ignored(cx.kernel, crate::linux_abi::LINUX_SIGTTOU);
+                    let blk_ttou = this.signal_blocked(cx.kernel, tid, crate::linux_abi::LINUX_SIGTTOU);
+                    if !ign_ttou && !blk_ttou {
+                        let orphaned = cx.kernel.kernel().caller_process_group_is_orphaned(cx.kernel);
+                        if orphaned {
+                            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+                        }
+                        if let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGTTOU) {
+                            cx.kernel.kernel().post_signal_to_process_group(
+                                cx.kernel.container().id(),
+                                cx.kernel.task().process_group(),
+                                signal,
+                            );
+                        }
+                        return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                    }
                 }
             }
             let address = buf.0;
