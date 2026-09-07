@@ -1737,7 +1737,7 @@
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "Scheduler::observe_generation_transition",
       "ordinal_in_function": 1,
-      "fingerprint": "aa49a1159dd66158d27635b58a3ad7982af18b4c10e7d13437b4bd3e626909bf",
+      "fingerprint": "0b6f9522566c460dffe3c5bb1743421c6dfad33386b5d4ba80f4ea87a7f312e4",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::scheduler_observer",
       "rationale": "Scheduler generation observer failed transition after kernel execution state advanced; stranding successor outside authority directory."
