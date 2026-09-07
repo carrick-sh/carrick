@@ -932,6 +932,9 @@ pub trait FsBackend: Send + Sync {
         false
     }
 
+    /// Notify the backend that a metadata xattr (chmod/chown) was written.
+    fn note_meta_xattr_written(&self) {}
+
     /// Monotonic per-backend structural generation. Bumped on any mutation
     /// that adds, removes, or renames entries in this backend's namespace.
     fn structural_generation(&self) -> u64 {
@@ -4932,6 +4935,28 @@ pub(crate) fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
     fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode);
 }
 
+pub(crate) fn fset_mode(fd: std::os::fd::RawFd, mode: u32) {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc == 0 {
+        let kind = st.st_mode as u32 & libc::S_IFMT as u32;
+        let owner_ok = if kind == libc::S_IFDIR as u32 {
+            mode & 0o700 == 0o700
+        } else {
+            mode & 0o600 == 0o600
+        };
+        if kind != libc::S_IFLNK as u32 {
+            let native_mode = if owner_ok { mode } else { mode | 0o700 };
+            let _ = unsafe { libc::fchmod(fd, native_mode as libc::mode_t) };
+            if owner_ok {
+                fremove_xattr(fd, CARRICK_MODE_XATTR);
+                return;
+            }
+        }
+    }
+    fset_mode_xattr(fd, mode);
+}
+
 /// 8-byte little-endian xattr write/read, mirroring the u32 helpers above. Used
 /// for the device-node `st_rdev` (a 64-bit `dev_t`).
 #[allow(dead_code)]
@@ -5789,6 +5814,10 @@ impl FsBackend for HostFsBackend {
                 RootMarker::Unknown => false,
             };
         meta_absent && !self.dir_has_overlay_interference("/")
+    }
+
+    fn note_meta_xattr_written(&self) {
+        self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
     }
 
     fn dir_has_overlay_interference(&self, _dir: &str) -> bool {
