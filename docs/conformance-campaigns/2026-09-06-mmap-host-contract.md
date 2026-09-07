@@ -700,3 +700,53 @@ with scoped cleanup zero. This closes the observed crash mechanism. Final
 branch acceptance still requires a signed rebuild with the checkpoint's direct
 private-file mapping plus the serial runtime, whole-probe, launch, zero-copy
 and latency receipts.
+
+
+## Final clean-tree acceptance and main landing
+
+The parked mmap branch is accepted and local main was fast-forwarded from the
+main checkout to `3889fde8e`. The accepted source keeps live stage-1 leaf
+tables until a break-before-make publisher exists, pins relocated root tables
+in the sparse resolver, defers pristine anonymous backing, and installs the
+whole-file immutable private view without copying it through
+`write_guest_bytes`.
+
+The exact branch artifact at source `3889fde8e42b6e34308307e53c1c730e24a2fe0f`
+has SHA-256
+`db554ff7d76fb91cb43ec30579d6db69600eaadb3150d234e3524146bef7f37b`,
+CDHash `622afcc4e88ce99e5be61764cd0728e2d25eda8c`, and LC_UUID
+`D62FA356-D238-33E7-9165-1DC5121E4756`; the hypervisor entitlement and
+`__dof_carrick` were present. Ubuntu `sh -c '/bin/true'` and
+python:3.12-slim `print(1)` exited zero. The Python allocator reducer
+`import collections; print(1)` passed five of five runs with fresh IDs and
+zero scoped survivors.
+
+The untraced CNTVCT fixture ran five trials of 1,000 operations at 24 MHz.
+Whole-libpython private-file mmap measured a 6.346125 us median and anonymous
+1 MiB mmap measured 4.302208 us, satisfying the requested 10 us and 6 us
+limits. On the same artifact the 100-map DTrace census recorded count=100,
+errors=0, `write_guest_bytes=0`, and chunks=0. The forced eager positive
+control recorded count=100, errors=0, 661,504,000 bytes and 161,500 chunks.
+Every guest run used a fresh `CARRICK_RUN_ID`, and instrumented elapsed time is
+not used as latency evidence.
+
+Clean-tree acceptance passed `just ci`: the complete serial
+`carrick-runtime` library suite reported 2,473 passed, 2 ignored, 0 failed,
+and all host and integration suites passed. The whole signed probe family
+passed 470 cached generic probes on both musl and GNU (940 executions), all
+three shards and their entitlement negative controls, 24 dedicated cases, the
+CLI boundary contract, 46 retained probes with 1 ignored, and the container
+gate. Clean committed-tree inventory reconciliation was committed before
+`just lint-domains`, which passed.
+
+Receipts remain under the mmap worktree's `target/conformance/`:
+`eco-mmap-ci-final-20260906d.log`,
+`eco-mmap-probes-final-20260906b.log`,
+`eco-mmap-launch-final-20260906a.log`,
+`eco-mmap-python-import-final-20260906a.log`,
+`eco-mmap-counter-final-20260906a.log`, and the matching
+`eco-mmap-copy-{lazy,eager}-final-20260906a.log` files. Rebuilding after the
+fast-forward produced the main artifact SHA-256
+`82c8bb495f791466b6c0fdc2926f97a2d3949e4e67d18d5f2c173b6decc9cb2f`,
+CDHash `99ccd10025275471194e76361374a051888a2807`, and LC_UUID
+`6AD8B868-C8AC-3046-A2B9-F7611B8E6284`, again with entitlement and DOF.
