@@ -38334,6 +38334,30 @@ impl HvfVmState {
             > 1
     }
 
+    pub(crate) const DEFAULT_FAULT_WINDOW_BYTES: u64 = 64 * 1024;
+
+    fn fault_window_bytes() -> u64 {
+        #[cfg(test)]
+        {
+            std::env::var("CARRICK_FAULT_WINDOW_BYTES")
+                .ok()
+                .and_then(|val| val.parse::<u64>().ok())
+                .filter(|&w| w >= 4096 && w.is_power_of_two())
+                .unwrap_or(Self::DEFAULT_FAULT_WINDOW_BYTES)
+        }
+        #[cfg(not(test))]
+        {
+            static WINDOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *WINDOW.get_or_init(|| {
+                std::env::var("CARRICK_FAULT_WINDOW_BYTES")
+                    .ok()
+                    .and_then(|val| val.parse::<u64>().ok())
+                    .filter(|&w| w >= 4096 && w.is_power_of_two())
+                    .unwrap_or(Self::DEFAULT_FAULT_WINDOW_BYTES)
+            })
+        }
+    }
+
     /// Materialize private zero backing for the exact accessible pieces of the
     /// sparse HVPatch mmap arena. One VMA hole becomes one host mapping, one
     /// stage-2 lease, and one inventory frame; there is no shared source frame
@@ -38382,14 +38406,20 @@ impl HvfVmState {
         let mut current = align_down(va, PAGE_SIZE);
         let end = align_up(requested_end, PAGE_SIZE)?;
 
-        // Step 1: Fix pool alignment miss.
-        // A first-touch inside a 16 KiB compound whose other pages are still
-        // holes materializes the WHOLE 16 KiB-aligned compound, so it always
-        // takes the pooled, zero-syscall path.
+        // Zero-allocation fast path: if the requested range is already backed
+        // by a live mapping, return immediately.
+        if let Some(mapping) = self.mapping_for_range(current, 1) {
+            if mapping.end >= end {
+                return Ok(());
+            }
+        }
+
+        // Anonymous private fault window (Step 1 + Step 2):
+        // Widen the fault window up to W bytes (default 64 KiB) within the pristine hole:
+        // window_end = min(hole_end, align_up(va + 1, W), vma_end, next_2mb_boundary)
         const COMPOUND: u64 = CowArmedRanges::COMPOUND_SIZE;
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
         if len == PAGE_SIZE as usize && current < end {
-            let compound_start = align_down(current, COMPOUND);
-            let compound_end = compound_start.saturating_add(COMPOUND);
             let pristine = self.deferred_anonymous_state().and_then(|state| {
                 state
                     .snapshot()
@@ -38399,29 +38429,110 @@ impl HvfVmState {
                     .map(|r| (r.start.raw(), r.end.raw()))
             });
             if let Some((p_start, p_end)) = pristine {
-                if compound_start >= p_start
-                    && compound_end <= p_end
-                    && compound_start >= arena_start
-                    && compound_end <= arena_end
-                {
+                let w = Self::fault_window_bytes();
+                if w < COMPOUND {
+                    // Hatch CARRICK_FAULT_WINDOW_BYTES=4096: single-page fallback.
                     let has_local = self
                         .mappings
                         .iter()
-                        .any(|m| m.start < compound_end && m.end > compound_start);
+                        .any(|m| m.start < end && m.end > current);
                     let has_alias = alias_registry().lock().has_live_process_alias_overlapping(
-                        compound_start,
-                        compound_end,
+                        current,
+                        end,
                         self.mm_root_slot,
                         self.container_root,
                     );
                     if !has_local && !has_alias {
                         self.materialize_sparse_mmap_extent(
-                            compound_start,
-                            compound_end,
+                            current,
+                            end,
                             SparseExtentBacking::Anon,
                             flush_stage1,
                             Some(current..end),
                         )?;
+                        return Ok(());
+                    }
+                } else {
+                    let w_end = align_up(current.saturating_add(1), w)?;
+                    let next_2mb = align_down(current, TWO_MIB).saturating_add(TWO_MIB);
+                    let vma_end = p_end;
+                    let mut window_end = vma_end.min(next_2mb).min(w_end).min(arena_end);
+                    window_end = window_end.max(end);
+
+                    let next_local = self
+                        .mappings
+                        .iter()
+                        .filter(|m| m.start > current && m.start < window_end)
+                        .map(|m| m.start)
+                        .min();
+                    let next_alias = alias_registry()
+                        .lock()
+                        .first_matching_process_alias_start_between(
+                            current,
+                            window_end,
+                            self.mm_root_slot,
+                            self.container_root,
+                            |alias| alias_backing_is_live(alias.physical_host_addr),
+                        );
+                    window_end = next_local
+                        .into_iter()
+                        .chain(next_alias)
+                        .min()
+                        .unwrap_or(window_end);
+
+                    let compound_start = align_down(current, COMPOUND);
+                    let window_start = if compound_start >= p_start
+                        && compound_start >= arena_start
+                        && !self
+                            .mappings
+                            .iter()
+                            .any(|m| m.start < current && m.end > compound_start)
+                        && !alias_registry().lock().has_live_process_alias_overlapping(
+                            compound_start,
+                            current,
+                            self.mm_root_slot,
+                            self.container_root,
+                        ) {
+                        compound_start
+                    } else {
+                        current
+                    };
+
+                    let has_conflict = self
+                        .mappings
+                        .iter()
+                        .any(|m| m.start < window_end && m.end > window_start)
+                        || alias_registry().lock().has_live_process_alias_overlapping(
+                            window_start,
+                            window_end,
+                            self.mm_root_slot,
+                            self.container_root,
+                        );
+
+                    if !has_conflict
+                        && window_start < window_end
+                        && window_start <= current
+                        && end <= window_end
+                    {
+                        let mut chunk_start = window_start;
+                        while chunk_start < window_end {
+                            let chunk_limit = if chunk_start.is_multiple_of(COMPOUND) {
+                                chunk_start.saturating_add(COMPOUND).min(window_end)
+                            } else {
+                                align_up(chunk_start.saturating_add(1), COMPOUND)?.min(window_end)
+                            };
+                            let materialized_end = self.materialize_sparse_mmap_extent(
+                                chunk_start,
+                                chunk_limit,
+                                SparseExtentBacking::Anon,
+                                flush_stage1,
+                                Some(current..end),
+                            )?;
+                            if materialized_end <= chunk_start {
+                                break;
+                            }
+                            chunk_start = materialized_end;
+                        }
                         return Ok(());
                     }
                 }
