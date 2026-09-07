@@ -1876,3 +1876,50 @@ main `ed3a42c85` (binary SHA-256 `a4c5c672…`), same invocation as the Sep 6
 baseline (`--workers 4 --carrick-timeout-cap-s 0 --require-cached-oracle`),
 into `target/conformance/eco-final-ledger/ledger-ed3a42c85.jsonl`; the host
 is kept free of other guests and builds for its duration.
+
+## 2026-09-07: second ledger — the campaign's measured effect
+
+Same harness invocation and cached oracle as the Sep 6 floor, on main
+`ed3a42c85` (binary SHA-256 `a4c5c672…`), host otherwise idle. Receipt:
+`target/conformance/eco-final-ledger/ledger-ed3a42c85.jsonl` (+ `.log`,
+`-summary.txt`).
+
+| Ecosystem | Sep 6 match | Now match | Regression | Crash | Timeout | Known diff | Unbaselined |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| CPython | 420 / 438 | **431** / 438 | 3 | 0 | 3 | 1 | 0 |
+| Go | 177 / 194 | **189** / 194 | 2 | 1 | 1 | 1 | 0 |
+| LTP | 1,452 / 1,492 | **1,459** / 1,492 | 11 | 0 | 4 | 11 | 7 |
+| Node | 2 / 3 | 2 / 3 | 1 | 0 | 0 | 0 | 0 |
+| **Total** | **2,051 (96.4%)** | **2,081 (97.8%)** | 17 | 1 | 8 | 13 | 7 |
+
+Gating verdicts 59 → 26. Thirty-four rows flipped to match (all twelve Go
+crash suites, the LTP fs regressions, cpython asyncio/importlib/
+multiprocessing_forkserver/regrtest/pathlib/shutil/tarfile/zipfile/venv/
+ctypes/mailbox); four LTP rows flipped the other way (`fcntl29`: execve
+past the point of no return kills the guest; `open04` timeout; `openat03`
+and `renameat202`: ENOENT on a just-created file — the dentry-cache
+eviction path, see below) and are the first items of the next leg.
+
+Time: the rows that were hangs or pathologies moved by tens to hundreds
+of seconds each (importlib 300 → 31 s, asyncio 300 → 176 s,
+multiprocessing_main_handling 253 → 98 s, threading 165 → 42 s, logging
+103 → 28 s, os 78 → 19 s, munmap04 29 → 1.8 s, tempfile 31 → 4 s, uuid
+27 → 2 s, tracemalloc 25 → 4 s). Against the 2x bar the aggregate is
+worse, not better: matched carrick time 3,107 → 3,809 s over 30 more
+matching rows, rows meeting both match and <2x 1,654 → 1,636 (77.8% →
+76.9%), rows ≥2x 397 → 445. Two causes are visible in the rows: newly
+matching suites are now counted at their full (slow) cost where a crash
+used to cost nothing (go_types 0.7 → 31 s, net_http 2.5 → 25.6 s,
+regrtest 10 → 42 s, tarfile 24 → 142 s), and create-heavy LTP rows gained
+~1.1 s each (mknod01, mkdirat02, mkdir05, link05) from the dentry cache's
+4096-directory bulk reset, which also explains the two ENOENT rows above.
+Neither is the fault path: that branch is parked with its measurements in
+the previous section.
+
+Open at hand-off, in priority order: (1) replace the dentry cache's bulk
+reset with per-entry eviction and re-verify `openat03`/`renameat202`/
+`fcntl29`/`open04`; (2) the first-touch redesign under the fork-cost
+constraint (brief in the session scratchpad, `brief-first-touch-v2.md`);
+(3) the exec-generation race (go-syscall, go-net under load); (4) the
+Docker-only bless of the three new probes; (5) the per-suite fixed cost
+on small CPython rows (abc 0.70 → 0.90 s), to be attributed standalone.
