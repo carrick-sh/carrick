@@ -1818,3 +1818,33 @@ pass; CPython test_signal/test_selectors/test_poll/test_select SUCCESS;
 2,491 runtime tests. Open follow-up recorded by the worker: a long mixed
 wait still holds its executor host thread (parity with the old loop), to be
 routed through the lease-release helper other long host waits use.
+
+## 2026-09-07: a pre-existing directory-listing defect behind the pathlib rows
+
+While gating the vfs round-3 branch, `test_pathlib` failed on main too:
+68 tests on the Sep 6 baseline build, 134 on today's main, 189 on the
+branch — every one the same shape: `os_helper.rmtree` calls `os.unlink`
+on `dirA` (EISDIR) because `scandir`'s `is_dir(follow_symlinks=False)`,
+i.e. carrick's `getdents64` `d_type`, said the directory was not one, and
+every later test's `setUp` then fails with `FileExists`. The earlier ledger
+summaries only quoted the first six failing test names, which hid the size
+of this row. It is not one test's doing: no alphabetical group before the
+first failure triggers it, and the exact `setUp` tree replays cleanly once.
+A loop of `setUp` + `rmtree` (`plcycle.py`, now in the vfs worktree's
+`target/`) fails deterministically at cycle 225 on main: immediately after
+`setUp` every entry's `d_type` matches `lstat`, so the mis-pairing happens
+mid-stream, after deletions, at an accumulation boundary in the directory
+listing/dentry cache. Worker `vfs-hot2d` has the reducer. The vfs branch it
+runs on is otherwise at parity or better than main back-to-back (fstat
+3.8 vs 25 µs, open+close 16.6 vs 19 µs, stat/ENOENT/listdir equal, 2,494
+runtime tests) after the worker reverted its own getdents change and
+fixed `utimensat` `AT_SYMLINK_NOFOLLOW` on dangling symlinks.
+
+Also this section: the exec-generation race is parked after three
+conversations (a probe that does not reproduce; a draft that re-checks and
+falls back, which the brief forbade); it stays an explicitly open item for
+a director-driven instrumented reduction. first-touch is at round 5: the
+million-depth compile reducer went from a 300 s cap to 72 s and
+`test_compile` from a 420 s timeout to 62 s, but the batched stage-2
+retirement broke four rollback/custody invariants that the round must
+restore before it lands.
