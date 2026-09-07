@@ -2330,6 +2330,22 @@
       "rationale": "Environment variable CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS read in exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "fault_window_bytes::CARRICK_FAULT_WINDOW_BYTES",
+      "fingerprint": "d65ad01b7ba81d1b0a9121f3ea237b8bc22533fd63dc95b2b2c796bf63dfe2ca",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FAULT_WINDOW_BYTES read in fault_window_bytes::CARRICK_FAULT_WINDOW_BYTES (crates/carrick-vmm-hvf/src/trap.rs) configuring the anonymous private fault window size."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "fault_window_bytes::WINDOW",
+      "fingerprint": "0623d2cbce0e61f080c5fccc451aa8bc1ba2283f9cd07e1a7dca3ea71ae1127a",
+      "classification": "config_debug",
+      "rationale": "OnceLock cache of the CARRICK_FAULT_WINDOW_BYTES configuration in fault_window_bytes::WINDOW (crates/carrick-vmm-hvf/src/trap.rs); carrier-wide configuration read once, describes the carrier and no Linux process."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "foreign_mm_tests::FOREIGN_MM_TEST_LOCK",

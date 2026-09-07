@@ -38332,25 +38332,14 @@ impl HvfVmState {
     pub(crate) const DEFAULT_FAULT_WINDOW_BYTES: u64 = 64 * 1024;
 
     fn fault_window_bytes() -> u64 {
-        #[cfg(test)]
-        {
+        static WINDOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *WINDOW.get_or_init(|| {
             std::env::var("CARRICK_FAULT_WINDOW_BYTES")
                 .ok()
                 .and_then(|val| val.parse::<u64>().ok())
                 .filter(|&w| w >= 4096 && w.is_power_of_two())
                 .unwrap_or(Self::DEFAULT_FAULT_WINDOW_BYTES)
-        }
-        #[cfg(not(test))]
-        {
-            static WINDOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            *WINDOW.get_or_init(|| {
-                std::env::var("CARRICK_FAULT_WINDOW_BYTES")
-                    .ok()
-                    .and_then(|val| val.parse::<u64>().ok())
-                    .filter(|&w| w >= 4096 && w.is_power_of_two())
-                    .unwrap_or(Self::DEFAULT_FAULT_WINDOW_BYTES)
-            })
-        }
+        })
     }
 
     /// Materialize private zero backing for the exact accessible pieces of the
