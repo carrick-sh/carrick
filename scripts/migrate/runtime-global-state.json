@@ -2656,22 +2656,6 @@
       "fingerprint": "b5c916c6541e982f549357c4358c60c34a4fb16f0f727a4a0cb900e017fc656a",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_DENTRY_EVICT read in new::CARRICK_DENTRY_EVICT (crates/carrick-runtime/src/vfs/dentry.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vfs/dentry.rs",
-      "symbol": "new::CARRICK_DENTRY_LRU_EVICT",
-      "fingerprint": "ec6987d7bed3a35263c62513c9248d245d579c05123f67ccaebf0fd2b3591b5c",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DENTRY_LRU_EVICT read in new::CARRICK_DENTRY_LRU_EVICT (crates/carrick-runtime/src/vfs/dentry.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vfs/dentry.rs",
-      "symbol": "new::CARRICK_DENTRY_PER_ENTRY_EVICT",
-      "fingerprint": "2bd34cd18fcf748e442a3fbb36975a0d9bdecf87d2c0306513ae0f84c04567be",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DENTRY_PER_ENTRY_EVICT read in new::CARRICK_DENTRY_PER_ENTRY_EVICT (crates/carrick-runtime/src/vfs/dentry.rs) configuring carrier behavior or debug logging."
     }
   ]
 }

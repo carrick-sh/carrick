@@ -222,8 +222,6 @@ impl DentryCache {
     pub fn new(is_shared: bool) -> Self {
         let eviction_enabled = std::env::var("CARRICK_DENTRY_EVICT")
             .ok()
-            .or_else(|| std::env::var("CARRICK_DENTRY_LRU_EVICT").ok())
-            .or_else(|| std::env::var("CARRICK_DENTRY_PER_ENTRY_EVICT").ok())
             .is_none_or(|v| v != "0");
 
         let capacity_bytes = std::env::var("CARRICK_DENTRY_CACHE_CAPACITY_BYTES")
