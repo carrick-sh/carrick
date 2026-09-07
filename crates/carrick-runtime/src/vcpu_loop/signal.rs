@@ -630,22 +630,34 @@ where
         return Ok(Some(PendingSignalAction::ignored()));
     }
     crate::exec_helpers::stop_for_debug_signal(pending);
-    let action = reserved
-        .map(crate::vcpu_loop::continuation::ReservedSignal::action)
-        .filter(|action| {
-            action.sa_handler != carrick_abi::LINUX_SIG_DFL
-                && action.sa_handler != carrick_abi::LINUX_SIG_IGN
-        })
-        .or_else(|| {
-            if reserved.is_none() {
-                dispatcher
-                    .take_pending_signal_action(context, tid, pending)
-                    .or_else(|| dispatcher.registered_signal_handler(context, pending))
-            } else {
-                None
-            }
-        });
-    if reserved.is_none() && action.is_none() && dispatcher.signal_is_ignored(context, pending) {
+    let (action, is_ignored) = if let Some(reserved) = reserved {
+        let action = reserved.action();
+        if action.sa_handler == carrick_abi::LINUX_SIG_IGN {
+            (None, true)
+        } else if action.sa_handler == carrick_abi::LINUX_SIG_DFL {
+            (None, false)
+        } else {
+            (Some(action), false)
+        }
+    } else if let Some(action) = dispatcher.take_pending_signal_action(context, tid, pending) {
+        if action.sa_handler == carrick_abi::LINUX_SIG_IGN {
+            (None, true)
+        } else if action.sa_handler == carrick_abi::LINUX_SIG_DFL {
+            (None, false)
+        } else {
+            (Some(action), false)
+        }
+    } else {
+        let action = dispatcher.signal_action(context, pending);
+        if action.sa_handler == carrick_abi::LINUX_SIG_IGN {
+            (None, true)
+        } else if action.sa_handler == carrick_abi::LINUX_SIG_DFL {
+            (None, false)
+        } else {
+            (Some(action), false)
+        }
+    };
+    if is_ignored {
         return Ok(Some(PendingSignalAction::ignored()));
     }
     match action {

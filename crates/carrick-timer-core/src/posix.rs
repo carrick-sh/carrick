@@ -57,14 +57,14 @@ pub struct PosixTimerSlot {
 }
 
 impl PosixTimerSlot {
-    fn new(clock_id: i32, signum: i32, target_tid: Option<i32>) -> Self {
+    fn new(clock_id: i32, signum: i32, target_tid: Option<i32>, si_value: i64) -> Self {
         Self {
             clock_id,
             target_tid,
             spec: Mutex::new(PosixTimerSpec {
                 signum,
                 spec: TimerSpecNs::DISARM,
-                si_value: 0,
+                si_value,
             }),
             armed_at_ns: AtomicU64::new(0),
             generation: AtomicU64::new(0),
@@ -112,12 +112,22 @@ pub fn create(clock_id: i32, signum: i32) -> i32 {
 /// Allocate a new timer (no arm yet) optionally targeting a specific thread `target_tid`
 /// (e.g. from `SIGEV_THREAD_ID`). Returns the new id.
 pub fn create_with_target(clock_id: i32, signum: i32, target_tid: Option<i32>) -> i32 {
+    create_with_target_and_value(clock_id, signum, target_tid, 0)
+}
+
+/// Allocate a new timer with a target thread and a `sigev_value` payload.
+pub fn create_with_target_and_value(
+    clock_id: i32,
+    signum: i32,
+    target_tid: Option<i32>,
+    si_value: i64,
+) -> i32 {
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let mut guard = registry();
     let map = ensure_registry(&mut guard);
     map.insert(
         id,
-        std::sync::Arc::new(PosixTimerSlot::new(clock_id, signum, target_tid)),
+        std::sync::Arc::new(PosixTimerSlot::new(clock_id, signum, target_tid, si_value)),
     );
     id
 }
@@ -133,6 +143,8 @@ pub struct PosixArm {
     pub signum: i32,
     /// Optional thread target (from `SIGEV_THREAD_ID`).
     pub target_tid: Option<i32>,
+    /// The `sigev_value` payload to deliver in `LinuxSiginfo::timer`.
+    pub si_value: i64,
     /// The slot, so the backend's firing thread can check `generation` /
     /// bump `overruns` without re-locking the registry.
     pub slot: std::sync::Arc<PosixTimerSlot>,
@@ -170,6 +182,7 @@ pub fn arm(id: i32, spec: TimerSpecNs) -> Option<PosixArm> {
         generation: new_gen,
         signum: old.signum, // signum doesn't change on arm; carried from create.
         target_tid: slot.target_tid,
+        si_value: old.si_value,
         slot,
     })
 }

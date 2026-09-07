@@ -179,7 +179,7 @@ impl ProcessTimerTarget {
             .filter(|task| task.key() == self.task)
     }
 
-    fn deliver(&self, signum: i32) -> bool {
+    fn deliver(&self, signum: i32, siginfo: Option<crate::linux_abi::LinuxSiginfo>) -> bool {
         if signum == 0 {
             return self.task().is_some();
         }
@@ -189,10 +189,15 @@ impl ProcessTimerTarget {
         let Some(kernel) = self.kernel.upgrade() else {
             return false;
         };
-        kernel.post_signal_to_task_key(self.task, signal, None)
+        kernel.post_signal_to_task_key(self.task, signal, siginfo)
     }
 
-    fn deliver_to_thread(&self, tid: i32, signum: i32) -> bool {
+    fn deliver_to_thread(
+        &self,
+        tid: i32,
+        signum: i32,
+        siginfo: Option<crate::linux_abi::LinuxSiginfo>,
+    ) -> bool {
         if signum == 0 {
             return self.task().is_some();
         }
@@ -209,9 +214,9 @@ impl ProcessTimerTarget {
             return false;
         };
         if let Some(thread) = task.thread(linux_tid) {
-            kernel.post_signal_to_thread_key(task.key(), thread.key(), signal, None)
+            kernel.post_signal_to_thread_key(task.key(), thread.key(), signal, siginfo)
         } else {
-            kernel.post_signal_to_task_key(self.task, signal, None)
+            kernel.post_signal_to_task_key(self.task, signal, siginfo)
         }
     }
 }
@@ -298,7 +303,8 @@ impl ProcessTimerDelivery {
                     return;
                 };
                 if now_ns >= cpu_due_ns {
-                    if !target.deliver(signum) {
+                    let siginfo = crate::linux_abi::LinuxSiginfo::kernel(signum);
+                    if !target.deliver(signum, Some(siginfo)) {
                         return;
                     }
                     if spec.interval == 0 {
@@ -322,7 +328,8 @@ impl ProcessTimerDelivery {
             if !slot.generation_matches(generation) {
                 return;
             }
-            if !target.deliver(signum) {
+            let siginfo = crate::linux_abi::LinuxSiginfo::kernel(signum);
+            if !target.deliver(signum, Some(siginfo)) {
                 return;
             }
             if spec.interval == 0 {
@@ -387,6 +394,7 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
             let slot = armed.slot.clone();
             let target_tid = armed.target_tid;
             let target_cpu = target.clone();
+            let si_value = armed.si_value;
             let cpu_now: Option<std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>> =
                 if carrick_timer_core::posix::is_process_cpu_clock(slot.clock_id) {
                     // CLOCK_PROCESS_CPUTIME_ID or dynamic per-process clock
@@ -416,10 +424,11 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
                     None
                 };
             let on_fire = move || {
+                let siginfo = crate::linux_abi::LinuxSiginfo::timer(signum, id, 0, si_value);
                 if let Some(tid) = target_tid {
-                    target.deliver_to_thread(tid, signum);
+                    target.deliver_to_thread(tid, signum, Some(siginfo));
                 } else {
-                    target.deliver(signum);
+                    target.deliver(signum, Some(siginfo));
                 }
             };
             let _ = std::thread::Builder::new()
