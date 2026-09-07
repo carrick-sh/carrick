@@ -549,6 +549,34 @@ impl FrameInventoryAuthority {
         state.frames.get(&frame).map(|entry| entry.mapping_count)
     }
 
+    /// Query mapping liveness for a batch of candidate extents and reference
+    /// counts for a batch of frames under a single inventory mutex acquisition.
+    pub fn retirement_batch_query(
+        &self,
+        mm: MmId,
+        extents: &[(MappingId, FrameId, Gpa, FrameLength)],
+        frames: &[FrameId],
+    ) -> (Vec<bool>, Vec<Option<usize>>) {
+        let state = self.state.lock();
+        let extent_liveness = extents
+            .iter()
+            .map(|&(mapping, frame, gpa, length)| {
+                state.mappings.get(&mapping).is_some_and(|entry| {
+                    entry.state == MappingState::Published
+                        && entry.mm == mm
+                        && entry.frame == frame
+                        && entry.gpa == gpa
+                        && entry.length == length
+                })
+            })
+            .collect();
+        let frame_counts = frames
+            .iter()
+            .map(|&frame| state.frames.get(&frame).map(|entry| entry.mapping_count))
+            .collect();
+        (extent_liveness, frame_counts)
+    }
+
     pub(crate) fn snapshot_until(&self, deadline: Instant) -> Option<FrameInventorySnapshot> {
         self.state
             .try_lock_until(deadline)
@@ -1999,5 +2027,214 @@ mod tests {
             }
         );
         assert!(fixture.authority.state.lock().reservations.is_empty());
+    }
+
+    #[test]
+    fn retirement_batch_query_matches_point_queries_across_shared_and_private_frames() {
+        let fixture = Fixture::new();
+        let mm3 = fixture.ids.mm_id().expect("vfork child mm");
+
+        let mut shared_frame = None;
+        let mut private_frame = None;
+        let mut mm1_shared_mapping = None;
+        let mut mm1_private_mapping = None;
+
+        // 1. Process mm1 sets up shared and private frames.
+        let batch1 = fixture.batch(4, |transaction, reservation| {
+            let shared = reservation.claim_frame().expect("shared frame");
+            let private = reservation.claim_frame().expect("private frame");
+            let m_shared = reservation.claim_mapping().expect("m_shared");
+            let m_private = reservation.claim_mapping().expect("m_private");
+
+            shared_frame = Some(shared);
+            private_frame = Some(private);
+            mm1_shared_mapping = Some(m_shared);
+            mm1_private_mapping = Some(m_private);
+
+            prepare_publish(reservation, transaction, shared, m_shared, 0x1000, 0x4000);
+            prepare_publish(reservation, transaction, private, m_private, 0x2000, 0x4000);
+        });
+        fixture
+            .authority
+            .apply(fixture.mm1, batch1)
+            .expect("apply mm1");
+
+        let shared_frame = shared_frame.unwrap();
+        let private_frame = private_frame.unwrap();
+        let mm1_shared_mapping = mm1_shared_mapping.unwrap();
+        let mm1_private_mapping = mm1_private_mapping.unwrap();
+
+        // 2. Forked sibling mm2 maps the shared frame and its own private sibling frame.
+        let mut sibling_frame = None;
+        let mut mm2_shared_mapping = None;
+        let mut mm2_sibling_mapping = None;
+        let batch2 = fixture.batch(4, |transaction, reservation| {
+            let sibling = reservation.claim_frame().expect("sibling frame");
+            let m_shared = reservation.claim_mapping().expect("m_shared 2");
+            let m_sibling = reservation.claim_mapping().expect("m_sibling");
+
+            sibling_frame = Some(sibling);
+            mm2_shared_mapping = Some(m_shared);
+            mm2_sibling_mapping = Some(m_sibling);
+
+            prepare_publish(
+                reservation,
+                transaction,
+                shared_frame,
+                m_shared,
+                0x1000,
+                0x4000,
+            );
+            prepare_publish(reservation, transaction, sibling, m_sibling, 0x3000, 0x4000);
+        });
+        fixture
+            .authority
+            .apply(fixture.mm2, batch2)
+            .expect("apply mm2");
+
+        let sibling_frame = sibling_frame.unwrap();
+        let mm2_shared_mapping = mm2_shared_mapping.unwrap();
+        let mm2_sibling_mapping = mm2_sibling_mapping.unwrap();
+
+        // 3. vfork child mm3 maps the shared frame and its own private vfork frame.
+        let mut vfork_frame = None;
+        let mut mm3_shared_mapping = None;
+        let mut mm3_vfork_mapping = None;
+        let batch3 = fixture.batch(4, |transaction, reservation| {
+            let vfork = reservation.claim_frame().expect("vfork frame");
+            let m_shared = reservation.claim_mapping().expect("m_shared 3");
+            let m_vfork = reservation.claim_mapping().expect("m_vfork");
+
+            vfork_frame = Some(vfork);
+            mm3_shared_mapping = Some(m_shared);
+            mm3_vfork_mapping = Some(m_vfork);
+
+            prepare_publish(
+                reservation,
+                transaction,
+                shared_frame,
+                m_shared,
+                0x1000,
+                0x4000,
+            );
+            prepare_publish(reservation, transaction, vfork, m_vfork, 0x4000, 0x4000);
+        });
+        fixture.authority.apply(mm3, batch3).expect("apply mm3");
+
+        let vfork_frame = vfork_frame.unwrap();
+        let mm3_shared_mapping = mm3_shared_mapping.unwrap();
+        let _mm3_vfork_mapping = mm3_vfork_mapping.unwrap();
+
+        // An unknown/unmapped frame claimed from a reservation that is never applied.
+        let unknown_frame = {
+            let capacity = FrameEventCapacity::for_event_count(1).expect("capacity");
+            let mut res = fixture
+                .authority
+                .reserve(&fixture.ids, 1, 1, capacity)
+                .expect("res");
+            let frame = res.claim_frame().expect("unapplied frame");
+            fixture.authority.abandon(res.transaction());
+            frame
+        };
+
+        // Construct candidate extents to test against mm1
+        let candidate_extents = vec![
+            // Valid private mapping for mm1
+            (
+                mm1_private_mapping,
+                private_frame,
+                Gpa(0x2000),
+                length(0x4000),
+            ),
+            // Valid shared mapping for mm1
+            (
+                mm1_shared_mapping,
+                shared_frame,
+                Gpa(0x1000),
+                length(0x4000),
+            ),
+            // Sibling mm2's mapping of the shared frame (not live in mm1)
+            (
+                mm2_shared_mapping,
+                shared_frame,
+                Gpa(0x1000),
+                length(0x4000),
+            ),
+            // vfork child mm3's mapping of the shared frame (not live in mm1)
+            (
+                mm3_shared_mapping,
+                shared_frame,
+                Gpa(0x1000),
+                length(0x4000),
+            ),
+            // Sibling mm2's private mapping (not live in mm1)
+            (
+                mm2_sibling_mapping,
+                sibling_frame,
+                Gpa(0x3000),
+                length(0x4000),
+            ),
+            // Mismatched frame
+            (
+                mm1_private_mapping,
+                shared_frame,
+                Gpa(0x2000),
+                length(0x4000),
+            ),
+            // Mismatched GPA
+            (
+                mm1_private_mapping,
+                private_frame,
+                Gpa(0x9000),
+                length(0x4000),
+            ),
+            // Mismatched length
+            (
+                mm1_private_mapping,
+                private_frame,
+                Gpa(0x2000),
+                length(0x8000),
+            ),
+        ];
+
+        let candidate_frames = vec![
+            shared_frame,
+            private_frame,
+            sibling_frame,
+            vfork_frame,
+            unknown_frame,
+        ];
+
+        let (batch_liveness, batch_counts) = fixture.authority.retirement_batch_query(
+            fixture.mm1,
+            &candidate_extents,
+            &candidate_frames,
+        );
+
+        // Prove exact equivalence against point queries
+        for (i, &(mapping, frame, gpa, length)) in candidate_extents.iter().enumerate() {
+            let point_live =
+                fixture
+                    .authority
+                    .mapping_is_live_exact(fixture.mm1, mapping, frame, gpa, length);
+            assert_eq!(
+                batch_liveness[i], point_live,
+                "extent #{i} mismatch between batch and point query"
+            );
+        }
+        for (j, &frame) in candidate_frames.iter().enumerate() {
+            let point_count = fixture.authority.frame_mapping_count(frame);
+            assert_eq!(
+                batch_counts[j], point_count,
+                "frame #{j} mismatch between batch and point query"
+            );
+        }
+
+        // Exact expected values
+        assert_eq!(
+            batch_liveness,
+            vec![true, true, false, false, false, false, false, false]
+        );
+        assert_eq!(batch_counts, vec![Some(3), Some(1), Some(1), Some(1), None]);
     }
 }
