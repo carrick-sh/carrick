@@ -8865,3 +8865,61 @@ fn shared_file_fixed_mremap_rejects_missing_maymove_or_overlapping_ranges() {
     );
     assert_eq!(outcome_overlap, DispatchOutcome::errno(LINUX_EINVAL));
 }
+
+#[test]
+fn coalesce_preserves_dontdump_policy_on_subrange() {
+    let mut vmas = vec![
+        SemanticVma {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: true,
+            execute: false,
+            provenance: VmaBackingProvenance::PrivateAnonymous,
+            fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+            dump_policy: carrick_abi::VmaDumpPolicy::Include,
+            droppable: false,
+            path: "[anon]".to_string(),
+            file_page_offset: None,
+        },
+        SemanticVma {
+            start: 0x2000,
+            end: 0x4000,
+            read: true,
+            write: true,
+            execute: false,
+            provenance: VmaBackingProvenance::PrivateAnonymous,
+            fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+            dump_policy: carrick_abi::VmaDumpPolicy::Include,
+            droppable: false,
+            path: "[anon]".to_string(),
+            file_page_offset: None,
+        },
+    ];
+
+    // Apply DONTDUMP to sub-range [0x2000, 0x3000) of B
+    update_semantic_vma_policy(
+        &mut vmas,
+        0x2000,
+        0x1000,
+        None,
+        None,
+        Some(carrick_abi::VmaDumpPolicy::Omit),
+    );
+
+    // Coalesce explicitly
+    coalesce_semantic_vmas(&mut vmas);
+
+    assert_eq!(vmas.len(), 3);
+    assert_eq!(vmas[0].start, 0x1000);
+    assert_eq!(vmas[0].end, 0x2000);
+    assert_eq!(vmas[0].dump_policy, carrick_abi::VmaDumpPolicy::Include);
+
+    assert_eq!(vmas[1].start, 0x2000);
+    assert_eq!(vmas[1].end, 0x3000);
+    assert_eq!(vmas[1].dump_policy, carrick_abi::VmaDumpPolicy::Omit);
+
+    assert_eq!(vmas[2].start, 0x3000);
+    assert_eq!(vmas[2].end, 0x4000);
+    assert_eq!(vmas[2].dump_policy, carrick_abi::VmaDumpPolicy::Include);
+}

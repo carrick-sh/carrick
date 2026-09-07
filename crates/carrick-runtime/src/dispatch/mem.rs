@@ -1548,6 +1548,7 @@ fn coalesce_semantic_vmas(vmas: &mut Vec<SemanticVma>) {
                 && last.execute == vma.execute
                 && last.provenance == vma.provenance
                 && last.fork_policy == vma.fork_policy
+                && last.dump_policy == vma.dump_policy
                 && last.droppable == vma.droppable
                 && last.path == vma.path
                 && offset_contiguous
