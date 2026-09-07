@@ -650,3 +650,53 @@ Exact signature, UUID, entitlement, DOF and scoped cleanup receipts are in
 and is not clean-tree landing acceptance. Foreign entry must consume its
 existing runtime-held exclusion instead of reacquiring local quiesce; root
 permission derivation and complete publication failure coverage remain open.
+
+
+### Foreign pristine copyout guest reproducer
+
+The signed in-process `deferred_anonymous_foreign_copyout` test maps untouched
+RW private anonymous memory before fork, then writes eight bytes into the child
+with process_vm_writev. Red: -1/EFAULT14; the child receives the explicit failure
+notification and exits4. It waits at most three seconds and scoped cleanup is
+zero. Parent isolation and untouched neighboring-page assertions are retained
+for the green run. `foreign-pristine-red.log`, run eco-foreign-pristine-red-20260906a;
+exact source diff and hash in `foreign-pristine-red-source.json` and `.patch`.
+The entitlement negative control passes. Commit `6610168a1` integrates the
+foreign pristine materialization path and its authenticated inventory receipt.
+
+The integrated foreign path publishes ready stage-1 permissions, authenticates
+`apply_foreign_cow`'s opaque proof and inventory revision, pins the new owner,
+and refreshes the lease snapshot before ordinary `prepare_write`. Its
+constructor consumes `ForeignMmInvocation` under the existing runtime
+exclusion, without reacquiring local quiesce.
+
+
+### Python allocator crash: live table coalescing
+
+The mmap checkpoint exposed a deterministic Python correctness regression:
+`import collections` failed 5/5 at `6610168a1` and `152e95c75`, while exact
+pre-change `75758eacd` passed 5/5. `PYTHONMALLOC=malloc` passed, narrowing the
+failure to pymalloc arena state. An unperturbed guest core put the fault in
+libpython at an arena-object store through a null pool pointer. The original
+core note selected stale ELR/SPSR for direct EL0 aborts; `132b717c6` now uses
+the exception pair only when the vCPU snapshot is actually in an EL1 vector.
+The resulting core reports the exact guest faulting PC and address.
+
+The matching carrier core shows the active MM manager had replaced the target
+L3 table with a valid 2 MiB block and the block's host backing still contained
+zeros where Python had already written allocator metadata. Disabling stage-1
+coalescing on the same signed binary made `import collections` pass. This is an
+ARM break-before-make violation: Carrick's live editor publishes one descriptor
+batch and one trailing TLBI, so it cannot safely perform a valid-table to
+valid-block transition, even with one vCPU.
+
+The red-first test
+`live_block_restore_keeps_table_until_break_before_make_is_available` observes
+the old table-to-block replacement. Live managers now retain the finer table;
+only detached fork images may coalesce until a two-phase invalidate, TLBI,
+make, TLBI publisher exists. All 191 `carrick-mem` library tests pass, and five
+fresh-ID untraced `import collections` launches pass on the signed fixed binary
+with scoped cleanup zero. This closes the observed crash mechanism. Final
+branch acceptance still requires a signed rebuild with the checkpoint's direct
+private-file mapping plus the serial runtime, whole-probe, launch, zero-copy
+and latency receipts.

@@ -554,6 +554,12 @@ pub struct PageTableManager {
     /// break-before-make structural change that is unsafe without an all-vCPU
     /// TLB flush HVF can't give one vCPU).
     multi_vcpu: bool,
+    /// Whether no hardware walker can currently reach this image. Replacing a
+    /// valid table descriptor with a valid block is an architectural
+    /// break-before-make transition. Carrick's live editor has one descriptor
+    /// batch and one trailing TLBI, so only a detached fork image may compact
+    /// tables until the live publisher grows a two-phase protocol.
+    offline_private_image: bool,
     /// Whether THIS thread's stage-1 edits are exclusive (see
     /// `carrick_hal::stage1_exclusive`). Distinct from `multi_vcpu`, which asks
     /// whether EAGER coalescing is worth doing; this asks only whether freeing a
@@ -599,6 +605,7 @@ impl Clone for PageTableManager {
             asid_scoped_leaves: self.asid_scoped_leaves,
             free_tables: self.free_tables.clone(),
             multi_vcpu: self.multi_vcpu,
+            offline_private_image: self.offline_private_image,
             stage1_exclusive: self.stage1_exclusive,
             reclaim_pending: self.reclaim_pending,
             dirty: self.dirty.clone(),
@@ -615,6 +622,7 @@ impl Clone for PageTableManager {
         self.asid_scoped_leaves = source.asid_scoped_leaves;
         self.free_tables.clone_from(&source.free_tables);
         self.multi_vcpu = source.multi_vcpu;
+        self.offline_private_image = source.offline_private_image;
         self.stage1_exclusive = source.stage1_exclusive;
         self.reclaim_pending = source.reclaim_pending;
         self.dirty.clone_from(&source.dirty);
@@ -644,6 +652,7 @@ impl PageTableManager {
             asid_scoped_leaves,
             free_tables: Vec::new(),
             multi_vcpu: false,
+            offline_private_image: false,
             stage1_exclusive: false,
             reclaim_pending: false,
             dirty: Vec::new(),
@@ -849,6 +858,14 @@ impl PageTableManager {
     /// reclaimable tables and no permission to reclaim them.
     pub fn declare_offline_private_image(&mut self) {
         self.stage1_exclusive = true;
+        self.offline_private_image = true;
+    }
+
+    /// Mark this image reachable by a hardware walker. Live table-to-block
+    /// compaction stays disabled until the publisher can perform the required
+    /// invalidate -> TLBI -> make -> TLBI sequence.
+    pub fn declare_live_hardware_image(&mut self) {
+        self.offline_private_image = false;
     }
 
     /// True iff `pa` is a runtime-allocated spare sub-table (never a boot table
@@ -872,8 +889,8 @@ impl PageTableManager {
     }
 
     /// Zero a freed spare sub-table and return it to the reusable free list.
-    /// Only reached from `try_coalesce`, which is gated on single-vCPU, so the
-    /// reused page can never be referenced by a sibling's stale walk cache.
+    /// Only reached from `try_coalesce`, which is gated on an offline private
+    /// image, so no hardware walk cache can still reference the page.
     fn free_table(&mut self, pa: u64) {
         if let Ok(loc) = self.pa_to_loc(pa) {
             // Bulk zeroing bypasses `write_desc`, so journal the page word by
@@ -1527,10 +1544,13 @@ impl PageTableManager {
 
     /// Collapse fully-uniform spare sub-tables covering `va` back into a single
     /// block, reclaiming the table page. L3→L2 (2 MiB) then L2→L1 (1 GiB).
-    /// Only spare tables are touched (the boot L2_A/L2_B/L3_A — null guard +
-    /// kernel hole — are never uniform and never spare, so are doubly safe).
+    /// This is restricted to an offline private image: a live valid-table to
+    /// valid-block replacement needs two-phase break-before-make publication,
+    /// which the one-batch editor cannot express. Only spare tables are touched
+    /// (the boot L2_A/L2_B/L3_A — null guard + kernel hole — are never uniform
+    /// and never spare, so are doubly safe).
     fn try_coalesce(&mut self, va: u64) -> bool {
-        if self.multi_vcpu {
+        if self.multi_vcpu || !self.offline_private_image {
             return false;
         }
         let mut coalesced = false;
@@ -2590,6 +2610,7 @@ mod tests {
     #[test]
     fn hvpatch_editor_preserves_non_global_across_protect_alias_repoint_and_coalesce() {
         let mut mgr = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        mgr.declare_offline_private_image();
         let leaf = |manager: &PageTableManager, va| terminal_descriptor(manager.debug_walk(va));
         let text = 0x0040_0000_u64;
 
@@ -3388,6 +3409,7 @@ mod tests {
         // 2 MiB to RW: the sub-table becomes uniform and is reclaimed, so the
         // spare cursor/free-list returns to its pre-split capacity.
         let mut mgr = manager();
+        mgr.declare_offline_private_image();
         let block = LINUX_MMAP_BASE + 0x20_0000; // 2 MiB-aligned arena block
         mgr.set_prot_none(block, 0x1000, None).expect("split");
         let after_split = mgr.arenas[0].next_free;
@@ -3402,6 +3424,32 @@ mod tests {
             !mgr.free_tables.is_empty(),
             "coalesce reclaimed a sub-table"
         );
+    }
+
+    #[test]
+    fn live_block_restore_keeps_table_until_break_before_make_is_available() {
+        // A live table-to-block replacement is an ARM break-before-make
+        // transition. Carrick's live editor currently publishes one descriptor
+        // batch followed by one TLBI, so it cannot safely perform the required
+        // invalidate -> TLBI -> make -> TLBI sequence. Keeping the L3 table is
+        // semantically exact and avoids a stale leaf continuing to receive
+        // writes after the software model has installed the coarse block.
+        let mut mgr = manager();
+        let block = LINUX_MMAP_BASE + 0x40_0000;
+        mgr.set_prot_none(block, 0x1000, None).expect("split");
+        assert_eq!(
+            mgr.debug_walk(block)[2] & TYPE_BITS,
+            TYPE_TABLE_OR_PAGE,
+            "the partial edit creates an L3 table"
+        );
+
+        mgr.set_rw(block, 1 << 21, true, None).expect("restore");
+        assert_eq!(
+            mgr.debug_walk(block)[2] & TYPE_BITS,
+            TYPE_TABLE_OR_PAGE,
+            "a live editor must retain the table until it has a two-phase BBM publisher"
+        );
+        assert!(mgr.free_tables.is_empty(), "the live table remains owned");
     }
 
     #[test]
@@ -3622,6 +3670,7 @@ mod tests {
         // (coalesce is a break-before-make change unsafe without an all-vCPU
         // flush). The structure stays split; no table is reclaimed.
         let mut mgr = manager();
+        mgr.declare_offline_private_image();
         mgr.set_multi_vcpu(true);
         let block = LINUX_MMAP_BASE + 0x60_0000;
         mgr.set_prot_none(block, 0x1000, None).expect("split");
