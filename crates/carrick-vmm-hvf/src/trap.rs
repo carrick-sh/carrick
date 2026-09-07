@@ -20677,26 +20677,40 @@ impl HvpatchFrameInventoryState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn final_exec_physical_extents(
     inventory: &HvpatchFrameInventory,
-    authority_mapping_count: &dyn Fn(carrick_hal::FrameId) -> Result<Option<usize>, TrapError>,
+    authority: &dyn carrick_hal::FrameCowAuthority,
 ) -> Result<std::collections::BTreeSet<(u64, usize)>, TrapError> {
     let frames = inventory.frames.lock();
     let mut physical = std::collections::BTreeSet::new();
     let mut local_stage2_references = std::collections::BTreeMap::new();
-    let mut candidate_frames = std::collections::BTreeSet::new();
+    let mut candidate_frames_set = std::collections::BTreeSet::new();
     for extent in inventory.extents.values() {
         *local_stage2_references
             .entry((extent.stage2_base, extent.stage2_length))
             .or_insert(0usize) += 1;
-        candidate_frames.insert(extent.frame);
+        candidate_frames_set.insert(extent.frame);
     }
+    let candidate_frames: Vec<carrick_hal::FrameId> = candidate_frames_set.into_iter().collect();
+    let (_, frame_counts) = authority
+        .retirement_batch_query(&[], &candidate_frames)
+        .map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "query exec-retirement frame inventory batch: {error}"
+            ))
+        })?;
+    let authoritative_counts: std::collections::BTreeMap<carrick_hal::FrameId, Option<usize>> =
+        candidate_frames
+            .into_iter()
+            .zip(frame_counts.into_iter())
+            .collect();
+
     let mut complete_frames = std::collections::BTreeSet::new();
-    for frame in candidate_frames {
+    for (&frame, authoritative) in &authoritative_counts {
         let backend = frames.references.get(&frame).copied().ok_or_else(|| {
             TrapError::Hypervisor(format!(
                 "HVPatch exec frame {frame:?} has no backend reference"
             ))
         })?;
-        if authority_mapping_count(frame)? == Some(backend) {
+        if *authoritative == Some(backend) {
             complete_frames.insert(frame);
         }
     }
@@ -36434,19 +36448,26 @@ impl HvfVmState {
     fn stage_retirement(
         inventory: &mut HvpatchFrameInventory,
         reservation: &mut carrick_hal::FrameInventoryReservation,
-        authority_mapping_count: &dyn Fn(carrick_hal::FrameId) -> Result<Option<usize>, TrapError>,
+        authority: &dyn carrick_hal::FrameCowAuthority,
     ) -> Result<std::collections::BTreeSet<(u64, u64)>, TrapError> {
-        let transaction = reservation.transaction();
+        let mut candidate_extents = Vec::with_capacity(inventory.extents.len());
+        for (&(gpa, mapping_length), extent) in &inventory.extents {
+            let non_zero_len = std::num::NonZeroU64::new(mapping_length).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch retirement contains empty extent at IPA 0x{gpa:x}"
+                ))
+            })?;
+            candidate_extents.push((
+                extent.mapping,
+                extent.frame,
+                carrick_guest_mem::Gpa(gpa),
+                carrick_hal::FrameLength::from_mapping_extent(non_zero_len),
+            ));
+        }
+
         let mut local_frame_references =
             std::collections::BTreeMap::<carrick_hal::FrameId, usize>::new();
-        for (&(gpa, length), extent) in &inventory.extents {
-            reservation
-                .push(carrick_hal::FrameInventoryEvent::UnmapMapping {
-                    transaction,
-                    mapping: extent.mapping,
-                    generation: Self::inventory_generation(2),
-                })
-                .map_err(Self::reservation_error)?;
+        for extent in inventory.extents.values() {
             let local = local_frame_references.entry(extent.frame).or_default();
             *local = local.checked_add(1).ok_or_else(|| {
                 TrapError::Hypervisor(format!(
@@ -36454,11 +36475,42 @@ impl HvfVmState {
                     extent.frame
                 ))
             })?;
-            if length == 0 {
+        }
+        let candidate_frames: Vec<carrick_hal::FrameId> =
+            local_frame_references.keys().copied().collect();
+
+        let (extent_liveness, frame_counts) = authority
+            .retirement_batch_query(&candidate_extents, &candidate_frames)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "query process-terminal frame inventory retirement batch: {error}"
+                ))
+            })?;
+
+        for (i, &exact_live) in extent_liveness.iter().enumerate() {
+            if !exact_live {
                 return Err(TrapError::Hypervisor(format!(
-                    "HVPatch retirement contains empty extent at IPA 0x{gpa:x}"
+                    "HVPatch process retirement mapping {:?} is not exact-live for retiring mm",
+                    candidate_extents[i].0
                 )));
             }
+        }
+
+        let authoritative_counts: std::collections::BTreeMap<carrick_hal::FrameId, Option<usize>> =
+            candidate_frames
+                .into_iter()
+                .zip(frame_counts.into_iter())
+                .collect();
+
+        let transaction = reservation.transaction();
+        for extent in inventory.extents.values() {
+            reservation
+                .push(carrick_hal::FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping: extent.mapping,
+                    generation: Self::inventory_generation(2),
+                })
+                .map_err(Self::reservation_error)?;
         }
         let mut local_stage2_references = std::collections::BTreeMap::new();
         for extent in inventory.extents.values() {
@@ -36479,7 +36531,7 @@ impl HvfVmState {
                     "HVPatch frame {frame:?} backend reference count underflow"
                 )));
             }
-            let authoritative = authority_mapping_count(frame)?;
+            let authoritative = authoritative_counts.get(&frame).copied().flatten();
             if authoritative == Some(global) {
                 complete_frames.insert(frame);
             }
@@ -36941,32 +36993,11 @@ impl HvfVmState {
             // deliberately retains historical rows and therefore cannot be
             // used to reconstruct one generation at terminal retirement.
             let mut stage2_owners = std::collections::BTreeMap::new();
-            for (&(gpa, mapping_length), extent) in &inventory.extents {
-                let exact_live = authority
-                    .mapping_is_live(
-                        extent.mapping,
-                        extent.frame,
-                        carrick_guest_mem::Gpa(gpa),
-                        carrick_hal::FrameLength::from_mapping_extent(
-                            std::num::NonZeroU64::new(mapping_length).ok_or_else(|| {
-                                TrapError::Hypervisor(
-                                    "HVPatch process retirement inventory has zero-length mapping"
-                                        .to_owned(),
-                                )
-                            })?,
-                        ),
-                    )
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "authenticate HVPatch process retirement mapping {:?} for retiring mm: {error}",
-                            extent.mapping
-                        ))
-                    })?;
-                if !exact_live {
-                    return Err(TrapError::Hypervisor(format!(
-                        "HVPatch process retirement mapping {:?} is not exact-live for retiring mm",
-                        extent.mapping
-                    )));
+            for (&(_gpa, mapping_length), extent) in &inventory.extents {
+                if mapping_length == 0 {
+                    return Err(TrapError::Hypervisor(
+                        "HVPatch process retirement inventory has zero-length mapping".to_owned(),
+                    ));
                 }
                 let ipa = extent.stage2_base;
                 let length = extent.stage2_length;
@@ -37113,13 +37144,6 @@ impl HvfVmState {
                 eprintln!("carrick: FATAL: validated HVPatch retirement reservation disappeared");
                 std::process::abort();
             });
-            let authoritative_mapping_count = |frame| {
-                authority.frame_mapping_count(frame).map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "query process-terminal frame mapping count: {error}"
-                    ))
-                })
-            };
             let diagnostic_extents = if cow_refusal_diagnostics_enabled() {
                 inventory
                     .extents
@@ -37129,11 +37153,8 @@ impl HvfVmState {
             } else {
                 Vec::new()
             };
-            let candidates = Self::stage_retirement(
-                &mut inventory,
-                &mut reservation,
-                &authoritative_mapping_count,
-            )?;
+            let candidates =
+                Self::stage_retirement(&mut inventory, &mut reservation, authority.as_ref())?;
             for (key, extent) in diagnostic_extents {
                 record_cow_inventory_lifecycle(
                     CowDiagnosticLifecycleKind::InventoryRemoved,
@@ -46026,17 +46047,8 @@ impl HvfVmState {
                     "HVPatch exec retirement has no frame inventory authority".to_owned(),
                 )
             })?;
-            let authoritative_mapping_count = |frame| {
-                authority.frame_mapping_count(frame).map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "query exec-retirement frame mapping count: {error}"
-                    ))
-                })
-            };
-            let extents = final_exec_physical_extents(
-                &self.frame_inventory.lock(),
-                &authoritative_mapping_count,
-            )?;
+            let extents =
+                final_exec_physical_extents(&self.frame_inventory.lock(), authority.as_ref())?;
             let replacement = plan
                 .mappings
                 .iter()
@@ -46144,13 +46156,6 @@ impl HvfVmState {
                         "HVPatch exec retirement has no frame inventory authority".to_owned(),
                     )
                 })?;
-                let authoritative_mapping_count = |frame| {
-                    authority.frame_mapping_count(frame).map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "query exec-retirement frame mapping count: {error}"
-                        ))
-                    })
-                };
                 let mut inventory = self.frame_inventory.lock();
                 let diagnostic_extents = if cow_refusal_diagnostics_enabled() {
                     inventory
@@ -46162,7 +46167,7 @@ impl HvfVmState {
                     Vec::new()
                 };
                 if let Err(error) =
-                    Self::stage_retirement(&mut inventory, retired, &authoritative_mapping_count)
+                    Self::stage_retirement(&mut inventory, retired, authority.as_ref())
                 {
                     eprintln!("carrick: FATAL: stage inventory after HVPatch exec unmap: {error}");
                     std::process::abort();
@@ -53785,7 +53790,53 @@ mod frame_inventory_backend_tests {
             frames.stage2_references.insert((0x8000, 0x4000), 1);
         }
 
-        let authoritative = |frame| Ok(Some(if frame == shared { 2 } else { 1 }));
+        struct TestFnAuthority<F>(F);
+        impl<F: Fn(carrick_hal::FrameId) -> Option<usize> + Send + Sync>
+            carrick_hal::FrameCowAuthority for TestFnAuthority<F>
+        {
+            fn quiesce(
+                &self,
+            ) -> Result<
+                Box<dyn carrick_hal::FrameCowQuiesce>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Ok(Box::new(()))
+            }
+            fn reserve(
+                &self,
+                _: usize,
+                _: usize,
+                _: usize,
+            ) -> Result<
+                carrick_hal::FrameInventoryReservation,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Err(Box::new(std::io::Error::other("unused")))
+            }
+            fn apply(
+                &self,
+                _: carrick_hal::FrameInventoryCommit<()>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err(Box::new(std::io::Error::other("unused")))
+            }
+            fn mapping_is_live(
+                &self,
+                _: carrick_hal::MappingId,
+                _: carrick_hal::FrameId,
+                _: carrick_guest_mem::Gpa,
+                _: carrick_hal::FrameLength,
+            ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(true)
+            }
+            fn frame_mapping_count(
+                &self,
+                frame: carrick_hal::FrameId,
+            ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+                Ok((self.0)(frame))
+            }
+        }
+
+        let authoritative = TestFnAuthority(|frame| Some(if frame == shared { 2 } else { 1 }));
         let extents = final_exec_physical_extents(&inventory, &authoritative).unwrap();
         assert_eq!(
             extents,
@@ -53800,7 +53851,8 @@ mod frame_inventory_backend_tests {
             .lock()
             .stage2_references
             .insert((0x4000, 0x4000), 1);
-        let incomplete_authority = |frame| Ok(Some(if frame == shared { 3 } else { 1 }));
+        let incomplete_authority =
+            TestFnAuthority(|frame| Some(if frame == shared { 3 } else { 1 }));
         let extents = final_exec_physical_extents(&inventory, &incomplete_authority).unwrap();
         assert_eq!(
             extents,
