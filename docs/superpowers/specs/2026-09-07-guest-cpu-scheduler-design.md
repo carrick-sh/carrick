@@ -99,6 +99,38 @@ frames genuinely shared across mms.
 nothing to steal) parks on the P's condvar. Fairness between Ps is the
 tick, not `sched_yield`.
 
+
+## Policy interface — an embedder can pass a scheduler
+
+Owner requirement (2026-09-07): `carrick-embed` must accept a scheduler
+from the embedding program, the way `ContainerBuilder` already accepts
+`time(TimeControl)`, `observer(..)`, `interceptor(..)` and
+`network_interposer(..)`.
+
+Split today's `Scheduler` into **mechanism** and **policy**:
+
+- *Mechanism* (stays in `kernel/scheduler.rs`, not pluggable): exact-
+  generation claims, `WakeAdmission`, settlement (`settle_*`), executor
+  registration and audits, close/drain observation counting, the
+  fork/exec/exit transitions. These are correctness invariants; no policy
+  may express a wrong one.
+- *Policy* (`carrick_hal::SchedulingPolicy`, object-safe, `Send + Sync`):
+  `cpu_count()`, `select_cpu(task: &TaskPlacement) -> GuestCpuId` (task id,
+  `last_cpu`, affinity mask, per-CPU load snapshot), `pick_next(cpu) ->
+  Option<TaskKey>` over that CPU's queue view, `steal(cpu) ->
+  Option<(GuestCpuId, TaskKey)>`, `on_tick(cpu) -> Preempt|Continue`,
+  and notification hooks (`on_runnable`, `on_block`, `on_exit`) that carry
+  typed identities only. The default implementation is the GuestCpu
+  policy above (per-CPU queues, last-CPU affinity, stealing).
+
+`ContainerBuilder::scheduler(policy: Arc<dyn SchedulingPolicy>)` installs
+it for that container's carrier; `RunRequest` carries it like
+`TimeControl`. An embedder can therefore run a deterministic scheduler
+(one CPU, FIFO, tick-driven preemption for reproducible tests), a
+priority scheduler, or a host-integrated one that consults its own
+workload. The policy never sees host threads, vCPUs or generations — it
+answers "which guest CPU, which task next", the mechanism does the rest.
+
 ## What this buys, measured against today
 
 | symptom | today | with the design |
@@ -143,3 +175,5 @@ classes; any change to the frame inventory's ownership exactness.
   reserve); propose `2 × nproc` with a `CARRICK_SPARE_EXECUTORS=` hatch.
 - Whether the reactor thread should become the I/O helper pool or stay a
   pure readiness service.
+- Resolved 2026-09-07 (owner): the design is approved, and the policy must
+  be embed-pluggable (section above).
