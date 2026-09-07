@@ -4832,7 +4832,7 @@ pub(crate) const CARRICK_UID_XATTR_NAME: &str = "user.carrick.uid";
 #[allow(dead_code)]
 pub(crate) const CARRICK_GID_XATTR_NAME: &str = "user.carrick.gid";
 
-fn is_internal_carrick_xattr(name: &str) -> bool {
+pub(crate) fn is_internal_carrick_xattr(name: &str) -> bool {
     name.starts_with("user.carrick.")
 }
 
@@ -4842,7 +4842,7 @@ fn is_internal_carrick_xattr(name: &str) -> bool {
 /// runs as root by default, so it may use `trusted.*` (CAP_SYS_ADMIN) just like
 /// the Docker-as-root oracle (CPython test_os's xattr-support probe sets
 /// `trusted.foo`). `system.*`/`security.*` are likewise accepted and round-trip.
-fn is_guest_xattr_namespace(name: &str) -> bool {
+pub(crate) fn is_guest_xattr_namespace(name: &str) -> bool {
     name.starts_with("user.")
         || name.starts_with("trusted.")
         || name.starts_with("security.")

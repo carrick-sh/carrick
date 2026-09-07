@@ -45,7 +45,7 @@ use crate::fs_backend::{
 use crate::linux_abi::LinuxErrno;
 use crate::linux_abi::{
     LINUX_E2BIG, LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
-    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
+    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS, LINUX_EXDEV,
 };
 use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
 use std::sync::Arc;
@@ -391,6 +391,143 @@ impl RootFsVfs {
             _ => {}
         }
         res
+    }
+
+    /// Open a metadata file descriptor for `path` via the dentry cache across layers.
+    pub fn open_metadata_fd(
+        &self,
+        path: &str,
+        follow: bool,
+    ) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, LinuxErrno> {
+        if !self.overlay.serves_dentry_cache() {
+            return Err(LINUX_ENOSYS);
+        }
+        self.dentry_cache
+            .open_metadata_fd(path, follow, &*self.overlay, self.rootfs.as_ref())
+    }
+
+    /// Read xattr for `path` via the dentry cache across layers.
+    pub fn get_xattr(&self, path: &str, name: &str, follow: bool) -> Result<Vec<u8>, LinuxErrno> {
+        use crate::dispatch::HostSyscallResult as _;
+        use crate::fs_backend::{is_guest_xattr_namespace, is_internal_carrick_xattr};
+
+        if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
+            return Err(crate::linux_abi::LINUX_ENODATA);
+        }
+        let cname = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
+        };
+
+        if self.overlay.serves_dentry_cache() {
+            let owned_fd = match self.open_metadata_fd(path, follow) {
+                Ok(fd) => fd,
+                Err(LINUX_EXDEV) => return self.overlay.get_xattr(path, name, follow),
+                Err(e) => return Err(e),
+            };
+            let host_fd = std::os::fd::AsRawFd::as_raw_fd(&*owned_fd);
+            let needed = unsafe {
+                carrick_portable::fgetxattr(host_fd, cname.as_ptr(), std::ptr::null_mut(), 0)
+            };
+            let needed = match needed.host_syscall_errno() {
+                Ok(needed) => needed,
+                Err(err) => return Err(err),
+            };
+            let mut buf = vec![0u8; needed as usize];
+            let n = unsafe {
+                carrick_portable::fgetxattr(
+                    host_fd,
+                    cname.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len() as libc::size_t,
+                )
+            };
+            n.host_syscall_errno().map(|n| {
+                buf.truncate(n as usize);
+                buf
+            })
+        } else {
+            self.overlay.get_xattr(path, name, follow)
+        }
+    }
+
+    /// List xattrs for `path` via the dentry cache across layers.
+    pub fn list_xattr(&self, path: &str, follow: bool) -> Result<Vec<String>, LinuxErrno> {
+        use crate::dispatch::HostSyscallResult as _;
+        use crate::fs_backend::{is_guest_xattr_namespace, is_internal_carrick_xattr};
+
+        fn collect_names(
+            needed: isize,
+            mut read: impl FnMut(&mut [u8]) -> isize,
+        ) -> Result<Vec<String>, LinuxErrno> {
+            let needed = match needed.host_syscall_errno() {
+                Ok(needed) => needed,
+                Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
+                Err(err) => return Err(err),
+            };
+            let mut buf = vec![0u8; needed as usize];
+            let n = match read(&mut buf).host_syscall_errno() {
+                Ok(n) => n,
+                Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
+                Err(err) => return Err(err),
+            };
+            buf.truncate(n as usize);
+            let names = buf
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| std::str::from_utf8(s).ok())
+                .filter(|s| is_guest_xattr_namespace(s) && !is_internal_carrick_xattr(s))
+                .map(|s| s.to_owned())
+                .collect();
+            Ok(names)
+        }
+
+        if self.overlay.serves_dentry_cache() {
+            let owned_fd = match self.open_metadata_fd(path, follow) {
+                Ok(fd) => fd,
+                Err(LINUX_EXDEV) => return self.overlay.list_xattr(path, follow),
+                Err(e) => return Err(e),
+            };
+            let host_fd = std::os::fd::AsRawFd::as_raw_fd(&*owned_fd);
+            let needed = unsafe { carrick_portable::flistxattr(host_fd, std::ptr::null_mut(), 0) };
+            collect_names(needed, |buf| unsafe {
+                carrick_portable::flistxattr(
+                    host_fd,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len() as libc::size_t,
+                )
+            })
+        } else {
+            self.overlay.list_xattr(path, follow)
+        }
+    }
+
+    /// Remove xattr on path via overlay or dentry cache fallback.
+    pub fn remove_xattr(&self, path: &str, name: &str, follow: bool) -> Result<(), LinuxErrno> {
+        use crate::dispatch::HostSyscallResult as _;
+        use crate::fs_backend::{is_guest_xattr_namespace, is_internal_carrick_xattr};
+
+        if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
+            return Err(crate::linux_abi::LINUX_ENODATA);
+        }
+        let inode = self.path_inode_identity(path);
+        let overlay_res = self.overlay.remove_xattr(path, name, follow);
+        if overlay_res.is_ok() {
+            self.dentry_cache.inode_changed(path, inode);
+            return Ok(());
+        }
+        if self.overlay.serves_dentry_cache() && matches!(overlay_res, Err(LINUX_ENOENT)) {
+            if let Ok(owned_fd) = self.open_metadata_fd(path, follow) {
+                let cname = match std::ffi::CString::new(name) {
+                    Ok(c) => c,
+                    Err(_) => return Err(crate::linux_abi::LINUX_EINVAL),
+                };
+                let host_fd = std::os::fd::AsRawFd::as_raw_fd(&*owned_fd);
+                let rc = unsafe { carrick_portable::fremovexattr(host_fd, cname.as_ptr()) };
+                return rc.host_syscall_errno().map(|_| ());
+            }
+        }
+        overlay_res
     }
 
     /// Set xattr on path and update dentry cache.
@@ -2672,5 +2809,28 @@ mod tests {
         // 8. Rmdir
         vfs.rmdir("/dir").unwrap();
         assert!(vfs.dentry_stat("/dir", false).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lower_layer_xattr_returns_enodata() {
+        let lower = tempfile::TempDir::new().unwrap();
+        let upper = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.path().join("usr/lib")).unwrap();
+        std::fs::write(lower.path().join("usr/lib/libtest.so"), b"elf").unwrap();
+
+        let vfs = host_lower_vfs(lower.path(), upper.path());
+        assert_eq!(
+            vfs.get_xattr("/usr/lib", "user.x", true),
+            Err(crate::linux_abi::LINUX_ENODATA)
+        );
+        assert_eq!(
+            vfs.get_xattr("/usr/lib/libtest.so", "user.x", true),
+            Err(crate::linux_abi::LINUX_ENODATA)
+        );
+        assert_eq!(
+            vfs.list_xattr("/usr/lib", true).unwrap(),
+            Vec::<String>::new()
+        );
     }
 }

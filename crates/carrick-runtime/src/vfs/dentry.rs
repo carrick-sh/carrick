@@ -1408,6 +1408,65 @@ impl DentryCache {
         ))
     }
 
+    /// Open a metadata file descriptor for `path`, resolving through the dentry cache
+    /// across both upper and lower layers.
+    pub fn open_metadata_fd(
+        &self,
+        path: &str,
+        follow: bool,
+        backend: &dyn FsBackend,
+        rootfs: Option<&RootFs>,
+    ) -> Result<Arc<OwnedFd>, LinuxErrno> {
+        self.check_fork();
+        let resolved = self.lookup_path(path, follow, backend, rootfs)?;
+        if resolved.dentry.id == Some(DentryId::ROOT) {
+            let fd = {
+                let mut dirs = self.dirs.write();
+                let d = dirs.get_mut(&DentryId::ROOT).ok_or(LINUX_ENOENT)?;
+                if d.upper_dir_fd.is_none() {
+                    d.upper_dir_fd = backend.dir_fd_for(Path::new(""));
+                }
+                if d.lower_dir_fd.is_none() {
+                    d.lower_dir_fd = rootfs
+                        .and_then(|rf| rf.immutable_backend())
+                        .and_then(|b| b.dir_fd_for(Path::new("")));
+                }
+                d.upper_dir_fd.as_ref().or(d.lower_dir_fd.as_ref()).cloned()
+            }
+            .ok_or(LINUX_ENOENT)?;
+            let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            if raw < 0 {
+                return Err(crate::host_to_linux_errno(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO),
+                ));
+            }
+            return Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }));
+        }
+
+        let parent_fd = resolved.parent_dir_fd.ok_or(LINUX_ENOENT)?;
+        #[cfg(target_os = "macos")]
+        let nofollow = if follow { 0 } else { libc::O_SYMLINK };
+        #[cfg(not(target_os = "macos"))]
+        let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                resolved.leaf_name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | nofollow,
+            )
+        };
+        if raw < 0 {
+            return Err(crate::host_to_linux_errno(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            ));
+        }
+        Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+    }
+
     /// Get cached inode record or refresh it from disk/backend.
     pub fn get_or_refresh_inode(
         &self,
