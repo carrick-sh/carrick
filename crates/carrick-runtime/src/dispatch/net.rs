@@ -6970,7 +6970,8 @@ impl SyscallDispatcher {
                 }
             } else {
                 // Mixed / synthetic fds: kernel WaitSet.
-                let wait_set = crate::kernel::WaitSet::with_wake_pipe();
+                let wait_set = crate::kernel::WaitSet::for_current_executor();
+                let _task_sub = wait_set.enroll_task(cx.kernel.task());
                 let mut _enrollments = Vec::new();
                 let mut host_fds: Vec<(i32, i16)> = Vec::new();
 
@@ -7385,7 +7386,8 @@ impl SyscallDispatcher {
             }
 
             // Mixed / synthetic fds: kernel WaitSet.
-            let wait_set = crate::kernel::WaitSet::with_wake_pipe();
+            let wait_set = crate::kernel::WaitSet::for_current_executor();
+            let _task_sub = wait_set.enroll_task(cx.kernel.task());
             let mut _enrollments = Vec::new();
             let mut host_fds: Vec<(i32, i16)> = Vec::new();
 

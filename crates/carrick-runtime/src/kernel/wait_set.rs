@@ -110,12 +110,92 @@ pub enum WaitSetOutcome {
     Interrupted,
 }
 
+/// A persistent wake pipe owned by an executor host thread.
+///
+/// Allocated once per host thread (via thread-local storage) and reused across syscalls,
+/// avoiding any per-syscall host file descriptor allocation.
+#[derive(Debug)]
+pub struct ExecutorWakePipe {
+    read_fd: HostFdRef,
+    write_fd: HostFdRef,
+}
+
+impl ExecutorWakePipe {
+    /// Create a new executor wake pipe with non-blocking, cloexec descriptors.
+    pub fn new() -> Option<Self> {
+        make_readiness_pipe().map(|(read_fd, write_fd)| Self { read_fd, write_fd })
+    }
+
+    /// The host read descriptor to include in `libc::poll`.
+    pub fn read_fd(&self) -> i32 {
+        self.read_fd.raw()
+    }
+
+    /// The host write descriptor used to wake a waiting thread.
+    pub fn write_fd(&self) -> i32 {
+        self.write_fd.raw()
+    }
+
+    /// Wake any thread blocked on this pipe by writing a single byte.
+    pub fn wake(&self) {
+        let byte = 1u8;
+        loop {
+            let rc = unsafe {
+                libc::write(
+                    self.write_fd.raw(),
+                    &byte as *const _ as *const libc::c_void,
+                    1,
+                )
+            };
+            if rc >= 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error().raw_os_error();
+            if err == Some(libc::EINTR) {
+                continue;
+            }
+            // EAGAIN / EWOULDBLOCK: pipe is full, reader will wake regardless.
+            break;
+        }
+    }
+
+    /// Drain all pending bytes from the pipe so it does not report readiness immediately.
+    pub fn drain(&self) {
+        let mut buf = [0u8; 128];
+        loop {
+            let rc = unsafe {
+                libc::read(
+                    self.read_fd.raw(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if rc > 0 {
+                continue;
+            }
+            if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+    }
+}
+
+thread_local! {
+    static CURRENT_EXECUTOR_WAKE_PIPE: Option<Arc<ExecutorWakePipe>> = ExecutorWakePipe::new().map(Arc::new);
+}
+
+/// Retrieve or initialize the thread-local [`ExecutorWakePipe`] for the calling host thread.
+pub fn current_executor_wake_pipe() -> Option<Arc<ExecutorWakePipe>> {
+    CURRENT_EXECUTOR_WAKE_PIPE.with(|cell| cell.clone())
+}
+
 #[derive(Debug)]
 pub struct WaitSetInner {
     notified: AtomicBool,
     lock: Mutex<()>,
     condvar: Condvar,
-    wake_pipe: Option<(HostFdRef, HostFdRef)>,
+    wake_pipe: Option<Arc<ExecutorWakePipe>>,
 }
 
 impl WaitSetInner {
@@ -125,8 +205,8 @@ impl WaitSetInner {
             let _guard = self.lock.lock();
             self.condvar.notify_all();
         }
-        if let Some((_, write_fd)) = &self.wake_pipe {
-            let _ = unsafe { libc::write(write_fd.raw(), [1u8].as_ptr() as *const _, 1) };
+        if let Some(pipe) = &self.wake_pipe {
+            pipe.wake();
         }
     }
 }
@@ -156,17 +236,29 @@ impl WaitSet {
         }
     }
 
-    /// Create a wait set equipped with a host wake pipe for multiplexing host descriptors.
-    pub fn with_wake_pipe() -> Self {
-        let wake_pipe = make_readiness_pipe();
+    /// Create a wait set equipped with an explicit executor wake pipe.
+    pub fn with_executor_pipe(pipe: Option<Arc<ExecutorWakePipe>>) -> Self {
+        if let Some(p) = &pipe {
+            p.drain();
+        }
         Self {
             inner: Arc::new(WaitSetInner {
                 notified: AtomicBool::new(false),
                 lock: Mutex::new(()),
                 condvar: Condvar::new(),
-                wake_pipe,
+                wake_pipe: pipe,
             }),
         }
+    }
+
+    /// Create a wait set equipped with the calling thread's cached [`ExecutorWakePipe`].
+    pub fn for_current_executor() -> Self {
+        Self::with_executor_pipe(current_executor_wake_pipe())
+    }
+
+    /// Legacy / compatibility constructor: aliases [`Self::for_current_executor`].
+    pub fn with_wake_pipe() -> Self {
+        Self::for_current_executor()
     }
 
     /// Wake this wait set immediately.
@@ -177,6 +269,32 @@ impl WaitSet {
     /// Enroll this wait set with a [`WaitQueue`].
     pub fn enroll(&self, queue: &WaitQueue) -> WaitEnrollment {
         queue.enroll(self)
+    }
+
+    /// Enroll a task's wake notifications with this wait set.
+    /// When the task is woken (e.g. by a signal), this wait set is notified.
+    pub fn enroll_task(
+        &self,
+        task: &crate::kernel::Task,
+    ) -> crate::kernel::objects::TaskWakeSubscription {
+        let ws = self.clone();
+        loop {
+            let observed = task.wake_generation();
+            let callback: std::sync::Arc<dyn Fn(u64) + Send + Sync + 'static> = {
+                let ws = ws.clone();
+                std::sync::Arc::new(move |_| {
+                    ws.wake();
+                })
+            };
+            match task.subscribe_wake(observed, callback) {
+                crate::kernel::objects::TaskWakeEnrollment::Ready(_) => {
+                    self.wake();
+                }
+                crate::kernel::objects::TaskWakeEnrollment::Subscribed(sub) => {
+                    return sub;
+                }
+            }
+        }
     }
 
     /// Wait for a notification, timeout, or signal interruption.
@@ -197,10 +315,13 @@ impl WaitSet {
         // Check if already notified before sleeping (closes race window!)
         if self.inner.notified.swap(false, Ordering::SeqCst) {
             self.drain_wake_pipe();
+            if is_interrupted() {
+                return WaitSetOutcome::Interrupted;
+            }
             return WaitSetOutcome::Woken;
         }
 
-        if host_fds.is_empty() && self.inner.wake_pipe.is_none() {
+        let outcome = if host_fds.is_empty() && self.inner.wake_pipe.is_none() {
             // Pure in-memory condvar path
             let mut guard = self.inner.lock.lock();
             match timeout {
@@ -212,35 +333,47 @@ impl WaitSet {
                         self.inner.condvar.wait(&mut guard);
                     }
                     self.inner.notified.store(false, Ordering::SeqCst);
-                    WaitSetOutcome::Woken
+                    if is_interrupted() {
+                        WaitSetOutcome::Interrupted
+                    } else {
+                        WaitSetOutcome::Woken
+                    }
                 }
                 Some(duration) => {
                     let deadline = Instant::now() + duration;
                     loop {
                         if is_interrupted() {
-                            return WaitSetOutcome::Interrupted;
+                            break WaitSetOutcome::Interrupted;
                         }
                         if self.inner.notified.swap(false, Ordering::SeqCst) {
-                            return WaitSetOutcome::Woken;
+                            if is_interrupted() {
+                                break WaitSetOutcome::Interrupted;
+                            }
+                            break WaitSetOutcome::Woken;
                         }
                         let now = Instant::now();
                         if now >= deadline {
-                            return WaitSetOutcome::Timeout;
+                            break WaitSetOutcome::Timeout;
                         }
                         let remaining = deadline - now;
                         let result = self.inner.condvar.wait_for(&mut guard, remaining);
                         if self.inner.notified.swap(false, Ordering::SeqCst) {
-                            return WaitSetOutcome::Woken;
+                            if is_interrupted() {
+                                break WaitSetOutcome::Interrupted;
+                            }
+                            break WaitSetOutcome::Woken;
                         }
                         if result.timed_out() || Instant::now() >= deadline {
-                            return WaitSetOutcome::Timeout;
+                            break WaitSetOutcome::Timeout;
                         }
                     }
                 }
             }
         } else {
             self.wait_host_poll(host_fds, timeout, is_interrupted)
-        }
+        };
+        self.drain_wake_pipe();
+        outcome
     }
 
     fn wait_host_poll(
@@ -249,7 +382,7 @@ impl WaitSet {
         timeout: Option<Duration>,
         is_interrupted: impl Fn() -> bool,
     ) -> WaitSetOutcome {
-        let wake_read_fd = self.inner.wake_pipe.as_ref().map(|(r, _)| r.raw());
+        let wake_read_fd = self.inner.wake_pipe.as_ref().map(|p| p.read_fd());
         let mut pollfds: Vec<libc::pollfd> = host_fds
             .iter()
             .map(|(fd, events)| libc::pollfd {
@@ -273,6 +406,9 @@ impl WaitSet {
             }
             if self.inner.notified.swap(false, Ordering::SeqCst) {
                 self.drain_wake_pipe();
+                if is_interrupted() {
+                    return WaitSetOutcome::Interrupted;
+                }
                 return WaitSetOutcome::Woken;
             }
 
@@ -305,10 +441,17 @@ impl WaitSet {
                     if let Some(wp) = pollfds.iter().find(|p| p.fd == rfd) {
                         if wp.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
                             self.drain_wake_pipe();
+                            if is_interrupted() {
+                                self.inner.notified.store(false, Ordering::SeqCst);
+                                return WaitSetOutcome::Interrupted;
+                            }
                         }
                     }
                 }
                 self.inner.notified.store(false, Ordering::SeqCst);
+                if is_interrupted() {
+                    return WaitSetOutcome::Interrupted;
+                }
                 return WaitSetOutcome::Woken;
             } else if rc == 0 {
                 return WaitSetOutcome::Timeout;
@@ -327,9 +470,8 @@ impl WaitSet {
     }
 
     fn drain_wake_pipe(&self) {
-        if let Some((read_fd, _)) = &self.inner.wake_pipe {
-            let mut buf = [0u8; 64];
-            while unsafe { libc::read(read_fd.raw(), buf.as_mut_ptr() as *mut _, buf.len()) } > 0 {}
+        if let Some(pipe) = &self.inner.wake_pipe {
+            pipe.drain();
         }
     }
 }
