@@ -421,6 +421,25 @@ impl RootFsVfs {
         res
     }
 
+    /// Set mode on an open host file descriptor and update dentry cache.
+    pub fn fset_mode(&self, raw_fd: std::os::fd::RawFd, mode: u32) {
+        crate::fs_backend::fset_mode(raw_fd, mode);
+        self.overlay.note_meta_xattr_written();
+        self.invalidate_host_fd(raw_fd);
+    }
+
+    /// Set owner on an open host file descriptor and update dentry cache.
+    pub fn fset_owner(
+        &self,
+        raw_fd: std::os::fd::RawFd,
+        uid: Option<carrick_abi::NsUid>,
+        gid: Option<carrick_abi::NsGid>,
+    ) {
+        crate::fs_backend::fset_owner_xattr(raw_fd, uid, gid);
+        self.overlay.note_meta_xattr_written();
+        self.invalidate_host_fd(raw_fd);
+    }
+
     /// Set times on path and update dentry cache.
     pub fn set_times(
         &self,
@@ -2934,5 +2953,37 @@ mod tests {
             vfs.list_xattr("/usr/lib", true).unwrap(),
             Vec::<String>::new()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_rootfs_vfs_fset_owner_and_fset_mode() {
+        use std::os::fd::AsRawFd;
+        let scratch = tempfile::tempdir().unwrap();
+        let mut vfs = RootFsVfs::new();
+        vfs.set_overlay(Box::new(HostFsBackend::from_path(scratch.path()).unwrap()));
+
+        vfs.create_file("/testfile").unwrap();
+        let (fd, st, _, _) = vfs.dentry_fast_open("/testfile", true).unwrap();
+
+        // Initial mode and owner
+        assert_eq!(st.mode & 0o777, 0o644);
+        assert_eq!(st.uid, carrick_abi::NsUid::ROOT);
+        assert_eq!(st.gid, carrick_abi::NsGid::ROOT);
+
+        // Mutate mode via fset_mode
+        vfs.fset_mode(fd.as_raw_fd(), 0o755);
+        let st2 = vfs.dentry_stat("/testfile", false).unwrap();
+        assert_eq!(st2.mode & 0o777, 0o755);
+
+        // Mutate owner via fset_owner
+        vfs.fset_owner(
+            fd.as_raw_fd(),
+            Some(carrick_abi::NsUid::new(1001)),
+            Some(carrick_abi::NsGid::new(1002)),
+        );
+        let st3 = vfs.dentry_stat("/testfile", false).unwrap();
+        assert_eq!(st3.uid, carrick_abi::NsUid::new(1001));
+        assert_eq!(st3.gid, carrick_abi::NsGid::new(1002));
     }
 }

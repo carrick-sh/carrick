@@ -7906,8 +7906,7 @@ impl SyscallDispatcher {
             self.dnotify_attrib(context, &path);
         }
         if let Some(raw_fd) = raw_host_fd {
-            crate::fs_backend::fset_owner_xattr(raw_fd, uid, gid);
-            self.invalidate_dentry_host_fd(raw_fd);
+            self.fs.rootfs_vfs.fset_owner(raw_fd, uid, gid);
         }
         DispatchOutcome::Returned { value: 0 }
     }
@@ -15909,8 +15908,7 @@ impl SyscallDispatcher {
                             }
                             OpenDescription::HostFile { host_fd, metadata, .. } => {
                                 metadata.mode = mode;
-                                crate::fs_backend::fset_mode_xattr(host_fd.raw(), mode);
-                                this.invalidate_dentry_host_fd(host_fd.raw());
+                                this.fs.rootfs_vfs.fset_mode(host_fd.raw(), mode);
                             }
                             _ => {}
                         }
