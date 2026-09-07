@@ -45,7 +45,8 @@ use crate::fs_backend::{
 use crate::linux_abi::LinuxErrno;
 use crate::linux_abi::{
     LINUX_E2BIG, LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
-    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS, LINUX_EXDEV,
+    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS, LINUX_EXDEV, LINUX_S_IFBLK,
+    LINUX_S_IFCHR, LINUX_S_IFMT,
 };
 use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
 use std::sync::Arc;
@@ -215,6 +216,52 @@ impl RootFsVfs {
         } else {
             None
         }
+    }
+
+    /// Get or fill cached inode record for an open host fd and its stat.
+    pub fn get_or_fill_host_inode(
+        &self,
+        host_fd: i32,
+        st: &libc::stat,
+    ) -> crate::vfs::dentry::InodeRecord {
+        let dev = st.st_dev as u64;
+        let ino = st.st_ino;
+        if let Some(record) = self.dentry_cache.get_inode_record(dev, ino) {
+            return record;
+        }
+
+        // Cache miss: read host metadata xattrs once from host_fd.
+        let mode_xattr = crate::fs_backend::fget_mode_xattr(host_fd);
+        let (mode, dev_type, rdev) = match mode_xattr {
+            Some(m) => {
+                let type_bits = m & LINUX_S_IFMT;
+                if type_bits == LINUX_S_IFCHR || type_bits == LINUX_S_IFBLK {
+                    let rdev = crate::fs_backend::fget_rdev_xattr(host_fd).unwrap_or(0);
+                    (m & 0o7777, type_bits, rdev)
+                } else {
+                    (m & 0o7777, 0, 0)
+                }
+            }
+            None => (st.st_mode as u32 & 0o7777, 0, 0),
+        };
+        let (uid, gid) = crate::fs_backend::fget_owner_xattr(host_fd);
+        let uid = uid.unwrap_or(carrick_abi::NsUid::ROOT);
+        let gid = gid.unwrap_or(carrick_abi::NsGid::ROOT);
+
+        let record = crate::vfs::dentry::InodeRecord {
+            mode,
+            uid,
+            gid,
+            size: st.st_size as u64,
+            atime: (st.st_atime, carrick_portable::stat_atime_nsec(st)),
+            mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
+            ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
+            nlink: st.st_nlink as u32,
+            rdev,
+            dev_type,
+        };
+        self.dentry_cache.insert_inode_record(dev, ino, record);
+        record
     }
 
     /// Invalidate dentry/inode cache entry for an open host fd.
@@ -429,10 +476,7 @@ impl RootFsVfs {
             let needed = unsafe {
                 carrick_portable::fgetxattr(host_fd, cname.as_ptr(), std::ptr::null_mut(), 0)
             };
-            let needed = match needed.host_syscall_errno() {
-                Ok(needed) => needed,
-                Err(err) => return Err(err),
-            };
+            let needed = needed.host_syscall_errno()?;
             let mut buf = vec![0u8; needed as usize];
             let n = unsafe {
                 carrick_portable::fgetxattr(
@@ -524,7 +568,11 @@ impl RootFsVfs {
                 };
                 let host_fd = std::os::fd::AsRawFd::as_raw_fd(&*owned_fd);
                 let rc = unsafe { carrick_portable::fremovexattr(host_fd, cname.as_ptr()) };
-                return rc.host_syscall_errno().map(|_| ());
+                let res = rc.host_syscall_errno().map(|_| ());
+                if res.is_ok() {
+                    self.dentry_cache.inode_changed(path, inode);
+                }
+                return res;
             }
         }
         overlay_res

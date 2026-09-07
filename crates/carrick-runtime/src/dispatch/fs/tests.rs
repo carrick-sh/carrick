@@ -1755,6 +1755,97 @@ fn immutable_lower_directory_path_stat_matches_its_fd_stat() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn fstat_caches_host_xattrs_and_invalidates_on_mutators() {
+    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+    let fd = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/walk/file.txt",
+        0,
+    );
+    assert!(fd >= 0);
+
+    // Initial fstat
+    crate::fs_backend::reset_host_xattr_read_count();
+    let st1 = dispatcher.fd_stat_record(fd as i32).unwrap();
+    assert_eq!(st1.mode & 0o7777, 0o4711);
+    assert_eq!(st1.uid.raw(), 7);
+    assert_eq!(st1.gid.raw(), 9);
+
+    // Repeat fstat: MUST be 0 host xattr reads!
+    let reads_before = crate::fs_backend::host_xattr_read_count();
+    let st2 = dispatcher.fd_stat_record(fd as i32).unwrap();
+    let reads_after = crate::fs_backend::host_xattr_read_count();
+    assert_eq!(
+        reads_after, reads_before,
+        "repeat fstat must perform 0 host xattr reads"
+    );
+    assert_eq!(st1, st2);
+
+    // Mutator: fchmod
+    const SYS_FCHMOD: u64 = 52;
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        SYS_FCHMOD,
+        [fd as u64, 0o644, 0, 0, 0, 0],
+    );
+    assert_eq!(rc, 0);
+
+    // fstat after mutator: must reflect updated mode AND force a refresh
+    crate::fs_backend::reset_host_xattr_read_count();
+    let st3 = dispatcher.fd_stat_record(fd as i32).unwrap();
+    assert_eq!(st3.mode & 0o7777, 0o644);
+    assert!(
+        crate::fs_backend::host_xattr_read_count() > 0,
+        "fstat after mutator must refresh"
+    );
+
+    // Repeat fstat again: MUST be 0 host xattr reads!
+    let reads_before = crate::fs_backend::host_xattr_read_count();
+    let st4 = dispatcher.fd_stat_record(fd as i32).unwrap();
+    let reads_after = crate::fs_backend::host_xattr_read_count();
+    assert_eq!(
+        reads_after, reads_before,
+        "repeat fstat must perform 0 host xattr reads"
+    );
+    assert_eq!(st3, st4);
+
+    // Mutator: fchown
+    const SYS_FCHOWN: u64 = 55;
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        SYS_FCHOWN,
+        [fd as u64, 42, 84, 0, 0, 0],
+    );
+    assert_eq!(rc, 0);
+
+    // fstat after fchown: must reflect updated owner AND force a refresh
+    crate::fs_backend::reset_host_xattr_read_count();
+    let st5 = dispatcher.fd_stat_record(fd as i32).unwrap();
+    assert_eq!(st5.uid.raw(), 42);
+    assert_eq!(st5.gid.raw(), 84);
+    assert!(
+        crate::fs_backend::host_xattr_read_count() > 0,
+        "fstat after fchown must refresh"
+    );
+
+    // Repeat fstat again: MUST be 0 host xattr reads!
+    let reads_before = crate::fs_backend::host_xattr_read_count();
+    let st6 = dispatcher.fd_stat_record(fd as i32).unwrap();
+    let reads_after = crate::fs_backend::host_xattr_read_count();
+    assert_eq!(
+        reads_after, reads_before,
+        "repeat fstat must perform 0 host xattr reads"
+    );
+    assert_eq!(st5, st6);
+}
+
 /// A lower-only file's `st_mtime`/`st_nlink` must come from the real host
 /// inode too. The path lane reported `mtime=0`/`nlink=1` for every untouched
 /// image file, so `make`-style newer-than comparisons saw the epoch.
@@ -7281,7 +7372,7 @@ fn test_stat_and_lookup_dot_leaf() {
             LINUX_AT_FDCWD,
             0x4000,
             0x7000,
-            crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW as u64,
+            crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW,
             0,
             0,
         ],
@@ -7313,7 +7404,7 @@ fn test_stat_and_lookup_dot_leaf() {
             LINUX_AT_FDCWD,
             0x4000,
             0x7000,
-            crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW as u64,
+            crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW,
             0,
             0,
         ],
@@ -7334,7 +7425,7 @@ fn test_stat_and_lookup_dot_leaf() {
             LINUX_AT_FDCWD,
             0x4000,
             0x7000,
-            crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW as u64,
+            crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW,
             0,
             0,
         ],
