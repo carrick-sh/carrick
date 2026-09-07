@@ -167,6 +167,7 @@ pub(crate) struct ForeignMmMutationAuthority {
     coordinator: Arc<MmMutationCoordinator>,
     census: Arc<crate::kernel::GuestExecutorCensus>,
     stage1: Arc<crate::hvpatch::Stage1MmLease>,
+    pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
 }
 
 #[allow(dead_code)] // Installed now; canonical process_vm consumer lands in Task 8.
@@ -176,6 +177,7 @@ impl ForeignMmMutationAuthority {
         coordinator: Arc<MmMutationCoordinator>,
         census: Arc<crate::kernel::GuestExecutorCensus>,
         stage1: Arc<crate::hvpatch::Stage1MmLease>,
+        pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
     ) -> Self {
         assert_eq!(
             coordinator.mm, mm,
@@ -186,6 +188,7 @@ impl ForeignMmMutationAuthority {
             coordinator,
             census,
             stage1,
+            pt_quiesce,
         }
     }
 
@@ -199,6 +202,7 @@ impl ForeignMmMutationAuthority {
         operation: impl FnOnce(&mut MmMutationGuard<'_>) -> T,
     ) -> Result<T, ForeignMmMutationError> {
         crate::vcpu_loop::with_foreign_mm_mutation_guard(
+            &self.pt_quiesce,
             self.mm,
             Arc::clone(&self.coordinator),
             &self.census,

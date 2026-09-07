@@ -68,11 +68,46 @@ pub fn barrier() -> &'static QuiesceBarrier {
     B.get_or_init(QuiesceBarrier::new)
 }
 
-/// True while a fork quiesce is in progress. Blocking waits OR this into their
+thread_local! {
+    static CURRENT_MM_QUIESCE: std::cell::RefCell<Option<Arc<PtQuiesce>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII token that binds the current thread's MM-scoped stage-1 quiesce barrier.
+pub struct CurrentMmQuiesceGuard {
+    prev: Option<Arc<PtQuiesce>>,
+}
+
+impl Drop for CurrentMmQuiesceGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        CURRENT_MM_QUIESCE.with(|cell| {
+            *cell.borrow_mut() = prev;
+        });
+    }
+}
+
+/// Bind the current thread's MM-scoped stage-1 page table quiesce barrier.
+pub fn bind_current_mm_quiesce(barrier: Arc<PtQuiesce>) -> CurrentMmQuiesceGuard {
+    let prev = CURRENT_MM_QUIESCE.with(|cell| cell.borrow_mut().replace(barrier));
+    CurrentMmQuiesceGuard { prev }
+}
+
+/// Returns the current thread's bound MM-scoped stage-1 quiesce barrier, if any.
+pub fn current_mm_quiesce() -> Option<Arc<PtQuiesce>> {
+    CURRENT_MM_QUIESCE.with(|cell| cell.borrow().clone())
+}
+
+/// Returns true if the current thread's MM is currently quiescing for a stage-1 edit.
+pub fn is_current_mm_quiescing() -> bool {
+    CURRENT_MM_QUIESCE.with(|cell| cell.borrow().as_ref().is_some_and(|pt| pt.is_quiescing()))
+}
+
+/// True while a fork quiesce is in progress, or the current thread's MM is
+/// quiescing for a stage-1 page-table edit. Blocking waits OR this into their
 /// wake predicate so they return (spurious EINTR) and reach the run-loop-top
 /// barrier instead of re-parking.
 pub fn is_quiescing() -> bool {
-    barrier().is_quiescing()
+    barrier().is_quiescing() || is_current_mm_quiescing()
 }
 
 /// Serializes HVF VM-topology mutations: a sibling thread building its vCPU vs.
@@ -887,9 +922,9 @@ impl QuiesceBarrier {
 /// its vCPU) at its run-loop top before re-entering guest, waits until no
 /// sibling is in-guest (via the kicker's in_guest flags — not a count), edits,
 /// then resumes. Distinct from fork's quiesce (which tears vCPUs down).
-pub fn pt_barrier() -> &'static PtQuiesce {
-    static B: OnceLock<PtQuiesce> = OnceLock::new();
-    B.get_or_init(PtQuiesce::new)
+pub fn pt_barrier() -> &'static Arc<PtQuiesce> {
+    static B: OnceLock<Arc<PtQuiesce>> = OnceLock::new();
+    B.get_or_init(|| Arc::new(PtQuiesce::new()))
 }
 
 #[derive(Debug)]
@@ -1092,15 +1127,18 @@ impl PtQuiesce {
     /// for siblings to leave guest. Dropping the guard calls `end`, so the pause
     /// is released on EVERY exit path of the editing syscall (incl. `?`-errors).
     /// `tid` is the editor, recorded so the drop can fire `pt-pause-end`.
-    pub fn pause_guard(&'static self, tid: carrick_hal::ThreadId) -> PtPauseGuard {
-        PtPauseGuard { barrier: self, tid }
+    pub fn pause_guard(self: &Arc<Self>, tid: carrick_hal::ThreadId) -> PtPauseGuard {
+        PtPauseGuard {
+            barrier: Arc::clone(self),
+            tid,
+        }
     }
 }
 
 /// RAII handle that ends a page-table-edit pause (resuming sibling vCPUs) when
 /// dropped. Held for the duration of the table-editing syscall.
 pub struct PtPauseGuard {
-    barrier: &'static PtQuiesce,
+    barrier: Arc<PtQuiesce>,
     tid: carrick_hal::ThreadId,
 }
 
@@ -1567,7 +1605,7 @@ mod tests {
 
     #[test]
     fn pt_pause_publishes_exact_invalidation_and_waits_for_owner_ack() {
-        let barrier: &'static PtQuiesce = Box::leak(Box::new(PtQuiesce::new()));
+        let barrier = Arc::new(PtQuiesce::new());
         let tid = carrick_hal::ThreadId::synthetic_for_tests(801);
         assert!(barrier.try_become_coordinator());
         barrier.set_quiescing();
@@ -1575,8 +1613,9 @@ mod tests {
         let serviced = Arc::new(AtomicBool::new(false));
         let worker_serviced = Arc::clone(&serviced);
         let identity = invalidation_identity(13, 17, 23, 0x8000, 29);
+        let worker_barrier = Arc::clone(&barrier);
         let worker = std::thread::spawn(move || {
-            barrier.park_servicing_exact_invalidation(identity.stage1(), tid, |request| {
+            worker_barrier.park_servicing_exact_invalidation(identity.stage1(), tid, |request| {
                 assert_eq!(request.identity(), identity);
                 worker_serviced.store(true, Ordering::SeqCst);
                 Ok(())
@@ -1600,7 +1639,7 @@ mod tests {
 
     #[test]
     fn pt_pause_invalidation_fails_closed_on_owner_failure_or_timeout() {
-        let failed_barrier: &'static PtQuiesce = Box::leak(Box::new(PtQuiesce::new()));
+        let failed_barrier = Arc::new(PtQuiesce::new());
         let failed_tid = carrick_hal::ThreadId::synthetic_for_tests(811);
         assert!(failed_barrier.try_become_coordinator());
         failed_barrier.set_quiescing();
@@ -1609,8 +1648,9 @@ mod tests {
         let service_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_calls = Arc::clone(&service_calls);
         let failed_identity = invalidation_identity(15, 19, 29, 0xa000, 31);
+        let worker_barrier = Arc::clone(&failed_barrier);
         let worker = std::thread::spawn(move || {
-            failed_barrier.park_servicing_exact_invalidation(
+            worker_barrier.park_servicing_exact_invalidation(
                 failed_identity.stage1(),
                 failed_tid,
                 |_| {
@@ -1644,7 +1684,7 @@ mod tests {
         drop(failed_guard);
         worker.join().expect("failed worker resumes after rollback");
 
-        let timeout_barrier: &'static PtQuiesce = Box::leak(Box::new(PtQuiesce::new()));
+        let timeout_barrier = Arc::new(PtQuiesce::new());
         let missing_tid = carrick_hal::ThreadId::synthetic_for_tests(821);
         assert!(timeout_barrier.try_become_coordinator());
         timeout_barrier.set_quiescing();
@@ -1693,23 +1733,25 @@ mod tests {
                 NonZeroU64::new(29).unwrap(),
             ),
         );
-        let barrier: &'static PtQuiesce = Box::leak(Box::new(PtQuiesce::new()));
+        let barrier = Arc::new(PtQuiesce::new());
         let tid = carrick_hal::ThreadId::synthetic_for_tests(831);
         assert!(barrier.try_become_coordinator());
         barrier.set_quiescing();
         let guard = barrier.pause_guard(carrick_hal::ThreadId::synthetic_for_tests(830));
         let wrong_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let wrong_worker_calls = Arc::clone(&wrong_calls);
+        let worker_barrier1 = Arc::clone(&barrier);
         let wrong_worker = std::thread::spawn(move || {
-            barrier.park_servicing_exact_invalidation(recycled_stage1, tid, |_| {
+            worker_barrier1.park_servicing_exact_invalidation(recycled_stage1, tid, |_| {
                 wrong_worker_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
         });
         let right_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let right_worker_calls = Arc::clone(&right_calls);
+        let worker_barrier2 = Arc::clone(&barrier);
         let right_worker = std::thread::spawn(move || {
-            barrier.park_servicing_exact_invalidation(old_stage1, tid, |observed| {
+            worker_barrier2.park_servicing_exact_invalidation(old_stage1, tid, |observed| {
                 assert_eq!(observed.identity(), request);
                 right_worker_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())

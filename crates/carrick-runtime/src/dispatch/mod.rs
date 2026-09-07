@@ -2484,6 +2484,7 @@ pub(crate) struct DispatchMmAuthority {
     host_alias_transactions: Arc<HostAliasTransactions>,
     mutation_coordinator: Arc<mm_mutation::MmMutationCoordinator>,
     guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
+    pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
     /// The `guest_realtime_epoch()` under which THIS MM's vvar
     /// `VVAR_OFF_REALTIME_OFF_NS` word was last stamped by the dispatcher
     /// (`SyscallDispatcher::sync_vvar_realtime_offset`). The vvar page is per
@@ -2509,6 +2510,7 @@ impl DispatchMmAuthority {
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
+            pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2520,6 +2522,7 @@ impl DispatchMmAuthority {
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
+            pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2539,6 +2542,7 @@ impl DispatchMmAuthority {
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
+            pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(
                 self.vvar_realtime_epoch
                     .load(std::sync::atomic::Ordering::Acquire),
@@ -2565,6 +2569,7 @@ impl DispatchMmAuthority {
                 host_alias_transactions: Arc::new(HostAliasTransactions::new()),
                 mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
                 guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
+                pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
                 // Never stamped: the child inherits the parent's vvar content
                 // through the COW split, and re-stamps on its next syscall
                 // only once a `clock_settime` has moved the global epoch.
@@ -2611,6 +2616,7 @@ impl DispatchMmAuthority {
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
+            pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -2644,8 +2650,13 @@ impl DispatchMmAuthority {
             Arc::clone(&authority.mutation_coordinator),
             Arc::clone(&authority.guest_executors),
             stage1,
+            Arc::clone(&authority.pt_quiesce),
         );
         (authority, mutation)
+    }
+
+    pub(crate) fn pt_quiesce(&self) -> &Arc<carrick_thread::fork_quiesce::PtQuiesce> {
+        &self.pt_quiesce
     }
 
     #[cfg(test)]
@@ -2742,6 +2753,10 @@ impl MmExecutorParticipation {
 
     pub(crate) fn mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
         Arc::clone(&self.authority.mutation_coordinator)
+    }
+
+    pub(crate) fn pt_quiesce(&self) -> &Arc<carrick_thread::fork_quiesce::PtQuiesce> {
+        self.authority.pt_quiesce()
     }
 
     fn authorizes(&self, authority: &Arc<DispatchMmAuthority>) -> bool {
@@ -5069,6 +5084,10 @@ impl SyscallDispatcher {
         self.mm_authority()
     }
 
+    pub(crate) fn pt_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::PtQuiesce> {
+        Arc::clone(self.mm_authority().pt_quiesce())
+    }
+
     #[cfg(test)]
     fn host_alias_transactions(&self) -> Arc<HostAliasTransactions> {
         Arc::clone(&self.mm_authority().host_alias_transactions)
@@ -6212,6 +6231,7 @@ impl SyscallDispatcher {
             Arc::clone(&authority.mutation_coordinator),
             Arc::clone(&authority.guest_executors),
             stage1,
+            Arc::clone(&authority.pt_quiesce),
         )
     }
 

@@ -137,6 +137,7 @@ struct KernelFrameCowAuthority {
     guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     tid: carrick_hal::ThreadId,
     identity: carrick_hal::FrameCowIdentity,
+    pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
 }
 
 /// Runtime-private payload carried opaquely through the HAL receipt. A
@@ -325,6 +326,7 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
             mm: mm.raw(),
             asid,
         },
+        pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
     })
 }
 
@@ -338,7 +340,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
     {
         quiesce::acquire_frame_cow_quiesce(
-            quiesce::pt_barrier(),
+            &self.pt_quiesce,
             self.mm,
             &self.guest_executors,
             self.tid,
@@ -2401,6 +2403,10 @@ impl KernelState {
         }
     }
 
+    pub(crate) fn pt_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::PtQuiesce> {
+        self.dispatcher.pt_quiesce()
+    }
+
     pub(crate) fn install_control_exec_runtime(
         &self,
         runtime: crate::kernel::control::ExecRuntime,
@@ -2711,6 +2717,7 @@ pub(crate) fn with_real_pt_pause_for_test<T>(
 
 #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
 pub(crate) fn with_foreign_mm_mutation_guard<T>(
+    barrier: &Arc<crate::fork_quiesce::PtQuiesce>,
     mm: crate::kernel::MmId,
     coordinator: Arc<crate::dispatch::mm_mutation::MmMutationCoordinator>,
     census: &crate::kernel::GuestExecutorCensus,
@@ -2719,7 +2726,7 @@ pub(crate) fn with_foreign_mm_mutation_guard<T>(
     run: impl FnOnce(&mut crate::dispatch::mm_mutation::MmMutationGuard<'_>) -> T,
 ) -> Result<T, crate::dispatch::mm_mutation::ForeignMmMutationError> {
     let mut authority = quiesce::acquire_foreign_mm_mutation_quiesce(
-        quiesce::pt_barrier(),
+        barrier,
         mm,
         census,
         coordinator,
@@ -4474,6 +4481,8 @@ fn bootstrap_hvpatch_process_child_tid(
 }
 
 trait ProductionHvpatchLoopPoll: Send {
+    fn pt_quiesce(&self) -> Arc<crate::fork_quiesce::PtQuiesce>;
+
     fn poll(
         &mut self,
         engine: &mut dyn std::any::Any,
@@ -6089,6 +6098,7 @@ where
             guest_executors: self.kernel.dispatcher.mm_executor_census(),
             tid,
             identity: cow_identity,
+            pt_quiesce: self.kernel.dispatcher.pt_quiesce(),
         });
         let child_token = match Arc::clone(&cow_authority).issue_hvpatch_child_token(&child_context)
         {
@@ -7645,17 +7655,17 @@ where
             }
         }
         self.traps = self.traps.saturating_add(1);
+        let pt_quiesce = self.kernel.pt_quiesce();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let entered_guest = quiesce::enter_hvpatch_guest_or_service_invalidation(
             &self.state.in_guest,
-            quiesce::pt_barrier(),
+            &pt_quiesce,
             self.state.this_tid,
             engine,
             control,
         )?;
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let entered_guest =
-            quiesce::enter_guest_or_park(&self.state.in_guest, quiesce::pt_barrier());
+        let entered_guest = quiesce::enter_guest_or_park(&self.state.in_guest, &pt_quiesce);
         if !entered_guest {
             return Ok(executor::ExecutorExit::Syscall);
         }
@@ -7961,6 +7971,8 @@ where
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let _current_mm =
+            carrick_thread::fork_quiesce::bind_current_mm_quiesce(self.kernel.pt_quiesce());
         match self.poll_with_engine(engine, control) {
             Err(ProductionHvpatchPollError::Runtime(error)) => {
                 match self.take_pending_exec_terminal() {
@@ -8001,6 +8013,10 @@ impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopPoll for ProductionHvpatc
 where
     E::SiblingSpec: 'static,
 {
+    fn pt_quiesce(&self) -> Arc<crate::fork_quiesce::PtQuiesce> {
+        self.kernel.pt_quiesce()
+    }
+
     fn poll(
         &mut self,
         engine: &mut dyn std::any::Any,
@@ -8300,6 +8316,8 @@ impl<E: 'static> HvpatchLoopJob<E> {
         let Some(production) = job.production.as_mut() else {
             return executor::ExecutorExit::InvalidState;
         };
+        let _current_mm =
+            carrick_thread::fork_quiesce::bind_current_mm_quiesce(production.pt_quiesce());
         let exit = production.poll(engine, control);
         job.suspended = match exit {
             executor::ExecutorExit::BlockedContinuation { .. }
@@ -10819,6 +10837,7 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
                     mm: mm.raw(),
                     asid: binding.asid.raw(),
                 },
+                pt_quiesce: kernel.dispatcher.pt_quiesce(),
             }),
             carrick_hal::FrameCowIdentity {
                 linux_pid: process.pid(),
