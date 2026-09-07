@@ -1089,6 +1089,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "mmapanonreuse": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "mmapcage": {
     "class": "conformance",
     "excluded": false,
