@@ -648,7 +648,7 @@ impl Kernel {
         {
             let state = self.registry().state.read();
             let has_drainable = state.retired_threads.iter().any(|retired| {
-                process.map_or(true, |pid| retired._task.id == pid)
+                process.is_none_or(|pid| retired._task.id == pid)
                     && retired.thread.strong_count() == 0
             });
             if !has_drainable {
@@ -658,7 +658,7 @@ impl Kernel {
         let mut state = self.registry().state.write();
         let before = state.retired_threads.len();
         state.retired_threads.retain(|retired| {
-            if process.map_or(true, |pid| retired._task.id == pid) {
+            if process.is_none_or(|pid| retired._task.id == pid) {
                 retired.thread.strong_count() != 0
             } else {
                 true
