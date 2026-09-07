@@ -1359,7 +1359,8 @@ impl Scheduler {
             // The Kernel execution state has already advanced. Returning an
             // ordinary error would strand the successor outside the combined
             // binding/authority directory and bypass logical completion.
-            tracing::error!(?thread, ?predecessor, ?successor, ?kind, %error, "scheduler generation observer lost exact transition");
+            let kernel_view = self.kernel.scheduler_thread_execution_diagnostic(thread);
+            tracing::error!(?thread, ?predecessor, ?successor, ?kind, %error, %kernel_view, "scheduler generation observer lost exact transition");
             std::process::abort();
         }
         Ok(())

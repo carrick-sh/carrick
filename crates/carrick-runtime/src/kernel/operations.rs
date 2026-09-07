@@ -2687,6 +2687,27 @@ impl Kernel {
         thread.with_active_execution_generation(generation, commit)
     }
 
+    /// Diagnostic projection of one scheduler thread's execution state for the
+    /// generation-observer abort: whether the registry still holds the thread
+    /// and which execution generation it considers active. Read-only; taken
+    /// on the abort path only.
+    pub(crate) fn scheduler_thread_execution_diagnostic(&self, key: ThreadKey) -> String {
+        let state = self.registry().state.read();
+        let Some(thread) = state.tasks.values().find_map(|record| {
+            let thread = record.task.thread(key.tid)?;
+            (thread.key() == key).then_some(thread)
+        }) else {
+            let same_tid = state
+                .tasks
+                .values()
+                .filter_map(|record| record.task.thread(key.tid))
+                .map(|thread| format!("{:?}", thread.key()))
+                .collect::<Vec<_>>();
+            return format!("thread absent from registry; same-tid threads={same_tid:?}");
+        };
+        thread.execution_state_diagnostic()
+    }
+
     /// Revalidate an exact granting generation and prove that `target` is a
     /// current process descendant in the Kernel parent graph. Thread-group
     /// siblings are intentionally excluded: scheduler shutdown inheritance is

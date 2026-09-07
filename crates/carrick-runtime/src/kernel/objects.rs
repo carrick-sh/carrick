@@ -6352,6 +6352,13 @@ impl Thread {
     /// Hold this exact execution generation stable while a scheduler commits
     /// dependent authority. The callback may acquire run-queue state; callers
     /// must never call it from a queue-held path.
+    /// Diagnostic rendering of the execution state (variant name and its
+    /// generation) for the generation-observer abort path.
+    pub(crate) fn execution_state_diagnostic(&self) -> String {
+        let execution = self.execution.lock();
+        format!("{:?}", execution.state)
+    }
+
     pub(crate) fn with_active_execution_generation<R>(
         &self,
         generation: ExecutionGeneration,
