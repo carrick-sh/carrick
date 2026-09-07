@@ -1742,3 +1742,58 @@ Main after these five landings is `HEAD` of this section's commit. The
 landed rows are re-verified standalone on that binary in the next section;
 the full cached ecosystem ledger is re-run once the first-touch, ppoll and
 pty-jobctl workers land, so a single artifact carries all of it.
+
+## 2026-09-07: sixth landing, two rejections, and where the fault path's cost went
+
+- **pty-jobctl landed** (`d137ef232`, `cf15c8c59`, probe `f5b4d784a`, main
+  `4ec85a708`): the relay loop is fail-closed on `POLLERR`/`POLLNVAL` and a
+  0-byte non-tty stdin (it spun at 85% CPU under `-t` with stdin from
+  /dev/null), and job control follows POSIX for background process groups
+  on the controlling tty (TOSTOP off: background writes succeed; background
+  reads get SIGTTIN, or EIO when the group is orphaned or SIGTTIN is
+  ignored/blocked). Receipts on the branch binary: `go-syscall`
+  `TestSetpgid` under `-t` PASS twice (was a 300 s wedge), `os_signal`,
+  `os_exec` PASS, LTP setpgid01–03 pass, 2,492 runtime tests. The
+  `ptyjobcontrol` probe is committed but not yet registered: registration
+  needs a Docker-oracle bless, which is a Docker-only phase.
+- **What the setpgid wedge unmasked**: the full `go-syscall` suite now aborts
+  the carrier under host load in `TestUnshareMountNameSpaceChroot`
+  (`scheduler generation observer lost exact transition … run queue
+  publication authority does not match the submitted generation`, then
+  every executor `failed boundary audit before ASID invalidation`), 2 of 4
+  loaded runs, 0 of 4 quiet, on two different binaries. Worker
+  `exec-generation` is reproducing it deterministically under a load
+  generator before fixing the transition authority.
+- **ppoll wait set, round 1 accepted, round 2 checkpointed** (`054605932`,
+  `67297a4cb`, `a40d54516`): the 10 ms slicing loop is gone; pipe wake
+  1.09 → 0.29 ms and eventfd 2.11 → 0.09 ms once the wake pipe became
+  per-executor; 30 ms timeouts land at 30.6 ms; an 85 s infinite wait no
+  longer returns 0 at 60 s. Still red: a `SIGALRM` to a task parked in a
+  mixed `ppoll` does not produce EINTR (the itimer publication path does
+  not reach the task-wake subscription) — worker `ppoll2`.
+- **vfs-hot2 round 1 rejected.** Measured back-to-back against main's
+  binary under the same host load (~15): the branch made stat 4.6 → 28 µs,
+  open+close 21.6 → 99 µs, ENOENT 3.6 → 19 µs and listdir(202) 0.95 →
+  4.8 ms, doubled go-types `TestSelf` to 71 s, and its fstat cache returned
+  the HOST uid/gid (501/20) for lower-layer files where the layered record
+  says 7/9. Lesson written into the brief: a perf branch is measured
+  against main's binary in the same run, never against yesterday's quiet
+  numbers. Worker `vfs-hot2b` has the table and the red test.
+- **first-touch, three checkpoints** (`86df75872`, `ca6533f0e`, `0be17ee7b`
+  plus the worker's own `ee46d7e5c`…`ea6c351b7`): interval index on the
+  task mapping table, bounded alias queries, in-place retain, batched
+  retirement, and an IPA index for `host_ptr` (lldb on the spinning carrier
+  showed `mapping_for_ipa_range` — a reverse linear scan by IPA — under
+  every stage-1 PTE edit). The million-depth compile reducer now completes
+  (8.8 / 54 / 31 s per shape under load) instead of hitting the 300 s cap;
+  the remaining cost is 84% address-space retirement
+  (`stage_retirement` + `retire_task_state_process_mappings_inner` per
+  mapping) and one red rollback test — worker `first-touch3`.
+- Landed-main receipts after the fifth landing (SHA `c52a38a2…`): test_re
+  8.1 → 2.9 s, test_os 41.9 → 20.7 s (under load), munmap04 30 s → 1.2 s,
+  multiprocessing_main_handling 253 → 33.6 s standalone (still 11× Docker;
+  profile: first-touch 35%, retirement 10%, an `fgetxattr` per `fstat` 5%),
+  `ls -la` on the Go image 32 → 0 errors, go testing/os_exec/io_fs/
+  path_filepath PASS. One load-coupled flake recorded: a child SIGSEGV in
+  `runtime.memmove` during `crypto/internal/fips140test` `TestCASTFailures`
+  under three concurrent builds, 0/6 quiet reruns.
