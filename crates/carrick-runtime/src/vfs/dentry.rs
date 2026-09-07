@@ -37,19 +37,19 @@
 //!   - Path mutations (`truncate`, `chmod`, `chown`, `utimes`): invalidate the target path's
 //!     dentry and inode record.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::fs_backend::{FsBackend, RealStat};
 use crate::linux_abi::{
-    LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP, LINUX_ENAMETOOLONG, LINUX_ENOENT, LINUX_ENOSYS,
-    LINUX_ENOTDIR, LINUX_EXDEV, LinuxErrno,
+    LINUX_EAGAIN, LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP, LINUX_ENAMETOOLONG, LINUX_ENOENT,
+    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_EXDEV, LinuxErrno,
 };
 use crate::rootfs::{RootFs, RootFsEntryKind};
 use carrick_abi::{NsGid, NsUid};
@@ -71,6 +71,7 @@ pub struct PositiveDentry {
     pub parent_gen: u64,
     pub dir_gen: Option<Arc<AtomicU64>>,
     pub is_lower: bool,
+    pub accessed: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -131,6 +132,7 @@ impl PositiveDentry {
 #[derive(Clone, Debug)]
 pub struct NegativeDentry {
     pub parent_gen: u64,
+    pub accessed: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +151,28 @@ pub struct DirEntry {
     pub path: String,
     pub dev: u64,
     pub ino: u64,
+    pub child_dir_count: usize,
+    pub accessed: Arc<AtomicBool>,
+}
+
+fn entry_node_approx_bytes(name: &str, node: &DentryNode) -> usize {
+    let name_cost = name.len() + 48;
+    let node_cost = match node {
+        DentryNode::Positive(pos) => {
+            std::mem::size_of::<PositiveDentry>()
+                + pos.symlink_target.as_ref().map_or(0, |s| s.len())
+        }
+        DentryNode::Negative(_) => std::mem::size_of::<NegativeDentry>(),
+    };
+    name_cost + node_cost
+}
+
+fn dir_entry_approx_bytes(dir: &DirEntry) -> usize {
+    std::mem::size_of::<DirEntry>() + dir.path.len() * 2 + 80
+}
+
+fn inode_approx_bytes() -> usize {
+    std::mem::size_of::<InodeRecord>() + 48
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +200,10 @@ pub struct DentryCache {
     next_dentry_id: AtomicU64,
     is_shared: bool,
     host_opens: AtomicU64,
+    capacity_bytes: usize,
+    eviction_enabled: bool,
+    approx_bytes: AtomicUsize,
+    dir_eviction_queue: Mutex<VecDeque<DentryId>>,
     fast_path: RwLock<FastPathCache>,
     entries: RwLock<HashMap<(DentryId, String), DentryNode>>,
     inodes: RwLock<HashMap<(u64, u64), InodeRecord>>,
@@ -191,21 +219,42 @@ impl Default for DentryCache {
 
 impl DentryCache {
     pub fn new(is_shared: bool) -> Self {
+        let eviction_enabled = std::env::var("CARRICK_DENTRY_EVICT")
+            .ok()
+            .or_else(|| std::env::var("CARRICK_DENTRY_LRU_EVICT").ok())
+            .or_else(|| std::env::var("CARRICK_DENTRY_PER_ENTRY_EVICT").ok())
+            .map_or(true, |v| v != "0");
+
+        let capacity_bytes = std::env::var("CARRICK_DENTRY_CACHE_CAPACITY_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32 * 1024 * 1024);
+
+        Self::new_with_capacity(is_shared, capacity_bytes, eviction_enabled)
+    }
+
+    pub fn new_with_capacity(
+        is_shared: bool,
+        capacity_bytes: usize,
+        eviction_enabled: bool,
+    ) -> Self {
         let root_gen = Arc::new(AtomicU64::new(1));
+        let root_dir = DirEntry {
+            id: DentryId::ROOT,
+            dir_gen: root_gen,
+            upper_dir_fd: None,
+            lower_dir_fd: None,
+            parent: None,
+            path: "/".to_string(),
+            dev: 0,
+            ino: 1,
+            child_dir_count: 0,
+            accessed: Arc::new(AtomicBool::new(true)),
+        };
+        let initial_bytes = dir_entry_approx_bytes(&root_dir);
+
         let mut dirs = HashMap::new();
-        dirs.insert(
-            DentryId::ROOT,
-            DirEntry {
-                id: DentryId::ROOT,
-                dir_gen: root_gen,
-                upper_dir_fd: None,
-                lower_dir_fd: None,
-                parent: None,
-                path: "/".to_string(),
-                dev: 0,
-                ino: 1,
-            },
-        );
+        dirs.insert(DentryId::ROOT, root_dir);
         let mut path_to_dir_id = HashMap::new();
         path_to_dir_id.insert("/".to_string(), DentryId::ROOT);
         path_to_dir_id.insert("".to_string(), DentryId::ROOT);
@@ -216,12 +265,36 @@ impl DentryCache {
             next_dentry_id: AtomicU64::new(1),
             is_shared,
             host_opens: AtomicU64::new(0),
+            capacity_bytes,
+            eviction_enabled,
+            approx_bytes: AtomicUsize::new(initial_bytes),
+            dir_eviction_queue: Mutex::new(VecDeque::new()),
             fast_path: RwLock::new(FastPathCache::default()),
             entries: RwLock::new(HashMap::new()),
             inodes: RwLock::new(HashMap::new()),
             dirs: RwLock::new(dirs),
             path_to_dir_id: RwLock::new(path_to_dir_id),
         }
+    }
+
+    pub fn approx_memory_bytes(&self) -> usize {
+        self.approx_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+
+    fn add_approx_bytes(&self, bytes: usize) {
+        self.approx_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn sub_approx_bytes(&self, bytes: usize) {
+        self.approx_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(bytes))
+            })
+            .ok();
     }
 
     pub fn host_open_count(&self) -> u64 {
@@ -256,20 +329,23 @@ impl DentryCache {
             self.inodes.write().clear();
             dirs.clear();
             path_to_dir_id.clear();
+            self.dir_eviction_queue.lock().clear();
             let root_gen = Arc::new(AtomicU64::new(1));
-            dirs.insert(
-                DentryId::ROOT,
-                DirEntry {
-                    id: DentryId::ROOT,
-                    dir_gen: root_gen,
-                    upper_dir_fd: None,
-                    lower_dir_fd: None,
-                    parent: None,
-                    path: "/".to_string(),
-                    dev: 0,
-                    ino: 1,
-                },
-            );
+            let root_dir = DirEntry {
+                id: DentryId::ROOT,
+                dir_gen: root_gen,
+                upper_dir_fd: None,
+                lower_dir_fd: None,
+                parent: None,
+                path: "/".to_string(),
+                dev: 0,
+                ino: 1,
+                child_dir_count: 0,
+                accessed: Arc::new(AtomicBool::new(true)),
+            };
+            self.approx_bytes
+                .store(dir_entry_approx_bytes(&root_dir), Ordering::Relaxed);
+            dirs.insert(DentryId::ROOT, root_dir);
             path_to_dir_id.insert("/".to_string(), DentryId::ROOT);
             path_to_dir_id.insert("".to_string(), DentryId::ROOT);
             self.proc_gen.store(cur_gen, Ordering::Relaxed);
@@ -422,7 +498,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.inodes.write().insert((dev, ino), record);
+            self.insert_inode_record(dev, ino, record);
 
             return Ok(ResolvedDentry {
                 dentry: PositiveDentry {
@@ -434,6 +510,7 @@ impl DentryCache {
                     parent_gen: 1,
                     dir_gen: Some(root_gen),
                     is_lower: false,
+                    accessed: Arc::new(AtomicBool::new(true)),
                 },
                 canonical_path: "/".to_string(),
                 parent_dir_fd: None,
@@ -444,7 +521,13 @@ impl DentryCache {
 
         let (parent_id, leaf_name, path) = {
             let dirs = self.dirs.read();
-            let d = dirs.get(&dir_id).ok_or(LINUX_ENOENT)?;
+            let d = match dirs.get(&dir_id) {
+                Some(d) => {
+                    d.accessed.store(true, Ordering::Relaxed);
+                    d
+                }
+                None => return Err(LINUX_EAGAIN),
+            };
             let (parent_id, leaf_name) = d.parent.as_ref().ok_or(LINUX_ENOENT)?;
             (*parent_id, leaf_name.clone(), d.path.clone())
         };
@@ -512,7 +595,15 @@ impl DentryCache {
 
             if name == "." {
                 if is_last {
-                    return self.resolve_dir_id(current_id, backend, rootfs);
+                    match self.resolve_dir_id(current_id, backend, rootfs) {
+                        Ok(r) => return Ok(r),
+                        Err(LINUX_EAGAIN) => {
+                            current_id = DentryId::ROOT;
+                            comp_idx = 0;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 comp_idx += 1;
                 continue;
@@ -526,7 +617,15 @@ impl DentryCache {
                 };
                 current_id = parent_id;
                 if is_last {
-                    return self.resolve_dir_id(current_id, backend, rootfs);
+                    match self.resolve_dir_id(current_id, backend, rootfs) {
+                        Ok(r) => return Ok(r),
+                        Err(LINUX_EAGAIN) => {
+                            current_id = DentryId::ROOT;
+                            comp_idx = 0;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 comp_idx += 1;
                 continue;
@@ -536,6 +635,7 @@ impl DentryCache {
                 let mut dirs = self.dirs.write();
                 match dirs.get_mut(&current_id) {
                     Some(d) => {
+                        d.accessed.store(true, Ordering::Relaxed);
                         let current_gen = d.dir_gen.load(Ordering::SeqCst);
                         let path = d.path.clone();
                         let rel = path.trim_start_matches('/');
@@ -554,7 +654,11 @@ impl DentryCache {
                             path,
                         )
                     }
-                    None => return Err(LINUX_ENOENT),
+                    None => {
+                        current_id = DentryId::ROOT;
+                        comp_idx = 0;
+                        continue;
+                    }
                 }
             };
 
@@ -566,11 +670,45 @@ impl DentryCache {
             let dentry_node = match cached_node {
                 Some(DentryNode::Negative(neg)) => {
                     if neg.parent_gen == parent_dir_gen {
-                        return Err(LINUX_ENOENT);
+                        let parent_fd = upper_fd.as_ref().or(lower_fd.as_ref());
+                        if let Some(pfd) = parent_fd {
+                            if let Ok(name_c) = CString::new(name.as_bytes()) {
+                                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                                let rc = unsafe {
+                                    libc::fstatat(
+                                        pfd.as_raw_fd(),
+                                        name_c.as_ptr(),
+                                        &mut st,
+                                        libc::AT_SYMLINK_NOFOLLOW,
+                                    )
+                                };
+                                if rc == 0 {
+                                    let mut entries = self.entries.write();
+                                    if let Some(removed) =
+                                        entries.remove(&(current_id, name.clone()))
+                                    {
+                                        let b = entry_node_approx_bytes(name, &removed);
+                                        self.sub_approx_bytes(b);
+                                    }
+                                    None
+                                } else {
+                                    neg.accessed.store(true, Ordering::Relaxed);
+                                    return Err(LINUX_ENOENT);
+                                }
+                            } else {
+                                neg.accessed.store(true, Ordering::Relaxed);
+                                return Err(LINUX_ENOENT);
+                            }
+                        } else {
+                            neg.accessed.store(true, Ordering::Relaxed);
+                            return Err(LINUX_ENOENT);
+                        }
+                    } else {
+                        None
                     }
-                    None
                 }
                 Some(DentryNode::Positive(pos)) => {
+                    pos.accessed.store(true, Ordering::Relaxed);
                     if pos.parent_gen == parent_dir_gen {
                         if self.is_shared {
                             let parent_fd = if pos.is_lower { &lower_fd } else { &upper_fd };
@@ -635,12 +773,16 @@ impl DentryCache {
                                         rdev: 0,
                                         dev_type: 0,
                                     };
-                                    self.inodes
-                                        .write()
-                                        .insert((st.st_dev as u64, st.st_ino), record);
+                                    self.insert_inode_record(st.st_dev as u64, st.st_ino, record);
                                     Some(pos)
                                 } else {
-                                    self.entries.write().remove(&(current_id, name.clone()));
+                                    if let Some(removed) =
+                                        self.entries.write().remove(&(current_id, name.clone()))
+                                    {
+                                        self.sub_approx_bytes(entry_node_approx_bytes(
+                                            name, &removed,
+                                        ));
+                                    }
                                     None
                                 }
                             } else {
@@ -650,7 +792,11 @@ impl DentryCache {
                             Some(pos)
                         }
                     } else {
-                        self.entries.write().remove(&(current_id, name.clone()));
+                        if let Some(removed) =
+                            self.entries.write().remove(&(current_id, name.clone()))
+                        {
+                            self.sub_approx_bytes(entry_node_approx_bytes(name, &removed));
+                        }
                         None
                     }
                 }
@@ -725,7 +871,17 @@ impl DentryCache {
                 comp_idx += 1;
                 if is_last {
                     let dirs = self.dirs.read();
-                    let dir = dirs.get(&current_id).ok_or(LINUX_ENOENT)?;
+                    let dir = match dirs.get(&current_id) {
+                        Some(d) => {
+                            d.accessed.store(true, Ordering::Relaxed);
+                            d
+                        }
+                        None => {
+                            current_id = DentryId::ROOT;
+                            comp_idx = 0;
+                            continue;
+                        }
+                    };
                     let leaf_name_c = CString::new(name.as_bytes()).map_err(|_| LINUX_ENOENT)?;
                     return Ok(ResolvedDentry {
                         dentry: node,
@@ -758,22 +914,42 @@ impl DentryCache {
     }
 
     fn insert_positive(&self, parent_id: DentryId, name: &str, pos: PositiveDentry) {
-        let mut entries = self.entries.write();
-        if entries.len() >= 16384 {
-            entries.clear();
+        let node = DentryNode::Positive(pos);
+        let added_bytes = entry_node_approx_bytes(name, &node);
+        self.add_approx_bytes(added_bytes);
+
+        {
+            let mut entries = self.entries.write();
+            if !self.eviction_enabled && entries.len() >= 16384 {
+                entries.clear();
+            }
+            entries.insert((parent_id, name.to_string()), node);
         }
-        entries.insert((parent_id, name.to_string()), DentryNode::Positive(pos));
+
+        if self.approx_bytes.load(Ordering::Relaxed) > self.capacity_bytes {
+            self.evict_if_needed();
+        }
     }
 
     fn insert_negative(&self, parent_id: DentryId, name: &str, parent_gen: u64) {
-        let mut entries = self.entries.write();
-        if entries.len() >= 16384 {
-            entries.clear();
+        let node = DentryNode::Negative(NegativeDentry {
+            parent_gen,
+            accessed: Arc::new(AtomicBool::new(true)),
+        });
+        let added_bytes = entry_node_approx_bytes(name, &node);
+        self.add_approx_bytes(added_bytes);
+
+        {
+            let mut entries = self.entries.write();
+            if !self.eviction_enabled && entries.len() >= 16384 {
+                entries.clear();
+            }
+            entries.insert((parent_id, name.to_string()), node);
         }
-        entries.insert(
-            (parent_id, name.to_string()),
-            DentryNode::Negative(NegativeDentry { parent_gen }),
-        );
+
+        if self.approx_bytes.load(Ordering::Relaxed) > self.capacity_bytes {
+            self.evict_if_needed();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -789,19 +965,18 @@ impl DentryCache {
         dev: u64,
         ino: u64,
     ) {
-        if self.dirs.read().len() >= 4096 {
-            let mut entries = self.entries.write();
-            let mut inodes = self.inodes.write();
-            let mut dirs = self.dirs.write();
-            let mut path_map = self.path_to_dir_id.write();
-            if dirs.len() >= 4096 {
-                entries.clear();
-                inodes.clear();
-                dirs.clear();
-                path_map.clear();
-                dirs.insert(
-                    DentryId::ROOT,
-                    DirEntry {
+        if !self.eviction_enabled {
+            if self.dirs.read().len() >= 4096 {
+                let mut entries = self.entries.write();
+                let mut inodes = self.inodes.write();
+                let mut dirs = self.dirs.write();
+                let mut path_map = self.path_to_dir_id.write();
+                if dirs.len() >= 4096 {
+                    entries.clear();
+                    inodes.clear();
+                    dirs.clear();
+                    path_map.clear();
+                    let root_dir = DirEntry {
                         id: DentryId::ROOT,
                         dir_gen: Arc::new(AtomicU64::new(1)),
                         upper_dir_fd: None,
@@ -810,29 +985,204 @@ impl DentryCache {
                         path: "/".to_string(),
                         dev: 0,
                         ino: 1,
-                    },
-                );
-                path_map.insert("/".to_string(), DentryId::ROOT);
-                path_map.insert("".to_string(), DentryId::ROOT);
-                self.bump_mutation();
+                        child_dir_count: 0,
+                        accessed: Arc::new(AtomicBool::new(true)),
+                    };
+                    dirs.insert(DentryId::ROOT, root_dir);
+                    path_map.insert("/".to_string(), DentryId::ROOT);
+                    path_map.insert("".to_string(), DentryId::ROOT);
+                    self.bump_mutation();
+                }
             }
         }
+
+        let dir_entry = DirEntry {
+            id,
+            dir_gen,
+            upper_dir_fd,
+            lower_dir_fd,
+            parent: Some((parent_id, name.to_string())),
+            path: path.to_string(),
+            dev,
+            ino,
+            child_dir_count: 0,
+            accessed: Arc::new(AtomicBool::new(true)),
+        };
+
+        let dir_bytes = dir_entry_approx_bytes(&dir_entry);
+        self.add_approx_bytes(dir_bytes);
+
+        {
+            let mut dirs = self.dirs.write();
+            let mut path_map = self.path_to_dir_id.write();
+
+            if let Some(parent) = dirs.get_mut(&parent_id) {
+                parent.child_dir_count += 1;
+            }
+
+            dirs.insert(id, dir_entry);
+            path_map.insert(path.to_string(), id);
+        }
+
+        self.dir_eviction_queue.lock().push_back(id);
+        if self.approx_bytes.load(Ordering::Relaxed) > self.capacity_bytes {
+            self.evict_if_needed();
+        }
+    }
+
+    fn evict_if_needed(&self) {
+        if !self.eviction_enabled {
+            return;
+        }
+        if self.approx_bytes.load(Ordering::Relaxed) <= self.capacity_bytes {
+            return;
+        }
+
+        let target_bytes = (self.capacity_bytes * 7) / 8;
+
+        let mut entries = self.entries.write();
+        let mut inodes = self.inodes.write();
         let mut dirs = self.dirs.write();
         let mut path_map = self.path_to_dir_id.write();
-        dirs.insert(
-            id,
-            DirEntry {
-                id,
-                dir_gen,
-                upper_dir_fd,
-                lower_dir_fd,
-                parent: Some((parent_id, name.to_string())),
-                path: path.to_string(),
-                dev,
-                ino,
-            },
-        );
-        path_map.insert(path.to_string(), id);
+
+        let mut bumped = false;
+
+        // 1. Evict leaf directories first
+        {
+            let mut dir_q = self.dir_eviction_queue.lock();
+            let mut attempts = 0;
+            let max_attempts = dir_q.len() + 32;
+
+            while self.approx_bytes.load(Ordering::Relaxed) > target_bytes
+                && attempts < max_attempts
+                && !dir_q.is_empty()
+            {
+                attempts += 1;
+                let dir_id = match dir_q.pop_front() {
+                    Some(id) => id,
+                    None => break,
+                };
+
+                if dir_id == DentryId::ROOT {
+                    continue;
+                }
+
+                let dir = match dirs.get(&dir_id) {
+                    Some(d) => d,
+                    None => continue,
+                };
+
+                // Non-leaf directories cannot be evicted
+                if dir.child_dir_count > 0 {
+                    dir_q.push_back(dir_id);
+                    continue;
+                }
+
+                // Check open fds
+                let has_open_upper = dir
+                    .upper_dir_fd
+                    .as_ref()
+                    .is_some_and(|fd| Arc::strong_count(fd) > 1);
+                let has_open_lower = dir
+                    .lower_dir_fd
+                    .as_ref()
+                    .is_some_and(|fd| Arc::strong_count(fd) > 1);
+                if has_open_upper || has_open_lower {
+                    dir_q.push_back(dir_id);
+                    continue;
+                }
+
+                // Second-chance clock
+                if dir.accessed.swap(false, Ordering::Relaxed) {
+                    dir_q.push_back(dir_id);
+                    continue;
+                }
+
+                // Evict this leaf directory
+                let dir = dirs.remove(&dir_id).unwrap();
+                let dir_bytes = dir_entry_approx_bytes(&dir);
+                self.sub_approx_bytes(dir_bytes);
+
+                path_map.remove(&dir.path);
+                if inodes.remove(&(dir.dev, dir.ino)).is_some() {
+                    self.sub_approx_bytes(inode_approx_bytes());
+                }
+
+                // Remove all entries cached under this directory
+                entries.retain(|&(p_id, ref child_name), node| {
+                    if p_id == dir_id {
+                        let node_bytes = entry_node_approx_bytes(child_name, node);
+                        self.sub_approx_bytes(node_bytes);
+                        if let DentryNode::Positive(pos) = node {
+                            if inodes.remove(&(pos.dev, pos.ino)).is_some() {
+                                self.sub_approx_bytes(inode_approx_bytes());
+                            }
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                // Unlink from parent
+                if let Some((parent_id, ref leaf_name)) = dir.parent {
+                    if let Some(node) = entries.remove(&(parent_id, leaf_name.clone())) {
+                        let node_bytes = entry_node_approx_bytes(leaf_name, &node);
+                        self.sub_approx_bytes(node_bytes);
+                    }
+                    if let Some(parent) = dirs.get_mut(&parent_id) {
+                        parent.child_dir_count = parent.child_dir_count.saturating_sub(1);
+                    }
+                }
+
+                bumped = true;
+            }
+        }
+
+        // 2. If still over capacity, evict standalone entries
+        if self.approx_bytes.load(Ordering::Relaxed) > target_bytes {
+            let mut to_remove = Vec::new();
+            for ((p_id, child_name), node) in entries.iter() {
+                if *p_id == DentryId::ROOT {
+                    continue;
+                }
+                match node {
+                    DentryNode::Positive(pos) => {
+                        if pos.id.is_some() {
+                            continue;
+                        }
+                        if pos.accessed.swap(false, Ordering::Relaxed) {
+                            continue;
+                        }
+                        to_remove.push((*p_id, child_name.clone()));
+                    }
+                    DentryNode::Negative(neg) => {
+                        if neg.accessed.swap(false, Ordering::Relaxed) {
+                            continue;
+                        }
+                        to_remove.push((*p_id, child_name.clone()));
+                    }
+                }
+                if to_remove.len() >= 256 {
+                    break;
+                }
+            }
+            for (p_id, child_name) in to_remove {
+                if let Some(node) = entries.remove(&(p_id, child_name.clone())) {
+                    self.sub_approx_bytes(entry_node_approx_bytes(&child_name, &node));
+                    if let DentryNode::Positive(pos) = node {
+                        if inodes.remove(&(pos.dev, pos.ino)).is_some() {
+                            self.sub_approx_bytes(inode_approx_bytes());
+                        }
+                    }
+                    bumped = true;
+                }
+            }
+        }
+
+        if bumped {
+            self.bump_mutation();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -892,9 +1242,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.inodes
-                .write()
-                .insert((st.st_dev as u64, st.st_ino), record);
+            self.insert_inode_record(st.st_dev as u64, st.st_ino, record);
             let pos = PositiveDentry {
                 id: None,
                 kind: RootFsEntryKind::Symlink,
@@ -904,6 +1252,7 @@ impl DentryCache {
                 parent_gen: parent_dir_gen,
                 dir_gen: None,
                 is_lower,
+                accessed: Arc::new(AtomicBool::new(true)),
             };
             self.insert_positive(parent_id, name, pos.clone());
             return Ok(pos);
@@ -987,9 +1336,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.inodes
-                .write()
-                .insert((st.st_dev as u64, st.st_ino), record);
+            self.insert_inode_record(st.st_dev as u64, st.st_ino, record);
             let pos = PositiveDentry {
                 id: Some(new_dir_id),
                 kind: RootFsEntryKind::Directory,
@@ -999,6 +1346,7 @@ impl DentryCache {
                 parent_gen: parent_dir_gen,
                 dir_gen: Some(child_dir_gen),
                 is_lower,
+                accessed: Arc::new(AtomicBool::new(true)),
             };
             self.insert_positive(parent_id, name, pos.clone());
             return Ok(pos);
@@ -1045,9 +1393,7 @@ impl DentryCache {
             rdev: 0,
             dev_type: 0,
         };
-        self.inodes
-            .write()
-            .insert((st.st_dev as u64, st.st_ino), record);
+        self.insert_inode_record(st.st_dev as u64, st.st_ino, record);
         let pos = PositiveDentry {
             id: None,
             kind,
@@ -1057,6 +1403,7 @@ impl DentryCache {
             parent_gen: parent_dir_gen,
             dir_gen: None,
             is_lower,
+            accessed: Arc::new(AtomicBool::new(true)),
         };
         self.insert_positive(parent_id, name, pos.clone());
         Ok(pos)
@@ -1175,7 +1522,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.inodes.write().insert((0, rs.ino), record);
+            self.insert_inode_record(0, rs.ino, record);
             let pos = PositiveDentry {
                 id: dir_id,
                 kind: rs.kind,
@@ -1185,6 +1532,7 @@ impl DentryCache {
                 parent_gen: parent_dir_gen,
                 dir_gen: child_dir_gen,
                 is_lower: false,
+                accessed: Arc::new(AtomicBool::new(true)),
             };
             self.insert_positive(parent_id, name, pos.clone());
             return Ok(pos);
@@ -1236,7 +1584,7 @@ impl DentryCache {
                 rdev: 0,
                 dev_type: 0,
             };
-            self.inodes.write().insert((0, ino), record);
+            self.insert_inode_record(0, ino, record);
             let pos = PositiveDentry {
                 id: dir_id,
                 kind: md.kind,
@@ -1246,6 +1594,7 @@ impl DentryCache {
                 parent_gen: parent_dir_gen,
                 dir_gen: child_dir_gen,
                 is_lower: false,
+                accessed: Arc::new(AtomicBool::new(true)),
             };
             self.insert_positive(parent_id, name, pos.clone());
             return Ok(pos);
@@ -1338,7 +1687,7 @@ impl DentryCache {
                     rdev: 0,
                     dev_type: 0,
                 };
-                self.inodes.write().insert((dev, ino), record);
+                self.insert_inode_record(dev, ino, record);
                 let pos = PositiveDentry {
                     id: dir_id,
                     kind: md.kind,
@@ -1348,6 +1697,7 @@ impl DentryCache {
                     parent_gen: parent_dir_gen,
                     dir_gen: child_dir_gen,
                     is_lower: true,
+                    accessed: Arc::new(AtomicBool::new(true)),
                 };
                 self.insert_positive(parent_id, name, pos.clone());
                 return Ok(pos);
@@ -1723,11 +2073,15 @@ impl DentryCache {
             && let Some(parent_id) = self.find_parent_dir_id(parent_path)
         {
             let mut entries = self.entries.write();
-            entries.remove(&(parent_id, name.to_string()));
+            if let Some(node) = entries.remove(&(parent_id, name.to_string())) {
+                self.sub_approx_bytes(entry_node_approx_bytes(name, &node));
+            }
             let dirs = self.dirs.read();
             if let Some(d) = dirs.get(&parent_id) {
                 d.dir_gen.fetch_add(1, Ordering::SeqCst);
-                self.inodes.write().remove(&(d.dev, d.ino));
+                if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
+                    self.sub_approx_bytes(inode_approx_bytes());
+                }
             }
         }
         if let Some(dir_id) = self.path_to_dir_id.read().get(norm) {
@@ -1737,7 +2091,9 @@ impl DentryCache {
             }
         }
         if let Some(id) = inode {
-            self.inodes.write().remove(&(id.dev, id.ino));
+            if self.inodes.write().remove(&(id.dev, id.ino)).is_some() {
+                self.sub_approx_bytes(inode_approx_bytes());
+            }
         }
     }
 
@@ -1755,32 +2111,52 @@ impl DentryCache {
                 None
             }
         };
-        if let Some(d) = removed_dir {
+        if let Some(ref d) = removed_dir {
+            self.sub_approx_bytes(dir_entry_approx_bytes(d));
             d.dir_gen.fetch_add(1, Ordering::SeqCst);
+            if let Some((parent_id, _)) = d.parent {
+                let mut dirs = self.dirs.write();
+                if let Some(parent) = dirs.get_mut(&parent_id) {
+                    parent.child_dir_count = parent.child_dir_count.saturating_sub(1);
+                }
+            }
         }
         if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
             && let Some(parent_id) = self.find_parent_dir_id(parent_path)
         {
             let mut entries = self.entries.write();
-            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
-            {
-                self.inodes.write().remove(&(pos.dev, pos.ino));
+            if let Some(node) = entries.remove(&(parent_id, name.to_string())) {
+                self.sub_approx_bytes(entry_node_approx_bytes(name, &node));
+                if let DentryNode::Positive(pos) = node {
+                    if self.inodes.write().remove(&(pos.dev, pos.ino)).is_some() {
+                        self.sub_approx_bytes(inode_approx_bytes());
+                    }
+                }
             }
-            let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(&parent_id) {
-                d.dir_gen.fetch_add(1, Ordering::SeqCst);
-                self.inodes.write().remove(&(d.dev, d.ino));
+            drop(entries);
+
+            let parent_gen = {
+                let mut dirs = self.dirs.write();
+                if let Some(d) = dirs.get_mut(&parent_id) {
+                    d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                    if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
+                        self.sub_approx_bytes(inode_approx_bytes());
+                    }
+                    Some(d.dir_gen.load(Ordering::SeqCst))
+                } else {
+                    None
+                }
+            };
+            if let Some(generation) = parent_gen {
                 if !self.is_shared {
-                    let parent_gen = d.dir_gen.load(Ordering::SeqCst);
-                    entries.insert(
-                        (parent_id, name.to_string()),
-                        DentryNode::Negative(NegativeDentry { parent_gen }),
-                    );
+                    self.insert_negative(parent_id, name, generation);
                 }
             }
         }
         if let Some(id) = inode {
-            self.inodes.write().remove(&(id.dev, id.ino));
+            if self.inodes.write().remove(&(id.dev, id.ino)).is_some() {
+                self.sub_approx_bytes(inode_approx_bytes());
+            }
         }
     }
 
@@ -1800,9 +2176,10 @@ impl DentryCache {
             id
         };
         if let Some(dir_id) = renamed_dir_id {
-            let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(&dir_id) {
+            let mut dirs = self.dirs.write();
+            if let Some(d) = dirs.get_mut(&dir_id) {
                 d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                d.path = norm_new.to_string();
             }
         }
 
@@ -1811,17 +2188,26 @@ impl DentryCache {
             && let Some(old_parent_id) = self.find_parent_dir_id(old_parent_path)
         {
             let mut entries = self.entries.write();
-            entries.remove(&(old_parent_id, old_name.to_string()));
-            let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(&old_parent_id) {
-                d.dir_gen.fetch_add(1, Ordering::SeqCst);
-                self.inodes.write().remove(&(d.dev, d.ino));
+            if let Some(node) = entries.remove(&(old_parent_id, old_name.to_string())) {
+                self.sub_approx_bytes(entry_node_approx_bytes(old_name, &node));
+            }
+            drop(entries);
+
+            let old_parent_gen = {
+                let mut dirs = self.dirs.write();
+                if let Some(d) = dirs.get_mut(&old_parent_id) {
+                    d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                    if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
+                        self.sub_approx_bytes(inode_approx_bytes());
+                    }
+                    Some(d.dir_gen.load(Ordering::SeqCst))
+                } else {
+                    None
+                }
+            };
+            if let Some(generation) = old_parent_gen {
                 if !self.is_shared {
-                    let parent_gen = d.dir_gen.load(Ordering::SeqCst);
-                    entries.insert(
-                        (old_parent_id, old_name.to_string()),
-                        DentryNode::Negative(NegativeDentry { parent_gen }),
-                    );
+                    self.insert_negative(old_parent_id, old_name, generation);
                 }
             }
         }
@@ -1831,19 +2217,110 @@ impl DentryCache {
             && let Some(new_parent_id) = self.find_parent_dir_id(new_parent_path)
         {
             let mut entries = self.entries.write();
-            if let Some(DentryNode::Positive(pos)) =
-                entries.remove(&(new_parent_id, new_name.to_string()))
-            {
-                self.inodes.write().remove(&(pos.dev, pos.ino));
+            if let Some(node) = entries.remove(&(new_parent_id, new_name.to_string())) {
+                self.sub_approx_bytes(entry_node_approx_bytes(new_name, &node));
+                if let DentryNode::Positive(pos) = node {
+                    if self.inodes.write().remove(&(pos.dev, pos.ino)).is_some() {
+                        self.sub_approx_bytes(inode_approx_bytes());
+                    }
+                }
             }
             let dirs = self.dirs.read();
             if let Some(d) = dirs.get(&new_parent_id) {
                 d.dir_gen.fetch_add(1, Ordering::SeqCst);
-                self.inodes.write().remove(&(d.dev, d.ino));
+                if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
+                    self.sub_approx_bytes(inode_approx_bytes());
+                }
             }
         }
         if let Some(id) = inode {
-            self.inodes.write().remove(&(id.dev, id.ino));
+            if self.inodes.write().remove(&(id.dev, id.ino)).is_some() {
+                self.sub_approx_bytes(inode_approx_bytes());
+            }
+        }
+    }
+
+    /// Notify that entries at `a` and `b` were exchanged (e.g. renameat2 RENAME_EXCHANGE).
+    pub fn entry_exchanged(
+        &self,
+        a: &str,
+        b: &str,
+        inode_a: Option<InodeIdentity>,
+        inode_b: Option<InodeIdentity>,
+    ) {
+        self.bump_mutation();
+        let norm_a = a.trim_end_matches('/');
+        let norm_b = b.trim_end_matches('/');
+
+        // Invalidate directory path cache for both if present
+        {
+            let mut path_map = self.path_to_dir_id.write();
+            let mut dirs = self.dirs.write();
+            if let Some(id_a) = path_map.remove(norm_a) {
+                if let Some(d) = dirs.remove(&id_a) {
+                    self.sub_approx_bytes(dir_entry_approx_bytes(&d));
+                }
+            }
+            if let Some(id_b) = path_map.remove(norm_b) {
+                if let Some(d) = dirs.remove(&id_b) {
+                    self.sub_approx_bytes(dir_entry_approx_bytes(&d));
+                }
+            }
+        }
+
+        // Invalidate entry a in its parent
+        if let Some((parent_path_a, name_a)) = Self::split_parent_and_name(norm_a)
+            && let Some(parent_id_a) = self.find_parent_dir_id(parent_path_a)
+        {
+            let mut entries = self.entries.write();
+            if let Some(node) = entries.remove(&(parent_id_a, name_a.to_string())) {
+                self.sub_approx_bytes(entry_node_approx_bytes(name_a, &node));
+                if let DentryNode::Positive(pos) = node {
+                    if self.inodes.write().remove(&(pos.dev, pos.ino)).is_some() {
+                        self.sub_approx_bytes(inode_approx_bytes());
+                    }
+                }
+            }
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(&parent_id_a) {
+                d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
+                    self.sub_approx_bytes(inode_approx_bytes());
+                }
+            }
+        }
+
+        // Invalidate entry b in its parent
+        if let Some((parent_path_b, name_b)) = Self::split_parent_and_name(norm_b)
+            && let Some(parent_id_b) = self.find_parent_dir_id(parent_path_b)
+        {
+            let mut entries = self.entries.write();
+            if let Some(node) = entries.remove(&(parent_id_b, name_b.to_string())) {
+                self.sub_approx_bytes(entry_node_approx_bytes(name_b, &node));
+                if let DentryNode::Positive(pos) = node {
+                    if self.inodes.write().remove(&(pos.dev, pos.ino)).is_some() {
+                        self.sub_approx_bytes(inode_approx_bytes());
+                    }
+                }
+            }
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(&parent_id_b) {
+                d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
+                    self.sub_approx_bytes(inode_approx_bytes());
+                }
+            }
+        }
+
+        if let Some(id) = inode_a {
+            if self.inodes.write().remove(&(id.dev, id.ino)).is_some() {
+                self.sub_approx_bytes(inode_approx_bytes());
+            }
+        }
+        if let Some(id) = inode_b {
+            if self.inodes.write().remove(&(id.dev, id.ino)).is_some() {
+                self.sub_approx_bytes(inode_approx_bytes());
+            }
         }
     }
 
@@ -1856,20 +2333,28 @@ impl DentryCache {
             && let Some(parent_id) = self.find_parent_dir_id(parent_path)
         {
             let mut entries = self.entries.write();
-            if let Some(DentryNode::Positive(pos)) = entries.remove(&(parent_id, name.to_string()))
-            {
-                self.inodes.write().remove(&(pos.dev, pos.ino));
+            if let Some(node) = entries.remove(&(parent_id, name.to_string())) {
+                self.sub_approx_bytes(entry_node_approx_bytes(name, &node));
+                if let DentryNode::Positive(pos) = node {
+                    if self.inodes.write().remove(&(pos.dev, pos.ino)).is_some() {
+                        self.sub_approx_bytes(inode_approx_bytes());
+                    }
+                }
             }
         }
         if let Some(id) = inode {
-            self.inodes.write().remove(&(id.dev, id.ino));
+            if self.inodes.write().remove(&(id.dev, id.ino)).is_some() {
+                self.sub_approx_bytes(inode_approx_bytes());
+            }
         }
     }
 
     /// Invalidate cached inode record for `id`.
     pub fn invalidate_inode(&self, id: InodeIdentity) {
         self.bump_mutation();
-        self.inodes.write().remove(&(id.dev, id.ino));
+        if self.inodes.write().remove(&(id.dev, id.ino)).is_some() {
+            self.sub_approx_bytes(inode_approx_bytes());
+        }
     }
 
     /// Bump the generation of a directory, invalidating negative lookups within it.
@@ -2154,5 +2639,137 @@ mod tests {
         // After 500 cycles, /tmp must still be stat-able and dirs must not have leaked 500 entries
         assert!(cache.stat("/tmp", true, &backend, None).is_ok());
         assert!(cache.dirs.read().len() < 50);
+    }
+
+    #[test]
+    fn test_dentry_cache_5000_dirs_preserves_earlier_entry() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new(false);
+
+        for i in 0..5000 {
+            let dir_name = format!("dir_{i}");
+            let disk_dir = tmp.path().join(&dir_name);
+            fs::create_dir_all(&disk_dir).unwrap();
+            let file_name = "file.txt";
+            fs::write(disk_dir.join(file_name), b"test").unwrap();
+
+            let guest_dir = format!("/dir_{i}");
+            let guest_file = format!("/dir_{i}/file.txt");
+            cache.entry_created(&guest_dir, None);
+            cache.entry_created(&guest_file, None);
+            assert!(cache.stat(&guest_file, true, &backend, None).is_ok());
+        }
+
+        // Target file right before the 4096th directory (i = 4094)
+        let target_file = "/dir_4094/file.txt";
+        let target_dir = "/dir_4094";
+        // Check if it's cached in path_to_dir_id and entries
+        let dir_id = cache.path_to_dir_id.read().get(target_dir).copied();
+        assert!(
+            dir_id.is_some(),
+            "dir_4094 should still be cached in path_to_dir_id"
+        );
+        assert!(cache.stat(target_file, true, &backend, None).is_ok());
+    }
+
+    #[test]
+    fn test_dentry_cache_memory_bounded_eviction_leaf_first() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        // Capacity of 64 KiB
+        let cache = DentryCache::new_with_capacity(false, 64 * 1024, true);
+
+        // 1. Create a parent directory with 2 leaf subdirectories
+        fs::create_dir_all(tmp.path().join("parent").join("leaf1")).unwrap();
+        fs::create_dir_all(tmp.path().join("parent").join("leaf2")).unwrap();
+        fs::write(tmp.path().join("parent").join("leaf1").join("f1.txt"), b"1").unwrap();
+        fs::write(tmp.path().join("parent").join("leaf2").join("f2.txt"), b"2").unwrap();
+
+        cache.entry_created("/parent", None);
+        cache.entry_created("/parent/leaf1", None);
+        cache.entry_created("/parent/leaf2", None);
+        cache.entry_created("/parent/leaf1/f1.txt", None);
+        cache.entry_created("/parent/leaf2/f2.txt", None);
+
+        assert!(
+            cache
+                .stat("/parent/leaf1/f1.txt", true, &backend, None)
+                .is_ok()
+        );
+        assert!(
+            cache
+                .stat("/parent/leaf2/f2.txt", true, &backend, None)
+                .is_ok()
+        );
+
+        // Both /parent and leaves are cached
+        assert!(cache.path_to_dir_id.read().get("/parent").is_some());
+        assert!(cache.path_to_dir_id.read().get("/parent/leaf1").is_some());
+
+        // 2. Churn with many other directories to exceed capacity and trigger eviction
+        for i in 0..1000 {
+            let dname = format!("churn_{i}");
+            let disk = tmp.path().join(&dname);
+            fs::create_dir_all(&disk).unwrap();
+            fs::write(disk.join("f.txt"), b"x").unwrap();
+            let gdir = format!("/churn_{i}");
+            let gfile = format!("/churn_{i}/f.txt");
+            cache.entry_created(&gdir, None);
+            cache.entry_created(&gfile, None);
+            let _ = cache.stat(&gfile, true, &backend, None);
+        }
+
+        // Eviction happened: memory is bounded
+        let approx = cache.approx_memory_bytes();
+        assert!(
+            approx <= cache.capacity_bytes() * 3,
+            "Memory should be bounded, got {approx}"
+        );
+
+        // Root is NEVER evicted
+        assert!(cache.dirs.read().contains_key(&DentryId::ROOT));
+
+        // Re-stat /parent/leaf1/f1.txt must succeed cleanly (re-walks backend if evicted)
+        assert!(
+            cache
+                .stat("/parent/leaf1/f1.txt", true, &backend, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_dentry_cache_exchange_preserves_both_entries() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new(false);
+
+        let path_a = tmp.path().join("file_a.txt");
+        let path_b = tmp.path().join("file_b.txt");
+        fs::write(&path_a, b"aaa").unwrap();
+        fs::write(&path_b, b"bbbbbb").unwrap();
+
+        cache.entry_created("/file_a.txt", None);
+        cache.entry_created("/file_b.txt", None);
+
+        let st_a = cache.stat("/file_a.txt", true, &backend, None).unwrap();
+        let st_b = cache.stat("/file_b.txt", true, &backend, None).unwrap();
+        assert_eq!(st_a.size, 3);
+        assert_eq!(st_b.size, 6);
+
+        // Perform swap on disk
+        let tmp_swap = tmp.path().join("file_swap.tmp");
+        fs::rename(&path_a, &tmp_swap).unwrap();
+        fs::rename(&path_b, &path_a).unwrap();
+        fs::rename(&tmp_swap, &path_b).unwrap();
+
+        // Notify exchange
+        cache.entry_exchanged("/file_a.txt", "/file_b.txt", None, None);
+
+        // Both must stat successfully with swapped sizes, neither is negative
+        let st_a_new = cache.stat("/file_a.txt", true, &backend, None).unwrap();
+        let st_b_new = cache.stat("/file_b.txt", true, &backend, None).unwrap();
+        assert_eq!(st_a_new.size, 6);
+        assert_eq!(st_b_new.size, 3);
     }
 }
