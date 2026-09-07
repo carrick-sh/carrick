@@ -4942,33 +4942,32 @@ impl Kernel {
                             && target.admits(*child_key, record.zombie.process_group)
                     })
                 });
-                let has_job_control = (job_control.stopped || job_control.continued)
-                    && (children.iter().any(|child_key| {
-                        state.tasks.get(&child_key.id).is_some_and(|record| {
-                            record.task.key() == *child_key
-                                && record.task.parent() == Some(parent)
-                                && class.admits(record.task.exit_signal())
-                                && target.admits(*child_key, record.task.process_group())
-                                && record
-                                    .task
-                                    .waitable_job_control_event(
-                                        job_control.stopped,
-                                        job_control.continued,
-                                        false,
-                                    )
-                                    .is_some()
-                        })
-                    }) || traced_non_children.iter().any(|tracee_key| {
-                        state.tasks.get(&tracee_key.id).is_some_and(|record| {
-                            record.task.key() == *tracee_key
-                                && record.task.ptrace_tracer() == Some(parent)
-                                && target.admits(*tracee_key, record.task.process_group())
-                                && record
-                                    .task
-                                    .waitable_job_control_event(true, job_control.continued, false)
-                                    .is_some()
-                        })
-                    }));
+                let has_job_control = children.iter().any(|child_key| {
+                    state.tasks.get(&child_key.id).is_some_and(|record| {
+                        record.task.key() == *child_key
+                            && record.task.parent() == Some(parent)
+                            && class.admits(record.task.exit_signal())
+                            && target.admits(*child_key, record.task.process_group())
+                            && record
+                                .task
+                                .waitable_job_control_event(
+                                    job_control.stopped,
+                                    job_control.continued,
+                                    false,
+                                )
+                                .is_some()
+                    })
+                }) || traced_non_children.iter().any(|tracee_key| {
+                    state.tasks.get(&tracee_key.id).is_some_and(|record| {
+                        record.task.key() == *tracee_key
+                            && record.task.ptrace_tracer() == Some(parent)
+                            && target.admits(*tracee_key, record.task.process_group())
+                            && record
+                                .task
+                                .waitable_job_control_event(true, job_control.continued, false)
+                                .is_some()
+                    })
+                });
 
                 if !has_exited_child && !has_job_control {
                     let live_tracee = traced_non_children.iter().any(|tracee_key| {
