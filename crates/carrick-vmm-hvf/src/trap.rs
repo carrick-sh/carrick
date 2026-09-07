@@ -38287,6 +38287,56 @@ impl HvfVmState {
         }
         let mut current = align_down(va, PAGE_SIZE);
         let end = align_up(requested_end, PAGE_SIZE)?;
+
+        // Step 1: Fix pool alignment miss.
+        // A first-touch inside a 16 KiB compound whose other pages are still
+        // holes materializes the WHOLE 16 KiB-aligned compound, so it always
+        // takes the pooled, zero-syscall path.
+        const COMPOUND: u64 = CowArmedRanges::COMPOUND_SIZE;
+        if len == PAGE_SIZE as usize && current < end {
+            let compound_start = align_down(current, COMPOUND);
+            let compound_end = compound_start.saturating_add(COMPOUND);
+            let pristine = self.deferred_anonymous_state().and_then(|state| {
+                state
+                    .snapshot()
+                    .pristine
+                    .into_iter()
+                    .find(|r| r.start.raw() <= current && current < r.end.raw())
+                    .map(|r| (r.start.raw(), r.end.raw()))
+            });
+            if let Some((p_start, p_end)) = pristine {
+                if compound_start >= p_start
+                    && compound_end <= p_end
+                    && compound_start >= arena_start
+                    && compound_end <= arena_end
+                {
+                    let has_local = self
+                        .mappings
+                        .iter()
+                        .any(|m| m.start < compound_end && m.end > compound_start);
+                    let has_alias = alias_registry().lock().iter().any(|alias| {
+                        alias_matches_process_scope(
+                            alias.ownership_scope,
+                            self.mm_root_slot,
+                            self.container_root,
+                        ) && alias.start < compound_end
+                            && alias.start.saturating_add(alias.size as u64) > compound_start
+                            && alias_backing_is_live(alias.physical_host_addr)
+                    });
+                    if !has_local && !has_alias {
+                        self.materialize_sparse_mmap_extent(
+                            compound_start,
+                            compound_end,
+                            SparseExtentBacking::Anon,
+                            flush_stage1,
+                            Some(current..end),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         while current < end {
             if let Some(mapping) = self.mapping_for_range(current, 1) {
                 let next = mapping.end.min(end);
@@ -38336,6 +38386,7 @@ impl HvfVmState {
                 hole_end,
                 SparseExtentBacking::Anon,
                 flush_stage1,
+                None,
             )?;
         }
         Ok(())
@@ -38467,8 +38518,13 @@ impl HvfVmState {
             } else {
                 SparseExtentBacking::Anon
             };
-            let next =
-                self.materialize_sparse_mmap_extent(current, hole_end, backing, flush_stage1)?;
+            let next = self.materialize_sparse_mmap_extent(
+                current,
+                hole_end,
+                backing,
+                flush_stage1,
+                None,
+            )?;
             if next <= current {
                 return Err(TrapError::Hypervisor(format!(
                     "private file view materialization made no progress at VA 0x{current:x}"
@@ -38485,6 +38541,7 @@ impl HvfVmState {
         end: u64,
         backing: SparseExtentBacking<'_>,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        receipt_range: Option<std::ops::Range<u64>>,
     ) -> Result<u64, TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
 
@@ -38610,14 +38667,32 @@ impl HvfVmState {
                     granule: carrick_aarch64::vmm::CowGranule::Page,
                 }]);
         }
-        self.supersede_cow_receipts("sparse-mmap-extent", start, semantic_len as u64);
-        self.cow_deferred_publications
-            .lock()
-            .push(PendingFrameCowPublication {
-                va: start,
-                len: semantic_len,
-                expected_ipa: semantic_ipa,
-            });
+        let (receipt_va, receipt_len, receipt_ipa) = if let Some(range) = receipt_range {
+            let r_start = start.max(range.start);
+            let r_end = end.min(range.end);
+            if r_start < r_end {
+                let r_len = usize::try_from(r_end - r_start)
+                    .map_err(|_| TrapError::MappingTooLarge(r_end - r_start))?;
+                let r_ipa = semantic_ipa.checked_add(r_start - start).ok_or_else(|| {
+                    TrapError::Hypervisor("sparse mmap receipt IPA overflow".to_owned())
+                })?;
+                (r_start, r_len, r_ipa)
+            } else {
+                (start, 0, semantic_ipa)
+            }
+        } else {
+            (start, semantic_len, semantic_ipa)
+        };
+        if receipt_len > 0 {
+            self.supersede_cow_receipts("sparse-mmap-extent", receipt_va, receipt_len as u64);
+            self.cow_deferred_publications
+                .lock()
+                .push(PendingFrameCowPublication {
+                    va: receipt_va,
+                    len: receipt_len,
+                    expected_ipa: receipt_ipa,
+                });
+        }
         if let Some(transition) = deferred_transition {
             transition.commit();
         }
