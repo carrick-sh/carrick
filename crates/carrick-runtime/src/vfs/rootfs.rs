@@ -44,9 +44,9 @@ use crate::fs_backend::{
 };
 use crate::linux_abi::LinuxErrno;
 use crate::linux_abi::{
-    LINUX_E2BIG, LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
-    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS, LINUX_EXDEV, LINUX_S_IFBLK,
-    LINUX_S_IFCHR, LINUX_S_IFMT,
+    LINUX_E2BIG, LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP,
+    LINUX_ENOENT, LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS, LINUX_EXDEV,
+    LINUX_S_IFBLK, LINUX_S_IFCHR, LINUX_S_IFMT,
 };
 use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
 use std::sync::Arc;
@@ -65,7 +65,7 @@ use super::{
 pub struct RootFsVfs {
     pub rootfs: Option<RootFs>,
     pub overlay: Box<dyn FsBackend>,
-    dentry_cache: Arc<crate::vfs::DentryCache>,
+    pub dentry_cache: Arc<crate::vfs::DentryCache>,
 }
 
 /// Richer result from [`RootFsVfs::open_for_dispatch`]. Carries the
@@ -625,6 +625,33 @@ impl RootFsVfs {
     /// `AT_SYMLINK_NOFOLLOW` and the writable backend can't answer a
     /// `real_stat` (e.g. the in-memory backend).
     pub fn lookup_nofollow(&self, path: &str) -> Result<Metadata, VfsError> {
+        if self.overlay.serves_dentry_cache() {
+            match self.dentry_stat(path, false) {
+                Ok(real) => {
+                    let kind = match real.kind {
+                        RootFsEntryKind::File => EntryKind::File,
+                        RootFsEntryKind::Directory => EntryKind::Directory,
+                        RootFsEntryKind::CharDevice => EntryKind::CharDevice,
+                        RootFsEntryKind::Fifo => EntryKind::Fifo,
+                        RootFsEntryKind::Socket => EntryKind::Socket,
+                        RootFsEntryKind::Symlink => EntryKind::Symlink,
+                    };
+                    return Ok(Metadata {
+                        kind,
+                        mode: real.mode,
+                        size: real.size,
+                        uid: real.uid.raw() as libc::uid_t,
+                        gid: real.gid.raw() as libc::gid_t,
+                        mtime_secs: real.mtime.0,
+                        mtime_nanos: real.mtime.1 as u32,
+                    });
+                }
+                Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
+                Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
+                Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
+                _ => {}
+            }
+        }
         // Ask backends that can cheaply prove "not a symlink" first. The Darwin
         // host backend answers regular files/directories from one contained fd
         // and returns None for symlinks and exceptional file types, preserving
@@ -1325,6 +1352,33 @@ impl Vfs for RootFsVfs {
                 mtime_secs: 0,
                 mtime_nanos: 0,
             });
+        }
+        if self.overlay.serves_dentry_cache() {
+            match self.dentry_stat(path, true) {
+                Ok(real) => {
+                    let kind = match real.kind {
+                        RootFsEntryKind::File => EntryKind::File,
+                        RootFsEntryKind::Directory => EntryKind::Directory,
+                        RootFsEntryKind::CharDevice => EntryKind::CharDevice,
+                        RootFsEntryKind::Fifo => EntryKind::Fifo,
+                        RootFsEntryKind::Socket => EntryKind::Socket,
+                        RootFsEntryKind::Symlink => EntryKind::Symlink,
+                    };
+                    return Ok(Metadata {
+                        kind,
+                        mode: real.mode,
+                        size: real.size,
+                        uid: real.uid.raw() as libc::uid_t,
+                        gid: real.gid.raw() as libc::gid_t,
+                        mtime_secs: real.mtime.0,
+                        mtime_nanos: real.mtime.1 as u32,
+                    });
+                }
+                Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
+                Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
+                Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
+                _ => {}
+            }
         }
         // One combined backend pass: kind + metadata answered from a single
         // contained open on the host backend (separate `lookup_kind` +

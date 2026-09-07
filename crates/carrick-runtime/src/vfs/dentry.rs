@@ -48,8 +48,8 @@ use parking_lot::RwLock;
 
 use crate::fs_backend::{FsBackend, RealStat};
 use crate::linux_abi::{
-    LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP, LINUX_ENAMETOOLONG, LINUX_ENOENT, LINUX_ENOTDIR,
-    LINUX_EXDEV, LinuxErrno,
+    LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP, LINUX_ENAMETOOLONG, LINUX_ENOENT, LINUX_ENOSYS,
+    LINUX_ENOTDIR, LINUX_EXDEV, LinuxErrno,
 };
 use crate::rootfs::{RootFs, RootFsEntryKind};
 use carrick_abi::{NsGid, NsUid};
@@ -175,6 +175,7 @@ pub struct DentryCache {
     mutation_gen: AtomicU64,
     next_dentry_id: AtomicU64,
     is_shared: bool,
+    host_opens: AtomicU64,
     fast_path: RwLock<FastPathCache>,
     entries: RwLock<HashMap<(DentryId, String), DentryNode>>,
     inodes: RwLock<HashMap<(u64, u64), InodeRecord>>,
@@ -214,12 +215,21 @@ impl DentryCache {
             mutation_gen: AtomicU64::new(1),
             next_dentry_id: AtomicU64::new(1),
             is_shared,
+            host_opens: AtomicU64::new(0),
             fast_path: RwLock::new(FastPathCache::default()),
             entries: RwLock::new(HashMap::new()),
             inodes: RwLock::new(HashMap::new()),
             dirs: RwLock::new(dirs),
             path_to_dir_id: RwLock::new(path_to_dir_id),
         }
+    }
+
+    pub fn host_open_count(&self) -> u64 {
+        self.host_opens.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_host_open_count(&self) {
+        self.host_opens.store(0, Ordering::Relaxed);
     }
 
     pub fn is_shared(&self) -> bool {
@@ -832,7 +842,11 @@ impl DentryCache {
         rootfs: Option<&RootFs>,
     ) -> Result<PositiveDentry, LinuxErrno> {
         let mode_type = st.st_mode as u32 & libc::S_IFMT as u32;
-        let real_stat = if !backend.serves_plain_metadata() {
+        let real_stat = if is_lower {
+            rootfs
+                .and_then(|rf| rf.immutable_backend())
+                .and_then(|b| b.real_stat(full_path, false))
+        } else if !backend.serves_plain_metadata() {
             backend.real_stat(full_path, false)
         } else {
             None
@@ -887,10 +901,44 @@ impl DentryCache {
         }
 
         if mode_type == libc::S_IFDIR as u32 {
-            let child_upper_dir_fd = backend.dir_fd_for(Path::new(rel_full));
-            let child_lower_dir_fd = rootfs
-                .and_then(|rf| rf.immutable_backend())
-                .and_then(|b| b.dir_fd_for(Path::new(rel_full)));
+            let child_upper_dir_fd = if !is_lower {
+                let raw = unsafe {
+                    libc::openat(
+                        parent_fd.as_raw_fd(),
+                        name_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                if raw >= 0 {
+                    self.host_opens.fetch_add(1, Ordering::Relaxed);
+                    Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                } else {
+                    backend.dir_fd_for(Path::new(rel_full))
+                }
+            } else {
+                backend.dir_fd_for(Path::new(rel_full))
+            };
+            let child_lower_dir_fd = if is_lower {
+                let raw = unsafe {
+                    libc::openat(
+                        parent_fd.as_raw_fd(),
+                        name_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                if raw >= 0 {
+                    self.host_opens.fetch_add(1, Ordering::Relaxed);
+                    Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                } else {
+                    rootfs
+                        .and_then(|rf| rf.immutable_backend())
+                        .and_then(|b| b.dir_fd_for(Path::new(rel_full)))
+                }
+            } else {
+                rootfs
+                    .and_then(|rf| rf.immutable_backend())
+                    .and_then(|b| b.dir_fd_for(Path::new(rel_full)))
+            };
             let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
             let child_dir_gen = Arc::new(AtomicU64::new(1));
             self.insert_dir(
@@ -1025,7 +1073,11 @@ impl DentryCache {
         };
         let rel_full = full_path.trim_start_matches('/');
 
-        if backend.is_deleted(&full_path) {
+        let is_whiteout = match upper_parent_fd {
+            Some(pfd) => backend.has_whiteout_in_dir(pfd.as_raw_fd(), name),
+            None => false,
+        };
+        if is_whiteout {
             if !self.is_shared {
                 self.insert_negative(parent_id, name, parent_dir_gen);
             }
@@ -1337,7 +1389,23 @@ impl DentryCache {
             }
         }
 
-        let resolved = self.lookup_path(path, effective_follow, backend, rootfs)?;
+        let resolved = match self.lookup_path(path, effective_follow, backend, rootfs) {
+            Ok(r) => r,
+            Err(e) => {
+                if !self.is_shared && matches!(e, LINUX_ENOENT) {
+                    let mut fp = self.fast_path.write();
+                    let map = if effective_follow {
+                        &mut fp.stat_follow
+                    } else {
+                        &mut fp.stat_nofollow
+                    };
+                    if map.len() < FAST_PATH_CAP {
+                        map.insert(norm_path.to_string(), Err(LINUX_ENOENT));
+                    }
+                }
+                return Err(e);
+            }
+        };
         if requires_dir && resolved.dentry.kind != RootFsEntryKind::Directory {
             return Err(LINUX_ENOTDIR);
         }
@@ -1389,7 +1457,7 @@ impl DentryCache {
             return Err(LINUX_EISDIR);
         }
         if resolved.dentry.kind != RootFsEntryKind::File {
-            return Err(LINUX_ENOENT);
+            return Err(LINUX_ENOSYS);
         }
         // Lower files must not be directly opened for writing without copy-up.
         if write && resolved.dentry.is_lower {
@@ -1412,6 +1480,7 @@ impl DentryCache {
                 .unwrap_or(libc::ENOENT);
             return Err(crate::host_to_linux_errno(err));
         }
+        self.host_opens.fetch_add(1, Ordering::Relaxed);
         let record = self.get_or_refresh_inode(&resolved, backend, rootfs)?;
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
         Ok((
@@ -1531,7 +1600,20 @@ impl DentryCache {
                 )
             };
             if rc == 0 {
-                let (mode, uid, gid) = if !backend.serves_plain_metadata() {
+                let (mode, uid, gid) = if resolved.dentry.is_lower {
+                    let rs = rootfs
+                        .and_then(|rf| rf.immutable_backend())
+                        .and_then(|b| b.real_stat(&resolved.canonical_path, false));
+                    if let Some(rs) = rs {
+                        (rs.mode, rs.uid, rs.gid)
+                    } else {
+                        (
+                            st.st_mode as u32 & 0o7777,
+                            NsUid(st.st_uid),
+                            NsGid(st.st_gid),
+                        )
+                    }
+                } else if !backend.serves_plain_metadata() {
                     if let Some(rs) = backend.real_stat(&resolved.canonical_path, false) {
                         (rs.mode, rs.uid, rs.gid)
                     } else {
@@ -1566,7 +1648,14 @@ impl DentryCache {
         }
 
         // 2. Try backend real_stat
-        if let Some(rs) = backend.real_stat(&resolved.canonical_path, false) {
+        let rs = if resolved.dentry.is_lower {
+            rootfs
+                .and_then(|rf| rf.immutable_backend())
+                .and_then(|b| b.real_stat(&resolved.canonical_path, false))
+        } else {
+            backend.real_stat(&resolved.canonical_path, false)
+        };
+        if let Some(rs) = rs {
             let record = InodeRecord {
                 mode: rs.mode,
                 uid: rs.uid,

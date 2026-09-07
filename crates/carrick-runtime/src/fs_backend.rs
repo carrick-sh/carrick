@@ -442,6 +442,11 @@ pub trait FsBackend: Send + Sync {
         matches!(self.lookup_kind(path), Some(OverlayEntryKind::Deleted))
     }
 
+    /// Cheaply check if `name` is whiteouted in the directory referred to by `parent_fd`.
+    fn has_whiteout_in_dir(&self, _parent_fd: i32, _name: &str) -> bool {
+        false
+    }
+
     /// `True` iff the backend can answer "what's at this path" — i.e.
     /// `lookup(...).is_some()`.
     fn shadows(&self, path: &str) -> bool {
@@ -5404,6 +5409,35 @@ impl FsBackend for HostFsBackend {
             return false;
         }
         matches!(self.lookup_kind(path), Some(OverlayEntryKind::Deleted))
+    }
+
+    fn has_whiteout_in_dir(&self, parent_fd: i32, name: &str) -> bool {
+        use sha2::{Digest as _, Sha256};
+        if !self.may_have_whiteouts() {
+            return false;
+        }
+        let digest = Sha256::digest(name.as_bytes());
+        let marker = format!("{HOST_WHITEOUT_SIDECAR_PREFIX}{digest:x}\0");
+        let raw = unsafe {
+            libc::openat(
+                parent_fd,
+                marker.as_ptr() as *const libc::c_char,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )
+        };
+        if raw < 0 {
+            return false;
+        }
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        unsafe {
+            libc::close(raw);
+        }
+        if n <= 0 {
+            return false;
+        }
+        &buf[..n as usize] == name.as_bytes()
     }
 
     fn native_reexec_authority(&self) -> Result<HostFsReexecAuthority, BackendError> {
