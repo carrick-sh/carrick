@@ -248,15 +248,6 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "AliasRegistry::rebuild_scope_rows",
-      "ordinal_in_function": 1,
-      "fingerprint": "38acfa1106f41f91dd7088c10e3c12168bcadc2d55cfcc55f962594b8bd4d740",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::host_alias",
-      "rationale": "A scope bucket that was just found and emptied under exclusive registry access disappeared before replacement; this proves the registry's bucket transaction is internally inconsistent and its indexes cannot be trusted."
-    },
-    {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasRegistry::replace_exact_keys_in_batch",
       "ordinal_in_function": 1,
       "fingerprint": "2ab4cf6e335a3b86c759f94f63cf5b2a1a00e5aefb1258803751d696ae41151e",
@@ -268,16 +259,25 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasRegistry::upsert_by_key",
       "ordinal_in_function": 1,
-      "fingerprint": "886dcc303488dab2bb78e3a240bb0eb7ad59880f90f0191e8cb6051178959d5b",
+      "fingerprint": "fbdea4538a4e8bd89075e3b5af51eff750f4fd5751c24c0da61df0c813bb9169",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
-      "rationale": "The exact-key index named a scope position that is absent from its authoritative bucket, proving index/bucket divergence before an alias mutation."
+      "rationale": "The exact-key index named a scope that is absent from the authoritative bucket map, proving index/bucket divergence before an alias mutation."
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasRegistry::upsert_by_key",
       "ordinal_in_function": 2,
-      "fingerprint": "886dcc303488dab2bb78e3a240bb0eb7ad59880f90f0191e8cb6051178959d5b",
+      "fingerprint": "fbdea4538a4e8bd89075e3b5af51eff750f4fd5751c24c0da61df0c813bb9169",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "The exact-key index's sequence could not be located in the sequence-ordered scope bucket, so the bucket is no longer in insertion order or the index names a retired row; continuing would update the wrong row."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "AliasRegistry::upsert_by_key",
+      "ordinal_in_function": 3,
+      "fingerprint": "fbdea4538a4e8bd89075e3b5af51eff750f4fd5751c24c0da61df0c813bb9169",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "The exact-key index's sequence or alias value disagreed with the authoritative scope bucket, so continuing the in-place update would corrupt ordering and exact-retirement identity."
@@ -285,8 +285,8 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "AliasRegistry::upsert_by_key",
-      "ordinal_in_function": 3,
-      "fingerprint": "886dcc303488dab2bb78e3a240bb0eb7ad59880f90f0191e8cb6051178959d5b",
+      "ordinal_in_function": 4,
+      "fingerprint": "fbdea4538a4e8bd89075e3b5af51eff750f4fd5751c24c0da61df0c813bb9169",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "The exact-key index entry disappeared during an exclusive upsert after its bucket was already mutated, leaving carrier alias indexes irreconcilably inconsistent."
