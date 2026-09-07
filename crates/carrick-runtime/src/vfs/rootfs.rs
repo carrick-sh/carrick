@@ -1316,8 +1316,7 @@ impl RootFsVfs {
             Ok(true) => {
                 let inode_a = self.path_inode_identity(a);
                 let inode_b = self.path_inode_identity(b);
-                self.dentry_cache.entry_moved(a, b, inode_b);
-                self.dentry_cache.entry_moved(b, a, inode_a);
+                self.dentry_cache.entry_exchanged(a, b, inode_a, inode_b);
                 Ok(())
             }
             // Backend couldn't own both sides even after materialise (Ok(false)),
