@@ -1996,3 +1996,66 @@ cycle; exit takes the carrier inventory mutex once per extent. Seven
 workers (`AGY_RUN_ID=perf2x-sep07`) hold the briefs: fault-window,
 mm-scope, exit-scaling, reactor, pprof-vdso (SIGPROF never lands in the
 vDSO), subprocess-fdleak, dentry-evict.
+
+## 2026-09-07: three landings, one rejection, and two reds under load
+
+Landed on main, each fast-forwarded from the worker branch, inventories
+reconciled, `just lint-domains` and the signed build green, `ubuntu:24.04
+/bin/true` and `python:3.12-slim print(1)` launch receipts:
+
+- **subprocess-fdleak** (`dc23e0128`..`5967a7b71`): `/proc/<self-pid>/fd`
+  resolves under HVPatch (the guest pid is not the carrier pid) and the
+  `/proc/self/fd` listing is built from the live fd table on every
+  `getdents64`. `cpython-subprocess` 297/297 on main (was 295/297).
+  Probe `procselffdfail` awaits its Docker bless.
+- **dentry-evict** (`cba377ccb`..`a4fe401e5`, hatch cleanup `1c8a320a4`):
+  the 4096-directory bulk reset is replaced by memory-bounded per-entry
+  eviction (32 MiB default, `CARRICK_DENTRY_CACHE_CAPACITY_BYTES`;
+  `CARRICK_DENTRY_EVICT=0` hatch), directories pinned by an explicit pin
+  count through the `RootFsVfs` mutators (a `strong_count` heuristic was
+  rejected in review), lookups re-walk on a concurrent eviction. Quiet
+  gate, both binaries: `openat03` DIFF → MATCH, `renameat202` REGRESSION
+  → MATCH, the six create-heavy LTP rows and `cpython-pathlib`/`tempfile`
+  unchanged to the millisecond.
+- **fault-window** (`4daf4bb29`..`03908a220`): a single-page first touch
+  materializes its whole 16 KiB compound (always the pooled, zero-syscall
+  path), anonymous private windows widen to 64 KiB
+  (`CARRICK_FAULT_WINDOW_BYTES`, `=4096` hatch) clamped to the pristine
+  hole, VMA, next mapping/alias and 2 MiB boundary, with untouched pages
+  left invalid and armed; every alias-registry walk on the path is a
+  bounded `by_va_start` query; the task mapping vector is kept sorted for
+  `partition_point`. 454 vmm-hvf tests serial. Quiet-gate numbers in the
+  same window, branch vs main: `cpython-itertools` 3.6 s vs 48.0 s,
+  `multiprocessing_main_handling` 13.8 vs 53.0 s, `importlib` 17.8 vs
+  24.9 s, `cpython-compile` 62 s vs the 300 s cap; `perf_fork` p50 253 vs
+  273 µs (unchanged). On the landed binary: `mincore01/02`,
+  `madvise01/06`, `mmap18`, `mmap01`, `munmap01`, `brk01`, `cpython-mmap`
+  all MATCH; `cpython-compile` MATCH 150/150 (first time).
+
+**Rejected.** `sched-herd` (no boundary yield, exact wakes): under three
+default-QoS hogs `cpython-importlib` wedged at
+`test_multiprocessing_pool_circular_import` with every executor parked in
+`RunQueue::take_row` — a lost wakeup (`target/perf/sched-herd-wedge/`).
+Its idle number was good (importlib 11.6 vs 24.9 s, involuntary context
+switches 325k vs 810k), so the worker is fixing the park/wake state
+machine with a red-first interleaving test. `exit-scaling`: the `wait`
+read-lock fast path drops ptrace tracee stops (4 kernel tests red on the
+branch, green on main). `pprof-vdso`: `cpython-signal` crashed the
+carrier and `TestCPUProfileMultithreadMagnitude` regressed on its own
+receipts. `reactor`: `withdraw` rebinds the wrong token after
+`swap_remove` (it reads the removed element, not the moved one).
+
+**Two reds under load, attributed.** With four workers building (load
+30), `go-go_types` aborts the carrier on EVERY binary including the
+ledger's `a4c5c672` (`scheduler generation observer lost exact
+transition … run queue publication authority does not match the
+submitted generation`, then every executor `failed boundary audit before
+ASID invalidation: host-signal-mask added=[1..31]`). This is the parked
+exec-generation race; it is pre-existing, load-coupled, and now
+reproduces 4 of 6 runs — the goal's "under the harness's own
+concurrency" clause cannot be met until it is fixed. Separately, two of
+three `go_types` runs on the landed binary ended in a Go runtime
+`fatal error: s.allocCount != s.nelems` inside a compile child (heap
+corruption), seen on neither the 4 KiB-window hatch nor the ledger
+binary in the same window; a larger sample is running before the window
+default is decided.
