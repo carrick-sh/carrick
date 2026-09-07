@@ -4806,31 +4806,13 @@ impl Kernel {
     ) -> Result<WaitOutcome, KernelOperationError> {
         self.sweep_retired_threads_for_process(Some(parent_id));
 
-        // Read-only path: if we are peeking or no matching child has exited,
-        // evaluate the entire wait query without acquiring a registry write lock.
-        let has_exited_child = if mode == WaitMode::Consume {
-            let state = self.registry().state.read();
-            ensure_task_unreserved(&state, parent_id)?;
-            let Some((parent, children)) = state
-                .tasks
-                .get(&parent_id)
-                .map(|record| (record.task.key(), record.task.children()))
-            else {
-                return Err(KernelOperationError::UnknownTask(parent_id));
-            };
-            children.iter().any(|child_key| {
-                state.zombies.get(&child_key.id).is_some_and(|record| {
-                    record.zombie.key == *child_key
-                        && record.zombie.parent == Some(parent)
-                        && class.admits(record.zombie.exit_signal)
-                        && target.admits(*child_key, record.zombie.process_group)
-                })
-            })
-        } else {
-            false
-        };
-
-        if !has_exited_child {
+        // Read-only path:
+        // For WaitMode::Observe, wait never modifies state; evaluate entirely under read lock.
+        // For WaitMode::Consume, check under read lock if any child is reapable or has a job control
+        // event. If none does, return StillRunning or NoChild without acquiring the write lock.
+        // Under NO circumstance does the read lock return Exited or job control state changes in
+        // WaitMode::Consume — check-and-consume must happen atomically under the write lock.
+        {
             let state = self.registry().state.read();
             if mode == WaitMode::Consume {
                 ensure_task_unreserved(&state, parent_id)?;
@@ -4849,110 +4831,171 @@ impl Kernel {
                 .into_iter()
                 .filter(|key| !children.contains(key))
                 .collect();
-            let exited = children.iter().find_map(|child_key| {
-                let record = state.zombies.get(&child_key.id)?;
-                if record.zombie.key == *child_key
-                    && record.zombie.parent == Some(parent)
-                    && class.admits(record.zombie.exit_signal)
-                    && target.admits(*child_key, record.zombie.process_group)
-                {
-                    Some((child_key.id, record.zombie.clone()))
-                } else {
-                    None
-                }
-            });
-            if let Some((_id, zombie)) = exited {
-                return Ok(WaitOutcome::Exited(zombie));
-            }
 
-            let state_change = children.iter().find_map(|child_key| {
-                let record = state.tasks.get(&child_key.id)?;
-                if record.task.key() == *child_key
-                    && record.task.parent() == Some(parent)
-                    && class.admits(record.task.exit_signal())
-                    && target.admits(*child_key, record.task.process_group())
-                {
-                    record
-                        .task
-                        .waitable_job_control_event(
-                            job_control.stopped,
-                            job_control.continued,
-                            mode == WaitMode::Consume,
-                        )
-                        .map(|event| match event {
-                            TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
-                                task: child_key.id,
-                                signal,
-                                ruid: record.task.process_credentials().ruid(),
-                            },
-                            TaskJobControlEvent::Continued => WaitOutcome::Continued {
-                                task: child_key.id,
-                                ruid: record.task.process_credentials().ruid(),
-                            },
-                        })
-                } else {
-                    None
+            if mode == WaitMode::Observe {
+                let exited = children.iter().find_map(|child_key| {
+                    let record = state.zombies.get(&child_key.id)?;
+                    if record.zombie.key == *child_key
+                        && record.zombie.parent == Some(parent)
+                        && class.admits(record.zombie.exit_signal)
+                        && target.admits(*child_key, record.zombie.process_group)
+                    {
+                        Some((child_key.id, record.zombie.clone()))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((_id, zombie)) = exited {
+                    return Ok(WaitOutcome::Exited(zombie));
                 }
-            });
-            if let Some(state_change) = state_change {
-                return Ok(state_change);
-            }
 
-            let tracee_stop = traced_non_children.iter().find_map(|tracee_key| {
-                let record = state.tasks.get(&tracee_key.id)?;
-                if record.task.key() == *tracee_key
-                    && record.task.ptrace_tracer() == Some(parent)
-                    && target.admits(*tracee_key, record.task.process_group())
-                {
-                    record
-                        .task
-                        .waitable_job_control_event(
-                            true,
-                            job_control.continued,
-                            mode == WaitMode::Consume,
-                        )
-                        .map(|event| match event {
-                            TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
-                                task: tracee_key.id,
-                                signal,
-                                ruid: record.task.process_credentials().ruid(),
-                            },
-                            TaskJobControlEvent::Continued => WaitOutcome::Continued {
-                                task: tracee_key.id,
-                                ruid: record.task.process_credentials().ruid(),
-                            },
-                        })
-                } else {
-                    None
-                }
-            });
-            if let Some(tracee_stop) = tracee_stop {
-                return Ok(tracee_stop);
-            }
-
-            let live_tracee = traced_non_children.iter().any(|tracee_key| {
-                let Some(record) = state.tasks.get(&tracee_key.id) else {
-                    return false;
-                };
-                record.task.key() == *tracee_key
-                    && record.task.ptrace_tracer() == Some(parent)
-                    && target.admits(*tracee_key, record.task.process_group())
-            });
-            let live_child = live_tracee
-                || children.iter().any(|child_key| {
-                    let Some(record) = state.tasks.get(&child_key.id) else {
-                        return false;
-                    };
-                    record.task.key() == *child_key
+                let state_change = children.iter().find_map(|child_key| {
+                    let record = state.tasks.get(&child_key.id)?;
+                    if record.task.key() == *child_key
                         && record.task.parent() == Some(parent)
                         && class.admits(record.task.exit_signal())
                         && target.admits(*child_key, record.task.process_group())
+                    {
+                        record
+                            .task
+                            .waitable_job_control_event(
+                                job_control.stopped,
+                                job_control.continued,
+                                false,
+                            )
+                            .map(|event| match event {
+                                TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
+                                    task: child_key.id,
+                                    signal,
+                                    ruid: record.task.process_credentials().ruid(),
+                                },
+                                TaskJobControlEvent::Continued => WaitOutcome::Continued {
+                                    task: child_key.id,
+                                    ruid: record.task.process_credentials().ruid(),
+                                },
+                            })
+                    } else {
+                        None
+                    }
                 });
-            return Ok(if live_child {
-                WaitOutcome::StillRunning
+                if let Some(state_change) = state_change {
+                    return Ok(state_change);
+                }
+
+                let tracee_stop = traced_non_children.iter().find_map(|tracee_key| {
+                    let record = state.tasks.get(&tracee_key.id)?;
+                    if record.task.key() == *tracee_key
+                        && record.task.ptrace_tracer() == Some(parent)
+                        && target.admits(*tracee_key, record.task.process_group())
+                    {
+                        record
+                            .task
+                            .waitable_job_control_event(true, job_control.continued, false)
+                            .map(|event| match event {
+                                TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
+                                    task: tracee_key.id,
+                                    signal,
+                                    ruid: record.task.process_credentials().ruid(),
+                                },
+                                TaskJobControlEvent::Continued => WaitOutcome::Continued {
+                                    task: tracee_key.id,
+                                    ruid: record.task.process_credentials().ruid(),
+                                },
+                            })
+                    } else {
+                        None
+                    }
+                });
+                if let Some(tracee_stop) = tracee_stop {
+                    return Ok(tracee_stop);
+                }
+
+                let live_tracee = traced_non_children.iter().any(|tracee_key| {
+                    let Some(record) = state.tasks.get(&tracee_key.id) else {
+                        return false;
+                    };
+                    record.task.key() == *tracee_key
+                        && record.task.ptrace_tracer() == Some(parent)
+                        && target.admits(*tracee_key, record.task.process_group())
+                });
+                let live_child = live_tracee
+                    || children.iter().any(|child_key| {
+                        let Some(record) = state.tasks.get(&child_key.id) else {
+                            return false;
+                        };
+                        record.task.key() == *child_key
+                            && record.task.parent() == Some(parent)
+                            && class.admits(record.task.exit_signal())
+                            && target.admits(*child_key, record.task.process_group())
+                    });
+                return Ok(if live_child {
+                    WaitOutcome::StillRunning
+                } else {
+                    WaitOutcome::NoChild
+                });
             } else {
-                WaitOutcome::NoChild
-            });
+                let has_exited_child = children.iter().any(|child_key| {
+                    state.zombies.get(&child_key.id).is_some_and(|record| {
+                        record.zombie.key == *child_key
+                            && record.zombie.parent == Some(parent)
+                            && class.admits(record.zombie.exit_signal)
+                            && target.admits(*child_key, record.zombie.process_group)
+                    })
+                });
+                let has_job_control = (job_control.stopped || job_control.continued)
+                    && (children.iter().any(|child_key| {
+                        state.tasks.get(&child_key.id).is_some_and(|record| {
+                            record.task.key() == *child_key
+                                && record.task.parent() == Some(parent)
+                                && class.admits(record.task.exit_signal())
+                                && target.admits(*child_key, record.task.process_group())
+                                && record
+                                    .task
+                                    .waitable_job_control_event(
+                                        job_control.stopped,
+                                        job_control.continued,
+                                        false,
+                                    )
+                                    .is_some()
+                        })
+                    }) || traced_non_children.iter().any(|tracee_key| {
+                        state.tasks.get(&tracee_key.id).is_some_and(|record| {
+                            record.task.key() == *tracee_key
+                                && record.task.ptrace_tracer() == Some(parent)
+                                && target.admits(*tracee_key, record.task.process_group())
+                                && record
+                                    .task
+                                    .waitable_job_control_event(true, job_control.continued, false)
+                                    .is_some()
+                        })
+                    }));
+
+                if !has_exited_child && !has_job_control {
+                    let live_tracee = traced_non_children.iter().any(|tracee_key| {
+                        let Some(record) = state.tasks.get(&tracee_key.id) else {
+                            return false;
+                        };
+                        record.task.key() == *tracee_key
+                            && record.task.ptrace_tracer() == Some(parent)
+                            && target.admits(*tracee_key, record.task.process_group())
+                    });
+                    let live_child = live_tracee
+                        || children.iter().any(|child_key| {
+                            let Some(record) = state.tasks.get(&child_key.id) else {
+                                return false;
+                            };
+                            record.task.key() == *child_key
+                                && record.task.parent() == Some(parent)
+                                && class.admits(record.task.exit_signal())
+                                && target.admits(*child_key, record.task.process_group())
+                        });
+                    return Ok(if live_child {
+                        WaitOutcome::StillRunning
+                    } else {
+                        WaitOutcome::NoChild
+                    });
+                }
+            }
         }
 
         let mut state = self.registry().state.write();
@@ -9412,6 +9455,66 @@ mod tests {
         // Sweeping child2 reaps child2's retired thread.
         assert_eq!(kernel.sweep_retired_threads_for_process(Some(child2_id)), 1);
         assert_eq!(kernel.registry().retired_thread_count(), 0);
+    }
+
+    #[test]
+    fn wait_consume_never_returns_unconsumed_zombie_under_interleaved_exit() {
+        let (kernel, root) = bootstrap(199);
+        let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        for i in 0..100 {
+            let child = kernel
+                .fork_task(
+                    &root,
+                    fork_plan.clone(),
+                    ThreadId::synthetic_for_tests(10_000 + i),
+                    format!("child-{i}"),
+                    None,
+                )
+                .expect("fork");
+            let child_id = child.task().key().id;
+            drop(child);
+
+            let waiter_kernel = Arc::clone(&kernel);
+            let root_id = root.task().key().id;
+
+            let waiter = std::thread::spawn(move || {
+                loop {
+                    match waiter_kernel.wait_child(root_id, Some(child_id), WaitMode::Consume) {
+                        Ok(WaitOutcome::StillRunning) => {
+                            std::thread::yield_now();
+                        }
+                        Ok(WaitOutcome::Exited(zombie)) => {
+                            assert_eq!(zombie.key.id, child_id);
+                            assert_eq!(
+                                waiter_kernel.registry().zombie_count(),
+                                0,
+                                "zombie must be consumed when WaitMode::Consume returns Exited"
+                            );
+                            assert!(
+                                matches!(
+                                    waiter_kernel.wait_child(
+                                        root_id,
+                                        Some(child_id),
+                                        WaitMode::Consume
+                                    ),
+                                    Ok(WaitOutcome::NoChild)
+                                ),
+                                "second wait in WaitMode::Consume must return NoChild, not double reap"
+                            );
+                            break;
+                        }
+                        other => panic!("unexpected wait outcome: {other:?}"),
+                    }
+                }
+            });
+
+            std::thread::yield_now();
+            kernel
+                .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+                .expect("exit");
+
+            waiter.join().expect("waiter thread join");
+        }
     }
 
     #[test]
