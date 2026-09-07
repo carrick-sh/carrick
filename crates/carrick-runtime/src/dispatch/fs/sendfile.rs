@@ -218,14 +218,14 @@ impl SyscallDispatcher {
         let Some(open) = in_file.description.read() else {
             return Err(LINUX_EINVAL);
         };
-        // HostFile: pread the requested window from the real fd. Cap the buffer:
+        // HostFile / File: pread/read the requested window. Cap the buffer:
         // callers (Go's poll.SendFile) pass count = INT_MAX, and a naive
         // `vec![0u8; count]` would zero-fill 2 GiB per call. Linux sendfile is
         // free to transfer fewer than `count` bytes (the caller loops), so read
-        // at most one chunk; pread then truncates to what the file holds.
+        // at most one chunk; pread/read_at then truncates to what the file holds.
+        const SENDFILE_CHUNK: usize = 1 << 24; // 16 MiB
+        let want = count.min(SENDFILE_CHUNK);
         if let OpenDescription::HostFile { host_fd, .. } = &*open {
-            const SENDFILE_CHUNK: usize = 1 << 24; // 16 MiB
-            let want = count.min(SENDFILE_CHUNK);
             let mut buf = vec![0u8; want];
             let n = unsafe {
                 libc::pread(
@@ -240,17 +240,29 @@ impl SyscallDispatcher {
             return Ok(buf);
         }
         let bytes = match &*open {
-            OpenDescription::Closed { .. } => return Err(LINUX_EBADF),
-            OpenDescription::File { contents, .. } => contents.read_at(offset, count),
+            OpenDescription::File { contents, .. } => {
+                let file_len = contents.len()?;
+                let available =
+                    usize::try_from(file_len.saturating_sub(offset as u64)).unwrap_or(usize::MAX);
+                let read_len = want.min(available);
+                if read_len == 0 {
+                    Vec::new()
+                } else {
+                    let mut buf = vec![0u8; read_len];
+                    let n = contents.read_at(offset as u64, &mut buf)?;
+                    buf.truncate(n);
+                    buf
+                }
+            }
             OpenDescription::SyntheticFile { contents, .. } => {
                 let available = contents.get(offset..).unwrap_or_default();
-                let write_len = available.len().min(count);
+                let write_len = available.len().min(want);
                 available[..write_len].to_vec()
             }
             OpenDescription::InMemoryFile { contents, .. } => {
                 let data = contents.read();
                 let available = data.get(offset..).unwrap_or_default();
-                let write_len = available.len().min(count);
+                let write_len = available.len().min(want);
                 available[..write_len].to_vec()
             }
             OpenDescription::HostFile { .. } => return Err(LINUX_EINVAL),
@@ -274,6 +286,7 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::Netlink { .. }
             | OpenDescription::InMemorySocket { .. } => return Err(LINUX_EINVAL),
+            OpenDescription::Closed { .. } => return Err(LINUX_EBADF),
         };
         Ok(bytes)
     }

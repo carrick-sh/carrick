@@ -3582,8 +3582,10 @@ fn rlimit_fsize_straddling_regular_write_returns_only_the_limit_prefix() {
     let OpenDescription::File { contents, .. } = &*description else {
         panic!("expected in-memory regular-file description");
     };
-    assert_eq!(contents.len(), 10);
-    assert_eq!(contents.to_vec(), b"abcdefghij");
+    assert_eq!(contents.len().unwrap(), 10);
+    let mut buf = vec![0u8; 10];
+    assert_eq!(contents.read_at(0, &mut buf).unwrap(), 10);
+    assert_eq!(buf, b"abcdefghij");
 }
 
 /// `close(2)` must retire the descriptor's `fd_open_paths` entry.

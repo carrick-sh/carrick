@@ -9005,14 +9005,14 @@ fn write_into_file_contents(
     contents: &mut FileContents,
     offset: &mut usize,
     bytes: &[u8],
-) -> Result<(), LinuxErrno> {
+) -> Result<usize, LinuxErrno> {
     let end = (*offset).checked_add(bytes.len()).ok_or(LINUX_EFBIG)?;
     if !contents.accepts_len(end as u64) {
         return Err(LINUX_EFBIG);
     }
-    contents.write_at(*offset, bytes)?;
-    *offset = end;
-    Ok(())
+    let written = contents.write_at(*offset as u64, bytes)?;
+    *offset += written;
+    Ok(written)
 }
 
 /// Seal enforcement for a content-modifying write to a memfd (`seals` is the
@@ -11576,6 +11576,18 @@ fn read_from_file_contents_at(
     mut offset: usize,
     iovecs: &[LinuxIovec],
 ) -> Result<usize, DispatchError> {
+    let mut max_iov_len = 0usize;
+    for iovec in iovecs {
+        let iov_len = usize::try_from(iovec.iov_len)
+            .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+        if iov_len > max_iov_len {
+            max_iov_len = iov_len;
+        }
+    }
+    if max_iov_len == 0 {
+        return Ok(0);
+    }
+    let mut scratch = vec![0u8; max_iov_len];
     let mut total = 0usize;
     for iovec in iovecs {
         let iov_base = iovec.iov_base;
@@ -11584,20 +11596,27 @@ fn read_from_file_contents_at(
         if iov_len == 0 {
             continue;
         }
-        let bytes = contents.read_at(offset, iov_len);
-        let read_len = bytes.len();
-        if read_len == 0 {
-            break;
-        }
-        if memory.write_bytes(iov_base, &bytes).is_err() {
-            return Ok(total);
-        }
-        offset += read_len;
-        total = total
-            .checked_add(read_len)
-            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-        if read_len < iov_len {
-            break;
+        let buf = &mut scratch[..iov_len];
+        match contents.read_at(offset as u64, buf) {
+            Ok(0) => break,
+            Ok(read_len) => {
+                if memory.write_bytes(iov_base, &buf[..read_len]).is_err() {
+                    return Ok(total);
+                }
+                offset += read_len;
+                total = total
+                    .checked_add(read_len)
+                    .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+                if read_len < iov_len {
+                    break;
+                }
+            }
+            Err(errno) => {
+                if total > 0 {
+                    return Ok(total);
+                }
+                return Err(DispatchError::Errno(errno));
+            }
         }
     }
     Ok(total)

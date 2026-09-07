@@ -2535,17 +2535,24 @@ impl SyscallDispatcher {
                             let err = if is_writable {
                                 if !is_memfd && !*writable {
                                     Some(LINUX_EACCES)
-                                } else if flags & LINUX_O_TRUNC != 0 && contents.len() != 0 {
-                                    if let Err(errno) = memfd_seal_resize_check(
-                                        open_file.description.common().seals(),
-                                        0,
-                                        contents.len(),
-                                    ) {
-                                        Some(errno)
-                                    } else {
-                                        contents.truncate(0);
-                                        metadata.size = 0;
-                                        None
+                                } else if flags & LINUX_O_TRUNC != 0 {
+                                    match contents.len() {
+                                        Err(errno) => Some(errno),
+                                        Ok(0) => None,
+                                        Ok(cur_len) => {
+                                            if let Err(errno) = memfd_seal_resize_check(
+                                                open_file.description.common().seals(),
+                                                0,
+                                                usize::try_from(cur_len).unwrap_or(usize::MAX),
+                                            ) {
+                                                Some(errno)
+                                            } else if let Err(errno) = contents.resize(0) {
+                                                Some(errno)
+                                            } else {
+                                                metadata.size = 0;
+                                                None
+                                            }
+                                        }
                                     }
                                 } else {
                                     None
@@ -6567,15 +6574,26 @@ impl SyscallDispatcher {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         }
                         let write_offset = *offset;
-                        if let Err(errno) = write_into_file_contents(contents, offset, bytes) {
-                            return DispatchOutcome::errno(errno);
-                        }
-                        metadata.size = contents.len();
-                        outcome = DispatchOutcome::Returned {
-                            value: bytes.len() as i64,
+                        let written = match write_into_file_contents(contents, offset, bytes) {
+                            Ok(n) => n,
+                            Err(errno) => return DispatchOutcome::errno(errno),
                         };
-                        writeback = (!is_anon_overlay_path(path))
-                            .then(|| (path.clone(), write_offset, contents.len()));
+                        let cur_len = match contents.len() {
+                            Ok(l) => l,
+                            Err(errno) if written == 0 => return DispatchOutcome::errno(errno),
+                            Err(_) => *offset as u64,
+                        };
+                        metadata.size = usize::try_from(cur_len).unwrap_or(metadata.size);
+                        outcome = DispatchOutcome::Returned {
+                            value: written as i64,
+                        };
+                        writeback = (!is_anon_overlay_path(path)).then(|| {
+                            (
+                                path.clone(),
+                                write_offset,
+                                usize::try_from(cur_len).unwrap_or(0),
+                            )
+                        });
                     }
                     _ => return DispatchOutcome::errno(LINUX_EBADF),
                 }
@@ -6701,7 +6719,20 @@ impl SyscallDispatcher {
                 contents,
                 metadata,
                 ..
-            } if is_anon_overlay_path(path.as_str()) => (contents.to_vec(), metadata.mode & 0o7777),
+            } if is_anon_overlay_path(path.as_str()) => {
+                let len = match contents.len() {
+                    Ok(l) => match usize::try_from(l) {
+                        Ok(u) => u,
+                        Err(_) => return Some(Err(linux_errno::EOVERFLOW)),
+                    },
+                    Err(errno) => return Some(Err(errno)),
+                };
+                let mut vec = vec![0u8; len];
+                if let Err(errno) = contents.read_at(0, &mut vec) {
+                    return Some(Err(errno));
+                }
+                (vec, metadata.mode & 0o7777)
+            }
             _ => return None,
         };
         drop(desc);
@@ -10147,6 +10178,10 @@ impl SyscallDispatcher {
                         // blocked only by F_SEAL_GROW when it extends the file —
                         // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
                         // seals WRITE then grows via fallocate successfully).
+                        let cur_len = match contents.len() {
+                            Ok(l) => l,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
                         if matches!(
                             open_file
                                 .description
@@ -10154,22 +10189,36 @@ impl SyscallDispatcher {
                                 .seals()
                                 .and_then(carrick_abi::LinuxMemfdSeals::from_bits),
                             Some(s) if s.contains(carrick_abi::LinuxMemfdSeals::GROW)
-                        ) && new_size as usize > contents.len()
+                        ) && new_size > cur_len
                         {
                             return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
                         if !contents.accepts_len(new_size) {
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
-                        if new_size as usize > contents.len() {
-                            contents.resize(new_size as usize);
-                            metadata.size = contents.len();
+                        if new_size > cur_len {
+                            if let Err(errno) = contents.resize(new_size) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            let confirmed_len = match contents.len() {
+                                Ok(l) => l,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            metadata.size = usize::try_from(confirmed_len).unwrap_or(metadata.size);
                         }
                         // Sync the grown contents to the overlay backing so a
                         // later fstat of the path agrees. Anonymous files
                         // (memfd, O_TMPFILE) have no overlay path to sync.
-                        writeback =
-                            (!is_anon_overlay_path(path)).then(|| (path.clone(), contents.to_vec()));
+                        let writeback_vec = if !is_anon_overlay_path(path) {
+                            let mut vec = vec![0u8; metadata.size];
+                            if let Err(errno) = contents.read_at(0, &mut vec) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            Some((path.clone(), vec))
+                        } else {
+                            None
+                        };
+                        writeback = writeback_vec;
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
                     OpenDescription::File {
@@ -10193,13 +10242,23 @@ impl SyscallDispatcher {
                             // The punched range reads back as zeros; the
                             // apparent size never changes (KEEP_SIZE is
                             // mandatory with PUNCH_HOLE).
-                            let cur_len = contents.len();
-                            let start = (offset as usize).min(cur_len);
-                            let end = (offset as usize).saturating_add(length as usize).min(cur_len);
-                            if end > start
-                                && let Err(errno) = contents.write_at(start, &vec![0u8; end - start])
-                            {
-                                return Ok(DispatchOutcome::errno(errno));
+                            let cur_len = match contents.len() {
+                                Ok(l) => l,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            let start = (offset as u64).min(cur_len);
+                            let end = (offset as u64).saturating_add(length as u64).min(cur_len);
+                            if end > start {
+                                let zero_chunk = [0u8; 4096];
+                                let mut cur = start;
+                                while cur < end {
+                                    let chunk_len = ((end - cur) as usize).min(zero_chunk.len());
+                                    match contents.write_at(cur, &zero_chunk[..chunk_len]) {
+                                        Ok(0) => break,
+                                        Ok(n) => cur += n as u64,
+                                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                                    }
+                                }
                             }
                         }
                         // KEEP_SIZE: don't change apparent size.
@@ -10322,27 +10381,41 @@ impl SyscallDispatcher {
                         if !contents.accepts_len(length as u64) {
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
+                        let cur_len = match contents.len() {
+                            Ok(l) => l,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
                         let new_len = length as usize;
                         // memfd resize seals: F_SEAL_SHRINK blocks shrink,
                         // F_SEAL_GROW blocks grow (memfd_create01).
                         if let Err(errno) = memfd_seal_resize_check(
                             open_file.description.common().seals(),
                             new_len,
-                            contents.len(),
+                            usize::try_from(cur_len).unwrap_or(usize::MAX),
                         ) {
                             return Ok(DispatchOutcome::errno(errno));
                         }
-                        if new_len > contents.len() {
-                            contents.resize(new_len);
-                        } else {
-                            contents.truncate(new_len);
-                            if *offset > new_len {
-                                *offset = new_len;
-                            }
+                        if let Err(errno) = contents.resize(length as u64) {
+                            return Ok(DispatchOutcome::errno(errno));
                         }
-                        metadata.size = contents.len();
-                        writeback =
-                            (!is_anon_overlay_path(path)).then(|| (path.clone(), contents.to_vec()));
+                        if *offset > new_len {
+                            *offset = new_len;
+                        }
+                        let confirmed_len = match contents.len() {
+                            Ok(l) => l,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
+                        metadata.size = usize::try_from(confirmed_len).unwrap_or(new_len);
+                        let writeback_vec = if !is_anon_overlay_path(path) {
+                            let mut vec = vec![0u8; metadata.size];
+                            if let Err(errno) = contents.read_at(0, &mut vec) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            Some((path.clone(), vec))
+                        } else {
+                            None
+                        };
+                        writeback = writeback_vec;
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
                     OpenDescription::InMemoryFile {
@@ -10881,7 +10954,10 @@ impl SyscallDispatcher {
                                 if offset < 0 {
                                     return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                                 }
-                                let file_size = contents.len();
+                                let file_size = match contents.len() {
+                                    Ok(l) => l as usize,
+                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                                };
                                 if (offset as usize) >= file_size {
                                     return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                                 }
@@ -10895,7 +10971,11 @@ impl SyscallDispatcher {
                             }
                         }
                     }
-                    (*file_offset as i64, contents.len() as i64)
+                    let file_size = match contents.len() {
+                        Ok(l) => l as i64,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
+                    (*file_offset as i64, file_size)
                 }
                 OpenDescription::SyntheticFile {
                     contents,
@@ -11153,10 +11233,18 @@ impl SyscallDispatcher {
                 OpenDescription::File {
                     contents, offset, ..
                 } => {
-                    let bytes = contents.read_at(*offset, length);
-                    let read_len = bytes.len();
-                    *offset += read_len;
-                    (read_len, bytes)
+                    let mut buf = vec![0u8; length];
+                    match contents.read_at(*offset as u64, &mut buf) {
+                        Ok(read_len) => {
+                            *offset += read_len;
+                            buf.truncate(read_len);
+                            (read_len, buf)
+                        }
+                        Err(errno) => {
+                            drop(open);
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                    }
                 }
                 OpenDescription::InMemoryFile {
                     contents,
@@ -11835,7 +11923,19 @@ impl SyscallDispatcher {
                 OpenDescription::Closed { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
-                OpenDescription::File { contents, .. } => contents.read_at(offset, length),
+                OpenDescription::File { contents, .. } => {
+                    let mut buf = vec![0u8; length];
+                    match contents.read_at(offset as u64, &mut buf) {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            buf
+                        }
+                        Err(errno) => {
+                            drop(open);
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                    }
+                }
                 OpenDescription::SyntheticFile { contents, .. } => contents
                     .get(offset..)
                     .unwrap_or_default()
@@ -12227,8 +12327,12 @@ impl SyscallDispatcher {
                     if !*writable {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    let cur_len = match contents.len() {
+                        Ok(l) => l as usize,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
                     let write_at = if is_append {
-                        contents.len()
+                        cur_len
                     } else {
                         offset as usize
                     };
@@ -12236,25 +12340,31 @@ impl SyscallDispatcher {
                         open_file.description.common().seals(),
                         write_at,
                         bytes.len(),
-                        contents.len(),
+                        cur_len,
                     ) {
                         return Ok(DispatchOutcome::errno(errno));
                     }
                     let mut off = write_at;
-                    if let Err(errno) = write_into_file_contents(contents, &mut off, &bytes) {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    metadata.size = contents.len();
-                    let writeback = (!is_anon_overlay_path(path)).then(|| (path.clone(), contents.len()));
+                    let written = match write_into_file_contents(contents, &mut off, &bytes) {
+                        Ok(n) => n,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
+                    let new_len = match contents.len() {
+                        Ok(l) => l as usize,
+                        Err(errno) if written == 0 => return Ok(DispatchOutcome::errno(errno)),
+                        Err(_) => cur_len.max(write_at.saturating_add(written)),
+                    };
+                    metadata.size = new_len;
+                    let writeback = (!is_anon_overlay_path(path)).then(|| (path.clone(), new_len));
                     drop(open);
                     if let Some((path, final_size)) = writeback {
                         let _ = this
                             .fs
                             .rootfs_vfs
-                            .write_file_range(&path, write_at, &bytes, final_size);
+                            .write_file_range(&path, write_at, &bytes[..written], final_size);
                     }
                     return Ok(DispatchOutcome::Returned {
-                        value: bytes.len() as i64,
+                        value: written as i64,
                     });
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -14088,7 +14198,10 @@ impl SyscallDispatcher {
                         }
                         st.st_size.max(0) as u64
                     }
-                    OpenDescription::File { contents, .. } => contents.len() as u64,
+                    OpenDescription::File { contents, .. } => match contents.len() {
+                        Ok(len) => len,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    },
                     OpenDescription::SyntheticFile { contents, .. } => contents.len() as u64,
                     // cachestat needs a page-cache-backed fd (regular file /
                     // shmem); anything else has no cache → EBADF.
@@ -14518,13 +14631,17 @@ impl SyscallDispatcher {
                             if !*writable {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             }
+                            let cur_len = match contents.len() {
+                                Ok(l) => l as usize,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
                             // memfd write seals: F_SEAL_WRITE → EPERM; F_SEAL_GROW
                             // → EPERM when the write would extend the file.
                             if let Err(errno) = memfd_seal_write_check(
                                 open_file.description.common().seals(),
                                 *offset,
                                 bytes.len(),
-                                contents.len(),
+                                cur_len,
                             ) {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
@@ -14533,11 +14650,19 @@ impl SyscallDispatcher {
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             }
                             let write_offset = *offset;
-                            if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
-                                return Ok(DispatchOutcome::errno(errno));
-                            }
-                            let written = bytes.len();
-                            metadata.size = contents.len();
+                            let written = match write_into_file_contents(contents, offset, &bytes) {
+                                Ok(n) => n,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            bytes.truncate(written);
+                            let new_len = match contents.len() {
+                                Ok(l) => l as usize,
+                                Err(errno) if written == 0 => {
+                                    return Ok(DispatchOutcome::errno(errno));
+                                }
+                                Err(_) => cur_len.max(write_offset.saturating_add(written)),
+                            };
+                            metadata.size = new_len;
                             outcome = DispatchOutcome::Returned {
                                 value: written as i64,
                             };
@@ -14546,7 +14671,7 @@ impl SyscallDispatcher {
                                     path: path.clone(),
                                     offset: write_offset,
                                     bytes,
-                                    final_size: contents.len(),
+                                    final_size: new_len,
                                 }
                             });
                         }
@@ -14813,7 +14938,7 @@ impl SyscallDispatcher {
                 if iov_len == 0 {
                     continue;
                 }
-                let bytes = match memory.read_bytes(iov_base, iov_len) {
+                let mut bytes = match memory.read_bytes(iov_base, iov_len) {
                     Ok(bytes) => bytes,
                     Err(_) => {
                         // Bytes already written are already visible in the
@@ -15082,20 +15207,32 @@ impl SyscallDispatcher {
                                 if !*writable {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 }
+                                let cur_len = match contents.len() {
+                                    Ok(l) => l as usize,
+                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                                };
                                 if let Err(errno) = memfd_seal_write_check(
                                     open_file.description.common().seals(),
                                     *offset,
                                     bytes.len(),
-                                    contents.len(),
+                                    cur_len,
                                 ) {
                                     return Ok(DispatchOutcome::errno(errno));
                                 }
                                 let write_offset = *offset;
-                                if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
-                                    return Ok(DispatchOutcome::errno(errno));
-                                }
-                                let written = bytes.len();
-                                metadata.size = contents.len();
+                                let written = match write_into_file_contents(contents, offset, &bytes) {
+                                    Ok(n) => n,
+                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                                };
+                                bytes.truncate(written);
+                                let new_len = match contents.len() {
+                                    Ok(l) => l as usize,
+                                    Err(errno) if written == 0 => {
+                                        return Ok(DispatchOutcome::errno(errno));
+                                    }
+                                    Err(_) => cur_len.max(write_offset.saturating_add(written)),
+                                };
+                                metadata.size = new_len;
                                 outcome = DispatchOutcome::Returned {
                                     value: written as i64,
                                 };
@@ -15104,7 +15241,7 @@ impl SyscallDispatcher {
                                         path: path.clone(),
                                         offset: write_offset,
                                         bytes,
-                                        final_size: contents.len(),
+                                        final_size: new_len,
                                     }
                                 });
                             }
