@@ -2092,3 +2092,25 @@ the coupling is host CPU starvation, not guest traffic. Note also that
 `with_live_active_scheduler_thread` scans every task in the carrier on
 every generation transition — an O(live tasks) cost on the wake/park
 path that the per-CPU scheduler must not inherit.
+
+## 2026-09-07: the fault-window corruption — a binary search on an unsorted vector
+
+The wide-window Go heap fatal (`allocCount != nelems`, 5 of 6 runs at
+64 KiB, 2 of 3 at 16 KiB, 0 of 4 at 4 KiB) and the rarer
+`memmove`/`stkbucket` SIGSEGV share one cause. The fault-window landing
+(`d8f8df493`) made the window arm's "next local mapping" and "mapping
+below the compound" questions and the materializer's next-mapping bound
+`partition_point` searches over `HvfTaskState.mappings`, assuming the
+vector is sorted by start — but five publication paths `push` and one
+`extend`s out of order. A binary search over an unsorted vector misses
+live mappings, so a sparse extent could be materialized on top of a
+mapping the guest had already written; wider windows simply asked the
+broken question more often. `a1fd9ad94` restores full scans for the
+three questions (the two sorted inserts stay, harmless). The perf that
+landed came from the compound-aligned pooled first touch and the bounded
+alias-registry queries, not from those searches. Validation on the fixed
+binary with `CARRICK_FAULT_WINDOW_BYTES=65536` forced is
+`target/conformance/eco-load/unsorted-fix-validate.log`; if it is clean
+the 64 KiB default returns. Lesson for the inventories: a `Vec` that one
+site binary-searches needs a single sorted-insert path and a debug
+assertion, or the search is a bug waiting for the next `push`.
