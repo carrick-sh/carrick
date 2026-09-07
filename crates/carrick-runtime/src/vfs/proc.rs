@@ -1310,7 +1310,9 @@ pub(crate) fn proc_live_pid(pid: &str) -> Option<(bool, u32)> {
     // proc_pid_dir_host_pid does the ns→host translation AND the liveness gate
     // (synthetic_task_dir), returning the host pid only for a live process.
     let host = proc_pid_dir_host_pid(&format!("/proc/{pid}"))?;
-    Some((host == std::process::id(), host))
+    let is_self = pid.parse::<u32>().ok() == Some(crate::namespace::pid::self_ns_pid())
+        || host == std::process::id();
+    Some((is_self, host))
 }
 
 /// For a `/proc/{self,…,<pid>}/<rest>` path of a LIVE process, the `<rest>`
@@ -1402,6 +1404,48 @@ fn proc_is_self_fdinfo_file(path: &str) -> bool {
     };
     rest.strip_prefix("fdinfo/")
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn proc_fd_dir_entries_with_context(path: &str, ctx: &OpenContext<'_>) -> Option<Vec<DirEnt>> {
+    if !proc_fd_is_dir(path) {
+        return None;
+    }
+    let mut entries = vec![
+        DirEnt {
+            name: ".".to_string(),
+            kind: EntryKind::Directory,
+        },
+        DirEnt {
+            name: "..".to_string(),
+            kind: EntryKind::Directory,
+        },
+    ];
+    entries.extend(ctx.open_fds().unwrap_or(&[]).iter().map(|fd| DirEnt {
+        name: fd.to_string(),
+        kind: EntryKind::Symlink,
+    }));
+    Some(entries)
+}
+
+fn proc_fdinfo_dir_entries_with_context(path: &str, ctx: &OpenContext<'_>) -> Option<Vec<DirEnt>> {
+    if !proc_fdinfo_is_dir(path) {
+        return None;
+    }
+    let mut entries = vec![
+        DirEnt {
+            name: ".".to_string(),
+            kind: EntryKind::Directory,
+        },
+        DirEnt {
+            name: "..".to_string(),
+            kind: EntryKind::Directory,
+        },
+    ];
+    entries.extend(ctx.open_fds().unwrap_or(&[]).iter().map(|fd| DirEnt {
+        name: fd.to_string(),
+        kind: EntryKind::File,
+    }));
+    Some(entries)
 }
 
 /// Directory listing for a `/proc/<pid>/ns` directory (one symlink per ns type).
@@ -2254,6 +2298,8 @@ pub(crate) fn synthetic_dir_entries_for_open(
         .or_else(|| proc_pid_dir_entries_with_context(path, ctx))
         .or_else(|| proc_ns_dir_entries_with_context(path, ctx))
         .or_else(|| proc_net_dir_entries_with_context(path, ctx))
+        .or_else(|| proc_fd_dir_entries_with_context(path, ctx))
+        .or_else(|| proc_fdinfo_dir_entries_with_context(path, ctx))
 }
 
 pub(crate) fn synthetic_dir_entries(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<DirEnt>> {
@@ -2546,6 +2592,11 @@ impl Vfs for ProcVfs {
         if let Some(entries) = proc_pid_dir_entries(path) {
             return Ok(entries);
         }
+        if let Some(entries) = proc_fd_dir_entries_with_context(path, &OpenContext::default())
+            .or_else(|| proc_fdinfo_dir_entries_with_context(path, &OpenContext::default()))
+        {
+            return Ok(entries);
+        }
         Err(LINUX_ENOTDIR)
     }
 
@@ -2568,47 +2619,11 @@ impl Vfs for ProcVfs {
                 status_flags: 0,
             });
         }
-        // `/proc/self/fd`: one symlink entry per currently-open fd. Built from
-        // the OpenContext snapshot (the only dir whose listing is live fd state),
-        // so `ls /proc/self/fd` and `for fd in /proc/self/fd/*` enumerate.
-        if proc_fd_is_dir(path) {
-            let mut entries = vec![
-                DirEnt {
-                    name: ".".to_string(),
-                    kind: EntryKind::Directory,
-                },
-                DirEnt {
-                    name: "..".to_string(),
-                    kind: EntryKind::Directory,
-                },
-            ];
-            entries.extend(ctx.open_fds().unwrap_or(&[]).iter().map(|fd| DirEnt {
-                name: fd.to_string(),
-                kind: EntryKind::Symlink,
-            }));
-            return Ok(VfsHandle::Directory {
-                path: path.to_string(),
-                entries,
-                status_flags: 0,
-            });
-        }
-        // `/proc/self/fdinfo`: one regular-FILE entry per open fd (the per-fd
-        // contents are rendered dispatcher-side at open of fdinfo/N).
-        if proc_fdinfo_is_dir(path) {
-            let mut entries = vec![
-                DirEnt {
-                    name: ".".to_string(),
-                    kind: EntryKind::Directory,
-                },
-                DirEnt {
-                    name: "..".to_string(),
-                    kind: EntryKind::Directory,
-                },
-            ];
-            entries.extend(ctx.open_fds().unwrap_or(&[]).iter().map(|fd| DirEnt {
-                name: fd.to_string(),
-                kind: EntryKind::File,
-            }));
+        // `/proc/self/fd` and `/proc/<self>/fd`: one symlink entry per currently-open fd.
+        // `/proc/self/fdinfo` and `/proc/<self>/fdinfo`: one regular-FILE entry per open fd.
+        if let Some(entries) = proc_fd_dir_entries_with_context(path, ctx)
+            .or_else(|| proc_fdinfo_dir_entries_with_context(path, ctx))
+        {
             return Ok(VfsHandle::Directory {
                 path: path.to_string(),
                 entries,

@@ -620,6 +620,7 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "pidnsinitreap",
     "posixtimers",
     "ppollsig",
+    "procselffdfail",
     "pselecteintr",
     "selecttimeout",
     "sigchld",

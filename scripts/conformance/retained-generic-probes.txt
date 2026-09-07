@@ -20,6 +20,7 @@ pauseeintr
 pidnsinitreap
 posixtimers
 ppollsig
+procselffdfail
 pselecteintr
 selecttimeout
 sigchld
