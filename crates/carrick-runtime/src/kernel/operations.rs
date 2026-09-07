@@ -4976,7 +4976,7 @@ impl Kernel {
         // a non-child tracee here; its exit still belongs to the real parent
         // (Linux would report that exit to the tracer first), so a tracer
         // waiting on a non-child tracee that exits sees ECHILD instead.
-        let _traced_non_children: Vec<TaskKey> = tracees
+        let traced_non_children: Vec<TaskKey> = tracees
             .into_iter()
             .filter(|key| !children.contains(key))
             .collect();
