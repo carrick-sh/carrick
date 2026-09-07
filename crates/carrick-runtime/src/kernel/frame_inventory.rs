@@ -549,7 +549,7 @@ impl FrameInventoryAuthority {
         state.frames.get(&frame).map(|entry| entry.mapping_count)
     }
 
-    /// Query mapping liveness for a batch of candidate extents and reference
+    /// Query extent liveness for a batch of candidate extents and reference
     /// counts for a batch of frames under a single inventory mutex acquisition.
     pub fn retirement_batch_query(
         &self,
@@ -560,8 +560,8 @@ impl FrameInventoryAuthority {
         let state = self.state.lock();
         let extent_liveness = extents
             .iter()
-            .map(|&(mapping, frame, gpa, length)| {
-                state.mappings.get(&mapping).is_some_and(|entry| {
+            .map(|&(target_map, frame, gpa, length)| {
+                state.mappings.get(&target_map).is_some_and(|entry| {
                     entry.state == MappingState::Published
                         && entry.mm == mm
                         && entry.frame == frame
@@ -2139,35 +2139,35 @@ mod tests {
 
         // Construct candidate extents to test against mm1
         let candidate_extents = vec![
-            // Valid private mapping for mm1
+            // Valid private extent for mm1
             (
                 mm1_private_mapping,
                 private_frame,
                 Gpa(0x2000),
                 length(0x4000),
             ),
-            // Valid shared mapping for mm1
+            // Valid shared extent for mm1
             (
                 mm1_shared_mapping,
                 shared_frame,
                 Gpa(0x1000),
                 length(0x4000),
             ),
-            // Sibling mm2's mapping of the shared frame (not live in mm1)
+            // Sibling mm2's extent of the shared frame (not live in mm1)
             (
                 mm2_shared_mapping,
                 shared_frame,
                 Gpa(0x1000),
                 length(0x4000),
             ),
-            // vfork child mm3's mapping of the shared frame (not live in mm1)
+            // vfork child mm3's extent of the shared frame (not live in mm1)
             (
                 mm3_shared_mapping,
                 shared_frame,
                 Gpa(0x1000),
                 length(0x4000),
             ),
-            // Sibling mm2's private mapping (not live in mm1)
+            // Sibling mm2's private extent (not live in mm1)
             (
                 mm2_sibling_mapping,
                 sibling_frame,
@@ -2212,11 +2212,11 @@ mod tests {
         );
 
         // Prove exact equivalence against point queries
-        for (i, &(mapping, frame, gpa, length)) in candidate_extents.iter().enumerate() {
+        for (i, &(cand_map, frame, gpa, length)) in candidate_extents.iter().enumerate() {
             let point_live =
                 fixture
                     .authority
-                    .mapping_is_live_exact(fixture.mm1, mapping, frame, gpa, length);
+                    .mapping_is_live_exact(fixture.mm1, cand_map, frame, gpa, length);
             assert_eq!(
                 batch_liveness[i], point_live,
                 "extent #{i} mismatch between batch and point query"
