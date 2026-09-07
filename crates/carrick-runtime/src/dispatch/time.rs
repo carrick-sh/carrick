@@ -574,6 +574,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             let mut signum = crate::linux_abi::LINUX_SIGALRM;
+            let mut target_tid = None;
             if sevp.0 != 0 {
                 let bytes = memory.read_bytes(sevp.0, 16)?;
                 let signo = i32::from_le_bytes(bytes[8..12].try_into().unwrap_or([0; 4]));
@@ -612,15 +613,7 @@ impl SyscallDispatcher {
                         if tid <= 0 {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        // Carrick has no per-guest-thread CPU timer
-                        // accounting; accepting CLOCK_THREAD_CPUTIME_ID here
-                        // would turn Go's per-M profiler timers into
-                        // wall-clock process SIGPROF streams. Report
-                        // unsupported so runtimes take their process-timer
-                        // fallback.
-                        if clock_id == LINUX_CLOCK_THREAD_CPUTIME_ID {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                        }
+                        target_tid = Some(tid);
                     }
                     if !(1..=64).contains(&signo) {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -630,7 +623,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             }
-            let timer_id = crate::posix_timer::create(clock_id as i32, signum);
+            let timer_id = crate::posix_timer::create_with_target(clock_id as i32, signum, target_tid);
             // The raw timer_create(2) ABI writes a kernel `timer_t`, which is a
             // 4-byte `int` (`__kernel_timer_t`) — NOT glibc's 8-byte opaque
             // timer_t (glibc synthesises that pointer from this int). Writing 8

@@ -5,8 +5,8 @@
 //! publish the process signal on each expiry).
 
 pub use carrick_timer_core::posix::{
-    PosixTimerSlot, PosixTimerSpec, clear, clock_id, create, delete, exists, getoverrun, remaining,
-    seed_overrun,
+    PosixTimerSlot, PosixTimerSpec, clear, clock_id, create, create_with_target, delete, exists,
+    getoverrun, remaining, seed_overrun,
 };
 
 use carrick_timer_core::TimerSpecNs;
@@ -15,17 +15,23 @@ use carrick_timer_core::TimerSpecNs;
 /// old_value). A `spec.value == 0` disarms. A non-zero value spawns a firing
 /// thread (the shared timer-core loop) that publishes `signum` after
 /// `spec.value` then every `spec.interval`, until the timer is re-armed or
-/// deleted (generation bump). Under HVF the kqueue signal pump handles the
-/// wake, so `on_fire` only publishes the process signal (no explicit vCPU
-/// kick).
+/// deleted (generation bump). If `target_tid` is set (e.g. `SIGEV_THREAD_ID`),
+/// the signal is thread-directed via `publish_pending_for`; otherwise it is
+/// process-directed via `publish_process_signal`. Under HVF the kqueue signal
+/// pump handles the wake, kicking the targeted or in-guest vCPU promptly.
 pub fn arm(id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
     let armed = carrick_timer_core::posix::arm(id, spec)?;
     if spec.value != 0 {
         let signum = armed.signum;
         let generation = armed.generation;
         let slot = armed.slot.clone();
+        let target_tid = armed.target_tid;
         let on_fire = move || {
-            crate::host_signal::publish_process_signal(signum);
+            if let Some(tid) = target_tid {
+                crate::host_signal::publish_pending_for(tid, signum);
+            } else {
+                crate::host_signal::publish_process_signal(signum);
+            }
         };
         let _ = std::thread::Builder::new()
             .name("carrick-posix-timer".to_owned())
