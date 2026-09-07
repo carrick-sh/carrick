@@ -1,25 +1,42 @@
-/target/
+# Build output. Unanchored so it also covers nested crates, fixtures, fuzz
+# targets and per-agent worktrees -- an anchored list missed
+# conformance-probes/target once and 234 build artifacts reached history.
+target/
+/rust_out
+
+# Agent worktrees (AGENTS.md puts them in carrick/.worktrees/ so that path is
+# sudo NOPASSWD and carrick can debug itself). Each one holds a full build.
+.worktrees/
+
+# Local run state / scratch
 /.carrick/
 /.serena/
-/fixtures/*/target/
-/conformance-probes/target/
-/perf-dynamic/target/
-/bench-native/target/
-.claude/
-/rust_out
 /.bench-scratch/
+
 # Editor / agent-tool session state (never publish)
+.claude/
 .antigravitycli/
 .gemini/
 /.pi/
+.codex/
+
 # Python bytecode (the .py sources are tracked; the cache is not)
 __pycache__/
 *.pyc
 
-# JIT/guest core dumps from native_run debugging
+# JIT/guest core dumps from native_run debugging. `core.<pid>` is the kernel's
+# default name; `core.[0-9]*` avoids swallowing sources such as core.rs.
 *.core
+core.[0-9]*
+
+# Debug symbol bundles produced next to release binaries
+*.dSYM/
+
+# macOS Finder metadata
+.DS_Store
+
+# Node fixtures (docker/nodejs-conformance) pull dependencies locally
+node_modules/
 
 # scratch / local tooling (accidentally committed in phase-2; keep on disk, out of git)
 last_1000_commits.txt
-.codex/
-conformance-probes/target
