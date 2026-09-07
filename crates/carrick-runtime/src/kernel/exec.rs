@@ -6,7 +6,7 @@ use super::address::MmBackend;
 use super::core::{
     Kernel, KernelContext, KernelTaskBinding, RetiredThreadRecord, TaskRevision, VforkReleaseReason,
 };
-use super::ids::{LinuxTid, MmId};
+use super::ids::{LinuxTid, MmId, TaskId};
 use super::objects::{
     ExecDrain, FileTable, FileTableExecFreeze, Mm, ObjectGraphError, PreparedThreadSet, TaskKey,
     TaskShared, ThreadKey, ThreadRef, ThreadResources,
@@ -639,11 +639,31 @@ impl Kernel {
     /// Release retired thread IDs after runner/context references drain. Every
     /// allocating or lifecycle operation calls this automatically.
     pub fn sweep_retired_threads(&self) -> usize {
+        self.sweep_retired_threads_for_process(None)
+    }
+
+    /// Release retired thread IDs after runner/context references drain,
+    /// optionally scoped to a single process.
+    pub fn sweep_retired_threads_for_process(&self, process: Option<TaskId>) -> usize {
+        {
+            let state = self.registry().state.read();
+            let has_drainable = state.retired_threads.iter().any(|retired| {
+                process.map_or(true, |pid| retired._task.id == pid)
+                    && retired.thread.strong_count() == 0
+            });
+            if !has_drainable {
+                return 0;
+            }
+        }
         let mut state = self.registry().state.write();
         let before = state.retired_threads.len();
-        state
-            .retired_threads
-            .retain(|retired| retired.thread.strong_count() != 0);
+        state.retired_threads.retain(|retired| {
+            if process.map_or(true, |pid| retired._task.id == pid) {
+                retired.thread.strong_count() != 0
+            } else {
+                true
+            }
+        });
         before - state.retired_threads.len()
     }
 }
