@@ -17,10 +17,10 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{CpuNs, TimerSpecNs};
+use crate::{CpuNs, TimerSpecNs, WallNs};
 
 /// One POSIX timer's arm spec (`timer_settime` value/interval + the signum to
 /// deliver). `si_value` carries the `sigev_value` payload for the `SI_TIMER`
@@ -41,6 +41,8 @@ pub struct PosixTimerSlot {
     /// Optional thread target (e.g. SIGEV_THREAD_ID). If set, expiries are
     /// directed to this specific guest tid rather than process-wide.
     pub target_tid: Option<i32>,
+    /// The vCPU execution slot in `carrick_host::guest_cpu` tracked for thread CPU timers.
+    pub cpu_slot: AtomicUsize,
     /// The current arm's spec (for replay if pump path is later wired up).
     pub spec: Mutex<PosixTimerSpec>,
     /// Host monotonic timestamp (ns since `BASE_INSTANT`) the current arm
@@ -56,11 +58,40 @@ pub struct PosixTimerSlot {
     pub overruns: AtomicU32,
 }
 
+static TID_TO_SLOT: Mutex<Option<HashMap<i32, usize>>> = Mutex::new(None);
+
+pub fn record_tid_slot(tid: i32, slot: usize) {
+    if tid <= 0 {
+        return;
+    }
+    if let Ok(mut guard) = TID_TO_SLOT.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(tid, slot);
+    }
+}
+
+pub fn slot_for_tid(tid: i32) -> Option<usize> {
+    if let Ok(guard) = TID_TO_SLOT.lock() {
+        guard.as_ref().and_then(|map| map.get(&tid).copied())
+    } else {
+        None
+    }
+}
+
 impl PosixTimerSlot {
     fn new(clock_id: i32, signum: i32, target_tid: Option<i32>) -> Self {
+        let current_slot = carrick_host::guest_cpu::this_thread_slot();
+        if let Some(tid) = target_tid {
+            record_tid_slot(tid, current_slot);
+        }
+        let cpu_slot = if let Some(tid) = target_tid {
+            slot_for_tid(tid).unwrap_or(current_slot)
+        } else {
+            current_slot
+        };
         Self {
             clock_id,
             target_tid,
+            cpu_slot: AtomicUsize::new(cpu_slot),
             spec: Mutex::new(PosixTimerSpec {
                 signum,
                 spec: TimerSpecNs::DISARM,
@@ -149,6 +180,16 @@ pub fn arm(id: i32, spec: TimerSpecNs) -> Option<PosixArm> {
         let map = ensure_registry(&mut guard);
         map.get(&id).cloned()
     }?;
+    if slot.clock_id == 3 {
+        let current_slot = carrick_host::guest_cpu::this_thread_slot();
+        if let Some(tid) = slot.target_tid {
+            record_tid_slot(tid, current_slot);
+            let s = slot_for_tid(tid).unwrap_or(current_slot);
+            slot.cpu_slot.store(s, Ordering::Release);
+        } else {
+            slot.cpu_slot.store(current_slot, Ordering::Release);
+        }
+    }
     let old = {
         let mut cur = slot.spec.lock().unwrap_or_else(|e| e.into_inner());
         let old = *cur;
@@ -257,24 +298,38 @@ pub fn run_fallback(
 /// CPU-time POSIX timer fallback: poll the aggregate guest CPU total (mirroring
 /// `itimer::run_fallback_cpu`) instead of sleeping wall-clock, so a
 /// `CLOCK_PROCESS_CPUTIME_ID` timer fires off real guest CPU and not while the
-/// process is idle. The previous per-backend copies fired CPU-clock timers off
-/// wall-clock — too early on an idle process.
+/// process is idle. For `CLOCK_THREAD_CPUTIME_ID`, polls the specific vCPU thread's
+/// execution time so concurrent sibling threads do not advance each other's timers.
 fn run_fallback_cpu(
     slot: &PosixTimerSlot,
     generation: u64,
     spec: TimerSpecNs,
     on_fire: &impl Fn(),
 ) {
-    let start = carrick_host::guest_cpu::total_ns_including_active();
+    let clock = slot.clock_id;
+    let cpu_slot = slot.cpu_slot.load(Ordering::Acquire);
+    let sample = || {
+        if clock == 3 && cpu_slot < 512 {
+            carrick_host::guest_cpu::slot_us(cpu_slot).saturating_mul(1000)
+        } else {
+            carrick_host::guest_cpu::total_ns_including_active()
+        }
+    };
+    let start = sample();
     let mut due = start.saturating_add(spec.value);
     let mut fired = false;
     loop {
         if !generation_matches(slot, generation) {
             return;
         }
-        let now = carrick_host::guest_cpu::total_ns_including_active();
+        let now = sample();
         if now < due {
-            let delay = crate::itimer::cpu_timer_recheck_delay_ns(CpuNs(due - now));
+            let remaining = CpuNs(due - now);
+            let delay = if clock == 3 {
+                WallNs(remaining.raw().clamp(1, 1_000_000))
+            } else {
+                crate::itimer::cpu_timer_recheck_delay_ns(remaining)
+            };
             std::thread::sleep(Duration::from_nanos(delay.raw()));
             continue;
         }
@@ -362,6 +417,11 @@ pub fn clear() {
     let mut guard = registry();
     if let Some(map) = guard.as_mut() {
         map.clear();
+    }
+    if let Ok(mut tid_guard) = TID_TO_SLOT.lock() {
+        if let Some(map) = tid_guard.as_mut() {
+            map.clear();
+        }
     }
 }
 
