@@ -1373,7 +1373,11 @@ impl Kernel {
         match ttys.get(&container) {
             Some(current) if current.session.id() == session => Ok(()),
             Some(_) if !force || !caller.resources().credentials().is_privileged() => {
-                Err(TtyControlError::Permission)
+                if super::tty::session_controlling_tty(session).is_some() {
+                    Ok(())
+                } else {
+                    Err(TtyControlError::Permission)
+                }
             }
             _ => {
                 ttys.insert(
@@ -1392,22 +1396,30 @@ impl Kernel {
         &self,
         caller: &KernelContext,
     ) -> Result<ProcessGroupId, TtyControlError> {
+        let session = caller.task().session();
+        if let Some(fg) = super::tty::session_foreground_process_group(session) {
+            return Ok(fg);
+        }
         let ttys = self.controlling_ttys.lock();
         let tty = ttys
             .get(&caller.container().id())
             .ok_or(TtyControlError::NotControlling)?;
-        if tty.session.id() != caller.task().session() {
+        if tty.session.id() != session {
             return Err(TtyControlError::NotControlling);
         }
         Ok(tty.foreground.id())
     }
 
     pub(crate) fn tty_session(&self, caller: &KernelContext) -> Result<SessionId, TtyControlError> {
+        let session = caller.task().session();
+        if super::tty::session_controlling_tty(session).is_some() {
+            return Ok(session);
+        }
         let ttys = self.controlling_ttys.lock();
         let tty = ttys
             .get(&caller.container().id())
             .ok_or(TtyControlError::NotControlling)?;
-        if tty.session.id() != caller.task().session() {
+        if tty.session.id() != session {
             return Err(TtyControlError::NotControlling);
         }
         Ok(tty.session.id())
@@ -1419,35 +1431,50 @@ impl Kernel {
         foreground: ProcessGroupId,
     ) -> Result<(), TtyControlError> {
         let container = caller.container().id();
+        let session = caller.task().session();
         let state = self.registry().state.read();
         let Some(group) = state.process_groups.get(&foreground) else {
             return Err(TtyControlError::Permission);
         };
-        if group.container != container || group.object.session() != caller.task().session() {
+        if group.container != container || group.object.session() != session {
             return Err(TtyControlError::Permission);
         }
-        let foreground = Arc::clone(&group.object);
-        let mut ttys = self.controlling_ttys.lock();
-        let tty = ttys
-            .get_mut(&container)
-            .ok_or(TtyControlError::NotControlling)?;
-        if tty.session.id() != caller.task().session() {
-            return Err(TtyControlError::NotControlling);
+        let foreground_obj = Arc::clone(&group.object);
+        drop(state);
+
+        let mut updated = false;
+        if let Some(tty_key) = super::tty::session_controlling_tty(session) {
+            if super::tty::set_foreground_process_group(tty_key, session, foreground).is_ok() {
+                updated = true;
+            }
         }
-        tty.foreground = foreground;
-        Ok(())
+
+        let mut ttys = self.controlling_ttys.lock();
+        if let Some(tty) = ttys.get_mut(&container) {
+            if tty.session.id() == session {
+                tty.foreground = foreground_obj;
+                updated = true;
+            }
+        }
+        if updated {
+            Ok(())
+        } else {
+            Err(TtyControlError::NotControlling)
+        }
     }
 
     pub(crate) fn tty_detach(&self, caller: &KernelContext) -> Result<(), TtyControlError> {
         let container = caller.container().id();
-        let mut ttys = self.controlling_ttys.lock();
-        let current = ttys
-            .get(&container)
-            .ok_or(TtyControlError::NotControlling)?;
-        if current.session.id() != caller.task().session() {
-            return Err(TtyControlError::NotControlling);
+        let session = caller.task().session();
+        if let Some(tty_key) = super::tty::session_controlling_tty(session) {
+            super::tty::detach_if_session(tty_key, session);
         }
-        ttys.remove(&container);
+        let mut ttys = self.controlling_ttys.lock();
+        if let Some(current) = ttys.get(&container) {
+            if current.session.id() == session {
+                ttys.remove(&container);
+            }
+        }
         Ok(())
     }
 
@@ -1456,24 +1483,59 @@ impl Kernel {
             .is_ok_and(|foreground| foreground != caller.task().process_group())
     }
 
-    pub(crate) fn post_signal_to_tty_foreground(
+    pub(crate) fn caller_process_group_is_orphaned(&self, caller: &KernelContext) -> bool {
+        let container = caller.container().id();
+        let session = caller.task().session();
+        let group_id = caller.task().process_group();
+        let state = self.registry().state.read();
+        let Some(group) = state.process_groups.get(&group_id) else {
+            return true;
+        };
+        if group.container != container {
+            return true;
+        }
+        for member_key in &group.members {
+            let Some(member_record) = state.tasks.get(&member_key.id) else {
+                continue;
+            };
+            if member_record.task.key() != *member_key
+                || member_record.task.lifecycle() != TaskLifecycle::Live
+                || member_record.task.container().id() != container
+            {
+                continue;
+            }
+            let Some(parent_key) = member_record.task.parent() else {
+                continue;
+            };
+            let Some(parent_record) = state.tasks.get(&parent_key.id) else {
+                continue;
+            };
+            if parent_record.task.key() != parent_key
+                || parent_record.task.lifecycle() != TaskLifecycle::Live
+                || parent_record.task.container().id() != container
+            {
+                continue;
+            }
+            if parent_record.task.session() == session
+                && parent_record.task.process_group() != group_id
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn post_signal_to_process_group(
         &self,
         container: super::container::ContainerId,
+        group_id: ProcessGroupId,
         signal: LinuxSignal,
     ) -> usize {
-        let Some(group) = self
-            .controlling_ttys
-            .lock()
-            .get(&container)
-            .map(|tty| Arc::clone(&tty.foreground))
-        else {
-            return 0;
-        };
         let state = self.registry().state.read();
         let mut tasks = state
             .process_groups
-            .get(&group.id())
-            .filter(|record| record.container == container && Arc::ptr_eq(&record.object, &group))
+            .get(&group_id)
+            .filter(|record| record.container == container)
             .into_iter()
             .flat_map(|record| record.members.iter())
             .filter_map(|task| {
@@ -1487,10 +1549,27 @@ impl Kernel {
             .collect::<Vec<_>>();
         drop(state);
         tasks.sort_unstable();
+        tasks.dedup();
         tasks
             .into_iter()
             .filter(|task| self.post_signal_to_task_key(*task, signal, None))
             .count()
+    }
+
+    pub(crate) fn post_signal_to_tty_foreground(
+        &self,
+        container: super::container::ContainerId,
+        signal: LinuxSignal,
+    ) -> usize {
+        let Some(group) = self
+            .controlling_ttys
+            .lock()
+            .get(&container)
+            .map(|tty| tty.foreground.id())
+        else {
+            return 0;
+        };
+        self.post_signal_to_process_group(container, group, signal)
     }
 
     pub fn task_identity(&self, task_id: TaskId) -> Result<TaskIdentity, KernelOperationError> {

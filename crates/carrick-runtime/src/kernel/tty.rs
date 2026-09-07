@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use carrick_abi::LinuxErrno;
 use parking_lot::Mutex;
 
-use super::{ContainerId, Kernel, LinuxSignal, ProcessGroupId, SessionId, TaskLifecycle};
+use super::{ContainerId, Kernel, LinuxSignal, ProcessGroupId, SessionId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TtyKey {
@@ -152,6 +152,32 @@ pub(crate) fn foreground_process_group(
     }
 }
 
+pub(crate) fn session_controlling_tty(session: SessionId) -> Option<TtyKey> {
+    let reg = slot().lock();
+    if reg.launch.session == Some(session) {
+        return Some(TtyKey::Launch);
+    }
+    for (index, state) in &reg.ptys {
+        if state.session == Some(session) {
+            return Some(TtyKey::Pty(*index));
+        }
+    }
+    None
+}
+
+pub(crate) fn session_foreground_process_group(session: SessionId) -> Option<ProcessGroupId> {
+    let reg = slot().lock();
+    if reg.launch.session == Some(session) {
+        return reg.launch.foreground;
+    }
+    for state in reg.ptys.values() {
+        if state.session == Some(session) {
+            return state.foreground;
+        }
+    }
+    None
+}
+
 /// Whether `session` already has a controlling terminal (the launch tty or
 /// any guest pty). Linux refuses `TIOCSCTTY` with EPERM for a session leader
 /// that already has one.
@@ -256,32 +282,7 @@ fn deliver_signal_to_group(
     group_id: ProcessGroupId,
     signal: LinuxSignal,
 ) -> usize {
-    let state = kernel.registry().state.read();
-    let mut tasks = state
-        .process_groups
-        .get(&group_id)
-        .filter(|record| record.container == container)
-        .into_iter()
-        .flat_map(|record| record.members.iter())
-        .filter_map(|task| {
-            state.tasks.get(&task.id).and_then(|record| {
-                (record.task.key() == *task
-                    && record.task.lifecycle() == TaskLifecycle::Live
-                    && record.task.container().id() == container)
-                    .then_some(*task)
-            })
-        })
-        .collect::<Vec<_>>();
-    drop(state);
-    tasks.sort_unstable();
-    tasks.dedup();
-    let mut delivered = 0;
-    for task in tasks {
-        if kernel.post_signal_to_task_key(task, signal, None) {
-            delivered += 1;
-        }
-    }
-    delivered
+    kernel.post_signal_to_process_group(container, group_id, signal)
 }
 
 #[derive(Default, Clone, Debug)]

@@ -1344,7 +1344,7 @@ mod tests {
 
     #[test]
     fn relay_does_not_spin_on_dev_null_stdin() {
-        let null_fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY) };
+        let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
         assert!(null_fd >= 0, "open /dev/null failed");
         let (real_app, real_term) = socketpair();
 
