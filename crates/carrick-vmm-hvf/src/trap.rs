@@ -38446,10 +38446,17 @@ impl HvfVmState {
                     let mut window_end = vma_end.min(next_2mb).min(w_end).min(arena_end);
                     window_end = window_end.max(end);
 
-                    let idx = self.mappings.partition_point(|m| m.start <= current);
-                    let next_local = self.mappings.get(idx).and_then(|m| {
-                        (m.start > current && m.start < window_end).then_some(m.start)
-                    });
+                    // `self.mappings` is NOT kept sorted by start (several
+                    // publication paths append), so every neighbour question
+                    // here is a full scan; a binary search on this vector
+                    // missed live mappings and let a window materialize over
+                    // them (Go heap corruption, 2026-09-07).
+                    let next_local = self
+                        .mappings
+                        .iter()
+                        .filter(|m| m.start > current && m.start < window_end)
+                        .map(|m| m.start)
+                        .min();
                     let next_alias = alias_registry()
                         .lock()
                         .first_matching_process_alias_start_between(
@@ -38474,16 +38481,10 @@ impl HvfVmState {
                             self.mm_root_slot,
                             self.container_root,
                         ) {
-                        let lower_idx = self.mappings.partition_point(|m| m.start < current);
-                        let lower_has_local = if lower_idx > 0 {
-                            self.mappings[..lower_idx]
-                                .iter()
-                                .rev()
-                                .take_while(|m| m.end > compound_start)
-                                .any(|m| m.start < current && m.end > compound_start)
-                        } else {
-                            false
-                        };
+                        let lower_has_local = self
+                            .mappings
+                            .iter()
+                            .any(|m| m.start < current && m.end > compound_start);
                         if !lower_has_local {
                             compound_start
                         } else {
@@ -38773,14 +38774,19 @@ impl HvfVmState {
         // The caller found this hole before quiescing. Recompute its upper
         // boundary under the topology lock so a sibling publication between
         // those two points cannot be overlapped.
-        let idx = self
+        // Full scan: `self.mappings` is not sorted by start (see the window
+        // arm above), and this bound decides whether the new extent overlaps
+        // a live mapping.
+        let next_local = self
             .mappings
-            .partition_point(|mapping| mapping.start <= start);
-        let next_local = self.mappings[idx..]
             .iter()
-            .take_while(|mapping| mapping.start < end)
-            .find(|mapping| global_frame_region_owner_matches_in(self.custody(), mapping))
-            .map(|mapping| mapping.start);
+            .filter(|mapping| {
+                mapping.start > start
+                    && mapping.start < end
+                    && global_frame_region_owner_matches_in(self.custody(), mapping)
+            })
+            .map(|mapping| mapping.start)
+            .min();
         let next_alias = alias_registry()
             .lock()
             .first_matching_process_alias_start_between(
