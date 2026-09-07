@@ -14,7 +14,7 @@
 
 use conformance_probes::report;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 #[repr(align(16))]
 #[allow(dead_code)]
@@ -24,6 +24,8 @@ static mut JUMP_BUF: JumpBuf = JumpBuf([0; 64]);
 static B_SPINNING: AtomicBool = AtomicBool::new(false);
 static B_OBSERVED_CHANGE: AtomicBool = AtomicBool::new(false);
 static B_STALE_FAULT: AtomicBool = AtomicBool::new(false);
+static B_ITERS_1: AtomicU64 = AtomicU64::new(0);
+static B_ITERS_2: AtomicU64 = AtomicU64::new(0);
 static PHASE: AtomicI32 = AtomicI32::new(0);
 
 static mut TEST_PAGE: *mut u8 = core::ptr::null_mut();
@@ -64,6 +66,7 @@ extern "C" fn worker_thread(_arg: *mut c_void) -> *mut c_void {
             B_SPINNING.store(true, Ordering::SeqCst);
             let mut iters: u64 = 0;
             while iters < MAX_ITERS {
+                B_ITERS_1.store(iters, Ordering::Relaxed);
                 let val = core::ptr::read_volatile(TEST_PAGE);
                 if val != 42 {
                     break;
@@ -82,6 +85,7 @@ extern "C" fn worker_thread(_arg: *mut c_void) -> *mut c_void {
             B_SPINNING.store(true, Ordering::SeqCst);
             let mut iters: u64 = 0;
             while iters < MAX_ITERS {
+                B_ITERS_2.store(iters, Ordering::Relaxed);
                 let val = core::ptr::read_volatile(TEST_PAGE);
                 if val != 84 {
                     break;
@@ -225,6 +229,12 @@ fn main() {
         libc::pthread_join(thread, core::ptr::null_mut());
         let stale_fault = B_STALE_FAULT.load(Ordering::SeqCst);
         libc::munmap(page3, 4096);
+
+        eprintln!(
+            "B_OBSERVED_ITERS: mprotect={}, munmap={}",
+            B_ITERS_1.load(Ordering::Relaxed),
+            B_ITERS_2.load(Ordering::Relaxed)
+        );
 
         report!(
             broadcast_mprotect_observed = mprotect_observed,
