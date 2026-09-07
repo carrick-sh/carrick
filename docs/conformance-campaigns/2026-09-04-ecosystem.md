@@ -1848,3 +1848,31 @@ million-depth compile reducer went from a 300 s cap to 72 s and
 `test_compile` from a 420 s timeout to 62 s, but the batched stage-2
 retirement broke four rollback/custody invariants that the round must
 restore before it lands.
+
+## 2026-09-07: the first-touch branch is parked, and the second ledger is running
+
+Measured on a quiet host (load ~2.6) after the eighth landing:
+
+| binary | multiprocessing_main_handling | test_compile |
+| --- | ---: | ---: |
+| main `ed3a42c85` | 32 s | 420 s (cap) |
+| branch at the mapping index + owner-generation fix | 117 s | 183 s |
+| branch at + O(n) retirement (4 custody tests red) | 142 s | 66 s |
+| branch at + custody fix | guest SIGBUS | guest SIGBUS |
+
+The indexed `MappingTable` fixes the first-touch hang but makes every
+fork/exec/retire clone or rebuild the whole table, so fork-heavy rows get
+3–4× slower; the later custody fix and the alias-retirement optimization
+retire frames a sibling still shares. A mechanism measured worse is not
+shipped: the branch is parked at `agy/first-touch-sep06`, the one neutral
+commit (diagnostic walk off the handled path) was measured alone and
+discarded, and the next design is briefed with the constraint that fork
+and retire cost must scale with the mappings that change, caching the
+page-table arena's host pointer on the stage-1 authority rather than
+indexing the table.
+
+With no worker running, the full cached ecosystem ledger is being re-run on
+main `ed3a42c85` (binary SHA-256 `a4c5c672…`), same invocation as the Sep 6
+baseline (`--workers 4 --carrick-timeout-cap-s 0 --require-cached-oracle`),
+into `target/conformance/eco-final-ledger/ledger-ed3a42c85.jsonl`; the host
+is kept free of other guests and builds for its duration.
