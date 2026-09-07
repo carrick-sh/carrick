@@ -1846,6 +1846,120 @@ fn fstat_caches_host_xattrs_and_invalidates_on_mutators() {
     assert_eq!(st5, st6);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn deep_tree_lookups_and_negative_opens_via_dentry_cache() {
+    let (lower, upper, mut dispatcher) = trusted_lower_lane_fixture();
+    let deep_dir = lower.path().join("d1/d2/d3/d4/d5/d6");
+    std::fs::create_dir_all(&deep_dir).unwrap();
+    std::fs::write(deep_dir.join("leaf.txt"), b"leaf content").unwrap();
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    // 1. Initial stat and open to warm the dentry cache
+    let path = "/d1/d2/d3/d4/d5/d6/leaf.txt";
+    let st = dispatcher.fs.rootfs_vfs.dentry_stat(path, false).unwrap();
+    assert_eq!(st.size, 12);
+
+    let fd = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, path, 0);
+    assert!(fd >= 0);
+
+    // 2. Warm cache stat: MUST be <= 1 host syscall (0 openat per component)
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .dentry_cache
+        .reset_host_open_count();
+    let st2 = dispatcher.fs.rootfs_vfs.dentry_stat(path, false).unwrap();
+    assert_eq!(st2.size, 12);
+    assert_eq!(
+        dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
+        0,
+        "warm stat must take 0 host opens"
+    );
+
+    // 3. Warm cache open: MUST take exactly 1 host openat (at the leaf, 0 per component)
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .dentry_cache
+        .reset_host_open_count();
+    let fd2 = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, path, 0);
+    assert!(fd2 >= 0);
+    assert_eq!(
+        dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
+        1,
+        "warm open of existing file must take exactly 1 host openat (the leaf)"
+    );
+
+    // 4. Relative open on warm cache: MUST take exactly 1 host openat (the leaf)
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .dentry_cache
+        .reset_host_open_count();
+    let rel_path = "d1/d2/d3/d4/d5/d6/leaf.txt";
+    let fd3 = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, rel_path, 0);
+    assert!(fd3 >= 0);
+    assert_eq!(
+        dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
+        1,
+        "relative open on warm cache must take exactly 1 host openat (the leaf)"
+    );
+
+    // 5. Negative lookup: open non-existent file under 6-deep dir
+    let missing_path = "/d1/d2/d3/d4/d5/d6/missing.txt";
+    let missing_fd = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        missing_path,
+        0,
+    );
+    assert_eq!(missing_fd, -(crate::linux_abi::LINUX_ENOENT.get() as i64));
+
+    // Repeat negative open: MUST be cached and take 0 host opens
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .dentry_cache
+        .reset_host_open_count();
+    let missing_fd2 = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        missing_path,
+        0,
+    );
+    assert_eq!(missing_fd2, -(crate::linux_abi::LINUX_ENOENT.get() as i64));
+    assert_eq!(
+        dispatcher.fs.rootfs_vfs.dentry_cache.host_open_count(),
+        0,
+        "cached negative open must take 0 host opens"
+    );
+
+    // 6. Invalidation by create: create the missing file in upper
+    let upper_deep = upper.path().join("d1/d2/d3/d4/d5/d6");
+    std::fs::create_dir_all(&upper_deep).unwrap();
+    std::fs::write(upper_deep.join("missing.txt"), b"now created").unwrap();
+    // Notify VFS mutator of creation (as open(O_CREAT) or mknod does)
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .dentry_cache
+        .entry_created(missing_path, None);
+
+    // Opening newly created file must now succeed!
+    let created_fd = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        missing_path,
+        0,
+    );
+    assert!(created_fd >= 0, "open after create must succeed");
+}
+
 /// A lower-only file's `st_mtime`/`st_nlink` must come from the real host
 /// inode too. The path lane reported `mtime=0`/`nlink=1` for every untouched
 /// image file, so `make`-style newer-than comparisons saw the epoch.

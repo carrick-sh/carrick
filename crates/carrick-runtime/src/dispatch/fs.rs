@@ -2369,6 +2369,19 @@ impl SyscallDispatcher {
         if path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
+        // dentry cache fast open: when serving the dentry cache, resolve directly
+        // from memory and open the leaf from the cached parent directory fd (0 host
+        // syscalls per intermediate component, <= 1 host openat at the leaf).
+        if !want_create
+            && !want_trunc
+            && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
+            && path.starts_with('/')
+        {
+            if let Some(outcome) = self.try_dentry_fast_open(path, flags, access, writable_request)
+            {
+                return Ok(outcome);
+            }
+        }
         // Cached-lower absolute read lane: glibc/Node issue their loader,
         // locale, and package reads as absolute AT_FDCWD opens. When the fresh
         // sparse upper proves it cannot affect that path, open the immutable
@@ -2383,59 +2396,6 @@ impl SyscallDispatcher {
         // `resolve_at_path` and the layered open stack entirely.
         if let Some(outcome) = self.try_trusted_dirfd_openat(dirfd, path, flags) {
             return Ok(outcome);
-        }
-        // Dentry cache fast open resolves the followed target. O_NOFOLLOW
-        // must reach the leaf-kind check below instead of reusing that target.
-        if !want_create
-            && !want_trunc
-            && !open_flags.contains(LinuxOpenFlags::NOFOLLOW)
-            && !open_flags.contains(LinuxOpenFlags::DIRECTORY)
-            && !open_flags.contains(LinuxOpenFlags::TMPFILE)
-            && !open_flags.contains(LinuxOpenFlags::PATH)
-            && (access == LINUX_O_RDONLY || access == LINUX_O_RDWR || access == LINUX_O_WRONLY)
-            && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
-            && path.starts_with('/')
-            && !path.ends_with('/')
-            && !path.ends_with("/.")
-            && !path.split('/').any(|c| c == "..")
-            && !path.starts_with("/proc")
-            && !path.starts_with("/sys")
-            && !path.starts_with("/dev")
-            && self.dac_overrides_permissions()
-            && self.fs.inotify_registry.is_empty()
-            && self.fs.fanotify_registry.is_empty()
-            && !self.fs.vfs_mounts.has_mount(path)
-        {
-            if let Ok((host_fd, real, canonical_path, source)) =
-                self.fs.rootfs_vfs.dentry_fast_open(path, writable_request)
-            {
-                use std::os::fd::IntoRawFd;
-                let raw = host_fd.into_raw_fd();
-                debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(raw));
-                crate::probes::path_open(path, real.size, 0);
-                let metadata = RootFsMetadata {
-                    path: std::path::Path::new(path).to_path_buf(),
-                    kind: RootFsEntryKind::File,
-                    mode: real.mode,
-                    size: usize::try_from(real.size).unwrap_or(usize::MAX),
-                };
-                let description = OpenDescription::HostFile {
-                    host_fd: HostFdRef::with_private_file_source(raw, source),
-                    metadata,
-                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                    writable: writable_request,
-                };
-                let status = flags & !LINUX_O_CLOEXEC;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(description)),
-                    status,
-                    linux_fd_flags_from_open_flags(flags),
-                );
-                if let Ok(fd) = self.install_fd_at_or_above(0, open_file) {
-                    self.record_fd_open_path(fd, canonical_path);
-                    return Ok(DispatchOutcome::Returned { value: fd as i64 });
-                }
-            }
         }
         // A trailing slash or "/." forces directory semantics on the final component.
         // Linux's open(2): `O_CREAT` of a path that ends in `/` can NEVER
@@ -2479,6 +2439,13 @@ impl SyscallDispatcher {
                     }
                     return Ok(DispatchOutcome::errno(LINUX_ENOENT));
                 }
+            }
+        }
+
+        if !want_create && !want_trunc && !ends_with_dot && !had_trailing_slash {
+            if let Some(outcome) = self.try_dentry_fast_open(&path, flags, access, writable_request)
+            {
+                return Ok(outcome);
             }
         }
 
@@ -3743,6 +3710,72 @@ impl SyscallDispatcher {
             return Some(DispatchOutcome::errno(linux_errno::EMFILE));
         };
         Some(DispatchOutcome::Returned { value: fd as i64 })
+    }
+
+    fn try_dentry_fast_open(
+        &self,
+        path: &str,
+        flags: u64,
+        access: u64,
+        writable_request: bool,
+    ) -> Option<DispatchOutcome> {
+        let open_flags = LinuxOpenFlags::from_bits_retain(flags);
+        if open_flags.intersects(
+            LinuxOpenFlags::NOFOLLOW
+                | LinuxOpenFlags::DIRECTORY
+                | LinuxOpenFlags::TMPFILE
+                | LinuxOpenFlags::PATH,
+        ) || (access != LINUX_O_RDONLY && access != LINUX_O_RDWR && access != LINUX_O_WRONLY)
+            || !path.starts_with('/')
+            || path.ends_with('/')
+            || path.ends_with("/.")
+            || path.split('/').any(|c| c == "..")
+            || path.starts_with("/proc")
+            || path.starts_with("/sys")
+            || path.starts_with("/dev")
+            || !self.dac_overrides_permissions()
+            || !self.fs.inotify_registry.is_empty()
+            || !self.fs.fanotify_registry.is_empty()
+            || self.fs.vfs_mounts.has_mount(path)
+        {
+            return None;
+        }
+
+        match self.fs.rootfs_vfs.dentry_fast_open(path, writable_request) {
+            Ok((host_fd, real, canonical_path, source)) => {
+                use std::os::fd::IntoRawFd;
+                let raw = host_fd.into_raw_fd();
+                debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(raw));
+                crate::probes::path_open(path, real.size, 0);
+                let metadata = RootFsMetadata {
+                    path: std::path::Path::new(path).to_path_buf(),
+                    kind: RootFsEntryKind::File,
+                    mode: real.mode,
+                    size: usize::try_from(real.size).unwrap_or(usize::MAX),
+                };
+                let description = OpenDescription::HostFile {
+                    host_fd: HostFdRef::with_private_file_source(raw, source),
+                    metadata,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                    writable: writable_request,
+                };
+                let status = flags & !LINUX_O_CLOEXEC;
+                let open_file = OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(description)),
+                    status,
+                    linux_fd_flags_from_open_flags(flags),
+                );
+                if let Ok(fd) = self.install_fd_at_or_above(0, open_file) {
+                    self.record_fd_open_path(fd, canonical_path);
+                    Some(DispatchOutcome::Returned { value: fd as i64 })
+                } else {
+                    Some(DispatchOutcome::errno(linux_errno::EMFILE))
+                }
+            }
+            Err(LINUX_ENOENT) => Some(DispatchOutcome::errno(LINUX_ENOENT)),
+            Err(LINUX_EISDIR) if writable_request => Some(DispatchOutcome::errno(LINUX_EISDIR)),
+            Err(_) => None,
+        }
     }
 
     /// Single-component `openat` through a TRUSTED host dirfd: service the
