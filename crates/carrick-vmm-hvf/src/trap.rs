@@ -38329,7 +38329,7 @@ impl HvfVmState {
             > 1
     }
 
-    pub(crate) const DEFAULT_FAULT_WINDOW_BYTES: u64 = 64 * 1024;
+    pub(crate) const DEFAULT_FAULT_WINDOW_BYTES: u64 = 4096;
 
     fn fault_window_bytes() -> u64 {
         static WINDOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
