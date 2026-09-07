@@ -188,7 +188,7 @@ impl SyscallDispatcher {
         context.shared().sighand().action_entry(signal)
     }
 
-    fn signal_action(context: &crate::kernel::KernelContext, signum: i32) -> LinuxSigaction {
+    fn signal_action_static(context: &crate::kernel::KernelContext, signum: i32) -> LinuxSigaction {
         crate::kernel::LinuxSignal::for_signal_number(signum)
             .ok()
             .map(|signal| context.shared().sighand().action(signal))
@@ -271,6 +271,15 @@ impl SyscallDispatcher {
         } else {
             Some(action)
         }
+    }
+
+    /// Read the currently-installed signal action from the task's Sighand.
+    pub fn signal_action(
+        &self,
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+    ) -> LinuxSigaction {
+        Self::signal_action_static(context, signum)
     }
 
     pub fn signal_altstack(
@@ -1889,7 +1898,7 @@ impl SyscallDispatcher {
                 None
             };
             if old_action != 0 {
-                let prev = Self::signal_action(cx.kernel, signum);
+                let prev = Self::signal_action_static(cx.kernel, signum);
                 if write_kernel_struct_raw(memory, old_action, &prev).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }

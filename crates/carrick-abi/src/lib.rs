@@ -1717,6 +1717,8 @@ pub const LINUX_SI_KERNEL: i32 = 128;
 /// `si_code` for a `sigqueue(3)`/`rt_sigqueueinfo(2)`-delivered signal — the
 /// handler's `si_value` carries the sender's payload.
 pub const LINUX_SI_QUEUE: i32 = -1;
+/// `si_code` for POSIX timer expirations (`timer_create(2)`/`timer_settime(2)`).
+pub const LINUX_SI_TIMER: i32 = -2;
 /// `si_code` for POSIX message-queue notifications (`mq_notify` with
 /// `SIGEV_SIGNAL`). Carries the sender identity and `sigev_value`.
 pub const LINUX_SI_MESGQ: i32 = -3;
@@ -1812,6 +1814,29 @@ impl LinuxSiginfo {
     ) -> Self {
         let mut s = Self::kill(si_signo, si_code, si_pid, si_uid);
         s._pad[0..4].copy_from_slice(&si_status.to_le_bytes());
+        s
+    }
+
+    /// Build an `SI_TIMER` siginfo for a POSIX timer expiration (`timer_create(2)`).
+    /// On Linux aarch64/x86_64, `_timer` occupies:
+    ///   offset 16: `int si_tid` (4 bytes)
+    ///   offset 20: `int si_overrun` (4 bytes)
+    ///   offset 24: `sigval si_sigval` (8 bytes)
+    /// In little-endian, `si_tid` and `si_overrun` pack into `si_addr` exactly like `kill`.
+    pub fn timer(si_signo: i32, si_tid: i32, si_overrun: i32, si_value: i64) -> Self {
+        let mut s = Self::empty();
+        s.si_signo = si_signo;
+        s.si_code = LINUX_SI_TIMER;
+        s.si_addr = (u64::from(si_overrun as u32) << 32) | u64::from(si_tid as u32);
+        s._pad[0..8].copy_from_slice(&si_value.to_le_bytes());
+        s
+    }
+
+    /// Build an `SI_KERNEL` siginfo for kernel-generated signals such as `setitimer`.
+    pub fn kernel(si_signo: i32) -> Self {
+        let mut s = Self::empty();
+        s.si_signo = si_signo;
+        s.si_code = LINUX_SI_KERNEL;
         s
     }
 }

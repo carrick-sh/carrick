@@ -1789,8 +1789,8 @@ pub mod posix_timer {
     //! (spawn + deliver via `timer_delivery` on each expiry).
 
     pub use carrick_timer_core::posix::{
-        PosixTimerSlot, PosixTimerSpec, clear, clock_id, create, delete, exists, getoverrun,
-        remaining, seed_overrun,
+        PosixTimerSlot, PosixTimerSpec, clear, clock_id, create, create_with_target,
+        create_with_target_and_value, delete, exists, getoverrun, remaining, seed_overrun,
     };
 
     /// (Re-)arm timer `id`. Returns the PREVIOUS spec (for `timer_settime`'s
