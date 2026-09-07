@@ -623,10 +623,25 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             }
-            if clock_id == crate::linux_abi::LINUX_CLOCK_THREAD_CPUTIME_ID && target_tid.is_none() {
-                let tid = cx.kernel.thread().key().tid.raw();
-                if tid > 0 {
-                    target_tid = Some(tid);
+            if target_tid.is_none() {
+                if clock_id == crate::linux_abi::LINUX_CLOCK_THREAD_CPUTIME_ID {
+                    let tid = cx.kernel.thread().key().tid.raw();
+                    if tid > 0 {
+                        target_tid = Some(tid);
+                    }
+                } else if let Some(super::DynamicCpuClock::PerThread) =
+                    super::dynamic_cpu_clock(clock_id)
+                {
+                    let raw = clock_id as i32;
+                    let encoded_tid = if raw < 0 { !(raw >> 3) } else { 0 };
+                    let tid = if encoded_tid > 0 {
+                        encoded_tid
+                    } else {
+                        cx.kernel.thread().key().tid.raw()
+                    };
+                    if tid > 0 {
+                        target_tid = Some(tid);
+                    }
                 }
             }
             let timer_id = crate::posix_timer::create_with_target(clock_id as i32, signum, target_tid);
