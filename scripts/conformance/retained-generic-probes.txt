@@ -23,6 +23,7 @@ ppollsig
 pselecteintr
 selecttimeout
 sigchld
+sigprofvdso
 splicenetpoll
 timeclock
 timeextra
