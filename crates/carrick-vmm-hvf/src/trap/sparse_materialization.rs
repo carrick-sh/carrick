@@ -1079,7 +1079,7 @@ mod arena_pin_tests {
 
         let resolver = state.pinned_stage1_arenas(&custody, base).unwrap();
         assert_eq!(
-            (&resolver).host_ptr_for_base(base),
+            resolver.host_ptr_for_base(base),
             Some(pointer),
             "a carrier-reuse root allocated in the global-frame arena must remain writable by its MM's page-table publisher",
         );
@@ -1303,8 +1303,8 @@ mod arena_pin_tests {
         wrong_custody.commit_create(other_generation).unwrap();
         assert!(state.pinned_stage1_arenas(&wrong_custody, base).is_err());
         let resolver = state.pinned_stage1_arenas(&custody, base).unwrap();
-        assert_eq!((&resolver).host_ptr_for_base(base), Some(pointer));
-        assert_eq!((&resolver).host_ptr_for_base(base + size as u64), None);
+        assert_eq!(resolver.host_ptr_for_base(base), Some(pointer));
+        assert_eq!(resolver.host_ptr_for_base(base + size as u64), None);
         assert_eq!(
             custody
                 .stage2_record_snapshot(identity.record_id)
@@ -1313,7 +1313,7 @@ mod arena_pin_tests {
             1
         );
         state.structural_owners.write().clear();
-        assert_eq!((&resolver).host_ptr_for_base(base), Some(pointer));
+        assert_eq!(resolver.host_ptr_for_base(base), Some(pointer));
         assert_eq!(
             custody.retire_stage2_record_using(identity, |_, _| panic!(
                 "pinned backing must not unmap"
