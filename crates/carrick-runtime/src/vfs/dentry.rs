@@ -51,7 +51,7 @@ use crate::linux_abi::{
     LINUX_EINVAL, LINUX_EISDIR, LINUX_ELOOP, LINUX_ENAMETOOLONG, LINUX_ENOENT, LINUX_ENOSYS,
     LINUX_ENOTDIR, LINUX_EXDEV, LinuxErrno,
 };
-use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind};
+use crate::rootfs::{RootFs, RootFsEntryKind};
 use carrick_abi::{NsGid, NsUid};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -143,7 +143,6 @@ pub enum DentryNode {
 pub struct DirEntry {
     pub id: DentryId,
     pub dir_gen: Arc<AtomicU64>,
-    pub seeded_gen: Arc<AtomicU64>,
     pub upper_dir_fd: Option<Arc<OwnedFd>>,
     pub lower_dir_fd: Option<Arc<OwnedFd>>,
     pub parent: Option<(DentryId, String)>,
@@ -199,7 +198,6 @@ impl DentryCache {
             DirEntry {
                 id: DentryId::ROOT,
                 dir_gen: root_gen,
-                seeded_gen: Arc::new(AtomicU64::new(0)),
                 upper_dir_fd: None,
                 lower_dir_fd: None,
                 parent: None,
@@ -264,7 +262,6 @@ impl DentryCache {
                 DirEntry {
                     id: DentryId::ROOT,
                     dir_gen: root_gen,
-                    seeded_gen: Arc::new(AtomicU64::new(0)),
                     upper_dir_fd: None,
                     lower_dir_fd: None,
                     parent: None,
@@ -802,7 +799,6 @@ impl DentryCache {
                 DirEntry {
                     id: DentryId::ROOT,
                     dir_gen: Arc::new(AtomicU64::new(1)),
-                    seeded_gen: Arc::new(AtomicU64::new(0)),
                     upper_dir_fd: None,
                     lower_dir_fd: None,
                     parent: None,
@@ -820,7 +816,6 @@ impl DentryCache {
             DirEntry {
                 id,
                 dir_gen,
-                seeded_gen: Arc::new(AtomicU64::new(0)),
                 upper_dir_fd,
                 lower_dir_fd,
                 parent: Some((parent_id, name.to_string())),
@@ -1879,137 +1874,6 @@ impl DentryCache {
             }
         }
     }
-
-    /// Populate dentry cache with children discovered during directory enumeration.
-    pub fn seed_dir_children(
-        &self,
-        dir_path: &str,
-        entries: &[RootFsDirEntry],
-        is_lower: bool,
-        backend: &dyn FsBackend,
-        rootfs: Option<&RootFs>,
-    ) {
-        if self.is_shared {
-            return;
-        }
-        let norm_dir = dir_path.trim_end_matches('/');
-        let norm_dir = if norm_dir.is_empty() { "/" } else { norm_dir };
-        if let Some(&dir_id) = self.path_to_dir_id.read().get(norm_dir) {
-            let dirs = self.dirs.read();
-            if let Some(dir) = dirs.get(&dir_id) {
-                if dir.seeded_gen.load(Ordering::Relaxed) == dir.dir_gen.load(Ordering::Relaxed) {
-                    return;
-                }
-            }
-        }
-        self.check_fork();
-
-        let resolved_dir = match self.lookup_path(dir_path, true, backend, rootfs) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let Some(parent_id) = resolved_dir.dentry.id else {
-            return;
-        };
-        let parent_dir_gen = resolved_dir
-            .dentry
-            .dir_gen
-            .as_ref()
-            .map(|g| g.load(Ordering::Relaxed))
-            .unwrap_or(1);
-
-        let mut entry_map = self.entries.write();
-        let mut dirs_map = self.dirs.write();
-        let mut path_map = self.path_to_dir_id.write();
-
-        if entry_map.len() + entries.len() >= 16384 {
-            entry_map.clear();
-        }
-
-        for entry in entries {
-            let name = &entry.name;
-            if name == "." || name == ".." {
-                continue;
-            }
-            if entry.metadata.kind == RootFsEntryKind::Symlink {
-                continue;
-            }
-            let key = (parent_id, name.clone());
-            if entry_map.contains_key(&key) {
-                continue;
-            }
-            let child_path = if norm_dir == "/" {
-                format!("/{}", name)
-            } else {
-                format!("{}/{}", norm_dir, name)
-            };
-
-            let (child_dir_id, child_dir_gen) = if entry.metadata.kind == RootFsEntryKind::Directory
-            {
-                if let Some(id) = path_map.get(&child_path).copied() {
-                    let child_gen = dirs_map.get(&id).map(|d| d.dir_gen.clone());
-                    (Some(id), child_gen)
-                } else {
-                    if dirs_map.len() >= 4096 {
-                        dirs_map.clear();
-                        path_map.clear();
-                        dirs_map.insert(
-                            DentryId::ROOT,
-                            DirEntry {
-                                id: DentryId::ROOT,
-                                dir_gen: Arc::new(AtomicU64::new(1)),
-                                seeded_gen: Arc::new(AtomicU64::new(0)),
-                                upper_dir_fd: None,
-                                lower_dir_fd: None,
-                                parent: None,
-                                path: "/".to_string(),
-                                dev: 0,
-                                ino: 1,
-                            },
-                        );
-                        path_map.insert("/".to_string(), DentryId::ROOT);
-                        path_map.insert("".to_string(), DentryId::ROOT);
-                    }
-                    let id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
-                    let child_gen = Arc::new(AtomicU64::new(1));
-                    dirs_map.insert(
-                        id,
-                        DirEntry {
-                            id,
-                            dir_gen: child_gen.clone(),
-                            seeded_gen: Arc::new(AtomicU64::new(0)),
-                            upper_dir_fd: None,
-                            lower_dir_fd: None,
-                            parent: Some((parent_id, name.clone())),
-                            path: child_path.clone(),
-                            dev: resolved_dir.dentry.dev,
-                            ino: entry.ino,
-                        },
-                    );
-                    path_map.insert(child_path.clone(), id);
-                    (Some(id), Some(child_gen))
-                }
-            } else {
-                (None, None)
-            };
-
-            let pos = PositiveDentry {
-                id: child_dir_id,
-                kind: entry.metadata.kind,
-                ino: entry.ino,
-                dev: resolved_dir.dentry.dev,
-                symlink_target: None,
-                parent_gen: parent_dir_gen,
-                dir_gen: child_dir_gen,
-                is_lower,
-            };
-            entry_map.insert(key, DentryNode::Positive(pos));
-        }
-
-        if let Some(dir) = dirs_map.get(&parent_id) {
-            dir.seeded_gen.store(parent_dir_gen, Ordering::Relaxed);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2247,53 +2111,5 @@ mod tests {
             .stat("/foo.txt", true, &backend, None)
             .expect("stat foo after write to ln");
         assert_eq!(st_foo2.size, 3);
-    }
-
-    #[test]
-    fn test_dentry_cache_seed_dir_children() {
-        let tmp = tempdir().unwrap();
-        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false);
-
-        fs::create_dir_all(tmp.path().join("subdir")).unwrap();
-        fs::write(tmp.path().join("subdir/file1.txt"), b"hello").unwrap();
-        fs::write(tmp.path().join("subdir/file2.txt"), b"world").unwrap();
-
-        let entries = vec![
-            RootFsDirEntry {
-                name: "file1.txt".to_string(),
-                metadata: crate::rootfs::RootFsMetadata {
-                    path: std::path::PathBuf::from("/subdir/file1.txt"),
-                    kind: RootFsEntryKind::File,
-                    mode: 0o644,
-                    size: 5,
-                },
-                ino: 12345,
-            },
-            RootFsDirEntry {
-                name: "file2.txt".to_string(),
-                metadata: crate::rootfs::RootFsMetadata {
-                    path: std::path::PathBuf::from("/subdir/file2.txt"),
-                    kind: RootFsEntryKind::File,
-                    mode: 0o644,
-                    size: 5,
-                },
-                ino: 12346,
-            },
-        ];
-
-        cache.seed_dir_children("/subdir", &entries, false, &backend, None);
-
-        let resolved = cache
-            .lookup_path("/subdir/file1.txt", false, &backend, None)
-            .expect("lookup should find seeded child");
-        assert_eq!(resolved.dentry.kind, RootFsEntryKind::File);
-        assert_eq!(resolved.dentry.ino, 12345);
-
-        let st = cache
-            .stat("/subdir/file1.txt", false, &backend, None)
-            .expect("stat should succeed");
-        assert_eq!(st.kind, RootFsEntryKind::File);
-        assert_eq!(st.size, 5);
     }
 }

@@ -276,25 +276,6 @@ impl RootFsVfs {
         self.dentry_cache.inode_changed(path, inode);
     }
 
-    /// Seed dentry cache with children discovered during directory enumeration.
-    pub fn seed_dir_children(
-        &self,
-        dir_path: &str,
-        entries: &[crate::rootfs::RootFsDirEntry],
-        is_lower: bool,
-    ) {
-        if !self.overlay.serves_dentry_cache() {
-            return;
-        }
-        self.dentry_cache.seed_dir_children(
-            dir_path,
-            entries,
-            is_lower,
-            &*self.overlay,
-            self.rootfs.as_ref(),
-        );
-    }
-
     /// Reset dentry cache on rootfs layer mutation.
     pub fn reset_dentry_cache(&mut self) {
         let is_shared = self.dentry_cache.is_shared();
