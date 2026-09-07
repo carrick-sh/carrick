@@ -2013,6 +2013,7 @@ pub trait FrameCowAuthority: Send + Sync {
 
     /// Batch query mapping exact-liveness for candidate extents and mapping counts
     /// for candidate frames under a single authority synchronization.
+    #[allow(clippy::type_complexity)]
     fn retirement_batch_query(
         &self,
         candidate_extents: &[(

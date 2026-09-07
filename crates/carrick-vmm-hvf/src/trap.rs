@@ -20698,10 +20698,7 @@ fn final_exec_physical_extents(
             ))
         })?;
     let authoritative_counts: std::collections::BTreeMap<carrick_hal::FrameId, Option<usize>> =
-        candidate_frames
-            .into_iter()
-            .zip(frame_counts.into_iter())
-            .collect();
+        candidate_frames.into_iter().zip(frame_counts).collect();
 
     let mut complete_frames = std::collections::BTreeSet::new();
     for (&frame, authoritative) in &authoritative_counts {
@@ -36497,10 +36494,7 @@ impl HvfVmState {
         }
 
         let authoritative_counts: std::collections::BTreeMap<carrick_hal::FrameId, Option<usize>> =
-            candidate_frames
-                .into_iter()
-                .zip(frame_counts.into_iter())
-                .collect();
+            candidate_frames.into_iter().zip(frame_counts).collect();
 
         let transaction = reservation.transaction();
         for extent in inventory.extents.values() {

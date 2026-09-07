@@ -9465,7 +9465,7 @@ mod tests {
             let child = kernel
                 .fork_task(
                     &root,
-                    fork_plan.clone(),
+                    fork_plan,
                     ThreadId::synthetic_for_tests(10_000 + i),
                     format!("child-{i}"),
                     None,
