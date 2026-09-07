@@ -1889,9 +1889,16 @@ impl SyscallDispatcher {
         // below skips `resolve_at_path`, which is where they were enforced.
         check_path_length(path)?;
 
+        let in_chroot = self
+            .captured_fs_context()
+            .chroot_root()
+            .as_deref()
+            .is_some_and(|r| r != "/");
+
         // Dentry-cache fast path: a stat of a plain absolute path is served
         // from the dentry cache (resolving symlinks and negative entries in-memory).
-        if (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
+        if !in_chroot
+            && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
             && path.starts_with('/')
             && !path.starts_with("/proc")
             && !path.starts_with("/sys")
@@ -1914,7 +1921,8 @@ impl SyscallDispatcher {
         // opts out): a repeat stat of a plain absolute path is served by one
         // revalidating fstatat through a cached, contained parent fd. Gated so
         // normalize(path) equals the resolved path (the cache key).
-        if !requires_dir
+        if !in_chroot
+            && !requires_dir
             && dirfd == LINUX_AT_FDCWD
             && path.starts_with('/')
             && !path.starts_with("/proc")
@@ -16631,8 +16639,15 @@ impl SyscallDispatcher {
             // ENOTDIR (matches newfstatat; man path_resolution(7)).
             let requires_dir = path.ends_with('/') || path.ends_with("/.");
 
+            let in_chroot = this
+                .captured_fs_context()
+                .chroot_root()
+                .as_deref()
+                .is_some_and(|r| r != "/");
+
             // Dentry cache fast path for statx
-            if (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
+            if !in_chroot
+                && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
                 && path.starts_with('/')
                 && !path.starts_with("/proc")
                 && !path.starts_with("/sys")
@@ -16656,7 +16671,8 @@ impl SyscallDispatcher {
             // Dispatch-level stat-cache fast path — see the twin block in
             // `newfstatat` for the gating rationale. write_statx_real's `path`
             // only feeds the type bits, so a hit is byte-identical.
-            if !requires_dir
+            if !in_chroot
+                && !requires_dir
                 && dirfd == LINUX_AT_FDCWD
                 && path.starts_with('/')
                 && !path.starts_with("/proc")

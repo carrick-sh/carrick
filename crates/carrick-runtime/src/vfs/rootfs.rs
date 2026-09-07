@@ -1469,6 +1469,10 @@ impl Vfs for RootFsVfs {
             return Err(LINUX_EISDIR);
         }
         let inode = self.path_inode_identity(path);
+        let parent_inode = std::path::Path::new(path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .and_then(|p| self.path_inode_identity(p));
         if in_overlay {
             self.overlay.remove_entry(path);
             // Tombstone only if the rootfs also has this path, so a
@@ -1489,6 +1493,9 @@ impl Vfs for RootFsVfs {
                 .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         }
         self.dentry_cache.entry_removed(path, inode);
+        if let Some(parent_id) = parent_inode {
+            self.dentry_cache.invalidate_inode(parent_id);
+        }
         Ok(())
     }
 
@@ -1521,6 +1528,10 @@ impl Vfs for RootFsVfs {
             return Err(LINUX_ENOTEMPTY);
         }
         let inode = self.path_inode_identity(path);
+        let parent_inode = std::path::Path::new(path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .and_then(|p| self.path_inode_identity(p));
         if in_overlay {
             self.overlay.remove_entry(path);
             let rootfs_has_it = self
@@ -1539,6 +1550,9 @@ impl Vfs for RootFsVfs {
                 .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         }
         self.dentry_cache.entry_removed(path, inode);
+        if let Some(parent_id) = parent_inode {
+            self.dentry_cache.invalidate_inode(parent_id);
+        }
         Ok(())
     }
 

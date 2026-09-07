@@ -6831,3 +6831,428 @@ fn lseek_data_and_hole_across_backends() {
         DispatchOutcome::errno(LINUX_ESPIPE)
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_creat_through_guest_created_symlink_to_dir() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    backend.make_dir("/realdir").unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    // Guest creates symlink /symdir -> realdir
+    memory.write_bytes(0x4000, b"realdir\0").unwrap();
+    memory.write_bytes(0x5000, b"/symdir\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        36,
+        [0x4000, LINUX_AT_FDCWD, 0x5000, 0, 0, 0],
+    );
+    assert_eq!(rc, 0, "symlinkat failed: {rc}");
+
+    // Guest creates file inside /symdir/testfile.txt
+    memory
+        .write_bytes(0x6000, b"/symdir/testfile.txt\0")
+        .unwrap();
+    let fd = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        56, // openat
+        [
+            LINUX_AT_FDCWD,
+            0x6000,
+            LINUX_O_CREAT | LINUX_O_WRONLY,
+            0o644,
+            0,
+            0,
+        ],
+    );
+    assert!(fd >= 0, "creat through symlink to dir failed: {fd}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_intermediate_symlink_loop_returns_eloop() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    backend.make_dir("/test_eloop").unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    // Guest creates test_eloop/test_eloop -> ../test_eloop
+    memory.write_bytes(0x4000, b"../test_eloop\0").unwrap();
+    memory
+        .write_bytes(0x5000, b"/test_eloop/test_eloop\0")
+        .unwrap();
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            36,
+            [0x4000, LINUX_AT_FDCWD, 0x5000, 0, 0, 0]
+        ),
+        0
+    );
+
+    // Path repeating /test_eloop 43 times
+    let mut path = "/test_eloop".to_string();
+    for _ in 0..42 {
+        path.push_str("/test_eloop");
+    }
+    memory
+        .write_bytes(0x6000, format!("{path}\0").as_bytes())
+        .unwrap();
+
+    // lstat on 43-hop path must return ELOOP, not 0!
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79, // newfstatat
+        [
+            LINUX_AT_FDCWD,
+            0x6000,
+            0x7000,
+            LINUX_AT_SYMLINK_NOFOLLOW,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(
+        rc,
+        -i64::from(crate::linux_abi::LINUX_ELOOP.get()),
+        "lstat on 43-hop intermediate loop should be ELOOP"
+    );
+
+    // readlink on 43-hop path must return ELOOP, not succeed!
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        78, // readlinkat
+        [LINUX_AT_FDCWD, 0x6000, 0x7000, 1024, 0, 0],
+    );
+    assert_eq!(
+        rc,
+        -i64::from(crate::linux_abi::LINUX_ELOOP.get()),
+        "readlink on 43-hop intermediate loop should be ELOOP"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_rename_symlink_into_symlinked_dir_preserves_symlink() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    backend.make_dir("/realdir").unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    // Create /symdir -> realdir
+    memory.write_bytes(0x4000, b"realdir\0").unwrap();
+    memory.write_bytes(0x5000, b"/symdir\0").unwrap();
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            36,
+            [0x4000, LINUX_AT_FDCWD, 0x5000, 0, 0, 0]
+        ),
+        0
+    );
+
+    // Create /mylink -> target_value
+    memory.write_bytes(0x4000, b"target_value\0").unwrap();
+    memory.write_bytes(0x5000, b"/mylink\0").unwrap();
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            36,
+            [0x4000, LINUX_AT_FDCWD, 0x5000, 0, 0, 0]
+        ),
+        0
+    );
+
+    // Rename /mylink -> /symdir/movedlink
+    memory.write_bytes(0x4000, b"/mylink\0").unwrap();
+    memory.write_bytes(0x5000, b"/symdir/movedlink\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        38, // renameat
+        [LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x5000, 0, 0],
+    );
+    assert_eq!(rc, 0, "renameat failed: {rc}");
+
+    // lstat /symdir/movedlink should report S_IFLNK
+    memory.write_bytes(0x6000, b"/symdir/movedlink\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79, // newfstatat
+        [
+            LINUX_AT_FDCWD,
+            0x6000,
+            0x7000,
+            LINUX_AT_SYMLINK_NOFOLLOW,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(rc, 0, "newfstatat failed: {rc}");
+    let mode = u32::from_ne_bytes(
+        memory
+            .read_bytes(0x7000 + 16, 4)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        mode & 0o170000,
+        0o120000,
+        "moved link must still be S_IFLNK"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_rmdir_after_unlinking_files() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    // Create /testdir
+    memory.write_bytes(0x4000, b"/testdir\0").unwrap();
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            34,
+            [LINUX_AT_FDCWD, 0x4000, 0o755, 0, 0, 0]
+        ),
+        0
+    );
+
+    // Create /testdir/file1, /testdir/file2
+    memory.write_bytes(0x4000, b"/testdir/file1\0").unwrap();
+    let fd1 = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            LINUX_O_CREAT | LINUX_O_WRONLY,
+            0o644,
+            0,
+            0,
+        ],
+    );
+    assert!(fd1 >= 0);
+    lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        57,
+        [fd1 as u64, 0, 0, 0, 0, 0],
+    );
+    // Create /testdir/file2
+    memory.write_bytes(0x4000, b"/testdir/file2\0").unwrap();
+    let fd2 = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            LINUX_O_CREAT | LINUX_O_WRONLY,
+            0o644,
+            0,
+            0,
+        ],
+    );
+    assert!(fd2 >= 0);
+    lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        57,
+        [fd2 as u64, 0, 0, 0, 0, 0],
+    );
+
+    // Stat /testdir while files exist: caches InodeRecord in dentry cache
+    memory.write_bytes(0x4000, b"/testdir\0").unwrap();
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [
+                LINUX_AT_FDCWD,
+                0x4000,
+                0x7000,
+                LINUX_AT_SYMLINK_NOFOLLOW,
+                0,
+                0
+            ]
+        ),
+        0
+    );
+
+    // Unlink both files
+    memory.write_bytes(0x4000, b"/testdir/file1\0").unwrap();
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            35,
+            [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]
+        ),
+        0
+    );
+    memory.write_bytes(0x4000, b"/testdir/file2\0").unwrap();
+    assert_eq!(
+        lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            35,
+            [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]
+        ),
+        0
+    );
+
+    // Check fstatat on /testdir -> st_nlink must be 2, not stale!
+    memory.write_bytes(0x4000, b"/testdir\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            0x7000,
+            LINUX_AT_SYMLINK_NOFOLLOW,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(rc, 0);
+    let nlink = u32::from_ne_bytes(
+        memory
+            .read_bytes(0x7000 + 20, 4)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(nlink, 2, "empty dir nlink must be 2");
+
+    // rmdir /testdir via unlinkat(..., AT_REMOVEDIR)
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        35,
+        [LINUX_AT_FDCWD, 0x4000, 0x200, 0, 0, 0],
+    );
+    assert_eq!(rc, 0, "rmdir should succeed");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_stat_absolute_path_after_chroot() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    backend.make_dir("/jail").unwrap();
+    backend
+        .set_file_contents("/jail/testfile", b"hello".to_vec())
+        .unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    // Set chroot root to /jail
+    dispatcher
+        .capture_one_task_context()
+        .unwrap()
+        .resources()
+        .fs_context()
+        .set_chroot_root(Some("/jail".to_owned()));
+
+    // stat("/testfile") - on unchanged code, dentry fast path looks up /testfile on rootfs and fails ENOENT (-2)
+    memory.write_bytes(0x4000, b"/testfile\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [LINUX_AT_FDCWD, 0x4000, 0x7000, 0, 0, 0],
+    );
+    assert_eq!(rc, 0, "stat(/testfile) after chroot should succeed");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_stat_and_lookup_dot_leaf() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    backend.make_dir("/mydir").unwrap();
+    backend
+        .set_file_contents("/mydir/myfile", b"data".to_vec())
+        .unwrap();
+    backend.symlink(".", "/mydir/dotsym").unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    // 1. stat("/mydir/.") succeeds and reports S_IFDIR
+    memory.write_bytes(0x4000, b"/mydir/.\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [LINUX_AT_FDCWD, 0x4000, 0x7000, 0, 0, 0],
+    );
+    assert_eq!(rc, 0, "stat(/mydir/.) should succeed");
+    let mode = u32::from_ne_bytes(
+        memory
+            .read_bytes(0x7000 + 16, 4)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(mode & 0o170000, 0o040000, "must be S_IFDIR");
+
+    // 2. stat("/mydir/myfile/.") fails with ENOTDIR (-20)
+    memory.write_bytes(0x4000, b"/mydir/myfile/.\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [LINUX_AT_FDCWD, 0x4000, 0x7000, 0, 0, 0],
+    );
+    assert_eq!(
+        rc,
+        -i64::from(crate::linux_abi::LINUX_ENOTDIR.get()),
+        "stat(/mydir/myfile/.) should be ENOTDIR"
+    );
+
+    // 3. stat("/mydir/dotsym") followed resolves to . (/mydir) and reports S_IFDIR
+    memory.write_bytes(0x4000, b"/mydir/dotsym\0").unwrap();
+    let rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        79,
+        [LINUX_AT_FDCWD, 0x4000, 0x7000, 0, 0, 0],
+    );
+    assert_eq!(rc, 0, "stat(/mydir/dotsym) should succeed");
+    let mode = u32::from_ne_bytes(
+        memory
+            .read_bytes(0x7000 + 16, 4)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(mode & 0o170000, 0o040000, "dotsym followed must be S_IFDIR");
+}

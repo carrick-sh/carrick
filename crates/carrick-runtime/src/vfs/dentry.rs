@@ -145,6 +145,8 @@ pub struct DirEntry {
     pub lower_dir_fd: Option<Arc<OwnedFd>>,
     pub parent: Option<(DentryId, String)>,
     pub path: String,
+    pub dev: u64,
+    pub ino: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +199,8 @@ impl DentryCache {
                 lower_dir_fd: None,
                 parent: None,
                 path: "/".to_string(),
+                dev: 0,
+                ino: 1,
             },
         );
         let mut path_to_dir_id = HashMap::new();
@@ -250,6 +254,8 @@ impl DentryCache {
                     lower_dir_fd: None,
                     parent: None,
                     path: "/".to_string(),
+                    dev: 0,
+                    ino: 1,
                 },
             );
             path_to_dir_id.insert("/".to_string(), DentryId::ROOT);
@@ -269,11 +275,14 @@ impl DentryCache {
     ) -> Result<ResolvedDentry, LinuxErrno> {
         self.check_fork();
 
-        let norm_path = path.trim_end_matches('/');
-        let norm_path = if norm_path.is_empty() { "/" } else { norm_path };
-
         let requires_dir = path.ends_with('/') || path.ends_with("/.");
         let effective_follow = follow_trailing || requires_dir;
+
+        let mut norm_path = path.trim_end_matches('/');
+        while norm_path.ends_with("/.") {
+            norm_path = &norm_path[..norm_path.len() - 2];
+        }
+        let norm_path = if norm_path.is_empty() { "/" } else { norm_path };
 
         if !self.is_shared {
             let fp = self.fast_path.read();
@@ -350,14 +359,13 @@ impl DentryCache {
         res
     }
 
-    fn lookup_path_slow(
+    fn resolve_dir_id(
         &self,
-        norm_path: &str,
-        follow_trailing: bool,
+        dir_id: DentryId,
         backend: &dyn FsBackend,
         rootfs: Option<&RootFs>,
     ) -> Result<ResolvedDentry, LinuxErrno> {
-        if norm_path == "/" {
+        if dir_id == DentryId::ROOT {
             let (root_gen, upper_fd, lower_fd) = {
                 let mut dirs = self.dirs.write();
                 let r = dirs.get_mut(&DentryId::ROOT).ok_or(LINUX_ENOENT)?;
@@ -383,6 +391,13 @@ impl DentryCache {
             } else {
                 (0, 1, 0o755)
             };
+            {
+                let mut dirs = self.dirs.write();
+                if let Some(r) = dirs.get_mut(&DentryId::ROOT) {
+                    r.dev = dev;
+                    r.ino = ino;
+                }
+            }
             let record = InodeRecord {
                 mode: if mode == 0 { 0o755 } else { mode },
                 uid: NsUid::ROOT,
@@ -413,6 +428,48 @@ impl DentryCache {
             });
         }
 
+        let (parent_id, leaf_name, path) = {
+            let dirs = self.dirs.read();
+            let d = dirs.get(&dir_id).ok_or(LINUX_ENOENT)?;
+            let (parent_id, leaf_name) = d.parent.as_ref().ok_or(LINUX_ENOENT)?;
+            (*parent_id, leaf_name.clone(), d.path.clone())
+        };
+
+        let leaf_parent_fd = {
+            let dirs = self.dirs.read();
+            dirs.get(&parent_id)
+                .and_then(|p| p.upper_dir_fd.clone().or_else(|| p.lower_dir_fd.clone()))
+        };
+
+        let node = {
+            let entries = self.entries.read();
+            match entries.get(&(parent_id, leaf_name.clone())) {
+                Some(DentryNode::Positive(pos)) => pos.clone(),
+                _ => return Err(LINUX_ENOENT),
+            }
+        };
+
+        let leaf_name_c = CString::new(leaf_name.as_bytes()).map_err(|_| LINUX_ENOENT)?;
+        Ok(ResolvedDentry {
+            dentry: node,
+            canonical_path: path,
+            parent_dir_fd: leaf_parent_fd,
+            leaf_name,
+            leaf_name_c,
+        })
+    }
+
+    fn lookup_path_slow(
+        &self,
+        norm_path: &str,
+        follow_trailing: bool,
+        backend: &dyn FsBackend,
+        rootfs: Option<&RootFs>,
+    ) -> Result<ResolvedDentry, LinuxErrno> {
+        if norm_path == "/" {
+            return self.resolve_dir_id(DentryId::ROOT, backend, rootfs);
+        }
+
         if norm_path.starts_with("/proc")
             || norm_path.starts_with("/sys")
             || norm_path.starts_with("/dev")
@@ -440,6 +497,9 @@ impl DentryCache {
             }
 
             if name == "." {
+                if is_last {
+                    return self.resolve_dir_id(current_id, backend, rootfs);
+                }
                 comp_idx += 1;
                 continue;
             }
@@ -451,6 +511,9 @@ impl DentryCache {
                         .unwrap_or(DentryId::ROOT)
                 };
                 current_id = parent_id;
+                if is_last {
+                    return self.resolve_dir_id(current_id, backend, rootfs);
+                }
                 comp_idx += 1;
                 continue;
             }
@@ -706,6 +769,8 @@ impl DentryCache {
         parent_id: DentryId,
         name: &str,
         path: &str,
+        dev: u64,
+        ino: u64,
     ) {
         let mut dirs = self.dirs.write();
         let mut path_map = self.path_to_dir_id.write();
@@ -721,6 +786,8 @@ impl DentryCache {
                     lower_dir_fd: None,
                     parent: None,
                     path: "/".to_string(),
+                    dev: 0,
+                    ino: 1,
                 },
             );
             path_map.insert("/".to_string(), DentryId::ROOT);
@@ -736,6 +803,8 @@ impl DentryCache {
                 lower_dir_fd,
                 parent: Some((parent_id, name.to_string())),
                 path: path.to_string(),
+                dev,
+                ino,
             },
         );
         path_map.insert(path.to_string(), id);
@@ -824,6 +893,8 @@ impl DentryCache {
                 parent_id,
                 name,
                 full_path,
+                st.st_dev as u64,
+                st.st_ino,
             );
             let on_disk_mode = st.st_mode as u32 & 0o7777;
             let (mode, uid, gid) = if let Some(ref rs) = real_stat {
@@ -1012,6 +1083,8 @@ impl DentryCache {
                     parent_id,
                     name,
                     &full_path,
+                    0,
+                    rs.ino,
                 );
                 (Some(new_dir_id), Some(child_dir_gen))
             } else {
@@ -1064,6 +1137,8 @@ impl DentryCache {
                     parent_id,
                     name,
                     &full_path,
+                    0,
+                    1,
                 );
                 (Some(new_dir_id), Some(child_dir_gen))
             } else {
@@ -1167,6 +1242,8 @@ impl DentryCache {
                         parent_id,
                         name,
                         &full_path,
+                        dev,
+                        ino,
                     );
                     (Some(new_dir_id), Some(child_dir_gen))
                 } else {
@@ -1217,7 +1294,10 @@ impl DentryCache {
 
         let requires_dir = path.ends_with('/') || path.ends_with("/.");
         let effective_follow = follow || requires_dir;
-        let norm_path = path.trim_end_matches('/');
+        let mut norm_path = path.trim_end_matches('/');
+        while norm_path.ends_with("/.") {
+            norm_path = &norm_path[..norm_path.len() - 2];
+        }
         let norm_path = if norm_path.is_empty() { "/" } else { norm_path };
 
         if !self.is_shared {
@@ -1463,6 +1543,11 @@ impl DentryCache {
         {
             let mut entries = self.entries.write();
             entries.remove(&(parent_id, name.to_string()));
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(&parent_id) {
+                d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                self.inodes.write().remove(&(d.dev, d.ino));
+            }
         }
         if let Some(dir_id) = self.path_to_dir_id.read().get(norm) {
             let dirs = self.dirs.read();
@@ -1498,9 +1583,11 @@ impl DentryCache {
             {
                 self.inodes.write().remove(&(pos.dev, pos.ino));
             }
-            if !self.is_shared {
-                let dirs = self.dirs.read();
-                if let Some(d) = dirs.get(&parent_id) {
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(&parent_id) {
+                d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                self.inodes.write().remove(&(d.dev, d.ino));
+                if !self.is_shared {
                     let parent_gen = d.dir_gen.load(Ordering::SeqCst);
                     entries.insert(
                         (parent_id, name.to_string()),
@@ -1542,9 +1629,11 @@ impl DentryCache {
         {
             let mut entries = self.entries.write();
             entries.remove(&(old_parent_id, old_name.to_string()));
-            if !self.is_shared {
-                let dirs = self.dirs.read();
-                if let Some(d) = dirs.get(&old_parent_id) {
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(&old_parent_id) {
+                d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                self.inodes.write().remove(&(d.dev, d.ino));
+                if !self.is_shared {
                     let parent_gen = d.dir_gen.load(Ordering::SeqCst);
                     entries.insert(
                         (old_parent_id, old_name.to_string()),
@@ -1563,6 +1652,11 @@ impl DentryCache {
                 entries.remove(&(new_parent_id, new_name.to_string()))
             {
                 self.inodes.write().remove(&(pos.dev, pos.ino));
+            }
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(&new_parent_id) {
+                d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                self.inodes.write().remove(&(d.dev, d.ino));
             }
         }
         if let Some(id) = inode {
@@ -1587,6 +1681,12 @@ impl DentryCache {
         if let Some(id) = inode {
             self.inodes.write().remove(&(id.dev, id.ino));
         }
+    }
+
+    /// Invalidate cached inode record for `id`.
+    pub fn invalidate_inode(&self, id: InodeIdentity) {
+        self.bump_mutation();
+        self.inodes.write().remove(&(id.dev, id.ino));
     }
 
     /// Bump the generation of a directory, invalidating negative lookups within it.
