@@ -2140,3 +2140,13 @@ session scratchpad, `fable-window.md`). The captured reaped-thread wake
 abort (previous section) is part of the scheduler work. Remaining
 Antigravity workers: reactor (poll deadline regression); sched-herd is
 prior art only.
+
+**Reactor branch parked** (`agy/reactor-sep07`, six turns). The
+incremental interest set, the exact-token wakes and the `swap_remove`
+rebinding fix are sound, but its deadline handling never matched Linux:
+first `poll() slept for too long` (5/7 on `ltp-poll02`), then, after the
+worker's re-arm fix, `poll() woken up early` (1/7 to 2/7) because it
+published deadlines due "within 1 ms". Main's reactor stays. The GuestCpu
+scheduler's phase 3 (blocking as a scheduler operation) is where the
+reactor's O(live blocked tasks) cost gets designed out, so the branch is
+kept as prior art rather than iterated further.
