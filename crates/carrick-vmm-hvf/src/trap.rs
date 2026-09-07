@@ -13876,6 +13876,99 @@ impl AliasRegistry {
         overlapping
     }
 
+    /// Whether any live alias visible to the process overlaps `[va, end)`.
+    /// Bounded to `by_va_start.range(va - widest_va .. end)` instead of walking
+    /// all carrier or scope rows.
+    fn has_live_process_alias_overlapping(
+        &self,
+        va: u64,
+        end: u64,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> bool {
+        if va >= end {
+            return false;
+        }
+        let lower = va.saturating_sub(self.widest_va);
+        if lower >= end {
+            return false;
+        }
+        for (_, rows) in self.by_va_start.range(lower..end) {
+            note_alias_state_rows_scanned(rows.len());
+            for &(_, alias) in rows {
+                if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                    && alias.start < end
+                    && alias.start.saturating_add(alias.size as u64) > va
+                    && alias_backing_is_live(alias.physical_host_addr)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Smallest `alias.start` strictly between `start` and `end` matching `predicate`
+    /// in the process-visible scopes.
+    /// Because `by_va_start` is ordered by `alias.start`, returns on the first
+    /// matching key without scanning the remainder of the registry.
+    fn first_matching_process_alias_start_between(
+        &self,
+        start: u64,
+        end: u64,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<u64> {
+        if start >= end {
+            return None;
+        }
+        for (&alias_start, rows) in self.by_va_start.range((
+            std::ops::Bound::Excluded(start),
+            std::ops::Bound::Excluded(end),
+        )) {
+            note_alias_state_rows_scanned(rows.len());
+            for &(_, alias) in rows {
+                if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                    && matches(&alias)
+                {
+                    return Some(alias_start);
+                }
+            }
+        }
+        None
+    }
+
+    /// The newest alias visible to the process whose guest-VA window contains `va`.
+    /// Bounded by `by_va_start.range(va - widest_va ..= va)`.
+    fn newest_process_alias_containing_va(
+        &self,
+        va: u64,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        let lower = va.saturating_sub(self.widest_va);
+        let mut newest: Option<(u64, AliasBacking)> = None;
+        for (_, rows) in self.by_va_start.range(lower..=va) {
+            note_alias_state_rows_scanned(rows.len());
+            for &(seq, alias) in rows {
+                if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                    && va >= alias.start
+                    && va < alias.start.saturating_add(alias.size as u64)
+                    && matches(&alias)
+                {
+                    match newest {
+                        None => newest = Some((seq, alias)),
+                        Some((best_seq, _)) if seq > best_seq => newest = Some((seq, alias)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        newest.map(|(_, alias)| alias)
+    }
+
     /// Insert a single row into buckets and indices with an explicit sequence.
     /// Used when staging a planned mutation subset without cloning or reindexing the whole registry.
     fn insert_indexed_row(&mut self, seq: u64, alias: AliasBacking) {
@@ -17791,18 +17884,19 @@ fn lookup_shared_alias_by_va(
     container_root: ContainerRootToken,
 ) -> Option<AliasBacking> {
     let end = va.saturating_add(len as u64);
-    alias_registry()
-        .lock()
-        .newest_matching_for_process(mm_root_slot, container_root, |e| {
-            alias_matches_process_scope(e.ownership_scope, mm_root_slot, container_root)
-                && va >= e.start
-                && end <= e.start.saturating_add(e.size as u64)
+    alias_registry().lock().newest_process_alias_containing_va(
+        va,
+        mm_root_slot,
+        container_root,
+        |e| {
+            end <= e.start.saturating_add(e.size as u64)
                 // Reject an entry whose backing is not mapped in THIS process
                 // (a parent's host_addr COW-inherited into a forked child) —
                 // dereferencing it would HOST-SIGSEGV the child. See
                 // `alias_backing_is_live`.
                 && alias_backing_is_live(e.host_addr.saturating_add((va - e.start) as usize))
-        })
+        },
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -38314,15 +38408,12 @@ impl HvfVmState {
                         .mappings
                         .iter()
                         .any(|m| m.start < compound_end && m.end > compound_start);
-                    let has_alias = alias_registry().lock().iter().any(|alias| {
-                        alias_matches_process_scope(
-                            alias.ownership_scope,
-                            self.mm_root_slot,
-                            self.container_root,
-                        ) && alias.start < compound_end
-                            && alias.start.saturating_add(alias.size as u64) > compound_start
-                            && alias_backing_is_live(alias.physical_host_addr)
-                    });
+                    let has_alias = alias_registry().lock().has_live_process_alias_overlapping(
+                        compound_start,
+                        compound_end,
+                        self.mm_root_slot,
+                        self.container_root,
+                    );
                     if !has_local && !has_alias {
                         self.materialize_sparse_mmap_extent(
                             compound_start,
@@ -38364,18 +38455,13 @@ impl HvfVmState {
                 .min();
             let next_alias = alias_registry()
                 .lock()
-                .iter()
-                .filter(|alias| {
-                    alias_matches_process_scope(
-                        alias.ownership_scope,
-                        self.mm_root_slot,
-                        self.container_root,
-                    ) && alias.start > current
-                        && alias.start < end
-                        && alias_backing_is_live(alias.physical_host_addr)
-                })
-                .map(|alias| alias.start)
-                .min();
+                .first_matching_process_alias_start_between(
+                    current,
+                    end,
+                    self.mm_root_slot,
+                    self.container_root,
+                    |alias| alias_backing_is_live(alias.physical_host_addr),
+                );
             let hole_end = next_local
                 .into_iter()
                 .chain(next_alias)
@@ -38574,21 +38660,20 @@ impl HvfVmState {
         // directly before allocating a second overlapping frame.
         let live_alias_end = alias_registry()
             .lock()
-            .newest_matching_for_process(self.mm_root_slot, self.container_root, |alias| {
-                alias_matches_process_scope(
-                    alias.ownership_scope,
-                    self.mm_root_slot,
-                    self.container_root,
-                ) && start >= alias.start
-                    && start < alias.start.saturating_add(alias.size as u64)
-                    && global_frame_host_owner_matches_in(
+            .newest_process_alias_containing_va(
+                start,
+                self.mm_root_slot,
+                self.container_root,
+                |alias| {
+                    global_frame_host_owner_matches_in(
                         self.custody(),
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
                         alias.owner_generation,
                     )
-            })
+                },
+            )
             .map(|alias| alias.start.saturating_add(alias.size as u64));
         if let Some(alias_end) = live_alias_end {
             return Ok(alias_end.min(end));
@@ -38609,24 +38694,21 @@ impl HvfVmState {
             .min();
         let next_alias = alias_registry()
             .lock()
-            .iter()
-            .filter(|alias| {
-                alias_matches_process_scope(
-                    alias.ownership_scope,
-                    self.mm_root_slot,
-                    self.container_root,
-                ) && alias.start > start
-                    && alias.start < end
-                    && global_frame_host_owner_matches_in(
+            .first_matching_process_alias_start_between(
+                start,
+                end,
+                self.mm_root_slot,
+                self.container_root,
+                |alias| {
+                    global_frame_host_owner_matches_in(
                         self.custody(),
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
                         alias.owner_generation,
                     )
-            })
-            .map(|alias| alias.start)
-            .min();
+                },
+            );
         let end = next_local
             .into_iter()
             .chain(next_alias)
