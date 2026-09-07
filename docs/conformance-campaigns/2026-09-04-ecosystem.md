@@ -1516,3 +1516,98 @@ onto this landing, use a fresh worker conversation, prove zero write_guest_bytes
 for the whole-file private view and meet file <=10 us / anon <=6 us. The
 quiet-host fork number and full cached ecosystem ledger remain pending; the
 Sep 4 floor is not replaced yet.
+
+## 2026-09-06 mmap accepted and Sep 4 floor replaced
+
+The reviewed `agy/mmap-lazy-sep06` branch landed at `3889fde8e`,
+fast-forwarded from the main checkout. Exact-artifact acceptance satisfied the
+whole-file private-map zero-copy contract: 100/100 mappings, zero errors, zero
+`write_guest_bytes`, and zero copy chunks. A forced eager positive control
+copied 661,504,000 bytes in 161,500 chunks. Untraced five-by-1,000 CNTVCT
+trials measured 6.346125 us median for a whole-libpython private file mmap and
+4.302208 us for a 1 MiB anonymous mmap, below the 10/6 us gates.
+
+The complete serial runtime suite passed 2,473 tests with 2 ignored. The whole
+signed probe family passed 470 generic probes on each libc lane, 24 dedicated
+cases, the CLI boundary contract, 46 retained probes with 1 ignored, and the
+container gate. Ubuntu shell true, Python print, and five Python allocator
+imports passed with fresh run IDs and zero scoped survivors. Artifact identity,
+launch, copy, latency and gate details are in
+[the mmap host contract](2026-09-06-mmap-host-contract.md).
+
+On the rebuilt main artifact (source `3889fde8e`, SHA-256
+`82c8bb495f791466b6c0fdc2926f97a2d3949e4e67d18d5f2c173b6decc9cb2f`), the
+quiet-host fork reducer settled below load 4 with no `yes` or Carrick process
+present, then measured 300 fork-to-wait samples after 30 warmups: p50
+250.875 us, p95 315.042 us, minimum 212.875 us. Against the retained 80 us
+Linux reference, the current fork floor is 3.14x and remains above target.
+Receipt: `target/conformance/eco-final-ledger/quiet-fork-3889fde8e.json`.
+
+The four declared oracle image IDs and live registry digests exactly matched
+the frozen closure scope. Docker was then stopped and verified unavailable.
+The four-worker Carrick-only run used all 2,127 cached oracle rows and wrote
+2,127 unique results with 2,127 fresh child run IDs; no guest or harness
+survived. The harness returned 1 solely because the discovery contains gating
+rows. Receipt:
+`target/conformance/eco-final-ledger/ledger-3889fde8e.jsonl` and its log and
+machine summary in the same directory.
+
+This result replaces the Sep 4 floor:
+
+| Ecosystem | Match | Regression | Crash | Timeout | Known diff | Unbaselined |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CPython | 420 / 438 | 11 | 1 | 6 | 0 | 0 |
+| Go | 177 / 194 | 5 | 12 | 0 | 0 | 0 |
+| LTP | 1,452 / 1,492 | 20 | 0 | 3 | 10 | 7 |
+| Node | 2 / 3 | 1 | 0 | 0 | 0 | 0 |
+| **Total** | **2,051 / 2,127 (96.43%)** | **37** | **13** | **9** | **10** | **7** |
+
+There are 59 gating verdicts, versus 47 on Sep 4. Twenty-two former blockers
+became matches, including the targeted fanotify, clock, pipe, splice, memfd,
+mremap and process-vm rows. Thirty-four former matches became nonmatches, so
+the net coverage count fell by 12. The replacement floor is intentionally not
+smoothed or re-blessed around those regressions.
+
+The remaining work ranks as follows:
+
+1. **Repair page-table/root publication before further optimization.** All 13
+   crash rows have one HVPatch authority failure family: 11 direct
+   projection-manager/CPU-TTBR root mismatches, one conflicting arena-source
+   install, and CPython regrtest dropping an active published inventory before
+   exact retirement while also reporting the root mismatch. Twelve are Go
+   packages and one is CPython. This is the first correctness blocker and is
+   suitable for unperturbed core plus event-ring attribution.
+2. **Repair the fd-relative namei/file-description regressions as one cluster.**
+   Twenty-one of the 22 match-to-regression transitions are path/filesystem
+   rows: CPython ctypes, mailbox, pathlib, shutil, tarfile, venv and zipfile;
+   Go build, io/fs and path/filepath; and LTP chroot02, fcntl01/11, lstat02,
+   open07, readlink03 and stat03 including their 64-bit variants. Representative
+   failures include temporary files becoming immediately unstatable and LTP
+   directory cleanup returning EISDIR. Go's FIPS CAST regression is the one
+   transition outside this cluster.
+3. **Treat nine budget-aligned rows as hangs, not ratios.** CPython compile,
+   importlib and asyncio stop at about 300 s; concurrent_futures,
+   multiprocessing_fork and multiprocessing_forkserver stop at about 600 s.
+   LTP inotify09, msgstress01 and shmctl05 stop at about 40 s. Reduce these after
+   the page-table crash and filesystem clusters so a shared cause is not counted
+   repeatedly.
+4. **Remove excess time above 2x in total-cost order.** Among semantically
+   matching rows, the largest excesses are CPython multiprocessing_spawn
+   (394.800 s, 6.46x, 272.626 s above 2x), multiprocessing_main_handling
+   (253.480 s, 87.65x, 247.696 s excess), threading (165.435 s, 11.97x,
+   137.803 s excess), os (77.679 s, 94.27x, 76.031 s excess), and logging
+   (102.828 s, 7.42x, 75.116 s excess). The next structural rows are CPython
+   itertools, tempfile, compileall, uuid, tracemalloc and random, plus
+   `ltp-munmap04` at 73.32x and `ltp-epoll-ltp` at 21.96x. End-to-end
+   `cpython-mmap` is correct but remains 4.21x despite the primitive mmap gate.
+5. **Lower the process floor.** Quiet-host fork remains 3.14x the retained
+   Linux number, so fork/exec amplification remains a separate cross-workload
+   term after the correctness clusters are fixed.
+
+Of the 2,051 matching rows, 397 are still at or above 2x, 56 are at or above
+5x and 25 are at or above 10x. The >=2x matches consume 70.11% of all matched
+Carrick time; the >=10x matches consume 30.03%. Aggregate matched time is
+1.623x the cached oracle and the median ratio is 0.49x, but only 1,654 of 2,127
+rows (77.76%) currently satisfy both semantic match and <2x. The live backlog
+to the combined goal is therefore 473 rows: 76 semantic/nonexecution rows plus
+397 matching but slow rows.
