@@ -16754,10 +16754,12 @@ impl SyscallDispatcher {
             } else {
                 path
             };
-            // The path must exist in the layered view, else NotFound (or a
-            // no-op success for synthetic /proc paths whose times we can't
-            // back).
-            match this.layered_metadata(&path) {
+            let exists = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+                this.layered_lstat(&path).map(|_| ())
+            } else {
+                this.layered_metadata(&path).map(|_| ())
+            };
+            match exists {
                 Ok(_) => {}
                 Err(errno) => {
                     if this.is_synthetic_virtual_path(cx.kernel, &path) {
