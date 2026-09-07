@@ -33160,74 +33160,51 @@ fn retire_process_aliases_in(
     versions: &mut AliasVersionRegistry,
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
-    global_keep: impl FnMut(&AliasBacking) -> bool,
+    mut global_keep: impl FnMut(&AliasBacking) -> bool,
 ) {
     let owned_scope = AliasRegistry::owned_scope(mm_root_slot, container_root);
-    let global_before: Vec<AliasBacking> = registry
-        .scope_rows(AliasOwnershipScope::Global)
-        .iter()
-        .map(|(_, alias)| *alias)
-        .collect();
-    let removed_owned = registry.remove_scope(owned_scope);
-    registry.retain_in_scope(AliasOwnershipScope::Global, global_keep);
-    let global_after: Vec<AliasBacking> = registry
-        .scope_rows(AliasOwnershipScope::Global)
-        .iter()
-        .map(|(_, alias)| *alias)
-        .collect();
-    note_alias_state_rows_scanned(removed_owned.len() + global_before.len() + global_after.len());
+    let mut dropped_global_first = std::collections::BTreeMap::new();
+    let mut dropped_global_order = Vec::new();
+    let mut seen_global_keys = std::collections::BTreeSet::new();
 
-    // Affected keys, in first-seen order, with their effective row afterwards.
+    let removed_owned = registry.remove_scope(owned_scope);
+    let removed_global = registry.retain_in_scope(AliasOwnershipScope::Global, |alias| {
+        let key = alias_version_key(alias);
+        let survives = global_keep(alias);
+        if seen_global_keys.insert(key) && !survives {
+            dropped_global_first.insert(key, *alias);
+            dropped_global_order.push(key);
+        }
+        survives
+    });
+    note_alias_state_rows_scanned(removed_owned.len() + removed_global.len());
+
+    // Affected keys, in first-seen order, with their effective row beforehand and afterwards.
     // Removing a whole scope leaves every key in it with no successor; the
     // `Global` half keeps the generic path's first-occurrence semantics for
     // duplicate keys exactly.
-    let mut affected: Vec<(AliasVersionKey, Option<AliasBacking>)> = Vec::new();
+    let mut affected: Vec<(AliasVersionKey, AliasBacking, Option<AliasBacking>)> = Vec::new();
     let mut seen_keys = std::collections::BTreeSet::new();
     for alias in &removed_owned {
         let key = alias_version_key(alias);
         if seen_keys.insert(key) {
-            affected.push((key, None));
+            affected.push((key, *alias, None));
         }
     }
-    let mut global_first_before: std::collections::BTreeMap<AliasVersionKey, AliasBacking> =
-        std::collections::BTreeMap::new();
-    let mut global_order: Vec<AliasVersionKey> = Vec::new();
-    for alias in &global_before {
-        let key = alias_version_key(alias);
-        if let std::collections::btree_map::Entry::Vacant(slot) = global_first_before.entry(key) {
-            slot.insert(*alias);
-            global_order.push(key);
-        }
-    }
-    let mut global_first_after: std::collections::BTreeMap<AliasVersionKey, AliasBacking> =
-        std::collections::BTreeMap::new();
-    for alias in &global_after {
-        global_first_after
-            .entry(alias_version_key(alias))
-            .or_insert(*alias);
-    }
-    for key in global_order {
-        let before = global_first_before[&key];
-        let after = global_first_after.get(&key).copied();
+    for key in dropped_global_order {
+        let before = dropped_global_first[&key];
+        let after = registry.find_by_key(key.0, key.1, key.2);
         if after == Some(before) {
             continue;
         }
-        affected.push((key, after));
+        affected.push((key, before, after));
     }
 
     let mut affected_physical: Vec<u64> = Vec::new();
     let mut affected_physical_seen: std::collections::BTreeSet<u64> =
         std::collections::BTreeSet::new();
-    for (key, after) in affected {
-        let before_rows = if key.2 == owned_scope {
-            removed_owned
-                .iter()
-                .find(|alias| alias_version_key(alias) == key)
-                .copied()
-        } else {
-            global_first_before.get(&key).copied()
-        };
-        for alias in before_rows.into_iter().chain(after) {
+    for (key, before, after) in affected {
+        for alias in std::iter::once(before).chain(after) {
             if affected_physical_seen.insert(alias.physical_ipa) {
                 affected_physical.push(alias.physical_ipa);
             }
@@ -36519,6 +36496,12 @@ impl HvfVmState {
                 )));
             }
         }
+        let mut incomplete_stage2_leases = std::collections::BTreeSet::new();
+        for extent in inventory.extents.values() {
+            if !complete_frames.contains(&extent.frame) {
+                incomplete_stage2_leases.insert((extent.stage2_base, extent.stage2_length));
+            }
+        }
         let mut retired_stage2 = std::collections::BTreeSet::new();
         let mut stage2_population_complete = std::collections::BTreeMap::new();
         for (&lease, &local) in &local_stage2_references {
@@ -36536,11 +36519,7 @@ impl HvfVmState {
                     "HVPatch stage-2 lease {lease:?} reference count underflow"
                 )));
             }
-            let all_frame_populations_complete = inventory
-                .extents
-                .values()
-                .filter(|extent| (extent.stage2_base, extent.stage2_length) == lease)
-                .all(|extent| complete_frames.contains(&extent.frame));
+            let all_frame_populations_complete = !incomplete_stage2_leases.contains(&lease);
             stage2_population_complete.insert(lease, all_frame_populations_complete);
             if global == local && all_frame_populations_complete {
                 retired_stage2.insert(lease);
