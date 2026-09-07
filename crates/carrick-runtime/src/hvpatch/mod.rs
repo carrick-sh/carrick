@@ -191,6 +191,29 @@ impl ProcessTimerTarget {
         };
         kernel.post_signal_to_task_key(self.task, signal, None)
     }
+
+    fn deliver_to_thread(&self, tid: i32, signum: i32) -> bool {
+        if signum == 0 {
+            return self.task().is_some();
+        }
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+            return false;
+        };
+        let Some(kernel) = self.kernel.upgrade() else {
+            return false;
+        };
+        let Some(task) = self.task() else {
+            return false;
+        };
+        let Ok(linux_tid) = crate::kernel::LinuxTid::from_abi_positive(tid) else {
+            return false;
+        };
+        if let Some(thread) = task.thread(linux_tid) {
+            kernel.post_signal_to_thread_key(task.key(), thread.key(), signal, None)
+        } else {
+            kernel.post_signal_to_task_key(self.task, signal, None)
+        }
+    }
 }
 
 struct ProcessItimerSlot {
@@ -362,12 +385,49 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
             let signum = armed.signum;
             let generation = armed.generation;
             let slot = armed.slot.clone();
+            let target_tid = armed.target_tid;
+            let target_cpu = target.clone();
+            let cpu_now: Option<std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>> =
+                if slot.clock_id == 2 {
+                    // CLOCK_PROCESS_CPUTIME_ID
+                    Some(std::sync::Arc::new(move || {
+                        let task = target_cpu.task()?;
+                        Some(
+                            task.self_cpu_ns_including_active()
+                                .saturating_add(task.self_system_cpu_us().saturating_mul(1000)),
+                        )
+                    }))
+                } else if slot.clock_id == 3 {
+                    // CLOCK_THREAD_CPUTIME_ID
+                    Some(std::sync::Arc::new(move || {
+                        let task = target_cpu.task()?;
+                        if let Some(tid) = target_tid {
+                            let linux_tid = crate::kernel::LinuxTid::from_abi_positive(tid).ok()?;
+                            let thread = task.thread(linux_tid)?;
+                            Some(thread.total_cpu_ns_including_active())
+                        } else {
+                            Some(
+                                task.self_cpu_ns_including_active()
+                                    .saturating_add(task.self_system_cpu_us().saturating_mul(1000)),
+                            )
+                        }
+                    }))
+                } else {
+                    None
+                };
+            let on_fire = move || {
+                if let Some(tid) = target_tid {
+                    target.deliver_to_thread(tid, signum);
+                } else {
+                    target.deliver(signum);
+                }
+            };
             let _ = std::thread::Builder::new()
                 .name(format!("carrick-hvpatch-ptimer-{id}"))
                 .spawn(move || {
-                    carrick_timer_core::posix::run_fallback(slot, generation, spec, || {
-                        let _ = target.deliver(signum);
-                    });
+                    carrick_timer_core::posix::run_fallback_with_cpu(
+                        slot, generation, spec, cpu_now, on_fire,
+                    );
                 });
         }
         Some(armed.old)

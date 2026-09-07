@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{CpuNs, TimerSpecNs, WallNs};
@@ -41,8 +41,6 @@ pub struct PosixTimerSlot {
     /// Optional thread target (e.g. SIGEV_THREAD_ID). If set, expiries are
     /// directed to this specific guest tid rather than process-wide.
     pub target_tid: Option<i32>,
-    /// The vCPU execution slot in `carrick_host::guest_cpu` tracked for thread CPU timers.
-    pub cpu_slot: AtomicUsize,
     /// The current arm's spec (for replay if pump path is later wired up).
     pub spec: Mutex<PosixTimerSpec>,
     /// Host monotonic timestamp (ns since `BASE_INSTANT`) the current arm
@@ -58,40 +56,11 @@ pub struct PosixTimerSlot {
     pub overruns: AtomicU32,
 }
 
-static TID_TO_SLOT: Mutex<Option<HashMap<i32, usize>>> = Mutex::new(None);
-
-pub fn record_tid_slot(tid: i32, slot: usize) {
-    if tid <= 0 {
-        return;
-    }
-    if let Ok(mut guard) = TID_TO_SLOT.lock() {
-        guard.get_or_insert_with(HashMap::new).insert(tid, slot);
-    }
-}
-
-pub fn slot_for_tid(tid: i32) -> Option<usize> {
-    if let Ok(guard) = TID_TO_SLOT.lock() {
-        guard.as_ref().and_then(|map| map.get(&tid).copied())
-    } else {
-        None
-    }
-}
-
 impl PosixTimerSlot {
     fn new(clock_id: i32, signum: i32, target_tid: Option<i32>) -> Self {
-        let current_slot = carrick_host::guest_cpu::this_thread_slot();
-        if let Some(tid) = target_tid {
-            record_tid_slot(tid, current_slot);
-        }
-        let cpu_slot = if let Some(tid) = target_tid {
-            slot_for_tid(tid).unwrap_or(current_slot)
-        } else {
-            current_slot
-        };
         Self {
             clock_id,
             target_tid,
-            cpu_slot: AtomicUsize::new(cpu_slot),
             spec: Mutex::new(PosixTimerSpec {
                 signum,
                 spec: TimerSpecNs::DISARM,
@@ -180,16 +149,6 @@ pub fn arm(id: i32, spec: TimerSpecNs) -> Option<PosixArm> {
         let map = ensure_registry(&mut guard);
         map.get(&id).cloned()
     }?;
-    if slot.clock_id == 3 {
-        let current_slot = carrick_host::guest_cpu::this_thread_slot();
-        if let Some(tid) = slot.target_tid {
-            record_tid_slot(tid, current_slot);
-            let s = slot_for_tid(tid).unwrap_or(current_slot);
-            slot.cpu_slot.store(s, Ordering::Release);
-        } else {
-            slot.cpu_slot.store(current_slot, Ordering::Release);
-        }
-    }
     let old = {
         let mut cur = slot.spec.lock().unwrap_or_else(|e| e.into_inner());
         let old = *cur;
@@ -273,8 +232,21 @@ pub fn run_fallback(
     spec: TimerSpecNs,
     on_fire: impl Fn(),
 ) {
+    run_fallback_with_cpu(slot, generation, spec, None, on_fire);
+}
+
+/// Drive a POSIX per-process timer's expiries on a backend firing thread, optionally
+/// using a custom CPU-time sampler (`cpu_now`) for CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`
+/// / `CLOCK_THREAD_CPUTIME_ID`).
+pub fn run_fallback_with_cpu(
+    slot: std::sync::Arc<PosixTimerSlot>,
+    generation: u64,
+    spec: TimerSpecNs,
+    cpu_now: Option<std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
+    on_fire: impl Fn(),
+) {
     if is_cpu_clock(slot.clock_id) {
-        run_fallback_cpu(&slot, generation, spec, &on_fire);
+        run_fallback_cpu(&slot, generation, spec, cpu_now.as_ref(), &on_fire);
         return;
     }
     std::thread::sleep(Duration::from_nanos(spec.value));
@@ -295,34 +267,36 @@ pub fn run_fallback(
     }
 }
 
-/// CPU-time POSIX timer fallback: poll the aggregate guest CPU total (mirroring
-/// `itimer::run_fallback_cpu`) instead of sleeping wall-clock, so a
-/// `CLOCK_PROCESS_CPUTIME_ID` timer fires off real guest CPU and not while the
-/// process is idle. For `CLOCK_THREAD_CPUTIME_ID`, polls the specific vCPU thread's
-/// execution time so concurrent sibling threads do not advance each other's timers.
+/// CPU-time POSIX timer fallback: poll the CPU clock total (from `cpu_now` or aggregate
+/// fallback) instead of sleeping wall-clock, so a CPU timer fires off real guest CPU and
+/// not while the process or thread is idle.
 fn run_fallback_cpu(
     slot: &PosixTimerSlot,
     generation: u64,
     spec: TimerSpecNs,
+    cpu_now: Option<&std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
     on_fire: &impl Fn(),
 ) {
     let clock = slot.clock_id;
-    let cpu_slot = slot.cpu_slot.load(Ordering::Acquire);
-    let sample = || {
-        if clock == 3 && cpu_slot < 512 {
-            carrick_host::guest_cpu::slot_us(cpu_slot).saturating_mul(1000)
+    let sample = || -> Option<u64> {
+        if let Some(sampler) = cpu_now {
+            sampler()
         } else {
-            carrick_host::guest_cpu::total_ns_including_active()
+            Some(carrick_host::guest_cpu::total_ns_including_active())
         }
     };
-    let start = sample();
+    let Some(start) = sample() else {
+        return;
+    };
     let mut due = start.saturating_add(spec.value);
     let mut fired = false;
     loop {
         if !generation_matches(slot, generation) {
             return;
         }
-        let now = sample();
+        let Some(now) = sample() else {
+            return;
+        };
         if now < due {
             let remaining = CpuNs(due - now);
             let delay = if clock == 3 {
@@ -383,6 +357,13 @@ pub fn delete(id: i32) -> bool {
     }
 }
 
+/// Does a timer with `id` exist in the registry?
+pub fn exists(id: i32) -> bool {
+    let mut guard = registry();
+    let map = ensure_registry(&mut guard);
+    map.contains_key(&id)
+}
+
 /// Snapshot the overrun counter for `id`. Returns `None` for an unknown id
 /// (Linux `EINVAL`). Carrick conservatively reports 0; the probe only
 /// requires `>= 0`.
@@ -391,13 +372,6 @@ pub fn getoverrun(id: i32) -> Option<u32> {
     let map = ensure_registry(&mut guard);
     map.get(&id)
         .map(|s| s.overruns.load(Ordering::SeqCst).min(OVERRUN_MAX))
-}
-
-/// `true` if `id` is currently in the registry.
-pub fn exists(id: i32) -> bool {
-    let mut guard = registry();
-    let map = ensure_registry(&mut guard);
-    map.contains_key(&id)
 }
 
 /// The clock a timer was created with (Linux `timer_create` clock_id). Returns
@@ -417,11 +391,6 @@ pub fn clear() {
     let mut guard = registry();
     if let Some(map) = guard.as_mut() {
         map.clear();
-    }
-    if let Ok(mut tid_guard) = TID_TO_SLOT.lock() {
-        if let Some(map) = tid_guard.as_mut() {
-            map.clear();
-        }
     }
 }
 
