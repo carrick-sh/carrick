@@ -789,28 +789,36 @@ impl DentryCache {
         dev: u64,
         ino: u64,
     ) {
+        if self.dirs.read().len() >= 4096 {
+            let mut entries = self.entries.write();
+            let mut inodes = self.inodes.write();
+            let mut dirs = self.dirs.write();
+            let mut path_map = self.path_to_dir_id.write();
+            if dirs.len() >= 4096 {
+                entries.clear();
+                inodes.clear();
+                dirs.clear();
+                path_map.clear();
+                dirs.insert(
+                    DentryId::ROOT,
+                    DirEntry {
+                        id: DentryId::ROOT,
+                        dir_gen: Arc::new(AtomicU64::new(1)),
+                        upper_dir_fd: None,
+                        lower_dir_fd: None,
+                        parent: None,
+                        path: "/".to_string(),
+                        dev: 0,
+                        ino: 1,
+                    },
+                );
+                path_map.insert("/".to_string(), DentryId::ROOT);
+                path_map.insert("".to_string(), DentryId::ROOT);
+                self.bump_mutation();
+            }
+        }
         let mut dirs = self.dirs.write();
         let mut path_map = self.path_to_dir_id.write();
-        if dirs.len() >= 4096 {
-            dirs.clear();
-            path_map.clear();
-            dirs.insert(
-                DentryId::ROOT,
-                DirEntry {
-                    id: DentryId::ROOT,
-                    dir_gen: Arc::new(AtomicU64::new(1)),
-                    upper_dir_fd: None,
-                    lower_dir_fd: None,
-                    parent: None,
-                    path: "/".to_string(),
-                    dev: 0,
-                    ino: 1,
-                },
-            );
-            path_map.insert("/".to_string(), DentryId::ROOT);
-            path_map.insert("".to_string(), DentryId::ROOT);
-            self.bump_mutation();
-        }
         dirs.insert(
             id,
             DirEntry {
@@ -1738,15 +1746,17 @@ impl DentryCache {
         self.bump_mutation();
         let norm = path.trim_end_matches('/');
         let norm = if norm.is_empty() { "/" } else { norm };
-        let removed_dir_id = {
+        let removed_dir = {
+            let mut dirs = self.dirs.write();
             let mut path_map = self.path_to_dir_id.write();
-            path_map.remove(norm)
-        };
-        if let Some(dir_id) = removed_dir_id {
-            let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(&dir_id) {
-                d.dir_gen.fetch_add(1, Ordering::SeqCst);
+            if let Some(dir_id) = path_map.remove(norm) {
+                dirs.remove(&dir_id)
+            } else {
+                None
             }
+        };
+        if let Some(d) = removed_dir {
+            d.dir_gen.fetch_add(1, Ordering::SeqCst);
         }
         if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
             && let Some(parent_id) = self.find_parent_dir_id(parent_path)
@@ -2111,5 +2121,38 @@ mod tests {
             .stat("/foo.txt", true, &backend, None)
             .expect("stat foo after write to ln");
         assert_eq!(st_foo2.size, 3);
+    }
+
+    #[test]
+    fn test_dentry_cache_repeated_mkdir_rmdir_cycles() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new(false);
+
+        // Pre-create parent directory /tmp
+        fs::create_dir_all(tmp.path().join("tmp")).unwrap();
+        cache.entry_created("/tmp", None);
+        assert!(cache.stat("/tmp", true, &backend, None).is_ok());
+
+        // Repeatedly create and remove subdirectories under /tmp
+        for i in 0..500 {
+            let dir_name = format!("cycle_{i}");
+            let disk_dir = tmp.path().join("tmp").join(&dir_name);
+            fs::create_dir_all(&disk_dir).unwrap();
+            let guest_path = format!("/tmp/{dir_name}");
+            cache.entry_created(&guest_path, None);
+
+            // Lookup and stat should succeed
+            assert!(cache.stat(&guest_path, true, &backend, None).is_ok());
+
+            // Remove directory
+            fs::remove_dir(&disk_dir).unwrap();
+            cache.entry_removed(&guest_path, None);
+            assert!(cache.stat(&guest_path, true, &backend, None).is_err());
+        }
+
+        // After 500 cycles, /tmp must still be stat-able and dirs must not have leaked 500 entries
+        assert!(cache.stat("/tmp", true, &backend, None).is_ok());
+        assert!(cache.dirs.read().len() < 50);
     }
 }
