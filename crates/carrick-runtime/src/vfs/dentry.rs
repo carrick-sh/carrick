@@ -596,22 +596,23 @@ impl DentryCache {
                                             name
                                         )
                                     };
-                                    let (mode, uid, gid) = if !backend.serves_plain_metadata() {
+                                    let (mode, uid, gid) = if pos.is_lower {
+                                        let rs = rootfs
+                                            .and_then(|rf| rf.immutable_backend())
+                                            .and_then(|b| b.real_stat(&child_path, false));
+                                        if let Some(rs) = rs {
+                                            (rs.mode, rs.uid, rs.gid)
+                                        } else {
+                                            (st.st_mode as u32 & 0o7777, NsUid::ROOT, NsGid::ROOT)
+                                        }
+                                    } else if !backend.serves_plain_metadata() {
                                         if let Some(rs) = backend.real_stat(&child_path, false) {
                                             (rs.mode, rs.uid, rs.gid)
                                         } else {
-                                            (
-                                                st.st_mode as u32 & 0o7777,
-                                                NsUid(st.st_uid),
-                                                NsGid(st.st_gid),
-                                            )
+                                            (st.st_mode as u32 & 0o7777, NsUid::ROOT, NsGid::ROOT)
                                         }
                                     } else {
-                                        (
-                                            st.st_mode as u32 & 0o7777,
-                                            NsUid(st.st_uid),
-                                            NsGid(st.st_gid),
-                                        )
+                                        (st.st_mode as u32 & 0o7777, NsUid::ROOT, NsGid::ROOT)
                                     };
                                     let record = InodeRecord {
                                         mode,
@@ -869,7 +870,7 @@ impl DentryCache {
             let (uid, gid) = if let Some(ref rs) = real_stat {
                 (rs.uid, rs.gid)
             } else {
-                (NsUid(st.st_uid), NsGid(st.st_gid))
+                (NsUid::ROOT, NsGid::ROOT)
             };
             let record = InodeRecord {
                 mode: st.st_mode as u32 & 0o7777,
@@ -962,8 +963,8 @@ impl DentryCache {
                     } else {
                         on_disk_mode
                     },
-                    NsUid(st.st_uid),
-                    NsGid(st.st_gid),
+                    NsUid::ROOT,
+                    NsGid::ROOT,
                 )
             };
             let record = InodeRecord {
@@ -1022,7 +1023,7 @@ impl DentryCache {
             } else {
                 on_disk_mode
             };
-            (kind, mode, NsUid(st.st_uid), NsGid(st.st_gid))
+            (kind, mode, NsUid::ROOT, NsGid::ROOT)
         };
         let record = InodeRecord {
             mode,
@@ -1607,28 +1608,16 @@ impl DentryCache {
                     if let Some(rs) = rs {
                         (rs.mode, rs.uid, rs.gid)
                     } else {
-                        (
-                            st.st_mode as u32 & 0o7777,
-                            NsUid(st.st_uid),
-                            NsGid(st.st_gid),
-                        )
+                        (st.st_mode as u32 & 0o7777, NsUid::ROOT, NsGid::ROOT)
                     }
                 } else if !backend.serves_plain_metadata() {
                     if let Some(rs) = backend.real_stat(&resolved.canonical_path, false) {
                         (rs.mode, rs.uid, rs.gid)
                     } else {
-                        (
-                            st.st_mode as u32 & 0o7777,
-                            NsUid(st.st_uid),
-                            NsGid(st.st_gid),
-                        )
+                        (st.st_mode as u32 & 0o7777, NsUid::ROOT, NsGid::ROOT)
                     }
                 } else {
-                    (
-                        st.st_mode as u32 & 0o7777,
-                        NsUid(st.st_uid),
-                        NsGid(st.st_gid),
-                    )
+                    (st.st_mode as u32 & 0o7777, NsUid::ROOT, NsGid::ROOT)
                 };
                 let record = InodeRecord {
                     mode,
