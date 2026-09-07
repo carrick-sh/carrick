@@ -1623,11 +1623,11 @@ impl crate::kernel::scheduler::SchedulerGenerationObserver for HvpatchTaskBindin
             .scheduler
             .lock()
             .upgrade()
-            .ok_or(crate::kernel::RunQueueError::AuthorityMismatch)?;
+            .ok_or(crate::kernel::RunQueueError::ObserverSchedulerGone)?;
         let mut bindings = self.bindings.lock();
         let mut record = bindings
             .remove(&(thread, predecessor))
-            .ok_or(crate::kernel::RunQueueError::AuthorityMismatch)?;
+            .ok_or(crate::kernel::RunQueueError::ObserverBindingMissing)?;
         if kind == crate::kernel::scheduler::SchedulerGenerationTransition::Terminal {
             return Ok(());
         }
