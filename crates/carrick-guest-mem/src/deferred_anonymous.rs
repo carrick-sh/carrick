@@ -412,6 +412,10 @@ impl DeferredPrivateFileTransition<'_> {
             .unwrap_or_else(|_| std::process::abort())
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.view.range.is_empty()
+    }
+
     pub fn file_offset(&self) -> u64 {
         self.view.file_offset
     }
@@ -734,8 +738,13 @@ mod tests {
         let mut page = [0; 0x1000];
         child
             .begin_private_file_materialization(GuestVa(0x2000))
-            .unwrap()
-            .copy_pristine(GuestVa(0x2000), &mut page)
+            .map(|transition| {
+                assert_eq!(transition.len(), 0x3000);
+                assert!(!transition.is_empty());
+                transition
+                    .copy_pristine(GuestVa(0x2000), &mut page)
+                    .unwrap();
+            })
             .unwrap();
         assert_eq!(page, [2; 0x1000]);
         child
