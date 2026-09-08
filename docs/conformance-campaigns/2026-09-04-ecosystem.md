@@ -2409,3 +2409,47 @@ pid 1 waits on a pipe they still hold. Hypotheses (signal into HostWait not
 cancelling the continuation; exit-path signal send lost; EOF not propagated
 when the last in-zone writer exits) are in `brief-hostwait-orphans.md`;
 dispatched to a dedicated agent with both snapshots.
+
+### 2026-09-08 01:30 — scheduler round 2 gated (not landable), two attributions landed on branches, round 3 dispatched
+
+**Scheduler round 2** (branch `agy/guest-cpu-sep07`, rebased onto main by the
+director as 24dd04d76, binary 2d2487fc…) delivered placement by executor
+availability (`CpuLoad{queued, idle, bound}`, counted idle announcements),
+the Go-style wake chain (`propagate_wake`), the embed policy hook
+(`ContainerBuilder::scheduler`, `cpu_count()` as the one nproc source) and a
+no-op reaped wake. Director's interleaved go_types gate under load 5→30:
+**branch 3/5 MATCH + 2/5 CARRICK_CRASH; main 5/5**. Both crashes: `executor
+worker died … exact thread generation is not live` → ASID retirement fails →
+`FATAL: drop HVPatch MM authority`. A queued row goes stale between enqueue
+and claim on the per-CPU/steal path and reaches `backend.load`. Round 3
+brief: authenticate the generation at claim (stale row discarded through
+lane A's `wake_rejected`), narrow the observer-error swallow, then M = P
+(unblocked by the exit-wedge landing), ablation, adversarial/record-replay
+policies.
+
+**cpython-compile attribution** (`docs/perf-results/2026-09-07-cpython-compile-attribution.md`
+on `agy/attr-compile2-sep07`, 78155cb5e): `test_compiler_recursion_limit`
+is 95 % of the row; reducer `compile('a' + '()' * 1_000_000)` is 36–55x
+and quadratic in depth because every first-touch fault runs eight linear
+scans over `HvfTaskState.mappings`, which grows one row per materialized
+extent to ~100k rows. Director decision: replace the vector with a
+sorted-by-construction, coalescing map keyed by `GuestVa` (row count stays
+O(#VMAs), lookups O(log N)); the page-level registry authentication stays.
+Round 3 worker dispatched.
+
+**cpython-tarfile attribution** (`docs/perf-results/2026-09-07-cpython-tarfile-attribution.md`
+on `agy/attr-tarfile-sep07`, cb916f5d1): 28 `NoneInfoExtractTests_*` are
+82 % of the row; per guest `unlinkat` ~211 host `openat` + ~160 `fstatat`,
+per `mkdirat` ~125 + ~125 — `dir_fd_for(full_path)` re-walks from the
+deepest cached ancestor, lower-layer lookups probe the upper backend per
+component, pure-upper dirs re-probe the lower `/tmp` fd. Owner ruling
+applies (carrick namei is the resolver): the dentry owns the parent fd, one
+host call per operation relative to it, negative lower dentries, per-entry
+invalidation. Round 3 worker dispatched with a "≤2 host opens per warm
+operation" invariant.
+
+**Lane A (`KernelAuditor`)** reported done by its worker; director gate:
+emit sites outside registry locks, 42 runtime + 69 embed unit tests green,
+rebased onto main (e08784dbb), lint 0, workspace check 0; `just test`
+running before the fast-forward. The signed embed test could not run: the
+`just test-embed` lane still needs Docker (lane B).
