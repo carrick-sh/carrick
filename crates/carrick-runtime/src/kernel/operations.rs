@@ -113,6 +113,46 @@ impl WaitJobControl {
     };
 }
 
+/// The waiting parent's task-wake generation, sampled by the SAME registry
+/// read that concluded no child was reapable.
+///
+/// Linux enqueues the waiter on the parent's wait queue BEFORE it rescans the
+/// child list, so a child that exits between the scan and the sleep still
+/// wakes the sleeper. This token is carrick's equivalent, and it exists as a
+/// type because the generation is only correct when it is sampled at that one
+/// moment: a producer edge for a child exit is published only after the exit
+/// has committed under the registry WRITE lock, so any edge that happens after
+/// this read necessarily carries a greater generation and the parked
+/// continuation's probe sees it.
+///
+/// Sampling it later — when the continuation is captured, after the syscall
+/// has already decided to block — silently loses every edge published in
+/// between. That is how a `go build` wedged with its child already a zombie,
+/// its parent's `wait4` continuation `enrolled` and quiet, and no SIGCHLD ever
+/// posted (`target/perf/wedges/ohw-r2c-32079`). The only constructor is inside
+/// the wait query, so "sampled at the wrong time" is not expressible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ChildWaitPrecheck(u64);
+
+impl ChildWaitPrecheck {
+    /// The parent's wake generation as of the scan that found nothing to reap.
+    pub const fn wake_generation(self) -> u64 {
+        self.0
+    }
+
+    /// Only for reconstructing a wait that never ran a scan (the host-process
+    /// compatibility families, which have no kernel-graph child to observe).
+    pub const fn unsampled() -> Self {
+        Self(0)
+    }
+
+    /// Stand in for a scan's reading in a test that drives the race directly.
+    #[cfg(test)]
+    pub(crate) const fn for_test(wake_generation: u64) -> Self {
+        Self(wake_generation)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WaitOutcome {
     Exited(Zombie),
@@ -125,7 +165,7 @@ pub enum WaitOutcome {
         task: TaskId,
         ruid: NsUid,
     },
-    StillRunning,
+    StillRunning(ChildWaitPrecheck),
     NoChild,
 }
 
@@ -5062,7 +5102,7 @@ impl Kernel {
                             && target.admits(*child_key, record.task.process_group())
                     });
                 return Ok(if live_child {
-                    WaitOutcome::StillRunning
+                    WaitOutcome::StillRunning(sample_precheck(&state, parent_id))
                 } else {
                     WaitOutcome::NoChild
                 });
@@ -5122,7 +5162,7 @@ impl Kernel {
                                 && target.admits(*child_key, record.task.process_group())
                         });
                     return Ok(if live_child {
-                        WaitOutcome::StillRunning
+                        WaitOutcome::StillRunning(sample_precheck(&state, parent_id))
                     } else {
                         WaitOutcome::NoChild
                     });
@@ -5289,7 +5329,7 @@ impl Kernel {
                     && target.admits(*child_key, record.task.process_group())
             });
         Ok(if live_child {
-            WaitOutcome::StillRunning
+            WaitOutcome::StillRunning(sample_precheck(&state, parent_id))
         } else {
             WaitOutcome::NoChild
         })
@@ -5465,6 +5505,18 @@ fn namespace_visible_task_id(task: &TaskRef) -> Result<u32, KernelOperationError
             .ok_or(KernelOperationError::PidNamespaceMembership(task.key().id)),
         None => Ok(internal),
     }
+}
+
+/// Sample the waiting parent's wake generation under the registry lock that
+/// just concluded nothing was reapable. See [`ChildWaitPrecheck`]: taking this
+/// reading anywhere else reintroduces the lost wake it exists to prevent.
+fn sample_precheck(state: &RegistryState, parent_id: TaskId) -> ChildWaitPrecheck {
+    ChildWaitPrecheck(
+        state
+            .tasks
+            .get(&parent_id)
+            .map_or(0, |record| record.task.wake_generation()),
+    )
 }
 
 fn ensure_task_unreserved(
@@ -7526,7 +7578,7 @@ mod tests {
             kernel
                 .wait_child(root.task().key().id, Some(child_id), WaitMode::Observe)
                 .expect("resumed child remains live"),
-            WaitOutcome::StillRunning,
+            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
         );
     }
 
@@ -7614,7 +7666,7 @@ mod tests {
             kernel
                 .wait_child(tracer_id, Some(tracee_id), WaitMode::Observe)
                 .expect("a live tracee is waitable by its tracer"),
-            WaitOutcome::StillRunning,
+            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
         );
 
         assert!(kernel.stop_task_for_ptrace(tracee_id, sigstop));
@@ -7642,7 +7694,7 @@ mod tests {
             kernel
                 .wait_child(root.task().key().id, Some(tracee_id), WaitMode::Observe)
                 .expect("resumed tracee remains live for its parent"),
-            WaitOutcome::StillRunning,
+            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
         );
     }
 
@@ -8094,7 +8146,7 @@ mod tests {
                     WaitMode::Consume,
                 )
                 .expect("wait after fatal resume"),
-            WaitOutcome::StillRunning,
+            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
             "SIGKILL must not manufacture a WCONTINUED transition",
         );
     }
@@ -8196,9 +8248,18 @@ mod tests {
         // Both alive: a plain wait blocks only on the SIGCHLD child, a
         // __WCLONE wait only on the clone child.
         for (class, expected) in [
-            (WaitChildClass::Sigchld, WaitOutcome::StillRunning),
-            (WaitChildClass::Clone, WaitOutcome::StillRunning),
-            (WaitChildClass::All, WaitOutcome::StillRunning),
+            (
+                WaitChildClass::Sigchld,
+                WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
+            ),
+            (
+                WaitChildClass::Clone,
+                WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
+            ),
+            (
+                WaitChildClass::All,
+                WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
+            ),
         ] {
             assert_eq!(
                 kernel
@@ -8254,7 +8315,7 @@ mod tests {
             kernel
                 .wait_child(root_id, None, WaitMode::Consume)
                 .expect("wait"),
-            WaitOutcome::StillRunning,
+            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
             "plain wait must not reap a clone child"
         );
         assert_eq!(
@@ -9613,7 +9674,7 @@ mod tests {
             let waiter = std::thread::spawn(move || {
                 loop {
                     match waiter_kernel.wait_child(root_id, Some(child_id), WaitMode::Consume) {
-                        Ok(WaitOutcome::StillRunning) => {
+                        Ok(WaitOutcome::StillRunning(_)) => {
                             std::thread::yield_now();
                         }
                         Ok(WaitOutcome::Exited(zombie)) => {
@@ -11102,7 +11163,7 @@ mod tests {
 
         assert!(matches!(
             kernel.wait_child(root.task.key().id, Some(child_id), WaitMode::Observe),
-            Ok(WaitOutcome::StillRunning)
+            Ok(WaitOutcome::StillRunning(_))
         ));
         kernel
             .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(7 << 8), None)

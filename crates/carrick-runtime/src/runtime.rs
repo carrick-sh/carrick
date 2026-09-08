@@ -2756,6 +2756,7 @@ mod tests {
                         Ok(DispatchOutcome::WaitOnHvpatchChild {
                             target: None,
                             sig_mask: carrick_abi::WaitSigMask::NONE,
+                            precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
                         })
                     } else {
                         Ok(DispatchOutcome::Returned { value: 17 })
