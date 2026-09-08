@@ -427,8 +427,8 @@ pub struct DiagnosticPollFd {
 /// The guest side of an fd wait: the exact slots it is authorised against.
 /// Rendered as `<fd>@<description>` so a snapshot reader can join straight to
 /// the `file_slots` / `file_descriptions` tables and name the pipe, socket or
-/// epoll the thread is parked on. The host fds in `poll_fds` are private dups
-/// and join to nothing.
+/// event set the thread is parked on. The host fds in `poll_fds` are private
+/// dups and join to nothing.
 fn fd_authority_diagnostic(authority: &WaitFdAuthority) -> String {
     let render = |slots: &[crate::kernel::objects::FileSlotAuthority]| {
         slots
