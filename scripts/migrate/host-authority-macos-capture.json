@@ -11523,15 +11523,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 122372,
-        "byte_start": 122347,
+        "byte_end": 124524,
+        "byte_start": 124499,
         "column": 30,
         "column_end": 55,
         "column_start": 30,
         "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-        "line": 3315,
-        "line_end": 3315,
-        "line_start": 3315
+        "line": 3358,
+        "line_end": 3358,
+        "line_start": 3358
       }
     },
     {
@@ -11543,15 +11543,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 349019,
-        "byte_start": 348994,
+        "byte_end": 350889,
+        "byte_start": 350864,
         "column": 35,
         "column_end": 60,
         "column_start": 35,
         "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-        "line": 8724,
-        "line_end": 8724,
-        "line_start": 8724
+        "line": 8761,
+        "line_end": 8761,
+        "line_start": 8761
       }
     },
     {
@@ -12034,15 +12034,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 182563,
-        "byte_start": 182545,
+        "byte_end": 184715,
+        "byte_start": 184697,
         "column": 9,
         "column_end": 27,
         "column_start": 9,
         "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-        "line": 4793,
-        "line_end": 4793,
-        "line_start": 4793
+        "line": 4836,
+        "line_end": 4836,
+        "line_start": 4836
       }
     },
     {
@@ -12054,15 +12054,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 387156,
-        "byte_start": 387138,
+        "byte_end": 389026,
+        "byte_start": 389008,
         "column": 17,
         "column_end": 35,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-        "line": 9637,
-        "line_end": 9637,
-        "line_start": 9637
+        "line": 9674,
+        "line_end": 9674,
+        "line_start": 9674
       }
     },
     {
@@ -12546,15 +12546,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 177535,
-        "byte_start": 177513,
+        "byte_end": 179687,
+        "byte_start": 179665,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-        "line": 4652,
-        "line_end": 4652,
-        "line_start": 4652
+        "line": 4695,
+        "line_end": 4695,
+        "line_start": 4695
       }
     },
     {
@@ -12566,15 +12566,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 378178,
-        "byte_start": 378156,
+        "byte_end": 380048,
+        "byte_start": 380026,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-        "line": 9471,
-        "line_end": 9471,
-        "line_start": 9471
+        "line": 9508,
+        "line_end": 9508,
+        "line_start": 9508
       }
     },
     {
@@ -12618,9 +12618,9 @@
       }
     }
   ],
-  "rows_sha256": "ad399e2f5b9f410b6e1f164b8b5d4f6ed2c5124eda2072c40bf73493e3cb0f82",
+  "rows_sha256": "f8e1e961fc8c7289f5214c7e03e087533835b7370c8d7da299088162fc4b78a1",
   "schema": 1,
-  "source_head": "f8a1fb3d8ae638d98b8262a40a01ce28d8f1ce73",
+  "source_head": "6ec41c60056f03ae0b2e1c6a424238bb9244e9f9",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
