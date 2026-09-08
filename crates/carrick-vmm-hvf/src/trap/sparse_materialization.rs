@@ -491,17 +491,50 @@ impl<'a> PublicationContext<'a> {
             TrapError::Hypervisor(format!("quiesce sparse publication MM: {error}"))
         })?;
         {
+            // Re-read after quiescing and authenticate the SEMANTIC MM identity
+            // — mm, asid, stage-1 root slot, container, persistent lifecycle —
+            // NOT the authority's `Arc` pointer.
+            //
+            // The MM-scoped frame-COW runtime binding carries a per-TASK
+            // authority (its `identity.linux_tid` and diagnostic `tid` are the
+            // task that last ran), so every sibling thread's first run and
+            // every exec REBINDS it with a fresh, equivalent authority object.
+            // A `ptr_eq` here therefore treated an unrelated sibling being
+            // created — a load-coupled event — as "the MM changed" and refused
+            // a correct first-touch publication, which the runtime lowered to
+            // SEGV_MAPERR (Go `runtime.persistentalloc1`, ~1 in 8 `go build`).
+            // The quiesce is valid regardless of which equivalent authority
+            // minted it: `KernelFrameCowAuthority::quiesce` routes through the
+            // `PtQuiesce` barrier and executor census OWNED BY THE SHARED
+            // `DispatchMmAuthority` for this mm, so the guard covers the mm, not
+            // an authority instance. The foreign-mm path (`for_foreign`) already
+            // authenticates by these same semantic fields and no pointer.
             let current = state.cow_runtime.read();
             if !current.as_ref().is_some_and(|current| {
                 current.identity.mm == identity.mm
                     && current.identity.asid == identity.asid
-                    && std::sync::Arc::ptr_eq(&current.authority, &binding.authority)
                     && current.mm_root_slot == binding.mm_root_slot
                     && current.container_root == binding.container_root
+                    && current.persistent_vm_lifecycle
             }) {
-                return Err(TrapError::Hypervisor(
-                    "sparse publication MM changed during quiesce".to_owned(),
-                ));
+                let describe = |b: &MmCowRuntimeBinding| {
+                    format!(
+                        "mm={} asid={} tid={} root={:x?} container={:?} lifecycle={}",
+                        b.identity.mm,
+                        b.identity.asid,
+                        b.identity.linux_tid,
+                        b.mm_root_slot,
+                        b.container_root,
+                        b.persistent_vm_lifecycle,
+                    )
+                };
+                return Err(TrapError::Hypervisor(format!(
+                    "sparse publication MM identity changed during quiesce: quiesced through [{}], now [{}]",
+                    describe(&binding),
+                    current
+                        .as_ref()
+                        .map_or_else(|| "unbound".to_owned(), describe),
+                )));
             }
         }
         Ok(Self {
@@ -1215,6 +1248,138 @@ mod arena_pin_tests {
             Some((owner.physical_ipa, owner.physical_size as u64))
         );
         drop(permit);
+        let journal = std::collections::BTreeMap::from([(owner.physical_ipa, owner.clone())]);
+        state
+            .retire_rolled_back_arenas(
+                &custody,
+                &[owner.physical_ipa],
+                &journal,
+                &mut |_, _| Ok(()),
+                &mut |_, _| Ok(()),
+            )
+            .unwrap();
+    }
+
+    /// A COW authority whose `quiesce()` REBINDS the MM's `cow_runtime` with a
+    /// fresh, equivalent authority object before returning — the exact,
+    /// deterministic shape of a sibling thread's first-run rebind landing
+    /// inside a first-touch quiesce window. `rebind_identity` chooses the mm
+    /// the sibling publishes; equal to the original models the benign sibling,
+    /// a different mm models a genuine MM change the check must still reject.
+    struct RebindingCowAuthority {
+        state: std::sync::Arc<MmAccessState>,
+        rebind_identity: carrick_hal::FrameCowIdentity,
+        mm_root_slot: Option<(u64, u64)>,
+    }
+
+    impl carrick_hal::FrameCowAuthority for RebindingCowAuthority {
+        fn quiesce(
+            &self,
+        ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.state.bind_cow_runtime(MmCowRuntimeBinding {
+                authority: std::sync::Arc::new(
+                    super::super::task_only_carrier_directory_tests::TestCowAuthority,
+                ),
+                identity: self.rebind_identity,
+                mm_root_slot: self.mm_root_slot,
+                container_root: ContainerRootToken::ROOT,
+                persistent_vm_lifecycle: true,
+            });
+            Ok(Box::new(()))
+        }
+
+        fn reserve(
+            &self,
+            _frame_candidates: usize,
+            _mapping_candidates: usize,
+            _event_count: usize,
+        ) -> Result<carrick_hal::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Err(Box::new(std::io::Error::other("unused test reserve")))
+        }
+
+        fn apply(
+            &self,
+            _commit: carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err(Box::new(std::io::Error::other("unused test apply")))
+        }
+
+        fn mapping_is_live(
+            &self,
+            _mapping: carrick_hal::MappingId,
+            _frame: carrick_hal::FrameId,
+            _gpa: carrick_guest_mem::Gpa,
+            _length: carrick_hal::FrameLength,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
+        }
+
+        fn frame_mapping_count(
+            &self,
+            _frame: carrick_hal::FrameId,
+        ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+    }
+
+    /// Regression for the Go startup `SIGSEGV` (SEGV_MAPERR) in
+    /// `runtime.persistentalloc1`: a first-touch publication must survive a
+    /// sibling task rebinding the same MM's frame-COW runtime binding with a
+    /// fresh (equivalent) authority during the quiesce, and must still reject a
+    /// genuine MM identity change.
+    #[test]
+    fn local_publication_tolerates_equivalent_rebind_during_quiesce() {
+        let (state, custody, owner) = rollback_fixture();
+        let identity = carrick_hal::FrameCowIdentity {
+            linux_pid: 7,
+            linux_tid: 8,
+            mm: 9,
+            asid: 10,
+        };
+        let root = Some((owner.physical_ipa, owner.physical_size as u64));
+
+        // A sibling task rebinds the SAME mm/asid/root with a different
+        // authority object (its own `linux_tid`) during the quiesce. Before the
+        // fix the post-quiesce `Arc::ptr_eq` refused this and the runtime
+        // lowered the refusal to SIGSEGV; it must now succeed.
+        state.bind_cow_runtime(MmCowRuntimeBinding {
+            authority: std::sync::Arc::new(RebindingCowAuthority {
+                state: state.clone(),
+                rebind_identity: carrick_hal::FrameCowIdentity {
+                    linux_tid: 99,
+                    ..identity
+                },
+                mm_root_slot: root,
+            }),
+            identity,
+            mm_root_slot: root,
+            container_root: ContainerRootToken::ROOT,
+            persistent_vm_lifecycle: true,
+        });
+        PublicationContext::for_local(state.clone(), custody.clone(), identity)
+            .expect("equivalent sibling rebind during quiesce must not refuse the publication");
+
+        // Control: a rebind that changes the MM identity during the quiesce
+        // must still be rejected.
+        state.bind_cow_runtime(MmCowRuntimeBinding {
+            authority: std::sync::Arc::new(RebindingCowAuthority {
+                state: state.clone(),
+                rebind_identity: carrick_hal::FrameCowIdentity { mm: 11, ..identity },
+                mm_root_slot: root,
+            }),
+            identity,
+            mm_root_slot: root,
+            container_root: ContainerRootToken::ROOT,
+            persistent_vm_lifecycle: true,
+        });
+        assert!(
+            PublicationContext::for_local(state.clone(), custody.clone(), identity).is_err(),
+            "a genuine MM change during quiesce must still be rejected"
+        );
+
+        drop(state.cow_runtime.write().take());
         let journal = std::collections::BTreeMap::from([(owner.physical_ipa, owner.clone())]);
         state
             .retire_rolled_back_arenas(
