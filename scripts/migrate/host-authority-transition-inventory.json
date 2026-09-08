@@ -15482,8 +15482,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:3180 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
     "review_id": "HA-000588",
     "source": {
-      "byte_end": 115448,
-      "byte_start": 115423,
+      "byte_end": 115447,
+      "byte_start": 115422,
       "column": 30,
       "column_end": 55,
       "column_start": 30,
@@ -15506,18 +15506,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:8551 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:8560 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 341496,
-      "byte_start": 341471,
+      "byte_end": 341927,
+      "byte_start": 341902,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 8551,
-      "line_end": 8551,
-      "line_start": 8551
+      "line": 8560,
+      "line_end": 8560,
+      "line_start": 8560
     }
   },
   {
@@ -16175,8 +16175,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:4608 in `acquire_process_retire_topology_lock_servicing`, `std::thread::sleep` backs off only the current persistent executor while it services owner commands and retries Carrick's topology lock; no host identity supplies the retirement answer or the fixed Carrick backoff duration.",
     "review_id": "HA-000613",
     "source": {
-      "byte_end": 172970,
-      "byte_start": 172952,
+      "byte_end": 172969,
+      "byte_start": 172951,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
@@ -16199,18 +16199,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9458 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9467 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000614",
     "source": {
-      "byte_end": 379461,
-      "byte_start": 379443,
+      "byte_end": 379892,
+      "byte_start": 379874,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9458,
-      "line_end": 9458,
-      "line_start": 9458
+      "line": 9467,
+      "line_end": 9467,
+      "line_start": 9467
     }
   },
   {
@@ -16862,8 +16862,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:4468 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
     "review_id": "HA-000638",
     "source": {
-      "byte_end": 167952,
-      "byte_start": 167930,
+      "byte_end": 167951,
+      "byte_start": 167929,
       "column": 9,
       "column_end": 31,
       "column_start": 9,
@@ -16886,18 +16886,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9292 in `capture_core_for_publication`, `std::thread::yield_now` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9301 in `capture_core_for_publication`, `std::thread::yield_now` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000639",
     "source": {
-      "byte_end": 370483,
-      "byte_start": 370461,
+      "byte_end": 370914,
+      "byte_start": 370892,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9292,
-      "line_end": 9292,
-      "line_start": 9292
+      "line": 9301,
+      "line_end": 9301,
+      "line_start": 9301
     }
   },
   {
