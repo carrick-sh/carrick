@@ -29959,6 +29959,58 @@ impl TaskMappingIndex {
             .chain(self.shadowed.iter().rev())
     }
 
+    /// The lowest row start strictly inside `(after, before)` for which
+    /// `accept` holds, or `None`.
+    ///
+    /// This is the "where does the next live neighbour begin" question the
+    /// sparse-materialization window arm asks before it publishes. It used to
+    /// be a full `filter().map().min()` scan because the vector was unsorted;
+    /// ordered rows answer it from the range itself.
+    pub(crate) fn first_start_between<F>(
+        &self,
+        after: GuestVa,
+        before: GuestVa,
+        mut accept: F,
+    ) -> Option<u64>
+    where
+        F: FnMut(&HvfMappedRegion) -> bool,
+    {
+        use std::ops::Bound;
+        let live = self
+            .live
+            .range((Bound::Excluded(after), Bound::Excluded(before)))
+            .map(|(_, row)| row)
+            .find(|row| accept(row))
+            .map(|row| row.start);
+        let displaced = self
+            .shadowed
+            .iter()
+            .filter(|row| row.start > after.0 && row.start < before.0 && accept(row))
+            .map(|row| row.start)
+            .min();
+        live.into_iter().chain(displaced).min()
+    }
+
+    /// Whether any row begins below `current` and still extends past
+    /// `floor` -- i.e. whether widening a window down to `floor` would
+    /// overlap a live neighbour.
+    ///
+    /// Live rows are ordered and non-overlapping, so `end` is monotonic and
+    /// only the row immediately below `current` can reach furthest down.
+    pub(crate) fn any_lower_row_reaches(&self, current: GuestVa, floor: u64) -> bool {
+        if self
+            .live
+            .range(..current)
+            .next_back()
+            .is_some_and(|(_, row)| row.end > floor)
+        {
+            return true;
+        }
+        self.shadowed
+            .iter()
+            .any(|row| row.start < current.0 && row.end > floor)
+    }
+
     /// The row covering `[va, va + length)`, or `None`.
     pub(crate) fn mapping_for_range(&self, va: GuestVa, length: usize) -> Option<&HvfMappedRegion> {
         self.candidates_for_range(va, length as u64)
@@ -39326,17 +39378,19 @@ impl HvfVmState {
                     let mut window_end = vma_end.min(next_2mb).min(w_end).min(arena_end);
                     window_end = window_end.max(end);
 
-                    // `self.mappings` is NOT kept sorted by start (several
-                    // publication paths append), so every neighbour question
-                    // here is a full scan; a binary search on this vector
-                    // missed live mappings and let a window materialize over
-                    // them (Go heap corruption, 2026-09-07).
-                    let next_local = self
-                        .mappings
-                        .iter()
-                        .filter(|m| m.start > current && m.start < window_end)
-                        .map(|m| m.start)
-                        .min();
+                    // Sorted by construction (`TaskMappingIndex`), so this
+                    // neighbour question is an ordered range query. The
+                    // earlier `partition_point` attempt was wrong because the
+                    // VECTOR was unsorted and a binary search missed live
+                    // mappings, letting a window materialize over them (Go
+                    // heap corruption, 2026-09-07); the invariant now holds at
+                    // every publication site, and displaced rows are searched
+                    // too.
+                    let next_local = self.mappings.first_start_between(
+                        GuestVa(current),
+                        GuestVa(window_end),
+                        |_| true,
+                    );
                     let next_alias = alias_registry()
                         .lock()
                         .first_matching_process_alias_start_between(
@@ -39363,8 +39417,7 @@ impl HvfVmState {
                         ) {
                         let lower_has_local = self
                             .mappings
-                            .iter()
-                            .any(|m| m.start < current && m.end > compound_start);
+                            .any_lower_row_reaches(GuestVa(current), compound_start);
                         if !lower_has_local {
                             compound_start
                         } else {
@@ -39419,12 +39472,9 @@ impl HvfVmState {
 
             // Preserve already-materialized neighbours. The topology lock in
             // the materializer rechecks this shape before publication.
-            let next_local = self
-                .mappings
-                .iter()
-                .filter(|mapping| mapping.start > current && mapping.start < end)
-                .map(|mapping| mapping.start)
-                .min();
+            let next_local =
+                self.mappings
+                    .first_start_between(GuestVa(current), GuestVa(end), |_| true);
             let next_alias = alias_registry()
                 .lock()
                 .first_matching_process_alias_start_between(
@@ -39654,19 +39704,16 @@ impl HvfVmState {
         // The caller found this hole before quiescing. Recompute its upper
         // boundary under the topology lock so a sibling publication between
         // those two points cannot be overlapped.
-        // Full scan: `self.mappings` is not sorted by start (see the window
-        // arm above), and this bound decides whether the new extent overlaps
-        // a live mapping.
-        let next_local = self
-            .mappings
-            .iter()
-            .filter(|mapping| {
-                mapping.start > start
-                    && mapping.start < end
-                    && global_frame_region_owner_matches_in(self.custody(), mapping)
-            })
-            .map(|mapping| mapping.start)
-            .min();
+        // Ordered range query (see the window arm above): this bound decides
+        // whether the new extent overlaps a live mapping, so it must still see
+        // every row -- including displaced ones -- that the exact live global
+        // owner still backs.
+        let custody = self.custody();
+        let next_local =
+            self.mappings
+                .first_start_between(GuestVa(start), GuestVa(end), |mapping| {
+                    global_frame_region_owner_matches_in(custody, mapping)
+                });
         let next_alias = alias_registry()
             .lock()
             .first_matching_process_alias_start_between(
