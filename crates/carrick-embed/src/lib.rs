@@ -72,6 +72,7 @@
 //! deterministic replacement for [`Carrier::shutdown`].
 mod builder;
 mod carrier;
+mod deadline;
 pub(crate) mod entitlement;
 mod error;
 mod prepared;

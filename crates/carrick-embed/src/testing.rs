@@ -51,6 +51,7 @@ pub struct TestContainer {
     every_child_runs_timeout: Duration,
     exit_budget_matcher: ExitBudgetMatcher,
     exit_budget_timeout: Duration,
+    deadline: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for TestContainer {
@@ -67,6 +68,7 @@ impl std::fmt::Debug for TestContainer {
             .field("pull", &self.pull)
             .field("observers_count", &self.observers.len())
             .field("interceptors_count", &self.interceptors.len())
+            .field("deadline", &self.deadline)
             .finish()
     }
 }
@@ -92,6 +94,7 @@ impl TestContainer {
             every_child_runs_timeout: Duration::from_secs(5),
             exit_budget_matcher: ExitBudgetMatcher::Any,
             exit_budget_timeout: Duration::from_secs(10),
+            deadline: None,
         }
     }
 
@@ -113,6 +116,30 @@ impl TestContainer {
     pub fn exit_budget(mut self, select: ExitBudgetMatcher, within: Duration) -> Self {
         self.exit_budget_matcher = select;
         self.exit_budget_timeout = within;
+        self
+    }
+
+    /// Bound every [`Self::run`] by wall clock, ending in a POST-MORTEM.
+    ///
+    /// On expiry the kernel is aborted through the one fail-closed sink and
+    /// the run returns [`EmbedError::KernelAborted`] carrying the kernel
+    /// graph, its findings and the event ring — instead of a host `SIGKILL`
+    /// that leaves an exit code and nothing to read.
+    ///
+    /// This is a TEST budget, so it is a number a human chose and can be wrong
+    /// under load; the always-on `ProcessGraphLiveness` invariant is the
+    /// load-independent one. Use this as a backstop and read the post-mortem
+    /// before believing it.
+    pub fn deadline(mut self, budget: std::time::Duration) -> Self {
+        self.deadline = Some(budget);
+        self
+    }
+
+    /// See [`ContainerBuilder::post_mortem_dir`]. Installed for the host
+    /// process the moment it is called, so the capture lands there even if the
+    /// abort fires before this container's builder is materialised.
+    pub fn post_mortem_dir(self, dir: impl Into<std::path::PathBuf>) -> Self {
+        carrick_runtime::kernel::debug::PostMortem::install_dir(dir.into());
         self
     }
 
@@ -280,7 +307,11 @@ impl TestContainer {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.builder(argv).run_blocking()
+        let builder = self.builder(argv);
+        match self.deadline {
+            Some(budget) => crate::deadline::run_with_deadline(builder, budget),
+            None => builder.run_blocking(),
+        }
     }
 
     /// Run `argv` with a fresh [`AuditObserver`] installed with fast-path visibility enabled.
