@@ -2640,3 +2640,11 @@ and their growth under repeated MAP_FIXED is unbounded (review note);
 `carrick-vmm-hvf` tests are flaky in parallel at base (shared statics).
 The `lost exact transition` abort the worker hit under load ≥19 on both
 binaries is the scheduler lane's (round 4).
+
+**Post-mapping-index gates (main f84bfe3e7):** lint 0, probe shards 3/3,
+smoke ok, rows 6/6 MATCH (`cpython-compile` 150/150 at 48.1 s under load
+24–35 — the pre-fix binary took 62 s at load 5; not a citable ratio, but
+the direction holds under worse load; `cpython-mmap`, `ltp-mmap18`,
+`ltp-munmap01`, `go-go_types`, `cpython-itertools` MATCH). The reducer
+aborted once on the exec-generation observer class (third instance on
+main tonight, all at load ≥30; scheduler round 4 owns it).
