@@ -300,3 +300,160 @@ impl KernelAuditor for ExitBudget {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carrick_hal::ThreadId;
+    use carrick_runtime::kernel::ids::TaskId;
+    use carrick_runtime::kernel::{LinuxWaitStatus, ObjectIdRegistry};
+
+    fn sample_task_key(pid: i32) -> TaskKey {
+        let registry = ObjectIdRegistry::new();
+        TaskKey {
+            id: TaskId::from_abi_positive(pid).unwrap(),
+            serial: registry.task_serial().unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_no_orphan_zombie() {
+        let auditor = NoOrphanZombie;
+        let pid1 = sample_task_key(1);
+        let child = sample_task_key(2);
+        let parent = sample_task_key(3);
+
+        // PID 1 orphan is allowed
+        assert_eq!(auditor.zombie_created(pid1, None), AuditVerdict::Continue);
+
+        // Child with parent is allowed
+        assert_eq!(
+            auditor.zombie_created(child, Some(parent)),
+            AuditVerdict::Continue
+        );
+
+        // Non-PID 1 orphan is aborted
+        assert_eq!(
+            auditor.zombie_created(child, None),
+            AuditVerdict::Abort(AuditReason::OrphanZombie { task: child })
+        );
+    }
+
+    #[test]
+    fn test_process_graph_liveness() {
+        let auditor = ProcessGraphLiveness;
+        assert_eq!(auditor.process_graph_empty(0), AuditVerdict::Continue);
+        assert_eq!(
+            auditor.process_graph_empty(3),
+            AuditVerdict::Abort(AuditReason::ProcessGraphEmptyWithUnpublishedJobs {
+                unpublished_jobs: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn test_no_wake_of_reaped_task() {
+        let auditor = NoWakeOfReapedTask;
+        let task = sample_task_key(10);
+
+        assert_eq!(
+            auditor.wake_rejected(task, WakeRejectionReason::Closed),
+            AuditVerdict::Continue
+        );
+        assert_eq!(
+            auditor.wake_rejected(task, WakeRejectionReason::StaleGeneration),
+            AuditVerdict::Continue
+        );
+        assert_eq!(
+            auditor.wake_rejected(task, WakeRejectionReason::Reaped),
+            AuditVerdict::Abort(AuditReason::WakeOfReapedTask { target: task })
+        );
+    }
+
+    #[test]
+    fn test_first_touch_never_delivered() {
+        let auditor = FirstTouchNeverDelivered;
+        let task = sample_task_key(10);
+
+        assert_eq!(
+            auditor.first_touch_delivered(task, 0x1000, FirstTouchDeliverReason::NotTracked),
+            AuditVerdict::Continue
+        );
+        assert_eq!(
+            auditor.first_touch_delivered(task, 0x1000, FirstTouchDeliverReason::BackendRefused),
+            AuditVerdict::Abort(AuditReason::FirstTouchRefused { task, addr: 0x1000 })
+        );
+    }
+
+    #[test]
+    fn test_every_child_runs_success_and_timeout() {
+        let auditor = EveryChildRuns::new(Duration::from_millis(50));
+        let parent = sample_task_key(10);
+        let child1 = sample_task_key(11);
+        let child2 = sample_task_key(12);
+        let exec =
+            ExecutorId::for_transitional_thread(ThreadId::from_guest_supplied_tid(1)).unwrap();
+        let cpu = GuestCpuId::new(0);
+
+        // child1 runs promptly
+        assert_eq!(
+            auditor.fork_admitted(parent, child1, ForkKind::Fork),
+            AuditVerdict::Continue
+        );
+        assert_eq!(
+            auditor.child_first_run(child1, exec, cpu),
+            AuditVerdict::Continue
+        );
+
+        // child2 is admitted but does not run within timeout
+        assert_eq!(
+            auditor.fork_admitted(parent, child2, ForkKind::Fork),
+            AuditVerdict::Continue
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
+        let verdict = auditor.child_first_run(child2, exec, cpu);
+        assert_eq!(
+            verdict,
+            AuditVerdict::Abort(AuditReason::ChildNeverRan {
+                child: child2,
+                within: Duration::from_millis(50),
+            })
+        );
+    }
+
+    #[test]
+    fn test_exit_budget_success_and_timeout() {
+        let auditor = ExitBudget::new(ExitBudgetMatcher::Any, Duration::from_millis(50));
+        let parent = sample_task_key(10);
+        let child1 = sample_task_key(11);
+        let child2 = sample_task_key(12);
+        let wait_status = LinuxWaitStatus::from_wait_encoding(0);
+
+        // child1 exits promptly within budget
+        assert_eq!(
+            auditor.fork_admitted(parent, child1, ForkKind::Fork),
+            AuditVerdict::Continue
+        );
+        assert_eq!(
+            auditor.exit_settled(child1, wait_status, ExitOwner::Task(parent)),
+            AuditVerdict::Continue
+        );
+
+        // child2 exceeds budget
+        assert_eq!(
+            auditor.fork_admitted(parent, child2, ForkKind::Fork),
+            AuditVerdict::Continue
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
+        let verdict = auditor.exit_settled(child2, wait_status, ExitOwner::Task(parent));
+        assert_eq!(
+            verdict,
+            AuditVerdict::Abort(AuditReason::ExitBudgetExceeded {
+                task: child2,
+                within: Duration::from_millis(50),
+            })
+        );
+    }
+}

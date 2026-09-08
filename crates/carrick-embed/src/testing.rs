@@ -9,7 +9,7 @@ use std::time::Duration;
 
 pub mod invariants;
 
-use crate::testing::invariants::{
+pub use crate::testing::invariants::{
     EveryChildRuns, ExitBudget, ExitBudgetMatcher, FirstTouchNeverDelivered, InvariantKind,
     NoOrphanZombie, NoWakeOfReapedTask, ProcessGraphLiveness,
 };

@@ -941,3 +941,25 @@ fn a_trap_limit_is_reported_not_erred() {
     assert!(result.trap_limit_hit);
     assert!(!result.success());
 }
+
+#[test]
+fn exit_budget_aborts_when_child_sleeps_past_budget() {
+    let _guard = common::guest_lock();
+    let result = ContainerBuilder::from_image(common::SMOKE_IMAGE)
+        .pull_policy(PullPolicy::Missing)
+        .command(["/bin/sh", "-c", "sleep 2"])
+        .auditor(Arc::new(carrick_embed::testing::ExitBudget::new(
+            carrick_embed::testing::ExitBudgetMatcher::Any,
+            Duration::from_millis(100),
+        )))
+        .run_blocking();
+    match result {
+        Err(EmbedError::CarrierFailed { reason }) => {
+            assert!(
+                reason.contains("exit budget") || reason.contains("ExitBudgetExceeded"),
+                "reason={reason}"
+            );
+        }
+        other => panic!("expected CarrierFailed with ExitBudgetExceeded, got {other:?}"),
+    }
+}
