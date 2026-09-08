@@ -2232,3 +2232,45 @@ from the CPU count until phase 3 closes that. Steps 5 and 6 (the
 embed-pluggable policy and the adversarial reproducer) are not done.
 Next round after the SEGV fix lands: rebase, re-run the go rows, ablate
 `sticky_depth` and idle-CPU wake against importlib, then the policy hook.
+
+### 2026-09-07 evening — exit-wedge mechanism, owner ruling on the runner, scheduler round 1 report
+
+**Exit wedge, decisive snapshot.** Run `gbl-fixsegv2-141` (main-derived binary,
+workload finished `BUILDS=8 FAILS=0`) wedged after its last line. `carrick debug
+hvpatch-kernel` returned `tasks: []`, `threads: []` and ONE zombie:
+`{ id: 1, serial: 6, parent: null, process_group: 1, session: 1 }` — the
+container's init exited and became a zombie nobody can reap; all ten executors
+in `RunQueue::take_row`, main in `HvpatchLoopResult::wait`. Evidence under
+`target/perf/wedges/gbl-fixsegv2-141/`. The Opus exit-wedge branch
+(`opus/exitwedge-sep07`, 1616728e6) fixes a lost-exit-claim publish path
+(`DeferredToProcessOwner` → `AlreadyPublished`, lost claim publishes its own
+member outcome); whether the pid-1 zombie is that path or a second one is
+open.
+
+**Owner ruling.** "Shouldn't our embed runner be able to handle this and abort
+in this scenario?" — yes, and it is now a requirement, not an option: the
+runner checks a liveness invariant when the process graph goes empty (event
+driven, never a timer): zero live tasks, no pending reactor work, and an
+unpublished process job ⇒ abort with a named error returned from
+`ContainerJobGroup::join`. Parking is unrepresentable. Brief:
+scratchpad `brief-runner-liveness.md` (dispatched after the exit-wedge branch
+reports, same files).
+
+**Host-wide carrier watchdog** (`target/conformance/eco-load/carrier-watchdog.sh`,
+log `target/perf/wedges/watchdog.log`): any guest alive > 5 min whose CPU time
+is frozen 3 min gets its kernel snapshot + `bt all` saved and is reaped by run
+id, whichever agent started it. Agents kept missing their own wedges.
+
+**Scheduler round 1 report (Opus, branch `agy/guest-cpu-sep07`).** Steps 1–4
+and 7 built and unit-tested (per-CPU queues, `last_cpu` affinity, own-CPU
+before steal, pinned rows unstealable, spares park); step 2 shipped with M =
+host parallelism (M = P wedged in teardown — the unpublished-result defect
+above, bisected to d1cae10e3); steps 5/6 (embed policy hook, adversarial
+policy) not done. Blockers: guest SIGSEGV in a forked `go build`
+(`mcentral.uncacheSpan → spanSet.push`) 3/7 vs main 0/5, not removed by
+restoring the boundary yield; importlib L0 2x slower than main (13.65 s vs
+6.79 s) while its load-coupling ratio improved (1.66 → 1.31) and IVCs fell
+28 % (not the tenth the design predicted). Round 2 brief: ablate
+`sticky_depth`/`wake_idle_cpu` on importlib first; bisect the placement policy
+(round-robin, no stealing) before touching memory code; then the policy hook
+with `cpu_count()` as the single `nproc` authority.
