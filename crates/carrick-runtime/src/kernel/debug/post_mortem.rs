@@ -123,7 +123,7 @@ pub enum AbortReason {
     },
     /// A `KernelAuditor` verdict (lane A's judgement surface).
     Auditor { invariant: String, detail: String },
-    /// The HVPatch alias-install arm (guest `mmap(2)`) could not finish an install
+    /// The HVPatch alias-install arm (the guest map-file syscall) could not finish an install
     /// backend had already committed to stage-2. Until 2026-09-08 these were
     /// seven bare `abort()`s with no log line: the carrier died rc=134 with
     /// empty stderr and the only evidence was a macOS crash report. Every
