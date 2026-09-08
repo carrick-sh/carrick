@@ -3169,3 +3169,14 @@ since round 5: `just doc` fails on an unresolved link
 (`crate::vcpu_loop::HvpatchProduction::after_reaped_settlement`) — folded
 into the next scheduler-file brief. The earlier exit-residual reading
 ("claimed=0, true wedge") is superseded by this ring evidence.
+
+**Round 7 landed (`opus/sched-r7-sep08` → main, 18th landing):** the
+liveness census carries the executor claim count and `is_dead()` requires
+it to be zero; the quantum-tail error path that dropped a live claim now
+settles it; `HVPSETTLE` ring records name every settlement sub-step.
+Director gates on the rebase: lint 0, workspace check 0, both red-first
+liveness tests green; build, lint, shards and the eleven rows chained
+behind the seventeenth landing's chain; the closing measurement re-armed
+behind this landing from a hash-pinned binary. Dispatched on top: the
+`mqnotifycrossproc` wake-audit fix (Exited vs Reaped), the `just doc`
+link, and a claim-age term so a claim held forever is still caught.
