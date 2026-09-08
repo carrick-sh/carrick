@@ -458,15 +458,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "function": "HvpatchLoopResult::wait",
-      "ordinal_in_function": 1,
-      "fingerprint": "a8dca0db88f50769a756cf4ac672cf9cd244edfd06bdd4b3b8020ce5e714ba59",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::start_gate",
-      "rationale": "TaskStartGate missing state transition payload upon wake."
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<ProductionHvpatchProcessBackendOps as HvpatchProcessBackendOps<E,E>>::fail_stop",
       "ordinal_in_function": 1,
       "fingerprint": "554241378c2bd9fbf6b2378a097892ac7011a49236395a19cc11aac4ecf1ff84",
@@ -1063,7 +1054,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "launch_persistent_hvpatch_job",
       "ordinal_in_function": 1,
-      "fingerprint": "dfd840467bdb55f35008a2d333e385c535cf603045dfe321f5d1301e2068bf8b",
+      "fingerprint": "109de392158dbcb05ba324663d36ff5c4c2afb9b8ab5225504be564a991ed69e",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::job_launch",
       "rationale": "Prepared persistent job missing task context during job launch."
@@ -1072,7 +1063,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "launch_persistent_hvpatch_job",
       "ordinal_in_function": 2,
-      "fingerprint": "dfd840467bdb55f35008a2d333e385c535cf603045dfe321f5d1301e2068bf8b",
+      "fingerprint": "109de392158dbcb05ba324663d36ff5c4c2afb9b8ab5225504be564a991ed69e",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "KernelState missing HVPatch runtime reference during persistent job launch."
