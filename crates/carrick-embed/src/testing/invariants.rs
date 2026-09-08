@@ -131,7 +131,12 @@ impl KernelAuditor for EveryChildRuns {
         std::thread::Builder::new()
             .name(format!("every-child-runs-{}", child.id.raw()))
             .spawn(move || {
-                if rx.recv_timeout(within).is_err() {
+                // ONLY a real timeout is an expiry. A `Disconnected` means
+                // this timer's sender was dropped -- the task was re-armed,
+                // or the auditor is being torn down -- and reporting that as
+                // an elapsed budget fires instantly on a bound that has not
+                // come close to running out.
+                if rx.recv_timeout(within) == Err(mpsc::RecvTimeoutError::Timeout) {
                     let mut p = pending.lock();
                     if p.remove(&child).is_some() {
                         let mut a = aborted.lock();
@@ -222,7 +227,13 @@ impl ExitBudget {
         std::thread::Builder::new()
             .name(format!("exit-budget-{}", task.id.raw()))
             .spawn(move || {
-                if rx.recv_timeout(within).is_err() {
+                // ONLY a real timeout is an expiry -- see the note in
+                // `EveryChildRuns::fork_admitted`. `ExitBudgetMatcher::Any`
+                // matches both `fork_admitted` and `exec_committed`, so an
+                // ordinary fork+exec re-arms the same `TaskKey` and drops
+                // this timer's sender; treating that `Disconnected` as an
+                // elapsed budget aborted every probe-gate shard in 0.78s.
+                if rx.recv_timeout(within) == Err(mpsc::RecvTimeoutError::Timeout) {
                     let mut p = pending.lock();
                     if p.remove(&task).is_some() {
                         let mut a = aborted.lock();
@@ -454,6 +465,43 @@ mod tests {
                 task: child2,
                 within: Duration::from_millis(50),
             })
+        );
+    }
+
+    /// Re-arming a task must not report its FIRST timer as expired.
+    ///
+    /// `ExitBudgetMatcher::Any` matches both `fork_admitted` and
+    /// `exec_committed`, so an ordinary guest `fork` + `exec` arms the same
+    /// `TaskKey` twice. `arm_task` used to `insert` the new sender over the
+    /// old one, dropping it; the first timer thread's `recv_timeout` then
+    /// returned `Err(Disconnected)` IMMEDIATELY, and the code treated any
+    /// `Err` as "the budget elapsed". That is why every
+    /// `just conformance-probes` shard aborted with `exceeded exit budget of
+    /// 10s` after 0.78s of wall clock — a budget that had not come close to
+    /// elapsing.
+    #[test]
+    fn rearming_a_task_does_not_report_a_false_expiry() {
+        let auditor = ExitBudget::new(ExitBudgetMatcher::Any, Duration::from_secs(3600));
+        let parent = sample_task_key(1);
+        let task = sample_task_key(2);
+        let wait_status = LinuxWaitStatus::from_wait_encoding(0);
+
+        assert_eq!(
+            auditor.fork_admitted(parent, task, ForkKind::Fork),
+            AuditVerdict::Continue
+        );
+        let generation = ExecutionGeneration::INITIAL;
+        assert_eq!(
+            auditor.exec_committed(task, generation, generation),
+            AuditVerdict::Continue
+        );
+
+        // The dropped first sender must not be mistaken for an expiry. An
+        // hour-long budget cannot have elapsed here.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            auditor.exit_settled(task, wait_status, ExitOwner::Task(parent)),
+            AuditVerdict::Continue
         );
     }
 }
