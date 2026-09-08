@@ -28921,12 +28921,54 @@ impl HvfTaskState {
             }
             return None;
         }
-        if let Some(mapping) = self
-            .mappings
-            .iter()
-            .rev()
-            .find(|mapping| mapping.contains_range(address, length) && region_is_live(mapping))
-        {
+        // A dynamic-alias row is this task's CACHE of a process-wide registry
+        // projection, and only the registry is edited by a sibling task's
+        // partial `munmap`/`MAP_FIXED`: `unregister_alias_entries` splits the
+        // registry entry and `split_local_rows_for_unmap` mirrors that onto the
+        // unmapping task's own rows, so every OTHER task keeps a row that still
+        // spans the retired page. Frame liveness cannot see that: the compound
+        // stays owned as long as one neighbouring page still uses it, so the
+        // stale row authenticated a PAGE the process had already unmapped. The
+        // page's next incarnation then took the zero-allocation fast path of
+        // `ensure_sparse_mmap_backing` and revalidated the retired leaf output
+        // (a frame handed to someone else, or the page's previous bytes) —
+        // the wide fault window makes multi-page rows, and with them this
+        // shape, routine (go_types `s.allocCount != s.nelems`, the
+        // `windowcoherence` cross-thread stress). Authenticate the row against
+        // the registry at the page: the projection it caches must still exist
+        // for this process scope with the same physical incarnation.
+        let row_projection_is_current = |mapping: &HvfMappedRegion| {
+            if !mapping.is_dynamic_alias {
+                return true;
+            }
+            let Some(end) = address.checked_add(length as u64) else {
+                return false;
+            };
+            alias_registry()
+                .lock()
+                .newest_process_alias_containing_va(
+                    address,
+                    self.mm_root_slot,
+                    self.container_root,
+                    |alias| {
+                        alias
+                            .start
+                            .checked_add(alias.size as u64)
+                            .is_some_and(|limit| end <= limit)
+                            && alias.physical_ipa == mapping.physical_ipa
+                            && alias.physical_size == mapping.physical_size
+                            && alias.owner_generation == mapping.owner_generation
+                            && alias.ipa.checked_add(address - alias.start)
+                                == mapping.ipa.checked_add(address - mapping.start)
+                    },
+                )
+                .is_some()
+        };
+        if let Some(mapping) = self.mappings.iter().rev().find(|mapping| {
+            mapping.contains_range(address, length)
+                && region_is_live(mapping)
+                && row_projection_is_current(mapping)
+        }) {
             return Some(mapping.view());
         }
         if !self.protections.range_no_access(address, length) {
