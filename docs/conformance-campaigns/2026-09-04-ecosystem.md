@@ -3073,3 +3073,11 @@ child instead of aborting. Director gates on the rebase: lint 0,
 workspace check 0, the three red-first tests green; build, lint, shards and
 the eleven rows chained. Two other agents remain: scheduler round 7
 (`SwitchingOut` after `exited`) and the probe-gate triage.
+
+**Activation reservation receipt (main 40e67f69b):** build/lint/shards 0,
+reducer 8/8, **11/11 rows MATCH with zero crashes** at load 14–26 — the
+first fully clean eleven-row run under load since the fleet started
+(previous loaded runs each lost one to two rows to a crash class that has
+since landed a fix). Ratios not cited (load). The closing measurement is
+armed to fire on a quiet host: the eleven rows at `--workers 1`, then the
+`--workers 4` cached ledger, then the four-sibling fork-to-wait.
