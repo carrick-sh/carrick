@@ -6540,9 +6540,23 @@ where
             mm,
             asid_generation,
         };
-        let generation = match child_context
-            .thread()
-            .publish_initial_task_state(task_state.clone())
+        // The gate must stand BEFORE the child is Kernel-runnable: from here
+        // a producer can wake it, and its submission is not admitted for
+        // another few hundred lines. See
+        // `Scheduler::publish_initial_task_state_gated`.
+        let publishing_scheduler = self
+            .kernel
+            .hvpatch_runtime
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "persistent HVPatch clone has no runtime directory".to_owned(),
+                )
+            })?
+            .continuation_services(child_context.kernel())
+            .0;
+        let generation = match publishing_scheduler
+            .publish_initial_task_state_gated(child_context.thread(), task_state.clone())
         {
             Ok(generation) if generation == expected_generation => generation,
             Ok(generation) => {
@@ -11538,9 +11552,10 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
         asid_generation,
     };
     let retained_cpu = state.clone();
-    let generation = context
-        .thread()
-        .publish_initial_task_state(state)
+    // Gated for the same reason the clone child is: the initial runner is
+    // Kernel-runnable here, and its submission is admitted later.
+    let generation = scheduler
+        .publish_initial_task_state_gated(context.thread(), state)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let start_gate = context
         .thread()
@@ -12187,8 +12202,11 @@ mod tests {
             .and_then(|tail| tail.split("fn trap_watchdog_decision").next())
             .expect("initial runner handoff body");
         let publish = handoff
-            .find(concat!("publish_initial_", "task_state(state)"))
-            .expect("initial task state must be published");
+            .find(concat!(
+                "publish_initial_",
+                "task_state_gated(context.thread(), state)"
+            ))
+            .expect("initial task state must be published through its claimability gate");
         let gate = handoff
             .find("take_opened_start_gate(generation)")
             .expect("claimed start gate");

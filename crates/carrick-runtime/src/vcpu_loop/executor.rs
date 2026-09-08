@@ -1802,11 +1802,22 @@ impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
         generation: ExecutionGeneration,
     ) -> Result<Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>, TrapError> {
         let bindings = self.bindings.lock();
-        bindings
-            .get(&(thread, generation))
-            .filter(|record| record.active)
-            .map(|record| Arc::clone(&record.binding))
-            .ok_or_else(|| TrapError::Hypervisor("missing exact HVPatch task binding".to_owned()))
+        // Two different defects wear one message otherwise, and telling them
+        // apart is the whole diagnosis when an executor claims a row it
+        // cannot service: a record that is PRESENT but dormant means the row
+        // became claimable before its submission activated (a claimability
+        // gate hole), while an ABSENT record means the row outlived the
+        // binding it named -- or predated any binding at all, which is what
+        // named the pre-publication window.
+        match bindings.get(&(thread, generation)) {
+            Some(record) if record.active => Ok(Arc::clone(&record.binding)),
+            Some(_) => Err(TrapError::Hypervisor(
+                "exact HVPatch task binding is still dormant".to_owned(),
+            )),
+            None => Err(TrapError::Hypervisor(
+                "missing exact HVPatch task binding".to_owned(),
+            )),
+        }
     }
     fn take_submission_authority(
         &self,
@@ -4809,6 +4820,7 @@ fn fail_running(
     settlement_error.map(|error| error.to_string())
 }
 
+#[track_caller]
 fn fail_running_and_retire<B, R>(
     resolver: &R,
     scheduler: &Scheduler,
@@ -4822,7 +4834,21 @@ where
 {
     let thread = running.thread_key();
     let generation = running.generation();
-    let binding = resolver.resolve(thread, generation).ok();
+    let resolved = resolver.resolve(thread, generation);
+    // Naming the settle site is the difference between "a claimed task was
+    // failed" and a diagnosis: `run_executor_loop` has more than a dozen arms
+    // that all settle `SnapshotRestoreFailed`, and reading the wrong one costs
+    // an investigation. `#[track_caller]` gives the exact arm for free.
+    tracing::error!(
+        ?thread,
+        ?generation,
+        ?reason,
+        resolved = resolved.is_ok(),
+        resolve_error = resolved.as_ref().err().map(ToString::to_string),
+        site = %std::panic::Location::caller(),
+        "executor failed a claimed task"
+    );
+    let binding = resolved.ok();
     let result = fail_running(scheduler, running, reason, receipts);
     resolver.retire(thread, generation);
     if let Some(binding) = binding {
@@ -7076,6 +7102,117 @@ pub(crate) mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_dropped_dormant_submission_leaves_no_claimable_row_for_its_generation() {
+        // The residual of the pre-activation wake window, and the one the
+        // claimability gate (119f07e97, ported onto the per-CPU queues by
+        // 16e262602) does not cover.
+        //
+        // `spawn_persistent_hvpatch_clone_thread` publishes the child to the
+        // Kernel as Runnable at `ExecutionGeneration::INITIAL`, opens its
+        // start gate, and only then activates the dormant submission that
+        // owns it. Every error arm between those two points does
+        // `drop(dormant)` and then `rollback_published_hvpatch_clone`. That
+        // drop removes the binding record AND releases the submission
+        // authority, and releasing an authority clears the key's ADMISSION
+        // gate -- so for the whole rollback the child would be a
+        // Kernel-runnable generation with no binding and no gate. A producer
+        // that woke it there (a futex on the tid the clone already copied
+        // out, a group signal) enqueued a CLAIMABLE row; an executor claimed
+        // it, `resolve` reported "missing exact HVPatch task binding", the
+        // worker settled the task `Failed { SnapshotRestoreFailed }`, and the
+        // rollback's own `fail_runnable_exact` then found that Failed
+        // generation and aborted the carrier:
+        //
+        //   carrick: FATAL: authoritative HVPatch clone rollback: fail exact
+        //   HVPatch clone runnable: thread execution transition
+        //   fail_runnable_generation is invalid from Failed { generation:
+        //   ExecutionGeneration(2), reason: SnapshotRestoreFailed }
+        //
+        // (cpython-threading `test_reinit_tls_after_fork`, host load ~30;
+        // crash report carrick-2026-09-08-052842.ips names exactly this frame
+        // pair.)
+        //
+        // The reservation `publish_initial_task_state_gated` takes belongs to
+        // the thread's FIRST generation rather than to any one authority, so
+        // it outlives the `drop(dormant)`. A generation that never published
+        // can never resolve, so no wake for it is ever claimable; publication
+        // or terminal retirement is the only lift.
+        let (kernel, context) = bootstrap(13_994);
+        let state = task_state(&context, 109);
+        let scheduler = Scheduler::new(kernel);
+        // The production order: the child's claimability is reserved before it
+        // is Kernel-runnable, and that reservation outlives the authority the
+        // rollback drops.
+        let generation = scheduler
+            .publish_initial_task_state_gated(context.thread(), state.clone())
+            .expect("publish child state");
+        let executor = scheduler
+            .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+            .unwrap();
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let binding = hvpatch_test_binding(&context, &state, 109);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(context.thread()),
+                generation,
+                Arc::clone(&binding),
+            )
+            .expect("prepare dormant child submission");
+
+        // The rollback arm: the submission dies before it ever activates,
+        // while the Kernel thread stays Runnable at this generation.
+        drop(dormant);
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                directory.as_ref(),
+                context.thread().key(),
+                generation,
+            )
+            .is_err(),
+            "the dropped submission's binding is gone, as the rollback intends",
+        );
+
+        // A real producer wakes the still-Kernel-runnable generation.
+        scheduler
+            .make_runnable(context.thread().key())
+            .expect("a producer may still wake the published thread");
+
+        let claimable = scheduler.queued_len();
+        if claimable != 0 {
+            let running = scheduler.take(&executor).expect("claim the queued row");
+            let resolved = <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                directory.as_ref(),
+                running.thread_key(),
+                running.generation(),
+            );
+            assert!(
+                resolved.is_ok(),
+                "an executor claimed a row whose submission never published: {:?}",
+                resolved.err(),
+            );
+        }
+        assert_eq!(
+            claimable, 0,
+            "a never-published generation must never hand an executor a row",
+        );
+
+        // And the rollback that follows still retires the generation and
+        // drains the queue: a held row is not a stranded one.
+        scheduler
+            .fail_runnable_exact(
+                context.thread().key(),
+                generation,
+                crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+            )
+            .expect("the rollback owns an unclaimed runnable generation");
+        assert_eq!(scheduler.queued_len(), 0);
+        scheduler.unregister_executor(&executor).unwrap();
     }
 
     #[test]
