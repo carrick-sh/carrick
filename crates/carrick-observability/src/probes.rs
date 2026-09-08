@@ -2347,6 +2347,47 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn mapping_index_census_provider_and_stub_keep_the_same_shape() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__mapping__index__begin(_: u64, _: u64) {}",
+            "fn hvpatch__mapping__index__fault(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
+            "fn hvpatch__mapping__index__cost(_: u64, _: u64, _: u64) {}",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing mapping index census ABI declaration {declaration}"
+            );
+        }
+        // The begin probe is the census ARM: it must hand back an `Instant`
+        // only while a consumer enabled it, or an un-traced guest would pay
+        // row counting on every fault.
+        let wrapper = source
+            .split_once("pub fn hvpatch_mapping_index_begin(")
+            .expect("real mapping index begin wrapper")
+            .1;
+        assert!(
+            wrapper[..wrapper.find("\n    }").unwrap_or(wrapper.len())]
+                .contains("started = Some(std::time::Instant::now());"),
+            "the mapping index census must be armed inside the probe closure"
+        );
+        let fault = source
+            .split_once("pub fn hvpatch_mapping_index_fault(")
+            .expect("real mapping index fault wrapper")
+            .1;
+        let census = fault
+            .find("carrick_usdt::hvpatch__mapping__index__fault!")
+            .expect("row census probe");
+        let cost = fault
+            .find("carrick_usdt::hvpatch__mapping__index__cost!")
+            .expect("cost companion probe");
+        assert!(
+            census < cost,
+            "the row census must fire before its cost companion"
+        );
+    }
+
+    #[test]
     fn frame_pool_provider_and_stub_keep_two_scalar_shape() {
         let source = include_str!("probes.rs");
         for declaration in [
@@ -4914,6 +4955,23 @@ mod real {
         /// Byte-copy authentication computed only when this probe is enabled.
         /// Args: old FrameId/IPA, source/destination FNV-1a, exact byte length.
         fn hvpatch__frame__cow__copy(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Arms the per-fault mapping-index census and marks its start.
+        /// Args: live rows and displaced rows in the faulting task's index.
+        /// Row-visit counting is OFF until this probe is enabled, so an
+        /// un-traced run pays one relaxed load per candidate walk and nothing
+        /// else.
+        fn hvpatch__mapping__index__begin(_: u64, _: u64) {}
+        /// One serviced first-touch fault, measured by the mapping-index
+        /// census. Args: faulting VA, live rows in the task mapping index,
+        /// rows the index's ordered/linear walks visited for this fault, rows
+        /// in the process alias registry, rows the registry's walks visited.
+        fn hvpatch__mapping__index__fault(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Cost companion to `hvpatch__mapping__index__fault`, fired
+        /// immediately after it on the same host thread. Args: nanoseconds
+        /// spent servicing the fault, the alias registry's monotone widest-VA
+        /// bound (which sets how far its containment queries walk), and the
+        /// displaced-row count.
+        fn hvpatch__mapping__index__cost(_: u64, _: u64, _: u64) {}
         /// HVPatch frame pool allocation hit.
         /// Args: site (0 = COW, 1 = sparse mmap), allocated physical IPA.
         fn hvpatch__frame__pool__hit(_: u32, _: u64) {}
@@ -6166,6 +6224,46 @@ mod real {
             fnv1a(dest),
             source.len() as u64
         ));
+    }
+
+    /// Arm the mapping-index census for one fault and stamp its start.
+    ///
+    /// Returns `Some(Instant)` ONLY while a DTrace consumer has enabled
+    /// `hvpatch-mapping-index-begin`; the generated macro runs the closure
+    /// nowhere else. Callers use the `Some` to decide whether to count rows at
+    /// all, so an un-traced guest never pays the census.
+    #[inline(never)]
+    pub fn hvpatch_mapping_index_begin(live: u64, shadowed: u64) -> Option<std::time::Instant> {
+        let mut started = None;
+        carrick_usdt::hvpatch__mapping__index__begin!(|| {
+            started = Some(std::time::Instant::now());
+            (live, shadowed)
+        });
+        started
+    }
+
+    /// See the `hvpatch__mapping__index__fault` provider doc. The cost
+    /// companion fires immediately after so a consumer can join the two on the
+    /// same host thread and never see a row census without its nanoseconds.
+    #[inline(never)]
+    pub fn hvpatch_mapping_index_fault(
+        far: u64,
+        live: u64,
+        visited: u64,
+        alias_rows: u64,
+        alias_visited: u64,
+        nanos: u64,
+        widest_va: u64,
+        shadowed: u64,
+    ) {
+        carrick_usdt::hvpatch__mapping__index__fault!(|| (
+            far,
+            live,
+            visited,
+            alias_rows,
+            alias_visited
+        ));
+        carrick_usdt::hvpatch__mapping__index__cost!(|| (nanos, widest_va, shadowed));
     }
 
     #[inline(never)]
@@ -8035,6 +8133,8 @@ mod stub {
     stub!(hvpatch_frame_cow(event: super::HvpatchFrameCow));
     stub!(hvpatch_frame_cow_trigger(event: super::HvpatchFrameCowTrigger));
     stub!(hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]));
+    stub!(hvpatch_mapping_index_begin(live: u64, shadowed: u64) -> Option<std::time::Instant> => None);
+    stub!(hvpatch_mapping_index_fault(far: u64, live: u64, visited: u64, alias_rows: u64, alias_visited: u64, nanos: u64, widest_va: u64, shadowed: u64));
     stub!(hvpatch_frame_pool_hit(site: u32, ipa: u64));
     stub!(hvpatch_frame_pool_miss(site: u32, ipa: u64));
     stub!(hvpatch_fork_frame_share(event: super::HvpatchForkFrameShare));
