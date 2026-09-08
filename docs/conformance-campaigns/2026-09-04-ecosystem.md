@@ -2525,7 +2525,7 @@ other half of the same window: a wake-queued row claimed before `activate`
 → `SnapshotRestoreFailed` → carrier abort (seen once, rc=134); brief
 `brief-activation-window.md`, dispatched after this lands.
 
-**Landed 2026-09-08 ~04:20 (two landings, one binary):**
+**Landed 2026-09-08 ~02:40 (two landings, one binary):**
 - **Lane B** (`opus/exitwedge-sep07` → main through 0268b74d2): `KernelAbort`
   sink with in-process `PostMortem` (kernel graph, executors, event ring,
   findings incl. dangling mappings), `EmbedError::KernelAborted` from
@@ -2548,3 +2548,18 @@ other half of the same window: a wake-queued row claimed before `activate`
   lint 0 after the host-authority rows were rebound. Binary of main
   c6f2eeb70: 32f5… (see build log). Smoke + reducer + rows in `post-laneb.log`
   (host loaded; crashes/wedges are the verdict).
+
+### 2026-09-08 03:05 — a silent carrier abort in the mmap alias-install path (main, under load)
+
+The post-landing go-build reducer on c6f2eeb70 (binary 79e957f1…) died
+rc=134 with empty stdout/stderr at host load 49. The crash report names
+the site: `carrick-executor-8`, `std::process::abort` inside
+`redispatch_threaded_syscall_for_executor`'s mmap alias-install arm, where
+four aborts (`take_alias_inventory` None, `apply_alias_frame_inventory`
+error, `len` conversion, PROT_NONE `protect_range` error) have no log line
+at all. Filed with tonight's two other load-exposed MM-authority FATALs
+(`vfork parent resume` refused; duplicate exec MM authority key) as one
+family; Fable agent dispatched (`brief-mmap-abort.md`): name the sites
+through the lane B sink, reproduce under hogs with a post-mortem, fix the
+root cause. Five `carrick_runtime` test-binary crash reports at 02:48 abort
+in `dispatch::sysv::shmdt` — an agent's unit-test run; noted, unowned.
