@@ -128,7 +128,7 @@ fn apply_alias_frame_inventory(
         .map(|_| ())
 }
 
-/// The mmap alias-install arm's fail-closed sink.
+/// The alias-install arm's (guest `mmap(2)`) fail-closed sink.
 ///
 /// Every step after `map_host_alias` has succeeded runs with the alias already
 /// committed to stage-2, so none of them can be lowered to a guest errno: a
@@ -10462,7 +10462,7 @@ where
                         // sibling stage its reuse and publish first, and its apply
                         // was refused with `UnreservedFrame`: the silent rc=134
                         // carrier abort of 2026-09-08 (go-build reducer, and the
-                        // mmap(MAP_SHARED) two-process reducer 4/4). Holding the
+                        // MAP_SHARED two-process reducer 4/4). Holding the
                         // lock across the apply makes publication order equal to
                         // staging order, which is the invariant the registry
                         // reuse relies on. Lock order is unchanged: the AliasUnmap
@@ -10482,7 +10482,7 @@ where
                         let Ok(len_bytes) = usize::try_from(len) else {
                             return Err(refuse(
                                 Site::LenOverflow,
-                                "mapping length does not fit usize".to_owned(),
+                                "range length does not fit usize".to_owned(),
                                 None,
                             ));
                         };
@@ -12833,14 +12833,14 @@ mod tests {
     /// accepts the reuse only if the frame is already published. So the
     /// install arm must publish while it still holds the AliasMap topology
     /// lock. Publishing after the release produced the 2026-09-08 silent
-    /// `UnreservedFrame` carrier abort under concurrent mmap(MAP_SHARED).
+    /// `UnreservedFrame` carrier abort under concurrent MAP_SHARED installs.
     #[test]
     fn alias_install_publishes_inventory_before_releasing_the_topology_lock() {
         let source = include_str!("mod.rs");
         let arm = source
             .split("DispatchOutcome::MapHostAlias {")
             .nth(1)
-            .expect("the mmap alias-install arm exists");
+            .expect("the alias-install arm exists");
         let arm = arm
             .split("break 'service installed;")
             .next()
