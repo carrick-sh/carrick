@@ -2648,3 +2648,27 @@ the direction holds under worse load; `cpython-mmap`, `ltp-mmap18`,
 `ltp-munmap01`, `go-go_types`, `cpython-itertools` MATCH). The reducer
 aborted once on the exec-generation observer class (third instance on
 main tonight, all at load ≥30; scheduler round 4 owns it).
+
+### 2026-09-08 05:10 — the pre-activation wake window closed (main a5f8592fc)
+
+The other half of the importlib hang: a wake-queued row could be CLAIMED
+before its submission's binding record was active, so `resolve` failed
+with `SnapshotRestoreFailed` and the clone rollback aborted the carrier
+(reproduced live: `lost exact transition … kernel_view=Failed {
+SnapshotRestoreFailed }` → `FATAL: authoritative HVPatch clone rollback`).
+Fix 119f07e97 (`opus/activation-window-sep08`): the run queue is the single
+authority for claimability and activation IS publication — every `admit_*`
+marks the key `unpublished` under the same lock that counts the authority;
+a wake for such a key owns the edge but its row is `deferred`, never in
+`rows`; only `publish` (from `activate`) clears the mark and releases the
+held row in the same critical section; `enqueue` returns a typed
+`EnqueueOutcome { Claimable, Deferred, Coalesced }` because a bool cannot
+say "queued but not claimable". Red-first unit test (wake → claim →
+activate) fails pre-fix with `missing exact HVPatch task binding`, green
+after; two existing tests that encoded the wrong order were corrected.
+Gates 0; go-build reducer 8/8; interleaved 16-pair A/B on the importlib
+argv: base 14/16 (two rc=134), fix 16/16, zero hangs, zero watchdog reaps.
+Director gates on the rebase: 36 scheduler/executor tests, lint 0,
+workspace check 0. Note for the scheduler branch: the per-CPU queue must
+carry the same gate when it rebases. Stale ledger argv: `--raw` (deleted
+in 457fd7bb0) still appears in `scripts/conformance/baseline.jsonl`.
