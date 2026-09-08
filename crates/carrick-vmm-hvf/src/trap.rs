@@ -38354,6 +38354,84 @@ impl HvfVmState {
         task: &mut HvfTaskState,
         expected_root_slot: Option<(u64, u64)>,
     ) -> Result<Option<HvpatchMmRootRetirementProof>, TrapError> {
+        /// Answer "which mapping rows contain `[ipa, ipa + length)`" for terminal
+        /// retirement without re-walking every row per inventory extent.
+        ///
+        /// Process-terminal retirement asks that question once per inventory
+        /// extent. Written directly as `task.mappings.iter().filter(..)` it is
+        /// O(extents x rows): a CPython `test_compile` guest retires with 33,471
+        /// inventory extents against 33,478 mapping rows, so one executor spins
+        /// through ~1.1e9 row visits inside
+        /// [`HvfVmState::retire_task_state_process_mappings_inner`] while its
+        /// Linux task is already a zombie. That is the shape the always-on
+        /// process-graph liveness sink reports as "1 container job(s) unpublished
+        /// with 0 live task(s), 1 live thread(s) and 0 runnable row(s) for
+        /// 2000ms" (`carrick run` rc 125): nothing is deadlocked, the settlement
+        /// that publishes the container job is simply still queued behind a
+        /// quadratic sweep.
+        ///
+        /// [`TaskMappingIndex::by_ipa`] cannot serve this query. It orders the
+        /// SEMANTIC `ipa`/`size` projection, while every lifetime decision here
+        /// must use the exact `physical_ipa`/`physical_size` tuple — a partial
+        /// 4 KiB Linux mapping can retain a 16 KiB physical owner whose base
+        /// precedes its semantic view. This index is therefore built once per
+        /// retirement, from a single pass over the rows, and covers displaced
+        /// rows as well as live ones because the scan it replaces did.
+        struct PhysicalExtentIndex<'rows> {
+            /// Rows ascending by `physical_ipa`.
+            rows: Vec<&'rows HvfMappedRegion>,
+            /// `rows[i].physical_ipa`, kept apart for the binary search.
+            starts: Vec<u64>,
+            /// `max(physical end of rows[0..=i])`. Non-decreasing, so a descending
+            /// walk stops at the first index whose prefix maximum can no longer
+            /// reach the query end: no earlier row reaches further either.
+            prefix_max_end: Vec<u64>,
+        }
+
+        impl<'rows> PhysicalExtentIndex<'rows> {
+            fn build(rows: impl Iterator<Item = &'rows HvfMappedRegion>) -> Self {
+                let mut rows: Vec<&'rows HvfMappedRegion> = rows.collect();
+                rows.sort_unstable_by_key(|row| row.physical_ipa);
+                let starts = rows.iter().map(|row| row.physical_ipa).collect::<Vec<_>>();
+                let mut prefix_max_end = Vec::with_capacity(rows.len());
+                let mut running = 0u64;
+                for row in &rows {
+                    running = running.max(Self::physical_end(row));
+                    prefix_max_end.push(running);
+                }
+                Self {
+                    rows,
+                    starts,
+                    prefix_max_end,
+                }
+            }
+
+            fn physical_end(row: &HvfMappedRegion) -> u64 {
+                row.physical_ipa.saturating_add(row.physical_size as u64)
+            }
+
+            /// Every row whose exact stage-2 physical extent contains
+            /// `[ipa, ipa + length)`, in no particular order — both consumers ask
+            /// `any`/`iter().any`, so order carries no meaning here.
+            fn containing(
+                &self,
+                ipa: u64,
+                length: u64,
+            ) -> impl Iterator<Item = &'rows HvfMappedRegion> {
+                let end = ipa.checked_add(length);
+                let upper = self.starts.partition_point(|start| *start <= ipa);
+                let prefix_max_end = &self.prefix_max_end;
+                let rows = &self.rows;
+                (0..upper)
+                    .rev()
+                    .take_while(move |&position| {
+                        end.is_some_and(|end| prefix_max_end[position] >= end)
+                    })
+                    .map(move |position| rows[position])
+                    .filter(move |row| end.is_some_and(|end| end <= Self::physical_end(row)))
+            }
+        }
+
         #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&task.custody);
         #[cfg(not(test))]
@@ -38402,6 +38480,11 @@ impl HvfVmState {
             // owner identity that was live at publication; `task.mappings`
             // deliberately retains historical rows and therefore cannot be
             // used to reconstruct one generation at terminal retirement.
+            //
+            // One pass builds the physical-extent index the per-extent
+            // containment queries below read; see `PhysicalExtentIndex` for
+            // why the direct per-extent scan is the exit residual.
+            let mapping_extents = PhysicalExtentIndex::build(task.mappings.iter());
             let mut stage2_owners = std::collections::BTreeMap::new();
             for (&(_gpa, mapping_length), extent) in &inventory.extents {
                 if mapping_length == 0 {
@@ -38422,15 +38505,8 @@ impl HvfVmState {
                         extent.stage2_owner
                     )));
                 }
-                let matching_rows: Vec<_> = task
-                    .mappings
-                    .iter()
-                    .filter(|mapping| {
-                        mapping.physical_ipa <= ipa
-                            && ipa.checked_add(length).is_some_and(|end| {
-                                end <= mapping.physical_ipa + mapping.physical_size as u64
-                            })
-                    })
+                let matching_rows: Vec<_> = mapping_extents
+                    .containing(ipa, length)
                     .filter_map(|mapping| {
                         mapped_region_stage2_owner_identity(mapping).map(|identity| {
                             (
@@ -38521,16 +38597,12 @@ impl HvfVmState {
                                     && active
                                     && mapped
                             })
-                    }) || task.mappings.iter().any(|m| {
-                        m.physical_ipa <= ipa
-                            && ipa
-                                .checked_add(length)
-                                .is_some_and(|end| end <= m.physical_ipa + m.physical_size as u64)
-                            && (extent.stage2_owner.generation == 0
-                                || m.owner_generation == extent.stage2_owner.generation
-                                || m.structural_owner.as_ref().is_some_and(|owner| {
-                                    owner.epoch().raw() == extent.stage2_owner.generation
-                                }))
+                    }) || mapping_extents.containing(ipa, length).any(|m| {
+                        extent.stage2_owner.generation == 0
+                            || m.owner_generation == extent.stage2_owner.generation
+                            || m.structural_owner.as_ref().is_some_and(|owner| {
+                                owner.epoch().raw() == extent.stage2_owner.generation
+                            })
                     });
                     let carrier_lease = carrier_stage2_lease_owner_matches(
                         custody,
@@ -52719,6 +52791,143 @@ mod frame_inventory_backend_tests {
             .unwrap(),
         );
         assert!(!carrier_stage2_leases().lock().contains_key(&key));
+    }
+
+    /// Terminal retirement must read the mapping rows a bounded number of
+    /// times, not once per inventory extent.
+    ///
+    /// The direct per-extent scan is the 2026-09-08 exit residual: a CPython
+    /// `test_compile` guest retires 33,471 inventory extents against 33,478
+    /// mapping rows, so the executor that owns the container's `exit_group`
+    /// spends minutes inside `retire_task_state_process_mappings_inner`
+    /// between its `Saved` receipt and `settle_exited`. Nothing deadlocks —
+    /// the container job's result is simply never published while that sweep
+    /// runs, which the process-graph liveness sink reports as "1 container
+    /// job(s) unpublished with 0 live task(s), 1 live thread(s)" and turns
+    /// into `carrick run` rc 125.
+    ///
+    /// Counting rows rather than seconds keeps the bar deterministic: the
+    /// pre-index code visits `EXTENTS * EXTENTS` rows here, the indexed code
+    /// one pass.
+    #[test]
+    fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
+        const EXTENTS: usize = 600;
+        const EXTENT_SIZE: u64 = 0x4000;
+
+        let mut task = hvpatch_task_state_test_fixture(12, 0x1_0000_0000, 12);
+        task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
+        task.mappings.clear();
+
+        let mut guards = Vec::with_capacity(EXTENTS);
+        let mut hosts = Vec::with_capacity(EXTENTS);
+        let mut rows = Vec::with_capacity(EXTENTS);
+        let mut extents = Vec::with_capacity(EXTENTS);
+        for index in 0..EXTENTS {
+            let key = next_test_physical_key(EXTENT_SIZE);
+            let generation = next_global_frame_owner_generation();
+            let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                EXTENT_SIZE as usize,
+                crate::host_mapping::HostMappingKind::FrameCow,
+            )
+            .unwrap();
+            let host_addr = host.as_ptr();
+            let start = 0x1_0000_0000 + index as u64 * EXTENT_SIZE;
+            rows.push(HvfMappedRegion {
+                start,
+                end: start + EXTENT_SIZE,
+                ipa: key.0,
+                physical_ipa: key.0,
+                host_addr,
+                size: EXTENT_SIZE as usize,
+                physical_size: EXTENT_SIZE as usize,
+                perms: applevisor::memory::MemPerms::ReadWrite,
+                memory: None,
+                host_mapping: None,
+                structural_owner: None,
+                stage2_lease: Some(GlobalFrameStage2Lease::fixed(key.0, key.1)),
+                is_dynamic_alias: false,
+                sharing: GuestMappingSharing::Private,
+                guest_writable: true,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+                owner_generation: generation,
+            });
+            extents.push((index, key, generation, host_addr as usize));
+            let owner = GlobalFrameHostOwner::new(
+                GlobalFrameStage2Lease::fixed(key.0, key.1),
+                host,
+                u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+                generation,
+                key.0,
+                key.1,
+            );
+            assert!(
+                global_frame_host_owners()
+                    .lock()
+                    .insert(key, GlobalFrameOwnerEntry::Live(std::sync::Arc::new(owner)))
+                    .is_none(),
+                "publication must displace no predecessor"
+            );
+            guards.push(TestGlobalFrameOwnerGuard { key, generation });
+            hosts.push(host_addr);
+        }
+        task.mappings.extend(rows);
+
+        {
+            let mut inventory = task.frame_inventory.lock();
+            inventory.initialized = true;
+            for &(index, key, generation, host_addr) in &extents {
+                let frame = carrick_hal::FrameId::from_kernel_allocation(id(1 + index as u64));
+                let mapping = carrick_hal::MappingId::from_kernel_allocation(id(1 + index as u64));
+                inventory.extents.insert(
+                    key,
+                    InventoryExtent {
+                        frame,
+                        mapping,
+                        backing: InventoryBackingIdentity::Private(1 + index as u64),
+                        stage2_base: key.0,
+                        stage2_length: key.1,
+                        stage2_owner: InventoryStage2OwnerIdentity {
+                            host_addr,
+                            generation,
+                        },
+                    },
+                );
+                let mut frames = inventory.frames.lock();
+                frames.references.insert(frame, 1);
+                frames.extent_references.insert((frame, key.0, key.1), 1);
+                frames.stage2_references.insert(key, 1);
+            }
+            let capacity = carrick_hal::FrameEventCapacity::for_event_count(4 * EXTENTS).unwrap();
+            inventory.retirement_reservation = Some(
+                carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                    carrick_hal::FrameInventoryProvenance::from_kernel_entropy([93; 32]),
+                    carrick_hal::FrameInventoryBatch::prepare(
+                        carrick_hal::KernelTransactionId::from_kernel_allocation(id(93)),
+                        capacity,
+                    )
+                    .unwrap(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+        }
+
+        let before = hot_path_rows_scanned(HotPathScan::TaskMappings);
+        HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect("stage terminal retirement over a many-extent inventory");
+        let scanned = hot_path_rows_scanned(HotPathScan::TaskMappings) - before;
+
+        let extents = EXTENTS as u64;
+        assert!(
+            scanned <= 8 * extents,
+            "terminal retirement over {extents} inventory extents visited {scanned} \
+             mapping rows; the containment question must be indexed once per \
+             retirement, not re-asked against every row per extent (the rescan \
+             shape visits {} rows and is the exit residual)",
+            extents * extents
+        );
+        drop(guards);
     }
 
     #[test]
