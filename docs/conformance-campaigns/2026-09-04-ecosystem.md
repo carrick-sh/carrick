@@ -2705,3 +2705,33 @@ the gate — an admission path the gate does not cover (fork from a threaded
 process). Kept the gate (its importlib A/B stands); residual dispatched
 (`brief-activation-residual.md`) with the rule that the rollback arm must
 stop aborting the carrier too.
+
+### 2026-09-08 06:10 — the silent mmap alias-install abort, root-caused (branch, landing)
+
+Fable agent, `fable/mmapabort-sep08`. The seven bare aborts compile to one
+landing block, so the crash report alone could not name the site;
+disassembling main's binary at the return address gave the predecessor
+`cmp x22, #0x1b` on the `Result<(), FrameInventoryError>` discriminant
+after `FrameInventoryAuthority::apply_inner`, and the crashed thread's
+`x22 = 3` = `UnreservedFrame`. A two-process reducer
+(`target/conformance/eco-load/mmshared.py`: 8 forked guests looping
+`mmap(MAP_SHARED)`/`munmap` over 32 files) reproduces it 4/4 in ~1 s at
+≥4 processes, 0/2 at 2. Root cause: `stage_mapping_in` registers a fresh
+`SharedFile` frame in the backend's shared registry at staging time under
+the AliasMap topology lock and the next installer of the same
+`(dev, ino, offset, len)` reuses that `FrameId` without reserving it; since
+d913972c2 the install arm released the topology lock BEFORE publishing, so
+a sibling could stage its reuse and publish first (publication-order trace
+`scripts/dtrace/hvpatch-alias-publication-order.d`: 149 µs descheduling
+window vs ~15–20 µs undisturbed). Fix 13680c8f2: publish while still
+holding the topology lock (publication order == staging order; lock order
+unchanged, the authority mutex is a leaf); d0e62df89: all seven sites
+typed through `AbortReason::HvpatchAliasInstall{…}` via the lane B sink so
+a refusal ends in `kernel aborted: …` with a post-mortem. Receipts:
+reducer main 8/11 silent rc=134 (2/2 under hogs) → typed pre-fix 5/9 named
+aborts with post-mortems → fixed **0/26** interleaved, plain and under hogs,
+load 17–45; five rows MATCH (`ltp-mmap18`, `ltp-mprotect01`, `go-go_types`,
+`cpython-asyncio`, `cpython-mmap`); gates 0. Open from the agent: the
+post-mortem kernel snapshot hits its 2 s deadline with 7 sibling processes
+live (`truncated`); the remaining go-build aborts are the scheduler
+observer class (round 5).
