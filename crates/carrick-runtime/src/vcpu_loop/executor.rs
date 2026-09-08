@@ -4536,9 +4536,25 @@ where
         if let Some(authority) = submission_authority.take() {
             if let Err(authority) = resolver.restore_submission_authority(authority) {
                 drop(authority);
-                return Err(
-                    "combined task resolver rejected worker-held authority restoration".to_owned(),
+                // The only error return in this quantum tail that dropped
+                // `running` without settling it. `RunnableThread::drop` runs
+                // `finish_claim` and nothing else, so the thread stayed in
+                // whatever state `begin_switch_out` published, its job kept no
+                // publisher, and the claim count went back to zero with no
+                // record anywhere -- the exact stranded shape the round-7
+                // `claim-dropped-unsettled` probe was added to name. Settle it
+                // the way every sibling error path in this function does.
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
                 );
+                return Err(with_settlement_error(
+                    "combined task resolver rejected worker-held authority restoration".to_owned(),
+                    settlement,
+                ));
             }
         }
         let settlement_thread = Arc::clone(running.thread());
