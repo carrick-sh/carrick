@@ -2322,3 +2322,28 @@ lost exact transition` race, reran clean). Suite gate ×2 on the fixed
 binary via the harness (`--require-cached-oracle`): `go-go_types` 571/571,
 `go-net_http` 1316/1316, `cpython-multiprocessing_main_handling` 39/39,
 `ltp-mmap01` 1/1, `ltp-mmap18` 4/4 — all MATCH, no regressions.
+
+### 2026-09-07 20:54 — post-SEGV-landing receipt on main 0529523ac (binary 5f3ed049…)
+
+`--workers 1`, `--require-cached-oracle`, host load 5.3 → 1.9 over the run,
+no other guests. go-build reducer 8/8, zero fatal lines. All eleven goal
+rows MATCH; `go-go_types` 571/571 and `go-runtime_pprof` 93/93 are whole
+for the first time (the SEGV class took `TestMapping`/`tracebackGoOnly`).
+
+| row | carrick ms | oracle ms | ratio |
+|---|---|---|---|
+| cpython-asyncio | 76882 | 72130 | 1.07 |
+| cpython-threading | 16889 | 13816 | 1.22 |
+| go-runtime_pprof | 23034 | 17180 | 1.34 |
+| cpython-importlib | 7293 | 2685 | 2.72 |
+| go-go_types | 19135 | 6182 | 3.10 |
+| cpython-subprocess | 64479 | 20698 | 3.12 |
+| cpython-itertools | 3838 | 1032 | 3.72 |
+| go-net_http | 15967 | 4098 | 3.90 |
+| cpython-multiprocessing_main_handling | 14808 | 2892 | 5.12 |
+| cpython-tarfile | 75581 | 4765 | 15.86 |
+| cpython-compile | 62282 | 2677 | 23.27 |
+
+Three of eleven at ≤2x. `compile` and `tarfile` are the two order-of-
+magnitude rows and are unattributed; attribution workers dispatched
+(briefs `brief-attr-compile.md`, `brief-attr-tarfile.md`).
