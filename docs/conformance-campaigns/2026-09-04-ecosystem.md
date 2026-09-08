@@ -3081,3 +3081,36 @@ first fully clean eleven-row run under load since the fleet started
 since landed a fix). Ratios not cited (load). The closing measurement is
 armed to fire on a quiet host: the eleven rows at `--workers 1`, then the
 `--workers 4` cached ledger, then the four-sibling fork-to-wait.
+
+### 2026-09-08 17:40 — probe-gate triage: one real regression, one wrong invariant, one flake, one new finding
+
+With the gate alive again (643 probe executions per run): **`processvmsparse`
+was a regression from 9ac383a69** — restoring the 64 KiB anonymous fault
+window as the default (bisected over 158 commits with `git bisect run`;
+hatch-confirmed on one binary: `CARRICK_FAULT_WINDOW_BYTES=4096` MATCH,
+default DIFF). Mechanism: the wide window materializes zeroed backing across
+64 KiB but installs stage-1 only for the faulting page, so
+`CarrierForeignMmReadLease::read` found a backed page with no stage-1 entry
+and no recipe and returned `Translation`, which short-circuited
+`process_vm_readv`. Fix 12c807779: a never-written page reads as zeros
+(Linux's answer for an untouched anonymous page), refusal kept only for a
+retained private-file recipe; red-first unit test; DIFF → MATCH on both
+libcs. **`pidnsorphanreap`:** the kernel graph was right (the grandchild IS
+reparented to init; the parentless zombie appears when init itself exits
+during the grandchild's sleep, the documented `retire_container` contract);
+the `NoOrphanZombie` invariant tested `parent.is_none() && id != 1` where
+`TaskKey::id` is a carrier-global allocation, not an ns-pid. Fix
+899da1f37: a typed `ZombieReaper { Parent, ContainerRetirement, Unreapable }`
+computed by the kernel from the exit's own snapshot; the invariant aborts
+only on `Unreapable`. Recorded divergence, not fixed: Linux's
+`zap_pid_ns_processes` kills the namespace when its init exits; carrick
+lets the grandchild run. **`coredumpfile`:** pre-existing, flaky only inside
+a full shard (its own `sched_yield` wait for worker threads expires under
+load; hypothesis, unproven). **New: `mqnotifycrossproc`** aborts on
+`NoWakeOfReapedTask` (load-dependent, pre-existing); the probe's output
+MATCHES the oracle even when the rejected wake fires, and
+`audit_wake_rejection` classifies a target found among `state.zombies` as
+`Reaped` — a zombie is exited-not-yet-waited, so the label is likely the
+whole bug. Filed for after round 7. Gates on the triage branch: clippy 0,
+lint 0, test 0, build 0; the probe gate runs 643 executions with zero DIFFs
+in its second run, failing only on `mqnotifycrossproc`.
