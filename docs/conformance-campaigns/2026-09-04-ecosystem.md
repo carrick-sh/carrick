@@ -2347,3 +2347,22 @@ for the first time (the SEGV class took `TestMapping`/`tracebackGoOnly`).
 Three of eleven at ≤2x. `compile` and `tarfile` are the two order-of-
 magnitude rows and are unattributed; attribution workers dispatched
 (briefs `brief-attr-compile.md`, `brief-attr-tarfile.md`).
+
+### 2026-09-07 22:25 — exit wedge confirmed end-to-end by the watchdog; fix gated
+
+The host-wide carrier watchdog reaped four wedges in 17 minutes, all with
+the same shape (ten executors in `take_row`, main in
+`HvpatchLoopResult::wait`). Two were the exit-wedge agent's own A/B **base**
+binary runs (`gbl-ABbase1`, `gbl-ABbase3`): kernel graph `tasks: []`,
+`threads: []`, one zombie pid 1 with no parent. The agent had recorded them
+as unexplained `rc=137` after `BUILDS=8`; that was the watchdog. So the
+pre-fix binary wedges 2/5 and the fix binary 0/5 on the same reducer under
+the same load. Two more were conformance rows on a main-class binary
+(`conf-36312-c00`, `conf-41112-c00`) whose kernel snapshot **refused itself**
+("mapping MappingId(22) names mm MmId(1), which is not in the snapshot") —
+a leaked alias-registry row is part of the wedge signature and the
+post-mortem capture must record it rather than refuse (lane B).
+
+Fix under gate: `opus/exitwedge-sep07` rebased (df0a28a4d publish-on-lost-
+claim, e42253f68 bounded signed exec/exit-storm test); unit reproducer 20/20
+red → green; signed embed test running before the fast-forward.
