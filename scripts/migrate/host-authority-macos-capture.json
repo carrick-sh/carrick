@@ -974,15 +974,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2031649,
-        "byte_start": 2031637,
+        "byte_end": 2035498,
+        "byte_start": 2035486,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 48550,
-        "line_end": 48550,
-        "line_start": 48550
+        "line": 48622,
+        "line_end": 48622,
+        "line_start": 48622
       }
     },
     {
@@ -995,15 +995,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2034280,
-        "byte_start": 2034268,
+        "byte_end": 2038129,
+        "byte_start": 2038117,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 48596,
-        "line_end": 48596,
-        "line_start": 48596
+        "line": 48668,
+        "line_end": 48668,
+        "line_start": 48668
       }
     },
     {
@@ -1016,15 +1016,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2036597,
-        "byte_start": 2036585,
+        "byte_end": 2040446,
+        "byte_start": 2040434,
         "column": 25,
         "column_end": 37,
         "column_start": 25,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 48637,
-        "line_end": 48637,
-        "line_start": 48637
+        "line": 48709,
+        "line_end": 48709,
+        "line_start": 48709
       }
     },
     {
@@ -12618,9 +12618,9 @@
       }
     }
   ],
-  "rows_sha256": "e32600c1dc5a61836496028c5a0d71ad3eebfe68b8b66dbe1bb88daab8f435bb",
+  "rows_sha256": "ad399e2f5b9f410b6e1f164b8b5d4f6ed2c5124eda2072c40bf73493e3cb0f82",
   "schema": 1,
-  "source_head": "d18a39bfe65818ee8d6d7fd88cb47fd40b1e52a1",
+  "source_head": "909cef4b758117a0a297a07717f6ff365f25e32a",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
