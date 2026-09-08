@@ -11543,15 +11543,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 352289,
-        "byte_start": 352264,
+        "byte_end": 355839,
+        "byte_start": 355814,
         "column": 35,
         "column_end": 60,
         "column_start": 35,
         "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-        "line": 8786,
-        "line_end": 8786,
-        "line_start": 8786
+        "line": 8854,
+        "line_end": 8854,
+        "line_start": 8854
       }
     },
     {
@@ -12054,15 +12054,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 390426,
-        "byte_start": 390408,
+        "byte_end": 393976,
+        "byte_start": 393958,
         "column": 17,
         "column_end": 35,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-        "line": 9699,
-        "line_end": 9699,
-        "line_start": 9699
+        "line": 9767,
+        "line_end": 9767,
+        "line_start": 9767
       }
     },
     {
@@ -12566,15 +12566,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 381448,
-        "byte_start": 381426,
+        "byte_end": 384998,
+        "byte_start": 384976,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-        "line": 9533,
-        "line_end": 9533,
-        "line_start": 9533
+        "line": 9601,
+        "line_end": 9601,
+        "line_start": 9601
       }
     },
     {
@@ -12618,9 +12618,9 @@
       }
     }
   ],
-  "rows_sha256": "ef40ed96063525e06c7ab29d4d7202484e5a49a376cd2586c92977c5f0dd2932",
+  "rows_sha256": "6501f50feb5a9a7ddc7700d61c11126fdfc8d8d6c0ad684be32fccb4c5745d1f",
   "schema": 1,
-  "source_head": "e20c003befc2300f019175aab1b8699e04dee3cb",
+  "source_head": "599d4e73c55b2d3424af2a03ca9292759750ce18",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
