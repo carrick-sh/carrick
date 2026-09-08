@@ -2944,3 +2944,28 @@ because the sink catches it (exit-residual agent dispatched). The
 activation residual's root cause (the clone child is kernel-runnable ~300
 lines before `admit`; fixed by gating the key before publication,
 threading 5/5 vs base 3/5) is being ported onto the per-CPU scheduler.
+
+### 2026-09-08 11:00 — round 6 landed (main 4b8b6b056): the exit deadlock was a self-deadlock
+
+`Scheduler::scheduler_summary` took the run-queue state mutex and, still
+holding it, called `RunQueue::waiter_count`, which locks the same
+non-reentrant mutex; the blocked main thread WAS the holder, the debug
+thread queued behind it, the parked spares innocent. Unconditional — no
+load needed. Fix ed05adb0e replaces the representation: the locked variant
+takes the guard the caller holds (the bad call is unwritable), a
+non-blocking census, and a named `SchedulerSummary` built from atomics plus
+`try_lock` that reports `WaiterCensus::RunQueueLocked` instead of joining a
+queue behind a stuck holder — the liveness sink can now fire in exactly the
+state it exists for (post-mortems carry `waiters: 17, run_queue_locked:
+false`). Red-first 5 s timeout → 0.01 s. Gates 0; compile 5/5 exits (each
+with the exit-residual abort, another agent's); go_types 3/3 vs control
+2/3. Not closed: the post-mortem capture still takes the per-CPU and
+executor-directory locks. **Gate regression found on main:** `just
+conformance-probes` fails the first case of every shard with `task
+task#2:41 exceeded exit budget of 10s` — lane A's `ExitBudget` timed
+invariant is on by default in the embed test container with a 10 s budget
+and the probe lane's first case exceeds it; narrow fix dispatched (timed
+invariants opt-in per test, structural invariants stay on). Also
+pre-existing on main before tonight: three `just test-integration`
+failures (`open_o_tmpfile…setuid_setgid`, `tty_ioctls…`,
+`timer_create_rejects…`).
