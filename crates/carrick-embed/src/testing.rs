@@ -3,12 +3,21 @@
 //! [`ContainerResult`]. Guest-running uses of these belong in tests executed
 //! by the signed `just test-embed` recipe.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
+pub mod invariants;
+
+use crate::testing::invariants::{
+    EveryChildRuns, ExitBudget, ExitBudgetMatcher, FirstTouchNeverDelivered, InvariantKind,
+    NoOrphanZombie, NoWakeOfReapedTask, ProcessGraphLiveness,
+};
 use crate::{
     AuditObserver, ContainerBuilder, ContainerResult, EmbedError, ImageStore, PullPolicy,
     SyscallInterceptor, SyscallObserver,
 };
+use carrick_runtime::observe::KernelAuditor;
 
 /// Read-only lifecycle telemetry for Carrick's own signed topology tests.
 /// This is not part of the stable embedding API.
@@ -37,6 +46,11 @@ pub struct TestContainer {
     pull: Option<PullPolicy>,
     observers: Vec<Arc<dyn SyscallObserver>>,
     interceptors: Vec<Arc<dyn SyscallInterceptor>>,
+    auditors: Vec<Arc<dyn KernelAuditor>>,
+    disabled_invariants: BTreeSet<InvariantKind>,
+    every_child_runs_timeout: Duration,
+    exit_budget_matcher: ExitBudgetMatcher,
+    exit_budget_timeout: Duration,
 }
 
 impl std::fmt::Debug for TestContainer {
@@ -73,7 +87,33 @@ impl TestContainer {
             pull: None,
             observers: Vec::new(),
             interceptors: Vec::new(),
+            auditors: Vec::new(),
+            disabled_invariants: BTreeSet::new(),
+            every_child_runs_timeout: Duration::from_secs(5),
+            exit_budget_matcher: ExitBudgetMatcher::Any,
+            exit_budget_timeout: Duration::from_secs(10),
         }
+    }
+
+    pub fn without_invariant(mut self, invariant: InvariantKind) -> Self {
+        self.disabled_invariants.insert(invariant);
+        self
+    }
+
+    pub fn auditor(mut self, auditor: Arc<dyn KernelAuditor>) -> Self {
+        self.auditors.push(auditor);
+        self
+    }
+
+    pub fn every_child_runs_timeout(mut self, timeout: Duration) -> Self {
+        self.every_child_runs_timeout = timeout;
+        self
+    }
+
+    pub fn exit_budget(mut self, select: ExitBudgetMatcher, within: Duration) -> Self {
+        self.exit_budget_matcher = select;
+        self.exit_budget_timeout = within;
+        self
     }
 
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -188,6 +228,48 @@ impl TestContainer {
         }
         for interceptor in &self.interceptors {
             builder = builder.interceptor(Arc::clone(interceptor));
+        }
+        if !self
+            .disabled_invariants
+            .contains(&InvariantKind::NoOrphanZombie)
+        {
+            builder = builder.auditor(Arc::new(NoOrphanZombie));
+        }
+        if !self
+            .disabled_invariants
+            .contains(&InvariantKind::ProcessGraphLiveness)
+        {
+            builder = builder.auditor(Arc::new(ProcessGraphLiveness));
+        }
+        if !self
+            .disabled_invariants
+            .contains(&InvariantKind::NoWakeOfReapedTask)
+        {
+            builder = builder.auditor(Arc::new(NoWakeOfReapedTask));
+        }
+        if !self
+            .disabled_invariants
+            .contains(&InvariantKind::FirstTouchNeverDelivered)
+        {
+            builder = builder.auditor(Arc::new(FirstTouchNeverDelivered));
+        }
+        if !self
+            .disabled_invariants
+            .contains(&InvariantKind::EveryChildRuns)
+        {
+            builder = builder.auditor(Arc::new(EveryChildRuns::new(self.every_child_runs_timeout)));
+        }
+        if !self
+            .disabled_invariants
+            .contains(&InvariantKind::ExitBudget)
+        {
+            builder = builder.auditor(Arc::new(ExitBudget::new(
+                self.exit_budget_matcher.clone(),
+                self.exit_budget_timeout,
+            )));
+        }
+        for auditor in &self.auditors {
+            builder = builder.auditor(Arc::clone(auditor));
         }
         builder
     }

@@ -79,10 +79,22 @@ pub struct TaskKey {
     pub serial: TaskSerial,
 }
 
+impl std::fmt::Display for TaskKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task#{}:{}", self.id.raw(), self.serial.raw())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ThreadKey {
     pub tid: LinuxTid,
     pub serial: ThreadSerial,
+}
+
+impl std::fmt::Display for ThreadKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "thread#{}:{}", self.tid.raw(), self.serial.raw())
+    }
 }
 
 pub(super) struct MmIoStateSnapshot {
@@ -3745,6 +3757,7 @@ pub struct Task {
     task_event_generation: AtomicU64,
     wake_listeners: Arc<Mutex<BTreeMap<u64, TaskWakeListener>>>,
     next_wake_listener: AtomicU64,
+    has_run: AtomicBool,
     /// Linux's per-process OOM-killer bias, `/proc/<pid>/oom_score_adj`
     /// (proc(5)): inherited at fork, independent of the parent afterwards, and
     /// shared by every thread of the process.
@@ -3972,6 +3985,7 @@ impl Task {
             task_event_generation: AtomicU64::new(0),
             wake_listeners: Arc::new(Mutex::new(BTreeMap::new())),
             next_wake_listener: AtomicU64::new(1),
+            has_run: AtomicBool::new(false),
             oom_score_adj: AtomicI32::new(0),
             dumpable: AtomicI32::new(DumpableMode::User as i32),
             nice: AtomicI32::new(0),
@@ -3983,6 +3997,11 @@ impl Task {
             nsproxy: ArcSwap::new(Arc::new(NsProxy::for_container(container))),
             nsproxy_write: Mutex::new(()),
         }
+    }
+
+    /// Mark this task as having run on an executor, returning `true` on first call.
+    pub fn mark_first_run(&self) -> bool {
+        !self.has_run.swap(true, Ordering::AcqRel)
     }
 
     /// The signal this process delivers to its parent when it terminates.
@@ -5657,7 +5676,7 @@ impl Drop for ExecDrain {
 pub struct ExecutionGeneration(u64);
 
 impl ExecutionGeneration {
-    const INITIAL: Self = Self(1);
+    pub const INITIAL: Self = Self(1);
 
     pub(crate) const fn initial_for_prepared_publication() -> Self {
         Self::INITIAL

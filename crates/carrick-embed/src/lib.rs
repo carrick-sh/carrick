@@ -109,12 +109,13 @@ pub use carrick_runtime::network::{
     NetworkInterposer, TargetSpec,
 };
 pub use carrick_runtime::observe::{
-    ArgFilter, AuditEvent, AuditObserver, BudgetCounters, BudgetResource, BudgetSnapshot,
-    ExceedAction, ExitStatus, FastPathVisibility, FaultAction, FaultCondition, FaultInjector,
-    FaultPredicate, FaultRule, FaultRuleBuilder, InterceptAction, InterceptedSyscall,
-    PolicyObserver, PolicyRule, ProcessInfo, ResourceBudget, SandboxObserver, SandboxPreset,
-    SyscallAction, SyscallArgIndexError, SyscallArgs, SyscallBitset, SyscallInfo,
-    SyscallInterceptor, SyscallObserver, SyscallOutcome, is_shortable_syscall,
+    ArgFilter, AuditEvent, AuditObserver, AuditReason, AuditVerdict, AuditorChain, BudgetCounters,
+    BudgetResource, BudgetSnapshot, ExceedAction, ExitOwner, ExitStatus, FastPathVisibility,
+    FaultAction, FaultCondition, FaultInjector, FaultPredicate, FaultRule, FaultRuleBuilder,
+    FirstTouchDeliverReason, ForkKind, GuestCpuId, InterceptAction, InterceptedSyscall,
+    KernelAuditor, PolicyObserver, PolicyRule, ProcessInfo, ResourceBudget, SandboxObserver,
+    SandboxPreset, SyscallAction, SyscallArgIndexError, SyscallArgs, SyscallBitset, SyscallInfo,
+    SyscallInterceptor, SyscallObserver, SyscallOutcome, WakeRejectionReason, is_shortable_syscall,
 };
 pub use carrick_runtime::runtime::{RunResult, RuntimeError, TerminalReason};
 pub use carrick_spec::{Mount, Platform, RunSpec, StdioMode};

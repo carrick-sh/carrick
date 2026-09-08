@@ -1315,6 +1315,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-runtime/src/observe/auditor.rs",
+      "symbol": "CONTAINER_AUDITORS",
+      "fingerprint": "4c45de524f3ca91e6dbcec70f0d44140c53b0e48e8f20fdf146e3ae15d7d6c21",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is keyed by exact container identity, mapping container to auditor chain."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-runtime/src/pty_relay.rs",
       "symbol": "WINCH_PIPE_WRITE",
       "fingerprint": "0efde91efab0d3df7a93b1a0b6554a008420c9bc83e195109adfe32353429078",

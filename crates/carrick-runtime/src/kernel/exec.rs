@@ -571,6 +571,18 @@ impl Kernel {
         prepared.guard.commit_reservation();
         drop(state);
         drop(old_threads);
+        let generation_before = prepared
+            .old_caller
+            .execution_state()
+            .generation()
+            .unwrap_or(super::objects::ExecutionGeneration::INITIAL);
+        let generation_after = prepared
+            .replacement
+            .execution_state()
+            .generation()
+            .unwrap_or(super::objects::ExecutionGeneration::INITIAL);
+        self.auditors()
+            .exec_committed(task_key, generation_before, generation_after);
         self.retire_file_table_after_exec(&old_files, &prepared.resources.files());
         self.retire_mm_io_state_if_unreferenced(&prepared.old_mm);
         let context = KernelContext::from_parts(

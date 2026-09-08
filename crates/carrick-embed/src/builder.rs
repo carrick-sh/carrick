@@ -129,6 +129,7 @@ pub struct ContainerBuilder {
     max_traps: usize,
     observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
     interceptors: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor>>,
+    auditors: Vec<std::sync::Arc<dyn carrick_runtime::observe::KernelAuditor>>,
     network_interposer: Option<carrick_runtime::network::interposer::NetworkInterposer>,
     shared_buffers: Vec<(String, crate::SharedBuffer)>,
 }
@@ -170,6 +171,7 @@ impl ContainerBuilder {
             max_traps: DEFAULT_MAX_TRAPS,
             observers: Vec::new(),
             interceptors: Vec::new(),
+            auditors: Vec::new(),
             network_interposer: None,
             shared_buffers: Vec::new(),
         }
@@ -304,6 +306,15 @@ impl ContainerBuilder {
         observer: std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>,
     ) -> Self {
         self.observers.push(observer);
+        self
+    }
+
+    /// Register a kernel auditor to receive lifecycle events for this container.
+    pub fn auditor(
+        mut self,
+        auditor: std::sync::Arc<dyn carrick_runtime::observe::KernelAuditor>,
+    ) -> Self {
+        self.auditors.push(auditor);
         self
     }
 
@@ -478,6 +489,7 @@ impl ContainerBuilder {
             extensions,
             plan.captured,
             self.shared_buffers,
+            self.auditors,
             PreparedCarrierOwnership {
                 runtime: carrier,
                 lease: carrier_lease,

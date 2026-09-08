@@ -972,7 +972,11 @@ impl RunQueue {
         })
     }
 
-    fn take_row(&self, executor: &ExecutorRegistration) -> Result<QueueRow, RunQueueError> {
+    fn take_row(
+        &self,
+        executor: &ExecutorRegistration,
+        auditors: Option<&crate::observe::AuditorChain>,
+    ) -> Result<QueueRow, RunQueueError> {
         let mut state = self.inner.state.lock();
         loop {
             let control_epoch = self.inner.control_epoch.load(Ordering::Acquire);
@@ -1021,6 +1025,10 @@ impl RunQueue {
                 .checked_add(1)
                 .unwrap_or_else(|| std::process::abort());
             let close_epoch = state.close_epoch;
+            if let Some(auditors) = auditors {
+                let cpu = crate::observe::GuestCpuId::new(executor.id.raw_for_probe());
+                auditors.executor_parked(executor.id, cpu, None);
+            }
             self.inner.changed.wait(&mut state);
             state.waiters = state
                 .waiters
@@ -1041,9 +1049,10 @@ impl RunQueue {
         &self,
         executor: &ExecutorRegistration,
         recorder: Option<&dyn DiscardRecorder>,
+        auditors: Option<&crate::observe::AuditorChain>,
     ) -> Result<QueueClaim, RunQueueError> {
         loop {
-            let row = self.take_row(executor)?;
+            let row = self.take_row(executor, auditors)?;
             let observed_state = row.thread.execution_diagnostic();
             if row.thread.key() != row.key.thread
                 || row.thread.execution_state().generation() != Some(row.key.generation)
@@ -1487,8 +1496,89 @@ impl Scheduler {
 
     pub fn wake(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
         let _transition = self.generation_transition.lock();
-        let pending = self.begin_wake(thread)?;
-        self.commit_wake(pending)
+        let pending = match self.begin_wake(thread) {
+            Ok(pending) => pending,
+            Err(err) => {
+                self.audit_wake_rejection(thread, &err);
+                return Err(err);
+            }
+        };
+        match self.commit_wake(pending) {
+            Ok(disposition) => Ok(disposition),
+            Err(err) => {
+                self.audit_wake_rejection(thread, &err);
+                Err(err)
+            }
+        }
+    }
+
+    fn audit_wake_rejection(&self, thread: ThreadKey, err: &SchedulerError) {
+        let state = self.kernel.registry().state.read();
+        let mut target = None;
+        let mut reason = None;
+
+        for record in state.tasks.values() {
+            if let Some(t) = record.task.thread(thread.tid) {
+                if t.key() == thread {
+                    target = Some(record.task.key());
+                    reason = Some(match err {
+                        SchedulerError::Queue(RunQueueError::Closed) => {
+                            crate::observe::WakeRejectionReason::Closed
+                        }
+                        SchedulerError::Queue(RunQueueError::AuthorityMismatch) => {
+                            crate::observe::WakeRejectionReason::StaleGeneration
+                        }
+                        SchedulerError::Thread(
+                            super::objects::ThreadExecutionError::SchedulerThreadMismatch {
+                                ..
+                            },
+                        ) => crate::observe::WakeRejectionReason::StaleGeneration,
+                        _ => crate::observe::WakeRejectionReason::Other(err.to_string()),
+                    });
+                    break;
+                }
+            }
+        }
+
+        if target.is_none() {
+            for retired in &state.retired_threads {
+                if retired._key == thread {
+                    target = Some(retired._task);
+                    reason = Some(crate::observe::WakeRejectionReason::Reaped);
+                    break;
+                }
+            }
+        }
+
+        if target.is_none() {
+            for zombie_rec in state.zombies.values() {
+                if super::ids::LinuxTid::for_task_leader(zombie_rec.zombie.key.id) == thread.tid {
+                    target = Some(zombie_rec.zombie.key);
+                    reason = Some(crate::observe::WakeRejectionReason::Reaped);
+                    break;
+                }
+            }
+        }
+
+        let Some(target) = target else {
+            return;
+        };
+        let reason = reason.unwrap_or_else(|| match err {
+            SchedulerError::UnknownThread => crate::observe::WakeRejectionReason::Reaped,
+            SchedulerError::Queue(RunQueueError::Closed) => {
+                crate::observe::WakeRejectionReason::Closed
+            }
+            SchedulerError::Queue(RunQueueError::AuthorityMismatch) => {
+                crate::observe::WakeRejectionReason::StaleGeneration
+            }
+            SchedulerError::Thread(
+                super::objects::ThreadExecutionError::SchedulerThreadMismatch { .. },
+            ) => crate::observe::WakeRejectionReason::StaleGeneration,
+            _ => crate::observe::WakeRejectionReason::Other(err.to_string()),
+        });
+
+        drop(state);
+        self.kernel.auditors().wake_rejected(target, reason);
     }
 
     /// Schedule an owner-thread control quantum without completing the
@@ -1668,7 +1758,10 @@ impl Scheduler {
 
     pub fn take(&self, executor: &ExecutorRegistration) -> Result<RunnableThread, RunQueueError> {
         let recorder = self.discard_recorder.lock().clone();
-        let QueueClaim { row, lease } = self.queue.take(executor, recorder.as_deref())?;
+        let auditors = self.kernel.auditors();
+        let QueueClaim { row, lease } =
+            self.queue
+                .take(executor, recorder.as_deref(), Some(&auditors))?;
         let binding = ExecutorBinding {
             executor: executor.id,
             executor_epoch: lease.executor_epoch(),

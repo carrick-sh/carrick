@@ -362,6 +362,16 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     mutation: &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
 ) -> Result<bool, TrapError> {
     use carrick_observability::probes::HvpatchFirstTouchDeliverReason as DeliverReason;
+    let notify_first_touch_deliver = |reason: DeliverReason| {
+        crate::probes::hvpatch_first_touch_deliver(address, reason, tid.raw());
+        if let Ok(context) = dispatcher.capture_kernel_context(tid) {
+            context.kernel().auditors().first_touch_delivered(
+                context.task().key(),
+                address,
+                reason,
+            );
+        }
+    };
     {
         let permit = mutation.host_alias_permit();
         if let Some(plan) = dispatcher.resident_fault_plan(&permit, address) {
@@ -385,25 +395,13 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
             ) {
                 Some(true) => return Ok(true),
                 Some(false) => {
-                    crate::probes::hvpatch_first_touch_deliver(
-                        address,
-                        DeliverReason::ArmingDenies,
-                        tid.raw(),
-                    );
+                    notify_first_touch_deliver(DeliverReason::ArmingDenies);
                     return Ok(false);
                 }
-                None => crate::probes::hvpatch_first_touch_deliver(
-                    address,
-                    DeliverReason::BackendRefused,
-                    tid.raw(),
-                ),
+                None => notify_first_touch_deliver(DeliverReason::BackendRefused),
             }
         } else {
-            crate::probes::hvpatch_first_touch_deliver(
-                address,
-                DeliverReason::NoPendingEdit,
-                tid.raw(),
-            );
+            notify_first_touch_deliver(DeliverReason::NoPendingEdit);
         }
     }
     {
@@ -428,11 +426,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     if retried {
         crate::probes::hvpatch_stale_stage1_retry(address, access as u32, tid.raw());
     } else {
-        crate::probes::hvpatch_first_touch_deliver(
-            address,
-            DeliverReason::StaleLeafNotRetried,
-            tid.raw(),
-        );
+        notify_first_touch_deliver(DeliverReason::StaleLeafNotRetried);
     }
     Ok(retried)
 }

@@ -1665,7 +1665,7 @@
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "RunQueue::take_row",
       "ordinal_in_function": 1,
-      "fingerprint": "a6e33c71a98c334190fe7953eea24d635b65d49ab516b44816343e4b24bb8a24",
+      "fingerprint": "21eefb4c9cb561a6592521f9eb936823c92e1735d46f61f4fb7b5fdf8591af79",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue claimed count overflow in take_row; corrupts run queue claim accounting."
@@ -1674,7 +1674,7 @@
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "RunQueue::take_row",
       "ordinal_in_function": 2,
-      "fingerprint": "a6e33c71a98c334190fe7953eea24d635b65d49ab516b44816343e4b24bb8a24",
+      "fingerprint": "21eefb4c9cb561a6592521f9eb936823c92e1735d46f61f4fb7b5fdf8591af79",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue closed_waiter_observations count overflow in take_row; corrupts queue close draining synchronization."
@@ -1683,7 +1683,7 @@
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "RunQueue::take_row",
       "ordinal_in_function": 3,
-      "fingerprint": "a6e33c71a98c334190fe7953eea24d635b65d49ab516b44816343e4b24bb8a24",
+      "fingerprint": "21eefb4c9cb561a6592521f9eb936823c92e1735d46f61f4fb7b5fdf8591af79",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue waiters count overflow in take_row; corrupts waiter tracking."
@@ -1692,7 +1692,7 @@
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "RunQueue::take_row",
       "ordinal_in_function": 4,
-      "fingerprint": "a6e33c71a98c334190fe7953eea24d635b65d49ab516b44816343e4b24bb8a24",
+      "fingerprint": "21eefb4c9cb561a6592521f9eb936823c92e1735d46f61f4fb7b5fdf8591af79",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue waiters count underflow in take_row; indicates corrupted waiter accounting."
@@ -2171,7 +2171,7 @@
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
       "function": "Kernel::wait_child_matching",
       "ordinal_in_function": 1,
-      "fingerprint": "2211a3140732966e1cab25fe8883ef0317cbeeafab24bda63d5fac3fdd25822b",
+      "fingerprint": "dc192e2b30821f268c32654d42e1757fb3f8f374752fcae2b1ce849864e00040",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::child_reaping",
       "rationale": "A reaped child identity exceeded the PID namespace member domain after its zombie was consumed; continuing would be unable to retire the exact namespace slot."
@@ -2180,7 +2180,7 @@
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
       "function": "Kernel::wait_child_matching",
       "ordinal_in_function": 2,
-      "fingerprint": "2211a3140732966e1cab25fe8883ef0317cbeeafab24bda63d5fac3fdd25822b",
+      "fingerprint": "dc192e2b30821f268c32654d42e1757fb3f8f374752fcae2b1ce849864e00040",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::child_reaping",
       "rationale": "The PID namespace refused to remove the exact child just consumed by wait; continuing would permit stale PID reuse or double reaping."

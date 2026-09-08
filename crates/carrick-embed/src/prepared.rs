@@ -25,6 +25,7 @@ pub struct PreparedContainer {
     retired: Arc<AtomicBool>,
     current_generation: Arc<AtomicU64>,
     shared_buffers: Vec<(String, SharedBuffer)>,
+    auditors: Arc<carrick_runtime::observe::AuditorChain>,
     carrier: PreparedCarrierOwnership,
 }
 
@@ -41,12 +42,14 @@ impl PreparedContainer {
         extensions: RuntimeExtensions,
         captured: CapturedStreams,
         shared_buffers: Vec<(String, SharedBuffer)>,
+        auditors: Vec<Arc<dyn carrick_runtime::observe::KernelAuditor>>,
         carrier: PreparedCarrierOwnership,
     ) -> Self {
         let launch = carrier.lease.launch().clone();
         let generation = 1;
         let retired = Arc::new(AtomicBool::new(false));
         let current_generation = Arc::new(AtomicU64::new(generation));
+        let auditors = Arc::new(carrick_runtime::observe::AuditorChain::new(auditors));
         Self {
             spec,
             warnings,
@@ -57,6 +60,7 @@ impl PreparedContainer {
             retired,
             current_generation,
             shared_buffers,
+            auditors,
             carrier,
         }
     }
@@ -99,6 +103,15 @@ impl PreparedContainer {
         let carrier_lease = self.carrier.lease;
         let implicit_carrier = self.carrier.implicit;
         let retired = Arc::clone(&self.retired);
+        let container_id = self.launch.container_id;
+        carrick_runtime::observe::register_container_auditors(container_id, self.auditors.clone());
+        struct UnregisterGuard(carrick_runtime::kernel::ContainerId);
+        impl Drop for UnregisterGuard {
+            fn drop(&mut self) {
+                carrick_runtime::observe::unregister_container_auditors(self.0);
+            }
+        }
+        let _guard = UnregisterGuard(container_id);
         let prepared = prepare_on(&carrier, &self.spec, carrier_lease, self.extensions);
         let result = match prepared {
             Ok(prepared) => prepared.execute().map_err(crate::entitlement::classify),
@@ -112,6 +125,12 @@ impl PreparedContainer {
             if result.is_ok() {
                 shutdown?;
             }
+        }
+        drop(_guard);
+        if let Some(reason) = self.auditors.abort_reason() {
+            return Err(EmbedError::CarrierFailed {
+                reason: reason.to_string(),
+            });
         }
         let result = result?;
         Ok(ContainerResult::from_run_result(result, self.captured))
