@@ -743,9 +743,30 @@ struct QueueKeyShard {
     /// row is held in `deferred` instead of becoming claimable: the task's
     /// binding is still dormant, so a claim could only fail it.
     unpublished: BTreeSet<QueueKey>,
-    /// The one row a wake enqueued for an unpublished key, held until that
-    /// key is published (or until its authority is released).
+    /// Exact keys reserved BEFORE their thread was published to the Kernel as
+    /// `Runnable`, by [`Scheduler::publish_initial_task_state_gated`].
+    ///
+    /// Distinct from `unpublished` because it has a different lifetime. An
+    /// admission gate belongs to one authority and dies with it; a
+    /// pre-publication reservation belongs to the THREAD's first generation
+    /// and must outlive every authority that fails over it, because the clone
+    /// rollback's `drop(dormant)` releases the authority while the child is
+    /// still Kernel-runnable and still wakeable. It is retired only by that
+    /// generation's first publication or its terminal retirement, both of
+    /// which are bounded, so it cannot strand a long-lived thread's rows the
+    /// way a lifetime-wide gate did (measured on the pre-per-CPU queue: a
+    /// `go build` regression of 5 aborts in 46 runs, 0 in 46 on main).
+    prepublication: BTreeSet<QueueKey>,
+    /// The one row a wake enqueued for a gated key, held until that key is
+    /// published (or, for an admission gate, until its authority is released).
     deferred: BTreeMap<QueueKey, QueueRow>,
+}
+
+impl QueueKeyShard {
+    /// Whether any gate currently denies claimability for this exact key.
+    fn gated(&self, key: QueueKey) -> bool {
+        self.unpublished.contains(&key) || self.prepublication.contains(&key)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -889,10 +910,31 @@ impl RunQueueInner {
     /// on a CPU queue, so `total_queued` never counted it and does not change.
     fn clear_unpublished(&self, key: QueueKey) {
         let mut shard = self.shard(key).lock();
+        // The ADMISSION gate dies with its authority, as it did in 119f07e97.
+        // What must NOT die with it is the thread's pre-publication
+        // reservation: the clone rollback's `drop(dormant)` releases this
+        // authority while the child is still Kernel-runnable and wakeable, and
+        // a claim there is the abort the reservation exists to stop.
         shard.unpublished.remove(&key);
         if shard.deferred.remove(&key).is_some() {
             shard.queued.remove(&key);
         }
+    }
+
+    /// Reserve one exact key ahead of its thread's Kernel publication, so the
+    /// key is unclaimable from the instant a producer can wake it.
+    fn reserve_prepublication(&self, key: QueueKey) {
+        self.shard(key).lock().prepublication.insert(key);
+    }
+
+    /// Retire every gate on one exact key, and the row held behind it. Only
+    /// the terminal retirement of that exact generation may do this: after
+    /// `fail_runnable_exact` / `fail_blocked_exact` the Kernel refuses to
+    /// queue the generation at all, so a gate has nothing left to guard and
+    /// keeping it would leak one entry per failed submission.
+    fn retire_gates(shard: &mut QueueKeyShard, key: QueueKey) {
+        shard.unpublished.remove(&key);
+        shard.prepublication.remove(&key);
     }
 
     /// Move an unpublished gate (and the row deferred behind it) from one
@@ -1139,9 +1181,13 @@ impl RunQueueInner {
                 return Ok(EnqueueOutcome::Coalesced);
             }
             shard.queued.insert(key);
-            if shard.unpublished.contains(&key) {
+            if shard.gated(key) {
                 // The submission that owns this exact generation is admitted
-                // but still dormant. Own the wake edge -- it must not be lost
+                // but still dormant, or the thread was reserved ahead of its
+                // Kernel publication and owns no submission at all. Either way
+                // no binding is resolvable for the key yet.
+                //
+                // Own the wake edge -- it must not be lost
                 // -- and hold the row off every CPU queue until publication
                 // makes the binding resolvable. A deferred row is invisible to
                 // a claim, a steal and a nudge alike, which is the whole point:
@@ -1193,7 +1239,10 @@ impl RunQueueInner {
         let waiter_present = {
             let mut local = cpu.state.lock();
             let mut shard = self.shard(key).lock();
-            shard.unpublished.remove(&key);
+            // Publication is the ordinary lift for BOTH gates: the admission
+            // gate of the submission being published, and the thread's
+            // pre-publication reservation, whose first generation this is.
+            Self::retire_gates(&mut shard, key);
             let publishable = if let Some(held) = shard.deferred.remove(&key) {
                 // The membership a deferred wake took stays; only the row moves.
                 held
@@ -1885,6 +1934,12 @@ impl RunQueue {
         }
     }
 
+    /// Remove one exact row because its generation has been terminally
+    /// retired. This is also the only place a gate is lifted without a
+    /// publication: the Kernel will refuse to queue the generation again, so
+    /// neither the admission gate nor the pre-publication reservation has
+    /// anything left to guard, and leaving them would leak one entry per
+    /// failed submission.
     fn remove_exact(&self, key: QueueKey) -> bool {
         for cpu in &self.inner.cpus {
             let mut local = cpu.state.lock();
@@ -1892,23 +1947,30 @@ impl RunQueue {
                 continue;
             };
             local.rows.remove(index);
-            self.inner.shard(key).lock().queued.remove(&key);
+            {
+                let mut shard = self.inner.shard(key).lock();
+                shard.queued.remove(&key);
+                RunQueueInner::retire_gates(&mut shard, key);
+            }
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.inner.total_queued.fetch_sub(1, Ordering::SeqCst);
             drop(local);
             self.inner.settle_close_if_closing();
             return true;
         }
-        // A row deferred behind an unpublished gate is on no CPU queue and was
-        // never counted, so removing it touches only the shard.
+        // A row deferred behind a gate is on no CPU queue and was never
+        // counted, so removing it touches only the shard.
         let mut shard = self.inner.shard(key).lock();
-        if shard.deferred.remove(&key).is_some() {
+        let held = shard.deferred.remove(&key).is_some();
+        if held {
             shard.queued.remove(&key);
-            drop(shard);
-            self.inner.settle_close_if_closing();
-            return true;
         }
-        false
+        RunQueueInner::retire_gates(&mut shard, key);
+        drop(shard);
+        if held {
+            self.inner.settle_close_if_closing();
+        }
+        held
     }
 
     fn admit_root(
@@ -2739,6 +2801,52 @@ impl Scheduler {
         self.wake(thread)
     }
 
+    /// Publish a brand-new thread's initial task state with its claimability
+    /// gate already standing.
+    ///
+    /// The gate `admit_*` raises is not early enough on its own. A clone or
+    /// fork child becomes `Runnable { INITIAL }` in the Kernel graph hundreds
+    /// of lines before `prepare_submission` admits the submission that owns
+    /// it -- the carrier backend, the COW token, the logical job and the start
+    /// gate all come first -- and in that window the key is not marked, so a
+    /// producer's wake (a futex on the tid the clone already copied out, a
+    /// group signal) enqueued a CLAIMABLE row for a generation with no binding
+    /// record at all. An executor claimed it, `resolve` reported "missing
+    /// exact HVPatch task binding", the task settled `SnapshotRestoreFailed`
+    /// and the carrier died -- `cpython-threading` `test_reinit_tls_after_fork`,
+    /// reproduced in ~13 s at host load 9-15.
+    ///
+    /// Reserving the gate BEFORE the Kernel publication removes the window
+    /// entirely: the key is unclaimable from the instant it can be woken until
+    /// the submission that owns it publishes. The reservation is deliberately
+    /// NOT the admission gate -- it belongs to the thread's first generation,
+    /// not to any one authority, so it survives the `drop(dormant)` every
+    /// clone-rollback arm performs. A failed publication takes its reservation
+    /// with it, since nothing can ever be woken for a generation that does not
+    /// exist.
+    pub(crate) fn publish_initial_task_state_gated(
+        &self,
+        thread: &Arc<Thread>,
+        state: super::objects::MigratableTaskState,
+    ) -> Result<ExecutionGeneration, ThreadExecutionError> {
+        let key = QueueKey {
+            thread: thread.key(),
+            generation: ExecutionGeneration::INITIAL,
+        };
+        self.queue.inner.reserve_prepublication(key);
+        match thread.publish_initial_task_state(state) {
+            Ok(generation) => {
+                debug_assert_eq!(generation, ExecutionGeneration::INITIAL);
+                Ok(generation)
+            }
+            Err(error) => {
+                let mut shard = self.queue.inner.shard(key).lock();
+                RunQueueInner::retire_gates(&mut shard, key);
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn fail_runnable_exact(
         &self,
         key: ThreadKey,
@@ -2798,6 +2906,13 @@ impl Scheduler {
             successor,
             SchedulerGenerationTransition::Terminal,
         );
+        // Terminal retirement of the exact generation: a gate a dormant
+        // admission or a pre-publication reservation left behind has nothing
+        // to guard once the Kernel refuses to queue this generation again.
+        self.queue.remove_exact(QueueKey {
+            thread: key,
+            generation,
+        });
         Ok(true)
     }
 
@@ -5393,8 +5508,13 @@ mod tests {
 
         drop(authority);
         // The held row went with it: the exact key is unqueued (a fresh wake
-        // reports `Queued`, not `Coalesced`) and, with no gate left, that
-        // wake is claimable immediately.
+        // reports `Queued`, not `Coalesced`) and, with the ADMISSION gate
+        // gone, that wake is claimable immediately. This fixture admits
+        // directly, so it carries no pre-publication reservation; the
+        // production shape -- where the thread was published to the Kernel
+        // through `publish_initial_task_state_gated` and the reservation
+        // outlives the authority -- is covered by
+        // `a_dropped_dormant_submission_leaves_no_claimable_row_for_its_generation`.
         assert_eq!(
             scheduler.make_runnable(context.thread().key()).unwrap(),
             WakeDisposition::Queued
