@@ -2194,3 +2194,14 @@ startup `SIGSEGV` in `persistentalloc` (~1 in 8 compiles, both windows),
 exit wedges with every executor idle (the wake-vs-reap family), and the
 observer abort. The 64 KiB default returns with this landing; the
 receipts are in `target/conformance/eco-load/land-window.log`.
+
+**Landed with the 64 KiB default** (`9ac383a69`, main binary `1536e789…`,
+load ~5): `cpython-itertools` 3.6 s (3.5x; was 20–28 s), `importlib`
+7.1 s (2.6x; was 10.9), `multiprocessing_main_handling` 14.8 s (5.1x; was
+33), `cpython-compile` MATCH 150/150 in 62 s (was the 300 s cap),
+`go-go_types` 18.3 s (3.0x; was 22.6) but 569/571, the mm rows MATCH, the
+go-build reducer 16 builds with zero bitmap fatals and one `SIGSEGV`.
+That `SIGSEGV` (SEGV_MAPERR in `runtime.persistentalloc1`, first touch of
+a chunk Go just `mmap`ed on another M) is the one remaining
+memory-integrity class: window-independent, load-coupled, ~1 in 8
+compiles. A Fable subagent is on it (brief `fable-segv.md`).
