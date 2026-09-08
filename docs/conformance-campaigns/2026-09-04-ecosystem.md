@@ -3114,3 +3114,13 @@ MATCHES the oracle even when the rejected wake fires, and
 whole bug. Filed for after round 7. Gates on the triage branch: clippy 0,
 lint 0, test 0, build 0; the probe gate runs 643 executions with zero DIFFs
 in its second run, failing only on `mqnotifycrossproc`.
+
+**Probe-triage fixes landed (`opus/probetriage-sep08` → main, 17th
+landing):** `processvmsparse` (a never-written window-backed page reads as
+zeros in the foreign-mm read lease, 12c807779) and the typed
+`ZombieReaper` on the zombie event (899da1f37, aab1f8d2b). Director gates:
+lint 0, workspace check 0, both red-first tests run directly in the
+worktree; build, lint, shards, the full `just conformance-probes` gate and
+the memory rows chained on main. Expected gate state after this: 643
+probe executions, failing only on `mqnotifycrossproc` until its wake-audit
+fix lands (brief written, dispatch after scheduler round 7).
