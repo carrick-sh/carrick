@@ -322,6 +322,9 @@ pub trait FsBackend: Send + Sync {
     fn archive_mutation_gate(&self) -> Option<&ArchiveMutationGate> {
         None
     }
+    /// Attach a weak reference to the dentry cache so the backend can query and update it.
+    fn attach_dentry_cache(&self, _cache: std::sync::Weak<crate::vfs::DentryCache>) {}
+
     /// Snapshot the durable root authority needed by native host self-reexec.
     /// Memory and synthetic backends reject this boundary explicitly.
     fn native_reexec_authority(&self) -> Result<HostFsReexecAuthority, BackendError> {
@@ -1922,6 +1925,7 @@ pub struct HostFsBackend {
     /// it; the later `insert` replaces the earlier. Both are valid, contained
     /// and independently owned, so the only effect is a transient second fd.
     dir_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, DirCacheEntry>>,
+    dentry_cache: parking_lot::Mutex<Option<std::sync::Weak<crate::vfs::DentryCache>>>,
     /// The process generation that owns the current [`Self::dir_cache`] fds.
     /// Changed on host fork so a child drops inherited entries and adopts
     /// the cache for this process. Replaces per-call `libc::getpid()`.
@@ -2661,6 +2665,7 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            dentry_cache: parking_lot::Mutex::new(None),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
@@ -2719,6 +2724,7 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            dentry_cache: parking_lot::Mutex::new(None),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
@@ -2885,6 +2891,19 @@ impl HostFsBackend {
                 && entry.dir_generation == generation
             {
                 return Ok(entry.fd.clone());
+            }
+        }
+
+        if let Some(weak) = self.dentry_cache.lock().as_ref()
+            && let Some(dc) = weak.upgrade()
+        {
+            let guest_path = if dir.as_os_str().is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", dir.to_string_lossy())
+            };
+            if let Some(fd) = dc.upper_dir_fd_for_guest_path(&guest_path) {
+                return Ok(fd);
             }
         }
 
@@ -3095,6 +3114,16 @@ impl HostFsBackend {
     ) {
         if !self.fast_fs {
             return;
+        }
+        if let Some(weak) = self.dentry_cache.lock().as_ref()
+            && let Some(dc) = weak.upgrade()
+        {
+            let guest_path = if dir.as_os_str().is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", dir.to_string_lossy())
+            };
+            dc.publish_dir_upper_fd(&guest_path, fd);
         }
         const DIR_CACHE_MAX_ENTRIES: usize = 4096;
         let mut cache = self.dir_cache.lock();
@@ -4615,24 +4644,7 @@ impl HostFsBackend {
                 continue;
             }
             let d_type = unsafe { (*entry).d_type };
-            let size = if d_type == libc::DT_REG {
-                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                if unsafe {
-                    libc::fstatat(
-                        parent_fd.as_raw_fd(),
-                        d_name.as_ptr(),
-                        &mut st,
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                } == 0
-                {
-                    Some(st.st_size as u64)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let size = None;
             if let Some(item) = f(d_name, d_type, size) {
                 results.push(item);
             }
@@ -5415,6 +5427,10 @@ pub(crate) fn write_owner_xattr(
 impl FsBackend for HostFsBackend {
     fn serves_dentry_cache(&self) -> bool {
         true
+    }
+
+    fn attach_dentry_cache(&self, cache: std::sync::Weak<crate::vfs::DentryCache>) {
+        *self.dentry_cache.lock() = Some(cache);
     }
 
     fn name_matches_on_disk(&self, rel: &Path) -> bool {
@@ -6259,16 +6275,6 @@ impl FsBackend for HostFsBackend {
             Some(pair) => pair,
             None => return Ok(false),
         };
-        let mut before: libc::stat = unsafe { core::mem::zeroed() };
-        let removed_symlink = unsafe {
-            libc::fstatat(
-                parent_fd.as_raw_fd(),
-                leaf_c.as_ptr(),
-                &mut before,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } == 0
-            && before.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32;
         let mut rc = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0) };
         let mut removed_dir = false;
         if rc != 0 {
@@ -6284,9 +6290,7 @@ impl FsBackend for HostFsBackend {
         }
         if rc == 0 {
             crate::fs_resolve_cache::bump_generation();
-            if removed_dir || removed_symlink {
-                self.evict_dir_cache_subtree(rel);
-            }
+            self.evict_dir_cache_subtree(rel);
             if self.use_stat_cache {
                 let mut map = self.stat_cache.lock();
                 map.remove(rel);

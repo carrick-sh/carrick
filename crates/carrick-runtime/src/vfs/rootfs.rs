@@ -137,25 +137,33 @@ impl OpenDispatchResult {
 
 impl RootFsVfs {
     pub fn new() -> Self {
+        let cache = Arc::new(crate::vfs::DentryCache::new(false));
+        let overlay = Box::new(MemoryBackend::new());
+        overlay.attach_dentry_cache(Arc::downgrade(&cache));
         Self {
             rootfs: None,
-            overlay: Box::new(MemoryBackend::new()),
-            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
+            overlay,
+            dentry_cache: cache,
         }
     }
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
+        let cache = Arc::new(crate::vfs::DentryCache::new(false));
+        let overlay = Box::new(MemoryBackend::new());
+        overlay.attach_dentry_cache(Arc::downgrade(&cache));
         Self {
             rootfs: Some(rootfs),
-            overlay: Box::new(MemoryBackend::new()),
-            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
+            overlay,
+            dentry_cache: cache,
         }
     }
 
     /// Swap the writable overlay. Returns the previously-installed
     /// backend so the caller can decide what to do with it.
     pub fn set_overlay(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
-        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(backend.is_shared()));
+        let cache = Arc::new(crate::vfs::DentryCache::new(backend.is_shared()));
+        backend.attach_dentry_cache(Arc::downgrade(&cache));
+        self.dentry_cache = cache;
         std::mem::replace(&mut self.overlay, backend)
     }
 
@@ -289,7 +297,9 @@ impl RootFsVfs {
     /// Reset dentry cache on rootfs layer mutation.
     pub fn reset_dentry_cache(&mut self) {
         let is_shared = self.dentry_cache.is_shared();
-        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(is_shared));
+        let cache = Arc::new(crate::vfs::DentryCache::new(is_shared));
+        self.overlay.attach_dentry_cache(Arc::downgrade(&cache));
+        self.dentry_cache = cache;
     }
 
     /// Create raw host fd in writable overlay and announce creation to dentry cache.
@@ -1339,11 +1349,17 @@ impl RootFsVfs {
     /// Layered "is this path a directory" check. Used by the
     /// dispatcher to validate mkdir/rename parent paths.
     pub fn is_directory(&self, path: &str) -> bool {
-        match self.overlay.lookup(path) {
-            Some(OverlayEntry::Dir) => return true,
-            Some(OverlayEntry::File(_)) => return false,
-            Some(OverlayEntry::Deleted) => return false,
+        if self.dentry_cache.has_dir(path) {
+            return true;
+        }
+        match self.overlay.lookup_kind(path) {
+            Some(OverlayEntryKind::Dir) => return true,
+            Some(OverlayEntryKind::File) => return false,
+            Some(OverlayEntryKind::Deleted) => return false,
             None => {}
+        }
+        if !self.dentry_cache.has_lower_dir(path) {
+            return false;
         }
         self.rootfs
             .as_ref()
@@ -1681,14 +1697,15 @@ impl Vfs for RootFsVfs {
         // Layered EEXIST: an existing overlay or rootfs entry (file
         // or dir) at `path` blocks mkdir. A tombstone clears the
         // rootfs view so a re-create is allowed.
-        match self.overlay.lookup(path) {
-            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
+        match self.overlay.lookup_kind(path) {
+            Some(OverlayEntryKind::Dir) | Some(OverlayEntryKind::File) => {
                 return Err(LINUX_EEXIST);
             }
-            Some(OverlayEntry::Deleted) => {}
+            Some(OverlayEntryKind::Deleted) => {}
             None => {
-                if let Some(rootfs) = self.rootfs.as_ref()
-                    && rootfs.metadata(path).is_ok()
+                if self
+                    .dentry_cache
+                    .lower_has_entry(path, self.rootfs.as_ref())
                 {
                     return Err(LINUX_EEXIST);
                 }
@@ -1745,10 +1762,8 @@ impl Vfs for RootFsVfs {
             // Tombstone only if the rootfs also has this path, so a
             // re-create still works.
             let rootfs_has_it = self
-                .rootfs
-                .as_ref()
-                .map(|r| r.symlink_metadata(path).is_ok())
-                .unwrap_or(false);
+                .dentry_cache
+                .lower_has_entry(path, self.rootfs.as_ref());
             if rootfs_has_it {
                 self.overlay
                     .mark_deleted(path)
@@ -1786,9 +1801,14 @@ impl Vfs for RootFsVfs {
         // Linux rmdir(2) requires the directory to be empty (ENOTEMPTY
         // otherwise). The layered view must show no surviving children:
         // overlay-owned entries plus rootfs entries that aren't tombstoned.
+        let rf_for_empty_check = if !self.dentry_cache.has_lower_dir(path) {
+            None
+        } else {
+            self.rootfs.as_ref()
+        };
         if let Ok(entries) = crate::overlay::layered_directory_entries(
             self.overlay.as_ref(),
-            self.rootfs.as_ref(),
+            rf_for_empty_check,
             path,
         ) && !entries.is_empty()
         {
@@ -1802,10 +1822,8 @@ impl Vfs for RootFsVfs {
         if in_overlay {
             self.overlay.remove_entry(path);
             let rootfs_has_it = self
-                .rootfs
-                .as_ref()
-                .map(|r| r.symlink_metadata(path).is_ok())
-                .unwrap_or(false);
+                .dentry_cache
+                .lower_has_entry(path, self.rootfs.as_ref());
             if rootfs_has_it {
                 self.overlay
                     .mark_deleted(path)
