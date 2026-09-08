@@ -1892,13 +1892,29 @@ impl HvpatchRuntimeDirectory {
 
     fn notify_child_exit(&self, parent: crate::kernel::TaskKey, signal: Option<i32>) {
         let Some(endpoint) = self.endpoints.lock().get(&parent).cloned() else {
+            tracing::error!(
+                parent = ?parent,
+                "child exit notification dropped: no runtime endpoint for the parent"
+            );
             return;
         };
         let Some(parent_kernel) = endpoint.kernel.upgrade() else {
+            tracing::error!(
+                parent = ?parent,
+                "child exit notification dropped: parent KernelState already dropped"
+            );
             return;
         };
-        let Ok(signal_snapshot) = endpoint.task_binding.capture_signal_snapshot() else {
-            return;
+        let signal_snapshot = match endpoint.task_binding.capture_signal_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::error!(
+                    parent = ?parent,
+                    %error,
+                    "child exit notification dropped: parent signal snapshot unavailable"
+                );
+                return;
+            }
         };
         let signal_context = signal_snapshot.context();
         if let Some(signal) = signal
@@ -2770,8 +2786,15 @@ impl KernelState {
     }
 
     fn notify_hvpatch_parent_exit(&self, parent: Option<crate::kernel::TaskKey>) {
-        if let (Some(parent), Some(directory)) = (parent, self.hvpatch_runtime.as_ref()) {
-            directory.notify_child_exit(parent, self.child_exit_signal);
+        match (parent, self.hvpatch_runtime.as_ref()) {
+            (Some(parent), Some(directory)) => {
+                directory.notify_child_exit(parent, self.child_exit_signal);
+            }
+            (Some(parent), None) => tracing::error!(
+                parent = ?parent,
+                "child exit notification dropped: no HVPatch runtime directory"
+            ),
+            (None, _) => {}
         }
     }
 
@@ -5690,6 +5713,11 @@ where
         let publish_result = process.publish_exit_status(status, orphan_adopter, |parent| {
             if child {
                 self.kernel.notify_hvpatch_parent_exit(parent);
+            } else if let Some(parent) = parent {
+                tracing::error!(
+                    parent = ?parent,
+                    "child exit notification dropped: is_child() said no parent but the exit transaction named one"
+                );
             }
         });
         if publish_result.is_ok() {

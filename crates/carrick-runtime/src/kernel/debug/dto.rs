@@ -294,6 +294,7 @@ pub struct DebugContinuationRegistrationRow {
     pub state: String,
     pub event: Option<String>,
     pub probe: String,
+    pub signal_readiness: String,
     pub poll_fds: Vec<DebugPollFdRow>,
     pub subscriptions: usize,
     pub has_task_waker: bool,
@@ -1347,6 +1348,7 @@ fn continuation_row(
                 state: registration.state.clone(),
                 event: registration.event.map(str::to_owned),
                 probe: registration.probe.clone(),
+                signal_readiness: registration.signal_readiness.clone(),
                 poll_fds: registration
                     .poll_fds
                     .iter()

@@ -406,6 +406,11 @@ pub struct ContinuationRegistrationDiagnostic {
     pub state: String,
     pub event: Option<&'static str>,
     pub probe: String,
+    /// The signal/task-wake generations this registration was captured at and
+    /// the producer task's current values. A child wait rides the task EVENT
+    /// generation; `observed_event == current_event` on a parked wait whose
+    /// child is already a zombie means no producer edge was ever published.
+    pub signal_readiness: String,
     /// Host fds the reactor polls for this registration, with their `poll(2)`
     /// event mask. Empty for probes that are not fd-driven.
     pub poll_fds: Vec<DiagnosticPollFd>,
@@ -417,6 +422,29 @@ pub struct ContinuationRegistrationDiagnostic {
 pub struct DiagnosticPollFd {
     pub fd: i32,
     pub events: i16,
+}
+
+/// The guest side of an fd wait: the exact slots it is authorised against.
+/// Rendered as `<fd>@<description>` so a snapshot reader can join straight to
+/// the `file_slots` / `file_descriptions` tables and name the pipe, socket or
+/// epoll the thread is parked on. The host fds in `poll_fds` are private dups
+/// and join to nothing.
+fn fd_authority_diagnostic(authority: &WaitFdAuthority) -> String {
+    let render = |slots: &[crate::kernel::objects::FileSlotAuthority]| {
+        slots
+            .iter()
+            .map(|slot| format!("{}@{}", slot.number().raw(), slot.description().raw()))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    match authority {
+        WaitFdAuthority::Empty => "slots=empty".to_owned(),
+        WaitFdAuthority::Missing => "slots=missing".to_owned(),
+        WaitFdAuthority::Logical { strict, watched } => {
+            format!("slots=[{}] watched=[{}]", render(strict), render(watched))
+        }
+        WaitFdAuthority::Internal(_) => "slots=internal".to_owned(),
+    }
 }
 
 fn detail_diagnostic(detail: &ContinuationDetail) -> String {
@@ -433,11 +461,22 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
         ContinuationDetail::Fds {
             registrations,
             on_timeout,
+            fd_authority,
             ..
-        } => format!("fds n={} on_timeout={on_timeout}", registrations.len()),
-        ContinuationDetail::Select { registrations, .. } => {
-            format!("select n={}", registrations.len())
-        }
+        } => format!(
+            "fds n={} on_timeout={on_timeout} {}",
+            registrations.len(),
+            fd_authority_diagnostic(fd_authority)
+        ),
+        ContinuationDetail::Select {
+            registrations,
+            fd_authority,
+            ..
+        } => format!(
+            "select n={} {}",
+            registrations.len(),
+            fd_authority_diagnostic(fd_authority)
+        ),
         ContinuationDetail::HostWrite(_) => "host-write".to_owned(),
         ContinuationDetail::RecordLock(_) => "record-lock".to_owned(),
         ContinuationDetail::Process { selector, .. } => match selector {
@@ -486,9 +525,15 @@ fn probe_diagnostic(probe: &ReadinessProbe) -> (String, Vec<DiagnosticPollFd>) {
         ),
         ReadinessProbe::RecordLock { .. } => ("record-lock".to_owned(), Vec::new()),
         ReadinessProbe::TaskWake { task, observed, .. } => (
-            format!(
-                "task-wake observed={observed} task_alive={}",
-                task.upgrade().is_some()
+            task.upgrade().map_or_else(
+                || format!("task-wake observed={observed} task=dropped"),
+                |task| {
+                    format!(
+                        "task-wake observed={observed} current={} events={}",
+                        task.wake_generation(),
+                        task.task_event_generation()
+                    )
+                },
             ),
             Vec::new(),
         ),
@@ -528,6 +573,7 @@ fn registration_diagnostic(binding: &RegistrationBinding) -> ContinuationRegistr
         state: state.to_owned(),
         event: None,
         probe: "none".to_owned(),
+        signal_readiness: "unavailable".to_owned(),
         poll_fds: Vec::new(),
         subscriptions: 0,
         has_task_waker: false,
@@ -545,7 +591,26 @@ fn registration_diagnostic(binding: &RegistrationBinding) -> ContinuationRegistr
         return absent("token-mismatch");
     }
     let (probe, poll_fds) = probe_diagnostic(&entry.probe);
+    let signal_readiness = entry.signal_readiness.task_ref.upgrade().map_or_else(
+        || {
+            format!(
+                "observed_wake={} observed_event={} task=dropped",
+                entry.signal_readiness.observed_task_wake,
+                entry.signal_readiness.observed_task_event
+            )
+        },
+        |task| {
+            format!(
+                "observed_wake={} current_wake={} observed_event={} current_event={}",
+                entry.signal_readiness.observed_task_wake,
+                task.wake_generation(),
+                entry.signal_readiness.observed_task_event,
+                task.task_event_generation()
+            )
+        },
+    );
     ContinuationRegistrationDiagnostic {
+        signal_readiness,
         continuation: token.continuation.raw(),
         thread_serial: token.thread_serial,
         execution_generation: token.execution_raw,
