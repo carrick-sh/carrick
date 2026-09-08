@@ -722,6 +722,36 @@ pub enum HvpatchFrameCowIntent {
     PrivilegedInternal = 2,
 }
 
+/// Why the runtime delivered an EL0 data abort as a signal instead of
+/// resolving it as an anonymous first touch (`resolve_mutating_fault`). One
+/// record per delivered fault; ordinals are read by `scripts/dtrace/`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchFirstTouchDeliverReason {
+    /// The page is in no first-touch tracked extent and no grow-down VMA:
+    /// the dispatcher has nothing to resolve (a genuine bad access, or a
+    /// mapping the dispatcher never published).
+    NotTracked = 0,
+    /// Tracked, but no pending first-touch edit names the page (already
+    /// committed, or retired by a sibling's unmap).
+    NoPendingEdit = 1,
+    /// The pending edit's arming protection denies the decoded access class
+    /// (a write to a `PROT_READ` first-touch page), or the class is unknown.
+    ArmingDenies = 2,
+    /// The backend refused to materialize or protect the page (paired with
+    /// `resident-fault-protection-error`, which carries the error text).
+    BackendRefused = 3,
+    /// No pending edit and no grow-down plan, and the live stage-1 leaf did
+    /// not satisfy the access, so the stale-fault retry declined.
+    StaleLeafNotRetried = 4,
+}
+
+impl HvpatchFirstTouchDeliverReason {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Exact authority that triggered a frame-COW transaction. Append only: these
 /// ordinals are part of the signed structural-receipt ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2262,6 +2292,10 @@ mod hvpatch_guest_probe_abi {
             "stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));",
             "fn hvpatch__stale__stage1__retry(_: u64, _: u32, _: i32) {}",
             "stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));",
+            "fn hvpatch__cow__runtime__bind(_: u64, _: u32, _: u64, _: i32, _: u32) {}",
+            "stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));",
+            "fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}",
+            "stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));",
             "fn stage1__arena__bind(_: u64, _: u32, _: u32, _: u32) {}",
             "stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));",
             "fn stage1__arena__install(_: u32, _: u32, _: u32, _: u64) {}",
@@ -4833,6 +4867,19 @@ mod real {
         /// of receiving SIGSEGV. Args: FAR, decoded access (0 read, 1 write,
         /// 2 execute), guest TID.
         fn hvpatch__stale__stage1__retry(_: u64, _: u32, _: i32) {}
+        /// The MM-scoped frame-COW runtime binding (the authority a sparse
+        /// first-touch publication quiesces through) was offered by a task.
+        /// Args: mm, ASID, authority pointer (identifies the `Arc`), the
+        /// offering task's Linux TID, and whether the offer REPLACED the
+        /// binding (1) or was absorbed because an equivalent MM binding was
+        /// already published (0). Fires at task bring-up and exec, never on
+        /// the fault path.
+        fn hvpatch__cow__runtime__bind(_: u64, _: u32, _: u64, _: i32, _: u32) {}
+        /// The runtime delivered an EL0 data abort as a signal instead of
+        /// resolving it as a first touch. Args: FAR, reason ordinal
+        /// (`HvpatchFirstTouchDeliverReason`), Linux TID. Fires once per
+        /// delivered fault, never on a resolved one.
+        fn hvpatch__first__touch__deliver(_: u64, _: u32, _: i32) {}
         /// Stage-1 page-table authority (re)bound into a VMM task state. Args:
         /// authority pointer (identifies the shared `Arc`), manager present,
         /// manager has a table arena source, arena count. Fires only at bind
@@ -6002,6 +6049,31 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32) {
         carrick_usdt::hvpatch__stale__stage1__retry!(|| (far, access, tid));
+    }
+
+    /// The runtime delivered an EL0 data abort as a signal instead of
+    /// resolving it as a first touch. See the `hvpatch__first__touch__deliver`
+    /// provider doc.
+    #[inline(never)]
+    pub fn hvpatch_first_touch_deliver(
+        far: u64,
+        reason: super::HvpatchFirstTouchDeliverReason,
+        tid: i32,
+    ) {
+        carrick_usdt::hvpatch__first__touch__deliver!(|| (far, reason.raw(), tid));
+    }
+
+    /// A task offered the MM-scoped frame-COW runtime binding. See the
+    /// `hvpatch__cow__runtime__bind` provider doc.
+    #[inline(never)]
+    pub fn hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool) {
+        carrick_usdt::hvpatch__cow__runtime__bind!(|| (
+            mm,
+            asid,
+            authority,
+            tid,
+            u32::from(replaced)
+        ));
     }
 
     /// See the `stage1__arena__bind` provider doc. Bind-time only.
@@ -7954,6 +8026,8 @@ mod stub {
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
     stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));
+    stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));
+    stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
     stub!(stage1_arena_bind(authority: u64, present: u32, has_source: u32, arenas: u32));
     stub!(stage1_arena_install(site: u32, applied: u32, deferred: u32, authority: u64));
     stub!(stage1_arena_replace(site: u32, source_before: u32, source_after: u32, authority: u64));

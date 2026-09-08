@@ -361,12 +361,13 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     tid: crate::kernel::LinuxTid,
     mutation: &mut crate::dispatch::mm_mutation::MmMutationGuard<'_>,
 ) -> Result<bool, TrapError> {
+    use carrick_observability::probes::HvpatchFirstTouchDeliverReason as DeliverReason;
     {
         let permit = mutation.host_alias_permit();
         if let Some(plan) = dispatcher.resident_fault_plan(&permit, address) {
             let page = plan.page();
             let prot = plan.prot();
-            if let Some(resolved) = apply_first_touch(
+            match apply_first_touch(
                 prot,
                 access,
                 || match engine.protect_range(
@@ -382,8 +383,27 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 },
                 || dispatcher.commit_resident_fault(plan),
             ) {
-                return Ok(resolved);
+                Some(true) => return Ok(true),
+                Some(false) => {
+                    crate::probes::hvpatch_first_touch_deliver(
+                        address,
+                        DeliverReason::ArmingDenies,
+                        tid.raw(),
+                    );
+                    return Ok(false);
+                }
+                None => crate::probes::hvpatch_first_touch_deliver(
+                    address,
+                    DeliverReason::BackendRefused,
+                    tid.raw(),
+                ),
             }
+        } else {
+            crate::probes::hvpatch_first_touch_deliver(
+                address,
+                DeliverReason::NoPendingEdit,
+                tid.raw(),
+            );
         }
     }
     {
@@ -407,6 +427,12 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     let retried = engine.resolve_stale_stage1_fault(address, access)?;
     if retried {
         crate::probes::hvpatch_stale_stage1_retry(address, access as u32, tid.raw());
+    } else {
+        crate::probes::hvpatch_first_touch_deliver(
+            address,
+            DeliverReason::StaleLeafNotRetried,
+            tid.raw(),
+        );
     }
     Ok(retried)
 }

@@ -3626,13 +3626,22 @@ impl SyscallDispatcher {
         let page = page_floor(addr, self.linux_page_size());
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        mem.resident_tracked_ranges
+        let tracked = mem
+            .resident_tracked_ranges
             .iter()
             .any(|range| page >= range.start().raw() && page < range.end().raw())
             || mem
                 .growdown_ranges
                 .iter()
-                .any(|&(low, _current, end)| page >= low && page < end)
+                .any(|&(low, _current, end)| page >= low && page < end);
+        if !tracked {
+            crate::probes::hvpatch_first_touch_deliver(
+                addr,
+                carrick_observability::probes::HvpatchFirstTouchDeliverReason::NotTracked,
+                0,
+            );
+        }
+        tracked
     }
 
     fn record_growdown_mapping(&self, start: u64, len: u64) {

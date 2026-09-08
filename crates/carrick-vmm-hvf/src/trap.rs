@@ -25301,6 +25301,13 @@ impl MmAccessState {
             }
             *slot = Some((mm, state));
         }
+        crate::probes::hvpatch_cow_runtime_bind(
+            binding.identity.mm,
+            u32::from(binding.identity.asid),
+            std::sync::Arc::as_ptr(&binding.authority) as *const () as u64,
+            binding.identity.linux_tid,
+            true,
+        );
         *self.cow_runtime.write() = Some(binding);
     }
 
