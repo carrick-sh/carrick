@@ -3140,3 +3140,32 @@ carry three `yes` hogs and a sibling agent's guests on top of the four
 workers, so they overstate the goal's condition. The run was stopped in
 phase 3 and re-armed to execute from a hash-pinned copy of the binary on
 the next genuinely quiet window.
+
+### 2026-09-08 19:30 — round 7: the "SwitchingOut wedge" was the sink missing a liveness term
+
+Round 7 instrumented the settlement sub-steps (`HVPSETTLE`, ring kind 50)
+and every wedge capture read the same story: `job-result-wait-abandoned`
+fires BEFORE `PEXIT_END` and the four `settle-exited` steps, which then
+publish into the exact result object the wait had abandoned. There is no
+stranded settlement; the `SwitchingOut` row was the capture running inside
+the abort, before the settlement. Condition: `GraphCensus::is_dead()` was
+`tasks == 0 && runnable == 0`, and a thread CLAIMED by an executor is
+neither a registry task nor a queued row — the claim is held from the exit
+boundary through `PEXIT_BEGIN`, terminal address-space retirement and
+`PEXIT_END` to `finish_claim`. Under load that retirement outruns the
+2000 ms confirm window and the judge called a working carrier dead; no
+deadline value fixes a missing term. Fix 61c06aae9: `Scheduler::claimed()`
+enters the census and `is_dead()` also requires `claimed == 0`; the one
+quantum-tail error path that dropped a live `RunnableThread` unsettled now
+routes through `fail_running_and_retire`. Red-first: both new liveness
+tests fail with the census carried but the predicate unchanged. Receipts:
+pre-fix 5/11 aborts (loads 18–28); post-fix compile 10/10 rc=0, control
+vs fix under 8 hogs 1/5 vs 0/5, final series on the signed artifact 6/6,
+go-build reducer 8/8 twice. **Coverage gap, recorded:** a claim held
+forever now parks instead of aborting (every shape the invariant was built
+for still fires); closing it wants a claim-age term or a settlement guard
+that owns the claim across the quantum tail. Also pre-existing on main
+since round 5: `just doc` fails on an unresolved link
+(`crate::vcpu_loop::HvpatchProduction::after_reaped_settlement`) — folded
+into the next scheduler-file brief. The earlier exit-residual reading
+("claimed=0, true wedge") is superseded by this ring evidence.
