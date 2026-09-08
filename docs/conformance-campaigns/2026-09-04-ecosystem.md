@@ -2998,3 +2998,36 @@ same source mid-run by the probe-gate reproduction; host load 32–104):**
 smoke ok, go-build reducer 8/8 zero abort lines at load 104, rows 6/6 MATCH
 (go_types, asyncio, compile, importlib, subprocess, threading) — the first
 row run tonight with no crash under heavy load. Ratios not cited.
+
+### 2026-09-08 14:50 — containment index landed (14th); the exit residual re-attributed; the probe gate was dead
+
+**HostWait landing receipt (main 0fd65be47):** build/lint/shards 0, reducer
+8/8 at load 35, rows 5/6 MATCH (go_types, net_http, importlib, mp_main,
+subprocess); `cpython-asyncio` crashed at 662 — the activation residual's
+spot, whose port onto the per-CPU scheduler is in flight.
+
+**Containment index (opus/exit-residual-sep08 → main 33942fb2f):** the
+terminal-retirement containment query asked once per inventory extent over
+every mapping row (O(extents × rows): 360,600 visits at 600×600, ~1.1e9
+in vivo behind 33k extents) now goes through a physical-extent index (one
+pass). Red-first reproduced by the second agent; gates 0. On the compile
+argv the pre-index control aborts 5/5 through the sink while still inside
+the sweep; the index binary 4/5, aborting only at load 28–55. **The
+residual is re-attributed by the fix binary's post-mortem:** init's thread
+emits the complete healthy exit sequence through `EXEC_SETTLEMENT
+state=exited` and then stays `SwitchingOut` with `claimed=0`, all executors
+parked, the job unpublished — a true wedge in the lost-claim family, not a
+slow teardown. The progress-based liveness idea is retracted (it would have
+hidden this). Scheduler round 7 dispatched on it with the post-mortems.
+
+**Probe gate:** the `exceeded exit budget` failure was not a slow first case
+(each aborted in 0.78–0.89 s) but `recv_timeout` treating `Disconnected`
+(a sender dropped by re-arming the same task on fork-then-exec) as expiry;
+fixed on `opus/probegate-sep08` (exact `Timeout` match + timed invariants
+opt-in, both red-first). Consequence: **the gate executed 3 of 532 probes
+from d462d6809 until now**, so a day of merges went unmeasured. With the
+fix it runs all 532 and fails three: `pidnsorphanreap` (orphan not
+reparented to local init, or the invariant misreads a nested pid ns),
+`coredumpfile` and `processvmsparse` oracle diffs — the latter a prime
+candidate for a regression from the sparse-mapping landings. Triage agent
+dispatched: attribute by bisect before fixing.
