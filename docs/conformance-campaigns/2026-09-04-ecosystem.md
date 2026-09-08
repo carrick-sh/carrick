@@ -2376,3 +2376,20 @@ the image path although the go image is in the local store and both local
 registries were down; fixing that lane is part of lane B. Post-landing rows
 in `post-exitwedge.log`. Lane B (KernelAbort sink, post-mortem, debug abort,
 deadline, exit budgets) dispatched on the same worktree.
+
+**Post-exit-wedge receipt (main 1152ced70, binary 93632a2e…, `--workers 1`,
+load 4.6 → 2.9, other agents' guests intermittently alive):** smoke ok,
+go-build reducer 8/8 clean, all eleven rows MATCH, no regression. Ratios:
+asyncio 1.07, threading 1.22, pprof 1.47, importlib 2.71, subprocess 3.09,
+itertools 3.69, go_types 3.92, net_http 5.3, mp_main 5.1, tarfile 16.26,
+compile 23.49. The two Go rows moved up from the previous receipt (3.10 →
+3.92, 3.90 → 5.3) under a higher starting load; treated as noise until a
+quiet-host pair says otherwise.
+
+**Worker fleet note:** all three antigravity workers dispatched this evening
+(attr-compile, attr-tarfile, kernel-auditor) died on an agy model-response
+transport timeout at 44–61 min with their work uncommitted. Parked as WIP
+commits (a0f0323f4, b4a8fa2e1, aa3913412 — the auditor WIP compiles with
+tests) and re-dispatched as short-turn workers (kernel-auditor2, attr-tarfile2
+continuing; attr-compile2 fresh from main, attribution-first, because the
+first turn scattered unverified edits across three subsystems).
