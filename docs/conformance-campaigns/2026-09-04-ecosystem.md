@@ -3062,3 +3062,14 @@ strings when ablated. Rebased receipts: cpython-threading **10/10 vs base
 3/3, reducer 8/8 vs 8/8. Deliberate divergences stated (`reactivate_exact`
 keeps count-only re-admission; `park_exact` releases through
 `clear_unpublished`). Rebasing onto the probe-gate main now.
+
+**Activation reservation landed (`opus/activation-residual-percpu-sep08` →
+main, 16th landing):** the clone child's and the initial runner's keys are
+reserved (`prepublication` beside `unpublished` on the per-CPU
+`QueueKeyShard`) before the thread is kernel-runnable; the reservation
+survives `drop(dormant)` and is lifted only by first publication or
+terminal retirement; the clone-rollback arm classifies an already-settled
+child instead of aborting. Director gates on the rebase: lint 0,
+workspace check 0, the three red-first tests green; build, lint, shards and
+the eleven rows chained. Two other agents remain: scheduler round 7
+(`SwitchingOut` after `exited`) and the probe-gate triage.
