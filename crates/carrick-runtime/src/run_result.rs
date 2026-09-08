@@ -71,6 +71,19 @@ pub enum RuntimeError {
     /// refusal as an execution failure, and the label is the message.
     #[error("configuration refused: {0}")]
     Configuration(String),
+    /// The one fail-closed sink. A judge proved the run can never finish, the
+    /// kernel was frozen and captured in process, and every unpublished job
+    /// was completed with this. It is deliberately NOT a panic and NOT an
+    /// `abort()`: the point of the sink is that the caller gets the evidence.
+    ///
+    /// `post_mortem` is an `Arc` because ONE capture is shared by every job the
+    /// abort completed — a second capture of an already-frozen kernel would be
+    /// a second, later, and therefore different answer to the same question.
+    #[error("kernel aborted: {reason}")]
+    KernelAborted {
+        reason: String,
+        post_mortem: std::sync::Arc<crate::kernel::debug::PostMortem>,
+    },
 }
 
 /// The runtime-side edge of the native memory error seam: the native

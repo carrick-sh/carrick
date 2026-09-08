@@ -988,6 +988,11 @@ pub(crate) struct HvpatchRuntimeDirectory {
     endpoints: Mutex<BTreeMap<crate::kernel::TaskKey, HvpatchRuntimeEndpoint>>,
     continuation_wait_service: Mutex<Option<Arc<continuation::CarrierWaitService>>>,
     scheduler: Mutex<Option<Arc<crate::kernel::scheduler::Scheduler>>>,
+    /// The kernel this carrier's jobs live in, for the always-on
+    /// `ProcessGraphLiveness` invariant and its post-mortem capture. `Weak`
+    /// because the directory outlives no kernel: the runner OBSERVES the graph,
+    /// it never keeps it alive.
+    liveness_kernel: Mutex<Option<Weak<crate::kernel::Kernel>>>,
     persistent_bindings: Arc<executor::HvpatchTaskBindingDirectory>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     carrier_tasks:
@@ -1216,7 +1221,7 @@ impl ContainerJobGroup {
             self.directory.process_jobs_changed.notify_all();
             break jobs;
         };
-        let result = wait_process_jobs(jobs);
+        let result = wait_process_jobs(jobs, &self.directory.process_graph_liveness());
         let mut state = self.directory.process_jobs.lock();
         let exact = state.groups.get(&self.container_id).is_some_and(|group| {
             group.closing && group.draining && group.reservations == 0 && group.jobs.is_empty()
@@ -1295,10 +1300,23 @@ impl Drop for ContainerJobReservation {
     }
 }
 
-fn wait_process_jobs(jobs: Vec<HvpatchProcessJobHandle>) -> Result<usize, RuntimeError> {
+fn wait_process_jobs(
+    jobs: Vec<HvpatchProcessJobHandle>,
+    liveness: &ProcessGraphLiveness,
+) -> Result<usize, RuntimeError> {
     let joined = jobs.len();
+    // Every job's result cell, kept so an abort can COMPLETE the ones this
+    // loop has not reached. A judge that proved nobody will publish job N has
+    // proved it for the whole group, and leaving the others pending would just
+    // move the wedge to the next waiter.
+    let pending: Vec<HvpatchLoopResult> = jobs
+        .iter()
+        .map(|job| match job {
+            HvpatchProcessJobHandle::Persistent { result, .. } => result.clone(),
+        })
+        .collect();
     let mut child_errors = Vec::new();
-    for job in jobs {
+    for (index, job) in jobs.into_iter().enumerate() {
         let result = match job {
             HvpatchProcessJobHandle::Persistent {
                 result,
@@ -1306,7 +1324,26 @@ fn wait_process_jobs(jobs: Vec<HvpatchProcessJobHandle>) -> Result<usize, Runtim
                 process_retirement,
             } => {
                 let _completion_identity = completion.id();
-                let result = result.wait();
+                let result = result.wait_supervised(liveness);
+                if let Err(RuntimeError::KernelAborted {
+                    reason,
+                    post_mortem,
+                }) = &result
+                {
+                    for other in pending.iter().skip(index + 1) {
+                        other.publish_if_pending(Err(RuntimeError::KernelAborted {
+                            reason: reason.clone(),
+                            post_mortem: Arc::clone(post_mortem),
+                        }));
+                    }
+                    // The kernel is frozen and captured; waiting the remaining
+                    // physical-retirement bounds would only add 5 s per job to
+                    // an outcome that is already decided.
+                    return Err(RuntimeError::KernelAborted {
+                        reason: reason.clone(),
+                        post_mortem: Arc::clone(post_mortem),
+                    });
+                }
                 // Result publication happens from terminal settlement while
                 // the worker still owns its loaded binding. Wait for the
                 // quantum's drop receipt before container-scoped VFS and
@@ -1361,6 +1398,7 @@ impl Default for HvpatchRuntimeDirectory {
             endpoints: Mutex::new(BTreeMap::new()),
             continuation_wait_service: Mutex::new(None),
             scheduler: Mutex::new(None),
+            liveness_kernel: Mutex::new(None),
             persistent_bindings: Arc::default(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             carrier_tasks: Mutex::new(None),
@@ -1382,6 +1420,18 @@ impl HvpatchRuntimeDirectory {
         ContainerJobGroup {
             directory: Arc::clone(self),
             container_id,
+        }
+    }
+
+    /// The runner invariant's view of this carrier.
+    fn process_graph_liveness(&self) -> ProcessGraphLiveness {
+        ProcessGraphLiveness {
+            kernel: self.liveness_kernel.lock().clone(),
+            scheduler: self.scheduler.lock().clone(),
+            #[cfg(test)]
+            fixed_census: None,
+            poll: LIVENESS_POLL,
+            confirm: LIVENESS_CONFIRM,
         }
     }
 
@@ -1477,10 +1527,26 @@ impl HvpatchRuntimeDirectory {
         result
     }
 
+    /// Bind the kernel the runner's liveness invariant observes. Idempotent
+    /// for one kernel; a DIFFERENT kernel replaces it, because the carrier has
+    /// exactly one live kernel graph and the invariant must judge that one.
+    fn bind_liveness_kernel(&self, kernel: &Arc<crate::kernel::Kernel>) {
+        let mut slot = self.liveness_kernel.lock();
+        if slot
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|installed| Arc::ptr_eq(&installed, kernel))
+        {
+            return;
+        }
+        *slot = Some(Arc::downgrade(kernel));
+    }
+
     fn prepare_persistent_services(
         &self,
         kernel: &Arc<crate::kernel::Kernel>,
     ) -> PreparedPersistentServices {
+        self.bind_liveness_kernel(kernel);
         if let Some(scheduler) = self.scheduler.lock().clone() {
             let wait_service = self
                 .continuation_wait_service
@@ -1538,6 +1604,7 @@ impl HvpatchRuntimeDirectory {
         Arc<crate::kernel::Scheduler>,
         Arc<continuation::CarrierWaitService>,
     ) {
+        self.bind_liveness_kernel(kernel);
         let scheduler =
             {
                 let mut slot = self.scheduler.lock();
@@ -1652,7 +1719,7 @@ impl HvpatchRuntimeDirectory {
             state.closed_groups.extend(groups.keys().copied());
             groups.into_values().flat_map(|group| group.jobs).collect()
         };
-        wait_process_jobs(jobs).map(|_| ())
+        wait_process_jobs(jobs, &self.process_graph_liveness()).map(|_| ())
     }
 
     pub(crate) fn shutdown_carrier_runtime(&self) -> Result<(), RuntimeError> {
@@ -3302,6 +3369,172 @@ pub(crate) enum HvpatchLoopPoll {
     Exited,
 }
 
+/// How often the runner re-evaluates the process-graph predicate while a
+/// container job is outstanding.
+///
+/// This is DETECTION LATENCY, not a timeout. The verdict below is structural —
+/// zero live tasks, zero runnable rows, and a job with no result — so a slow
+/// run never trips it however long it takes, and shortening or lengthening this
+/// interval cannot change any verdict, only when it is reached.
+const LIVENESS_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long the dead-graph census must hold UNCHANGED before the runner
+/// aborts.
+///
+/// The window exists for one real transient: the last task leaves the registry
+/// a moment before its settlement publishes the job's result, so an instant
+/// verdict would fire on a run that was about to finish correctly. Requiring
+/// the same census across the window means nothing in the graph moved — and
+/// with no task, no thread and no runnable row, nothing that could publish the
+/// job exists.
+const LIVENESS_CONFIRM: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The always-on runner invariant of the kernel-audit design: a container job
+/// that cannot be published by anything must not be waited on forever.
+///
+/// The 2026-09-07 exit wedge is the shape it exists for. A `go build` leader
+/// that lost its `exit_group` claim settled without publishing its logical
+/// result; every Linux task then retired, every executor parked in
+/// `RunQueue::take_row`, one unreapable zombie pid 1 remained, and
+/// `ContainerJobGroup::join` waited on an `HvpatchLoopResult` for the life of
+/// the process. `f8487d23b` removed that particular publisher gap. This removes
+/// the CLASS: after this, a job with no result and no live task is not a hang,
+/// it is a named `RuntimeError::KernelAborted` carrying a post-mortem.
+#[derive(Clone)]
+pub(crate) struct ProcessGraphLiveness {
+    kernel: Option<Weak<crate::kernel::Kernel>>,
+    scheduler: Option<Arc<crate::kernel::scheduler::Scheduler>>,
+    /// Test seam: a census the fixture drives directly, so the confirm state
+    /// machine can be exercised without retiring a real root task. Never
+    /// constructed outside `cfg(test)`; the shipped path has exactly one
+    /// census source, the kernel registry.
+    #[cfg(test)]
+    fixed_census: Option<Arc<Mutex<Option<GraphCensus>>>>,
+    poll: std::time::Duration,
+    confirm: std::time::Duration,
+}
+
+/// A cheap census of everything that could still publish a job result.
+///
+/// Deliberately cheap: `task_count`/`zombie_count`/`retired_thread_count` are
+/// one registry read each and `queued_len` one queue read, so the invariant
+/// costs nothing on a healthy run. `retired_threads` carries no verdict of its
+/// own — it is the ACTIVITY fingerprint that makes "unchanged" mean "nothing
+/// moved", since a thread retiring between two observations bumps it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GraphCensus {
+    tasks: usize,
+    zombies: usize,
+    retired_threads: usize,
+    runnable: usize,
+}
+
+impl GraphCensus {
+    /// True when nothing in this census can ever run guest code again.
+    ///
+    /// Zombies are deliberately NOT liveness: a zombie holds no thread and
+    /// runs no code, and the wedge's own zombie is pid 1 with no parent — an
+    /// unreapable remain, which is the evidence, not a reason to keep waiting.
+    const fn is_dead(&self) -> bool {
+        self.tasks == 0 && self.runnable == 0
+    }
+}
+
+impl ProcessGraphLiveness {
+    /// A liveness handle with no kernel bound. Used by the pure-unit fixtures
+    /// and by any lane that has not published a kernel: it observes nothing and
+    /// therefore never fires, which is the only safe answer when the invariant
+    /// cannot see the graph it would judge.
+    #[cfg(test)]
+    fn unbound() -> Self {
+        Self {
+            kernel: None,
+            scheduler: None,
+            fixed_census: None,
+            poll: LIVENESS_POLL,
+            confirm: LIVENESS_CONFIRM,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_tests(
+        kernel: Option<&Arc<crate::kernel::Kernel>>,
+        fixed_census: Option<Arc<Mutex<Option<GraphCensus>>>>,
+        confirm: std::time::Duration,
+    ) -> Self {
+        Self {
+            kernel: kernel.map(Arc::downgrade),
+            scheduler: None,
+            fixed_census,
+            poll: std::time::Duration::from_millis(10),
+            confirm,
+        }
+    }
+
+    fn census(&self) -> Option<GraphCensus> {
+        #[cfg(test)]
+        if let Some(fixed) = &self.fixed_census {
+            return *fixed.lock();
+        }
+        let kernel = self.kernel.as_ref()?.upgrade()?;
+        let registry = kernel.registry();
+        Some(GraphCensus {
+            tasks: registry.task_count(),
+            zombies: registry.zombie_count(),
+            retired_threads: registry.retired_thread_count(),
+            runnable: self
+                .scheduler
+                .as_ref()
+                .map_or(0, |scheduler| scheduler.queued_len()),
+        })
+    }
+
+    /// Freeze, capture, and build the abort every unpublished job is completed
+    /// with.
+    ///
+    /// The freeze is the existing scheduler control epoch: every executor
+    /// bounces out of the run queue with `RunQueueError::ControlPoked` at its
+    /// next boundary and cannot claim a new row, so the capture reads a graph
+    /// nothing is mutating. No new lock is taken.
+    fn abort(&self, reason: crate::kernel::debug::AbortReason) -> RuntimeError {
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.poke_executor_control();
+        }
+        let kernel = self.kernel.as_ref().and_then(Weak::upgrade);
+        let run_id = std::env::var("CARRICK_RUN_ID")
+            .ok()
+            .filter(|id| !id.is_empty());
+        let mut post_mortem =
+            crate::kernel::debug::PostMortem::capture(kernel.as_ref(), reason, run_id);
+        post_mortem.enrich_from_capture();
+        let summary = post_mortem.reason.summary();
+        tracing::error!(
+            target: "carrick::kernel::post_mortem",
+            reason = %summary,
+            "kernel aborted"
+        );
+        post_mortem.persist_if_configured();
+        RuntimeError::KernelAborted {
+            reason: summary,
+            post_mortem: Arc::new(post_mortem),
+        }
+    }
+
+    fn liveness_abort(&self, census: GraphCensus, unpublished_jobs: usize) -> RuntimeError {
+        self.abort(crate::kernel::debug::AbortReason::ProcessGraphLiveness {
+            unpublished_jobs,
+            live_tasks: census.tasks,
+            // Filled from the capture's own rows: naming a zombie costs a
+            // snapshot, and one taken before the freeze would describe a
+            // different graph from the one in the post-mortem.
+            live_threads: 0,
+            runnable_rows: census.runnable,
+            zombies: Vec::new(),
+            confirmed_after_ms: u64::try_from(self.confirm.as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+}
+
 struct HvpatchLoopResultState {
     result: Mutex<Option<Result<VcpuLoopOutcome, RuntimeError>>>,
     ready: Condvar,
@@ -3342,6 +3575,75 @@ impl HvpatchLoopResult {
             self.state.ready.wait(&mut slot);
         }
         slot.take().unwrap_or_else(|| std::process::abort())
+    }
+
+    /// Publish `result` only if nothing has published yet.
+    ///
+    /// [`Self::publish`] aborts the process on a double publication, which is
+    /// right for a settlement (two settlements for one job is a kernel bug).
+    /// The abort sink is the one publisher that legitimately races a real
+    /// settlement: it completes jobs a judge proved nobody will complete, and
+    /// a settlement finishing in that same instant is a better outcome, not a
+    /// conflict. Returns whether this call was the publisher.
+    fn publish_if_pending(&self, result: Result<VcpuLoopOutcome, RuntimeError>) -> bool {
+        let mut slot = self.state.result.lock();
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(result);
+        self.state.ready.notify_all();
+        true
+    }
+
+    /// Wait for this job's terminal result under the always-on
+    /// `ProcessGraphLiveness` invariant.
+    ///
+    /// Returns `Err(RuntimeError::KernelAborted)` when the invariant proves the
+    /// result can never arrive. Parking forever is no longer representable
+    /// here: the only way out of this loop is a published result or a named
+    /// abort.
+    fn wait_supervised(
+        self,
+        liveness: &ProcessGraphLiveness,
+    ) -> Result<VcpuLoopOutcome, RuntimeError> {
+        let mut confirming: Option<(GraphCensus, std::time::Instant)> = None;
+        let mut slot = self.state.result.lock();
+        loop {
+            if let Some(result) = slot.take() {
+                return result;
+            }
+            self.state.ready.wait_for(&mut slot, liveness.poll);
+            if slot.is_some() {
+                continue;
+            }
+            // An operator's `carrick debug abort --run-id` is latched by the
+            // debug server and executed HERE, through the same sink, so a
+            // requested abort and an invariant abort produce one shape.
+            if let Some(reason) = crate::kernel::debug::take_abort_request() {
+                return Err(liveness.abort(reason));
+            }
+            // Evaluated with the result slot held, so "no result" and "no
+            // publisher" are read as one observation rather than two.
+            let Some(census) = liveness.census() else {
+                // No kernel bound: the invariant cannot see the graph it would
+                // judge, so it must not judge. Fail OPEN here rather than
+                // inventing a verdict.
+                continue;
+            };
+            if !census.is_dead() {
+                confirming = None;
+                continue;
+            }
+            match confirming {
+                Some((observed, since))
+                    if observed == census && since.elapsed() >= liveness.confirm =>
+                {
+                    return Err(liveness.liveness_abort(census, 1));
+                }
+                Some((observed, _)) if observed == census => {}
+                _ => confirming = Some((census, std::time::Instant::now())),
+            }
+        }
     }
 }
 
@@ -11846,6 +12148,235 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_state(&child_memory), (child_pid, 1, 0));
+    }
+
+    // ---- ProcessGraphLiveness: the always-on runner invariant ----------------
+
+    fn dead_census() -> GraphCensus {
+        GraphCensus {
+            tasks: 0,
+            zombies: 1,
+            retired_threads: 4,
+            runnable: 0,
+        }
+    }
+
+    fn live_census() -> GraphCensus {
+        GraphCensus {
+            tasks: 2,
+            zombies: 0,
+            retired_threads: 4,
+            runnable: 1,
+        }
+    }
+
+    /// A zombie is not liveness. The wedge's own graph is exactly this: no
+    /// task, no runnable row, and one unreapable pid-1 zombie — which is the
+    /// EVIDENCE, not a reason to keep waiting for it to be reaped.
+    #[test]
+    fn a_graph_with_only_zombies_is_dead() {
+        assert!(dead_census().is_dead());
+        assert!(!live_census().is_dead());
+        assert!(
+            !GraphCensus {
+                tasks: 0,
+                zombies: 0,
+                retired_threads: 0,
+                runnable: 1
+            }
+            .is_dead(),
+            "a runnable row can still publish a result"
+        );
+    }
+
+    /// The invariant must not touch a job that publishes normally.
+    #[test]
+    fn a_published_result_returns_from_the_supervised_wait_without_a_verdict() {
+        let census = Arc::new(Mutex::new(Some(dead_census())));
+        let liveness = ProcessGraphLiveness::for_tests(
+            None,
+            Some(Arc::clone(&census)),
+            Duration::from_secs(30),
+        );
+        let result = HvpatchLoopResult::pending();
+        result.publish(Ok(VcpuLoopOutcome::ThreadDone));
+        assert!(matches!(
+            result.wait_supervised(&liveness),
+            Ok(VcpuLoopOutcome::ThreadDone)
+        ));
+    }
+
+    /// THE invariant. An unpublished job on a graph that can never publish it
+    /// is a named abort with a post-mortem, not a hang.
+    #[test]
+    fn an_unpublished_job_on_a_dead_graph_aborts_instead_of_parking() {
+        let census = Arc::new(Mutex::new(Some(dead_census())));
+        let liveness = ProcessGraphLiveness::for_tests(
+            None,
+            Some(Arc::clone(&census)),
+            Duration::from_millis(50),
+        );
+        let result = HvpatchLoopResult::pending();
+        let Err(error) = result.wait_supervised(&liveness) else {
+            panic!("a job nothing can publish must not park");
+        };
+        let RuntimeError::KernelAborted {
+            reason,
+            post_mortem,
+        } = error
+        else {
+            panic!("expected KernelAborted, got {error}");
+        };
+        assert!(reason.contains("process-graph liveness"), "{reason}");
+        assert!(
+            matches!(
+                post_mortem.reason,
+                crate::kernel::debug::AbortReason::ProcessGraphLiveness {
+                    unpublished_jobs: 1,
+                    live_tasks: 0,
+                    runnable_rows: 0,
+                    ..
+                }
+            ),
+            "{:?}",
+            post_mortem.reason
+        );
+    }
+
+    /// A live graph never trips it, however long the job takes. The verdict is
+    /// structural, so the wait's DURATION is not evidence of anything.
+    #[test]
+    fn a_live_graph_never_trips_the_invariant_however_long_the_job_takes() {
+        let census = Arc::new(Mutex::new(Some(live_census())));
+        let liveness = ProcessGraphLiveness::for_tests(
+            None,
+            Some(Arc::clone(&census)),
+            Duration::from_millis(20),
+        );
+        let result = HvpatchLoopResult::pending();
+        let publisher = result.clone();
+        let waiter = std::thread::spawn(move || result.wait_supervised(&liveness));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!waiter.is_finished(), "the invariant fired on a live graph");
+        publisher.publish(Ok(VcpuLoopOutcome::ThreadDone));
+        assert!(matches!(
+            waiter.join().expect("waiter"),
+            Ok(VcpuLoopOutcome::ThreadDone)
+        ));
+    }
+
+    /// The confirm window exists for ONE transient: the last task leaves the
+    /// registry a moment before its settlement publishes. A graph that goes
+    /// dead and then publishes must finish normally.
+    #[test]
+    fn a_graph_that_goes_dead_and_then_publishes_finishes_normally() {
+        let census = Arc::new(Mutex::new(Some(live_census())));
+        let liveness = ProcessGraphLiveness::for_tests(
+            None,
+            Some(Arc::clone(&census)),
+            Duration::from_millis(400),
+        );
+        let result = HvpatchLoopResult::pending();
+        let publisher = result.clone();
+        let waiter = std::thread::spawn(move || result.wait_supervised(&liveness));
+        *census.lock() = Some(dead_census());
+        std::thread::sleep(Duration::from_millis(60));
+        publisher.publish(Ok(VcpuLoopOutcome::ThreadDone));
+        assert!(
+            matches!(
+                waiter.join().expect("waiter"),
+                Ok(VcpuLoopOutcome::ThreadDone)
+            ),
+            "the settlement won the confirm window and must be honoured"
+        );
+    }
+
+    /// Census CHANGE restarts confirmation: a graph that is still moving is
+    /// still capable of publishing, even when its task count is momentarily 0.
+    #[test]
+    fn a_changing_census_restarts_confirmation() {
+        let census = Arc::new(Mutex::new(Some(dead_census())));
+        let liveness = ProcessGraphLiveness::for_tests(
+            None,
+            Some(Arc::clone(&census)),
+            Duration::from_millis(200),
+        );
+        let result = HvpatchLoopResult::pending();
+        let publisher = result.clone();
+        let waiter = std::thread::spawn(move || result.wait_supervised(&liveness));
+        for retired in 5..14_usize {
+            std::thread::sleep(Duration::from_millis(50));
+            *census.lock() = Some(GraphCensus {
+                retired_threads: retired,
+                ..dead_census()
+            });
+        }
+        assert!(
+            !waiter.is_finished(),
+            "activity in the graph must restart confirmation"
+        );
+        publisher.publish(Ok(VcpuLoopOutcome::ThreadDone));
+        assert!(matches!(
+            waiter.join().expect("waiter"),
+            Ok(VcpuLoopOutcome::ThreadDone)
+        ));
+    }
+
+    /// An unbound liveness sees no graph, so it must never judge one. Failing
+    /// OPEN is the only honest answer when the invariant cannot observe.
+    #[test]
+    fn an_unbound_liveness_never_judges() {
+        let liveness = ProcessGraphLiveness::unbound();
+        assert!(liveness.census().is_none());
+        let result = HvpatchLoopResult::pending();
+        let publisher = result.clone();
+        let waiter = std::thread::spawn(move || result.wait_supervised(&liveness));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!waiter.is_finished());
+        publisher.publish(Ok(VcpuLoopOutcome::ThreadDone));
+        assert!(matches!(
+            waiter.join().expect("waiter"),
+            Ok(VcpuLoopOutcome::ThreadDone)
+        ));
+    }
+
+    /// The REAL census path, against a real kernel with a live root task: the
+    /// fixture seam above proves the state machine, this proves the reading.
+    #[test]
+    fn a_real_kernel_with_a_live_root_task_reads_as_alive() {
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            81_207,
+            ThreadId::synthetic_for_tests(81_207),
+            "liveness-census".to_owned(),
+        )
+        .expect("root bootstrap");
+        let (kernel, _context) =
+            crate::kernel::Kernel::bootstrap_root(bootstrap).expect("root kernel");
+        let liveness = ProcessGraphLiveness::for_tests(Some(&kernel), None, LIVENESS_CONFIRM);
+        let census = liveness.census().expect("a bound kernel answers a census");
+        assert_eq!(census.tasks, 1, "the root task is live");
+        assert!(!census.is_dead());
+    }
+
+    /// A liveness bound to a kernel that has been dropped observes nothing and
+    /// must not invent a dead-graph verdict from the absence.
+    #[test]
+    fn a_dropped_kernel_stops_the_invariant_rather_than_convicting_it() {
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            81_208,
+            ThreadId::synthetic_for_tests(81_208),
+            "liveness-dropped".to_owned(),
+        )
+        .expect("root bootstrap");
+        let (kernel, context) =
+            crate::kernel::Kernel::bootstrap_root(bootstrap).expect("root kernel");
+        let liveness = ProcessGraphLiveness::for_tests(Some(&kernel), None, LIVENESS_CONFIRM);
+        drop(context);
+        drop(kernel);
+        assert!(
+            liveness.census().is_none(),
+            "an unobservable graph is not a dead graph"
+        );
     }
 
     fn alias_context(pid: i32) -> crate::kernel::KernelContext {

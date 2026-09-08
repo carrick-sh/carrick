@@ -12,10 +12,11 @@
 pub mod client;
 pub mod dto;
 pub mod endpoint;
+pub mod post_mortem;
 pub mod server;
 pub mod wire;
 
-pub use client::{ClientError, fetch, fetch_at};
+pub use client::{AbortAck, ClientError, abort, abort_at, fetch, fetch_at};
 pub use dto::{
     DebugAltstack, DebugClass, DebugCredentialsRow, DebugExecutorBindingRow,
     DebugExecutorReceiptRow, DebugExecutorReceiptSummary, DebugExecutorRow,
@@ -23,10 +24,15 @@ pub use dto::{
     DebugMappingRow, DebugMmRow, DebugProcessGroupRow, DebugRunQueueRow, DebugSchedulerRow,
     DebugSessionRow, DebugSighandRow, DebugTaskRow, DebugTaskSharedRow, DebugTaskSignalRow,
     DebugThreadResourcesRow, DebugThreadRow, DebugThreadSignalRow, DebugVmaRow, DebugZombieRow,
-    KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugAuxProvider,
-    KernelDebugDtoError, KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable, UnknownTable,
+    KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugAction,
+    KernelDebugAuxProvider, KernelDebugDtoError, KernelDebugRequest, KernelDebugSnapshot,
+    KernelDebugTable, UnknownTable,
 };
 pub use endpoint::{DebugEndpoint, EndpointError};
+pub use post_mortem::{
+    AbortReason, CAPTURE_DEADLINE, POST_MORTEM_DIR_ENV, POST_MORTEM_SCHEMA, PostMortem, Truncated,
+    ZombieSummary, request_abort, take_abort_request,
+};
 pub use server::{KernelDebugServer, ServerError};
 pub use wire::{DEADLINE, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, WireError};
 
@@ -143,6 +149,56 @@ mod tests {
         assert!(
             snapshot.mms.is_none(),
             "an unrequested table must be absent, not empty"
+        );
+        server.shutdown();
+    }
+
+    /// `carrick debug abort --run-id` over the existing socket: the runtime
+    /// acknowledges and LATCHES one abort for its runner to execute. This
+    /// replaces the host-wide shell watchdog's `lldb` step.
+    #[test]
+    fn an_abort_request_is_acknowledged_and_latched_exactly_once() {
+        let (_temp, endpoint) = scoped_endpoint("k1-debug-abort");
+        let kernel = kernel_with_root();
+        let mut server =
+            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        // A prior test's latch would make this prove nothing.
+        let _ = post_mortem::take_abort_request();
+
+        let ack = abort_at(&endpoint, "k1-debug-abort").expect("abort request");
+        assert_eq!(ack.schema, KERNEL_DEBUG_RESPONSE_SCHEMA);
+
+        let latched = post_mortem::take_abort_request().expect("the runner must find the request");
+        assert!(
+            matches!(latched, AbortReason::DebugRequest { .. }),
+            "{latched:?}"
+        );
+        assert!(
+            post_mortem::take_abort_request().is_none(),
+            "one request must produce exactly one abort"
+        );
+        server.shutdown();
+    }
+
+    /// A bare request still asks for a snapshot: the read path is the default
+    /// and cannot be reached into an abort by omission.
+    #[test]
+    fn a_request_without_an_action_reads_rather_than_aborts() {
+        let (_temp, endpoint) = scoped_endpoint("k1-debug-default-action");
+        let kernel = kernel_with_root();
+        let mut server =
+            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let _ = post_mortem::take_abort_request();
+
+        let snapshot = fetch_at(&endpoint, None).expect("fetch snapshot");
+        assert!(snapshot.tasks.is_some_and(|tasks| !tasks.is_empty()));
+        assert!(
+            post_mortem::take_abort_request().is_none(),
+            "a read must never latch an abort"
+        );
+        assert_eq!(
+            KernelDebugRequest::for_tables(None).action,
+            KernelDebugAction::Snapshot
         );
         server.shutdown();
     }

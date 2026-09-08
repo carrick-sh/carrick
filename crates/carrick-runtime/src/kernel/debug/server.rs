@@ -240,6 +240,17 @@ fn build_response(
             error: error.to_string(),
         };
     }
+    if let super::dto::KernelDebugAction::Abort { run_id } = &request.action {
+        super::post_mortem::request_abort(super::post_mortem::AbortReason::DebugRequest {
+            run_id: run_id.clone(),
+        });
+        return ServerResponse::Aborting {
+            schema: KERNEL_DEBUG_RESPONSE_SCHEMA.to_owned(),
+            run_id: run_id.clone(),
+            post_mortem_dir: super::post_mortem::PostMortem::configured_dir()
+                .map(|dir| dir.display().to_string()),
+        };
+    }
     let selected = request.selected();
     match kernel.snapshot(deadline) {
         Ok(snapshot) => {
@@ -262,7 +273,18 @@ fn build_response(
 #[serde(untagged)]
 pub enum ServerResponse {
     Snapshot(Box<KernelDebugSnapshot>),
-    Error { schema: String, error: String },
+    /// An abort was latched. The runtime performs the ONE capture at its next
+    /// runner boundary; this response is the acknowledgement, not the
+    /// artifact, so an abort never produces two answers to the same question.
+    Aborting {
+        schema: String,
+        run_id: String,
+        post_mortem_dir: Option<String>,
+    },
+    Error {
+        schema: String,
+        error: String,
+    },
 }
 
 /// The set of tables a bare (unfiltered) request selects. Exposed so tests and

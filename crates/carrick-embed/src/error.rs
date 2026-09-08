@@ -1,6 +1,9 @@
 //! Typed failure surface of an embedded run.
 
+use std::sync::Arc;
+
 use carrick_runtime::dispatch::DispatchError;
+use carrick_runtime::kernel::debug::PostMortem;
 use carrick_runtime::runtime::RuntimeError;
 use carrick_runtime::trap::TrapError;
 
@@ -68,6 +71,20 @@ pub enum EmbedError {
     /// The blocking execute task panicked (`tokio::task::JoinError`).
     #[error("the execute task panicked: {0}")]
     ExecutePanicked(String),
+    /// A judge proved this run could never finish, the kernel was frozen and
+    /// captured in process, and every unpublished job was completed.
+    ///
+    /// This is the ONE fail-closed sink. Before it existed, the same states
+    /// ended as a hang (`ContainerJobGroup::join` waiting on a result nobody
+    /// could publish), a carrier `abort()` with no kernel-graph view, or a
+    /// guest signal the guest reported as its own bug. `post_mortem` carries
+    /// the kernel graph, its findings, and the event ring as of the abort — so
+    /// a wedge is a returned value, not a debugging session.
+    #[error("kernel aborted: {reason}")]
+    KernelAborted {
+        reason: String,
+        post_mortem: Arc<PostMortem>,
+    },
 }
 
 /// Which runtime call produced a [`RuntimeError`]; decides `Prepare` vs
@@ -85,6 +102,13 @@ impl EmbedError {
             RuntimeError::CarrierClosing => Self::CarrierClosing,
             RuntimeError::CarrierClosed => Self::CarrierClosed,
             RuntimeError::CarrierFailed(reason) => Self::CarrierFailed { reason },
+            RuntimeError::KernelAborted {
+                reason,
+                post_mortem,
+            } => Self::KernelAborted {
+                reason,
+                post_mortem,
+            },
             RuntimeError::ExplicitCarrierBindingRequired => Self::Config(
                 "an explicit carrier is active; use carrier.container(image)".to_owned(),
             ),

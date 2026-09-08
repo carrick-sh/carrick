@@ -539,12 +539,10 @@ pub enum RingReadError {
     UnknownKind { logical_index: u64, kind: u8 },
 }
 
-#[cfg(any(test, feature = "event-ring-dump"))]
 const fn known_kind(kind: u8) -> bool {
     kind >= BIND && kind <= HVPBLOCK_ARGS
 }
 
-#[cfg(any(test, feature = "event-ring-dump"))]
 fn read_slot_after(
     slot: &Slot,
     logical_index: u64,
@@ -603,9 +601,25 @@ fn read_slot_after(
     })
 }
 
-#[cfg(any(test, feature = "event-ring-dump"))]
 fn read_slot(slot: &Slot, logical_index: u64) -> Result<EventRecord, RingReadError> {
     read_slot_after(slot, logical_index, || {})
+}
+
+/// Drain the ring oldest-to-newest for a post-mortem capture, up to `max`
+/// records.
+///
+/// Every slot is reported: a slot the reader could not decode becomes an
+/// `Err` row rather than a silent omission, because "the ring had nothing
+/// there" and "the reader lost that slot" call for opposite conclusions and a
+/// capture that cannot tell them apart is not evidence. Lock-free and
+/// allocation-bounded; safe to call from a frozen carrier.
+pub fn drain_recent(max: usize) -> Vec<Result<EventRecord, RingReadError>> {
+    let total = IDX.load(Ordering::Acquire);
+    let window = max.min(N) as u64;
+    let start = total.saturating_sub(window);
+    (start..total)
+        .map(|logical_index| read_slot(&RING[(logical_index % N as u64) as usize], logical_index))
+        .collect()
 }
 
 #[cfg(test)]

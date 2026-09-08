@@ -42,13 +42,61 @@ pub fn fetch(
     fetch_at(&endpoint, tables)
 }
 
-/// Fetch from an exact endpoint.
-pub fn fetch_at(
-    endpoint: &DebugEndpoint,
-    tables: Option<Vec<KernelDebugTable>>,
-) -> Result<KernelDebugSnapshot, ClientError> {
+/// Ask the run identified by `run_id` to abort its kernel.
+///
+/// Returns the acknowledgement: the run id the runtime stamped and the
+/// directory it will write the post-mortem into, when one is configured. The
+/// capture itself is produced by the runtime's own runner boundary and
+/// travels to the embedding caller as `EmbedError::KernelAborted`.
+pub fn abort(run_id: &str) -> Result<AbortAck, ClientError> {
+    let endpoint = DebugEndpoint::for_run_id(run_id)?;
+    abort_at(&endpoint, run_id)
+}
+
+pub fn abort_at(endpoint: &DebugEndpoint, run_id: &str) -> Result<AbortAck, ClientError> {
     let deadline = Instant::now() + DEADLINE;
-    let mut stream = UnixStream::connect(endpoint.socket_path()).map_err(|error| {
+    let mut stream = connect(endpoint)?;
+    let encoded = wire::encode_canonical(&KernelDebugRequest::abort(run_id))?;
+    timeout_aware(wire::write_frame(
+        &mut stream,
+        &encoded,
+        MAX_REQUEST_BYTES,
+        deadline,
+        "client-write",
+    ))?;
+    let payload = timeout_aware(wire::read_frame(
+        &mut stream,
+        MAX_RESPONSE_BYTES,
+        deadline,
+        "client-read",
+    ))?;
+    if let Ok(refusal) = wire::decode_exact::<ServerRefusal>(&payload)
+        && refusal.schema == KERNEL_DEBUG_RESPONSE_SCHEMA
+    {
+        return Err(ClientError::Refused(refusal.error));
+    }
+    let ack: AbortAck = wire::decode_exact(&payload)?;
+    if ack.schema != KERNEL_DEBUG_RESPONSE_SCHEMA {
+        return Err(ClientError::Refused(format!(
+            "unknown abort response schema {}",
+            ack.schema
+        )));
+    }
+    Ok(ack)
+}
+
+/// The runtime accepted an abort request.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbortAck {
+    pub schema: String,
+    pub run_id: String,
+    #[serde(default)]
+    pub post_mortem_dir: Option<String>,
+}
+
+fn connect(endpoint: &DebugEndpoint) -> Result<UnixStream, ClientError> {
+    UnixStream::connect(endpoint.socket_path()).map_err(|error| {
         if matches!(
             error.kind(),
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
@@ -59,7 +107,16 @@ pub fn fetch_at(
         } else {
             ClientError::Wire(WireError::Io(error))
         }
-    })?;
+    })
+}
+
+/// Fetch from an exact endpoint.
+pub fn fetch_at(
+    endpoint: &DebugEndpoint,
+    tables: Option<Vec<KernelDebugTable>>,
+) -> Result<KernelDebugSnapshot, ClientError> {
+    let deadline = Instant::now() + DEADLINE;
+    let mut stream = connect(endpoint)?;
 
     let request = KernelDebugRequest::for_tables(tables);
     let requested = request.selected();

@@ -129,8 +129,30 @@ pub struct UnknownTable(pub String);
 #[serde(deny_unknown_fields)]
 pub struct KernelDebugRequest {
     pub schema: String,
-    /// Requested tables. `None` means every table.
+    /// Requested tables. `None` means every table. Ignored by
+    /// [`KernelDebugAction::Abort`].
     pub tables: Option<Vec<KernelDebugTable>>,
+    /// What the peer is asking the runtime to DO. Defaults to `Snapshot`, the
+    /// read-only projection this socket has always served.
+    #[serde(default)]
+    pub action: KernelDebugAction,
+}
+
+/// What a debug request asks for. Reading is the default; aborting is the
+/// operator's replacement for the host-wide shell watchdog's `lldb` step.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KernelDebugAction {
+    #[default]
+    Snapshot,
+    /// Latch a `KernelAbort`. The runtime freezes, captures one post-mortem
+    /// and completes every unpublished container job with
+    /// `EmbedError::KernelAborted`.
+    ///
+    /// The requester's `run_id` travels IN the request: the socket path
+    /// carries only its digest, and the runtime must not have to read its own
+    /// environment to name the run an operator just named.
+    Abort { run_id: String },
 }
 
 impl KernelDebugRequest {
@@ -138,6 +160,18 @@ impl KernelDebugRequest {
         Self {
             schema: KERNEL_DEBUG_REQUEST_SCHEMA.to_owned(),
             tables,
+            action: KernelDebugAction::Snapshot,
+        }
+    }
+
+    /// Ask the runtime to abort its kernel.
+    pub fn abort(run_id: impl Into<String>) -> Self {
+        Self {
+            schema: KERNEL_DEBUG_REQUEST_SCHEMA.to_owned(),
+            tables: None,
+            action: KernelDebugAction::Abort {
+                run_id: run_id.into(),
+            },
         }
     }
 
