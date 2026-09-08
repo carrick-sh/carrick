@@ -6451,6 +6451,21 @@ where
             .publish_terminal(self.terminal_result.take());
     }
 
+    /// Publish the terminal result of a job that lost the process-exit claim.
+    ///
+    /// Such a job carries no outcome of its own: another thread of the same
+    /// process owns the exit, so Linux terminated this thread. That is the same
+    /// `ThreadDone` the owner's member drain publishes through
+    /// `publish_member`, and publishing it here keeps the job's own settlement
+    /// the sole owner of its publication instead of a member list this job may
+    /// already have left.
+    fn publish_lost_claim_terminal_result(&mut self) {
+        if self.terminal_result.is_none() {
+            self.terminal_result = Some(Ok(VcpuLoopOutcome::ThreadDone));
+        }
+        self.publish_terminal_result();
+    }
+
     fn suspend(
         &mut self,
         suspension: HvpatchLoopSuspension,
@@ -8057,7 +8072,7 @@ where
 
     fn after_executor_failure_settlement(&mut self) -> continuation::ExecutorFailureSettlement {
         if self.terminal_settlement.is_published() {
-            return continuation::ExecutorFailureSettlement::DeferredToProcessOwner;
+            return continuation::ExecutorFailureSettlement::AlreadyPublished;
         }
         if self.terminal_result.is_some() {
             self.publish_terminal_result();
@@ -8087,7 +8102,20 @@ where
         };
         match receipt.claim {
             ProcessExitClaim::LostToExec | ProcessExitClaim::AlreadyOwned => {
-                return continuation::ExecutorFailureSettlement::DeferredToProcessOwner;
+                // Losing the claim used to defer publication to the process
+                // terminal owner. That owner only ever publishes the members
+                // its drain snapshot holds, and an `execve` survivor is removed
+                // from the member list by `finish_persistent_process_handles`
+                // and never re-enrolled -- so a lost-claim survivor's result was
+                // published by nobody. Its container process job then waited on
+                // an `HvpatchLoopResult` forever, with every Kernel task retired
+                // and every executor idle (the `go build` / `go_types` exit
+                // wedge). The outcome is not in doubt here: another thread owns
+                // the process exit, so Linux has terminated this one, which is
+                // exactly the `ThreadDone` the owner's member drain would have
+                // published. Publish it from the settlement that owns it.
+                self.publish_lost_claim_terminal_result();
+                return continuation::ExecutorFailureSettlement::PublishCurrent;
             }
             ProcessExitClaim::Owner | ProcessExitClaim::Pending => {}
         }
@@ -17292,6 +17320,60 @@ mod tests {
                 case.context.thread().key(),
             );
         }
+    }
+
+    /// An executor failure on a job that LOST the process-exit claim must still
+    /// publish that job's own logical result.
+    ///
+    /// Deferring to the process terminal owner is only sound while this job's
+    /// settlement is still enrolled in the owner's member list. An `execve`
+    /// survivor is removed from that list by `finish_persistent_process_handles`
+    /// and never re-enrolled, so the owner's drain never publishes it: the
+    /// container's `wait_process_jobs` then waits on an `HvpatchLoopResult` that
+    /// no one can ever publish, with an empty kernel graph and idle executors
+    /// (the `go build` / `go_types` exit wedge).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn executor_failure_after_a_lost_exit_claim_publishes_its_own_result() {
+        let (kernel, _context, state) = typed_completion_fixture(72_461, SyscallDispatcher::new());
+        let owner = ThreadId::synthetic_for_tests(72_462);
+        assert_eq!(
+            kernel
+                .clone_admission
+                .try_claim_process_exit(owner)
+                .expect("sibling claims the process exit")
+                .claim,
+            ProcessExitClaim::Owner,
+        );
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let settlement = job.terminal_settlement.clone();
+        let result = settlement.result.clone();
+        let completion = settlement.completion();
+        assert_ne!(
+            kernel
+                .clone_admission
+                .try_claim_process_exit(job.state.this_tid)
+                .expect("loser claim")
+                .claim,
+            ProcessExitClaim::Owner,
+        );
+
+        assert_eq!(
+            ProductionHvpatchLoopPoll::after_executor_failure_settlement(&mut job),
+            continuation::ExecutorFailureSettlement::PublishCurrent,
+            "a job that cannot prove an owner will publish it must publish itself"
+        );
+
+        assert!(
+            settlement.is_published(),
+            "the lost-claim member left its container job result unpublished"
+        );
+        assert!(completion.is_finished());
+        assert!(
+            matches!(result.wait(), Ok(VcpuLoopOutcome::ThreadDone)),
+            "Linux terminated this thread at the owner's exit_group: ThreadDone"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
