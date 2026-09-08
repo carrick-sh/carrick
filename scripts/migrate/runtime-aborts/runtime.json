@@ -1962,7 +1962,7 @@
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "RunQueue::close",
       "ordinal_in_function": 1,
-      "fingerprint": "7aac6fd1f576ee6387ae764e1738cd030d39f7d36d67b68e290338e7465c70ea",
+      "fingerprint": "6c24f5fd84c25791ba87ae636991f4745b6c4eb21ab46ee05f6ec861185ca6b1",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue close_epoch counter overflow in close; wrapping epoch numbers corrupts queue close synchronization."
