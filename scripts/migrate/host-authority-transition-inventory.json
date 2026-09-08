@@ -1041,8 +1041,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:18498 in `trace_permit_park`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `trace_permit_park`; no guest identity selects its host target.",
     "review_id": "HA-000042",
     "source": {
-      "byte_end": 748174,
-      "byte_start": 748162,
+      "byte_end": 748298,
+      "byte_start": 748286,
       "column": 22,
       "column_end": 34,
       "column_start": 22,
@@ -1069,8 +1069,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:18513 in `permit_exhausted`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `permit_exhausted`; no guest identity selects its host target.",
     "review_id": "HA-000043",
     "source": {
-      "byte_end": 748603,
-      "byte_start": 748591,
+      "byte_end": 748727,
+      "byte_start": 748715,
       "column": 22,
       "column_end": 34,
       "column_start": 22,
@@ -1097,8 +1097,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:19032 in `record_vm_resident`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `record_vm_resident`; no guest identity selects its host target.",
     "review_id": "HA-000044",
     "source": {
-      "byte_end": 770612,
-      "byte_start": 770600,
+      "byte_end": 770736,
+      "byte_start": 770724,
       "column": 22,
       "column_end": 34,
       "column_start": 22,
@@ -1125,8 +1125,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:19352 in `create_with_no_resources_backpressure_bounded`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `create_with_no_resources_backpressure_bounded`; no guest identity selects its host target.",
     "review_id": "HA-000045",
     "source": {
-      "byte_end": 784115,
-      "byte_start": 784103,
+      "byte_end": 784239,
+      "byte_start": 784227,
       "column": 34,
       "column_end": 46,
       "column_start": 34,
@@ -1153,8 +1153,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:19363 in `create_with_no_resources_backpressure_bounded`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `create_with_no_resources_backpressure_bounded`; no guest identity selects its host target.",
     "review_id": "HA-000046",
     "source": {
-      "byte_end": 784597,
-      "byte_start": 784585,
+      "byte_end": 784721,
+      "byte_start": 784709,
       "column": 34,
       "column_end": 46,
       "column_start": 34,
@@ -1181,8 +1181,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:19373 in `create_with_no_resources_backpressure_bounded`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `create_with_no_resources_backpressure_bounded`; no guest identity selects its host target.",
     "review_id": "HA-000047",
     "source": {
-      "byte_end": 785065,
-      "byte_start": 785053,
+      "byte_end": 785189,
+      "byte_start": 785177,
       "column": 34,
       "column_end": 46,
       "column_start": 34,
@@ -1206,18 +1206,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:47158 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:48026 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000048",
     "source": {
-      "byte_end": 1974009,
-      "byte_start": 1973997,
+      "byte_end": 2007274,
+      "byte_start": 2007262,
       "column": 21,
       "column_end": 33,
       "column_start": 21,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 47158,
-      "line_end": 47158,
-      "line_start": 47158
+      "line": 48026,
+      "line_end": 48026,
+      "line_start": 48026
     }
   },
   {
@@ -1234,18 +1234,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:47204 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:48072 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000049",
     "source": {
-      "byte_end": 1976640,
-      "byte_start": 1976628,
+      "byte_end": 2009905,
+      "byte_start": 2009893,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 47204,
-      "line_end": 47204,
-      "line_start": 47204
+      "line": 48072,
+      "line_end": 48072,
+      "line_start": 48072
     }
   },
   {
@@ -1262,18 +1262,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:47245 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:48113 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000050",
     "source": {
-      "byte_end": 1978957,
-      "byte_start": 1978945,
+      "byte_end": 2012222,
+      "byte_start": 2012210,
       "column": 25,
       "column_end": 37,
       "column_start": 25,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 47245,
-      "line_end": 47245,
-      "line_start": 47245
+      "line": 48113,
+      "line_end": 48113,
+      "line_start": 48113
     }
   },
   {
@@ -3028,8 +3028,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:12198 in `create_exec_private_file_artifact`, `std::fs::OpenOptions::new` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000118",
     "source": {
-      "byte_end": 507199,
-      "byte_start": 507174,
+      "byte_end": 507287,
+      "byte_start": 507262,
       "column": 16,
       "column_end": 41,
       "column_start": 16,
@@ -3642,8 +3642,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:12203 in `create_exec_private_file_artifact`, `std::fs::OpenOptions::open` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000141",
     "source": {
-      "byte_end": 507303,
-      "byte_start": 507299,
+      "byte_end": 507391,
+      "byte_start": 507387,
       "column": 10,
       "column_end": 14,
       "column_start": 10,
@@ -9202,8 +9202,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:12204 in `create_exec_private_file_artifact`, `std::fs::remove_file` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000348",
     "source": {
-      "byte_end": 507357,
-      "byte_start": 507337,
+      "byte_end": 507445,
+      "byte_start": 507425,
       "column": 25,
       "column_end": 45,
       "column_start": 25,
@@ -9230,8 +9230,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:12206 in `create_exec_private_file_artifact`, `std::fs::remove_file` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000349",
     "source": {
-      "byte_end": 507423,
-      "byte_start": 507403,
+      "byte_end": 507511,
+      "byte_start": 507491,
       "column": 17,
       "column_end": 37,
       "column_start": 17,
@@ -14995,8 +14995,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:12196 in `create_exec_private_file_artifact`, `std::process::id` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000571",
     "source": {
-      "byte_end": 507148,
-      "byte_start": 507132,
+      "byte_end": 507236,
+      "byte_start": 507220,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
@@ -15023,8 +15023,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:19028 in `record_vm_resident`, `std::process::id` acts only on the authenticated owner of the current HVF VM residency slot used by `record_vm_resident`; no guest identity selects its host target.",
     "review_id": "HA-000572",
     "source": {
-      "byte_end": 770363,
-      "byte_start": 770347,
+      "byte_end": 770487,
+      "byte_start": 770471,
       "column": 57,
       "column_end": 73,
       "column_start": 57,
@@ -15051,8 +15051,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:19182 in `acquire_atomic_vcpu_permit`, `std::process::id` acts only on the authenticated owner of the current global vCPU permit used by `acquire_atomic_vcpu_permit`; no guest identity selects its host target.",
     "review_id": "HA-000573",
     "source": {
-      "byte_end": 777198,
-      "byte_start": 777182,
+      "byte_end": 777322,
+      "byte_start": 777306,
       "column": 15,
       "column_end": 31,
       "column_start": 15,
@@ -16398,8 +16398,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:18558 in `acquire_global_vcpu_permit`, `std::thread::sleep` acts only on the current HVF carrier admission and diagnostic state used by `acquire_global_vcpu_permit`; no guest identity selects its host target.",
     "review_id": "HA-000621",
     "source": {
-      "byte_end": 750404,
-      "byte_start": 750386,
+      "byte_end": 750528,
+      "byte_start": 750510,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
@@ -16426,8 +16426,8 @@
     "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:19200 in `acquire_atomic_vcpu_permit`, `std::thread::sleep` acts only on the current HVF carrier admission and diagnostic state used by `acquire_atomic_vcpu_permit`; no guest identity selects its host target.",
     "review_id": "HA-000622",
     "source": {
-      "byte_end": 777815,
-      "byte_start": 777797,
+      "byte_end": 777939,
+      "byte_start": 777921,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
