@@ -2969,3 +2969,26 @@ invariants opt-in per test, structural invariants stay on). Also
 pre-existing on main before tonight: three `just test-integration`
 failures (`open_o_tmpfile…setuid_setgid`, `tty_ioctls…`,
 `timer_create_rejects…`).
+
+### 2026-09-08 13:00 — the go-build HostWait hang landed (main, 13th landing)
+
+The snapshot could not say what a `HostWait` thread waited on, so the
+first commit (8af7166de) made it say: family, probe, polled fds, deadline
+and registration state per continuation. The reproduced wedge then read:
+one lost wake. Task 8447's thread was in `wait-on-hvpatch-child`,
+`enrolled`, `event: None`, with its child 8452 already a zombie and no
+SIGCHLD ever posted; the other sixteen threads were downstream. Mechanism:
+`wait4`/`waitid` scans the child set, returns `StillRunning`, and only
+THEN builds the continuation, whose capture re-reads the parent's wake
+generation — a child exiting in that window commits its zombie and spends
+the wake edge before the reading, so `subscribe_wake` compares equal and
+the parent enrols past the only edge that would ever fire. Linux enqueues
+on the wait queue before rescanning. Fix bec71f7ec: `ChildWaitPrecheck` is
+sampled inside the scan and threaded to both readiness paths. Red-first
+unit test (`Enrolled` vs `Ready`); pre-fix 1 wedge in 10 reducer runs,
+post-fix 0 in 19 (load 8–40); gates 0; director rebase, reconcile, lint 0,
+workspace check 0. Not proven: no in-vivo generation reading of a
+post-instrumentation wedge; the four now-loud `notify_child_exit`
+refusal paths fired 0 times; the `TaskBusy` arm's unsampled precheck trades
+a lost wake for redispatches while a fork reservation is held (bounded,
+unmeasured).
