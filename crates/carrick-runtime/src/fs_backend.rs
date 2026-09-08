@@ -3227,6 +3227,15 @@ impl HostFsBackend {
         self.dir_cache.lock().clear();
     }
 
+    /// Evict `dir` and all its descendants from [`Self::dir_cache`].
+    /// Used when a directory or symlink is removed: the directory itself and
+    /// any cached subpaths (if any) are gone, but parent and sibling
+    /// directories remain valid containment anchors and must NOT be evicted.
+    fn evict_dir_cache_subtree(&self, dir: &Path) {
+        let mut cache = self.dir_cache.lock();
+        cache.retain(|k, _| k != dir && !k.starts_with(dir));
+    }
+
     /// The guest's own host open failed with `host_errno`. If that is
     /// descriptor exhaustion and carrick's own directory cache (up to 4096
     /// held dirfds) may be why, reclaim it and report `true`: the caller
@@ -4073,6 +4082,9 @@ impl HostFsBackend {
     }
 
     fn clear_whiteout_normalized(&self, normalized: &Path) {
+        if !self.may_have_whiteouts() {
+            return;
+        }
         let Some(marker) = host_whiteout_sidecar_rel(normalized) else {
             return;
         };
@@ -5951,6 +5963,18 @@ impl FsBackend for HostFsBackend {
                     None => Err(BackendError::Io),
                 };
             }
+        } else {
+            let flags = libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK
+                | libc::O_NOFOLLOW;
+            let raw = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0) };
+            if raw >= 0 {
+                let fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+                let generation = crate::fs_resolve_cache::current_dir_generation();
+                self.publish_dir_fd(rel, &fd, generation);
+            }
         }
         self.clear_whiteout_normalized(&normalized);
         crate::fs_resolve_cache::bump_generation();
@@ -6261,8 +6285,14 @@ impl FsBackend for HostFsBackend {
         if rc == 0 {
             crate::fs_resolve_cache::bump_generation();
             if removed_dir || removed_symlink {
-                crate::fs_resolve_cache::bump_dir_generation();
-                self.drop_dir_cache();
+                self.evict_dir_cache_subtree(rel);
+            }
+            if self.use_stat_cache {
+                let mut map = self.stat_cache.lock();
+                map.remove(rel);
+                if removed_dir {
+                    map.retain(|k, _| !k.starts_with(rel));
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -6981,10 +7011,9 @@ impl FsBackend for HostFsBackend {
         if rc != 0 {
             return Err(BackendError::Io);
         }
-        crate::fs_resolve_cache::bump_dir_generation();
-        self.drop_dir_cache();
+        self.evict_dir_cache_subtree(rel);
         if self.use_stat_cache {
-            self.drop_stat_cache_after_rename();
+            self.stat_cache.lock().remove(rel);
         }
         Ok(())
     }
@@ -8931,6 +8960,43 @@ mod tests {
             before,
             "file churn must not invalidate the directory cache"
         );
+    }
+
+    /// Deleting a leaf directory (e.g. during `rmtree`) must NOT invalidate
+    /// parent or ancestor directory file descriptors. Only the deleted subtree
+    /// is evicted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dir_cache_survives_directory_tree_deletion() {
+        use std::os::fd::AsRawFd;
+
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.make_dir("/pkg").unwrap();
+        b.make_dir("/pkg/a").unwrap();
+        b.make_dir("/pkg/a/b").unwrap();
+        b.make_dir("/pkg/a/b/c").unwrap();
+
+        let pkg_fd = b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd();
+        let a_fd = b.dir_fd_for(Path::new("pkg/a")).unwrap().as_raw_fd();
+        let b_fd = b.dir_fd_for(Path::new("pkg/a/b")).unwrap().as_raw_fd();
+        let _c_fd = b.dir_fd_for(Path::new("pkg/a/b/c")).unwrap().as_raw_fd();
+
+        // Removing leaf directory `c` must evict `c` but preserve `b`, `a`, and `pkg`.
+        assert!(b.remove_entry("/pkg/a/b/c"));
+        assert!(b.dir_fd_for(Path::new("pkg/a/b/c")).is_err());
+        assert_eq!(
+            b.dir_fd_for(Path::new("pkg/a/b")).unwrap().as_raw_fd(),
+            b_fd
+        );
+        assert_eq!(b.dir_fd_for(Path::new("pkg/a")).unwrap().as_raw_fd(), a_fd);
+        assert_eq!(b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(), pkg_fd);
+
+        // Removing `b` preserves `a` and `pkg`.
+        assert!(b.remove_entry("/pkg/a/b"));
+        assert!(b.dir_fd_for(Path::new("pkg/a/b")).is_err());
+        assert_eq!(b.dir_fd_for(Path::new("pkg/a")).unwrap().as_raw_fd(), a_fd);
+        assert_eq!(b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(), pkg_fd);
     }
 
     /// A cached dirfd names an INODE, so a rename of the directory would make
