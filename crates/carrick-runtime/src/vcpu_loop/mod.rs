@@ -6283,6 +6283,27 @@ where
             generation,
             |thread, generation| runtime.persistent_bindings().retire(thread, generation),
         )
+        .map(|retirement| {
+            // A child that settled terminally before the rollback reached it
+            // is not a rollback failure. This used to abort the carrier: an
+            // executor claimed the child's pre-activation generation, could
+            // not resolve its binding, settled it
+            // `Failed { SnapshotRestoreFailed }`, and this rollback then
+            // found that Failed generation and killed every Linux process in
+            // the carrier. The claim itself is now unrepresentable (the
+            // thread's pre-publication reservation outlives the authority
+            // this rollback drops), and the outcome of reaching this state by
+            // any other route is a guest-visible clone failure, not a dead
+            // carrier.
+            if let executor::FailedCloneRetirement::AlreadySettled(state) = retirement {
+                tracing::error!(
+                    thread = ?context.thread().key(),
+                    ?generation,
+                    ?state,
+                    "HVPatch clone rollback found its child already settled; failing the clone"
+                );
+            }
+        })
         .unwrap_or_else(|error| {
             eprintln!("carrick: FATAL: authoritative HVPatch clone rollback: {error}");
             std::process::abort();
@@ -6577,6 +6598,7 @@ where
                     generation,
                     |_, _| {},
                 )
+                .map(|_| ())
                 .unwrap_or_else(|error| {
                     eprintln!("carrick: FATAL: retire generation-drifted clone: {error}");
                     std::process::abort();
@@ -6629,6 +6651,7 @@ where
                     generation,
                     |_, _| {},
                 )
+                .map(|_| ())
                 .unwrap_or_else(|retire| {
                     eprintln!("carrick: FATAL: retire carrier-commit clone: {retire}");
                     std::process::abort();
