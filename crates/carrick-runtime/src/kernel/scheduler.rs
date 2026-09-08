@@ -759,6 +759,49 @@ struct RunQueueState {
     closed_waiter_observations: usize,
 }
 
+/// Parked executors right now, or the reason the census could not be taken.
+///
+/// A non-blocking reader that cannot get a run-queue lock must say so. An
+/// `Option`/`0` would let "nobody is parked" and "I could not look" share one
+/// value, which is precisely the confusion an abort sink cannot afford.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaiterCensus {
+    /// Every run-queue lock was uncontended; this is the exact count.
+    Exact(usize),
+    /// A run-queue lock was held elsewhere. The reader reported it instead of
+    /// joining the queue behind a holder that may itself be stuck.
+    RunQueueLocked,
+}
+
+impl WaiterCensus {
+    /// The count when it is exact, `None` when a lock was contended.
+    pub fn exact(self) -> Option<usize> {
+        match self {
+            Self::Exact(count) => Some(count),
+            Self::RunQueueLocked => None,
+        }
+    }
+
+    /// Whether the census lost to a contended run-queue lock.
+    pub fn is_run_queue_locked(self) -> bool {
+        matches!(self, Self::RunQueueLocked)
+    }
+}
+
+/// The run-queue picture the kernel-debug endpoint and the post-mortem sink
+/// read. Every field is either published atomically or read with `try_lock`,
+/// so building one never blocks.
+#[derive(Clone, Debug)]
+pub struct SchedulerSummary {
+    pub lifecycle: String,
+    pub queued_len: usize,
+    pub claimed: usize,
+    pub waiters: WaiterCensus,
+    pub control_epoch: u64,
+    pub need_resched: bool,
+    pub snapshot_count: u64,
+}
+
 /// What a queue insertion did with one exact row. A bare `bool` said only
 /// "queued or coalesced", which cannot express the third case the pre-
 /// activation window needs: durably queued but deliberately NOT claimable.
@@ -2212,13 +2255,7 @@ impl RunQueue {
             // carrier lock is held, so an executor is either already parked
             // (counted, and woken by the nudge below) or has not yet parked
             // and will see the published lifecycle before it does.
-            let cpu_waiters: usize = self
-                .inner
-                .cpus
-                .iter()
-                .map(|cpu| cpu.state.lock().waiters)
-                .sum();
-            state.close_waiters_expected = cpu_waiters + state.spare_waiters;
+            state.close_waiters_expected = self.waiter_count_locked(&state);
             self.inner
                 .close_epoch
                 .store(state.close_epoch, Ordering::Release);
@@ -2259,17 +2296,48 @@ impl RunQueue {
         self.inner.total_queued.load(Ordering::SeqCst)
     }
 
-    /// Executors parked right now, across every CPU plus the spare pool. Used
-    /// by the debug summary and, at `close`, to size the close-observation
-    /// debt.
-    fn waiter_count(&self) -> usize {
+    /// Executors parked right now, across every CPU plus the spare pool,
+    /// counted from a state guard the CALLER already holds.
+    ///
+    /// The count needs `spare_waiters`, which lives in the run-queue state, so
+    /// it takes the guard as an argument instead of locking. Locking here was
+    /// only ever safe for a caller that did not already hold the state, and
+    /// that rule lived in prose: `close` obeyed it by open-coding the sum,
+    /// while `scheduler_summary` locked the state and then called this, re-
+    /// entering a non-reentrant `parking_lot::Mutex` and deadlocking its own
+    /// thread while holding the lock the whole carrier drains through. Taking
+    /// `&RunQueueState` makes that call unwritable.
+    fn waiter_count_locked(&self, state: &RunQueueState) -> usize {
         let cpu_waiters: usize = self
             .inner
             .cpus
             .iter()
             .map(|cpu| cpu.state.lock().waiters)
             .sum();
-        cpu_waiters + self.inner.state.lock().spare_waiters
+        cpu_waiters + state.spare_waiters
+    }
+
+    /// The same census for a reader that must never block: the kernel-debug
+    /// endpoint and the post-mortem abort sink.
+    ///
+    /// Those two exist to describe a carrier that is already stuck, so joining
+    /// the queue behind whoever holds a run-queue lock turns the instrument
+    /// into a second casualty — measured on `test_compile`, where the abort
+    /// sink could not fire at all. Every lock is taken with `try_lock` and a
+    /// contended read is reported as [`WaiterCensus::RunQueueLocked`], never
+    /// waited on and never a silent zero.
+    fn try_waiter_census(&self) -> WaiterCensus {
+        let mut total = 0usize;
+        for cpu in &self.inner.cpus {
+            let Some(local) = cpu.state.try_lock() else {
+                return WaiterCensus::RunQueueLocked;
+            };
+            total += local.waiters;
+        }
+        let Some(state) = self.inner.state.try_lock() else {
+            return WaiterCensus::RunQueueLocked;
+        };
+        WaiterCensus::Exact(total + state.spare_waiters)
     }
 
     #[cfg(test)]
@@ -3575,29 +3643,30 @@ impl Scheduler {
         &self.kernel
     }
 
-    pub fn scheduler_summary(&self) -> (String, usize, usize, usize, u64, bool, u64) {
-        let state = self.queue.inner.state.lock();
-        let lifecycle = match state.lifecycle {
+    /// What the kernel-debug endpoint and the abort sink read about the run
+    /// queue, produced WITHOUT ever blocking on a run-queue lock.
+    ///
+    /// The lifecycle is taken from the atomic `RunQueueInner` publishes it to,
+    /// the totals are atomics already, and the parked-executor census is a
+    /// `try_lock` that reports [`WaiterCensus::RunQueueLocked`] rather than
+    /// waiting. This reader has to be able to speak in exactly the state it
+    /// exists to describe.
+    pub fn scheduler_summary(&self) -> SchedulerSummary {
+        let lifecycle = match self.queue.inner.lifecycle() {
             QueueLifecycle::Open => "open",
             QueueLifecycle::Closing => "closing",
             QueueLifecycle::Closed => "closed",
         }
         .to_owned();
-        let queued_len = self.queue.inner.total_queued.load(Ordering::Acquire);
-        let claimed = self.queue.inner.claimed.load(Ordering::Acquire);
-        let waiters = self.queue.waiter_count();
-        let control_epoch = self.queue.inner.control_epoch.load(Ordering::Acquire);
-        let need_resched = self.need_resched();
-        let snapshot_count = self.snapshot_count();
-        (
+        SchedulerSummary {
             lifecycle,
-            queued_len,
-            claimed,
-            waiters,
-            control_epoch,
-            need_resched,
-            snapshot_count,
-        )
+            queued_len: self.queue.inner.total_queued.load(Ordering::Acquire),
+            claimed: self.queue.inner.claimed.load(Ordering::Acquire),
+            waiters: self.queue.try_waiter_census(),
+            control_epoch: self.queue.inner.control_epoch.load(Ordering::Acquire),
+            need_resched: self.need_resched(),
+            snapshot_count: self.snapshot_count(),
+        }
     }
 
     pub fn snapshot_run_queue_rows(&self) -> Vec<(ThreadKey, ExecutionGeneration, bool)> {
@@ -3734,7 +3803,8 @@ impl Scheduler {
 
     #[cfg(test)]
     fn waiter_count(&self) -> usize {
-        self.queue.waiter_count()
+        let state = self.queue.inner.state.lock();
+        self.queue.waiter_count_locked(&state)
     }
 
     #[cfg(test)]
@@ -6465,5 +6535,67 @@ mod tests {
         assert_eq!(disposition, WakeDisposition::Pending);
         assert_eq!(observer.fired.load(Ordering::SeqCst), 1);
         assert_eq!(scheduler.queued_len(), 0, "nothing was published");
+    }
+
+    /// `scheduler_summary` must return. It is the only reader the kernel-debug
+    /// endpoint and the post-mortem sink have, and it took the run-queue state
+    /// mutex and then called `waiter_count`, which takes the SAME mutex — a
+    /// non-reentrant `parking_lot::Mutex`, so every call self-deadlocked the
+    /// calling thread while holding the lock the whole carrier drains through.
+    /// Measured on `test_compile` (target/perf/wedges/cmp-sched-1/bt-all.txt):
+    /// thread #1 blocked at `waiter_count` scheduler.rs:2272 holding
+    /// `0x13a752ec8` acquired at `scheduler_summary` scheduler.rs:3579.
+    #[test]
+    fn scheduler_summary_returns_and_does_not_self_deadlock() {
+        let (kernel, context) = bootstrap(12_600);
+        publish(&context, 1);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let probe = Arc::clone(&scheduler);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let summary = probe.scheduler_summary();
+            let _ = tx.send(summary);
+        });
+        let summary = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("scheduler_summary must return; it deadlocked on its own state mutex");
+        worker.join().expect("summary probe thread");
+        assert_eq!(summary.lifecycle, "open");
+        assert_eq!(
+            summary.waiters,
+            super::WaiterCensus::Exact(0),
+            "nothing else held a run-queue lock, so the census is exact"
+        );
+    }
+
+    /// The liveness/post-mortem sink has to be able to speak in exactly the
+    /// wedged state it exists to describe, so its scheduler reader must never
+    /// block on the run-queue state mutex: it reports `run_queue_locked`
+    /// instead of joining the queue behind whoever holds it.
+    #[test]
+    fn scheduler_summary_reports_run_queue_locked_instead_of_blocking() {
+        let (kernel, context) = bootstrap(12_601);
+        publish(&context, 1);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let held = scheduler.queue.inner.state.lock();
+        let probe = Arc::clone(&scheduler);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = tx.send(probe.scheduler_summary());
+        });
+        let summary = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the sink must judge while another thread holds the run-queue state mutex");
+        assert_eq!(
+            summary.waiters,
+            super::WaiterCensus::RunQueueLocked,
+            "the contended read is a named finding, not a silent zero"
+        );
+        assert_eq!(
+            summary.lifecycle, "open",
+            "lifecycle is published atomically and stays readable"
+        );
+        drop(held);
+        worker.join().expect("summary probe thread");
     }
 }

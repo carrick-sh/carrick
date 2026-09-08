@@ -489,7 +489,12 @@ pub struct DebugSchedulerRow {
     pub lifecycle: String,
     pub queued_len: usize,
     pub claimed: usize,
-    pub waiters: usize,
+    /// Parked executors, or `None` when a run-queue lock was held elsewhere.
+    /// The sink reports the contention instead of blocking on it, so `None`
+    /// means "could not look", distinct from `Some(0)` "nobody is parked".
+    pub waiters: Option<usize>,
+    /// Set when `waiters` is `None`: a run-queue lock was contended.
+    pub run_queue_locked: bool,
     pub control_epoch: u64,
     pub need_resched: bool,
     pub snapshot_count: u64,
