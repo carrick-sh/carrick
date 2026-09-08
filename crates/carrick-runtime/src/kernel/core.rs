@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+
+use arc_swap::ArcSwap;
 
 use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, ThreadId};
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -451,6 +453,9 @@ pub struct Kernel {
     container_root_publication_barriers: ContainerRootPublicationBarriers,
     /// `RLIMIT_CPU` watchdog; see [`super::cpu_limit`].
     cpu_limit_watch: CpuLimitWatch,
+    auditors: ArcSwap<crate::observe::auditor::AuditorChain>,
+    abort_reason: Arc<Mutex<Option<crate::observe::auditor::AuditReason>>>,
+    unpublished_jobs: AtomicUsize,
 }
 
 /// A fully constructed container-init graph that is still invisible to the
@@ -1308,10 +1313,48 @@ impl Kernel {
             #[cfg(test)]
             container_root_publication_barriers: ContainerRootPublicationBarriers::default(),
             cpu_limit_watch: CpuLimitWatch::default(),
+            auditors: {
+                let auditors = crate::observe::get_container_auditors(container.id());
+                ArcSwap::from(auditors)
+            },
+            abort_reason: Arc::new(Mutex::new(None)),
+            unpublished_jobs: AtomicUsize::new(0),
         });
         container.bind_kernel(&kernel);
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
+    }
+
+    pub fn auditors(&self) -> Arc<crate::observe::auditor::AuditorChain> {
+        self.auditors.load_full()
+    }
+
+    pub fn set_auditors(&self, auditors: Arc<crate::observe::auditor::AuditorChain>) {
+        self.auditors.store(auditors);
+    }
+
+    pub fn record_abort(&self, reason: crate::observe::auditor::AuditReason) {
+        let mut guard = self.abort_reason.lock();
+        if guard.is_none() {
+            *guard = Some(reason.clone());
+        }
+        self.auditors.load().record_abort(reason);
+    }
+
+    pub fn abort_reason(&self) -> Option<crate::observe::auditor::AuditReason> {
+        let direct = self.abort_reason.lock().clone();
+        if direct.is_some() {
+            return direct;
+        }
+        self.auditors.load().abort_reason()
+    }
+
+    pub fn unpublished_jobs(&self) -> usize {
+        self.unpublished_jobs.load(Ordering::Acquire)
+    }
+
+    pub fn set_unpublished_jobs(&self, count: usize) {
+        self.unpublished_jobs.store(count, Ordering::Release);
     }
 
     /// The kernel's `RLIMIT_CPU` watchdog.

@@ -3712,6 +3712,11 @@ where
             crate::event_ring::rec_hvpatch_executor_claim(pid, tid, executor_id.raw_for_probe());
         }
         if let Some(task) = kernel_task.as_ref() {
+            let cpu = crate::observe::GuestCpuId::new(executor_id.raw_for_probe());
+            scheduler
+                .kernel()
+                .auditors()
+                .executor_claimed(executor_id, cpu, task.key());
             // A scheduler claim is evidence even when the claimed snapshot is
             // malformed. Preserve the non-reused task/thread/generation join
             // and use zero only for the authority field that could not be
@@ -3827,6 +3832,15 @@ where
             Some(generation),
             asid_generation,
         );
+        if let Some(task) = kernel_task.as_ref() {
+            if task.mark_first_run() {
+                let cpu = crate::observe::GuestCpuId::new(executor_id.raw_for_probe());
+                scheduler
+                    .kernel()
+                    .auditors()
+                    .child_first_run(task.key(), executor_id, cpu);
+            }
+        }
 
         let mut pending_exec_retirement = None;
         let mut pending_exec_cleanup = false;
@@ -4413,6 +4427,23 @@ where
                 }
                 if matches!(event, ExecutorPoolEvent::SettledExited { .. }) {
                     binding.after_terminal_settlement();
+                    let task_key = settlement_thread.task_key();
+                    let (status, owner) =
+                        if let Some(zombie) = scheduler.kernel().registry().zombie(task_key.id) {
+                            (
+                                zombie.status,
+                                crate::observe::ExitOwner::from(zombie.parent),
+                            )
+                        } else {
+                            (
+                                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                                crate::observe::ExitOwner::Nobody,
+                            )
+                        };
+                    scheduler
+                        .kernel()
+                        .auditors()
+                        .exit_settled(task_key, status, owner);
                 }
                 receipts.record(executor_id, event);
                 probe_executor_lifecycle(

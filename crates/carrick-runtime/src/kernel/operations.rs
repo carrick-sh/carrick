@@ -964,6 +964,15 @@ impl PreparedFork {
         }
         .publish();
 
+        let fork_kind = if vfork_parent_wait.is_some() {
+            crate::observe::ForkKind::Vfork
+        } else {
+            crate::observe::ForkKind::Fork
+        };
+        kernel
+            .auditors()
+            .fork_admitted(child_parent_task.key(), child_key, fork_kind);
+
         // The child inherited its parent's RLIMIT_CPU; a finite one must be
         // watched from the moment the child is visible.
         kernel.cpu_limit_watch().ensure_watching(&kernel, &child);
@@ -1297,6 +1306,9 @@ impl PreparedThreadClone {
         if let Some(pending) = pending_publication {
             pending.publish();
         }
+        kernel
+            .auditors()
+            .fork_admitted(task.key(), task.key(), crate::observe::ForkKind::Thread);
         Ok(PublishedThreadClone {
             started: Some(StartedThreadClone {
                 context: KernelContext::from_parts(
@@ -4585,6 +4597,11 @@ impl Kernel {
         let pending_publication = prepared.reservation.commit(&mut state)?;
         drop(state);
         pending_publication.publish();
+        self.auditors()
+            .zombie_created(prepared.task, prepared.result_zombie.parent);
+        if self.registry().state.read().tasks.is_empty() {
+            self.auditors().process_graph_empty(self.unpublished_jobs());
+        }
         if let Some(region) = pid_region {
             for tid in retired_secondary_namespace_tids {
                 if !region.unregister_reaped(tid) {
@@ -5078,6 +5095,7 @@ impl Kernel {
                     parent_record.revision = parent_revision;
                 }
                 drop(state);
+                self.auditors().reaped(parent, zombie.key);
                 if let Some(region) = parent_pid_region {
                     let internal =
                         u32::try_from(id.raw()).unwrap_or_else(|_| std::process::abort());

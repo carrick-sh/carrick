@@ -1,6 +1,7 @@
 //! Observer pipeline for syscalls, lifecycle events, and process accounting.
 
 pub mod audit;
+pub mod auditor;
 pub mod budget;
 pub mod fault;
 pub mod intercept;
@@ -8,6 +9,11 @@ pub mod policy;
 pub mod sandbox;
 
 pub use audit::{AuditEvent, AuditObserver};
+pub use auditor::{
+    AuditReason, AuditVerdict, AuditorChain, ExitOwner, FirstTouchDeliverReason, ForkKind,
+    GuestCpuId, KernelAuditor, WakeRejectionReason, get_container_auditors,
+    register_container_auditors, unregister_container_auditors,
+};
 pub use budget::{BudgetCounters, BudgetResource, BudgetSnapshot, ExceedAction, ResourceBudget};
 pub use fault::{
     FaultAction, FaultCondition, FaultInjector, FaultPredicate, FaultRule, FaultRuleBuilder,
