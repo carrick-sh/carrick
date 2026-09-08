@@ -4658,6 +4658,33 @@
   },
   {
     "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
+    "expansion": null,
+    "operation": "std::fs::create_dir_all",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "source": {
+      "byte_end": 15617,
+      "byte_start": 15594,
+      "column": 9,
+      "column_end": 32,
+      "column_start": 9,
+      "file": "crates/carrick-runtime/src/kernel/debug/post_mortem.rs",
+      "line": 384,
+      "line_end": 384,
+      "line_start": 384
+    },
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the operator-selected post-mortem directory"
+    },
+    "rationale": "At crates/carrick-runtime/src/kernel/debug/post_mortem.rs:384 in `PostMortem::write_to_dir`, `std::fs::create_dir_all` accesses only the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "review_id": "HA-000646"
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
@@ -11061,6 +11088,60 @@
       "line_end": 187,
       "line_start": 187
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-WRITE",
+    "expansion": null,
+    "operation": "std::fs::write",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "source": {
+      "byte_end": 15828,
+      "byte_start": 15814,
+      "column": 9,
+      "column_end": 23,
+      "column_start": 9,
+      "file": "crates/carrick-runtime/src/kernel/debug/post_mortem.rs",
+      "line": 388,
+      "line_end": 388,
+      "line_start": 388
+    },
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the post-mortem JSON inside the operator-selected post-mortem directory"
+    },
+    "rationale": "At crates/carrick-runtime/src/kernel/debug/post_mortem.rs:388 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem JSON inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "review_id": "HA-000647"
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-WRITE",
+    "expansion": null,
+    "operation": "std::fs::write",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "source": {
+      "byte_end": 16154,
+      "byte_start": 16140,
+      "column": 9,
+      "column_end": 23,
+      "column_start": 9,
+      "file": "crates/carrick-runtime/src/kernel/debug/post_mortem.rs",
+      "line": 397,
+      "line_end": 397,
+      "line_start": 397
+    },
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the post-mortem event-ring JSONL inside the operator-selected post-mortem directory"
+    },
+    "rationale": "At crates/carrick-runtime/src/kernel/debug/post_mortem.rs:397 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "review_id": "HA-000648"
   },
   {
     "catalog_id": "HA-CATALOG-FS-WRITE",
