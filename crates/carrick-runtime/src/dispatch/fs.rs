@@ -4196,27 +4196,66 @@ impl SyscallDispatcher {
         Some(Ok(self.stat_record_with_device(&full, &real)))
     }
 
+    /// Whether a raw `getdirentries64` stream off `trusted`'s fd IS the exact
+    /// guest listing of `dir_path` — i.e. no other layer contributes a name to
+    /// it and every `d_type` the stream reports is the guest-visible type.
+    ///
+    /// Both anchors qualify, under the proof their own layer already carries:
+    ///
+    /// - `MergedUpper`: the scratch tree is the merged truth (rootfs
+    ///   materialized, deletions are real unlinks), so only a MARKER node (an
+    ///   AF_UNIX socket or `mknod` device — a regular file whose guest type
+    ///   lives in an xattr) can make the stream lie, which
+    ///   `dir_has_overlay_interference` answers root-wide.
+    /// - `ImmutableLower`: the anchor was minted only after
+    ///   `fast_nofollow_absent(dir)` proved the sparse upper holds NOTHING at
+    ///   this directory and has published no whiteout anywhere, so the upper
+    ///   can contribute neither an addition nor a deletion below it and the
+    ///   lower's own stream is the whole merged listing. The proof is bound to
+    ///   the fork-shared structural generation stamped into the anchor: any
+    ///   later create/unlink/rename/copy-up — in this process or a sibling —
+    ///   retires it and the listing falls back to the layered merge. The lower
+    ///   is itself a host backend, so it gets the SAME marker-node question as
+    ///   the upper, asked of the lower's own root.
+    ///
+    /// `d_ino` needs no separate argument: a lower entry's guest `st_ino` IS
+    /// its host inode in the layer cache (`RootFs::directory_entries` reports
+    /// exactly that from its per-child `real_stat`), which is the number the
+    /// stream already carries.
+    fn trusted_dir_stream_is_exact(&self, trusted: &TrustedHostDir, dir_path: &str) -> bool {
+        if trusted.is_merged_upper() {
+            return !self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .dir_has_overlay_interference(dir_path);
+        }
+        if !trusted.namespace_is_current_against(self.fs.rootfs_vfs.overlay.structural_generation())
+        {
+            return false;
+        }
+        self.fs
+            .rootfs_vfs
+            .rootfs
+            .as_ref()
+            .and_then(|rootfs| rootfs.immutable_backend())
+            .is_some_and(|lower| !FsBackend::dir_has_overlay_interference(lower, dir_path))
+    }
+
     /// List a directory for a guest read (`getdents64`, or an `lseek` that
-    /// needs the entry count). A trusted MergedUpper dirfd is STREAMED (one
-    /// readdir batch — d_name/d_type/d_ino straight off the kernel, zero
-    /// per-child stats) when nothing can make the raw stream lie about the
-    /// guest view; everything else takes the exact layered merge by path.
-    /// Runs on the first read of a description and again after an lseek-0
-    /// rewind.
+    /// needs the entry count). A trusted dirfd whose layer provably owns the
+    /// whole listing is STREAMED (one readdir batch — d_name/d_type/d_ino
+    /// straight off the kernel, zero per-child stats, see
+    /// [`Self::trusted_dir_stream_is_exact`]); everything else takes the exact
+    /// layered merge by path. Runs on the first read of a description and
+    /// again after an lseek-0 rewind.
     fn list_directory_entries(
         &self,
         dir_path: &str,
         trusted: Option<&TrustedHostDir>,
     ) -> Vec<RootFsDirEntry> {
         let streamed = match trusted {
-            Some(trusted)
-                if trusted.is_merged_upper()
-                    && !self
-                        .fs
-                        .rootfs_vfs
-                        .overlay
-                        .dir_has_overlay_interference(dir_path) =>
-            {
+            Some(trusted) if self.trusted_dir_stream_is_exact(trusted, dir_path) => {
                 read_host_dir_entries(trusted.fd.raw(), dir_path)
             }
             _ => None,

@@ -4,7 +4,7 @@
  *
  * (a) WHAT IT MEASURES. For every guest syscall whose name is in the fs set
  *     below (openat, close, unlinkat, newfstatat, mkdirat, renameat,
- *     fstat, faccessat, readlinkat), keyed by guest syscall name:
+ *     fstat, faccessat, readlinkat, getdents64, statx), keyed by name:
  *       @wall        quantize of the service window (syscall-entry -> -return)
  *       @wall_sum    total window ns
  *       @host_n      quantize of host syscalls issued inside ONE window
@@ -62,7 +62,8 @@ carrick*:::syscall-entry
 	    this->name == "unlinkat" || this->name == "newfstatat" ||
 	    this->name == "mkdirat" || this->name == "renameat" ||
 	    this->name == "fstat" || this->name == "faccessat" ||
-	    this->name == "readlinkat") ? 1 : 0;
+	    this->name == "readlinkat" || this->name == "getdents64" ||
+	    this->name == "statx") ? 1 : 0;
 	/* arg2 is the ADDRESS of the guest's SyscallArgs ([u64; 6]); a creating
 	 * openat (Linux O_CREAT = 0x40 in args[2]) is a different operation
 	 * from an open of an existing entry and is ledgered under its own key. */
