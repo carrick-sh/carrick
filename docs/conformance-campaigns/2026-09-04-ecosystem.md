@@ -2468,3 +2468,18 @@ the real `carrick-hal::scheduler::GuestCpuId`; expect a small merge there).
 at idle — the load-coupling the goal names, measured on main itself. The
 scheduler binary's one loaded MATCH at load 23 was 64 s (10.4x). Pairs only;
 a quiet-vs-4-worker measurement on one binary is still owed.
+
+**Post-lane-A rows (binary e1a87448…, host load 26–33 from six live agents):**
+9/11 MATCH, two `CARRICK_CRASH`, both pre-existing load-exposed classes, not
+the auditor: `go-go_types` (`conf-36877-c00`) died on `scheduler generation
+observer lost exact transition` (exec-generation abort; the scheduler
+branch's rejection-instead-of-abort turned out to kill the waking executor,
+so it lands with round 3, not alone); `cpython-asyncio` (`conf-36877-c03`,
+inside `test_subprocess…test_kill_issue43884`) died on `HVPatch terminal
+owner publishes failure error=configuration refused: vfork parent resume`
+→ `FATAL: drop HVPatch MM authority (holder=registration-cleanup)`. That
+vfork-parent-resume refusal is a new named signature; filed here for the
+next process-lifecycle round. Every ratio in that run is inflated by the
+load and is not cited. Rule for the rest of the campaign: no ecosystem
+ratio is measured while the host load exceeds ~5; gates under load count
+only crashes and wedges.
