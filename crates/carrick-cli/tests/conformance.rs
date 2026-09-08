@@ -2890,9 +2890,9 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// handshake/EINTR/SA_RESTART matrix.
 /// `mmapanonreuse` proves that partial and whole anonymous arena reuse never
 /// exposes stale bytes. It is `generic`, moving the authoritative inventory to
-/// 520 probe sources: 493 conformance sources (470 generic, 23 dedicated), 26
-/// performance sources, and one helper. Both libc lanes gate 986 rows.
-const PROBE_SOURCE_COUNT: usize = 520;
+/// 527 probe sources: 500 conformance sources (477 generic, 23 dedicated), 26
+/// performance sources, and one helper. Both libc lanes gate 1000 rows.
+const PROBE_SOURCE_COUNT: usize = 527;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4648,9 +4648,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 470);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 493);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 986);
+    assert_eq!(generic.len(), 477);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 500);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1000);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

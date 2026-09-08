@@ -624,6 +624,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "forkexecstorm": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "forkfault": {
     "class": "conformance",
     "excluded": false,
@@ -1645,7 +1650,7 @@
     "runner": "generic"
   },
   "ppollwaitset": {
-    "class": "performance",
+    "class": "conformance",
     "excluded": false,
     "runner": "generic"
   },
@@ -1875,6 +1880,11 @@
     "runner": "generic"
   },
   "ptyisig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptyjobcontrol": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
