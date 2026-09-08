@@ -3664,14 +3664,28 @@ impl HvpatchLoopResult {
         liveness: &ProcessGraphLiveness,
     ) -> Result<VcpuLoopOutcome, RuntimeError> {
         let mut confirming: Option<(GraphCensus, std::time::Instant)> = None;
-        let mut slot = self.state.result.lock();
         loop {
-            if let Some(result) = slot.take() {
-                return result;
-            }
-            self.state.ready.wait_for(&mut slot, liveness.poll);
-            if slot.is_some() {
-                continue;
+            // LOCK ORDER: the judging below runs with NO result lock held.
+            //
+            // `census` takes the kernel registry read lock, and the publishing
+            // side reaches `HvpatchLoopResult::publish` -- this same result
+            // mutex -- from terminal settlement, which runs under registry
+            // locks. Judging under the result lock therefore inverts that
+            // order: `result -> registry` here against `registry -> result`
+            // there. Nothing is lost by dropping it: a publication that lands
+            // between the observation and the verdict is caught by the
+            // re-check at the top of the loop and by the confirmed-verdict
+            // re-check below, and the confirm window already exists because
+            // this observation is not atomic with the graph.
+            {
+                let mut slot = self.state.result.lock();
+                if let Some(result) = slot.take() {
+                    return result;
+                }
+                self.state.ready.wait_for(&mut slot, liveness.poll);
+                if slot.is_some() {
+                    continue;
+                }
             }
             // An abort is carrier-terminal: once one exists, every wait in
             // this carrier is answered by it, including the implicit carrier's
@@ -3683,10 +3697,12 @@ impl HvpatchLoopResult {
             // debug server and executed HERE, through the same sink, so a
             // requested abort and an invariant abort produce one shape.
             if let Some(reason) = crate::kernel::debug::take_abort_request() {
+                // A requested abort is carrier-terminal by the operator's own
+                // decision, so it is answered even if this one job settled in
+                // the same instant: the point of `carrick debug abort` is that
+                // the CARRIER stops and produces evidence.
                 return Err(liveness.abort(reason));
             }
-            // Evaluated with the result slot held, so "no result" and "no
-            // publisher" are read as one observation rather than two.
             let Some(census) = liveness.census() else {
                 // No kernel bound: the invariant cannot see the graph it would
                 // judge, so it must not judge. Fail OPEN here rather than
@@ -3701,12 +3717,23 @@ impl HvpatchLoopResult {
                 Some((observed, since))
                     if observed == census && since.elapsed() >= liveness.confirm =>
                 {
-                    return Err(liveness.liveness_abort(census, 1));
+                    return match self.take_published() {
+                        // A settlement landed while the verdict was being
+                        // formed. A real result always beats an abort: the job
+                        // was published, so the premise of the verdict is gone.
+                        Some(result) => result,
+                        None => Err(liveness.liveness_abort(census, 1)),
+                    };
                 }
                 Some((observed, _)) if observed == census => {}
                 _ => confirming = Some((census, std::time::Instant::now())),
             }
         }
+    }
+
+    /// Take a published result if one has landed, without waiting.
+    fn take_published(&self) -> Option<Result<VcpuLoopOutcome, RuntimeError>> {
+        self.state.result.lock().take()
     }
 }
 
