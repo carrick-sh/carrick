@@ -7962,8 +7962,29 @@ pub fn layered_directory_entries(
     dir: &str,
 ) -> Result<Vec<RootFsDirEntry>, RootFsError> {
     let mut out: Vec<RootFsDirEntry> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
     let deleted: HashSet<String> = overlay.deleted_child_names(dir).into_iter().collect();
+    // The upper's contribution to THIS directory, read ONCE. `child_names`
+    // is the same enumeration the additions pass below already performed, and
+    // it answers the shadowing question for every lower entry by NAME: the
+    // upper can only shadow `dir/x` by holding `x` as a child of `dir`, so
+    // membership in this set is exactly `shadows(joined(dir, x))` — byte
+    // exact on both sides (`lookup_kind` applies the same on-disk name check
+    // the enumeration reads through) — for one directory read instead of one
+    // full path lookup per lower entry.
+    //
+    // That per-entry lookup was the dominant term behind a guest `getdents64`
+    // on an image directory: listing `/usr/local/lib/python3.12` (201 entries)
+    // under `python:3.12-slim` issued 384 host `fstatat64`, and half of them
+    // came from `shadows`. The sparse upper very often holds a directory as
+    // an EMPTY SHELL (an ancestor materialized for something below it), which
+    // is why the cheaper "the upper has nothing at this path at all" proof
+    // does not fire on the hot directories and this one does.
+    let upper_children = overlay.child_names(dir);
+    let upper_names: HashSet<&str> = upper_children
+        .iter()
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    let mut seen: HashSet<String> = HashSet::new();
 
     if let Some(rootfs) = rootfs {
         match rootfs.directory_entries(dir) {
@@ -7975,7 +7996,7 @@ pub fn layered_directory_entries(
                     if deleted.contains(&entry.name) {
                         continue;
                     }
-                    if overlay.shadows(&joined(dir, &entry.name)) {
+                    if upper_names.contains(entry.name.as_str()) {
                         continue;
                     }
                     seen.insert(entry.name.clone());
@@ -7988,8 +8009,9 @@ pub fn layered_directory_entries(
             Err(other) => return Err(other),
         }
     }
+    drop(upper_names);
 
-    for (name, kind, known_size) in overlay.child_names(dir) {
+    for (name, kind, known_size) in upper_children {
         if is_internal_sidecar_name(&name) {
             continue;
         }
@@ -8229,6 +8251,90 @@ mod tests {
         let names: Vec<_> = entries.into_iter().map(|entry| entry.name).collect();
 
         assert_eq!(names, vec!["visible"]);
+    }
+
+    /// Answering "does the upper shadow this lower entry?" from the upper's
+    /// own child-name set (one directory read) instead of one full path
+    /// lookup per lower entry must be EXACT: every way the sparse upper can
+    /// contribute to a lower-backed directory has to be reflected.
+    ///
+    /// Red-first shape: replace the `upper_names.contains(..)` test in
+    /// [`layered_directory_entries`] with `false` and the SHADOW case below
+    /// reports `a` twice; drop the `deleted` test and the WHITEOUT case keeps
+    /// listing `b`. The EMPTY SHELL case is the one that made the cheaper
+    /// whole-directory proof (`fast_nofollow_absent`) useless on the hot
+    /// image directories: the upper holds the directory with no children at
+    /// all, so a proof keyed on the directory's absence never fires there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn layered_listing_reflects_every_upper_contribution_to_a_lower_directory() {
+        // name:kind, so a SHADOWED entry is caught by the type the merge
+        // publishes (getdents64's `d_type`), not merely by the name set — the
+        // upper and the lower can hold the same name with different types.
+        fn names(upper: &HostFsBackend, lower: &RootFs, dir: &str) -> Vec<String> {
+            let mut names: Vec<String> = layered_directory_entries(upper, Some(lower), dir)
+                .unwrap()
+                .into_iter()
+                .map(|entry| format!("{}:{:?}", entry.name, entry.metadata.kind))
+                .collect();
+            names.sort();
+            names
+        }
+
+        let lower_dir = tempfile::TempDir::new().unwrap();
+        {
+            let lower_backend = HostFsBackend::from_path(lower_dir.path()).unwrap();
+            lower_backend.make_dir("/img").unwrap();
+            lower_backend.create_file("/img/a").unwrap();
+            lower_backend.create_file("/img/b").unwrap();
+            lower_backend.create_file("/img/.carrick-lnkown.a").unwrap();
+        }
+        let lower = RootFs::from_immutable_host_dir(lower_dir.path()).unwrap();
+
+        let (mut upper, _scratch) = host_backend();
+        upper.enable_sparse_upper_fast_miss();
+
+        // Upper holds nothing at /img: the short-circuit serves the lower's
+        // listing, still hiding carrick's own sidecar names.
+        assert!(upper.fast_nofollow_absent("/img"));
+        assert_eq!(names(&upper, &lower, "/img"), vec!["a:File", "b:File"]);
+
+        // EMPTY SHELL: the sparse upper materializes /img as an ancestor with
+        // no children of its own. The whole-directory absence proof is now
+        // dead (`fast_nofollow_absent` is false) but the listing is still
+        // exactly the lower's — this is the shape the hot image directories
+        // are actually in during a python spawn.
+        upper.make_dir("/img").unwrap();
+        assert!(!upper.fast_nofollow_absent("/img"));
+        assert_eq!(names(&upper, &lower, "/img"), vec!["a:File", "b:File"]);
+
+        // ADDITION: a guest create under /img makes the upper a contributor;
+        // its child must appear exactly once.
+        upper.create_file("/img/c").unwrap();
+        assert_eq!(
+            names(&upper, &lower, "/img"),
+            vec!["a:File", "b:File", "c:File"]
+        );
+
+        // SHADOW: an upper entry with a lower entry's name is listed ONCE and
+        // with the UPPER's type. `a` is a file in the lower and a directory in
+        // the upper, so a merge that failed to drop the lower copy would both
+        // duplicate the name and report the wrong `d_type` for it.
+        upper.make_dir("/img/a").unwrap();
+        assert_eq!(
+            names(&upper, &lower, "/img"),
+            vec!["a:Directory", "b:File", "c:File"]
+        );
+
+        // WHITEOUT: a tombstone hides the lower's entry. A published whiteout
+        // also disarms the upper's authoritative-miss proof globally, so no
+        // OTHER directory can be short-circuited past this deletion either.
+        upper.mark_deleted("/img/b").unwrap();
+        assert_eq!(names(&upper, &lower, "/img"), vec!["a:Directory", "c:File"]);
+        assert!(
+            !upper.fast_nofollow_absent("/never-existed"),
+            "a published whiteout must disarm the upper's authoritative miss"
+        );
     }
 
     #[test]

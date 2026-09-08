@@ -54,6 +54,56 @@ fn lstat_mode(path: &str) -> Result<u32, i32> {
     }
 }
 
+/// Read a directory's entries as `(name, d_type)`, sorted, excluding `.`/`..`.
+/// Uses `opendir`/`readdir` so the answer comes from `getdents64`'s own
+/// `d_name`/`d_type` — the fields a merged listing has to get right.
+fn read_dir_types(dir: &str) -> Result<Vec<(String, u8)>, i32> {
+    let c = CString::new(dir).unwrap();
+    let dirp = unsafe { libc::opendir(c.as_ptr()) };
+    if dirp.is_null() {
+        return Err(errno());
+    }
+    let mut out = Vec::new();
+    loop {
+        let ent = unsafe { libc::readdir(dirp) };
+        if ent.is_null() {
+            break;
+        }
+        let (d_type, name) = unsafe {
+            let e = &*ent;
+            (
+                e.d_type,
+                std::ffi::CStr::from_ptr(e.d_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        out.push((name, d_type));
+    }
+    unsafe { libc::closedir(dirp) };
+    out.sort();
+    Ok(out)
+}
+
+fn dir_entry_type(entries: &[(String, u8)], name: &str) -> String {
+    match entries.iter().find(|(n, _)| n == name) {
+        Some((_, t)) => match *t {
+            libc::DT_REG => "REG".to_string(),
+            libc::DT_DIR => "DIR".to_string(),
+            libc::DT_LNK => "LNK".to_string(),
+            libc::DT_FIFO => "FIFO".to_string(),
+            libc::DT_SOCK => "SOCK".to_string(),
+            libc::DT_CHR => "CHR".to_string(),
+            libc::DT_UNKNOWN => "UNKNOWN".to_string(),
+            other => format!("T{other}"),
+        },
+        None => "ABSENT".to_string(),
+    }
+}
+
 fn main() {
     let dir = "/tmp/carrick_dentrycache_probe";
     let _ = fs::remove_dir_all(dir);
@@ -412,6 +462,153 @@ fn main() {
         Err(e) => println!("write_after_rename_size=ERR:{e}"),
     }
 
+    // 14. Readdir coherence on an IMAGE-BACKED (lower) directory.
+    //
+    // `/usr/lib` comes from the image layer, so its listing is served by the
+    // layered merge of the immutable lower with the writable upper. Every
+    // guest mutation below is a way the upper can contribute to a directory
+    // it does not otherwise own — an addition, a type-flipping recreate, a
+    // rename, and a tombstone over an image entry — which is exactly what a
+    // merge that answers the shadowing question from the upper's own child
+    // name set has to keep reporting. `d_ino` is checked against `stat()` so
+    // the merge cannot invent an inode for an image entry.
+    let img = "/usr/lib";
+    let img_before = read_dir_types(img).expect("listing an image directory");
+    println!("img_initial_nonempty={}", !img_before.is_empty());
+
+    // 14a. create: a new upper child of an image directory is listed, ONCE,
+    // with the right type.
+    let img_file = format!("{img}/carrick_probe_file");
+    {
+        let mut f = File::create(&img_file).expect("create in image dir");
+        f.write_all(b"x").expect("write");
+    }
+    let after_create = read_dir_types(img).expect("listing after create");
+    println!(
+        "img_create_type={}",
+        dir_entry_type(&after_create, "carrick_probe_file")
+    );
+    println!(
+        "img_create_count_delta={}",
+        after_create.len() as i64 - img_before.len() as i64
+    );
+    println!(
+        "img_create_occurrences={}",
+        after_create
+            .iter()
+            .filter(|(n, _)| n == "carrick_probe_file")
+            .count()
+    );
+
+    // 14b. mkdir and symlink under the same image directory.
+    let img_dir = format!("{img}/carrick_probe_dir");
+    fs::create_dir(&img_dir).expect("mkdir in image dir");
+    let img_link = format!("{img}/carrick_probe_link");
+    symlink("carrick_probe_file", &img_link).expect("symlink in image dir");
+    let after_mkdir = read_dir_types(img).expect("listing after mkdir/symlink");
+    println!(
+        "img_mkdir_type={}",
+        dir_entry_type(&after_mkdir, "carrick_probe_dir")
+    );
+    println!(
+        "img_symlink_type={}",
+        dir_entry_type(&after_mkdir, "carrick_probe_link")
+    );
+
+    // 14c. rename inside the image directory: the old name goes, the new one
+    // appears, in ONE listing.
+    let img_moved = format!("{img}/carrick_probe_moved");
+    fs::rename(&img_file, &img_moved).expect("rename in image dir");
+    let after_rename = read_dir_types(img).expect("listing after rename");
+    println!(
+        "img_rename_old={}",
+        dir_entry_type(&after_rename, "carrick_probe_file")
+    );
+    println!(
+        "img_rename_new={}",
+        dir_entry_type(&after_rename, "carrick_probe_moved")
+    );
+
+    // 14d. unlink then recreate the same name, as a DIRECTORY this time: the
+    // listing must report the new type, not the unlinked file's.
+    fs::remove_file(&img_moved).expect("unlink in image dir");
+    let after_unlink = read_dir_types(img).expect("listing after unlink");
+    println!(
+        "img_unlink_gone={}",
+        dir_entry_type(&after_unlink, "carrick_probe_moved")
+    );
+    fs::create_dir(&img_moved).expect("recreate as dir");
+    let after_recreate = read_dir_types(img).expect("listing after recreate");
+    println!(
+        "img_recreate_type={}",
+        dir_entry_type(&after_recreate, "carrick_probe_moved")
+    );
+
+    // 14e. TOMBSTONE over an IMAGE entry: `os-release` is a real file of the
+    // image layer, so deleting it must hide the lower's entry from the merged
+    // listing — the case a per-name shadow test has to keep answering.
+    let img_lower_entry = "os-release";
+    let img_lower_path = format!("{img}/{img_lower_entry}");
+    println!(
+        "img_lower_entry_before={}",
+        dir_entry_type(&img_before, img_lower_entry)
+    );
+    let rm = fs::remove_file(&img_lower_path);
+    println!("img_lower_unlink_ok={}", rm.is_ok());
+    let after_whiteout = read_dir_types(img).expect("listing after whiteout");
+    println!(
+        "img_lower_entry_after={}",
+        dir_entry_type(&after_whiteout, img_lower_entry)
+    );
+    println!(
+        "img_lower_stat_errno={}",
+        match stat_mode_and_size(&img_lower_path) {
+            Ok(_) => 0,
+            Err(e) => e,
+        }
+    );
+
+    // 14f. d_ino of a surviving IMAGE entry equals its stat's st_ino, so the
+    // merge reports the lower's real inode rather than a synthetic one.
+    let img_probe_dir = after_whiteout
+        .iter()
+        .find(|(n, t)| *t == libc::DT_DIR && !n.starts_with("carrick_probe"))
+        .map(|(n, _)| n.clone());
+    match img_probe_dir {
+        Some(name) => {
+            let path = format!("{img}/{name}");
+            let st = stat_full(&path);
+            let c = CString::new(img).unwrap();
+            let dirp = unsafe { libc::opendir(c.as_ptr()) };
+            let mut d_ino: u64 = 0;
+            if !dirp.is_null() {
+                loop {
+                    let ent = unsafe { libc::readdir(dirp) };
+                    if ent.is_null() {
+                        break;
+                    }
+                    let e = unsafe { &*ent };
+                    let n = unsafe { std::ffi::CStr::from_ptr(e.d_name.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned();
+                    if n == name {
+                        d_ino = e.d_ino as u64;
+                        break;
+                    }
+                }
+                unsafe { libc::closedir(dirp) };
+            }
+            println!(
+                "img_dirent_ino_matches_stat={}",
+                matches!(st, Ok(st) if st.st_ino as u64 == d_ino && d_ino != 0)
+            );
+        }
+        None => println!("img_dirent_ino_matches_stat=NO_DIR_ENTRY"),
+    }
+
     // Cleanup
     let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(&img_dir);
+    let _ = fs::remove_dir_all(&img_moved);
+    let _ = fs::remove_file(&img_link);
 }

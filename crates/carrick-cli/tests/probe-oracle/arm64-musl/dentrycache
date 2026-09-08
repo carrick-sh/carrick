@@ -1,4 +1,4 @@
-66260cdb09f8244f
+745920dfc443c063
 link1_stat_ok=true
 link1_stat_size=5
 link1_stat_is_reg=true
@@ -48,3 +48,18 @@ fallocate_size=4096
 hardlink_write_other_name_size=8
 hardlink_write_other_name_nlink=2
 write_after_rename_size=9
+img_initial_nonempty=true
+img_create_type=REG
+img_create_count_delta=1
+img_create_occurrences=1
+img_mkdir_type=DIR
+img_symlink_type=LNK
+img_rename_old=ABSENT
+img_rename_new=REG
+img_unlink_gone=ABSENT
+img_recreate_type=DIR
+img_lower_entry_before=REG
+img_lower_unlink_ok=true
+img_lower_entry_after=ABSENT
+img_lower_stat_errno=2
+img_dirent_ino_matches_stat=true

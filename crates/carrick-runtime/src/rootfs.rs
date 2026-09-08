@@ -182,6 +182,12 @@ struct LowerEntry {
     kind: RootFsEntryKind,
     mode: u32,
     size: usize,
+    /// The lower's real host inode, memoised with the rest: the layer cache
+    /// is immutable for the container's life, so an entry's inode is as
+    /// stable as its kind. `directory_entries` publishes it as `getdents64`'s
+    /// `d_ino`, which is why enumerating a directory used to cost one host
+    /// `fstatat` per child on EVERY listing.
+    ino: u64,
 }
 
 impl PartialEq for RootFs {
@@ -1323,30 +1329,7 @@ impl RootFs {
                 .backend
                 .child_names(&display_rootfs_path(&dir))
                 .into_iter()
-                .map(|(name, kind, known_size)| {
-                    let child = dir.join(&name);
-                    let child_text = display_rootfs_path(&child);
-                    let stat = host.backend.real_stat(&child_text, false);
-                    Ok(RootFsDirEntry {
-                        name,
-                        metadata: RootFsMetadata {
-                            path: child,
-                            kind: stat.map(|value| value.kind).unwrap_or(kind),
-                            mode: stat.map(|value| value.mode).unwrap_or(
-                                if kind == RootFsEntryKind::Directory {
-                                    0o755
-                                } else {
-                                    0o644
-                                },
-                            ),
-                            size: stat
-                                .and_then(|value| usize::try_from(value.size).ok())
-                                .or_else(|| known_size.and_then(|size| usize::try_from(size).ok()))
-                                .unwrap_or(0),
-                        },
-                        ino: stat.map(|value| value.ino).unwrap_or(0),
-                    })
-                })
+                .map(|(name, kind, known_size)| host_dir_entry(host, &dir, name, kind, known_size))
                 .collect();
         }
         let dir = normalize_rootfs_path(path.as_ref())?;
@@ -1397,30 +1380,7 @@ impl RootFs {
             }
             return children
                 .into_iter()
-                .map(|(name, kind, known_size)| {
-                    let child = dir.join(&name);
-                    let child_text = display_rootfs_path(&child);
-                    let stat = host.backend.real_stat(&child_text, false);
-                    Ok(RootFsDirEntry {
-                        name,
-                        metadata: RootFsMetadata {
-                            path: child,
-                            kind: stat.map(|value| value.kind).unwrap_or(kind),
-                            mode: stat.map(|value| value.mode).unwrap_or(
-                                if kind == RootFsEntryKind::Directory {
-                                    0o755
-                                } else {
-                                    0o644
-                                },
-                            ),
-                            size: stat
-                                .and_then(|value| usize::try_from(value.size).ok())
-                                .or_else(|| known_size.and_then(|size| usize::try_from(size).ok()))
-                                .unwrap_or(0),
-                        },
-                        ino: stat.map(|value| value.ino).unwrap_or(0),
-                    })
-                })
+                .map(|(name, kind, known_size)| host_dir_entry(host, &dir, name, kind, known_size))
                 .collect();
         }
 
@@ -1756,11 +1716,15 @@ fn note_lower_miss(host: &ImmutableHostRoot, normalized: &Path) {
     host.listings.lock().insert(parent.to_path_buf(), listing);
 }
 
-fn host_metadata(
+/// The memoised lower facts for `path`, and the normalized key they are
+/// filed under. The single place the lower's dcache is consulted or filled:
+/// the layer cache never changes for the container's life, so one answer per
+/// `(path, follow)` is authoritative forever — positive AND negative.
+fn host_lower_entry(
     host: &ImmutableHostRoot,
     path: &Path,
     follow: bool,
-) -> Result<RootFsMetadata, RootFsError> {
+) -> Result<(PathBuf, Option<LowerEntry>), RootFsError> {
     let normalized = normalize_rootfs_path(path)?;
     let key = (normalized, follow);
     let cached = host.dcache.lock().get(&key).copied();
@@ -1772,6 +1736,7 @@ fn host_metadata(
                 kind: stat.kind,
                 mode: stat.mode,
                 size: usize::try_from(stat.size).unwrap_or(usize::MAX),
+                ino: stat.ino,
             });
             if entry.is_none() {
                 note_lower_miss(host, &key.0);
@@ -1784,13 +1749,55 @@ fn host_metadata(
             entry
         }
     };
-    let (normalized, _) = key;
+    Ok((key.0, entry))
+}
+
+fn host_metadata(
+    host: &ImmutableHostRoot,
+    path: &Path,
+    follow: bool,
+) -> Result<RootFsMetadata, RootFsError> {
+    let (normalized, entry) = host_lower_entry(host, path, follow)?;
     let entry = entry.ok_or_else(|| RootFsError::NotFound(display_rootfs_path(&normalized)))?;
     Ok(RootFsMetadata {
         path: normalized,
         kind: entry.kind,
         mode: entry.mode,
         size: entry.size,
+    })
+}
+
+/// One directory child of the immutable lower, built from the memoised
+/// `(path, follow=false)` facts rather than a fresh host `fstatat` per
+/// listing. `known_size`/`kind` from the directory stream are the fallback
+/// for a child the lower cannot stat at all.
+fn host_dir_entry(
+    host: &ImmutableHostRoot,
+    dir: &Path,
+    name: String,
+    stream_kind: RootFsEntryKind,
+    known_size: Option<u64>,
+) -> Result<RootFsDirEntry, RootFsError> {
+    let child = dir.join(&name);
+    let entry = host_lower_entry(host, &child, false)?.1;
+    Ok(RootFsDirEntry {
+        name,
+        metadata: RootFsMetadata {
+            path: child,
+            kind: entry.map(|value| value.kind).unwrap_or(stream_kind),
+            mode: entry.map(|value| value.mode).unwrap_or(
+                if stream_kind == RootFsEntryKind::Directory {
+                    0o755
+                } else {
+                    0o644
+                },
+            ),
+            size: entry
+                .map(|value| value.size)
+                .or_else(|| known_size.and_then(|size| usize::try_from(size).ok()))
+                .unwrap_or(0),
+        },
+        ino: entry.map(|value| value.ino).unwrap_or(0),
     })
 }
 
