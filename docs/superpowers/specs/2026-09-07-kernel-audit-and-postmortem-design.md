@@ -68,6 +68,18 @@ through the builder for production embeds):
   `BackendRefused` (a correct publication that carrick refused).
 - `EveryChildRuns { within: Duration }` — `fork_admitted` without a matching
   `child_first_run` (timed, so it is a test-only invariant).
+- `ExitBudget { select, within: Duration }` — a per-process exit timer
+  (owner: "set timers on procs failing to exit"). `select` is a typed matcher
+  over the kernel graph — `Pid(NsPid)`, `ChildrenOf(TaskKey)`, `Exec(glob)`,
+  `Any` — and the clock starts at the matched event (`fork_admitted`,
+  `exec_committed`, or an explicit `ContainerHandle::arm_exit_budget(task,
+  within)` from the test body). A task still alive at expiry trips the sink;
+  the post-mortem names the task's snapshot row (state, what it is parked in,
+  which executor holds it, its pending signals) so the reader sees *why* it
+  did not exit, not just that it did not. The timer lives in the test runner
+  (a `TestContainer` budget thread keyed by `TaskKey`), never in the kernel,
+  and it is disarmed by the matching `exit_settled`, so a task that exits on
+  time costs nothing.
 
 ### 2. `KernelAbort` — the fail-closed sink
 
@@ -95,7 +107,8 @@ One path, used by every judge:
 Triggers: an auditor `Abort`; the runner liveness invariant (always on, not
 optional — it is the fix for the exit wedge class, the auditor form exists so
 tests can observe it); `TestContainer::deadline(Duration)` (a wall-clock
-budget that ends in a post-mortem, replacing host-side `SIGKILL`); and
+budget that ends in a post-mortem, replacing host-side `SIGKILL`) and the
+per-process `ExitBudget` timers above; and
 `carrick debug abort --run-id <id>`, a new request on the existing
 `KernelDebugServer` socket, so the host-wide watchdog becomes a one-line Rust
 subcommand instead of a shell script that runs `lldb`.
