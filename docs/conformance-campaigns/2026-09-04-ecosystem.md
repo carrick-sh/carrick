@@ -2672,3 +2672,25 @@ Director gates on the rebase: 36 scheduler/executor tests, lint 0,
 workspace check 0. Note for the scheduler branch: the per-CPU queue must
 carry the same gate when it rebases. Stale ledger argv: `--raw` (deleted
 in 457fd7bb0) still appears in `scripts/conformance/baseline.jsonl`.
+
+### 2026-09-08 05:30 — scheduler round 4 verdict and round 5
+
+Round 4 (056a8cc23) landed on the branch: the rebase over lane A, one
+`GuestCpuId` (lane A had compiled a second copy of the hal file via
+`#[path]`, so its placeholder CPU ids were a different type), the real
+guest CPU on every auditor emit, `wake_rejected(StaleGeneration)` from the
+queue's discard paths, and the reaped-path `SubmissionAuthority` leak
+closed (`retire_reaped`, red-first). Gates 0 (5161 tests, probe shards,
+lint). **Blocker attributed:** the branch's go_types wedge (eight watchdog
+reaps + one 20-min test bound; guest prints PASS, 18 executors parked,
+main in `wait_process_jobs`) is the same defect main aborts on
+(`lost exact transition`): round 3's `TargetReaped` settlement withholds
+the successor AND skips the terminal publication the old executor-death
+path made, and `classify_transition_rejection` reads only registry
+absence, which is also true mid-retirement. M = P: four interleaved pairs
+on importlib, two favour M = 10, one tie, one confounded — not flipped.
+Round 5 (dispatched): reaped settlement publishes the terminal result;
+classification from the kernel graph's execution state with the
+lost-transition arm becoming a `KernelAbort`; rebase onto a5f8592fc and
+port the claimability gate into the per-CPU queues; go_types 5/5 with
+zero reaps as the bar.
