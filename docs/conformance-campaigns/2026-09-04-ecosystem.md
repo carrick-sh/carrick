@@ -3180,3 +3180,12 @@ behind the seventeenth landing's chain; the closing measurement re-armed
 behind this landing from a hash-pinned binary. Dispatched on top: the
 `mqnotifycrossproc` wake-audit fix (Exited vs Reaped), the `just doc`
 link, and a claim-age term so a claim held forever is still caught.
+
+**Seventeenth landing receipt (main d41833ae6):** build/lint/shards 0;
+`just conformance-probes` on main: 496 probe executions (shard 2 green;
+shard 1 stops at `mqnotifycrossproc`, the wake-audit mislabel whose fix is
+in flight; shard 0 stops at `coredumpfile`, the in-shard flake, DIFF at
+load 17) — exactly the two survivors the triage named, nothing new;
+reducer 8/8; rows 6/6 MATCH (compile, mmap, mmap18, munmap01, go_types,
+itertools at load 7–13). `coredumpfile` attribution dispatched (probe-side
+thread wait under load, or carrick dropping threads from the core).
