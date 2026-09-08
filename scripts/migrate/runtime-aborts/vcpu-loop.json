@@ -703,10 +703,10 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::rollback_published_hvpatch_clone",
       "ordinal_in_function": 3,
-      "fingerprint": "bc09921fe87ab0db0225bedde7ca83ae1c0116f33025d1f800e8abe755f4503e",
+      "fingerprint": "c75e52094babb7d2db0b784c76f49b7720d1b706ea983e7a9b44514c6bb15d1e",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_rollback",
-      "rationale": "Failed to retire clone authority during clone rollback."
+      "rationale": "Failed to retire clone authority during clone rollback; an already-settled child generation is classified and tolerated, so this arm is reached only when the retirement itself is impossible."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
@@ -739,7 +739,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 3,
-      "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
+      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to abort task backend when clone execution generation drifted."
@@ -748,7 +748,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 4,
-      "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
+      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "Missing HVPatch runtime binding during generation drift clone retirement."
@@ -757,7 +757,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 5,
-      "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
+      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to retire generation-drifted clone thread in scheduler."
@@ -766,7 +766,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 6,
-      "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
+      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to restore memory bytes when aborting generation-drifted clone."
@@ -775,7 +775,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 7,
-      "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
+      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to abort task backend for unpublished clone thread."
@@ -784,7 +784,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 8,
-      "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
+      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to retire unpublished clone thread in process graph."
@@ -793,7 +793,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 9,
-      "fingerprint": "2ee6b408845739043260a39e06556092239ee25366f25b9602988805f1d10be9",
+      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to restore memory bytes when aborting unpublished clone."
@@ -802,7 +802,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 10,
-      "fingerprint": "338fc2e23b7b38f6a2b9b90c9c60ae4a7cbcaa2d1a1040236316d575b06da873",
+      "fingerprint": "0791415caae29a575e3c644fdb570d70a37e360ea3983e8bd781caae80884f90",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "Missing HVPatch runtime binding when committing clone task backend."
@@ -811,7 +811,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 11,
-      "fingerprint": "5391889be0df1f2c35f0ecddfc3cdbc0d2d9c3677dcdb5bda047208901edf965",
+      "fingerprint": "ad3e7367cdbf3f97efc908d39bf7b447a5f31ac50ab9bb1cafff5211cbb3dc37",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to retire clone thread following carrier task commit failure."
@@ -820,7 +820,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 12,
-      "fingerprint": "5391889be0df1f2c35f0ecddfc3cdbc0d2d9c3677dcdb5bda047208901edf965",
+      "fingerprint": "ad3e7367cdbf3f97efc908d39bf7b447a5f31ac50ab9bb1cafff5211cbb3dc37",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to restore memory bytes following carrier task commit failure."
