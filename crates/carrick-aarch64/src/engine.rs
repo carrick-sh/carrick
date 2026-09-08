@@ -129,6 +129,14 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// Non-aliasing guest-run time awaiting the exact logical-thread charge.
     pending_guest_run_receipt_ns: u64,
 
+    /// `(far, retries)` of the stale stage-1 fault this task keeps retrying.
+    /// A genuine sibling race resolves within one or two retries; a fault the
+    /// live walk keeps permitting while the vCPU keeps refusing it names a
+    /// stage-1 leaf whose frame stage-2 no longer maps, which no TLBI can
+    /// repair. Bounding the retry turns that silent 100% CPU livelock into a
+    /// named failure carrying the walk.
+    stale_stage1_retry: (u64, u32),
+
     // ── shared memory state (the X86EngineCore parallels) ──
     /// Live stage-1 page-table authority over the guest's own translation tables at
     /// `LINUX_PAGE_TABLES_BASE` and extension arena source.
@@ -242,6 +250,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_resume_pc: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
+            stale_stage1_retry: (0, 0),
             last_fault_esr: 0,
             last_exit_class: 0,
             is_forked_child: false,
@@ -422,6 +431,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             mm_generation,
             asid_generation,
             pending_guest_run_receipt_ns,
+            // A task adopted from a snapshot starts with no stale fault.
+            stale_stage1_retry: (0, 0),
             page_tables,
             protections,
             pending_process_fork,
@@ -670,6 +681,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_resume_pc: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
+            stale_stage1_retry: (0, 0),
             last_fault_esr: 0,
             last_exit_class: 0,
             is_forked_child: false,
@@ -789,6 +801,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_resume_pc: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
+            stale_stage1_retry: (0, 0),
             last_fault_esr: 0,
             last_exit_class: 0,
             is_forked_child: false,
@@ -2965,6 +2978,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let leaf = carrick_mem::page_table::terminal_descriptor(walk);
         if !carrick_mem::page_table::terminal_descriptor_permits_el0(leaf, access) {
             return Ok(false);
+        }
+        const STALE_STAGE1_RETRY_BOUND: u32 = 4096;
+        self.stale_stage1_retry = match self.stale_stage1_retry {
+            (va, retries) if va == far => (va, retries.saturating_add(1)),
+            _ => (far, 1),
+        };
+        if self.stale_stage1_retry.1 > STALE_STAGE1_RETRY_BOUND {
+            return Err(TrapError::Hypervisor(format!(
+                "stale stage-1 fault at {far:#x} retried {STALE_STAGE1_RETRY_BOUND} times: the live walk {walk:x?} permits {access:?} but the vCPU keeps faulting (a stage-1 leaf naming a frame stage-2 no longer maps)"
+            )));
         }
         self.run_stage1_maintenance()?;
         Ok(true)
