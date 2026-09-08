@@ -541,24 +541,56 @@ fn restore_worker_vcpu_before_binding_publication<V, B>(
     publish(backend, worker_vcpu)
 }
 
+/// What a clone rollback found when it went to retire the child's exact
+/// published generation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FailedCloneRetirement {
+    /// The rollback failed the runnable generation itself: the child never
+    /// ran, which is the ordinary case.
+    Retired,
+    /// The generation had already settled TERMINALLY before the rollback
+    /// reached it. That is not a rollback failure and never justified killing
+    /// the carrier: the generation this rollback exists to retire is already
+    /// retired, the child is torn down exactly as before, and the clone still
+    /// fails to the guest.
+    AlreadySettled(crate::kernel::objects::ThreadExecutionState),
+}
+
 pub(crate) fn retire_failed_hvpatch_clone_authority(
     scheduler: &Scheduler,
     kernel: &Arc<crate::kernel::Kernel>,
     context: &crate::kernel::KernelContext,
     generation: ExecutionGeneration,
     retire_binding: impl FnOnce(ThreadKey, ExecutionGeneration),
-) -> Result<(), String> {
-    scheduler
-        .fail_runnable_exact(
-            context.thread().key(),
-            generation,
-            ExecutionFailure::SnapshotSaveFailed,
-        )
-        .map_err(|error| format!("fail exact HVPatch clone runnable: {error}"))?;
+) -> Result<FailedCloneRetirement, String> {
+    let retirement = match scheduler.fail_runnable_exact(
+        context.thread().key(),
+        generation,
+        ExecutionFailure::SnapshotSaveFailed,
+    ) {
+        Ok(()) => FailedCloneRetirement::Retired,
+        // Classified on the TYPED transition error, never on a formatted
+        // string: the only refusal that is not a carrier fault is "this exact
+        // generation is already terminal".
+        Err(crate::kernel::SchedulerError::Thread(
+            crate::kernel::objects::ThreadExecutionError::InvalidTransition {
+                operation: "fail_runnable_generation",
+                state,
+            },
+        )) if matches!(
+            state,
+            crate::kernel::objects::ThreadExecutionState::Failed { .. }
+                | crate::kernel::objects::ThreadExecutionState::Exited { .. }
+        ) =>
+        {
+            FailedCloneRetirement::AlreadySettled(state)
+        }
+        Err(error) => return Err(format!("fail exact HVPatch clone runnable: {error}")),
+    };
     retire_binding(context.thread().key(), generation);
     kernel
         .exit_thread(context, None)
-        .map(|_| ())
+        .map(|_| retirement)
         .map_err(|error| format!("retire exact HVPatch clone Kernel thread: {error}"))
 }
 
@@ -7101,6 +7133,68 @@ pub(crate) mod tests {
                 generation,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_clone_rollback_tolerates_a_child_that_already_settled() {
+        // The second half of the threading residual. Even with the
+        // claimability gate closed, `rollback_published_hvpatch_clone`
+        // treated ANY refusal from `fail_runnable_exact` as a carrier fault:
+        //
+        //   carrick: FATAL: authoritative HVPatch clone rollback: fail exact
+        //   HVPatch clone runnable: thread execution transition
+        //   fail_runnable_generation is invalid from Failed { generation:
+        //   ExecutionGeneration(2), reason: SnapshotRestoreFailed }
+        //
+        // `std::process::abort()` there kills every Linux process in the
+        // carrier for a condition that is, at worst, one failed clone. The
+        // generation the rollback exists to retire has ALREADY been retired
+        // -- terminally, by whoever settled it -- so there is nothing left to
+        // fail and nothing that justifies ending the carrier.
+        let (kernel, root) = bootstrap(13_993);
+        // A cloned thread, the shape the field hit: the child is published to
+        // the Kernel as `Runnable { INITIAL }` before its submission
+        // activates, and the rollback retires it while its task lives on.
+        let context = sibling(&kernel, &root, 23_993);
+        let state = task_state(&context, 108);
+        let generation = context
+            .thread()
+            .publish_initial_task_state(state)
+            .expect("publish child state");
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+
+        // Something else settled this generation terminally first.
+        scheduler
+            .fail_runnable_exact(
+                context.thread().key(),
+                generation,
+                crate::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
+            )
+            .expect("settle the child terminally");
+
+        let retired = std::cell::Cell::new(None);
+        let outcome = retire_failed_hvpatch_clone_authority(
+            &scheduler,
+            &kernel,
+            &context,
+            generation,
+            |thread, generation| retired.set(Some((thread, generation))),
+        )
+        .expect("an already-settled child must not be a carrier fault");
+        assert!(
+            matches!(
+                outcome,
+                super::FailedCloneRetirement::AlreadySettled(
+                    crate::kernel::objects::ThreadExecutionState::Failed { .. }
+                )
+            ),
+            "the rollback must name what it found, not abort: {outcome:?}",
+        );
+        assert_eq!(
+            retired.get(),
+            Some((context.thread().key(), generation)),
+            "the rollback still retires the child's binding",
         );
     }
 
