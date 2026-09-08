@@ -2563,3 +2563,9 @@ family; Fable agent dispatched (`brief-mmap-abort.md`): name the sites
 through the lane B sink, reproduce under hogs with a post-mortem, fix the
 root cause. Five `carrick_runtime` test-binary crash reports at 02:48 abort
 in `dispatch::sysv::shmdt` — an agent's unit-test run; noted, unowned.
+
+**Post-landing rows on c6f2eeb70 (binary 79e957f1…, load 49 → 3 over the
+run):** 11/11 MATCH, no crash in the row run (the one silent abort was the
+go-build reducer before it, filed above). Ratios not cited (load). A quiet
+window opened at the end (load 3.2): `quiet-short.sh` is taking the
+fork-to-wait measurement and the short rows on this binary.
