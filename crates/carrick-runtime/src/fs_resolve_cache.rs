@@ -161,8 +161,17 @@ pub fn current_dir_generation() -> u64 {
 /// that can re-point an existing directory path — rename/exchange where either
 /// side is a directory, and directory removal (including a whiteout that hides
 /// one). See [`current_dir_generation`] for why the set is this narrow.
-pub fn bump_dir_generation() {
-    generation_word_at(DIR_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst);
+///
+/// Returns the generation this call established. A caller that knows EXACTLY
+/// which of its own cached entries the mutation invalidated can re-stamp the
+/// survivors with this value (see
+/// `HostFsBackend::evict_dir_cache_subtree_restamping`) instead of paying the
+/// global invalidation it just imposed on every other process. Using the
+/// returned value rather than a fresh `current_dir_generation()` read is what
+/// makes that sound: if a SIBLING process bumps in between, the survivors stay
+/// stamped at the older value and are correctly invalidated on their next read.
+pub fn bump_dir_generation() -> u64 {
+    generation_word_at(DIR_GENERATION_SLOT).fetch_add(1, Ordering::SeqCst) + 1
 }
 
 /// Current sandbox-root MARKER generation — the one the host backend's

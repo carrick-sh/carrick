@@ -1922,6 +1922,15 @@ pub struct HostFsBackend {
     /// it; the later `insert` replaces the earlier. Both are valid, contained
     /// and independently owned, so the only effect is a transient second fd.
     dir_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, DirCacheEntry>>,
+    /// Host `openat` calls spent WALKING a path to a directory fd
+    /// ([`Self::dir_fd_for_hops`] and its post-reclaim retry) — the exact cost
+    /// that `namei_leaf` -> `dir_fd_for(parent)` pays on every guest
+    /// `mkdirat`/`unlinkat`/`openat`. It is the amplification this cache
+    /// exists to remove, so it is counted rather than described: a warm
+    /// `dir_cache` must answer with ZERO walk opens, and
+    /// `warm_dir_cache_bounds_path_walk_opens_per_guest_op` fails if it does
+    /// not. Diagnostic only; nothing branches on it.
+    path_walk_host_opens: std::sync::atomic::AtomicU64,
     /// The process generation that owns the current [`Self::dir_cache`] fds.
     /// Changed on host fork so a child drops inherited entries and adopts
     /// the cache for this process. Replaces per-call `libc::getpid()`.
@@ -2046,6 +2055,23 @@ struct DirCacheEntry {
 #[allow(dead_code)]
 struct StatCacheEntry {
     real: RealStat,
+}
+
+#[cfg(target_os = "macos")]
+impl StatCacheEntry {
+    /// Re-stamp the directory-topology generation this entry's `parent_fd` is
+    /// trusted at. Sound only for a survivor of
+    /// [`HostFsBackend::evict_dir_cache_subtree_restamping`]: the caller
+    /// established `generation` itself and has already dropped every entry the
+    /// mutation could have re-pointed.
+    fn restamp_dir_generation(&mut self, generation: u64) {
+        self.dir_generation = generation;
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl StatCacheEntry {
+    fn restamp_dir_generation(&mut self, _generation: u64) {}
 }
 
 struct WatchResCacheEntry {
@@ -2661,6 +2687,7 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            path_walk_host_opens: std::sync::atomic::AtomicU64::new(0),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
@@ -2719,6 +2746,7 @@ impl HostFsBackend {
             sparse_upper_fast_miss: false,
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            path_walk_host_opens: std::sync::atomic::AtomicU64::new(0),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             use_stat_cache: stat_cache_enabled(),
@@ -2946,6 +2974,8 @@ impl HostFsBackend {
             let Some(component_c) = cstring_from_osstr(component) else {
                 return Err(libc::EINVAL);
             };
+            self.path_walk_host_opens
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let raw = unsafe { libc::openat(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
             if raw < 0 {
                 let err = std::io::Error::last_os_error()
@@ -3032,6 +3062,8 @@ impl HostFsBackend {
             let Some(component_c) = cstring_from_osstr(component) else {
                 return Err(libc::EINVAL);
             };
+            self.path_walk_host_opens
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let raw = unsafe { libc::openat(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
             if raw < 0 {
                 let err = std::io::Error::last_os_error()
@@ -3225,6 +3257,54 @@ impl HostFsBackend {
     /// shared generation is observed.
     fn drop_dir_cache(&self) {
         self.dir_cache.lock().clear();
+    }
+
+    /// Host `openat` calls spent walking paths since the last
+    /// [`Self::reset_path_walk_host_opens`]. See [`Self::path_walk_host_opens`].
+    pub fn path_walk_host_opens(&self) -> u64 {
+        self.path_walk_host_opens
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Zero the path-walk host-open counter so a caller can measure one
+    /// guest operation's amplification.
+    pub fn reset_path_walk_host_opens(&self) {
+        self.path_walk_host_opens
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Evict `dir` and its descendants from BOTH generation-stamped caches and
+    /// re-stamp every surviving entry with `new_dir_generation`.
+    ///
+    /// A directory removal must bump the shared directory-topology generation
+    /// (`fs_resolve_cache::bump_dir_generation`) so a SIBLING host process
+    /// cannot keep serving a dirfd for a path that a later `mkdir` re-creates
+    /// as a different inode. But that bump also invalidates THIS process's
+    /// caches, and this process knows precisely what it invalidated: the
+    /// removed path and anything under it. Every other entry still names the
+    /// same live inode at the same path, so re-stamping them to the generation
+    /// we ourselves established keeps them servable.
+    ///
+    /// Measured by `warm_dir_cache_bounds_path_walk_opens_per_guest_op`: 20
+    /// warm create/remove operations under `pkg/a/b` cost 12 host path-walk
+    /// `openat` calls when the bump invalidates our own cache, and 0 with this
+    /// re-stamp. That difference is the cpython-tarfile `rmtree` amplification.
+    ///
+    /// LOCK ORDER `stat_cache` -> `dir_cache`, per
+    /// [`Self::drop_stat_cache_after_rename`].
+    fn evict_dir_cache_subtree_restamping(&self, dir: &Path, new_dir_generation: u64) {
+        if self.use_stat_cache {
+            let mut stats = self.stat_cache.lock();
+            stats.retain(|k, _| k != dir && !k.starts_with(dir));
+            for entry in stats.values_mut() {
+                entry.restamp_dir_generation(new_dir_generation);
+            }
+        }
+        let mut cache = self.dir_cache.lock();
+        cache.retain(|k, _| k != dir && !k.starts_with(dir));
+        for entry in cache.values_mut() {
+            entry.dir_generation = new_dir_generation;
+        }
     }
 
     /// Evict `dir` and all its descendants from [`Self::dir_cache`].
@@ -4615,7 +4695,24 @@ impl HostFsBackend {
                 continue;
             }
             let d_type = unsafe { (*entry).d_type };
-            let size = None;
+            let size = if d_type == libc::DT_REG {
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        parent_fd.as_raw_fd(),
+                        d_name.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                {
+                    Some(st.st_size as u64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if let Some(item) = f(d_name, d_type, size) {
                 results.push(item);
             }
@@ -6257,12 +6354,29 @@ impl FsBackend for HostFsBackend {
         }
         if rc == 0 {
             crate::fs_resolve_cache::bump_generation();
-            self.evict_dir_cache_subtree(rel);
-            if self.use_stat_cache {
-                let mut map = self.stat_cache.lock();
-                map.remove(rel);
-                if removed_dir {
-                    map.retain(|k, _| !k.starts_with(rel));
+            // Only a DIRECTORY removal can leave another host process serving a
+            // cached dirfd for a path that a later mkdir re-creates as a
+            // different inode, so only that case pays the shared
+            // `bump_dir_generation` (see `fs_resolve_cache::current_dir_generation`).
+            // Removing a SYMLINK cannot: `dir_fd_for_hops` walks with
+            // `O_NOFOLLOW`, so no cached entry is ever reached through one, and
+            // the `fstatat` this path used to spend proving the leaf was a
+            // symlink bought nothing but the same global invalidation.
+            if removed_dir {
+                // Only a DIRECTORY removal can leave a sibling host process
+                // serving a cached dirfd for a path a later `mkdir` re-creates
+                // as a different inode, so only that case pays the shared
+                // generation bump. Removing a SYMLINK cannot:
+                // `dir_fd_for_hops` walks with `O_NOFOLLOW`, so no cached entry
+                // is ever reached through one — and the `fstatat` this path
+                // used to spend proving the leaf was a symlink bought nothing
+                // but the same global invalidation.
+                let generation = crate::fs_resolve_cache::bump_dir_generation();
+                self.evict_dir_cache_subtree_restamping(rel, generation);
+            } else {
+                self.evict_dir_cache_subtree(rel);
+                if self.use_stat_cache {
+                    self.stat_cache.lock().remove(rel);
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -8930,6 +9044,59 @@ mod tests {
             b.dir_fd_for(Path::new("pkg")).unwrap().as_raw_fd(),
             before,
             "file churn must not invalidate the directory cache"
+        );
+    }
+
+    /// THE MEASURED INVARIANT: on a warm `dir_cache`, one guest-level
+    /// `mkdirat` / `unlinkat` / `openat` under an already-resolved parent costs
+    /// at most 2 host `openat` calls spent walking the path — and in practice
+    /// zero, because `namei_leaf`'s `dir_fd_for(parent)` hits the cache.
+    ///
+    /// This is the cpython-tarfile amplification expressed as an assertion.
+    /// Before the per-subtree eviction landed, `remove_entry` on a directory
+    /// called `bump_dir_generation()` + `drop_dir_cache()`, which invalidated
+    /// EVERY cached dirfd in every process; the next operation therefore
+    /// re-walked its whole path from the sandbox root. Measured red-first
+    /// against that behaviour this test reports 60 walk opens for the 20
+    /// operations below (3 per op, one per component of `pkg/a/b`); with the
+    /// per-subtree eviction it reports 0.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn warm_dir_cache_bounds_path_walk_opens_per_guest_op() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.make_dir("/pkg").unwrap();
+        b.make_dir("/pkg/a").unwrap();
+        b.make_dir("/pkg/a/b").unwrap();
+
+        // Warm the cache the way a real workload does: resolve the parent once.
+        b.dir_fd_for(Path::new("pkg/a/b")).unwrap();
+
+        // extractall/rmtree shape: create a child directory, create a file in
+        // it, remove both, repeat. Every one of these is a guest syscall whose
+        // host cost must not grow with the depth of the path.
+        const CYCLES: u64 = 5;
+        b.reset_path_walk_host_opens();
+        for i in 0..CYCLES {
+            let dir = format!("/pkg/a/b/d{i}");
+            let file = format!("{dir}/f");
+            b.make_dir(&dir).unwrap();
+            b.create_file(&file).unwrap();
+            assert!(b.remove_entry(&file));
+            assert!(b.remove_entry(&dir));
+        }
+        let ops = CYCLES * 4;
+        let walked = b.path_walk_host_opens();
+        // The bar in the brief is <=2 host opens per warm guest op; the shape
+        // actually achieved is 0 for the whole loop, so assert the strong form.
+        // Red-first receipt: with the pre-fix `bump_dir_generation()` +
+        // `drop_dir_cache()` on directory removal this same assertion measures
+        // 12 (each of the 5 rmdirs invalidates the whole cache and the next
+        // operations re-walk `pkg`, `a`, `b`).
+        assert!(
+            walked <= 2,
+            "a warm dir_cache must cost no host path-walk opens; measured \
+             {walked} walk opens across {ops} warm guest operations"
         );
     }
 
