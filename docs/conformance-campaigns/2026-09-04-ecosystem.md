@@ -2777,3 +2777,11 @@ executors parked, reactor idle. Not the pid-1 exit wedge (tasks live) and
 not the importlib orphan cause (nothing died): a lost wake into a host wait
 on the go toolchain's fork/exec/pipe path. Dispatched
 (`brief-gobuild-hostwait.md`) with the classification-first method.
+
+**Receipt hygiene note (07:25):** the post-alias row run straddled the
+build of 65b3c791c — `target/release/carrick` was replaced at 06:45:38 while
+the harness was between rows, so `post-alias.jsonl` rows c00–c02 ran the
+2f3e0288b binary and c03–c04 the 65b3c791c binary. Both carry the alias
+fix; the verdicts stand for "main ≥ 2f3e0288b" only. A clean
+smoke-plus-rows on 65b3c791c runs after it finishes. Rule restated: the
+next landing's build waits for the previous post-landing script's DONE line.
