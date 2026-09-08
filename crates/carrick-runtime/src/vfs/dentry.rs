@@ -147,6 +147,7 @@ pub struct DirEntry {
     pub dir_gen: Arc<AtomicU64>,
     pub upper_dir_fd: Option<Arc<OwnedFd>>,
     pub lower_dir_fd: Option<Arc<OwnedFd>>,
+    pub lower_probed: bool,
     pub parent: Option<(DentryId, String)>,
     pub path: String,
     pub dev: u64,
@@ -243,6 +244,7 @@ impl DentryCache {
             dir_gen: root_gen,
             upper_dir_fd: None,
             lower_dir_fd: None,
+            lower_probed: false,
             parent: None,
             path: "/".to_string(),
             dev: 0,
@@ -336,6 +338,7 @@ impl DentryCache {
                 dir_gen: root_gen,
                 upper_dir_fd: None,
                 lower_dir_fd: None,
+                lower_probed: false,
                 parent: None,
                 path: "/".to_string(),
                 dev: 0,
@@ -639,14 +642,15 @@ impl DentryCache {
                         d.accessed.store(true, Ordering::Relaxed);
                         let current_gen = d.dir_gen.load(Ordering::SeqCst);
                         let path = d.path.clone();
-                        let rel = path.trim_start_matches('/');
-                        if d.upper_dir_fd.is_none() {
-                            d.upper_dir_fd = backend.dir_fd_for(Path::new(rel));
-                        }
-                        if d.lower_dir_fd.is_none() {
-                            d.lower_dir_fd = rootfs
-                                .and_then(|rf| rf.immutable_backend())
-                                .and_then(|b| b.dir_fd_for(Path::new(rel)));
+                        if current_id == DentryId::ROOT {
+                            if d.upper_dir_fd.is_none() {
+                                d.upper_dir_fd = backend.dir_fd_for(Path::new(""));
+                            }
+                            if d.lower_dir_fd.is_none() {
+                                d.lower_dir_fd = rootfs
+                                    .and_then(|rf| rf.immutable_backend())
+                                    .and_then(|b| b.dir_fd_for(Path::new("")));
+                            }
                         }
                         (
                             current_gen,
@@ -982,6 +986,7 @@ impl DentryCache {
                         dir_gen: Arc::new(AtomicU64::new(1)),
                         upper_dir_fd: None,
                         lower_dir_fd: None,
+                        lower_probed: false,
                         parent: None,
                         path: "/".to_string(),
                         dev: 0,
@@ -998,11 +1003,19 @@ impl DentryCache {
             }
         }
 
+        let lower_probed = lower_dir_fd.is_some()
+            || (parent_id != DentryId::ROOT
+                && self
+                    .dirs
+                    .read()
+                    .get(&parent_id)
+                    .is_some_and(|p| p.lower_probed && p.lower_dir_fd.is_none()));
         let dir_entry = DirEntry {
             id,
             dir_gen,
             upper_dir_fd,
             lower_dir_fd,
+            lower_probed,
             parent: Some((parent_id, name.to_string())),
             path: path.to_string(),
             dev,
@@ -1285,14 +1298,32 @@ impl DentryCache {
                     self.host_opens.fetch_add(1, Ordering::Relaxed);
                     Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
                 } else {
-                    rootfs
-                        .and_then(|rf| rf.immutable_backend())
-                        .and_then(|b| b.dir_fd_for(Path::new(rel_full)))
+                    None
                 }
             } else {
-                rootfs
-                    .and_then(|rf| rf.immutable_backend())
-                    .and_then(|b| b.dir_fd_for(Path::new(rel_full)))
+                let parent_lower_fd = self
+                    .dirs
+                    .read()
+                    .get(&parent_id)
+                    .and_then(|d| d.lower_dir_fd.clone());
+                match parent_lower_fd {
+                    Some(pfd) => {
+                        let raw = unsafe {
+                            libc::openat(
+                                pfd.as_raw_fd(),
+                                name_c.as_ptr(),
+                                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                            )
+                        };
+                        if raw >= 0 {
+                            self.host_opens.fetch_add(1, Ordering::Relaxed);
+                            Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
             };
             let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
             let child_dir_gen = Arc::new(AtomicU64::new(1));
@@ -1489,9 +1520,29 @@ impl DentryCache {
                 let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
                 let child_dir_gen = Arc::new(AtomicU64::new(1));
                 let child_upper_dir_fd = backend.dir_fd_for(Path::new(rel_full));
-                let child_lower_dir_fd = rootfs
-                    .and_then(|rf| rf.immutable_backend())
-                    .and_then(|b| b.dir_fd_for(Path::new(rel_full)));
+                let parent_lower_fd = self
+                    .dirs
+                    .read()
+                    .get(&parent_id)
+                    .and_then(|d| d.lower_dir_fd.clone());
+                let child_lower_dir_fd = match parent_lower_fd {
+                    Some(pfd) => {
+                        let raw = unsafe {
+                            libc::openat(
+                                pfd.as_raw_fd(),
+                                name_c.as_ptr(),
+                                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                            )
+                        };
+                        if raw >= 0 {
+                            self.host_opens.fetch_add(1, Ordering::Relaxed);
+                            Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
                 self.insert_dir(
                     new_dir_id,
                     child_dir_gen.clone(),
@@ -1546,9 +1597,29 @@ impl DentryCache {
                 let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
                 let child_dir_gen = Arc::new(AtomicU64::new(1));
                 let child_upper_dir_fd = backend.dir_fd_for(Path::new(rel_full));
-                let child_lower_dir_fd = rootfs
-                    .and_then(|rf| rf.immutable_backend())
-                    .and_then(|b| b.dir_fd_for(Path::new(rel_full)));
+                let parent_lower_fd = self
+                    .dirs
+                    .read()
+                    .get(&parent_id)
+                    .and_then(|d| d.lower_dir_fd.clone());
+                let child_lower_dir_fd = match parent_lower_fd {
+                    Some(pfd) => {
+                        let raw = unsafe {
+                            libc::openat(
+                                pfd.as_raw_fd(),
+                                name_c.as_ptr(),
+                                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                            )
+                        };
+                        if raw >= 0 {
+                            self.host_opens.fetch_add(1, Ordering::Relaxed);
+                            Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
                 self.insert_dir(
                     new_dir_id,
                     child_dir_gen.clone(),
