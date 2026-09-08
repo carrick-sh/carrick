@@ -2121,6 +2121,12 @@ pub enum DispatchOutcome {
         /// no Darwin child process exists for HvPatch.
         target: Option<i32>,
         sig_mask: carrick_abi::WaitSigMask,
+        /// The parent's wake generation as of the scan that found nothing to
+        /// reap. The continuation must enroll against THIS, not against a
+        /// generation re-read when it is captured: a child that exits in
+        /// between publishes its edge before the capture, and a capture-time
+        /// reading then subscribes past it and parks forever.
+        precheck: crate::kernel::ChildWaitPrecheck,
     },
     /// A synchronous signal wait found no matching signal already pending and
     /// must wait until one of `wait_set` arrives, or until `timeout` elapses.

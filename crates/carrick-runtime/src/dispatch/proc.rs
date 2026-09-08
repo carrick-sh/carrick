@@ -3264,7 +3264,7 @@ impl SyscallDispatcher {
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    crate::hvpatch::WaitResult::StillRunning => {
+                    crate::hvpatch::WaitResult::StillRunning(precheck) => {
                         if guest_nohang {
                             if infop_addr.0 != 0 {
                                 (*cx.memory).write_bytes(
@@ -3298,6 +3298,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::WaitOnHvpatchChild {
                             target,
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
+                            precheck,
                         });
                     }
                     crate::hvpatch::WaitResult::NoChild => {
@@ -3747,7 +3748,7 @@ impl SyscallDispatcher {
                             value: i64::from(exit.visible_pid()),
                         });
                     }
-                    crate::hvpatch::WaitResult::StillRunning => {
+                    crate::hvpatch::WaitResult::StillRunning(precheck) => {
                         if guest_nohang {
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
@@ -3775,6 +3776,7 @@ impl SyscallDispatcher {
                             // continuation resolves it in the kernel graph.
                             target: host_target,
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
+                            precheck,
                         });
                     }
                     crate::hvpatch::WaitResult::NoChild => {

@@ -692,6 +692,13 @@ enum ContinuationDetail {
     Process {
         selector: ChildSelector,
         sig_mask: WaitSigMask,
+        /// The parent's wake generation as of the child scan that concluded
+        /// nothing was reapable. Both readiness probes enroll against THIS
+        /// rather than against the generation the capture re-reads, because a
+        /// child that exits between the scan and the capture publishes its
+        /// edge in between. See
+        /// [`ChildWaitPrecheck`](crate::kernel::ChildWaitPrecheck).
+        precheck: crate::kernel::ChildWaitPrecheck,
     },
     Signals {
         wait_set: SigSet,
@@ -1116,6 +1123,7 @@ impl BlockedContinuation {
                     ContinuationDetail::Process {
                         selector: ChildSelector::HostPid(pid),
                         sig_mask,
+                        precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
                     },
                 ))
             }
@@ -1130,10 +1138,15 @@ impl BlockedContinuation {
                     ContinuationDetail::Process {
                         selector: ChildSelector::HostPid(pid),
                         sig_mask,
+                        precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
                     },
                 ))
             }
-            DispatchOutcome::WaitOnHvpatchChild { target, sig_mask } => {
+            DispatchOutcome::WaitOnHvpatchChild {
+                target,
+                sig_mask,
+                precheck,
+            } => {
                 if backend != ContinuationBackend::Hvpatch {
                     return Err(ContinuationBuildError::StaleChildSelector);
                 }
@@ -1166,7 +1179,11 @@ impl BlockedContinuation {
                     None,
                     Vec::new(),
                     Some(sig_mask),
-                    ContinuationDetail::Process { selector, sig_mask },
+                    ContinuationDetail::Process {
+                        selector,
+                        sig_mask,
+                        precheck,
+                    },
                 ))
             }
             DispatchOutcome::WaitOnSignals {
@@ -1520,7 +1537,9 @@ impl BlockedContinuation {
             ContinuationDetail::RecordLock(lock) => {
                 fingerprint ^= std::mem::size_of_val(lock) as u64;
             }
-            ContinuationDetail::Process { selector, sig_mask } => {
+            ContinuationDetail::Process {
+                selector, sig_mask, ..
+            } => {
                 fingerprint ^= sig_mask.block_mask().raw();
                 fingerprint ^= match selector {
                     ChildSelector::Exact(key) => key.serial.raw(),
@@ -2541,10 +2560,19 @@ impl SignalReadinessProbe {
             } => (Some(wait_set), Some(block_mask)),
             _ => (None, None),
         };
+        // A process wait subscribes to the parent's task wake, and
+        // `event_after_task_wake` turns ANY such edge into `Ready` for it. It
+        // must therefore subscribe at the generation its child scan observed,
+        // not at the capture's re-reading, or `subscribe_wake` enrols past the
+        // exit edge that already fired. See `ChildWaitPrecheck`.
+        let observed_task_wake = match state.detail {
+            ContinuationDetail::Process { precheck, .. } => precheck.wake_generation(),
+            _ => state.authority.task_wake_generation,
+        };
         Self {
             kernel: state.authority.kernel.clone(),
             task_ref: state.authority.task_ref.clone(),
-            observed_task_wake: state.authority.task_wake_generation,
+            observed_task_wake,
             observed_task_event: state.authority.task_event_generation,
             task: state.authority.task,
             thread: state.authority.thread,
@@ -2704,15 +2732,16 @@ impl ReadinessProbe {
                 write: Arc::clone(write),
                 completion: Arc::clone(&state.producer_completion),
             },
-            ContinuationDetail::Process { .. } => {
-                let task = state.authority.task_ref.clone();
-                let observed = state.authority.task_wake_generation;
-                Self::TaskWake {
-                    task,
-                    observed,
-                    deadline: state.deadline,
-                }
-            }
+            // Enroll against the generation the CHILD SCAN observed, never
+            // the one the capture re-read: the capture happens after the
+            // syscall has already decided to block, so a child that exits in
+            // that window publishes its wake edge before the reading and the
+            // probe then compares equal forever. See `ChildWaitPrecheck`.
+            ContinuationDetail::Process { precheck, .. } => Self::TaskWake {
+                task: state.authority.task_ref.clone(),
+                observed: precheck.wake_generation(),
+                deadline: state.deadline,
+            },
             // A signal park must hear `task.wake()` — THE single door — like
             // every other park: a thread-directed post to a FORKED task's
             // sigsuspend/sigtimedwait park has no other prompt vehicle (the
@@ -5948,6 +5977,7 @@ mod tests {
             ContinuationFamily::WaitOnHvpatchChild => DispatchOutcome::WaitOnHvpatchChild {
                 target: None,
                 sig_mask: WaitSigMask::NONE,
+                precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
             },
             ContinuationFamily::WaitOnSignals => DispatchOutcome::WaitOnSignals {
                 wait_set: SigSet::from_raw(0x55),
@@ -6154,6 +6184,7 @@ mod tests {
             DispatchOutcome::WaitOnHvpatchChild {
                 target: None,
                 sig_mask: WaitSigMask::NONE,
+                precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -6172,6 +6203,7 @@ mod tests {
             DispatchOutcome::WaitOnHvpatchChild {
                 target: None,
                 sig_mask: WaitSigMask::NONE,
+                precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -6220,6 +6252,7 @@ mod tests {
             DispatchOutcome::WaitOnHvpatchChild {
                 target: None,
                 sig_mask: WaitSigMask::NONE,
+                precheck: crate::kernel::ChildWaitPrecheck::unsampled(),
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -6287,6 +6320,73 @@ mod tests {
                 .expect("registration diagnostic")
                 .state,
             "absent"
+        );
+    }
+
+    /// A child that exits AFTER the wait scan found nothing but BEFORE the
+    /// continuation is captured must still wake the parent.
+    ///
+    /// This is the `go build` wedge: the exit's producer edge is published
+    /// while the syscall is still returning `StillRunning`, the capture then
+    /// re-reads the parent's wake generation and sees the post-edge value,
+    /// and `subscribe_wake` enrols past the only edge that will ever fire.
+    /// The snapshot signature is a zombie child, an `enrolled` parent wait
+    /// with `event: None`, and `observed_wake == current_wake`
+    /// (`target/perf/wedges/ohw-r2c-32079`).
+    ///
+    /// Red-first receipt: build the continuation from a precheck sampled
+    /// AFTER the edge (`ChildWaitPrecheck::unsampled()` is not enough —
+    /// use the post-edge generation) and this assertion fails, which is the
+    /// behaviour every capture-time reading had.
+    #[test]
+    fn child_wait_enrolled_after_the_exit_edge_still_sees_it() {
+        let (kernel, context) = bootstrap(15_121);
+        let generation = publish(&context, 0x361);
+
+        // What the wait scan observed: no child reapable, parent at this
+        // wake generation.
+        let precheck = crate::kernel::ChildWaitPrecheck::for_test(context.task().wake_generation());
+
+        // The child exits here — after the scan, before the capture — and its
+        // terminal path publishes the parent's wake edge.
+        // Returns false: no listener is enrolled yet — which is exactly the
+        // problem. The generation still moves.
+        let _ = context.task().publish_wake_subscriptions();
+        assert_ne!(
+            context.task().wake_generation(),
+            precheck.wake_generation(),
+            "the simulated exit must actually move the parent's generation"
+        );
+
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnHvpatchChild {
+                target: None,
+                sig_mask: WaitSigMask::NONE,
+                precheck,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("kernel child continuation");
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        service
+            .enroll(&mut registration)
+            .expect("enroll child wait");
+
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token.continuation)
+                .expect("child registration")
+                .state,
+            RegistrationState::Ready,
+            "an exit edge published between the child scan and the capture must \
+             still make the wait ready; enrolling past it parks the parent forever"
         );
     }
 

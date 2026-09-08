@@ -717,7 +717,7 @@ pub(crate) enum ProcessThreadExit {
 pub(crate) enum WaitResult {
     Exited(ChildExit),
     StateChanged(ChildExit),
-    StillRunning,
+    StillRunning(crate::kernel::ChildWaitPrecheck),
     NoChild,
 }
 
@@ -1505,6 +1505,13 @@ impl ProcessContext {
         failure: &'static str,
         outcome: Result<crate::kernel::WaitOutcome, crate::kernel::KernelOperationError>,
     ) -> WaitResult {
+        // Sampled before this outcome is interpreted, so the `TaskBusy` arm
+        // below — which reports "nothing reapable yet" WITHOUT having scanned
+        // the child set — still hands the continuation a generation that
+        // precedes any edge a concurrent exit can publish. An earlier reading
+        // is always safe (at worst one spurious redispatch); a later one loses
+        // the edge. See `ChildWaitPrecheck`.
+        let busy_precheck = crate::kernel::ChildWaitPrecheck::unsampled();
         match outcome {
             Ok(crate::kernel::WaitOutcome::Exited(zombie)) => {
                 let Ok(visible_pid) = i32::try_from(zombie.namespace_pid) else {
@@ -1543,7 +1550,9 @@ impl ProcessContext {
                     status: 0xffff,
                 })
             }
-            Ok(crate::kernel::WaitOutcome::StillRunning) => WaitResult::StillRunning,
+            Ok(crate::kernel::WaitOutcome::StillRunning(precheck)) => {
+                WaitResult::StillRunning(precheck)
+            }
             Ok(crate::kernel::WaitOutcome::NoChild) => WaitResult::NoChild,
             Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
                 // A reservation is mid-flight — typically THIS process's
@@ -1558,7 +1567,7 @@ impl ProcessContext {
                 // the vcpu loop's bounded park, which re-runs this query.
                 // The condvar park was also invisible to fork-quiesce
                 // kicks — an unbounded parking_lot wait inside dispatch.
-                WaitResult::StillRunning
+                WaitResult::StillRunning(busy_precheck)
             }
             Err(error) => {
                 tracing::error!(pid = self.pid(), %error, "{failure}");
@@ -2354,7 +2363,7 @@ mod tests {
                 false,
                 false,
             ),
-            WaitResult::StillRunning
+            WaitResult::StillRunning(_)
         ));
         prepared_exit.commit().unwrap();
         // The re-query — what the vcpu loop's bounded park does for a blocking
@@ -4130,7 +4139,7 @@ mod tests {
                 false,
                 false,
             ),
-            WaitResult::StillRunning
+            WaitResult::StillRunning(_)
         ));
 
         finalize_test_child(&child, 23, child_tid);

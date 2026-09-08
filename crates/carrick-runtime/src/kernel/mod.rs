@@ -98,12 +98,12 @@ pub(crate) use objects::{
     NO_READINESS_CONTEXT, NoReadinessContext, ReadinessContext,
 };
 pub use operations::{
-    ChildStartOutcome, ChildStartWait, ForkReservation, KernelFailpoint, KernelOperationError,
-    PreparedFork, PreparedTaskExit, PreparedThreadClone, ProcessIdentity, ProcessState,
-    PublishedFork, PublishedThreadClone, ReservedPidfdSubscription, SignalTargetAuthorization,
-    StartedFork, StartedThreadClone, TaskIdentity, TaskOperationReservation,
-    ThreadCloneReservation, ThreadPublicationReservationAttempt, WaitChildClass, WaitMode,
-    WaitOutcome,
+    ChildStartOutcome, ChildStartWait, ChildWaitPrecheck, ForkReservation, KernelFailpoint,
+    KernelOperationError, PreparedFork, PreparedTaskExit, PreparedThreadClone, ProcessIdentity,
+    ProcessState, PublishedFork, PublishedThreadClone, ReservedPidfdSubscription,
+    SignalTargetAuthorization, StartedFork, StartedThreadClone, TaskIdentity,
+    TaskOperationReservation, ThreadCloneReservation, ThreadPublicationReservationAttempt,
+    WaitChildClass, WaitMode, WaitOutcome,
 };
 pub(crate) use operations::{
     CloseRangeUnshare, ExactSignalTargetAuthorization, ExactThreadSignalPost, TtyControlError,
