@@ -30252,6 +30252,7 @@ impl TaskMappingIndex {
 impl std::ops::Index<usize> for TaskMappingIndex {
     type Output = HvfMappedRegion;
 
+    #[allow(clippy::expect_used)]
     fn index(&self, position: usize) -> &Self::Output {
         self.iter().nth(position).expect("mapping row in range")
     }
@@ -30259,6 +30260,7 @@ impl std::ops::Index<usize> for TaskMappingIndex {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", test))]
 impl std::ops::IndexMut<usize> for TaskMappingIndex {
+    #[allow(clippy::expect_used)]
     fn index_mut(&mut self, position: usize) -> &mut Self::Output {
         self.iter_mut().nth(position).expect("mapping row in range")
     }
