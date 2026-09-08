@@ -10451,11 +10451,27 @@ where
                                 None,
                             ));
                         };
-                        // Serialize both the reservation slot and raw HVF topology
-                        // mutation. Authority publication takes its own lock only
-                        // after the topology lock and backend locks are released.
+                        // Publish to the kernel frame-inventory authority BEFORE
+                        // releasing the topology lock. Staging above made a fresh
+                        // shared-file frame visible to every later installer of the
+                        // same file through the backend's shared-frame registry
+                        // (`stage_mapping_in`: `frames.shared.entry(backing)`), and
+                        // a reuser's batch names that frame WITHOUT reserving it —
+                        // the authority accepts it only if the frame is already
+                        // live. Publishing after the release (d913972c2) let a
+                        // sibling stage its reuse and publish first, and its apply
+                        // was refused with `UnreservedFrame`: the silent rc=134
+                        // carrier abort of 2026-09-08 (go-build reducer, and the
+                        // mmap(MAP_SHARED) two-process reducer 4/4). Holding the
+                        // lock across the apply makes publication order equal to
+                        // staging order, which is the invariant the registry
+                        // reuse relies on. Lock order is unchanged: the AliasUnmap
+                        // retirement already publishes under this lock, and the
+                        // authority mutex is a leaf (`frame_inventory.rs` never
+                        // calls out while holding it).
+                        let published = apply_alias_frame_inventory(&kernel_context, commit);
                         drop(topology);
-                        if let Err(error) = apply_alias_frame_inventory(&kernel_context, commit) {
+                        if let Err(error) = published {
                             return Err(refuse(
                                 Site::InventoryPublish,
                                 error.to_string(),
@@ -12809,6 +12825,42 @@ mod tests {
             })
             .expect("publish event");
         reservation.commit(())
+    }
+
+    /// The backend's shared-frame registry makes a freshly staged shared-file
+    /// frame reusable by the next installer of the same file from staging
+    /// time, and a reuser's batch does not reserve that frame; the authority
+    /// accepts the reuse only if the frame is already published. So the
+    /// install arm must publish while it still holds the AliasMap topology
+    /// lock. Publishing after the release produced the 2026-09-08 silent
+    /// `UnreservedFrame` carrier abort under concurrent mmap(MAP_SHARED).
+    #[test]
+    fn alias_install_publishes_inventory_before_releasing_the_topology_lock() {
+        let source = include_str!("mod.rs");
+        let arm = source
+            .split("DispatchOutcome::MapHostAlias {")
+            .nth(1)
+            .expect("the mmap alias-install arm exists");
+        let arm = arm
+            .split("break 'service installed;")
+            .next()
+            .expect("the alias-install arm ends by breaking with its result");
+        // Anchor after the backend commit is taken: the failed-install
+        // rollback above it drops the lock too, and must not satisfy this.
+        let tail = arm
+            .split("engine.take_alias_inventory()")
+            .nth(1)
+            .expect("the arm takes the backend alias commit");
+        let publish = tail
+            .find("apply_alias_frame_inventory(&kernel_context, commit)")
+            .expect("the arm publishes the alias inventory");
+        let release = tail
+            .find("drop(topology);")
+            .expect("the arm releases the topology lock after the commit is taken");
+        assert!(
+            publish < release,
+            "alias inventory publication must complete under the AliasMap topology lock"
+        );
     }
 
     #[test]
