@@ -128,6 +128,71 @@ fn apply_alias_frame_inventory(
         .map(|_| ())
 }
 
+/// The mmap alias-install arm's fail-closed sink.
+///
+/// Every step after `map_host_alias` has succeeded runs with the alias already
+/// committed to stage-2, so none of them can be lowered to a guest errno: a
+/// refusal there is a carrier invariant violation. Until 2026-09-08 each was a
+/// bare `abort()` with no log line, and the go-build reducer died rc=134 with
+/// empty stderr. This names the site through lane B's `KernelAbort` sink —
+/// the run ends in `kernel aborted: hvpatch alias install …` with a
+/// post-mortem — and, for a refused inventory publication, asks the authority
+/// whether the frame the batch names is still a candidate of some other
+/// reserved, unapplied transaction, which is the publication-order signature.
+///
+/// Returns the carrier-terminal error the arm completes with; every later job
+/// wait in this carrier is answered by the same recorded abort.
+#[allow(clippy::too_many_arguments)]
+fn refuse_alias_install(
+    kernel: &Kernel,
+    context: &crate::kernel::KernelContext,
+    site: crate::kernel::debug::HvpatchAliasInstallSite,
+    guest_pid: i32,
+    guest_tid: i32,
+    va: u64,
+    len: u64,
+    prot: u64,
+    shared: bool,
+    prot_none: bool,
+    error: String,
+    frame: Option<carrick_hal::FrameId>,
+) -> RuntimeError {
+    let pending_reservation = frame
+        .and_then(|frame| {
+            context
+                .kernel()
+                .frame_inventory()
+                .pending_reservation_for_frame(frame)
+        })
+        .map(|transaction| transaction.raw());
+    let reason = crate::kernel::debug::AbortReason::HvpatchAliasInstall {
+        site,
+        guest_pid,
+        guest_tid,
+        executor: std::thread::current().name().map(str::to_owned),
+        mm: context.shared().mm().id().raw(),
+        va,
+        len,
+        prot,
+        shared,
+        prot_none,
+        error,
+        frame: frame.map(|frame| frame.raw()),
+        pending_reservation,
+    };
+    tracing::error!(
+        reason = %reason.summary(),
+        "HVPatch alias install refused; aborting the carrier"
+    );
+    match kernel.hvpatch_runtime.as_ref() {
+        Some(directory) => directory.process_graph_liveness().abort(reason),
+        // The arm is reached only with an HVPatch process context, which is
+        // always paired with a runtime directory; a carrier without one cannot
+        // capture, so the summary is the whole evidence.
+        None => RuntimeError::Configuration(reason.summary()),
+    }
+}
+
 struct KernelFrameCowAuthority {
     deferred_anonymous: Option<Arc<carrick_guest_mem::DeferredAnonymousState>>,
     kernel: Arc<crate::kernel::Kernel>,
@@ -10360,26 +10425,59 @@ where
                                 value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
                             });
                         }
+                        use crate::kernel::debug::HvpatchAliasInstallSite as Site;
+                        let guest_pid = process.pid();
+                        let guest_tid = self.this_tid.raw();
+                        let refuse = |site: Site, error: String, frame| {
+                            refuse_alias_install(
+                                kernel,
+                                &kernel_context,
+                                site,
+                                guest_pid,
+                                guest_tid,
+                                va.raw(),
+                                len,
+                                prot,
+                                shared,
+                                prot_none,
+                                error,
+                                frame,
+                            )
+                        };
                         let Some(commit) = engine.take_alias_inventory() else {
-                            std::process::abort();
+                            return Err(refuse(
+                                Site::InventoryCommitMissing,
+                                "backend staged no alias inventory commit".to_owned(),
+                                None,
+                            ));
                         };
                         // Serialize both the reservation slot and raw HVF topology
                         // mutation. Authority publication takes its own lock only
                         // after the topology lock and backend locks are released.
                         drop(topology);
-                        if apply_alias_frame_inventory(&kernel_context, commit).is_err() {
-                            std::process::abort();
+                        if let Err(error) = apply_alias_frame_inventory(&kernel_context, commit) {
+                            return Err(refuse(
+                                Site::InventoryPublish,
+                                error.to_string(),
+                                error.frame(),
+                            ));
                         }
 
-                        let Ok(len) = usize::try_from(len) else {
-                            std::process::abort();
+                        let Ok(len_bytes) = usize::try_from(len) else {
+                            return Err(refuse(
+                                Site::LenOverflow,
+                                "mapping length does not fit usize".to_owned(),
+                                None,
+                            ));
                         };
-                        if prot_none && engine.protect_range(va.raw(), len, 0).is_err() {
-                            std::process::abort();
+                        if prot_none
+                            && let Err(error) = engine.protect_range(va.raw(), len_bytes, 0)
+                        {
+                            return Err(refuse(Site::ProtectNone, error.to_string(), None));
                         }
                         engine.set_mapping_protection_and_sharing(
                             va.raw(),
-                            len,
+                            len_bytes,
                             prot_none,
                             !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
                                 .contains(carrick_abi::LinuxProtFlags::WRITE),
@@ -10391,19 +10489,25 @@ where
                         );
                         if let Some((bus_start, bus_len)) = install.bus_fault_range() {
                             let Ok(bus_len) = usize::try_from(bus_len) else {
-                                std::process::abort();
+                                return Err(refuse(
+                                    Site::BusFaultLenOverflow,
+                                    format!(
+                                        "bus-fault tail length {bus_len:#x} does not fit usize"
+                                    ),
+                                    None,
+                                ));
                             };
-                            if engine.protect_range(bus_start, bus_len, 0).is_err() {
-                                std::process::abort();
+                            if let Err(error) = engine.protect_range(bus_start, bus_len, 0) {
+                                return Err(refuse(
+                                    Site::BusFaultProtect,
+                                    format!("bus-fault tail {bus_start:#x}+{bus_len:#x}: {error}"),
+                                    None,
+                                ));
                             }
                             engine.set_no_access(bus_start, bus_len, true);
                         }
-                        if kernel
-                            .dispatcher
-                            .commit_host_alias_install(install)
-                            .is_err()
-                        {
-                            std::process::abort();
+                        if let Err(error) = kernel.dispatcher.commit_host_alias_install(install) {
+                            return Err(refuse(Site::DispatcherCommit, format!("{error:?}"), None));
                         }
                         Ok(DispatchOutcome::Returned {
                             value: success_retval,
