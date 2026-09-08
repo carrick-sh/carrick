@@ -37,7 +37,7 @@
 //!   - Path mutations (`truncate`, `chmod`, `chown`, `utimes`): invalidate the target path's
 //!     dentry and inode record.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
@@ -148,6 +148,7 @@ pub struct DirEntry {
     pub upper_dir_fd: Option<Arc<OwnedFd>>,
     pub lower_dir_fd: Option<Arc<OwnedFd>>,
     pub lower_probed: bool,
+    pub upper_probed_gen: u64,
     pub parent: Option<(DentryId, String)>,
     pub path: String,
     pub dev: u64,
@@ -155,6 +156,7 @@ pub struct DirEntry {
     pub child_dir_count: usize,
     pub accessed: Arc<AtomicBool>,
     pub pin_count: Arc<AtomicUsize>,
+    pub lower_negatives: Arc<parking_lot::RwLock<HashSet<String>>>,
 }
 
 fn entry_node_approx_bytes(name: &str, node: &DentryNode) -> usize {
@@ -245,6 +247,7 @@ impl DentryCache {
             upper_dir_fd: None,
             lower_dir_fd: None,
             lower_probed: false,
+            upper_probed_gen: 0,
             parent: None,
             path: "/".to_string(),
             dev: 0,
@@ -252,6 +255,7 @@ impl DentryCache {
             child_dir_count: 0,
             accessed: Arc::new(AtomicBool::new(true)),
             pin_count: Arc::new(AtomicUsize::new(0)),
+            lower_negatives: Arc::new(parking_lot::RwLock::new(HashSet::new())),
         };
         let initial_bytes = dir_entry_approx_bytes(&root_dir);
 
@@ -311,6 +315,12 @@ impl DentryCache {
         self.is_shared
     }
 
+    fn combined_generation(&self) -> u64 {
+        self.mutation_gen
+            .load(Ordering::Relaxed)
+            .wrapping_add(crate::fs_resolve_cache::current_generation())
+    }
+
     fn bump_mutation(&self) {
         self.mutation_gen.fetch_add(1, Ordering::SeqCst);
         let mut fp = self.fast_path.write();
@@ -339,6 +349,8 @@ impl DentryCache {
                 upper_dir_fd: None,
                 lower_dir_fd: None,
                 lower_probed: false,
+                lower_negatives: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+                upper_probed_gen: 0,
                 parent: None,
                 path: "/".to_string(),
                 dev: 0,
@@ -637,6 +649,43 @@ impl DentryCache {
 
             let (parent_dir_gen, upper_fd, lower_fd, current_dir_path) = {
                 let mut dirs = self.dirs.write();
+                let current_generation = self.combined_generation();
+                let parent_probe_info = if current_id != DentryId::ROOT {
+                    dirs.get(&current_id).and_then(|d| {
+                        if d.upper_dir_fd.is_none() && d.upper_probed_gen != current_generation {
+                            let (pid, name) = d.parent.clone()?;
+                            let pfd = dirs.get(&pid).and_then(|p| p.upper_dir_fd.clone());
+                            Some((pfd, name))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+
+                let probed_fd = if let Some((Some(ref pfd), ref leaf_name)) = parent_probe_info {
+                    if let Ok(name_c) = CString::new(leaf_name.as_bytes()) {
+                        let raw = unsafe {
+                            libc::openat(
+                                pfd.as_raw_fd(),
+                                name_c.as_ptr(),
+                                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                            )
+                        };
+                        if raw >= 0 {
+                            self.host_opens.fetch_add(1, Ordering::Relaxed);
+                            Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 match dirs.get_mut(&current_id) {
                     Some(d) => {
                         d.accessed.store(true, Ordering::Relaxed);
@@ -650,6 +699,13 @@ impl DentryCache {
                                 d.lower_dir_fd = rootfs
                                     .and_then(|rf| rf.immutable_backend())
                                     .and_then(|b| b.dir_fd_for(Path::new("")));
+                            }
+                        } else if parent_probe_info.is_some() {
+                            if let Some(fd) = probed_fd {
+                                d.upper_dir_fd = Some(fd);
+                                d.upper_probed_gen = u64::MAX;
+                            } else {
+                                d.upper_probed_gen = current_generation;
                             }
                         }
                         (
@@ -675,27 +731,32 @@ impl DentryCache {
             let dentry_node = match cached_node {
                 Some(DentryNode::Negative(neg)) => {
                     if neg.parent_gen == parent_dir_gen {
-                        let parent_fd = upper_fd.as_ref().or(lower_fd.as_ref());
-                        if let Some(pfd) = parent_fd {
-                            if let Ok(name_c) = CString::new(name.as_bytes()) {
-                                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                                let rc = unsafe {
-                                    libc::fstatat(
-                                        pfd.as_raw_fd(),
-                                        name_c.as_ptr(),
-                                        &mut st,
-                                        libc::AT_SYMLINK_NOFOLLOW,
-                                    )
-                                };
-                                if rc == 0 {
-                                    let mut entries = self.entries.write();
-                                    if let Some(removed) =
-                                        entries.remove(&(current_id, name.clone()))
-                                    {
-                                        let b = entry_node_approx_bytes(name, &removed);
-                                        self.sub_approx_bytes(b);
+                        if self.is_shared {
+                            let parent_fd = upper_fd.as_ref().or(lower_fd.as_ref());
+                            if let Some(pfd) = parent_fd {
+                                if let Ok(name_c) = CString::new(name.as_bytes()) {
+                                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                                    let rc = unsafe {
+                                        libc::fstatat(
+                                            pfd.as_raw_fd(),
+                                            name_c.as_ptr(),
+                                            &mut st,
+                                            libc::AT_SYMLINK_NOFOLLOW,
+                                        )
+                                    };
+                                    if rc == 0 {
+                                        let mut entries = self.entries.write();
+                                        if let Some(removed) =
+                                            entries.remove(&(current_id, name.clone()))
+                                        {
+                                            let b = entry_node_approx_bytes(name, &removed);
+                                            self.sub_approx_bytes(b);
+                                        }
+                                        None
+                                    } else {
+                                        neg.accessed.store(true, Ordering::Relaxed);
+                                        return Err(LINUX_ENOENT);
                                     }
-                                    None
                                 } else {
                                     neg.accessed.store(true, Ordering::Relaxed);
                                     return Err(LINUX_ENOENT);
@@ -742,7 +803,13 @@ impl DentryCache {
                                     let (mode, uid, gid) = if pos.is_lower {
                                         let rs = rootfs
                                             .and_then(|rf| rf.immutable_backend())
-                                            .and_then(|b| b.real_stat(&child_path, false));
+                                            .and_then(|b| {
+                                                if !b.serves_plain_metadata() {
+                                                    b.real_stat(&child_path, false)
+                                                } else {
+                                                    None
+                                                }
+                                            });
                                         if let Some(rs) = rs {
                                             (rs.mode, rs.uid, rs.gid)
                                         } else {
@@ -987,6 +1054,7 @@ impl DentryCache {
                         upper_dir_fd: None,
                         lower_dir_fd: None,
                         lower_probed: false,
+                        upper_probed_gen: 0,
                         parent: None,
                         path: "/".to_string(),
                         dev: 0,
@@ -994,6 +1062,7 @@ impl DentryCache {
                         child_dir_count: 0,
                         accessed: Arc::new(AtomicBool::new(true)),
                         pin_count: Arc::new(AtomicUsize::new(0)),
+                        lower_negatives: Arc::new(parking_lot::RwLock::new(HashSet::new())),
                     };
                     dirs.insert(DentryId::ROOT, root_dir);
                     path_map.insert("/".to_string(), DentryId::ROOT);
@@ -1010,12 +1079,18 @@ impl DentryCache {
                     .read()
                     .get(&parent_id)
                     .is_some_and(|p| p.lower_probed && p.lower_dir_fd.is_none()));
+        let upper_probed_gen = if upper_dir_fd.is_some() {
+            u64::MAX
+        } else {
+            self.combined_generation()
+        };
         let dir_entry = DirEntry {
             id,
             dir_gen,
             upper_dir_fd,
             lower_dir_fd,
             lower_probed,
+            upper_probed_gen,
             parent: Some((parent_id, name.to_string())),
             path: path.to_string(),
             dev,
@@ -1023,6 +1098,7 @@ impl DentryCache {
             child_dir_count: 0,
             accessed: Arc::new(AtomicBool::new(true)),
             pin_count: Arc::new(AtomicUsize::new(0)),
+            lower_negatives: Arc::new(parking_lot::RwLock::new(HashSet::new())),
         };
 
         let dir_bytes = dir_entry_approx_bytes(&dir_entry);
@@ -1212,9 +1288,13 @@ impl DentryCache {
     ) -> Result<PositiveDentry, LinuxErrno> {
         let mode_type = st.st_mode as u32 & libc::S_IFMT as u32;
         let real_stat = if is_lower {
-            rootfs
-                .and_then(|rf| rf.immutable_backend())
-                .and_then(|b| b.real_stat(full_path, false))
+            rootfs.and_then(|rf| rf.immutable_backend()).and_then(|b| {
+                if !b.serves_plain_metadata() {
+                    b.real_stat(full_path, false)
+                } else {
+                    None
+                }
+            })
         } else if !backend.serves_plain_metadata() {
             backend.real_stat(full_path, false)
         } else {
@@ -1284,7 +1364,29 @@ impl DentryCache {
                     backend.dir_fd_for(Path::new(rel_full))
                 }
             } else {
-                backend.dir_fd_for(Path::new(rel_full))
+                let parent_upper_fd = self
+                    .dirs
+                    .read()
+                    .get(&parent_id)
+                    .and_then(|d| d.upper_dir_fd.clone());
+                match parent_upper_fd {
+                    Some(pfd) => {
+                        let raw = unsafe {
+                            libc::openat(
+                                pfd.as_raw_fd(),
+                                name_c.as_ptr(),
+                                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                            )
+                        };
+                        if raw >= 0 {
+                            self.host_opens.fetch_add(1, Ordering::Relaxed);
+                            Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
             };
             let child_lower_dir_fd = if is_lower {
                 let raw = unsafe {
@@ -1519,12 +1621,32 @@ impl DentryCache {
             let (dir_id, child_dir_gen) = if rs.kind == RootFsEntryKind::Directory {
                 let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
                 let child_dir_gen = Arc::new(AtomicU64::new(1));
-                let child_upper_dir_fd = backend.dir_fd_for(Path::new(rel_full));
-                let parent_lower_fd = self
-                    .dirs
-                    .read()
-                    .get(&parent_id)
-                    .and_then(|d| d.lower_dir_fd.clone());
+                let (parent_upper_fd, parent_lower_fd) = {
+                    let dirs = self.dirs.read();
+                    let d = dirs.get(&parent_id);
+                    (
+                        d.and_then(|d| d.upper_dir_fd.clone()),
+                        d.and_then(|d| d.lower_dir_fd.clone()),
+                    )
+                };
+                let child_upper_dir_fd = match parent_upper_fd {
+                    Some(pfd) => {
+                        let raw = unsafe {
+                            libc::openat(
+                                pfd.as_raw_fd(),
+                                name_c.as_ptr(),
+                                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                            )
+                        };
+                        if raw >= 0 {
+                            self.host_opens.fetch_add(1, Ordering::Relaxed);
+                            Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
                 let child_lower_dir_fd = match parent_lower_fd {
                     Some(pfd) => {
                         let raw = unsafe {
@@ -1596,12 +1718,32 @@ impl DentryCache {
             let (dir_id, child_dir_gen) = if md.kind == RootFsEntryKind::Directory {
                 let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
                 let child_dir_gen = Arc::new(AtomicU64::new(1));
-                let child_upper_dir_fd = backend.dir_fd_for(Path::new(rel_full));
-                let parent_lower_fd = self
-                    .dirs
-                    .read()
-                    .get(&parent_id)
-                    .and_then(|d| d.lower_dir_fd.clone());
+                let (parent_upper_fd, parent_lower_fd) = {
+                    let dirs = self.dirs.read();
+                    let d = dirs.get(&parent_id);
+                    (
+                        d.and_then(|d| d.upper_dir_fd.clone()),
+                        d.and_then(|d| d.lower_dir_fd.clone()),
+                    )
+                };
+                let child_upper_dir_fd = match parent_upper_fd {
+                    Some(pfd) => {
+                        let raw = unsafe {
+                            libc::openat(
+                                pfd.as_raw_fd(),
+                                name_c.as_ptr(),
+                                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                            )
+                        };
+                        if raw >= 0 {
+                            self.host_opens.fetch_add(1, Ordering::Relaxed);
+                            Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
                 let child_lower_dir_fd = match parent_lower_fd {
                     Some(pfd) => {
                         let raw = unsafe {
@@ -1670,6 +1812,18 @@ impl DentryCache {
 
         // 2. Check Lower RootFs (if available)
         if let Some(rf) = rootfs {
+            let lower_neg = {
+                let dirs = self.dirs.read();
+                dirs.get(&parent_id)
+                    .is_some_and(|d| d.lower_negatives.read().contains(name))
+            };
+            if lower_neg {
+                if !self.is_shared {
+                    self.insert_negative(parent_id, name, parent_dir_gen);
+                }
+                return Err(LINUX_ENOENT);
+            }
+
             if let Some(lower_fd) = lower_parent_fd {
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
                 let rc = unsafe {
@@ -1694,6 +1848,11 @@ impl DentryCache {
                         backend,
                         rootfs,
                     );
+                } else {
+                    let dirs = self.dirs.read();
+                    if let Some(d) = dirs.get(&parent_id) {
+                        d.lower_negatives.write().insert(name.to_string());
+                    }
                 }
             } else if let Ok(md) = rf.symlink_metadata(&full_path) {
                 // Fallback for when lower_parent_fd is not available (e.g. in-memory rootfs)
@@ -1724,10 +1883,50 @@ impl DentryCache {
                 let (dir_id, child_dir_gen) = if md.kind == RootFsEntryKind::Directory {
                     let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
                     let child_dir_gen = Arc::new(AtomicU64::new(1));
-                    let child_upper_dir_fd = backend.dir_fd_for(Path::new(rel_full));
-                    let child_lower_dir_fd = rf
-                        .immutable_backend()
-                        .and_then(|b| b.dir_fd_for(Path::new(rel_full)));
+                    let (parent_upper_fd, parent_lower_fd) = {
+                        let dirs = self.dirs.read();
+                        let d = dirs.get(&parent_id);
+                        (
+                            d.and_then(|d| d.upper_dir_fd.clone()),
+                            d.and_then(|d| d.lower_dir_fd.clone()),
+                        )
+                    };
+                    let child_upper_dir_fd = match parent_upper_fd {
+                        Some(pfd) => {
+                            let raw = unsafe {
+                                libc::openat(
+                                    pfd.as_raw_fd(),
+                                    name_c.as_ptr(),
+                                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                                )
+                            };
+                            if raw >= 0 {
+                                self.host_opens.fetch_add(1, Ordering::Relaxed);
+                                Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
+                    let child_lower_dir_fd = match parent_lower_fd {
+                        Some(pfd) => {
+                            let raw = unsafe {
+                                libc::openat(
+                                    pfd.as_raw_fd(),
+                                    name_c.as_ptr(),
+                                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                                )
+                            };
+                            if raw >= 0 {
+                                self.host_opens.fetch_add(1, Ordering::Relaxed);
+                                Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
                     self.insert_dir(
                         new_dir_id,
                         child_dir_gen.clone(),
@@ -1773,6 +1972,12 @@ impl DentryCache {
         }
 
         // 3. Absent in both Upper and Lower
+        if rootfs.is_some() {
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(&parent_id) {
+                d.lower_negatives.write().insert(name.to_string());
+            }
+        }
         if !self.is_shared {
             self.insert_negative(parent_id, name, parent_dir_gen);
         }
@@ -2028,9 +2233,13 @@ impl DentryCache {
             };
             if rc == 0 {
                 let (mode, uid, gid) = if resolved.dentry.is_lower {
-                    let rs = rootfs
-                        .and_then(|rf| rf.immutable_backend())
-                        .and_then(|b| b.real_stat(&resolved.canonical_path, false));
+                    let rs = rootfs.and_then(|rf| rf.immutable_backend()).and_then(|b| {
+                        if !b.serves_plain_metadata() {
+                            b.real_stat(&resolved.canonical_path, false)
+                        } else {
+                            None
+                        }
+                    });
                     if let Some(rs) = rs {
                         (rs.mode, rs.uid, rs.gid)
                     } else {
@@ -2064,11 +2273,17 @@ impl DentryCache {
 
         // 2. Try backend real_stat
         let rs = if resolved.dentry.is_lower {
-            rootfs
-                .and_then(|rf| rf.immutable_backend())
-                .and_then(|b| b.real_stat(&resolved.canonical_path, false))
-        } else {
+            rootfs.and_then(|rf| rf.immutable_backend()).and_then(|b| {
+                if !b.serves_plain_metadata() {
+                    b.real_stat(&resolved.canonical_path, false)
+                } else {
+                    None
+                }
+            })
+        } else if !backend.serves_plain_metadata() {
             backend.real_stat(&resolved.canonical_path, false)
+        } else {
+            None
         };
         if let Some(rs) = rs {
             let record = InodeRecord {
@@ -2146,7 +2361,6 @@ impl DentryCache {
             }
             let dirs = self.dirs.read();
             if let Some(d) = dirs.get(&parent_id) {
-                d.dir_gen.fetch_add(1, Ordering::SeqCst);
                 if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
                     self.sub_approx_bytes(inode_approx_bytes());
                 }
@@ -2204,9 +2418,8 @@ impl DentryCache {
             drop(entries);
 
             let parent_gen = {
-                let mut dirs = self.dirs.write();
-                if let Some(d) = dirs.get_mut(&parent_id) {
-                    d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                let dirs = self.dirs.read();
+                if let Some(d) = dirs.get(&parent_id) {
                     if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
                         self.sub_approx_bytes(inode_approx_bytes());
                     }
@@ -2262,9 +2475,8 @@ impl DentryCache {
             drop(entries);
 
             let old_parent_gen = {
-                let mut dirs = self.dirs.write();
-                if let Some(d) = dirs.get_mut(&old_parent_id) {
-                    d.dir_gen.fetch_add(1, Ordering::SeqCst);
+                let dirs = self.dirs.read();
+                if let Some(d) = dirs.get(&old_parent_id) {
                     if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
                         self.sub_approx_bytes(inode_approx_bytes());
                     }
@@ -2295,7 +2507,6 @@ impl DentryCache {
             }
             let dirs = self.dirs.read();
             if let Some(d) = dirs.get(&new_parent_id) {
-                d.dir_gen.fetch_add(1, Ordering::SeqCst);
                 if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
                     self.sub_approx_bytes(inode_approx_bytes());
                 }
@@ -2499,6 +2710,131 @@ impl DentryCache {
         self.entries
             .read()
             .contains_key(&(dir_id, child_name.to_string()))
+    }
+
+    /// Check whether the parent of `path` is proven to have no lower-layer backing.
+    /// Returns false only if the parent is cached and has lower_probed with no lower_dir_fd.
+    pub fn parent_has_lower_dir(&self, path: &str) -> bool {
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        if let Some((parent_path, _)) = Self::split_parent_and_name(norm)
+            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
+        {
+            let dirs = self.dirs.read();
+            if let Some(dir) = dirs.get(&parent_id) {
+                if dir.lower_probed && dir.lower_dir_fd.is_none() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Check whether a directory is proven to have no lower-layer backing.
+    /// Returns false only if the directory is cached and has lower_probed with no lower_dir_fd.
+    pub fn has_lower_dir(&self, path: &str) -> bool {
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        let map = self.path_to_dir_id.read();
+        if let Some(dir_id) = map
+            .get(norm)
+            .or_else(|| map.get(norm.trim_end_matches('/')))
+        {
+            let dirs = self.dirs.read();
+            if let Some(dir) = dirs.get(dir_id) {
+                if dir.lower_probed && dir.lower_dir_fd.is_none() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Check whether an entry exists in the lower layer.
+    /// Returns false with 0 host calls if the parent is a pure-upper directory
+    /// or if the entry is recorded in `lower_negatives`.
+    /// Otherwise probes lower with 1 host call and caches the negative on ENOENT.
+    pub fn lower_has_entry(&self, path: &str, rootfs: Option<&RootFs>) -> bool {
+        let norm = path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        let Some((parent_path, name)) = Self::split_parent_and_name(norm) else {
+            return rootfs.and_then(|r| r.symlink_metadata(norm).ok()).is_some();
+        };
+        let Some(parent_id) = self.find_parent_dir_id(parent_path) else {
+            return rootfs.and_then(|r| r.symlink_metadata(norm).ok()).is_some();
+        };
+        let dirs = self.dirs.read();
+        let Some(dir) = dirs.get(&parent_id) else {
+            return rootfs.and_then(|r| r.symlink_metadata(norm).ok()).is_some();
+        };
+        if dir.lower_probed && dir.lower_dir_fd.is_none() {
+            return false;
+        }
+        if dir.lower_negatives.read().contains(name) {
+            return false;
+        }
+        let lower_fd = dir.lower_dir_fd.clone();
+        drop(dirs);
+
+        if let Some(lfd) = lower_fd {
+            if let Ok(name_c) = CString::new(name.as_bytes()) {
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                let rc = unsafe {
+                    libc::fstatat(
+                        lfd.as_raw_fd(),
+                        name_c.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc == 0 {
+                    return true;
+                }
+            }
+        } else if let Some(rf) = rootfs {
+            if rf.symlink_metadata(norm).is_ok() {
+                return true;
+            }
+        } else {
+            return false;
+        }
+
+        // Probed and absent in lower: record in lower_negatives!
+        let dirs = self.dirs.read();
+        if let Some(dir) = dirs.get(&parent_id) {
+            dir.lower_negatives.write().insert(name.to_string());
+        }
+        false
+    }
+
+    /// Retrieve the upper directory file descriptor for a guest-absolute path if cached.
+    pub fn upper_dir_fd_for_guest_path(&self, guest_path: &str) -> Option<Arc<OwnedFd>> {
+        let norm = guest_path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        let map = self.path_to_dir_id.read();
+        let dir_id = map
+            .get(norm)
+            .or_else(|| map.get(norm.trim_end_matches('/')))?;
+        let dirs = self.dirs.read();
+        let dir = dirs.get(dir_id)?;
+        dir.upper_dir_fd.clone()
+    }
+
+    /// Update the upper directory fd for a cached directory.
+    pub fn publish_dir_upper_fd(&self, guest_path: &str, fd: &Arc<OwnedFd>) {
+        let norm = guest_path.trim_end_matches('/');
+        let norm = if norm.is_empty() { "/" } else { norm };
+        let map = self.path_to_dir_id.read();
+        if let Some(dir_id) = map
+            .get(norm)
+            .or_else(|| map.get(norm.trim_end_matches('/')))
+        {
+            let mut dirs = self.dirs.write();
+            if let Some(dir) = dirs.get_mut(dir_id) {
+                dir.upper_dir_fd = Some(fd.clone());
+                dir.upper_probed_gen = u64::MAX;
+            }
+        }
     }
 }
 
@@ -3022,5 +3358,106 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         churn_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_warm_cache_per_entry_invalidation() {
+        let tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+        let cache = DentryCache::new(false);
+
+        let test_dir = tmp.path().join("test_dir");
+        fs::create_dir(&test_dir).unwrap();
+        fs::write(test_dir.join("file_a.txt"), b"aaa").unwrap();
+        fs::write(test_dir.join("file_b.txt"), b"bbb").unwrap();
+
+        // 1. Initial lookups to populate the cache
+        cache.reset_host_open_count();
+        let st_a1 = cache
+            .stat("/test_dir/file_a.txt", false, &backend, None)
+            .unwrap();
+        let st_b1 = cache
+            .stat("/test_dir/file_b.txt", false, &backend, None)
+            .unwrap();
+        assert_eq!(st_a1.size, 3);
+        assert_eq!(st_b1.size, 3);
+
+        // 2. Create file_c.txt in the same directory
+        fs::write(test_dir.join("file_c.txt"), b"ccc").unwrap();
+        cache.entry_created("/test_dir/file_c.txt", None);
+
+        // Warm lookup of file_a.txt and file_b.txt must NOT be evicted by file_c creation!
+        cache.reset_host_open_count();
+        let st_a2 = cache
+            .stat("/test_dir/file_a.txt", false, &backend, None)
+            .unwrap();
+        let st_b2 = cache
+            .stat("/test_dir/file_b.txt", false, &backend, None)
+            .unwrap();
+        assert_eq!(st_a2.size, 3);
+        assert_eq!(st_b2.size, 3);
+        // On a warm dentry cache, stat requires 0 host opens
+        assert_eq!(
+            cache.host_open_count(),
+            0,
+            "sibling positive dentries must remain cached after entry_created"
+        );
+
+        // 3. Unlink file_a.txt
+        fs::remove_file(test_dir.join("file_a.txt")).unwrap();
+        cache.entry_removed("/test_dir/file_a.txt", None);
+
+        // file_b.txt must STILL remain cached!
+        cache.reset_host_open_count();
+        let st_b3 = cache
+            .stat("/test_dir/file_b.txt", false, &backend, None)
+            .unwrap();
+        assert_eq!(st_b3.size, 3);
+        assert_eq!(
+            cache.host_open_count(),
+            0,
+            "sibling positive dentries must remain cached after entry_removed"
+        );
+
+        // file_a.txt must be negative
+        let err_a = cache
+            .stat("/test_dir/file_a.txt", false, &backend, None)
+            .unwrap_err();
+        assert_eq!(err_a, LINUX_ENOENT);
+    }
+
+    #[test]
+    fn test_lower_negative_cached_after_one_probe() {
+        let lower_tmp = tempdir().unwrap();
+        fs::create_dir_all(lower_tmp.path().join("tmp")).unwrap();
+        let rootfs = RootFs::from_immutable_host_dir(lower_tmp.path()).unwrap();
+
+        let upper_tmp = tempdir().unwrap();
+        let backend = HostFsBackend::from_path(upper_tmp.path()).unwrap();
+        let cache = DentryCache::new(false);
+
+        // Warm /tmp
+        let _ = cache.stat("/tmp", false, &backend, Some(&rootfs)).unwrap();
+
+        // 1. Probe nonexistent entry under lower-backed /tmp
+        cache.reset_host_open_count();
+        let err1 = cache
+            .stat("/tmp/nonexistent_file", false, &backend, Some(&rootfs))
+            .unwrap_err();
+        assert_eq!(err1, LINUX_ENOENT);
+        let first_opens = cache.host_open_count();
+
+        // 2. Second lookup must use cached lower-negative, requiring 0 host opens
+        cache.reset_host_open_count();
+        let err2 = cache
+            .stat("/tmp/nonexistent_file", false, &backend, Some(&rootfs))
+            .unwrap_err();
+        assert_eq!(err2, LINUX_ENOENT);
+        assert_eq!(
+            cache.host_open_count(),
+            0,
+            "second lookup of lower-negative path must issue 0 host opens"
+        );
+        let _ = first_opens;
     }
 }
