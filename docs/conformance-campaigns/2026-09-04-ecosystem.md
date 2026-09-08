@@ -2150,3 +2150,18 @@ published deadlines due "within 1 ms". Main's reactor stays. The GuestCpu
 scheduler's phase 3 (blocking as a scheduler operation) is where the
 reactor's O(live blocked tasks) cost gets designed out, so the branch is
 kept as prior art rather than iterated further.
+
+**mm-scope landed** (`f0e783943`..`60af77a56`, repair `691ef3fd7`, main
+binary `20b7aebd…`): the stage-1 pause's coordinator election is per mm
+(`PtQuiesce` owned by the `Mm`, bound thread-locally while a vCPU
+executes for it) instead of one carrier-wide static, and the
+`tlbibroadcast` probe (awaiting its Docker bless) records that a guest
+`tlbi vmalle1is` on one vCPU is observed by a sibling vCPU without a
+stop-the-world pause on Hypervisor.framework — the fact phase 4 of the
+scheduler design needs. Quiet-host gate on both binaries: all nine rows
+MATCH with identical times (`go_types` 571/571, `net_http` 1316/1316,
+`threading`, `multiprocessing_main_handling`, `mprotect01/04`,
+`munmap01`, `brk01`, `mmap01`); post-landing smoke and rows green. The
+worker's own receipts had used `--flake-retries`, so the landing gate
+re-ran them without retries. Two inventory JSONs reached main with
+conflict markers through the rebase and were repaired in `691ef3fd7`.
