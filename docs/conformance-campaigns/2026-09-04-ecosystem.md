@@ -3260,3 +3260,44 @@ every wait in the foreground; never background a sleep."
   21 — killed; every brief now mandates foreground waits and pid-exact hog
   cleanup. A `pkill -f` pattern killed its own monitor twice: match by pid
   file, never by command text.
+
+### 2026-09-08 15:40 — closing measurement #5: the first citable scorecard
+
+Binary `ad7f29b806ef0003` (main `a1772b279`, runtime = `879dc8606`), pinned
+copy, `--require-cached-oracle`; phase 1 started at load 4.51 with no
+build and no guest alive, phase 2 gated quiet again (2.23), load 2–7 for
+the whole run (`quiet-close5.log`, `quiet-close5-w{1,4}.jsonl`). The script
+then sat 90 min in a bare `wait` that also waited on its own load sampler —
+released by hand; phase 3 ran at 15:35.
+
+| row | w1 | w4 | w4/w1 | goal (≤2x @ w4, movement ≤1.5x) |
+|---|---|---|---|---|
+| cpython-asyncio | 1.02 | 1.04 | 1.02 | MET |
+| cpython-threading | 1.15 | 1.16 | 1.01 | MET |
+| go-runtime_pprof | 1.34 | 1.52 | 1.13 | MET |
+| cpython-itertools | 2.11 | 2.65 | 1.26 | open (ratio) |
+| go-go_types | 2.93 | 2.77 | 0.95 | open (ratio) |
+| cpython-importlib | 2.56 | 2.99 | 1.17 | open (ratio) |
+| cpython-subprocess | 3.10 | 3.23 | 1.04 | open (ratio) |
+| go-net_http | 3.70 | 3.65 | 0.99 | open (ratio) |
+| cpython-tarfile | 4.74 | 5.30 | 1.12 | open (ratio) |
+| cpython-multiprocessing_main_handling | 3.60 | 5.54 | **1.54** | open (ratio + load-coupling) |
+| cpython-compile | 5.63 | 8.80 | **1.56** | open (ratio + load-coupling) |
+
+Verdicts 11/11 MATCH at both worker counts — no regression against
+`ledger-ed3a42c85`. `perf_fork` sampled during the 4-worker phase: p50
+583 / 264 / 270 µs against the 251 µs quiet reference (2.3x while the four
+workers were starting at load 5.6, then 1.05x and 1.08x).
+
+**What the campaign bought (idle ratios, same rows, ledger-3889fde8e →
+now):** compile 23x → 5.6x, itertools 47.8 s → 2.2 s, tarfile ~14x →
+4.7x, multiprocessing 12x → 3.6x, go_types 31–43x → 2.9x, importlib hang →
+2.6x, plus every wedge/crash class closed (26 watchdog reaps in the day,
+zero in the closing run). **What is left:** eight rows above 2x, two of them
+also load-coupled (compile, multiprocessing — both fork/exec/fault-bound),
+and the fork-to-wait cost during worker start-up. Next round, four briefs,
+one cluster each: the super-linear compile fault count; negative dentries +
+symlink caching + `getpid`-free `dir_fd_for` behind subprocess / tarfile /
+importlib (the fs path term is 60 host syscalls per spawn at 20–70 µs);
+the Go rows' top syscall term; the per-exec fixed cost behind
+multiprocessing (16.6 ms vs 4.5 ms per `python3 -c pass`).
