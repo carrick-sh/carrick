@@ -96,8 +96,24 @@ impl std::fmt::Display for ZombieReaper {
 }
 
 /// Why a scheduler wake attempt was rejected.
+///
+/// `Exited` and `Reaped` are the whole point of this type. A wake that loses
+/// a race with its target's exit is ORDINARY -- Linux drops a signal, an mq
+/// notification or a futex wake aimed at a task that has just left, and so
+/// does carrick. A wake aimed at an identity the graph no longer owns is a
+/// DEFECT: the waker is holding an authority that outlived the thing it
+/// names, and the next allocation of that identity would receive the wake.
+/// Collapsing the two made [`crate::observe::KernelAuditor::wake_rejected`]
+/// unable to state which one it saw.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum WakeRejectionReason {
+    /// The target is still in the kernel graph but can never run again: its
+    /// thread's typed execution state is terminal, its thread has retired
+    /// while its task lives, or its task is a zombie awaiting a `wait`. A
+    /// no-op, not a defect.
+    Exited,
+    /// The target identity is gone from the graph entirely -- no live task,
+    /// no zombie, no retired thread owns it. The waker's authority is stale.
     Reaped,
     Closed,
     StaleGeneration,
@@ -108,6 +124,7 @@ pub enum WakeRejectionReason {
 impl fmt::Display for WakeRejectionReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Exited => write!(f, "exited"),
             Self::Reaped => write!(f, "reaped"),
             Self::Closed => write!(f, "closed"),
             Self::StaleGeneration => write!(f, "stale_generation"),
@@ -825,6 +842,7 @@ mod tests {
             format!("task({parent})")
         );
 
+        assert_eq!(WakeRejectionReason::Exited.to_string(), "exited");
         assert_eq!(WakeRejectionReason::Reaped.to_string(), "reaped");
         assert_eq!(WakeRejectionReason::Closed.to_string(), "closed");
         assert_eq!(
