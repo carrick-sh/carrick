@@ -682,7 +682,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::retire_task_state_process_mappings_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "cf798743e905d0440e600f972a52c07de65f96eede7c7755f9749a35bf0a33a7",
+      "fingerprint": "00fe3079de0954bc71874e98d2278fcb8699fb064c7603ac717e52db3d4abf38",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Validated retirement reservation disappeared from inventory ledger during process mapping retirement, indicating concurrent state mutation or broken transaction atomicity."
