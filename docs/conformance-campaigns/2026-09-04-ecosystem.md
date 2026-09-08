@@ -2580,3 +2580,27 @@ itertools and multiprocessing; the mapping index for compile; the dentry
 resolution for tarfile). The quiet fork-to-wait driver refused its
 preflight (two sibling guests alive); the goal's fork measurement is the
 four-sibling ledger condition and runs with the final ledger.
+
+### 2026-09-08 03:45 — tarfile dirfd-invalidation fix landed (main 7d4a5d222)
+
+The parked WIP self-deadlocked (a `Weak<DentryCache>` bridge re-entered a
+`parking_lot::RwLock` held across the root fill) and was removed. The real
+mechanism was narrower than the attribution's shape: `remove_entry_checked`
+answered every directory removal with `bump_dir_generation()` +
+`drop_dir_cache()`, and both `DirCacheEntry` and `StatCacheEntry` carry
+that one stamp, so **one `rmdir` invalidated every cached dirfd and leaf
+stat in every process, including the remover's own re-walk**; `rmtree`
+re-walked from the sandbox root on nearly every operation. Fix
+(3da0053c6): the removal evicts exactly its subtree and re-stamps
+survivors with the generation it just established, keeping the
+cross-process invalidation contract. Receipt (same reducer, both binaries,
+identical guest call counts): host `openat`/`fstatat` per guest `unlinkat`
+212.8/162.6 → 6.41/6.89, per `mkdirat` 123.5/124.4 → 7.91/7.71; total host
+syscalls 3,190,240 → 503,294 (6.34x). 19/19 rows MATCH (tarfile,
+subprocess, unlink/mkdir/rmdir/rename ltp cases); gates 0; director re-ran
+the 97 dentry/backend unit tests, lint and workspace check on the rebase.
+Not met: ≤2 opens per warm op (6–8 remain, unattributed, outside the path
+walk; `getdents64` at 3.3 opens/call is the largest remaining multiplier);
+the ratio is not citable (load 13–24). Next design item, from the worker:
+a per-path dirfd epoch instead of one global generation word, which also
+makes the cross-process re-stamp argument a type instead of a comment.
