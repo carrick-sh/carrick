@@ -2205,3 +2205,30 @@ That `SIGSEGV` (SEGV_MAPERR in `runtime.persistentalloc1`, first touch of
 a chunk Go just `mmap`ed on another M) is the one remaining
 memory-integrity class: window-independent, load-coupled, ~1 in 8
 compiles. A Fable subagent is on it (brief `fable-segv.md`).
+
+## 2026-09-07: the GuestCpu scheduler, round 1 (not landed)
+
+An Opus subagent implemented design phase 2 on `agy/guest-cpu-sep07`
+(HEAD `85a0bbcfc`): one `GuestCpu` per exposed CPU with its own run
+queue, the carrier mutex off the enqueue/claim path, a `findrunnable`
+steal, Go's `wakep` idle flag with a wake-ticket pre-park re-check, a
+`GuestCpuPolicy` placement hook, executors bound to CPUs, guest-visible
+CPU truth (`sched_getcpu`, `/proc/<pid>/stat` field 39 — which had been
+the constant 17), a conditional boundary yield, and the captured abort
+closed: a wake whose target was reaped is rejected, never fatal
+(red-first: removing the liveness branch reproduces the SIGABRT). Every
+unit gate is green (2,517 runtime tests, clippy, fmt, lint, signed
+build). Two findings keep it off main: a guest `SIGSEGV` in a forked
+`go build` (`mcentral.uncacheSpan` → `spanSet.push`, 3 of 7 runs vs 0 of
+5 on main in the same session) — the same first-touch class the SEGV
+worker is hunting, presumably made more frequent by `last_cpu`
+stickiness; and `cpython-importlib` at 13.7 s vs 6.8 s on main
+(load ~10), with involuntary context switches down only 28%. It also
+found that sizing one executor per guest CPU wedges teardown with every
+queue provably empty: the exiting process's job result is never
+published from terminal settlement (the same unpublished-result wedge
+the director captured on main), so the executor count stays decoupled
+from the CPU count until phase 3 closes that. Steps 5 and 6 (the
+embed-pluggable policy and the adversarial reproducer) are not done.
+Next round after the SEGV fix lands: rebase, re-run the go rows, ablate
+`sticky_depth` and idle-CPU wake against importlib, then the policy hook.
