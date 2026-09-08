@@ -256,11 +256,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::SyntheticProcContext::synthetic_proc_context_observed::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-<<<<<<< HEAD
-      "line": 10955,
-=======
-      "line": 10991,
->>>>>>> d738b5f99 (chore: reconcile the line-pinned inventories for per-mm stage-1 quiesce scoping)
+      "line": 10975,
       "item": "SyntheticProcContext::synthetic_proc_context_observed",
       "category": "proc",
       "expression": ".proc.lock()",
