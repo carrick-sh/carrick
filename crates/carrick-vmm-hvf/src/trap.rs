@@ -28938,7 +28938,11 @@ impl HvfTaskState {
         // the registry at the page: the projection it caches must still exist
         // for this process scope with the same physical incarnation.
         let row_projection_is_current = |mapping: &HvfMappedRegion| {
-            if !mapping.is_dynamic_alias {
+            // Only the persistent (HVPatch) lifecycle publishes multi-page
+            // rows into a process-scoped registry; the mature lane stamps no
+            // owner generation and clears the registry at exec, so its rows
+            // keep the frame-liveness contract above.
+            if !mapping.is_dynamic_alias || !self.persistent_vm_lifecycle {
                 return true;
             }
             let Some(end) = address.checked_add(length as u64) else {
