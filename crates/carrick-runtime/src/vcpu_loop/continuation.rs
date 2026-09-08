@@ -3884,7 +3884,7 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
 
     fn after_terminal_settlement(&mut self) {}
 
-    /// See [`crate::vcpu_loop::HvpatchProduction::after_reaped_settlement`].
+    /// See [`crate::vcpu_loop::ProductionHvpatchLoopPoll::after_reaped_settlement`].
     /// The default is the terminal publication: a job with no separate reaped
     /// story still must not end unpublished.
     fn after_reaped_settlement(&mut self) {

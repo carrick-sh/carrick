@@ -374,7 +374,7 @@ impl ContainerBuilder {
     /// The policy is CARRIER-scoped, not container-scoped: HVPatch runs every
     /// Linux task of every container on one run queue. Installing a second,
     /// different policy on the same carrier — or installing one after the
-    /// carrier has booted — is an [`EmbedError`](crate::EmbedError) from
+    /// carrier has booted — is an [`EmbedError`] from
     /// `start`, never a silent no-op.
     pub fn scheduler(mut self, policy: std::sync::Arc<dyn carrick_hal::SchedulingPolicy>) -> Self {
         self.scheduler = Some(policy);
