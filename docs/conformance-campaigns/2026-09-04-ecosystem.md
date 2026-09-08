@@ -2924,3 +2924,23 @@ this is a candidate scheduler regression at exit (suspect: a row deferred
 by the ported claimability gate on the per-CPU path never released).
 Reproduction with the sink armed and a rebuilt pre-scheduler control are
 running.
+
+### 2026-09-08 10:10 — the compile exit hang, attributed to two defects
+
+Sink-armed reproduction on the scheduler main (`cmp-sched-1`): after
+`Result: SUCCESS` the carrier froze; the kernel snapshot timed out; the
+backtrace (`target/perf/wedges/cmp-sched-1/bt-all.txt`) shows the main
+thread and the debug server both blocked on the run-queue STATE mutex
+(`RunQueue::waiter_count` ← `scheduler_summary`), bound executors parked on
+their per-CPU condvars, spares parked in `park_spare` on that mutex's
+condvar, and no visible holder — a leaked or park-held guard on the
+close/drain path of the landed scheduler (round 6, dispatched). The
+pre-scheduler control (rebuilt 65b3c791c) on the same argv ends in 18 s
+with lane B's abort: `1 container job unpublished with 0 live task(s),
+1 live thread(s); zombie pid 1` (2/2, post-mortems in
+`pm-cmp-ctrl-{1,2}/`) — the exit-wedge residual lane B's carry-in named
+(the `execve` survivor never re-enrolled), pre-existing, now visible only
+because the sink catches it (exit-residual agent dispatched). The
+activation residual's root cause (the clone child is kernel-runnable ~300
+lines before `admit`; fixed by gating the key before publication,
+threading 5/5 vs base 3/5) is being ported onto the per-CPU scheduler.
