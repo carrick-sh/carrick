@@ -2274,3 +2274,51 @@ restoring the boundary yield; importlib L0 2x slower than main (13.65 s vs
 `sticky_depth`/`wake_idle_cpu` on importlib first; bisect the placement policy
 (round-robin, no stealing) before touching memory code; then the policy hook
 with `cpu_count()` as the single `nproc` authority.
+## 2026-09-07: the Go startup SEGV_MAPERR, found — a per-task authority pointer trusted across a quiesce
+
+A Fable subagent proved the mechanism (branch `fable/segv-sep07`, brief
+`fable-segv.md`). The remaining window-independent, load-coupled Go
+startup `SIGSEGV` (SEGV_MAPERR in `runtime.persistentalloc1`, ~1 in 8
+`go build`) was the first touch of a chunk Go had just `mmap`ed. The
+runtime's sparse first-touch publication (`PublicationContext::for_local`
+in `crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs`) reads the
+MM-scoped frame-COW runtime binding, quiesces the mm through it, then
+re-reads the binding and refused the publication unless the authority
+`Arc` was **pointer-identical** across the quiesce ("sparse publication
+MM changed during quiesce"). But that binding carries a **per-task**
+authority — its `linux_tid`/`tid` name the task that last ran — so every
+sibling thread's first run and every exec legitimately rebinds it with a
+fresh, equivalent authority object. A sibling being created while another
+task sat in its first-touch quiesce replaced the pointer, the `ptr_eq`
+read "the MM changed", and the refusal was lowered to SEGV_MAPERR. The
+"correct with one process, wrong the instant a second appears" class; the
+foreign-mm path (`for_foreign`) already authenticated by semantic fields
+and no pointer. The fix authenticates the semantic MM identity across the
+quiesce (mm, asid, stage-1 root slot, container, persistent lifecycle),
+not the authority pointer; the quiesce is valid regardless of which
+equivalent authority minted it, because `KernelFrameCowAuthority::quiesce`
+routes through the `PtQuiesce` barrier and executor census owned by the
+shared `DispatchMmAuthority` for the mm.
+
+Instruments added (`diagnostics(runtime)`): `hvpatch-first-touch-deliver`
+(FAR, reason ordinal, TID — names WHICH of the five arms of
+`resolve_mutating_fault` gave up), `hvpatch-cow-runtime-bind` (authority
+pointer lineage per task), and `scripts/dtrace/hvpatch-first-touch-segv.d`
+which joins the fault, the deliver reason, the last process-wide `munmap`,
+and the bind lineage into one line per delivered SIGSEGV. On main's binary
+(`1536e789…`) it attributed every SIGSEGV to a `BackendRefused` reading
+"sparse publication MM changed during quiesce", FAR in Go's arena,
+`esr=92000047` (write translation fault).
+
+Evidence (fix binary `6bdfe4b1…`, load 5–15): new unit
+`local_publication_tolerates_equivalent_rebind_during_quiesce` injects the
+sibling rebind inside the quiesce window — RED with the `ptr_eq` clause
+restored, GREEN with the fix, control (rebind to a different mm) still
+rejected. New `windowcoherence` scenario `sibling_handoff_first_touch`:
+9/12 SEGV on main's binary under load, 20/20 green on the fixed binary.
+go-build reducer at 64 KiB: three 8-build sets with zero SIGSEGV and zero
+fatal lines (one run excluded for the known `scheduler generation observer
+lost exact transition` race, reran clean). Suite gate ×2 on the fixed
+binary via the harness (`--require-cached-oracle`): `go-go_types` 571/571,
+`go-net_http` 1316/1316, `cpython-multiprocessing_main_handling` 39/39,
+`ltp-mmap01` 1/1, `ltp-mmap18` 4/4 — all MATCH, no regressions.
