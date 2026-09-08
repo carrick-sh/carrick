@@ -169,7 +169,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "<PersistentCarrierMappings as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "a28a7b9940fb064dd453055f77408731f7656796d0ffb24b076ab1d4c6b61fa4",
+      "fingerprint": "e40293ff06dc5462c1d1411ec73a031a53b018278161a37b2985c644cfd91cc3",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Failure during drop to unmap persistent carrier stage-2 mappings leaves dangling stage-2 translations referencing freed host memory. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited (alias state partitioned by ownership scope and indexed, page-table pre-images journalled instead of cloned), which is what moved the fingerprint."
@@ -178,7 +178,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "<PersistentCarrierMappings as Drop>::drop",
       "ordinal_in_function": 2,
-      "fingerprint": "a28a7b9940fb064dd453055f77408731f7656796d0ffb24b076ab1d4c6b61fa4",
+      "fingerprint": "e40293ff06dc5462c1d1411ec73a031a53b018278161a37b2985c644cfd91cc3",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Retiring a persistent carrier stage-2 lease failed at the carrier authority's terminal point, after which the `OwnedHostMapping` below releases the host backing. Continuing would leave the guest a live stage-2 route into freed host memory, so this is the same condition -- and the same verdict -- as the `hv_vm_unmap` failure in the lease-less branch of this very loop, which has always aborted here (ordinal #1). It restores the abort that lease `Drop` performed before `901945f82` moved retirement to explicit safe points."
@@ -475,7 +475,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 4,
-      "fingerprint": "2e58e296d7c8998e40a15800d1b9d23b19164f89b9280232f0beace45fc5a3f8",
+      "fingerprint": "3913db25c58521bd576e4db8ba4877d9d64d271790518bda602eeaec85a41a0d",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Publishing global-frame host owner failed after stage-2 mappings were installed, desynchronizing global frame owner registry from carrier memory."
@@ -484,7 +484,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfVmState::execve_rebuild_inner",
       "ordinal_in_function": 5,
-      "fingerprint": "2e58e296d7c8998e40a15800d1b9d23b19164f89b9280232f0beace45fc5a3f8",
+      "fingerprint": "3913db25c58521bd576e4db8ba4877d9d64d271790518bda602eeaec85a41a0d",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Installing the replacement exec region's exact structural owner into the already-published MM authority failed; continuing would leave stage-1 root or structural mappings without authenticated stage-2 lifetime authority."
@@ -997,7 +997,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "perform_foreign_cow_transaction",
       "ordinal_in_function": 14,
-      "fingerprint": "497f88be02b69e31a7f47991040c647cd64a0fcd9da208eaa9d22982f1dcc4e2",
+      "fingerprint": "dfef55a97ca2e949625dc54c28fe83c7fdb596d24b6bd8433fc4fb513a0269b8",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Committing frame inventory split into carrier ledger failed after kernel publication, desynchronizing carrier inventory from kernel state."
