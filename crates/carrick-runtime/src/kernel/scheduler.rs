@@ -860,6 +860,16 @@ struct RunQueueInner {
     wake_admissions: AtomicU64,
     control_epoch: AtomicU64,
     claimed: AtomicUsize,
+    /// Monotone count of claim BOUNDARIES crossed: one per claim taken and one
+    /// per claim finished.
+    ///
+    /// `claimed` is a level, not an edge. Two executors handing work back and
+    /// forth hold it at a constant 1 while the carrier plainly progresses, and
+    /// the liveness census judges "nothing moved" by comparing two censuses
+    /// for EQUALITY -- so the level alone cannot tell a carrier that is
+    /// working from one that is stranded. This counter is the edge term that
+    /// makes an unchanged census mean exactly "no claim boundary crossed".
+    claim_boundaries: AtomicU64,
     total_queued: AtomicUsize,
     active_authorities: AtomicUsize,
     close_epoch: AtomicU64,
@@ -1339,6 +1349,7 @@ impl RunQueueInner {
     /// can never observe a moment where the row is in neither count.
     fn finish_removal(&self, local: &mut GuestCpuLocalState, cpu: &GuestCpu, key: QueueKey) {
         self.claimed.fetch_add(1, Ordering::SeqCst);
+        self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
         self.shard(key).lock().queued.remove(&key);
         cpu.depth.store(local.rows.len(), Ordering::Release);
         self.total_queued.fetch_sub(1, Ordering::SeqCst);
@@ -1422,6 +1433,7 @@ impl RunQueueInner {
         if self.claimed.fetch_sub(1, Ordering::SeqCst) == 0 {
             std::process::abort();
         }
+        self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
         self.settle_close_if_closing();
     }
 
@@ -1915,6 +1927,7 @@ impl RunQueue {
                 wake_admissions: AtomicU64::new(0),
                 control_epoch: AtomicU64::new(0),
                 claimed: AtomicUsize::new(0),
+                claim_boundaries: AtomicU64::new(0),
                 total_queued: AtomicUsize::new(0),
                 active_authorities: AtomicUsize::new(0),
                 close_epoch: AtomicU64::new(0),
@@ -3886,6 +3899,13 @@ impl Scheduler {
     /// `finish_claim`. A carrier holding one is still working.
     pub fn claimed(&self) -> usize {
         self.queue.inner.claimed.load(Ordering::Acquire)
+    }
+
+    /// Claim boundaries this carrier has crossed: the ACTIVITY fingerprint
+    /// that turns a claim from an unconditional liveness signal into a bounded
+    /// one. See `RunQueueInner::claim_boundaries`.
+    pub fn claim_boundaries(&self) -> u64 {
+        self.queue.inner.claim_boundaries.load(Ordering::Acquire)
     }
 
     pub fn need_resched(&self) -> bool {
