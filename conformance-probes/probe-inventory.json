@@ -2594,6 +2594,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "windowcoherence": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "writevpartial": {
     "class": "conformance",
     "excluded": false,

@@ -175,8 +175,8 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "vfs_mount_rw",
     "waitidcputime",
     "waitpgid",
-    "writevpartial",
-    "xthreadsig",
+    "windowcoherence",
+    "xsignal",
 ];
 
 /// Exact materialized Shard 1 probe list: index % 3 == 1 over generic conformance probes.
@@ -337,12 +337,12 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "vmsplicepipe",
     "waitidsiuid",
     "waitrestart",
-    "xprocsigign",
-    "zerolenio",
+    "writevpartial",
+    "xthreadsig",
 ];
 
 /// Exact materialized list of generic conformance probes for shard 2 (index % 3 == 2).
-/// Hard-asserted to have exactly 157 sorted unique names.
+/// Hard-asserted to have exactly 158 sorted unique names.
 pub const SHARD_2_PROBES: &[&str] = &[
     "accessx",
     "adjtimexstate",
@@ -500,7 +500,8 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "waitexitstorm",
     "waitidspec",
     "waitsiblingsigchld",
-    "xsignal",
+    "xprocsigign",
+    "zerolenio",
 ];
 
 /// Per-probe additions to the generic container launch request.
@@ -633,6 +634,7 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "tlbibroadcast",
     "waitexitstorm",
     "waitsiblingsigchld",
+    "windowcoherence",
 ];
 
 /// Probes that cannot share an embedded test process after they fail. Keep
@@ -726,7 +728,7 @@ fn special_policy_names_are_unique_in_the_generic_shard_union() {
         SHARD_0_PROBES.len() + SHARD_1_PROBES.len() + SHARD_2_PROBES.len(),
         "generic shard arrays must form a unique union"
     );
-    assert_eq!(union.len(), 473, "generic shard union must remain complete");
+    assert_eq!(union.len(), 474, "generic shard union must remain complete");
 
     for (special, _) in SPECIAL_PROBE_LAUNCH_POLICIES {
         let occurrences = shards
