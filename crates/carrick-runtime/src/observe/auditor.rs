@@ -606,7 +606,12 @@ mod tests {
             AuditVerdict::Continue
         }
 
-        fn executor_parked(&self, _executor: ExecutorId, _cpu: GuestCpuId) -> AuditVerdict {
+        fn executor_parked(
+            &self,
+            _executor: ExecutorId,
+            _cpu: GuestCpuId,
+            _task: Option<TaskKey>,
+        ) -> AuditVerdict {
             self.executor_parked_count.fetch_add(1, Ordering::SeqCst);
             AuditVerdict::Continue
         }
@@ -678,7 +683,7 @@ mod tests {
         assert!(chain.executor_claimed(exec_id, cpu, child).is_continue());
         assert_eq!(auditor.executor_claimed_count.load(Ordering::SeqCst), 1);
 
-        assert!(chain.executor_parked(exec_id, cpu).is_continue());
+        assert!(chain.executor_parked(exec_id, cpu, None).is_continue());
         assert_eq!(auditor.executor_parked_count.load(Ordering::SeqCst), 1);
 
         assert!(
@@ -752,7 +757,7 @@ mod tests {
 
     #[test]
     fn test_container_auditors_registry() {
-        let cid = carrick_hal::ContainerId::new();
+        let cid = carrick_hal::ContainerId::allocate();
         let chain = Arc::new(AuditorChain::empty());
 
         register_container_auditors(cid, Arc::clone(&chain));

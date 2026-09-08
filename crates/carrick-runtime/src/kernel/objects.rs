@@ -5726,7 +5726,7 @@ impl ExecutorId {
     }
 
     #[cfg(test)]
-    pub(super) fn synthetic_for_tests(raw: u32) -> Self {
+    pub(crate) fn synthetic_for_tests(raw: u32) -> Self {
         Self(raw)
     }
 }
