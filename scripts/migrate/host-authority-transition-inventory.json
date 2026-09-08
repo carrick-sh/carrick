@@ -1206,42 +1206,14 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:47105 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:47151 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000048",
     "source": {
-      "byte_end": 1970962,
-      "byte_start": 1970950,
+      "byte_end": 1973731,
+      "byte_start": 1973719,
       "column": 21,
       "column_end": 33,
       "column_start": 21,
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 47105,
-      "line_end": 47105,
-      "line_start": 47105
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-PROCESS-GETPID",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "current HVF carrier admission and diagnostic state used by `run_to_exit`"
-    },
-    "expansion": null,
-    "operation": "libc::getpid",
-    "profiles": [
-      "macos-cli-default",
-      "macos-hvf-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:47151 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
-    "review_id": "HA-000049",
-    "source": {
-      "byte_end": 1973593,
-      "byte_start": 1973581,
-      "column": 36,
-      "column_end": 48,
-      "column_start": 36,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "line": 47151,
       "line_end": 47151,
@@ -1262,18 +1234,46 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:47192 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:47197 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "review_id": "HA-000049",
+    "source": {
+      "byte_end": 1976362,
+      "byte_start": 1976350,
+      "column": 36,
+      "column_end": 48,
+      "column_start": 36,
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "line": 47197,
+      "line_end": 47197,
+      "line_start": 47197
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-GETPID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current HVF carrier admission and diagnostic state used by `run_to_exit`"
+    },
+    "expansion": null,
+    "operation": "libc::getpid",
+    "profiles": [
+      "macos-cli-default",
+      "macos-hvf-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:47238 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000050",
     "source": {
-      "byte_end": 1975910,
-      "byte_start": 1975898,
+      "byte_end": 1978679,
+      "byte_start": 1978667,
       "column": 25,
       "column_end": 37,
       "column_start": 25,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 47192,
-      "line_end": 47192,
-      "line_start": 47192
+      "line": 47238,
+      "line_end": 47238,
+      "line_start": 47238
     }
   },
   {
