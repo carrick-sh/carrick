@@ -3031,3 +3031,34 @@ reparented to local init, or the invariant misreads a nested pid ns),
 `coredumpfile` and `processvmsparse` oracle diffs — the latter a prime
 candidate for a regression from the sparse-mapping landings. Triage agent
 dispatched: attribute by bisect before fixing.
+
+### 2026-09-08 15:45 — containment-index receipt; probe-gate fix landed (15th); activation reservation ready
+
+**Containment index (main 33942fb2f) receipt:** build/lint/shards 0,
+reducer 8/8 zero aborts, rows 6/6 MATCH (compile 35.2 s at load 22–29,
+mmap, mmap18, munmap01, go_types, itertools). Ratios not cited.
+
+**Probe-gate fix landed (`opus/probegate-sep08` → main 31fb94d67):**
+`recv_timeout`'s `Disconnected` (a sender dropped by re-arming the same
+task on fork-then-exec) is no longer read as expiry — exact `Timeout`
+match, red-first (`ExitBudgetExceeded { within: 3600s }` after 100 ms
+pre-fix); the timed invariants (`EveryChildRuns`, `ExitBudget`) are opt-in
+per test, `Option`-typed so "unarmed" is unrepresentable as a duration, the
+install rule in one `invariant_auditors()` helper asserted by kind. The
+gate now executes 532 probes (was 3); two survivors, `pidnsorphanreap`
+and `processvmsparse`, are with the triage agent; `coredumpfile` failed on
+the old base and passes on current main. Filed: the `conformance-probes/
+.gitignore` anchor is one directory too deep.
+
+**Activation reservation (per-CPU port) ready:** re-implemented on the
+per-CPU `QueueKeyShard` (`prepublication` beside `unpublished`; the shard
+gate is what `enqueue` consults; `publish_initial_task_state_gated`
+reserves before the kernel publication; the reservation survives
+`drop(dormant)` and is lifted only by first publication or terminal
+retirement; `FailedCloneRetirement::{Retired, AlreadySettled}` typed).
+Both red-first tests pass on the per-CPU queues with the exact field
+strings when ablated. Rebased receipts: cpython-threading **10/10 vs base
+6/10** (four field FATALs on base), importlib 3/3 vs 3/3, go_types 3/3 vs
+3/3, reducer 8/8 vs 8/8. Deliberate divergences stated (`reactivate_exact`
+keeps count-only re-admission; `park_exact` releases through
+`clear_unpublished`). Rebasing onto the probe-gate main now.
