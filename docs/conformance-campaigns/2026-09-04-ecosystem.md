@@ -2165,3 +2165,32 @@ MATCH with identical times (`go_types` 571/571, `net_http` 1316/1316,
 worker's own receipts had used `--flake-retries`, so the landing gate
 re-ran them without retries. Two inventory JSONs reached main with
 conflict markers through the rebase and were repaired in `691ef3fd7`.
+
+## 2026-09-07: the wide-window corruption, found — a stale row trusted by frame liveness
+
+A Fable subagent proved the mechanism (branch `agy/window-corruption-sep07`,
+landed as `e22aca098`..`5094077b8` plus registration). A task's
+`HvfMappedRegion` rows are per-task caches of the process-wide alias
+registry. A sibling thread's partial `munmap` (or `MAP_FIXED` over a
+sub-range) splits the registry entry and mirrors the split only onto the
+unmapping task's own rows; every other task keeps a row still spanning
+the retired page. `mapping_for_range_in` authenticated such rows by FRAME
+liveness, which cannot see a page-level retirement while the compound is
+still owned by a neighbouring page, so on the page's next incarnation
+the "already backed" fast path of `ensure_sparse_mmap_backing` skipped
+materialization and revalidated the retired leaf: the page's previous
+bytes (Go's `s.allocCount != s.nelems`), a frame recycled to another
+mapping (silent aliasing), or a stage-2-unmapped frame that
+`resolve_stale_stage1_fault` retried forever (a 100% CPU livelock). The
+4 KiB arm was clean only because a one-page row cannot be partially
+unmapped. The fix authenticates a dynamic row against the registry at the
+page (same physical incarnation and owner generation), gated to the
+persistent lifecycle; the stale-fault retry is now bounded and named.
+Evidence: `windowcoherence` `fragment_stress` livelocks deterministically
+at op 663 at 64 KiB on the unfixed binary and is 20/20 green fixed; the
+go-build reducer went from 6 of 8 bitmap fatals to 0 in 13 wide-window
+runs; go_types 150/150 twice. Still open and window-independent: a Go
+startup `SIGSEGV` in `persistentalloc` (~1 in 8 compiles, both windows),
+exit wedges with every executor idle (the wake-vs-reap family), and the
+observer abort. The 64 KiB default returns with this landing; the
+receipts are in `target/conformance/eco-load/land-window.log`.
