@@ -5515,7 +5515,16 @@ where
                 // result is not the launch result, so this arm's Err(()) was
                 // the only externally visible trace ("sibling-owned process
                 // termination failed" with no cause). Name the cause here.
-                tracing::error!(%error, "HVPatch terminal owner publishes failure");
+                //
+                // The guest pid belongs in the line for the same reason: a
+                // `cpython-importlib` wedge left one zombie at `127 << 8` and
+                // an unattributable error on stderr, so which Linux process
+                // carrick killed had to be inferred from the wait status.
+                tracing::error!(
+                    guest_pid = process.pid(),
+                    %error,
+                    "HVPatch terminal owner publishes failure"
+                );
                 (127, 127 << 8, Err(()))
             }
             PersistentTerminal::Outcome {

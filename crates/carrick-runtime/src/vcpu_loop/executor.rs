@@ -1459,7 +1459,7 @@ impl PreparedHvpatchSubmission {
             record.active = true;
             authority.publication_handle()
         };
-        match publication.publish_unique(scheduler, thread) {
+        match publication.publish(scheduler, thread) {
             Ok(()) => {
                 self.armed = false;
                 Ok(())
@@ -6768,7 +6768,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn dormant_activation_rejects_a_preexisting_exact_queue_row() {
+    fn dormant_activation_coalesces_onto_a_preexisting_exact_queue_row() {
+        // The run queue holds at most one row per exact (thread, generation),
+        // so a row that is already there IS the row this activation wants.
+        // Activation therefore coalesces onto it and the binding resolves;
+        // what protects against a second submission for the same key is
+        // `prepare_submission`'s duplicate-binding check, not the queue.
         let (kernel, context) = bootstrap(13_998);
         let state = task_state(&context, 108);
         let generation = context
@@ -6807,20 +6812,82 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        assert!(
-            dormant
-                .activate(&scheduler, Arc::clone(context.thread()), proof)
-                .is_err()
-        );
+        dormant
+            .activate(&scheduler, Arc::clone(context.thread()), proof)
+            .expect("activation coalesces onto the exact row already queued");
         assert!(
             <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
                 directory.as_ref(),
                 context.thread().key(),
                 generation,
             )
-            .is_err()
+            .is_ok()
         );
         assert_eq!(scheduler.queued_len(), 1);
+    }
+
+    #[test]
+    fn a_legitimate_wake_before_activation_does_not_reject_the_dormant_submission() {
+        // The child/successor task is published to the Kernel as runnable
+        // BEFORE its dormant submission is activated, and `activate` releases
+        // the binding-directory lock before publishing (4150290e1, the ABBA
+        // fix). A real producer that wakes the task in that window queues the
+        // exact `(thread, generation)` row first; `publish_unique` then sees
+        // its own key and rejects the activation, which every production
+        // caller lowers into a guest-fatal `TrapError`.
+        //
+        // A wake and an activation assert the SAME fact about the SAME exact
+        // generation, and the run queue already coalesces by exact key
+        // (`runnable_wake_is_idempotent_and_never_duplicates_the_row`), so
+        // this must not be an error.
+        let (kernel, context) = bootstrap(13_997);
+        let state = task_state(&context, 109);
+        let generation = context
+            .thread()
+            .publish_initial_task_state(state.clone())
+            .expect("publish root state");
+        let scheduler = Scheduler::new(kernel);
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let binding = hvpatch_test_binding(&context, &state, 109);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(context.thread()),
+                generation,
+                Arc::clone(&binding),
+            )
+            .expect("prepare dormant root");
+        scheduler
+            .make_runnable(context.thread().key())
+            .expect("a real producer wakes the freshly published task");
+        assert_eq!(scheduler.queued_len(), 1);
+        let start_gate = context
+            .thread()
+            .take_opened_start_gate(generation)
+            .expect("opened root start gate");
+        let proof = HvpatchActivationProof::validate(
+            &context,
+            &state,
+            generation,
+            binding.identity(),
+            start_gate,
+        )
+        .unwrap();
+
+        dormant
+            .activate(&scheduler, Arc::clone(context.thread()), proof)
+            .expect("a wake-queued exact row must not reject its own activation");
+        assert_eq!(scheduler.queued_len(), 1);
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                directory.as_ref(),
+                context.thread().key(),
+                generation,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

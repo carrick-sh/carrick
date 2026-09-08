@@ -36,14 +36,6 @@ pub enum RunQueueError {
     Closed,
     #[error("new root submissions are rejected while the run queue is closing")]
     SubmissionRejected,
-    /// A publication found the exact `(thread, generation)` row already in the
-    /// run queue. This is NOT a closing queue: it says the same exact
-    /// generation was published twice. It has its own identity because the
-    /// shared `SubmissionRejected` spelling made a live HVPatch activation
-    /// failure read as "the run queue is closing" in a guest-fatal error, and
-    /// the run queue was demonstrably `open` in the wedge snapshot.
-    #[error("the exact runnable generation is already queued")]
-    AlreadyQueued,
     /// A submission-authority counter would overflow. Distinct from a closing
     /// queue for the same reason: an exhaustion is not a shutdown.
     #[error("concurrent submission authorities are exhausted")]
@@ -894,16 +886,28 @@ pub(crate) struct SubmissionPublication {
 }
 
 impl SubmissionPublication {
-    pub(crate) fn publish_unique(
+    /// Publish the exact `(thread, generation)` row this authority admitted.
+    ///
+    /// The run queue is keyed by that exact pair and coalesces by it, so a
+    /// row that is already queued IS this publication's row: a wake and an
+    /// activation assert the same fact about the same generation, and
+    /// `Scheduler::wake` has always reported the second one as
+    /// `WakeDisposition::Coalesced` rather than an error. Publication says
+    /// the same thing.
+    ///
+    /// This used to reject a coalesce. The child (or exec successor) is
+    /// published to the Kernel as runnable BEFORE its dormant submission is
+    /// activated, so any real producer that wakes it in that window queues
+    /// the row first; the activation then found "its own" row and failed,
+    /// and every production caller lowers an activation failure into a
+    /// guest-fatal `TrapError`. That killed a live `cpython-importlib`
+    /// guest process mid-run with exit `127`.
+    pub(crate) fn publish(
         &self,
         scheduler: &Scheduler,
         thread: Arc<Thread>,
     ) -> Result<(), SchedulerError> {
-        if self.publish_row(scheduler, thread)? {
-            Ok(())
-        } else {
-            Err(RunQueueError::AlreadyQueued.into())
-        }
+        self.publish_row(scheduler, thread).map(|_| ())
     }
 
     fn publish_row(
@@ -2755,13 +2759,14 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_exact_publication_names_the_queued_row_not_a_closing_queue() {
-        // A live HVPatch activation that finds its exact (thread, generation)
-        // row already queued used to surface as `SubmissionRejected`, whose
-        // message says "new root submissions are rejected while the run queue
-        // is closing". That text reached a guest-fatal error on a run whose
-        // run queue was demonstrably `open`, so the message actively misled
-        // the investigation. A duplicate row must name itself.
+    fn a_duplicate_exact_publication_coalesces_onto_the_queued_row() {
+        // Publication of an exact `(thread, generation)` row is idempotent for
+        // the same reason `wake` is: the run queue is keyed by that pair and
+        // holds at most one row for it. Rejecting the second publication made
+        // a wake that beat an activation into the queue kill the guest
+        // process, and it did so wearing the `SubmissionRejected` message
+        // "new root submissions are rejected while the run queue is closing"
+        // on a run whose run queue was demonstrably `open`.
         let (kernel, context) = bootstrap(12_113);
         publish(&context, 21);
         let scheduler = Scheduler::new(kernel);
@@ -2771,25 +2776,12 @@ mod tests {
             .expect("admit the exact root authority");
         authority
             .publication_handle()
-            .publish_unique(&scheduler, Arc::clone(context.thread()))
+            .publish(&scheduler, Arc::clone(context.thread()))
             .expect("first publication of the exact row");
-        let error = authority
+        authority
             .publication_handle()
-            .publish_unique(&scheduler, Arc::clone(context.thread()))
-            .expect_err("the exact row is already queued");
-        assert!(
-            matches!(
-                error,
-                super::SchedulerError::Queue(RunQueueError::AlreadyQueued)
-            ),
-            "a duplicate exact row must be AlreadyQueued, got {error:?}"
-        );
-        let rendered = error.to_string();
-        assert_eq!(rendered, "the exact runnable generation is already queued");
-        assert!(
-            !rendered.contains("closing"),
-            "a duplicate exact row must never be reported as a closing run queue: {rendered}"
-        );
+            .publish(&scheduler, Arc::clone(context.thread()))
+            .expect("a second publication of the same exact row coalesces");
         assert_eq!(scheduler.queued_len(), 1);
     }
 
