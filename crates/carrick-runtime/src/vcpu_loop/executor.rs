@@ -21,7 +21,7 @@ use crate::kernel::objects::{
 };
 use crate::kernel::{
     ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, MmId, RunnableThread,
-    Scheduler, SubmissionAuthority,
+    Scheduler, SettlementDisposition, SubmissionAuthority,
 };
 use crate::trap::TrapError;
 
@@ -902,6 +902,12 @@ pub trait PersistentTaskBinding {
 
     fn after_terminal_settlement(&self) {}
 
+    /// The scheduler settled this thread against a TERMINAL target: nothing
+    /// will run it again, so its job publishes here or nowhere.
+    fn after_reaped_settlement(&self) {
+        self.after_terminal_settlement();
+    }
+
     fn after_executor_failure_settlement(&self) {
         self.after_terminal_settlement();
     }
@@ -964,6 +970,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
 
     fn after_terminal_settlement(&self) {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::after_terminal_settlement(self);
+    }
+
+    fn after_reaped_settlement(&self) {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::after_reaped_settlement(self);
     }
 
     fn after_executor_failure_settlement(&self) {
@@ -4489,12 +4499,20 @@ where
             }
         }
         let settlement_thread = Arc::clone(running.thread());
+        // A settlement whose target was reaped in flight leaves this thread
+        // with no successor and no other publisher, so its process job is
+        // published HERE. Recorded by the arms below and acted on once, after
+        // the settlement succeeds.
+        let mut reaped_settlement = false;
         let settlement = match exit {
             ExecutorExit::Blocked(reason) => {
                 drop(submission_authority);
                 scheduler
                     .settle_blocked(running, reason)
-                    .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation })
+                    .map(|disposition| {
+                        reaped_settlement = disposition == SettlementDisposition::TargetReaped;
+                        ExecutorPoolEvent::SettledBlocked { thread, generation }
+                    })
             }
             ExecutorExit::BlockedContinuation {
                 continuation,
@@ -4526,20 +4544,26 @@ where
                 drop(submission_authority);
                 scheduler
                     .settle_blocked_continuation(running, *continuation, registration)
-                    .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation })
+                    .map(|disposition| {
+                        reaped_settlement = disposition == SettlementDisposition::TargetReaped;
+                        ExecutorPoolEvent::SettledBlocked { thread, generation }
+                    })
             }
             ExecutorExit::Yielded | ExecutorExit::Preempted => {
-                let successor = scheduler
+                let disposition = scheduler
                     .settle_runnable_successor(running)
                     .map_err(|error| error.to_string())?;
-                let _ = successor;
+                reaped_settlement = disposition == SettlementDisposition::TargetReaped;
                 Ok(ExecutorPoolEvent::SettledRunnable { thread, generation })
             }
             ExecutorExit::Quiesced => {
                 drop(submission_authority);
                 scheduler
                     .settle_blocked(running, BlockedReason::HostWait)
-                    .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation })
+                    .map(|disposition| {
+                        reaped_settlement = disposition == SettlementDisposition::TargetReaped;
+                        ExecutorPoolEvent::SettledBlocked { thread, generation }
+                    })
             }
             ExecutorExit::Exited => {
                 drop(submission_authority);
@@ -4565,6 +4589,18 @@ where
             matches!(settlement, Ok(ExecutorPoolEvent::SettledRunnable { .. }));
         match settlement {
             Ok(event) => {
+                if reaped_settlement {
+                    // The kernel graph says this thread is terminal: it will
+                    // never be claimed again, so the job it owns publishes now
+                    // or never. Round 4 withheld the successor AND the result,
+                    // and `go_types` then wedged with the guest already at
+                    // PASS, eighteen executors parked in `take_row` and main
+                    // in `wait_process_jobs`.
+                    // The binding record itself was already retired by
+                    // `SchedulerGenerationObserver::retire_reaped`, which owns
+                    // that half; what was missing is the RESULT.
+                    binding.after_reaped_settlement();
+                }
                 if let Some((pid, tid)) = post_run_event_identity {
                     crate::event_ring::rec_hvpatch_executor_settlement(
                         pid,
@@ -8204,6 +8240,64 @@ pub(crate) mod tests {
         scheduler.unregister_executor(&registration).unwrap();
         scheduler.close();
         scheduler.wait_closed();
+    }
+
+    /// RED-FIRST RECEIPT for the reaped-settlement publication.
+    ///
+    /// A yield whose target is reaped in flight settles cleanly — round 3 and
+    /// round 4 fixed that — but the job the thread owns is left with NO
+    /// publisher: no successor is queued, no executor runs that generation
+    /// again, and no exit or exec path names it. Its `HvpatchLoopResult` is
+    /// never filled and `wait_process_jobs` waits for the life of the process.
+    /// That is the `go_types` wedge: the guest printed PASS, eighteen
+    /// executors parked in `take_row`, and main sat in
+    /// `HvpatchLoopResult::wait`.
+    ///
+    /// The reap is driven from the test thread while the worker is held inside
+    /// its first quantum, so the settlement that follows is deterministic
+    /// rather than load-dependent.
+    #[test]
+    fn a_reaped_yield_publishes_the_process_job_it_would_have_stranded() {
+        let (kernel, context) = bootstrap(14_610);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let factory = Arc::new(FakeFactory::default());
+        let binding = FakeBinding::new(170, [Step::Yield, Step::Exit]);
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *binding.entered.lock() = Some(Arc::clone(&entered));
+        *binding.resume.lock() = Some(Arc::clone(&resume));
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+        binding.notify_on_terminal_settlement(terminal_tx);
+        factory.install(&context, Arc::clone(&binding));
+        let generation = publish(&context, 170);
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        // Publish THROUGH the factory so it holds the authority: the reaped
+        // rejection this test needs comes from the factory's own rollover, and
+        // an authority it never saw would make the transition a silent `Ok`.
+        let authority = scheduler
+            .admit_root(context.thread().key(), generation)
+            .expect("admit root");
+        TaskBindingResolver::<FakeBinding>::publish_test_root(
+            &*factory,
+            &scheduler,
+            Arc::clone(context.thread()),
+            authority,
+        )
+        .expect("publish the root through the factory");
+
+        // The worker is inside its first quantum with the row claimed. Reap
+        // the task here: the yield settlement that follows names a target the
+        // kernel graph holds only as a retirement.
+        entered.wait();
+        assert!(kernel.reap_task_record_for_test(context.thread().task_key().id));
+        resume.wait();
+
+        let published = terminal_rx.recv_timeout(std::time::Duration::from_secs(60));
+        let _ = pool.shutdown();
+        published.expect(
+            "a settlement whose target was reaped must publish the process job it owns; \
+             nothing else can",
+        );
     }
 
     #[test]

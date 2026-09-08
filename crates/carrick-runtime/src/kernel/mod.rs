@@ -115,7 +115,8 @@ pub use registry::{
 pub(crate) use scheduler::SubmissionAuthority;
 pub use scheduler::{
     ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, RunQueue,
-    RunQueueError, RunnableThread, Scheduler, SchedulerError, WakeDisposition,
+    RunQueueError, RunnableThread, Scheduler, SchedulerError, SettlementDisposition,
+    WakeDisposition,
 };
 pub use snapshot::{
     CredentialsSnapshotRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,

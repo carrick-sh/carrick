@@ -2095,15 +2095,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "Scheduler::observe_generation_transition",
-      "ordinal_in_function": 1,
-      "fingerprint": "4bdcc8cc8e5fd8bae621f4140fb81bbda74ca6105ef81c07d203cb82b3637d79",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::scheduler_observer",
-      "rationale": "Scheduler generation observer failed transition after kernel execution state advanced; stranding successor outside authority directory."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "Scheduler::retarget_running_exec",
       "ordinal_in_function": 1,
       "fingerprint": "8ebcb1633985aa7ebee6e023c4291cce633bd35af274515a6ab16f88c7460e92",
