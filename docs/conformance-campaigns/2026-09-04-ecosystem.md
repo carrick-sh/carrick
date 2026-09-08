@@ -2453,3 +2453,18 @@ emit sites outside registry locks, 42 runtime + 69 embed unit tests green,
 rebased onto main (e08784dbb), lint 0, workspace check 0; `just test`
 running before the fast-forward. The signed embed test could not run: the
 `just test-embed` lane still needs Docker (lane B).
+
+**Landed 2026-09-08 01:50: lane A `KernelAuditor`** (agy/kernel-auditor-sep07 →
+main, last d462d6809; signed binary e1a87448…). Gates by the director:
+42 runtime + 69 embed unit tests, `just test` 0, `just lint-domains` 0,
+probe shards 3/3, signed build 0; smoke and the eleven rows running
+(`post-lanea.log`). Until lane B lands, an `Abort` verdict surfaces as
+`EmbedError::CarrierFailed` when the run ends, and the per-executor
+`GuestCpuId` is a placeholder until the scheduler branch lands (it carries
+the real `carrick-hal::scheduler::GuestCpuId`; expect a small merge there).
+
+**Scheduler gate, main side (suggests, not confirmed):** under host load
+18–28 main's go_types row took 80–174 s (13–28x the oracle) against ~19 s
+at idle — the load-coupling the goal names, measured on main itself. The
+scheduler binary's one loaded MATCH at load 23 was 64 s (10.4x). Pairs only;
+a quiet-vs-4-worker measurement on one binary is still owed.
