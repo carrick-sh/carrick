@@ -11,7 +11,7 @@ pub mod sandbox;
 pub use audit::{AuditEvent, AuditObserver};
 pub use auditor::{
     AuditReason, AuditVerdict, AuditorChain, ExitOwner, FirstTouchDeliverReason, ForkKind,
-    GuestCpuId, KernelAuditor, WakeRejectionReason, get_container_auditors,
+    GuestCpuId, KernelAuditor, WakeRejectionReason, ZombieReaper, get_container_auditors,
     register_container_auditors, unregister_container_auditors,
 };
 pub use budget::{BudgetCounters, BudgetResource, BudgetSnapshot, ExceedAction, ResourceBudget};

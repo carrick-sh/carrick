@@ -589,6 +589,14 @@ pub struct PreparedTaskExit {
     affected_revisions: BTreeMap<TaskId, (TaskRevision, TaskRevision)>,
     adopter: Option<TaskKey>,
     prepared_adopter_children: Option<BTreeSet<TaskKey>>,
+    /// The container's pid-namespace init as of this transaction, when it is
+    /// still LIVE (the exiting task itself counts: it is live until this exit
+    /// commits). `None` means the init has already become a zombie, so nothing
+    /// inside the namespace can adopt anyone any more and container retirement
+    /// is the reaper of last resort. Recorded here rather than re-read at
+    /// commit so the judgement comes from the same reserved snapshot that
+    /// chose `adopter`.
+    namespace_init: Option<TaskKey>,
     registry_zombie: Zombie,
     result_zombie: Zombie,
 }
@@ -600,6 +608,23 @@ impl PreparedTaskExit {
 
     pub const fn transaction(&self) -> KernelTransactionId {
         self.reservation.transaction
+    }
+
+    /// Who will consume the zombie this exit publishes.
+    ///
+    /// A parentless zombie is NOT by itself a defect: a container's
+    /// pid-namespace init has no parent inside its namespace, and a task its
+    /// init left behind when it exited has none either — `retire_container`
+    /// reaps both. The defect is a parentless zombie published while the
+    /// namespace init was still live and should have adopted it.
+    fn zombie_reaper(&self) -> crate::observe::ZombieReaper {
+        match self.result_zombie.parent {
+            Some(parent) => crate::observe::ZombieReaper::Parent(parent),
+            None => match self.namespace_init {
+                Some(init) if init != self.task => crate::observe::ZombieReaper::Unreapable,
+                _ => crate::observe::ZombieReaper::ContainerRetirement,
+            },
+        }
     }
 
     pub fn commit(self) -> Result<Zombie, KernelOperationError> {
@@ -4473,6 +4498,21 @@ impl Kernel {
                 })
             })
         };
+        // The namespace's reparenting authority, independent of whether THIS
+        // exit has anything to reparent. `adopter` below is additionally
+        // filtered to "not self" and "has children", which makes it useless as
+        // an answer to "could anything in this namespace still have adopted an
+        // orphan?" — the question a zombie's reaper depends on.
+        let namespace_init = state
+            .container_inits
+            .get(&task.container().id())
+            .copied()
+            .filter(|init| {
+                *init == task_key
+                    || state.tasks.get(&init.id).is_some_and(|record| {
+                        record.task.key() == *init && record.task.lifecycle() == TaskLifecycle::Live
+                    })
+            });
         let mut children = task.children();
         children.sort_by_key(|child| child.serial);
         // The adopter is only a participant when there is something to
@@ -4561,6 +4601,7 @@ impl Kernel {
             affected_revisions,
             adopter,
             prepared_adopter_children,
+            namespace_init,
             registry_zombie,
             result_zombie,
         })
@@ -4579,6 +4620,10 @@ impl Kernel {
         mut prepared: PreparedTaskExit,
         notify_parent: impl FnOnce(Option<TaskKey>),
     ) -> Result<Zombie, KernelOperationError> {
+        // Read before the zombie is moved into the registry below: the auditor
+        // is told who will consume it, and that judgement belongs to the same
+        // reserved snapshot that chose the adopter.
+        let zombie_reaper = prepared.zombie_reaper();
         let mut state = self.registry().state.write();
         prepared.reservation.validate(&state)?;
         let Some(exiting_record) = state.tasks.get(&prepared.task.id) else {
@@ -4732,8 +4777,7 @@ impl Kernel {
         let pending_publication = prepared.reservation.commit(&mut state)?;
         drop(state);
         pending_publication.publish();
-        self.auditors()
-            .zombie_created(prepared.task, prepared.result_zombie.parent);
+        self.auditors().zombie_created(prepared.task, zombie_reaper);
         if self.registry().state.read().tasks.is_empty() {
             self.auditors().process_graph_empty(self.unpublished_jobs());
         }
@@ -6889,6 +6933,106 @@ mod tests {
             .expect("child exit");
         assert_eq!(zombie.parent, Some(root.task().key()));
         assert_ne!(zombie.parent, Some(parent.task().key()));
+    }
+
+    /// `pidnsorphanreap` in miniature, in the kernel graph alone.
+    ///
+    /// init(root) -> probe -> child -> grandchild. The child exits first, so
+    /// the grandchild reparents to init; init then exits while the grandchild
+    /// is still live, which orphans it (the contract
+    /// `root_exit_before_descendant_exit_allows_orphan_teardown` pins). The
+    /// grandchild's own exit therefore publishes a PARENTLESS zombie — and that
+    /// is not a dropped edge: `retire_container` reaps the namespace's remains.
+    /// The `NoOrphanZombie` invariant read this as a kernel defect because it
+    /// tested `TaskKey::id != 1`, a carrier-global allocation, as a stand-in for
+    /// "is this the namespace init".
+    #[test]
+    fn a_zombie_left_behind_by_its_namespace_init_names_container_retirement() {
+        let (kernel, root) = bootstrap(501);
+        let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let probe = kernel
+            .fork_task(
+                &root,
+                fork_plan,
+                ThreadId::synthetic_for_tests(9_501),
+                "probe".to_string(),
+                None,
+            )
+            .expect("probe");
+        let child = kernel
+            .fork_task(
+                &probe,
+                fork_plan,
+                ThreadId::synthetic_for_tests(9_502),
+                "child".to_string(),
+                None,
+            )
+            .expect("child");
+        let grandchild = kernel
+            .fork_task(
+                &child,
+                fork_plan,
+                ThreadId::synthetic_for_tests(9_503),
+                "grandchild".to_string(),
+                None,
+            )
+            .expect("grandchild");
+
+        // The child exits first: the grandchild reparents to the namespace
+        // init, which is exactly what Linux does and what the probe expects.
+        let child_zombie = kernel
+            .exit_task_key_eventually(child.task().key(), LinuxWaitStatus::from_wait_encoding(0))
+            .expect("child exit");
+        assert_eq!(child_zombie.parent, Some(probe.task().key()));
+        assert_eq!(grandchild.task().parent(), Some(root.task().key()));
+
+        // A live namespace init adopting an orphan is the reapable case.
+        let prepared_probe = kernel
+            .prepare_task_exit_key(
+                probe.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("prepare probe exit");
+        assert_eq!(
+            prepared_probe.zombie_reaper(),
+            crate::observe::ZombieReaper::Parent(root.task().key())
+        );
+        prepared_probe.commit().expect("commit probe exit");
+
+        // The namespace init itself has no parent, and nothing inside the
+        // namespace could ever have adopted it.
+        let prepared_init = kernel
+            .prepare_task_exit_key(
+                root.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("prepare init exit");
+        assert_eq!(
+            prepared_init.zombie_reaper(),
+            crate::observe::ZombieReaper::ContainerRetirement
+        );
+        prepared_init.commit().expect("commit init exit");
+
+        // The grandchild outlived the init, so it is parentless too — and is
+        // reaped by container retirement, not stranded.
+        assert_eq!(grandchild.task().parent(), None);
+        let prepared_grandchild = kernel
+            .prepare_task_exit_key(
+                grandchild.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("prepare grandchild exit");
+        assert_eq!(
+            prepared_grandchild.zombie_reaper(),
+            crate::observe::ZombieReaper::ContainerRetirement
+        );
+        let grandchild_zombie = prepared_grandchild
+            .commit()
+            .expect("commit grandchild exit");
+        assert_eq!(grandchild_zombie.parent, None);
     }
 
     #[test]
