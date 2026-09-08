@@ -2524,3 +2524,27 @@ queued`), fixed 16/16; rows importlib and mp_main MATCH; gates 0. Open, the
 other half of the same window: a wake-queued row claimed before `activate`
 → `SnapshotRestoreFailed` → carrier abort (seen once, rc=134); brief
 `brief-activation-window.md`, dispatched after this lands.
+
+**Landed 2026-09-08 ~04:20 (two landings, one binary):**
+- **Lane B** (`opus/exitwedge-sep07` → main through 0268b74d2): `KernelAbort`
+  sink with in-process `PostMortem` (kernel graph, executors, event ring,
+  findings incl. dangling mappings), `EmbedError::KernelAborted` from
+  `join`/`execute`, `ContainerBuilder::post_mortem_dir` + `CARRICK_POSTMORTEM_DIR`
+  + CLI flag, `carrick debug abort --run-id` (verified live), every job wait
+  supervised, `TestContainer::deadline`, the embed interceptor probe rebuilt
+  as a cross-compiled Rust crate so `just test-embed` no longer touches
+  Docker, and a lock-order fix (result→registry inversion). Director gates
+  on the rebase over lane A (one additive conflict in the embed test
+  container): workspace check 0, lint 0, `just test` 0 (38 suites), signed
+  `a_container_that_will_not_finish_aborts_with_a_post_mortem` green in
+  90 s with the negative control. Follow-ups filed: `ExitBudget` wiring onto
+  lane A's events; the liveness judgement is poll-backed rather than driven
+  by `process_graph_empty`; the abort request and post-mortem dir are
+  process-global statics; `std::process::abort()` sites are outside the
+  sink; carrier teardown after an abort prints a lost-lease error.
+- **Activation-publish fix** (`opus/hostwait-sep08` → main through
+  c6f2eeb70): idempotent `SubmissionPublication::publish` and named run-queue
+  rejections. Director gates: the three unit tests green on the rebased tree,
+  lint 0 after the host-authority rows were rebound. Binary of main
+  c6f2eeb70: 32f5… (see build log). Smoke + reducer + rows in `post-laneb.log`
+  (host loaded; crashes/wedges are the verdict).
