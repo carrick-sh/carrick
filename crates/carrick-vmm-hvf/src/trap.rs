@@ -9711,6 +9711,95 @@ mod task_only_carrier_directory_tests {
         }
     }
 
+    /// A first-touch fault must not pay for every extent the process already
+    /// materialized.
+    ///
+    /// The complexity contract for the VA-window queries, asserted on visited
+    /// rows so it is deterministic under load. The shape it pins is the one
+    /// `docs/perf-results/2026-09-08-mapping-index-census.md` measured on the
+    /// cpython-compile reducer: six sites asked "which alias VA windows
+    /// overlap this range" as `by_va_start.range(va - widest_va ..= va)`, and
+    /// `widest_va` is a MONOTONE GLOBAL MAXIMUM, so one live large mapping
+    /// widened the walk for every later query while every materialized extent
+    /// added a row inside it. That walk visited 341 rows per fault at reducer
+    /// depth 100,000 and 847 at depth 800,000 -- 111 million rows in one run,
+    /// 532x what the ordered mapping index visited.
+    ///
+    /// The fixture is that shape in miniature: one wide row sets the bound,
+    /// and `DENSE_ROWS` page-sized rows pack the window below the probe. Only
+    /// two rows can possibly contain the probe VA, so a bound that is a
+    /// function of the ANSWER visits a handful; a bound that is a function of
+    /// the POPULATION visits `DENSE_ROWS`.
+    #[test]
+    fn a_va_window_query_does_not_pay_for_every_materialized_extent() {
+        const DENSE_ROWS: u64 = 2048;
+        const PAGE: u64 = 0x1000;
+        const BASE: u64 = 0x7000_0000_0000;
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x4fff_1000_0000,
+            size: 0x4000,
+        };
+
+        let mut registry = AliasRegistry::default();
+        // One wide live row well below the dense run. It legitimately exists
+        // (a large file mapping, an arena reservation) and must stay findable.
+        let mut wide = alias(0x1000, 3);
+        wide.start = BASE;
+        wide.size = (DENSE_ROWS * PAGE) as usize;
+        wide.ipa = 0x6000_0000_0000;
+        wide.physical_ipa = 0x5000_0000_0000;
+        wide.ownership_scope = scope;
+        registry.push(wide);
+
+        let dense_base = BASE + DENSE_ROWS * PAGE;
+        for index in 0..DENSE_ROWS {
+            let mut row = alias(0x2000 + index as usize, 3);
+            row.start = dense_base + index * PAGE;
+            row.size = PAGE as usize;
+            row.ipa = 0x6100_0000_0000 + index * PAGE;
+            row.physical_ipa = 0x5100_0000_0000 + index * PAGE;
+            row.ownership_scope = scope;
+            registry.push(row);
+        }
+
+        let probe = dense_base + (DENSE_ROWS - 1) * PAGE;
+        let before = alias_state_rows_scanned();
+        let found = registry.newest_process_alias_containing_va(
+            probe,
+            Some((0x4fff_1000_0000, 0x4000)),
+            ContainerRootToken::ROOT,
+            |_| true,
+        );
+        let scanned = alias_state_rows_scanned() - before;
+
+        assert_eq!(
+            found.map(|row| row.start),
+            Some(probe),
+            "the containment query must still find the exact covering row"
+        );
+        // The wide row must stay reachable through the same query: a bound
+        // that only looks near the probe would silently lose it.
+        let wide_probe = BASE + PAGE;
+        assert_eq!(
+            registry
+                .newest_process_alias_containing_va(
+                    wide_probe,
+                    Some((0x4fff_1000_0000, 0x4000)),
+                    ContainerRootToken::ROOT,
+                    |_| true,
+                )
+                .map(|row| row.start),
+            Some(BASE),
+            "a wide row must still answer a containment query inside it"
+        );
+        assert!(
+            scanned <= 64,
+            "a containment query visited {scanned} alias rows with {DENSE_ROWS} \
+             extents materialized below it; the bound must be a function of the \
+             answer, not of the population"
+        );
+    }
+
     /// One retiring guest process must not pay for the alias rows of every
     /// OTHER live guest process.
     ///
@@ -12910,9 +12999,36 @@ struct AliasRegistry {
     /// foreign process can never widen another mm's lookup.
     physical_size_counts_by_scope:
         std::collections::BTreeMap<AliasOwnershipScope, std::collections::BTreeMap<u64, usize>>,
-    /// Widest window ever indexed, per axis. Only ever grows: a stale-wide
-    /// bound makes a query walk further than needed, never miss a row.
-    widest_va: u64,
+    /// The VA-window rows again, bucketed by window SIZE CLASS.
+    ///
+    /// Six call sites ask one question -- "which rows' guest-VA windows can
+    /// overlap this probe range" -- and they used to ask it as
+    /// `by_va_start.range(probe - widest_va .. end)` against a MONOTONE global
+    /// maximum window width. That made the walk length a property of the
+    /// POPULATION rather than of the answer: one live wide mapping widened the
+    /// window for every later query, and every materialized extent added a row
+    /// inside it. `docs/perf-results/2026-09-08-mapping-index-census.md`
+    /// measured that on the cpython-compile reducer at 341 visited rows per
+    /// first-touch fault at depth 100,000 rising to 847 at depth 800,000 --
+    /// 111 million rows in one run, 532x what the ordered mapping index
+    /// visited, and the last super-linear term on that path.
+    ///
+    /// Keying by `(class, start)` where `class = ceil(log2(size))` bounds each
+    /// class's walk by that class's OWN widest member: the dense run of
+    /// page-sized rows is searched over one page, and the rare wide row is
+    /// searched over its own width but only against the few rows its size.
+    /// The exact overlap test each caller applies is unchanged; only the
+    /// candidate set shrinks, and it shrinks to a superset of the answer.
+    by_va_class_start: std::collections::BTreeMap<(u32, u64), Vec<(u64, AliasBacking)>>,
+    /// Exact multiset of live VA size classes. Exact, not a high-water mark,
+    /// for the reason `physical_size_counts_by_scope` already records: a
+    /// monotone maximum is poisoned forever by one huge row that has since
+    /// retired. It also enumerates the classes a query must visit.
+    va_class_counts: std::collections::BTreeMap<u32, usize>,
+    /// Widest IPA window ever indexed. Only ever grows: a stale-wide bound
+    /// makes a query walk further than needed, never miss a row. The VA axis
+    /// carried the same shape until the census above; this axis was not
+    /// measured hot and keeps it.
     widest_ipa: u64,
 }
 
@@ -13034,7 +13150,12 @@ impl AliasRegistry {
             .entry(alias.start)
             .or_default()
             .push((seq, alias));
-        self.widest_va = self.widest_va.max(alias.size as u64);
+        let class = Self::va_window_class(alias.size as u64);
+        self.by_va_class_start
+            .entry((class, alias.start))
+            .or_default()
+            .push((seq, alias));
+        *self.va_class_counts.entry(class).or_default() += 1;
         self.by_ipa_start
             .entry(alias.ipa)
             .or_default()
@@ -13063,6 +13184,23 @@ impl AliasRegistry {
             }
             if rows.is_empty() {
                 self.by_va_start.remove(&alias.start);
+            }
+        }
+        let class = Self::va_window_class(alias.size as u64);
+        if let Some(rows) = self.by_va_class_start.get_mut(&(class, alias.start)) {
+            if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
+                rows.remove(at);
+            }
+            if rows.is_empty() {
+                self.by_va_class_start.remove(&(class, alias.start));
+            }
+        }
+        if let std::collections::btree_map::Entry::Occupied(mut count) =
+            self.va_class_counts.entry(class)
+        {
+            *count.get_mut() = count.get().saturating_sub(1);
+            if *count.get() == 0 {
+                count.remove();
             }
         }
         if let Some(rows) = self.by_ipa_start.get_mut(&alias.ipa) {
@@ -13112,12 +13250,13 @@ impl AliasRegistry {
     /// constructed directly rather than through the mutators.
     fn reindex(&mut self) {
         self.by_va_start.clear();
+        self.by_va_class_start.clear();
+        self.va_class_counts.clear();
         self.by_ipa_start.clear();
         self.by_physical_start.clear();
         self.by_scope_physical_start.clear();
         self.physical_size_counts_by_scope.clear();
         self.exact_first_by_scope.clear();
-        self.widest_va = 0;
         self.widest_ipa = 0;
         let rows: Vec<(u64, AliasBacking)> = self
             .by_scope
@@ -13130,6 +13269,73 @@ impl AliasRegistry {
         for scope in self.by_scope.keys().copied().collect::<Vec<_>>() {
             self.rebuild_exact_scope(scope);
         }
+    }
+
+    /// Which size class a VA window of `size` bytes belongs to: the exponent
+    /// of the smallest power of two that can hold it, so every member of class
+    /// `c` has `size <= 1 << c`.
+    fn va_window_class(size: u64) -> u32 {
+        match size.max(1).checked_next_power_of_two() {
+            Some(rounded) => rounded.ilog2(),
+            None => u64::BITS,
+        }
+    }
+
+    /// The widest VA window any LIVE row can have: the radius of the largest
+    /// live size class. Reported by the per-fault mapping-index census as the
+    /// bound the containment queries actually pay, so the probe keeps naming
+    /// the thing it named before the class index replaced the monotone
+    /// `widest_va` -- except that this one shrinks again when the wide row
+    /// retires.
+    fn widest_va_window(&self) -> u64 {
+        self.va_class_counts
+            .keys()
+            .next_back()
+            .copied()
+            .map_or(0, Self::va_window_class_radius)
+    }
+
+    /// The widest window any member of class `c` can have.
+    fn va_window_class_radius(class: u32) -> u64 {
+        if class >= u64::BITS {
+            u64::MAX
+        } else {
+            1_u64 << class
+        }
+    }
+
+    /// Every row whose guest-VA window can overlap `[start, end)`, in
+    /// unspecified order, each visited at most once.
+    ///
+    /// THE VA-axis candidate query. It is a superset of the answer -- callers
+    /// keep their own exact overlap or containment test, which this does not
+    /// change -- but the superset is bounded per size class by that class's
+    /// own widest member rather than by the widest row in the registry. See
+    /// [`Self::by_va_class_start`] for the measurement that motivated it.
+    fn va_window_rows(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> impl Iterator<Item = &(u64, AliasBacking)> + '_ {
+        self.va_class_counts
+            .keys()
+            .copied()
+            .flat_map(move |class| {
+                let radius = Self::va_window_class_radius(class);
+                let lower = start.saturating_sub(radius.saturating_sub(1));
+                // A row of this class beginning below `lower` ends at or below
+                // `start`, and one beginning at or above `end` starts past the
+                // range; neither can overlap.
+                (lower < end).then_some(((class, lower), (class, end)))
+            })
+            .flat_map(move |(from, to)| {
+                self.by_va_class_start
+                    .range(from..to)
+                    .flat_map(|(_, rows)| {
+                        note_alias_state_rows_scanned(rows.len());
+                        rows.iter()
+                    })
+            })
     }
 
     /// The row registered LAST whose window contains `probe`, among the rows
@@ -13153,9 +13359,12 @@ impl AliasRegistry {
     fn newest_containing_va(
         &self,
         va: u64,
-        matches: impl FnMut(&AliasBacking) -> bool,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
     ) -> Option<AliasBacking> {
-        Self::newest_containing(&self.by_va_start, self.widest_va, va, matches)
+        self.va_window_rows(va, va.saturating_add(1))
+            .filter(|(_, alias)| matches(alias))
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, alias)| *alias)
     }
 
     /// [`Self::oldest_matching`] for a predicate that requires the row's IPA
@@ -13264,11 +13473,12 @@ impl AliasRegistry {
         self.by_scope.clear();
         self.exact_first_by_scope.clear();
         self.by_va_start.clear();
+        self.by_va_class_start.clear();
+        self.va_class_counts.clear();
         self.by_ipa_start.clear();
         self.by_physical_start.clear();
         self.by_scope_physical_start.clear();
         self.physical_size_counts_by_scope.clear();
-        self.widest_va = 0;
         self.widest_ipa = 0;
         self.rows = 0;
         // `next_seq` is deliberately NOT reset: sequence numbers are identity
@@ -13857,19 +14067,12 @@ impl AliasRegistry {
         if end <= va {
             return Vec::new();
         }
-        let lower = va.saturating_sub(self.widest_va);
-        if lower >= end {
-            return Vec::new();
-        }
         let mut overlapping = Vec::new();
-        for (_, rows) in self.by_va_start.range(lower..end) {
-            note_alias_state_rows_scanned(rows.len());
-            for &(seq, alias) in rows {
-                if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
-                    && alias.start.saturating_add(alias.size as u64) > va
-                {
-                    overlapping.push((seq, alias));
-                }
+        for &(seq, alias) in self.va_window_rows(va, end) {
+            if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                && alias.start.saturating_add(alias.size as u64) > va
+            {
+                overlapping.push((seq, alias));
             }
         }
         overlapping.sort_by_key(|(seq, _)| *seq);
@@ -13889,23 +14092,12 @@ impl AliasRegistry {
         if va >= end {
             return false;
         }
-        let lower = va.saturating_sub(self.widest_va);
-        if lower >= end {
-            return false;
-        }
-        for (_, rows) in self.by_va_start.range(lower..end) {
-            note_alias_state_rows_scanned(rows.len());
-            for &(_, alias) in rows {
-                if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
-                    && alias.start < end
-                    && alias.start.saturating_add(alias.size as u64) > va
-                    && alias_backing_is_live(alias.physical_host_addr)
-                {
-                    return true;
-                }
-            }
-        }
-        false
+        self.va_window_rows(va, end).any(|&(_, alias)| {
+            alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                && alias.start < end
+                && alias.start.saturating_add(alias.size as u64) > va
+                && alias_backing_is_live(alias.physical_host_addr)
+        })
     }
 
     /// Smallest `alias.start` strictly between `start` and `end` matching `predicate`
@@ -13948,21 +14140,17 @@ impl AliasRegistry {
         container_root: ContainerRootToken,
         mut matches: impl FnMut(&AliasBacking) -> bool,
     ) -> Option<AliasBacking> {
-        let lower = va.saturating_sub(self.widest_va);
         let mut newest: Option<(u64, AliasBacking)> = None;
-        for (_, rows) in self.by_va_start.range(lower..=va) {
-            note_alias_state_rows_scanned(rows.len());
-            for &(seq, alias) in rows {
-                if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
-                    && va >= alias.start
-                    && va < alias.start.saturating_add(alias.size as u64)
-                    && matches(&alias)
-                {
-                    match newest {
-                        None => newest = Some((seq, alias)),
-                        Some((best_seq, _)) if seq > best_seq => newest = Some((seq, alias)),
-                        _ => {}
-                    }
+        for &(seq, alias) in self.va_window_rows(va, va.saturating_add(1)) {
+            if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                && va >= alias.start
+                && va < alias.start.saturating_add(alias.size as u64)
+                && matches(&alias)
+            {
+                match newest {
+                    None => newest = Some((seq, alias)),
+                    Some((best_seq, _)) if seq > best_seq => newest = Some((seq, alias)),
+                    _ => {}
                 }
             }
         }
@@ -17934,19 +18122,12 @@ fn unregister_alias_entries(
     if end <= va {
         return std::collections::BTreeSet::new();
     }
-    let lower = va.saturating_sub(registry.widest_va);
-    if lower >= end {
-        return std::collections::BTreeSet::new();
-    }
     let mut overlapping = Vec::new();
-    for (_, rows) in registry.by_va_start.range(lower..end) {
-        note_alias_state_rows_scanned(rows.len());
-        for &(seq, alias) in rows {
-            if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
-                && alias.start.saturating_add(alias.size as u64) > va
-            {
-                overlapping.push((seq, alias));
-            }
+    for &(seq, alias) in registry.va_window_rows(va, end) {
+        if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+            && alias.start.saturating_add(alias.size as u64) > va
+        {
+            overlapping.push((seq, alias));
         }
     }
     if overlapping.is_empty() {
@@ -18077,12 +18258,10 @@ fn retained_private_reuse_alias_fragment_in(
     let ipa_end = ipa.checked_add(len as u64)?;
     // An existing semantic fragment is already an exact lifetime owner. Do not
     // replace a wider entry with this one-page reuse observation.
-    // Query `by_va_start` bounded to [va - widest_va, va] to locate any
-    // overlapping candidate without scanning unrelated processes or rows.
+    // The VA-window candidate query locates any overlapping candidate without
+    // scanning unrelated processes or rows.
     let has_existing = registry
-        .by_va_start
-        .range(va.saturating_sub(registry.widest_va)..=va)
-        .flat_map(|(_, rows)| rows)
+        .va_window_rows(va, va.saturating_add(1))
         .any(|(_, entry)| {
             alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
                 && va >= entry.start
@@ -18232,25 +18411,21 @@ fn unregister_alias_in(
     let Some(end) = va.checked_add(len as u64).filter(|&end| end > va) else {
         return std::collections::BTreeSet::new();
     };
-    let lower = va.saturating_sub(registry.widest_va);
     let mut keys = std::collections::BTreeSet::new();
-    for (_, rows) in registry.by_va_start.range(lower..end) {
-        note_alias_state_rows_scanned(rows.len());
-        for (_, entry) in rows {
-            let entry_end = entry.start.saturating_add(entry.size as u64);
-            if !alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
-                || entry_end <= va
-            {
-                continue;
-            }
-            keys.insert(alias_version_key(entry));
-            if entry_end > end {
-                keys.insert((
-                    end,
-                    entry.ipa.saturating_add(end.saturating_sub(entry.start)),
-                    entry.ownership_scope,
-                ));
-            }
+    for (_, entry) in registry.va_window_rows(va, end) {
+        let entry_end = entry.start.saturating_add(entry.size as u64);
+        if !alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
+            || entry_end <= va
+        {
+            continue;
+        }
+        keys.insert(alias_version_key(entry));
+        if entry_end > end {
+            keys.insert((
+                end,
+                entry.ipa.saturating_add(end.saturating_sub(entry.start)),
+                entry.ownership_scope,
+            ));
         }
     }
     // Snapshot suffix keys too: an existing row can collide with a fragment,
@@ -29662,6 +29837,23 @@ pub(crate) struct HvfMappedRegion {
     shared_key_offset: u64,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfMappedRegion {
+    /// Whether this row still owns something whose `Drop` frees backing.
+    ///
+    /// A row holding any of these is a lifetime holder: dropping it releases
+    /// host pages, a stage-2 lease or a structural owner. A row holding none
+    /// of them is pure description -- which is NOT the same as "safe to
+    /// forget"; see [`TaskMappingIndex::displace_overlapping`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn holds_backing_handle(&self) -> bool {
+        self.memory.is_some()
+            || self.host_mapping.is_some()
+            || self.structural_owner.is_some()
+            || self.stage2_lease.is_some()
+    }
+}
+
 /// A copyable projection of the scalar fields of an [`HvfMappedRegion`] that the
 /// syscall-path accessors actually read (`start`/`end`/`ipa`/`host_addr`/`size`/
 /// `guest_writable`/sharing). [`HvfInner::mapping_for_range`] returns this
@@ -29889,6 +30081,31 @@ impl TaskMappingIndex {
     }
 
     /// Move every live row intersecting `[start, end)` into `shadowed`.
+    ///
+    /// **This vector is not bounded, and the obvious bound is not safe.**
+    /// Dropping a displaced row that lies entirely inside the incoming row's
+    /// range and holds no lifetime handle
+    /// ([`HvfMappedRegion::holds_backing_handle`]) is behaviour-preserving for
+    /// every ORDERED query -- `candidates_for_range` yields live rows first so
+    /// the incoming row already won those lookups; `first_start_between` can
+    /// only answer smaller, because a dropped row's start lies in the query
+    /// range only when the incoming row's start does too; and
+    /// `any_lower_row_reaches` reads the immediate live predecessor, which
+    /// reaches at least as far down. It is NOT safe for row IDENTITY: a fork
+    /// child's inherited rows are handle-free by construction (the child sets
+    /// `memory`/`host_mapping` to `None` after `mem::forget`, because the
+    /// pages live on through COW), so handle-freedom does not mean "nothing to
+    /// keep". `an_overlapping_publication_wins_lookups_without_dropping_the_row_it_shadows`
+    /// pins exactly that case -- a child's rebased vvar row overlapping its
+    /// parent's exactly -- and the drop deletes the parent incarnation it
+    /// requires to stay reachable.
+    ///
+    /// A safe retirement has to key on whether the displaced row's owner
+    /// generation still authenticates against the live global-frame owner,
+    /// which is the same authority every other retirement site uses and which
+    /// this type does not hold: `insert` takes no custody.
+    /// `repeated_overlapping_publication_retains_one_row_per_incarnation`
+    /// measures what actually accumulates.
     fn displace_overlapping(&mut self, start: u64, end: u64) {
         let mut displaced = Vec::new();
         if let Some((&key, row)) = self.live.range(..GuestVa(start)).next_back()
@@ -30650,6 +30867,66 @@ mod task_mapping_index_tests {
             generations,
             vec![2, 1],
             "both incarnations stay reachable, newest first",
+        );
+    }
+
+    /// What the displaced-row backlog actually accumulates, and why the
+    /// obvious bound is refused.
+    ///
+    /// Repeated `MAP_FIXED` over one range publishes a fresh incarnation each
+    /// time -- new backing, new IPA, new owner generation -- and every one of
+    /// them displaces its predecessor, so the vector grows by one per
+    /// republication and every full-table pass and every displaced-row lookup
+    /// tail pays for the whole history. This test states that growth rather
+    /// than asserting it away: the safe retirement needs the displaced row's
+    /// owner generation authenticated against the live global-frame owner, and
+    /// `insert` holds no custody to authenticate against. See
+    /// `TaskMappingIndex::displace_overlapping`.
+    ///
+    /// The per-fault census in
+    /// `docs/perf-results/2026-09-08-mapping-index-census.md` measured the
+    /// backlog at 1 row in every bucket of every reducer depth from 100,000 to
+    /// 800,000, so this is a latent bound, not a measured cost.
+    #[test]
+    fn repeated_overlapping_publication_retains_one_row_per_incarnation() {
+        const REPUBLICATIONS: u64 = 32;
+        let va = 0x2e00_0000_0000_u64;
+        let mut index = TaskMappingIndex::new();
+        for generation in 1..=REPUBLICATIONS {
+            let mut row = thread_sibling_tests::mapped_region(
+                va,
+                va + 0x4000,
+                0x2e00_0000_0000 + generation * 0x4000,
+            );
+            row.owner_generation = generation;
+            assert!(
+                !row.holds_backing_handle(),
+                "the fixture models an inherited, handle-free row"
+            );
+            index.insert(row);
+        }
+
+        assert_eq!(
+            index.live_len(),
+            1,
+            "one live row per range: the newest incarnation"
+        );
+        assert_eq!(
+            index.shadowed_len() as u64,
+            REPUBLICATIONS - 1,
+            "every earlier incarnation is retained; this is the unbounded shape"
+        );
+        assert_eq!(
+            index
+                .mapping_for_range(GuestVa(va), 0x1000)
+                .map(|row| row.owner_generation),
+            Some(REPUBLICATIONS),
+            "the newest incarnation still wins the lookup"
+        );
+        assert_eq!(
+            index.candidates_for_range(GuestVa(va), 0x1000).count() as u64,
+            REPUBLICATIONS,
+            "and every retained incarnation is still offered, newest first"
         );
     }
 
@@ -39514,17 +39791,20 @@ impl HvfVmState {
         let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let (alias_rows, widest_va) = {
             let registry = alias_registry().lock();
-            (registry.len() as u64, registry.widest_va)
+            (registry.len() as u64, registry.widest_va_window())
         };
         carrick_observability::probes::hvpatch_mapping_index_fault(
-            va,
-            self.mappings.live_len() as u64,
-            hot_path_rows_scanned_live(HotPathScan::TaskMappings).wrapping_sub(mapping_rows_before),
-            alias_rows,
-            hot_path_rows_scanned_live(HotPathScan::AliasState).wrapping_sub(alias_rows_before),
-            nanos,
-            widest_va,
-            self.mappings.shadowed_len() as u64,
+            carrick_observability::probes::HvpatchMappingIndexCensus::new(
+                va,
+                self.mappings.live_len() as u64,
+                self.mappings.shadowed_len() as u64,
+                hot_path_rows_scanned_live(HotPathScan::TaskMappings)
+                    .wrapping_sub(mapping_rows_before),
+                alias_rows,
+                hot_path_rows_scanned_live(HotPathScan::AliasState).wrapping_sub(alias_rows_before),
+                widest_va,
+                nanos,
+            ),
         );
         outcome
     }

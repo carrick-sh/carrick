@@ -642,6 +642,82 @@ impl HvpatchSyscallService {
     }
 }
 
+/// One serviced HVPatch first-touch fault, as the mapping-index census sees
+/// it: what both lookup structures HELD, what their walks VISITED for this one
+/// fault, and what it cost.
+///
+/// A struct rather than eight scalars because the two populations and the two
+/// visit counts are only meaningful as a set -- a visit count without the
+/// population it was measured against says nothing about complexity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchMappingIndexCensus {
+    far: u64,
+    live_rows: u64,
+    shadowed_rows: u64,
+    rows_visited: u64,
+    alias_rows: u64,
+    alias_rows_visited: u64,
+    widest_va_window: u64,
+    nanos: u64,
+}
+
+impl HvpatchMappingIndexCensus {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        far: u64,
+        live_rows: u64,
+        shadowed_rows: u64,
+        rows_visited: u64,
+        alias_rows: u64,
+        alias_rows_visited: u64,
+        widest_va_window: u64,
+        nanos: u64,
+    ) -> Self {
+        Self {
+            far,
+            live_rows,
+            shadowed_rows,
+            rows_visited,
+            alias_rows,
+            alias_rows_visited,
+            widest_va_window,
+            nanos,
+        }
+    }
+
+    pub const fn far(self) -> u64 {
+        self.far
+    }
+
+    pub const fn live_rows(self) -> u64 {
+        self.live_rows
+    }
+
+    pub const fn shadowed_rows(self) -> u64 {
+        self.shadowed_rows
+    }
+
+    pub const fn rows_visited(self) -> u64 {
+        self.rows_visited
+    }
+
+    pub const fn alias_rows(self) -> u64 {
+        self.alias_rows
+    }
+
+    pub const fn alias_rows_visited(self) -> u64 {
+        self.alias_rows_visited
+    }
+
+    pub const fn widest_va_window(self) -> u64 {
+        self.widest_va_window
+    }
+
+    pub const fn nanos(self) -> u64 {
+        self.nanos
+    }
+}
+
 /// Fatal or signal-lowered AArch64 fault with its Linux guest identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HvpatchGuestFault {
@@ -2353,6 +2429,7 @@ mod hvpatch_guest_probe_abi {
             "fn hvpatch__mapping__index__begin(_: u64, _: u64) {}",
             "fn hvpatch__mapping__index__fault(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
             "fn hvpatch__mapping__index__cost(_: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_mapping_index_fault(event: super::HvpatchMappingIndexCensus));",
         ] {
             assert!(
                 source.matches(declaration).count() >= 2,
@@ -6246,24 +6323,19 @@ mod real {
     /// companion fires immediately after so a consumer can join the two on the
     /// same host thread and never see a row census without its nanoseconds.
     #[inline(never)]
-    pub fn hvpatch_mapping_index_fault(
-        far: u64,
-        live: u64,
-        visited: u64,
-        alias_rows: u64,
-        alias_visited: u64,
-        nanos: u64,
-        widest_va: u64,
-        shadowed: u64,
-    ) {
+    pub fn hvpatch_mapping_index_fault(event: super::HvpatchMappingIndexCensus) {
         carrick_usdt::hvpatch__mapping__index__fault!(|| (
-            far,
-            live,
-            visited,
-            alias_rows,
-            alias_visited
+            event.far(),
+            event.live_rows(),
+            event.rows_visited(),
+            event.alias_rows(),
+            event.alias_rows_visited()
         ));
-        carrick_usdt::hvpatch__mapping__index__cost!(|| (nanos, widest_va, shadowed));
+        carrick_usdt::hvpatch__mapping__index__cost!(|| (
+            event.nanos(),
+            event.widest_va_window(),
+            event.shadowed_rows()
+        ));
     }
 
     #[inline(never)]
@@ -8134,7 +8206,7 @@ mod stub {
     stub!(hvpatch_frame_cow_trigger(event: super::HvpatchFrameCowTrigger));
     stub!(hvpatch_frame_cow_copy(old_frame: u64, old_ipa: u64, source: &[u8], dest: &[u8]));
     stub!(hvpatch_mapping_index_begin(live: u64, shadowed: u64) -> Option<std::time::Instant> => None);
-    stub!(hvpatch_mapping_index_fault(far: u64, live: u64, visited: u64, alias_rows: u64, alias_visited: u64, nanos: u64, widest_va: u64, shadowed: u64));
+    stub!(hvpatch_mapping_index_fault(event: super::HvpatchMappingIndexCensus));
     stub!(hvpatch_frame_pool_hit(site: u32, ipa: u64));
     stub!(hvpatch_frame_pool_miss(site: u32, ipa: u64));
     stub!(hvpatch_fork_frame_share(event: super::HvpatchForkFrameShare));
