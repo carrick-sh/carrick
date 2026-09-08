@@ -161,7 +161,7 @@ use crate::syscall_mailbox::{
     HvfSyscallTransport, MailboxBinding, MailboxSlotAllocator, MailboxSlotId,
 };
 use carrick_aarch64::Aarch64VcpuSnapshot;
-use carrick_guest_mem::MemoryError;
+use carrick_guest_mem::{GuestVa, MemoryError};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
@@ -2558,7 +2558,7 @@ mod foreign_mm_tests {
             })
             .collect();
         let mut cleanup = PendingExecStage2Cleanup {
-            mappings: Vec::new(),
+            mappings: TaskMappingIndex::new(),
             extents,
             predecessor_aliases: Vec::new(),
             frames: Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
@@ -3483,7 +3483,7 @@ mod foreign_mm_tests {
             ext_base.0,
         );
         ext_region.host_addr = ext_host.as_mut_ptr();
-        runtime.mappings.push(ext_region);
+        runtime.mappings.insert(ext_region);
 
         // Run sync_to_host under the manager lock with a bounded wait to detect self-deadlock.
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -3691,7 +3691,7 @@ mod foreign_mm_tests {
             stage1_root.raw(),
         );
         primary_region.host_addr = primary_host.as_mut_ptr();
-        parent_runtime.mappings.push(primary_region);
+        parent_runtime.mappings.insert(primary_region);
 
         // Extension arena mapping in parent
         let mut ext_host = vec![0u8; TWO_MIB as usize];
@@ -3701,7 +3701,7 @@ mod foreign_mm_tests {
             ext_base.0,
         );
         ext_region.host_addr = ext_host.as_mut_ptr();
-        parent_runtime.mappings.push(ext_region);
+        parent_runtime.mappings.insert(ext_region);
 
         // Prepare child page tables (cloned and rebased for child root slot)
         let child_root_base = 0x8800_0080_0000_u64;
@@ -7206,7 +7206,7 @@ mod foreign_mm_tests {
             shared_key_offset: 0,
             owner_generation: generation,
         };
-        task.mappings.push(region);
+        task.mappings.insert(region);
 
         let mut tables = crate::page_table::PageTableManager::new(
             carrick_mem::memory::stage1_hvpatch_page_tables(),
@@ -7690,7 +7690,7 @@ mod foreign_mm_tests {
             .map_aliased(semantic_va, key.0, key.1, false, None)
             .expect("publish live COW source stage-1 compound");
         task.page_tables_authority().set_manager(page_tables);
-        task.mappings.push(HvfMappedRegion {
+        task.mappings.insert(HvfMappedRegion {
             start: semantic_va,
             ipa: key.0 + key.1,
             physical_ipa: key.0 + key.1,
@@ -7780,7 +7780,7 @@ mod foreign_mm_tests {
             inventoried_cow_source_fixture(CowSourceInventoryFixture::Absent);
         let (host_addr, _) = global_frame_host_owner_identity_in(&custody, key.0, key.1)
             .expect("current COW source owner identity");
-        task.mappings.push(HvfMappedRegion {
+        task.mappings.insert(HvfMappedRegion {
             start: semantic_va,
             ipa: key.0,
             physical_ipa: key.0,
@@ -8056,7 +8056,7 @@ mod foreign_mm_tests {
             .find(concat!("let alias = Alias", "Backing {"))
             .expect("full-VM alias construction");
         let mapped = full_vm
-            .find(concat!("mapped.push(HvfMapped", "Region {"))
+            .find(concat!("mapped.insert(HvfMapped", "Region {"))
             .expect("full-VM mapping construction");
         let inventory = full_vm
             .find(concat!(
@@ -17862,15 +17862,15 @@ fn mapping_is_current_for_process_fork_indexed(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn current_process_alias_keys(
-    mappings: &[HvfMappedRegion],
+fn current_process_alias_keys<'a>(
+    mappings: impl IntoIterator<Item = &'a HvfMappedRegion>,
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
 ) -> std::collections::HashSet<ProcessAliasKey> {
     let index = process_alias_index(aliases, mm_root_slot, container_root);
     mappings
-        .iter()
+        .into_iter()
         .filter(|mapping| mapping_is_current_for_process_fork_indexed(mapping, &index))
         .map(mapped_region_process_alias_key)
         .collect()
@@ -24379,20 +24379,25 @@ mod carrier_vm_custody_tests {
         );
         mm_access.install_structural_owner(std::sync::Arc::clone(&owner));
         drop(owner);
-        let mut mappings = vec![region];
         let projection_offset = 0x1000_u64;
-        mappings[0].start += projection_offset;
-        mappings[0].ipa += projection_offset;
-        mappings[0].host_addr = mappings[0]
-            .host_addr
-            .wrapping_add(projection_offset as usize);
+        let mut region = region;
+        region.start += projection_offset;
+        region.ipa += projection_offset;
+        region.host_addr = region.host_addr.wrapping_add(projection_offset as usize);
+        let mut mappings = TaskMappingIndex::from_region(region);
         // `unowned_runtime_region` intentionally retains the physical owner
         // size even when this row is only an offset semantic projection.
-        assert_eq!(mappings[0].size, mappings[0].physical_size);
-        assert_eq!(mappings[0].end - mappings[0].start, len - projection_offset,);
+        assert_eq!(
+            mappings.first().unwrap().size,
+            mappings.first().unwrap().physical_size
+        );
+        assert_eq!(
+            mappings.first().unwrap().end - mappings.first().unwrap().start,
+            len - projection_offset,
+        );
 
-        let exact_generation = mappings[0].owner_generation;
-        mappings[0].owner_generation = exact_generation.saturating_add(1);
+        let exact_generation = mappings.first().unwrap().owner_generation;
+        mappings.first_mut().unwrap().owner_generation = exact_generation.saturating_add(1);
         let drift_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
             &custody,
             &mut mappings,
@@ -24407,7 +24412,9 @@ mod carrier_vm_custody_tests {
             "unexpected structural generation-drift rejection: {drift_error}",
         );
         assert!(
-            !mappings[0]
+            !mappings
+                .first()
+                .unwrap()
                 .structural_owner
                 .as_ref()
                 .expect("drift rejection preserves structural owner")
@@ -24420,7 +24427,7 @@ mod carrier_vm_custody_tests {
             super::ScopedStage2MapTestStub::is_mapped(ipa, len as usize),
             "generation-drift rejection must preserve the structural map",
         );
-        mappings[0].owner_generation = exact_generation;
+        mappings.first_mut().unwrap().owner_generation = exact_generation;
 
         let subextent_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
             &custody,
@@ -24519,7 +24526,7 @@ mod carrier_vm_custody_tests {
         let pin = custody
             .pin_stage2_record(identity)
             .expect("pin structural root slot");
-        let mut mappings = vec![region];
+        let mut mappings = TaskMappingIndex::from_region(region);
 
         let retirement_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
             &custody,
@@ -26809,7 +26816,7 @@ fn perform_foreign_cow_transaction(
         HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 &lease.custody,
-                &mut [],
+                &mut TaskMappingIndex::new(),
                 split.old.stage2_base,
                 split.old.stage2_length,
             )
@@ -27703,7 +27710,7 @@ pub mod foreign_cow_test_support {
 pub(crate) struct HvfTaskState {
     #[cfg(not(test))]
     custody: std::sync::Arc<CarrierVmCustody>,
-    mappings: Vec<HvfMappedRegion>,
+    mappings: TaskMappingIndex,
     /// Per-mm stage-1 root-table slot. It contains page-table/control backing
     /// only; guest data frames live at stable global IPAs outside the slot.
     /// Ordinary VMM engines leave this unset.
@@ -27813,7 +27820,7 @@ impl std::ops::Deref for HvfTaskState {
 struct PendingExecStage2Cleanup {
     #[cfg(not(test))]
     custody: std::sync::Arc<CarrierVmCustody>,
-    mappings: Vec<HvfMappedRegion>,
+    mappings: TaskMappingIndex,
     /// Physical candidates selected at exec publication, bound to the exact
     /// global-owner incarnation observed at that boundary.
     extents: std::collections::BTreeMap<(u64, usize), InventoryStage2OwnerIdentity>,
@@ -28062,7 +28069,7 @@ impl PendingExecStage2Cleanup {
             })
             .collect::<Vec<_>>();
         let mut retained_backings = Vec::new();
-        for mapping in self.mappings.drain(..) {
+        for mapping in std::mem::take(&mut self.mappings).into_values() {
             if retired_extents
                 .iter()
                 .any(|retired| mapped_region_matches_retired_inventory_extent(&mapping, *retired))
@@ -28699,11 +28706,16 @@ impl HvfTaskState {
                 ));
             }
         }
-        let mapping = self.mappings.iter().rev().find(|mapping| {
+        let candidate = self
+            .mappings
+            .range(..=GuestVa(semantic_va))
+            .next_back()
+            .map(|(_, m)| m);
+        let mapping = if let Some(mapping) = candidate {
             let physical_mapping_end = mapping
                 .physical_ipa
                 .checked_add(mapping.physical_size as u64);
-            mapping.start < semantic_end
+            if mapping.start < semantic_end
                 && semantic_va < mapping.end
                 && affine_translation_matches(mapping.start, mapping.ipa)
                 && physical_ipa >= mapping.physical_ipa
@@ -28714,6 +28726,31 @@ impl HvfTaskState {
                         mapping.physical_size as u64,
                     )
                     || global_frame_region_owner_matches_in(custody, mapping))
+            {
+                Some(mapping)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mapping = mapping.or_else(|| {
+            self.mappings.iter().rev().find(|mapping| {
+                let physical_mapping_end = mapping
+                    .physical_ipa
+                    .checked_add(mapping.physical_size as u64);
+                mapping.start < semantic_end
+                    && semantic_va < mapping.end
+                    && affine_translation_matches(mapping.start, mapping.ipa)
+                    && physical_ipa >= mapping.physical_ipa
+                    && physical_mapping_end.is_some_and(|limit| physical_end <= limit)
+                    && (!self.persistent_vm_lifecycle
+                        || !is_reusable_global_frame_extent(
+                            mapping.physical_ipa,
+                            mapping.physical_size as u64,
+                        )
+                        || global_frame_region_owner_matches_in(custody, mapping))
+            })
         });
         if let Some(mapping) = mapping
             && let Some(physical_host_addr) = mapped_region_physical_host_addr(mapping)
@@ -28894,14 +28931,15 @@ impl HvfTaskState {
                 )
         };
         if let Some(ipa) = stage1_ipa {
-            if let Some(mapping) = self.mappings.iter().rev().find(|mapping| {
-                ipa >= mapping.ipa
+            if let Some((_, mapping)) = self.mappings.range(..=GuestVa(address)).next_back() {
+                if ipa >= mapping.ipa
                     && ipa < mapping.ipa.saturating_add(mapping.size as u64)
                     && mapping.contains_range(address, length)
                     && mapping.ipa.checked_add(address - mapping.start) == Some(ipa)
                     && region_is_live(mapping)
-            }) {
-                return Some(mapping.view());
+                {
+                    return Some(mapping.view());
+                }
             }
             if let Some(alias) = alias_registry().lock().newest_containing_ipa(ipa, |alias| {
                 // A fork peer can retain the same physical frame at a
@@ -28975,12 +29013,13 @@ impl HvfTaskState {
                 )
                 .is_some()
         };
-        if let Some(mapping) = self.mappings.iter().rev().find(|mapping| {
-            mapping.contains_range(address, length)
+        if let Some((_, mapping)) = self.mappings.range(..=GuestVa(address)).next_back() {
+            if mapping.contains_range(address, length)
                 && region_is_live(mapping)
                 && row_projection_is_current(mapping)
-        }) {
-            return Some(mapping.view());
+            {
+                return Some(mapping.view());
+            }
         }
         if !self.protections.range_no_access(address, length) {
             if let Some(alias) = alias_registry().lock().newest_process_alias_containing_va(
@@ -29059,7 +29098,7 @@ impl HvfTaskState {
         Self {
             #[cfg(not(test))]
             custody: std::sync::Arc::new(CarrierVmCustody::new()),
-            mappings: Vec::new(),
+            mappings: TaskMappingIndex::new(),
             mm_root_slot: None,
             container_root: ContainerRootToken(0),
             pending_exec_mm_root_slot: None,
@@ -29238,14 +29277,9 @@ impl HvfTaskState {
         if carrier_initial_arena_retired().swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
-        let Some(index) = self
-            .mappings
-            .iter()
-            .position(|mapping| mapping.start == crate::memory::LINUX_MMAP_BASE)
-        else {
+        let Some(mapping) = self.mappings.get(&GuestVa(crate::memory::LINUX_MMAP_BASE)) else {
             return Ok(());
         };
-        let mapping = &self.mappings[index];
         if mapping.end
             != crate::memory::LINUX_MMAP_BASE.saturating_add(crate::memory::mmap_arena_size())
             || mapping.physical_ipa != crate::memory::LINUX_MMAP_BASE
@@ -29264,7 +29298,10 @@ impl HvfTaskState {
                 "unmap HVPatch initial sparse mmap arena: 0x{rc:x}"
             )));
         }
-        drop(self.mappings.remove(index));
+        self.mappings.remove_range(
+            GuestVa(crate::memory::LINUX_MMAP_BASE),
+            crate::memory::mmap_arena_size() as usize,
+        );
         Ok(())
     }
 }
@@ -29285,7 +29322,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
     let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
     let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     HvfTaskState {
-        mappings: vec![HvfMappedRegion {
+        mappings: TaskMappingIndex::from_region(HvfMappedRegion {
             start: mapping_start,
             end: mapping_start + 0x1000,
             ipa: mapping_start + 0x10_0000,
@@ -29304,7 +29341,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation: mm_slot,
-        }],
+        }),
         mm_root_slot: Some((mm_slot << 20, 0x20_0000)),
         container_root: ContainerRootToken::from_raw(1),
         pending_exec_mm_root_slot: None,
@@ -29667,6 +29704,453 @@ struct MappingView {
     sharing: GuestMappingSharing,
     shared_key_base: u64,
     shared_key_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+pub(crate) struct TaskMappingIndex(std::collections::BTreeMap<GuestVa, HvfMappedRegion>);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl TaskMappingIndex {
+    pub(crate) fn new() -> Self {
+        Self(std::collections::BTreeMap::new())
+    }
+
+    pub(crate) fn from_region(region: HvfMappedRegion) -> Self {
+        let mut index = Self::new();
+        index.insert(region);
+        index
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_invariants(&self) {
+        let mut prev_end: Option<u64> = None;
+        for (va, region) in &self.0 {
+            assert_eq!(
+                va.0, region.start,
+                "key must match region.start: key=0x{:x}, start=0x{:x}",
+                va.0, region.start
+            );
+            assert!(
+                region.start < region.end,
+                "region must have start < end: [0x{:x}, 0x{:x})",
+                region.start,
+                region.end
+            );
+            if let Some(prev) = prev_end {
+                assert!(
+                    prev <= region.start,
+                    "mappings must be strictly increasing and non-overlapping: prev_end 0x{:x} > start 0x{:x}",
+                    prev,
+                    region.start
+                );
+            }
+            prev_end = Some(region.end);
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    fn assert_invariants(&self) {}
+
+    pub(crate) fn insert(&mut self, mut region: HvfMappedRegion) {
+        // Check predecessor (strictly before region.start)
+        let pred_key = self
+            .0
+            .range(..GuestVa(region.start))
+            .next_back()
+            .map(|(k, _)| *k);
+        if let Some(pred_key) = pred_key {
+            let can_merge = {
+                let pred = &self.0[&pred_key];
+                can_coalesce_mappings(pred, &region)
+            };
+            if can_merge {
+                let mut pred = self.0.remove(&pred_key).unwrap();
+                coalesce_mappings_into_left(&mut pred, region);
+                region = pred;
+            }
+        }
+
+        // Check successor (at region.end)
+        let succ_key = GuestVa(region.end);
+        let can_merge_succ = self
+            .0
+            .get(&succ_key)
+            .is_some_and(|succ| can_coalesce_mappings(&region, succ));
+        if can_merge_succ {
+            let succ = self.0.remove(&succ_key).unwrap();
+            coalesce_mappings_into_left(&mut region, succ);
+        }
+
+        self.0.insert(GuestVa(region.start), region);
+        self.assert_invariants();
+    }
+
+    pub(crate) fn remove_range(&mut self, va: GuestVa, len: usize) {
+        let Some(end) = va.0.checked_add(len as u64) else {
+            return;
+        };
+        let mut to_remove = Vec::new();
+        if let Some((&k, m)) = self.0.range(..va).next_back() {
+            if m.end > va.0 {
+                to_remove.push(k);
+            }
+        }
+        for (&k, _) in self.0.range(va..GuestVa(end)) {
+            to_remove.push(k);
+        }
+        for k in to_remove {
+            self.0.remove(&k);
+        }
+        self.assert_invariants();
+    }
+
+    pub(crate) fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&HvfMappedRegion) -> bool,
+    {
+        self.0.retain(|_, v| f(v));
+        self.assert_invariants();
+    }
+
+    pub(crate) fn split_for_unmap(&mut self, va: GuestVa, len: usize) {
+        let Some(end) = va.0.checked_add(len as u64) else {
+            return;
+        };
+        let mut candidate_keys = Vec::new();
+        if let Some((&k, m)) = self.0.range(..va).next_back() {
+            if m.end > va.0 {
+                candidate_keys.push(k);
+            }
+        }
+        for (&k, _) in self.0.range(va..GuestVa(end)) {
+            candidate_keys.push(k);
+        }
+
+        let mut tails = Vec::new();
+        for k in candidate_keys {
+            let Some(mut row) = self.0.remove(&k) else {
+                continue;
+            };
+            if !row.is_dynamic_alias {
+                self.0.insert(k, row);
+                continue;
+            }
+            let row_size = semantic_extent_size(row.start, row.end);
+            let Some(row_end) = row.start.checked_add(row_size as u64) else {
+                self.0.insert(k, row);
+                continue;
+            };
+            if row_end <= va.0 || row.start >= end {
+                self.0.insert(k, row);
+                continue;
+            }
+            let head_survives = row.start < va.0;
+            let tail_survives = row_end > end;
+            if tail_survives {
+                let delta = end.saturating_sub(row.start);
+                tails.push(HvfMappedRegion {
+                    start: end,
+                    end: row.end,
+                    ipa: row.ipa.saturating_add(delta),
+                    physical_ipa: row.physical_ipa,
+                    physical_size: row.physical_size,
+                    host_addr: row.host_addr.wrapping_add(delta as usize),
+                    size: usize::try_from(row_end.saturating_sub(end)).unwrap_or_default(),
+                    perms: row.perms,
+                    memory: None,
+                    host_mapping: None,
+                    structural_owner: row.structural_owner.clone(),
+                    stage2_lease: None,
+                    is_dynamic_alias: true,
+                    sharing: row.sharing,
+                    guest_writable: row.guest_writable,
+                    shared_key_base: row.shared_key_base,
+                    shared_key_offset: row.shared_key_offset.saturating_add(delta),
+                    owner_generation: row.owner_generation,
+                });
+            }
+            if head_survives {
+                row.end = va.0;
+                row.size = usize::try_from(va.0.saturating_sub(row.start)).unwrap_or_default();
+                self.0.insert(GuestVa(row.start), row);
+            }
+        }
+
+        for tail in tails {
+            self.0.insert(GuestVa(tail.start), tail);
+        }
+
+        self.assert_invariants();
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn get(&self, key: &GuestVa) -> Option<&HvfMappedRegion> {
+        self.0.get(key)
+    }
+
+    pub(crate) fn first(&self) -> Option<&HvfMappedRegion> {
+        self.0.values().next()
+    }
+
+    pub(crate) fn first_mut(&mut self) -> Option<&mut HvfMappedRegion> {
+        self.0.values_mut().next()
+    }
+
+    pub(crate) fn last(&self) -> Option<&HvfMappedRegion> {
+        self.0.values().next_back()
+    }
+
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &HvfMappedRegion> {
+        self.0.values()
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut HvfMappedRegion> {
+        self.0.values_mut()
+    }
+
+    pub(crate) fn values(&self) -> impl DoubleEndedIterator<Item = &HvfMappedRegion> {
+        self.0.values()
+    }
+
+    pub(crate) fn into_values(self) -> impl DoubleEndedIterator<Item = HvfMappedRegion> {
+        self.0.into_values()
+    }
+
+    pub(crate) fn range<R>(
+        &self,
+        range: R,
+    ) -> impl DoubleEndedIterator<Item = (&GuestVa, &HvfMappedRegion)>
+    where
+        R: std::ops::RangeBounds<GuestVa>,
+    {
+        self.0.range(range)
+    }
+
+    pub(crate) fn mapping_for_range(&self, va: GuestVa, length: usize) -> Option<&HvfMappedRegion> {
+        let (_, mapping) = self.0.range(..=va).next_back()?;
+        if mapping.contains_range(va.0, length) {
+            Some(mapping)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn has_range_overlap(&self, start: GuestVa, end: GuestVa) -> bool {
+        if self.0.range(start..end).next().is_some() {
+            return true;
+        }
+        if let Some((_, m)) = self.0.range(..start).next_back() {
+            if m.end > start.0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn take_structural_owner(
+        &mut self,
+        ipa: u64,
+        length: u64,
+    ) -> Option<(GuestVa, std::sync::Arc<StructuralBackingOwner>)> {
+        for (&va, mapping) in self.0.iter_mut() {
+            let matches = mapping.structural_owner.as_ref().is_some_and(|owner| {
+                (mapping.physical_ipa, mapping.physical_size as u64) == (ipa, length)
+                    || (owner.physical_ipa <= ipa
+                        && ipa.checked_add(length).is_some_and(|candidate_end| {
+                            owner
+                                .physical_ipa
+                                .checked_add(owner.physical_size as u64)
+                                .is_some_and(|owner_end| candidate_end <= owner_end)
+                        }))
+            });
+            if matches {
+                let owner = mapping.structural_owner.take()?;
+                return Some((va, owner));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn restore_structural_owner(
+        &mut self,
+        va: GuestVa,
+        owner: std::sync::Arc<StructuralBackingOwner>,
+    ) {
+        if let Some(m) = self.0.get_mut(&va) {
+            m.structural_owner = Some(owner);
+        }
+    }
+
+    pub(crate) fn take_stage2_lease(
+        &mut self,
+        ipa: u64,
+        length: u64,
+    ) -> Option<GlobalFrameStage2Lease> {
+        for mapping in self.0.values_mut() {
+            let matches = mapping.stage2_lease.as_ref().is_some_and(|lease| {
+                let (base, len) = lease.key();
+                base <= ipa && ipa.checked_add(length).is_some_and(|end| end <= base + len)
+            });
+            if matches {
+                return mapping.stage2_lease.take();
+            }
+        }
+        None
+    }
+
+    pub(crate) fn take_exact_unowned_stage2_lease(
+        &mut self,
+        ipa: u64,
+        length: u64,
+        host_addr: usize,
+    ) -> Option<GlobalFrameStage2Lease> {
+        let expected = InventoryStage2OwnerIdentity {
+            host_addr,
+            generation: 0,
+        };
+        for mapping in self.0.values_mut() {
+            let exact_owner = mapped_region_stage2_owner_identity(mapping) == Some(expected);
+            let exact_lease = mapping
+                .stage2_lease
+                .as_ref()
+                .is_some_and(|lease| lease.key() == (ipa, length) && lease.active && lease.mapped);
+            if exact_owner && exact_lease {
+                return mapping.stage2_lease.take();
+            }
+        }
+        None
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl FromIterator<HvfMappedRegion> for TaskMappingIndex {
+    fn from_iter<I: IntoIterator<Item = HvfMappedRegion>>(iter: I) -> Self {
+        let mut index = Self::new();
+        for region in iter {
+            index.insert(region);
+        }
+        index
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Extend<HvfMappedRegion> for TaskMappingIndex {
+    fn extend<T: IntoIterator<Item = HvfMappedRegion>>(&mut self, iter: T) {
+        for region in iter {
+            self.insert(region);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl IntoIterator for TaskMappingIndex {
+    type Item = HvfMappedRegion;
+    type IntoIter = std::collections::btree_map::IntoValues<GuestVa, HvfMappedRegion>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_values()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> IntoIterator for &'a TaskMappingIndex {
+    type Item = &'a HvfMappedRegion;
+    type IntoIter = std::collections::btree_map::Values<'a, GuestVa, HvfMappedRegion>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.values()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> IntoIterator for &'a mut TaskMappingIndex {
+    type Item = &'a mut HvfMappedRegion;
+    type IntoIter = std::collections::btree_map::ValuesMut<'a, GuestVa, HvfMappedRegion>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.values_mut()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn can_coalesce_mappings(left: &HvfMappedRegion, right: &HvfMappedRegion) -> bool {
+    if left.end != right.start {
+        return false;
+    }
+    if left.owner_generation != right.owner_generation {
+        return false;
+    }
+    match (&left.structural_owner, &right.structural_owner) {
+        (None, None) => {}
+        (Some(a), Some(b)) if std::sync::Arc::ptr_eq(a, b) => {}
+        _ => return false,
+    }
+    if left.perms != right.perms
+        || left.is_dynamic_alias != right.is_dynamic_alias
+        || left.sharing != right.sharing
+        || left.guest_writable != right.guest_writable
+    {
+        return false;
+    }
+    if left.memory.is_some()
+        || right.memory.is_some()
+        || left.host_mapping.is_some()
+        || right.host_mapping.is_some()
+        || left.stage2_lease.is_some()
+        || right.stage2_lease.is_some()
+    {
+        return false;
+    }
+    if left.ipa.saturating_add(left.size as u64) != right.ipa {
+        return false;
+    }
+    if !left.host_addr.is_null() || !right.host_addr.is_null() {
+        if (left.host_addr as usize).saturating_add(left.size) != (right.host_addr as usize) {
+            return false;
+        }
+    }
+    if left.shared_key_base != right.shared_key_base {
+        return false;
+    }
+    if left.shared_key_base != 0 {
+        if left.shared_key_offset.saturating_add(left.size as u64) != right.shared_key_offset {
+            return false;
+        }
+    } else if left.shared_key_offset != 0 || right.shared_key_offset != 0 {
+        return false;
+    }
+    let adjacent_physical =
+        left.physical_ipa.saturating_add(left.physical_size as u64) == right.physical_ipa;
+    let same_compound =
+        left.physical_ipa == right.physical_ipa && left.physical_size == right.physical_size;
+    if !adjacent_physical && !same_compound {
+        return false;
+    }
+    true
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn coalesce_mappings_into_left(left: &mut HvfMappedRegion, right: HvfMappedRegion) {
+    let adjacent_physical =
+        left.physical_ipa.saturating_add(left.physical_size as u64) == right.physical_ipa;
+    left.end = right.end;
+    left.size += right.size;
+    if adjacent_physical {
+        left.physical_size += right.physical_size;
+    }
 }
 
 /// Snapshot of vCPU register state used for reclaim and executor rebinding.
@@ -30596,9 +31080,11 @@ fn is_persistent_executor_carrier_address(address: u64) -> bool {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn persistent_executor_carrier_mappings(mappings: &[HvfMappedRegion]) -> Vec<ThreadMappingDesc> {
+fn persistent_executor_carrier_mappings<'a>(
+    mappings: impl IntoIterator<Item = &'a HvfMappedRegion>,
+) -> Vec<ThreadMappingDesc> {
     mappings
-        .iter()
+        .into_iter()
         .filter(|mapping| is_persistent_executor_carrier_mapping(mapping))
         .map(ThreadMappingDesc::from_region)
         .collect()
@@ -30609,7 +31095,7 @@ fn persistent_executor_carrier_mappings(mappings: &[HvfMappedRegion]) -> Vec<Thr
 /// drops only after every worker vCPU has been joined and destroyed.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct PersistentCarrierMappings {
-    mappings: Vec<HvfMappedRegion>,
+    mappings: TaskMappingIndex,
     custody: std::sync::Arc<CarrierVmCustody>,
     vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool,
 }
@@ -30617,16 +31103,16 @@ struct PersistentCarrierMappings {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PersistentCarrierMappings {
     fn extract(
-        task_mappings: &mut Vec<HvfMappedRegion>,
+        task_mappings: &mut TaskMappingIndex,
         custody: std::sync::Arc<CarrierVmCustody>,
     ) -> Result<Self, TrapError> {
-        let mut carrier = Vec::with_capacity(5);
-        let mut task = Vec::with_capacity(task_mappings.len());
-        for mapping in std::mem::take(task_mappings) {
+        let mut carrier = TaskMappingIndex::new();
+        let mut task = TaskMappingIndex::new();
+        for mapping in std::mem::take(task_mappings).into_values() {
             if is_persistent_executor_carrier_mapping(&mapping) {
-                carrier.push(mapping);
+                carrier.insert(mapping);
             } else {
-                task.push(mapping);
+                task.insert(mapping);
             }
         }
         *task_mappings = task;
@@ -30668,11 +31154,7 @@ impl PersistentCarrierMappings {
     }
 
     fn host_pointer(&self, address: u64, length: usize) -> Option<std::ptr::NonNull<u8>> {
-        let end = address.checked_add(u64::try_from(length).ok()?)?;
-        let mapping = self
-            .mappings
-            .iter()
-            .find(|mapping| address >= mapping.start && end <= mapping.end)?;
+        let mapping = self.mappings.mapping_for_range(GuestVa(address), length)?;
         let offset = usize::try_from(address.checked_sub(mapping.start)?).ok()?;
         std::ptr::NonNull::new(unsafe { mapping.host_addr.add(offset) })
     }
@@ -30703,7 +31185,7 @@ impl Drop for PersistentCarrierMappings {
         let vm_destroyed = self
             .vm_destroyed_after_custody_commit
             .load(std::sync::atomic::Ordering::Acquire);
-        for mut mapping in self.mappings.drain(..) {
+        for mut mapping in std::mem::take(&mut self.mappings).into_values() {
             if let Some(mut lease) = mapping.stage2_lease.take() {
                 // Retire EXPLICITLY. Dropping a lease does not unmap stage-2 --
                 // it only releases the IPA reservation and (in a debug build)
@@ -35598,7 +36080,7 @@ impl HvfVmState {
 
     fn retire_stage2_extent_from_mappings_in(
         custody: &CarrierVmCustody,
-        mappings: &mut [HvfMappedRegion],
+        mappings: &mut TaskMappingIndex,
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
@@ -35612,24 +36094,8 @@ impl HvfVmState {
         {
             return Ok(());
         }
-        let structural_claim = mappings.iter().position(|mapping| {
-            mapping.structural_owner.as_ref().is_some_and(|owner| {
-                (mapping.physical_ipa, mapping.physical_size as u64) == (ipa, length)
-                    || (owner.physical_ipa <= ipa
-                        && ipa.checked_add(length).is_some_and(|candidate_end| {
-                            owner
-                                .physical_ipa
-                                .checked_add(owner.physical_size as u64)
-                                .is_some_and(|owner_end| candidate_end <= owner_end)
-                        }))
-            })
-        });
-        if let Some(index) = structural_claim {
-            let owner = mappings[index]
-                .structural_owner
-                .take()
-                .unwrap_or_else(|| unreachable!("structural claim lost its owner"));
-            let mapping = &mappings[index];
+        if let Some((va, owner)) = mappings.take_structural_owner(ipa, length) {
+            let mapping = mappings.get(&va).expect("mapping exists");
             let identity = authenticated_structural_owner_record_in(
                 custody,
                 &owner,
@@ -35642,7 +36108,7 @@ impl HvfVmState {
             let Some(identity) = identity
                 .filter(|_| mapping.physical_ipa == ipa && mapping.physical_size as u64 == length)
             else {
-                mappings[index].structural_owner = Some(owner);
+                mappings.restore_structural_owner(va, owner);
                 return Err(TrapError::Hypervisor(format!(
                     "structural retirement owner for IPA 0x{ipa:x} size {length} is not the exact current custody owner"
                 )));
@@ -35664,11 +36130,11 @@ impl HvfVmState {
                 &mut release_retired_stage2_ipa,
             );
             if let Err(error) = retirement {
-                mappings[index].structural_owner = Some(owner);
+                mappings.restore_structural_owner(va, owner);
                 return Err(error);
             }
             if custody.stage2_record_snapshot(identity.record_id).is_some() {
-                mappings[index].structural_owner = Some(owner);
+                mappings.restore_structural_owner(va, owner);
                 return Err(TrapError::Hypervisor(format!(
                     "structural retirement owner for IPA 0x{ipa:x} size {length} did not reach terminal retirement"
                 )));
@@ -35676,14 +36142,7 @@ impl HvfVmState {
             drop(owner);
             return Ok(());
         }
-        if let Some(lease) = mappings.iter_mut().find_map(|mapping| {
-            (mapping.stage2_lease.as_ref().is_some_and(|lease| {
-                let (base, len) = lease.key();
-                base <= ipa && ipa.checked_add(length).is_some_and(|end| end <= base + len)
-            }))
-            .then(|| mapping.stage2_lease.take())
-            .flatten()
-        }) {
+        if let Some(lease) = mappings.take_stage2_lease(ipa, length) {
             drop(lease);
             return Ok(());
         }
@@ -35716,30 +36175,17 @@ impl HvfVmState {
 
     fn retire_unowned_stage2_extent_from_mappings_in(
         custody: &CarrierVmCustody,
-        mappings: &mut [HvfMappedRegion],
+        mappings: &mut TaskMappingIndex,
         ipa: u64,
         length: u64,
         host_addr: usize,
     ) -> Result<(), TrapError> {
-        let expected = InventoryStage2OwnerIdentity {
-            host_addr,
-            generation: 0,
-        };
         if let Some(live) = global_frame_host_owner_identity_in(custody, ipa, length) {
             return Err(TrapError::Hypervisor(format!(
                 "unowned stage-2 retirement {ipa:#x}/{length:#x} found live global owner {live:?}"
             )));
         }
-        if let Some(lease) = mappings.iter_mut().find_map(|mapping| {
-            let exact_owner = mapped_region_stage2_owner_identity(mapping) == Some(expected);
-            let exact_lease = mapping
-                .stage2_lease
-                .as_ref()
-                .is_some_and(|lease| lease.key() == (ipa, length) && lease.active && lease.mapped);
-            (exact_owner && exact_lease)
-                .then(|| mapping.stage2_lease.take())
-                .flatten()
-        }) {
+        if let Some(lease) = mappings.take_exact_unowned_stage2_lease(ipa, length, host_addr) {
             drop(lease);
             return Ok(());
         }
@@ -35765,7 +36211,7 @@ impl HvfVmState {
 
     #[cfg(test)]
     fn retire_stage2_extent_from_mappings(
-        mappings: &mut [HvfMappedRegion],
+        mappings: &mut TaskMappingIndex,
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
@@ -35779,7 +36225,7 @@ impl HvfVmState {
 
     #[cfg(test)]
     fn retire_unowned_stage2_extent_from_mappings(
-        mappings: &mut [HvfMappedRegion],
+        mappings: &mut TaskMappingIndex,
         ipa: u64,
         length: u64,
         host_addr: usize,
