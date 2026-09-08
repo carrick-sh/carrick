@@ -561,7 +561,7 @@ pub enum RingReadError {
 }
 
 const fn known_kind(kind: u8) -> bool {
-    kind >= BIND && kind <= HVPBLOCK_ARGS
+    kind >= BIND && kind <= HVPSETTLE
 }
 
 fn read_slot_after(
