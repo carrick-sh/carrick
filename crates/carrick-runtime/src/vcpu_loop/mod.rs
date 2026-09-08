@@ -3605,6 +3605,8 @@ pub(crate) struct GraphCensus {
     zombies: usize,
     retired_threads: usize,
     runnable: usize,
+    /// Threads an executor currently holds a claim on.
+    claimed: usize,
 }
 
 impl GraphCensus {
@@ -3613,8 +3615,20 @@ impl GraphCensus {
     /// Zombies are deliberately NOT liveness: a zombie holds no thread and
     /// runs no code, and the wedge's own zombie is pid 1 with no parent — an
     /// unreapable remain, which is the evidence, not a reason to keep waiting.
+    ///
+    /// A CLAIM is liveness, and it is the signal the other two cannot see. A
+    /// thread is claimed from the moment an executor takes it until
+    /// `settle_exited` calls `finish_claim`, which spans the whole terminal
+    /// tail: the exit boundary, `PEXIT_BEGIN`, the terminal address-space
+    /// retirement, `PEXIT_END`, and the settlement that publishes the job. For
+    /// all of that the task is already a zombie (`tasks == 0`) and nothing is
+    /// queued (`runnable == 0`), so without this term the predicate calls a
+    /// carrier dead while the very settlement it is waiting for is running.
+    /// A genuinely stranded claim is released without settling — the count
+    /// drops and the verdict still fires — so this costs the invariant no
+    /// power over real wedges.
     const fn is_dead(&self) -> bool {
-        self.tasks == 0 && self.runnable == 0
+        self.tasks == 0 && self.runnable == 0 && self.claimed == 0
     }
 }
 
@@ -3666,6 +3680,10 @@ impl ProcessGraphLiveness {
                 .scheduler
                 .as_ref()
                 .map_or(0, |scheduler| scheduler.queued_len()),
+            claimed: self
+                .scheduler
+                .as_ref()
+                .map_or(0, |scheduler| scheduler.claimed()),
         })
     }
 
@@ -12548,6 +12566,7 @@ mod tests {
             zombies: 1,
             retired_threads: 4,
             runnable: 0,
+            claimed: 0,
         }
     }
 
@@ -12557,6 +12576,20 @@ mod tests {
             zombies: 0,
             retired_threads: 4,
             runnable: 1,
+            claimed: 1,
+        }
+    }
+
+    /// The graph a terminal settlement is IN FLIGHT on: the exiting task is
+    /// already a zombie and nothing is queued, but an executor still holds the
+    /// claim it will settle and publish from.
+    fn settling_census() -> GraphCensus {
+        GraphCensus {
+            tasks: 0,
+            zombies: 1,
+            retired_threads: 4,
+            runnable: 0,
+            claimed: 1,
         }
     }
 
@@ -12572,10 +12605,15 @@ mod tests {
                 tasks: 0,
                 zombies: 0,
                 retired_threads: 0,
-                runnable: 1
+                runnable: 1,
+                claimed: 0
             }
             .is_dead(),
             "a runnable row can still publish a result"
+        );
+        assert!(
+            !settling_census().is_dead(),
+            "an executor still holding a claim will settle and publish from it"
         );
     }
 
@@ -12631,6 +12669,43 @@ mod tests {
             "{:?}",
             post_mortem.reason
         );
+    }
+
+    /// A claim an executor still holds is liveness, however dead the registry
+    /// looks.
+    ///
+    /// The round-7 wedge: under load the container leader's terminal
+    /// address-space retirement (`PEXIT_BEGIN` -> `PEXIT_END`) runs for longer
+    /// than the confirm window while the executor still holds the claim it is
+    /// about to settle. `tasks` is already 0 (the task became a zombie) and
+    /// `runnable` is 0 (nothing is queued), so the census read DEAD and the
+    /// judge aborted a job whose `settle_exited` -> `publish_terminal_result`
+    /// landed microseconds later -- the ring shows `job-result-wait-abandoned`
+    /// immediately BEFORE `settle-exited-enter` and the matching
+    /// `job-result-published` on the very same `HvpatchLoopResultState`.
+    /// A claimed thread is the one liveness signal that covers that whole
+    /// window, so it belongs in the deadness predicate.
+    #[test]
+    fn an_outstanding_executor_claim_keeps_the_invariant_from_firing() {
+        let census = Arc::new(Mutex::new(Some(settling_census())));
+        let liveness = ProcessGraphLiveness::for_tests(
+            None,
+            Some(Arc::clone(&census)),
+            Duration::from_millis(20),
+        );
+        let result = HvpatchLoopResult::pending();
+        let publisher = result.clone();
+        let waiter = std::thread::spawn(move || result.wait_supervised(&liveness));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !waiter.is_finished(),
+            "the invariant fired while an executor still held the claim it settles from"
+        );
+        publisher.publish(Ok(VcpuLoopOutcome::ThreadDone));
+        assert!(matches!(
+            waiter.join().expect("waiter"),
+            Ok(VcpuLoopOutcome::ThreadDone)
+        ));
     }
 
     /// A live graph never trips it, however long the job takes. The verdict is

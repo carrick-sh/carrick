@@ -3877,6 +3877,17 @@ impl Scheduler {
         self.queue.len()
     }
 
+    /// Threads currently CLAIMED by an executor.
+    ///
+    /// A claimed thread is neither a registry task nor a queued row, so it is
+    /// invisible to both of the other liveness signals -- and a claim is
+    /// exactly the state a thread is in from its quantum's exit boundary,
+    /// through terminal address-space retirement, until `settle_exited` calls
+    /// `finish_claim`. A carrier holding one is still working.
+    pub fn claimed(&self) -> usize {
+        self.queue.inner.claimed.load(Ordering::Acquire)
+    }
+
     pub fn need_resched(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
     }
@@ -4049,7 +4060,7 @@ mod tests {
     };
     use crate::compat::SyscallArgs;
     use crate::dispatch::SyscallRequest;
-    use crate::kernel::objects::MigratableTaskState;
+    use crate::kernel::objects::{BlockedReason, MigratableTaskState, ThreadExecutionState};
     use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap};
     use crate::vcpu_loop::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationBackend, ContinuationCapture,
