@@ -4010,7 +4010,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 3188,
+      "line": 3213,
       "categories": [
         "table_guard"
       ],
@@ -4021,7 +4021,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 6489,
+      "line": 6533,
       "categories": [
         "table_guard"
       ],
@@ -4032,7 +4032,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 6520,
+      "line": 6564,
       "categories": [
         "table_guard"
       ],
