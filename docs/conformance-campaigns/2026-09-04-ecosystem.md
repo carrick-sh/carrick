@@ -3189,3 +3189,16 @@ load 17) — exactly the two survivors the triage named, nothing new;
 reducer 8/8; rows 6/6 MATCH (compile, mmap, mmap18, munmap01, go_types,
 itertools at load 7–13). `coredumpfile` attribution dispatched (probe-side
 thread wait under load, or carrick dropping threads from the core).
+
+**Round-7 landing receipt (main e7eb0338d, receipt files named 4cc18d085):**
+build/lint/shards 0 (`target/perf/land/{build,lint,shards}-4cc18d085.log`);
+reducer 8/8 (`RESULT label=post-r7 window=65536 rc=0 BUILDS=8 FAILS=0
+fatal_lines=0 abort=0` at load 16–22); all eleven goal rows MATCH with zero
+crashes/wedges at that load (`target/conformance/eco-load/post-r7.log`):
+go_types 571/571, net_http 1316/1316, runtime_pprof 93/93, asyncio
+2554/2554, compile 150/150, importlib 1256/1256, itertools 136/136,
+multiprocessing_main_handling 39/39, subprocess 297/297, tarfile 611/611,
+threading 202/202. Ratios not cited (load >5). The chain itself wedged six
+minutes on a gate marker grepped from the wrong log — rule recorded. The
+closing measurement (`quiet-close.sh`) now waits for a quiet host and pins
+its own copy of this binary.
