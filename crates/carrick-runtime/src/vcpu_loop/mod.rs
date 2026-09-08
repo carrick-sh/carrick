@@ -3548,6 +3548,20 @@ const LIVENESS_POLL: std::time::Duration = std::time::Duration::from_millis(250)
 /// job exists.
 const LIVENESS_CONFIRM: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How many confirm windows an executor claim may sit on an otherwise dead
+/// graph without crossing a claim boundary before it stops counting as
+/// liveness.
+///
+/// The claim term exists for the terminal tail -- exit boundary, `PEXIT_BEGIN`,
+/// terminal address-space retirement, `PEXIT_END`, settlement -- which under
+/// load runs for longer than one confirm window. It must not also excuse a
+/// claim nothing will ever release, so it is bounded rather than absolute. The
+/// bound is deliberately far above any tail ever measured (a claim that has
+/// crossed no boundary for 64 s at the shipped `LIVENESS_CONFIRM`) so that
+/// slowness is never mistaken for a wedge; the invariant's job is to turn an
+/// infinite park into a named abort, not to be quick about it.
+const LIVENESS_CLAIM_STALL_WINDOWS: u32 = 32;
+
 /// The always-on runner invariant of the kernel-audit design: a container job
 /// that cannot be published by anything must not be waited on forever.
 ///
@@ -3607,6 +3621,27 @@ pub(crate) struct GraphCensus {
     runnable: usize,
     /// Threads an executor currently holds a claim on.
     claimed: usize,
+    /// Claim BOUNDARIES the carrier has crossed. The edge term behind
+    /// `claimed`: a claim taken or finished bumps it, so an unchanged census
+    /// means no executor crossed a claim boundary, not merely that the same
+    /// NUMBER of claims is outstanding.
+    claim_boundaries: u64,
+}
+
+/// What a census says about a job's chance of ever being published.
+///
+/// Not a bool, because the two dead shapes are confirmed over different
+/// windows: an empty graph is dead as soon as it stops moving, while a graph
+/// whose only liveness is an executor claim is dead only once that claim has
+/// crossed no boundary for [`LIVENESS_CLAIM_STALL_WINDOWS`] of them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CensusVerdict {
+    /// A live task, or a queued row: something can still publish.
+    Live,
+    /// Nothing holds a thread and nothing is queued.
+    Dead,
+    /// Nothing but an outstanding executor claim.
+    ClaimedOnly,
 }
 
 impl GraphCensus {
@@ -3627,8 +3662,23 @@ impl GraphCensus {
     /// A genuinely stranded claim is released without settling — the count
     /// drops and the verdict still fires — so this costs the invariant no
     /// power over real wedges.
-    const fn is_dead(&self) -> bool {
-        self.tasks == 0 && self.runnable == 0 && self.claimed == 0
+    /// A claim is liveness only while it MOVES, though. An executor that
+    /// takes a claim and never releases it holds the census permanently
+    /// un-dead, so round 7's unconditional `claimed == 0` term handed this
+    /// invariant its own failure mode back: `wait_supervised` parks for the
+    /// life of the process behind one stranded claim, which is the hang the
+    /// invariant exists to remove, reached through a claim instead of an
+    /// empty graph. A settlement in flight and a stranded claim are identical
+    /// by INSPECTION and differ only in AGE, so the claim term is bounded --
+    /// see [`CensusVerdict::ClaimedOnly`] and [`LIVENESS_CLAIM_STALL_WINDOWS`].
+    const fn verdict(&self) -> CensusVerdict {
+        if self.tasks > 0 || self.runnable > 0 {
+            return CensusVerdict::Live;
+        }
+        if self.claimed > 0 {
+            return CensusVerdict::ClaimedOnly;
+        }
+        CensusVerdict::Dead
     }
 }
 
@@ -3684,6 +3734,10 @@ impl ProcessGraphLiveness {
                 .scheduler
                 .as_ref()
                 .map_or(0, |scheduler| scheduler.claimed()),
+            claim_boundaries: self
+                .scheduler
+                .as_ref()
+                .map_or(0, |scheduler| scheduler.claim_boundaries()),
         })
     }
 
@@ -3730,6 +3784,14 @@ impl ProcessGraphLiveness {
     /// The abort this carrier already suffered, if any.
     fn recorded(&self) -> Option<RuntimeError> {
         self.recorded.lock().as_ref().map(KernelAbortRecord::error)
+    }
+
+    /// How long a census whose only liveness is an executor claim must hold
+    /// unchanged before it is a verdict. See [`LIVENESS_CLAIM_STALL_WINDOWS`].
+    fn claim_stall(&self) -> std::time::Duration {
+        self.confirm
+            .saturating_mul(LIVENESS_CLAIM_STALL_WINDOWS)
+            .max(self.poll)
     }
 
     fn liveness_abort(&self, census: GraphCensus, unpublished_jobs: usize) -> RuntimeError {
@@ -3872,14 +3934,20 @@ impl HvpatchLoopResult {
                 // inventing a verdict.
                 continue;
             };
-            if !census.is_dead() {
-                confirming = None;
-                continue;
-            }
+            // How long this shape must hold before it becomes a verdict. An
+            // empty graph needs one confirm window; a graph whose only
+            // liveness is an executor claim needs that claim to have crossed
+            // no boundary for `LIVENESS_CLAIM_STALL_WINDOWS` of them.
+            let hold = match census.verdict() {
+                CensusVerdict::Live => {
+                    confirming = None;
+                    continue;
+                }
+                CensusVerdict::Dead => liveness.confirm,
+                CensusVerdict::ClaimedOnly => liveness.claim_stall(),
+            };
             match confirming {
-                Some((observed, since))
-                    if observed == census && since.elapsed() >= liveness.confirm =>
-                {
+                Some((observed, since)) if observed == census && since.elapsed() >= hold => {
                     return match self.take_published() {
                         // A settlement landed while the verdict was being
                         // formed. A real result always beats an abort: the job
@@ -12567,6 +12635,7 @@ mod tests {
             retired_threads: 4,
             runnable: 0,
             claimed: 0,
+            claim_boundaries: 12,
         }
     }
 
@@ -12577,6 +12646,7 @@ mod tests {
             retired_threads: 4,
             runnable: 1,
             claimed: 1,
+            claim_boundaries: 12,
         }
     }
 
@@ -12590,6 +12660,7 @@ mod tests {
             retired_threads: 4,
             runnable: 0,
             claimed: 1,
+            claim_boundaries: 12,
         }
     }
 
@@ -12598,22 +12669,26 @@ mod tests {
     /// EVIDENCE, not a reason to keep waiting for it to be reaped.
     #[test]
     fn a_graph_with_only_zombies_is_dead() {
-        assert!(dead_census().is_dead());
-        assert!(!live_census().is_dead());
-        assert!(
-            !GraphCensus {
+        assert_eq!(dead_census().verdict(), CensusVerdict::Dead);
+        assert_eq!(live_census().verdict(), CensusVerdict::Live);
+        assert_eq!(
+            GraphCensus {
                 tasks: 0,
                 zombies: 0,
                 retired_threads: 0,
                 runnable: 1,
-                claimed: 0
+                claimed: 0,
+                claim_boundaries: 12,
             }
-            .is_dead(),
+            .verdict(),
+            CensusVerdict::Live,
             "a runnable row can still publish a result"
         );
-        assert!(
-            !settling_census().is_dead(),
-            "an executor still holding a claim will settle and publish from it"
+        assert_eq!(
+            settling_census().verdict(),
+            CensusVerdict::ClaimedOnly,
+            "an executor still holding a claim will settle and publish from it, \
+             but only for as long as that claim keeps moving"
         );
     }
 
@@ -12706,6 +12781,45 @@ mod tests {
             waiter.join().expect("waiter"),
             Ok(VcpuLoopOutcome::ThreadDone)
         ));
+    }
+
+    /// ...but a claim is liveness only while it MOVES.
+    ///
+    /// Round 7 bought the test above by putting `claimed == 0` into the
+    /// deadness predicate, and in doing so handed the invariant's own failure
+    /// mode back: a claim an executor takes and never releases makes the
+    /// census permanently un-dead, so the judge never forms a verdict and
+    /// `wait_supervised` parks for the life of the process — the exact hang
+    /// this invariant exists to remove, now reachable through one stranded
+    /// claim instead of an empty graph.
+    ///
+    /// A settlement in flight and a stranded claim are indistinguishable by
+    /// INSPECTION — both are `tasks == 0, runnable == 0, claimed == 1`. They
+    /// differ only in AGE: a real terminal tail crosses a claim boundary and
+    /// moves the census; a stranded one never does. So the claim term is
+    /// bounded rather than unconditional.
+    #[test]
+    fn a_claim_that_never_makes_boundary_progress_is_eventually_dead() {
+        let census = Arc::new(Mutex::new(Some(settling_census())));
+        let liveness = ProcessGraphLiveness::for_tests(
+            None,
+            Some(Arc::clone(&census)),
+            Duration::from_millis(20),
+        );
+        let waiter =
+            std::thread::spawn(move || HvpatchLoopResult::pending().wait_supervised(&liveness));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !waiter.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            waiter.is_finished(),
+            "a claim held forever must not park the carrier forever"
+        );
+        let Err(RuntimeError::KernelAborted { reason, .. }) = waiter.join().expect("waiter") else {
+            panic!("a stranded claim must produce a named abort");
+        };
+        assert!(reason.contains("process-graph liveness"), "{reason}");
     }
 
     /// A live graph never trips it, however long the job takes. The verdict is
@@ -12861,7 +12975,7 @@ mod tests {
         let liveness = ProcessGraphLiveness::for_tests(Some(&kernel), None, LIVENESS_CONFIRM);
         let census = liveness.census().expect("a bound kernel answers a census");
         assert_eq!(census.tasks, 1, "the root task is live");
-        assert!(!census.is_dead());
+        assert_eq!(census.verdict(), CensusVerdict::Live);
     }
 
     /// A liveness bound to a kernel that has been dropped observes nothing and
