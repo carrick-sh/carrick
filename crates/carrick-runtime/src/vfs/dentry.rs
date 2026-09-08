@@ -2712,24 +2712,6 @@ impl DentryCache {
             .contains_key(&(dir_id, child_name.to_string()))
     }
 
-    /// Check whether the parent of `path` is proven to have no lower-layer backing.
-    /// Returns false only if the parent is cached and has lower_probed with no lower_dir_fd.
-    pub fn parent_has_lower_dir(&self, path: &str) -> bool {
-        let norm = path.trim_end_matches('/');
-        let norm = if norm.is_empty() { "/" } else { norm };
-        if let Some((parent_path, _)) = Self::split_parent_and_name(norm)
-            && let Some(parent_id) = self.find_parent_dir_id(parent_path)
-        {
-            let dirs = self.dirs.read();
-            if let Some(dir) = dirs.get(&parent_id) {
-                if dir.lower_probed && dir.lower_dir_fd.is_none() {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
     /// Check whether a directory is proven to have no lower-layer backing.
     /// Returns false only if the directory is cached and has lower_probed with no lower_dir_fd.
     pub fn has_lower_dir(&self, path: &str) -> bool {
