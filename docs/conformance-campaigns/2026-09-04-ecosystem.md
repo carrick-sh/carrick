@@ -2735,3 +2735,33 @@ load 17–45; five rows MATCH (`ltp-mmap18`, `ltp-mprotect01`, `go-go_types`,
 post-mortem kernel snapshot hits its 2 s deadline with 7 sibling processes
 live (`truncated`); the remaining go-build aborts are the scheduler
 observer class (round 5).
+
+### 2026-09-08 07:00 — compile round 4 landed: the residual was the alias VA-window walk (main 65b3c791c)
+
+New probes (`hvpatch-mapping-index-begin/-fault/-cost`, read by
+`scripts/dtrace/hvpatch-mapping-index-census.d`) put a number on every
+lookup a first-touch fault makes. The `TaskMappingIndex` visits 1.59–1.70
+rows per fault and that FALLS as its population grows 15x — it is not the
+residual. The `AliasRegistry` VA-window walk is: six sites asked
+`by_va_start.range(va - widest_va .. end)` with `widest_va` a monotone global
+maximum, so the walk length was a property of the population (111M rows
+visited at 800k depth against the index's 209K; 341 → 847 rows per fault
+as `widest_va` grew 6.3 → 16 MiB). Fix dbc428c52: VA rows keyed by
+`(ceil(log2(size)), start)` with an exact class multiset; one
+`va_window_rows` query at all six sites; `widest_va` deleted. Alias visits
+1,963,695 → 5,751 (341x) at 100k, 24,748,685 → 44,641 (554x) at 400k; 1.0
+row per fault; fault counts, index visits and populations identical across
+binaries (controls). Rows MATCH (compile 150/150, mmap, mmap18, munmap01,
+go_types); go-build reducer zero SIGSEGV / zero fatal in 16 runs; gates 0;
+director re-ran the 465 hvf lib tests serially. The briefed
+"one owner per VMA" change is retired: the index already visits 1.6 rows
+per fault, and extents are unmergeable by IPA/host-pointer adjacency (each
+materialization is its own `mmap`), not by owner label — merging them means
+changing what a materialization allocates. Not landed, deliberately: dropping
+handle-free shadowed rows breaks row identity for fork-inherited rows
+(pinned by a test); measured backlog is 1 row. Open: the fault count itself
+is still super-linear (8x depth = 22.8x faults, rows 14.9x, lumpy) — the
+next compile attribution; `widest_ipa` keeps the same latent shape; the
+`carrick-vmm-hvf` parallel-test flake is pre-existing on main. No citable
+ratio yet (load 9–55); a quiet-window compile re-measure is queued by the
+agent behind a load < 5 gate.
