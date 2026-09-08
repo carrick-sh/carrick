@@ -2604,3 +2604,12 @@ walk; `getdents64` at 3.3 opens/call is the largest remaining multiplier);
 the ratio is not citable (load 13–24). Next design item, from the worker:
 a per-path dirfd epoch instead of one global generation word, which also
 makes the cross-process re-stamp argument a type instead of a comment.
+
+**Post-tarfile gates (main 7d4a5d222, binary from build-7d4a5d222.log):**
+lint 0, probe shards 3/3, smoke incl. an `rmtree` sequence ok. The go-build
+reducer aborted once at load 32 on `scheduler generation observer lost
+exact transition` (crash report `carrick-2026-09-08-034418.ips`,
+`observe_generation_transition ← settle_blocked_continuation`), the
+exec-generation class whose fix (5d7efe418, settlement outcome instead of
+`?`) is on the scheduler branch and lands with round 4 — second instance
+on a main reducer tonight, both at load ≥ 30. Rows in `post-tarfile.log`.
