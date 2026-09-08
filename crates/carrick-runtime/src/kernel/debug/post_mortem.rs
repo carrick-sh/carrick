@@ -123,6 +123,52 @@ pub enum AbortReason {
     },
     /// A `KernelAuditor` verdict (lane A's judgement surface).
     Auditor { invariant: String, detail: String },
+    /// The HVPatch mmap alias-install arm could not finish an install the
+    /// backend had already committed to stage-2. Until 2026-09-08 these were
+    /// seven bare `abort()`s with no log line: the carrier died rc=134 with
+    /// empty stderr and the only evidence was a macOS crash report. Every
+    /// field is what the reader needed and did not have: which of the seven
+    /// sites, for which Linux task on which executor, over which mapping, and
+    /// — for a refused inventory publication — whether the frame the batch
+    /// names is still a candidate of some OTHER reserved, unapplied
+    /// transaction (a staged-but-unpublished sibling install), which is the
+    /// publication-order race signature.
+    HvpatchAliasInstall {
+        site: HvpatchAliasInstallSite,
+        guest_pid: i32,
+        guest_tid: i32,
+        executor: Option<String>,
+        mm: u64,
+        va: u64,
+        len: u64,
+        prot: u64,
+        shared: bool,
+        prot_none: bool,
+        error: String,
+        frame: Option<u64>,
+        pending_reservation: Option<u64>,
+    },
+}
+
+/// Which step of the HVPatch alias install refused. Ordered as the arm runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HvpatchAliasInstallSite {
+    /// `take_alias_inventory` returned no commit after a successful
+    /// `map_host_alias`: the backend broke its own staging contract.
+    InventoryCommitMissing,
+    /// The kernel frame-inventory authority refused the staged batch.
+    InventoryPublish,
+    /// The mapping length does not fit `usize` (unreachable on 64-bit hosts).
+    LenOverflow,
+    /// `protect_range(PROT_NONE)` failed on the freshly installed range.
+    ProtectNone,
+    /// The bus-fault tail length does not fit `usize`.
+    BusFaultLenOverflow,
+    /// `protect_range` failed on the bus-fault tail.
+    BusFaultProtect,
+    /// The dispatcher refused to commit the install it had itself claimed.
+    DispatcherCommit,
 }
 
 impl AbortReason {
@@ -169,6 +215,36 @@ impl AbortReason {
                 task.map_or_else(|| "?".to_owned(), |id| id.to_string())
             ),
             Self::Auditor { invariant, detail } => format!("auditor {invariant}: {detail}"),
+            Self::HvpatchAliasInstall {
+                site,
+                guest_pid,
+                guest_tid,
+                executor,
+                mm,
+                va,
+                len,
+                prot,
+                shared,
+                prot_none,
+                error,
+                frame,
+                pending_reservation,
+            } => {
+                let executor = executor.as_deref().unwrap_or("?");
+                let frame = frame.map_or_else(String::new, |frame| format!(" frame {frame}"));
+                let pending = match pending_reservation {
+                    Some(transaction) => format!(
+                        " — that frame is still a candidate of reserved, unapplied \
+                         transaction {transaction} (staged but not yet published)"
+                    ),
+                    None => String::new(),
+                };
+                format!(
+                    "hvpatch alias install {site:?} refused for guest pid {guest_pid} tid \
+                     {guest_tid} on {executor} (mm {mm:#x} va {va:#x} len {len:#x} prot \
+                     {prot:#x} shared={shared} prot_none={prot_none}){frame}: {error}{pending}"
+                )
+            }
         }
     }
 }

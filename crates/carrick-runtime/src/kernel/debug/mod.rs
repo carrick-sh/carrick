@@ -30,8 +30,8 @@ pub use dto::{
 };
 pub use endpoint::{DebugEndpoint, EndpointError};
 pub use post_mortem::{
-    AbortReason, CAPTURE_DEADLINE, POST_MORTEM_DIR_ENV, POST_MORTEM_SCHEMA, PostMortem, Truncated,
-    ZombieSummary, request_abort, take_abort_request,
+    AbortReason, CAPTURE_DEADLINE, HvpatchAliasInstallSite, POST_MORTEM_DIR_ENV,
+    POST_MORTEM_SCHEMA, PostMortem, Truncated, ZombieSummary, request_abort, take_abort_request,
 };
 pub use server::{KernelDebugServer, ServerError};
 pub use wire::{DEADLINE, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, WireError};

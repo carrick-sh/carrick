@@ -544,6 +544,23 @@ impl FrameInventoryAuthority {
     /// This is the population `RetireFrame` enforces, so a backend planning a
     /// retirement must gate on THIS number rather than on its own per-mm
     /// bookkeeping.
+    /// Diagnostic for a refused publication: the reserved, not-yet-applied
+    /// transaction (if any) holding `frame` as a candidate. A `PrepareMapping`
+    /// naming a frame the authority does not know can only be legitimate if
+    /// that frame is a candidate of THIS batch's reservation; a hit here on a
+    /// DIFFERENT transaction means a sibling staged the frame in the backend
+    /// (where a shared-file frame is visible to reusers from staging time)
+    /// but has not published it yet — the publication-order race. Linear in
+    /// the live reservation count, which is small; failure-path only.
+    pub fn pending_reservation_for_frame(&self, frame: FrameId) -> Option<KernelTransactionId> {
+        let state = self.state.lock();
+        state
+            .reservations
+            .iter()
+            .find(|(_, record)| record.frames.binary_search(&frame).is_ok())
+            .map(|(transaction, _)| *transaction)
+    }
+
     pub fn frame_mapping_count(&self, frame: FrameId) -> Option<usize> {
         let state = self.state.lock();
         state.frames.get(&frame).map(|entry| entry.mapping_count)
@@ -1034,6 +1051,23 @@ pub enum FrameInventoryError {
     RollbackReceiptMismatch(MappingId),
     #[error("test failpoint before event {0}")]
     InjectedFailure(usize),
+}
+
+impl FrameInventoryError {
+    /// The frame a refusal is about, when it is about one.
+    pub fn frame(&self) -> Option<FrameId> {
+        match self {
+            Self::UnreservedFrame(frame)
+            | Self::RetiredFrame(frame)
+            | Self::FrameStillMapped(frame)
+            | Self::RetireWithoutUnmap(frame)
+            | Self::MappingCountExhausted(frame)
+            | Self::MappingCountUnderflow(frame)
+            | Self::FrameGenerationMismatch { frame, .. }
+            | Self::FrameLengthMismatch { frame, .. } => Some(*frame),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
