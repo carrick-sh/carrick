@@ -8,7 +8,7 @@ use std::time::Duration;
 use carrick_runtime::kernel::objects::{ExecutionGeneration, ExecutorId, TaskKey};
 use carrick_runtime::observe::{
     AuditReason, AuditVerdict, ExitOwner, FirstTouchDeliverReason, ForkKind, GuestCpuId,
-    KernelAuditor, WakeRejectionReason,
+    KernelAuditor, WakeRejectionReason, ZombieReaper,
 };
 use parking_lot::Mutex;
 
@@ -23,16 +23,32 @@ pub enum InvariantKind {
     ExitBudget,
 }
 
-/// Invariant: A zombie must have a parent unless it is PID 1.
+/// Invariant: every zombie must have a reaper.
+///
+/// This used to read "a zombie must have a parent unless it is PID 1", testing
+/// `task.id.raw() != 1`. Both halves were wrong. `TaskKey::id` is a
+/// CARRIER-GLOBAL allocation, not an ns-pid, so the `!= 1` clause names the
+/// first task the carrier ever created rather than "this container's init" —
+/// in a carrier running a second container that container's init aborts on its
+/// own exit. And a parentless zombie is legitimate in more than the init case:
+/// when a container's init exits with descendants still alive, carrick's
+/// documented contract (`root_exit_before_descendant_exit_allows_orphan_
+/// teardown`) orphans them, and `retire_container` reaps the namespace's
+/// remains. So the invariant reported `pidnsorphanreap` — a probe whose
+/// grandchild deliberately outlives the init — as a kernel defect.
+///
+/// The kernel now states the reaper it recorded, and only
+/// [`ZombieReaper::Unreapable`] — no parent while the pid-namespace init was
+/// still live and should have adopted the task — is a dropped edge that
+/// nothing will ever consume.
 #[derive(Clone, Debug, Default)]
 pub struct NoOrphanZombie;
 
 impl KernelAuditor for NoOrphanZombie {
-    fn zombie_created(&self, task: TaskKey, parent: Option<TaskKey>) -> AuditVerdict {
-        if parent.is_none() && task.id.raw() != 1 {
-            AuditVerdict::Abort(AuditReason::OrphanZombie { task })
-        } else {
-            AuditVerdict::Continue
+    fn zombie_created(&self, task: TaskKey, reaper: ZombieReaper) -> AuditVerdict {
+        match reaper {
+            ZombieReaper::Unreapable => AuditVerdict::Abort(AuditReason::OrphanZombie { task }),
+            ZombieReaper::Parent(_) | ZombieReaper::ContainerRetirement => AuditVerdict::Continue,
         }
     }
 }
@@ -330,23 +346,42 @@ mod tests {
     #[test]
     fn test_no_orphan_zombie() {
         let auditor = NoOrphanZombie;
-        let pid1 = sample_task_key(1);
+        let init = sample_task_key(1);
         let child = sample_task_key(2);
         let parent = sample_task_key(3);
 
-        // PID 1 orphan is allowed
-        assert_eq!(auditor.zombie_created(pid1, None), AuditVerdict::Continue);
-
-        // Child with parent is allowed
+        // A live parent will wait(2) for it.
         assert_eq!(
-            auditor.zombie_created(child, Some(parent)),
+            auditor.zombie_created(child, ZombieReaper::Parent(parent)),
             AuditVerdict::Continue
         );
 
-        // Non-PID 1 orphan is aborted
+        // The namespace init itself has no parent by construction.
         assert_eq!(
-            auditor.zombie_created(child, None),
+            auditor.zombie_created(init, ZombieReaper::ContainerRetirement),
+            AuditVerdict::Continue
+        );
+
+        // Only a dropped reparent edge -- no parent while the namespace init
+        // was live and could have adopted it -- is a defect.
+        assert_eq!(
+            auditor.zombie_created(child, ZombieReaper::Unreapable),
             AuditVerdict::Abort(AuditReason::OrphanZombie { task: child })
+        );
+    }
+
+    /// The shape `pidnsorphanreap` produces, and the one the old
+    /// `parent == None && task.id != 1` test called a kernel defect: a task
+    /// whose pid-namespace init exited while it was still alive is parentless
+    /// AND has a reaper -- container retirement. A carrier-global `TaskId` is
+    /// not an ns-pid, so no auditor can tell these apart on its own.
+    #[test]
+    fn an_orphan_left_by_an_exited_namespace_init_is_not_a_defect() {
+        let auditor = NoOrphanZombie;
+        let grandchild = sample_task_key(4);
+        assert_eq!(
+            auditor.zombie_created(grandchild, ZombieReaper::ContainerRetirement),
+            AuditVerdict::Continue
         );
     }
 

@@ -62,6 +62,39 @@ impl fmt::Display for ExitOwner {
     }
 }
 
+/// Who the kernel recorded as able to reap a zombie at its publication.
+///
+/// An observer cannot derive this from the [`TaskKey`] alone. `TaskKey::id` is
+/// a carrier-global allocation, NOT an ns-pid, so "is this pid 1" is not a test
+/// an auditor can perform: in a carrier running two containers the second
+/// container's init has an id far above 1, and in a nested pid namespace the
+/// numeric identity an observer sees is not the one the guest sees. The kernel
+/// therefore states the answer rather than inviting every auditor to guess it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ZombieReaper {
+    /// A live parent task, which will observe the exit through `wait(2)`.
+    Parent(TaskKey),
+    /// The zombie has no parent, and no live pid-namespace init could have
+    /// adopted it — it either IS its container's init, or its init exited
+    /// first and left it behind. Carrick's container retirement is the reaper
+    /// of last resort for both, so the zombie is still consumed, exactly once.
+    ContainerRetirement,
+    /// The zombie has no parent even though its pid-namespace init was live
+    /// and should have adopted it: a dropped reparent edge, which no waiter and
+    /// no retirement path will ever consume.
+    Unreapable,
+}
+
+impl std::fmt::Display for ZombieReaper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parent(key) => write!(f, "parent({key})"),
+            Self::ContainerRetirement => write!(f, "container-retirement"),
+            Self::Unreapable => write!(f, "unreapable"),
+        }
+    }
+}
+
 /// Why a scheduler wake attempt was rejected.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum WakeRejectionReason {
@@ -118,7 +151,10 @@ impl fmt::Display for AuditReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OrphanZombie { task } => {
-                write!(f, "orphan zombie without parent (not pid 1): {task}")
+                write!(
+                    f,
+                    "zombie {task} has no parent although its pid-namespace init was live"
+                )
             }
             Self::ProcessGraphEmptyWithUnpublishedJobs { unpublished_jobs } => {
                 write!(
@@ -207,7 +243,7 @@ pub trait KernelAuditor: Send + Sync {
     ) -> AuditVerdict {
         AuditVerdict::Continue
     }
-    fn zombie_created(&self, _task: TaskKey, _parent: Option<TaskKey>) -> AuditVerdict {
+    fn zombie_created(&self, _task: TaskKey, _reaper: ZombieReaper) -> AuditVerdict {
         AuditVerdict::Continue
     }
     fn reaped(&self, _parent: TaskKey, _child: TaskKey) -> AuditVerdict {
@@ -374,12 +410,12 @@ impl AuditorChain {
         AuditVerdict::Continue
     }
 
-    pub fn zombie_created(&self, task: TaskKey, parent: Option<TaskKey>) -> AuditVerdict {
+    pub fn zombie_created(&self, task: TaskKey, reaper: ZombieReaper) -> AuditVerdict {
         if let Some(reason) = self.abort_reason() {
             return AuditVerdict::Abort(reason);
         }
         for auditor in &self.auditors {
-            let verdict = auditor.zombie_created(task, parent);
+            let verdict = auditor.zombie_created(task, reaper);
             if !verdict.is_continue() {
                 return self.check_or_record(verdict);
             }
@@ -590,7 +626,7 @@ mod tests {
             AuditVerdict::Continue
         }
 
-        fn zombie_created(&self, task: TaskKey, _parent: Option<TaskKey>) -> AuditVerdict {
+        fn zombie_created(&self, task: TaskKey, _reaper: ZombieReaper) -> AuditVerdict {
             self.zombie_created_count.fetch_add(1, Ordering::SeqCst);
             if self.abort_on_zombie {
                 AuditVerdict::Abort(AuditReason::OrphanZombie { task })
@@ -696,7 +732,11 @@ mod tests {
         );
         assert_eq!(auditor.first_touch_count.load(Ordering::SeqCst), 1);
 
-        assert!(chain.zombie_created(child, Some(parent)).is_continue());
+        assert!(
+            chain
+                .zombie_created(child, ZombieReaper::Parent(parent))
+                .is_continue()
+        );
         assert_eq!(auditor.zombie_created_count.load(Ordering::SeqCst), 1);
 
         let wait_status = LinuxWaitStatus::from_wait_encoding(0);
@@ -738,7 +778,7 @@ mod tests {
         );
 
         // zombie_created returns Abort
-        let verdict = chain.zombie_created(child, None);
+        let verdict = chain.zombie_created(child, ZombieReaper::Unreapable);
         assert_eq!(
             verdict,
             AuditVerdict::Abort(AuditReason::OrphanZombie { task: child })
