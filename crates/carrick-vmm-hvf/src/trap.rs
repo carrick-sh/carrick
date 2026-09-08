@@ -37459,6 +37459,14 @@ impl HvfVmState {
             .stage2_references
             .insert(stage2_lease, stage2_references);
         if matches!(backing, InventoryBackingIdentity::SharedFile { .. }) {
+            // From this point the frame is REUSABLE by the next installer of
+            // the same file (the `existing` lookup above), and a reuser's batch
+            // names it without reserving it. The authority accepts that only
+            // once this frame is published, so whoever stages a fresh shared
+            // frame must publish it before releasing the topology lock the
+            // staging ran under (`vcpu_loop` alias-install arm). Publishing
+            // after the release let a reuser publish first and aborted the
+            // carrier with `UnreservedFrame` (2026-09-08).
             frames.shared.entry(backing).or_insert(frame);
         }
         drop(frames);
