@@ -2794,3 +2794,92 @@ tonight):** smoke ok, go-build reducer 8/8 zero fatal, rows 6/6 MATCH:
 `go-go_types` 20.0 s / 3.23x, `ltp-mmap18` 0.46x, `ltp-munmap01` 0.29x.
 Lint 0, probe shards 3/3. Disk: swept the build trees of eight landed,
 idle worktrees (66 GiB; 30 → 96 GiB free).
+### 2026-09-08 — scheduler round 5: the go_types wedge closed
+
+Branch `agy/guest-cpu-sep07`, rebased onto `4ba654760`. Two defects, one
+ending. `go_types` wedged eight times under round 4 — guest at `PASS`, every
+Kernel task retired, eighteen executors parked in `take_row`, main in
+`wait_process_jobs → HvpatchLoopResult::wait` — and aborted on other runs of
+the same shape with `lost exact transition … kernel_view=thread absent from
+registry` (`target/conformance/raw/conf-13842-c00.err`).
+
+1. **The reaped settlement published nothing.** Rounds 3/4 made such a
+   settlement finish and retire its binding, but never published the thread's
+   own result: no successor, so no executor runs it again and no exit or exec
+   path names it — its `HvpatchLoopResult` had no publisher at all.
+   `SettlementDisposition` now reports `TargetReaped` out of
+   `settle_blocked`/`settle_blocked_continuation`/`settle_runnable_successor`,
+   and the executor publishes `ThreadDone` through the job's own settlement
+   (`after_reaped_settlement`), exactly as the lost-process-exit-claim path
+   does. Only the successor is still withheld.
+2. **"Reaped" was decided from registry ABSENCE.** It is now decided from the
+   kernel graph: the thread object's typed `Thread::execution_state`, plus the
+   two terminal facts it cannot carry (the thread is in `retired_threads`, or
+   its task is a zombie). Absence alone is `Reachable`. The
+   `LostExactTransition` arm stopped being `std::process::abort()` — it goes
+   through lane B's sink as `AbortReason::LostExactTransition` naming the
+   tid/serial, both generations, the transition kind, the typed execution
+   state and the registry view, so the carrier ends in `kernel aborted: …`
+   with a post-mortem instead of a bare signal.
+
+The rebase also ported the **claimability gate** onto the per-CPU queues:
+`QueueKeyShard` holds `queued`/`unpublished`/`deferred` together, so a
+deferred row is on no CPU deque at all — on this representation "not
+claimable" also means "not stealable" and "not reachable by a nudge".
+`publish` is the one transition that lifts the gate and places the row.
+Main's two gate tests run unchanged against it. Two branch tests that
+admitted an authority and then relied on a raw enqueue being claimable
+wedged `take` for six minutes until they were switched to publish through
+the authority — the gate's own evidence that the port is real.
+
+**Red-first receipts (pre-fix binary, same tree):**
+`a_reaped_yield_publishes_the_process_job_it_would_have_stranded` FAILED at
+`finished in 60.03s` — the 60 s `recv_timeout` expiring with nothing
+published; and the classification scenario asserted as
+`retired = [(thread, generation)]` PASSED, i.e. round 4 did call registry
+absence a reap.
+
+**go_types, 5 interleaved pairs** (mine `89906ec7c` /
+`b942632acefe5f65…` vs base `4ba654760` / `a77e7021f12bffac…`, order
+alternated, `--carrick-timeout-cap-s 0` so the declared 360 s budget applies
+rather than the harness's 21 s adaptive one — under which BOTH arms time out):
+
+| pair | mine | main | load before mine / main |
+|---|---|---|---|
+| 1 | MATCH 571/571, 35 s | MATCH 571/571, 36 s | 9.83 / 10.13 |
+| 2 | MATCH 571/571, 85 s | MATCH 571/571, 33 s | 8.63 / 11.20 |
+| 3 | MATCH 571/571, 62 s | MATCH 571/571, 31 s | 18.55 / 18.72 |
+| 4 | MATCH 571/571, 30 s | MATCH 571/571, 31 s | 12.27 / 14.50 |
+| 5 | MATCH 571/571, 58 s | MATCH 571/571, 65 s | 10.78 / 15.36 |
+
+10/10 runs `rc=0`, **zero wedges, zero watchdog reaps** (no new directory
+under `target/perf/wedges` in the window; last reap 05:00:34, before the
+first run) and **zero `kernel aborted` lines**. Host load 8.6–18.7
+throughout, so the per-run seconds are not citable as a ratio — only
+"returned" vs "never returns" is being measured, which is the defect.
+
+Gates on `89906ec7c`: `just clippy` 0, `just lint-domains` 0 (the
+host-authority census is the usual local subset: the six cross-target
+profiles are pending), `just test` 0 (9962 passing test results across the
+matrix, 0 failed), `just build` 0 (signed, entitlement present,
+`__dof_carrick` present).
+
+**The four cpython rows** (same two binaries, `--carrick-timeout-cap-s 0`):
+base 4/4 MATCH (asyncio 2554/2554, importlib 1256/1256, mp_main 39/39,
+subprocess 297/297, 88 s, load 6.39); mine 3/4 MATCH with
+`cpython-asyncio` CARRICK_CRASH at 667/2554 (73 s, load 14.63). Attributed
+rather than assumed: a dedicated interleaved `cpython-asyncio` pair put the
+crash on the OTHER side — **mine MATCH 2554/2554 (97 s, load 11.23), base
+CARRICK_CRASH 667/2554 (41 s, load 9.18)**. The signature on the base arm is
+main's own dispatched activation-window residual, not this lane's:
+`generation observer has no binding record for the predecessor generation …
+kernel_view=Failed { generation: 2, reason: SnapshotRestoreFailed }`, which
+round 4's classifier calls a lost transition (the thread is present in the
+registry) and aborts on. Round 5's classifier calls `Failed` TERMINAL, so the
+same shape settles, publishes `ThreadDone` and the run continues — which is
+why the crash flips arms. So: the row is load-probabilistic on both binaries,
+the class is `brief-activation-residual.md`'s, and this change makes it
+survivable rather than carrier-fatal. NOT proven: whether making it
+survivable is the whole answer for that residual, or only removes its loudest
+symptom; and only one interleaved asyncio pair was completed before the
+session ended (the second base run was still going).
