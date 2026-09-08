@@ -29734,6 +29734,25 @@ pub(crate) struct TaskMappingIndex {
     /// Rows an overlapping insert displaced. Retained only so that displacing
     /// a row never changes when its handles drop.
     shadowed: Vec<HvfMappedRegion>,
+    /// Live rows ordered by stage-2 IPA base, `(row.ipa, row.start)` naming the
+    /// `live` key. Rows may share an IPA (a fork peer keeps the same physical
+    /// frame at another VA), so this is a set, not a map from IPA to row.
+    ///
+    /// This exists because the raw-IPA lookup the page-table walk does on EVERY
+    /// fault (`diagnostic_fault_page_tables` -> `host_ptr` ->
+    /// `mapping_for_ipa_range`) wants the page-table root row, which is
+    /// published early at a LOW guest VA. A reverse walk of the VA-ordered map
+    /// reaches it LAST, so without this index that lookup stays a full-table
+    /// scan -- and a reverse `BTreeMap` walk costs several times more per row
+    /// than the contiguous vector this type replaced, which measured as a NET
+    /// 1.39x REGRESSION (docs/perf-results/2026-09-08-mapping-index-measurement.md).
+    by_ipa: std::collections::BTreeSet<(u64, u64)>,
+    /// How many live rows have each `size`. Only the largest matters: it bounds
+    /// how far below a queried IPA a row that still covers it can begin, which
+    /// is what turns the IPA walk from unbounded into a short one. A monotone
+    /// high-water mark would be poisoned forever by one huge arena row, so the
+    /// exact multiset is kept.
+    ipa_span_counts: std::collections::BTreeMap<u64, usize>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -29742,7 +29761,47 @@ impl TaskMappingIndex {
         Self {
             live: std::collections::BTreeMap::new(),
             shadowed: Vec::new(),
+            by_ipa: std::collections::BTreeSet::new(),
+            ipa_span_counts: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Publish one row into the live map and both ordered views. Every live
+    /// insertion goes through here so the IPA view cannot drift.
+    fn live_insert(&mut self, region: HvfMappedRegion) {
+        self.by_ipa.insert((region.ipa, region.start));
+        *self.ipa_span_counts.entry(region.size as u64).or_insert(0) += 1;
+        if let Some(previous) = self.live.insert(GuestVa(region.start), region) {
+            // A same-start replacement: retire the row that left.
+            self.forget_ipa_entry(&previous);
+        }
+    }
+
+    /// Take one row out of the live map and both ordered views.
+    fn live_remove(&mut self, key: &GuestVa) -> Option<HvfMappedRegion> {
+        let row = self.live.remove(key)?;
+        self.forget_ipa_entry(&row);
+        Some(row)
+    }
+
+    fn forget_ipa_entry(&mut self, row: &HvfMappedRegion) {
+        self.by_ipa.remove(&(row.ipa, row.start));
+        if let std::collections::btree_map::Entry::Occupied(mut span) =
+            self.ipa_span_counts.entry(row.size as u64)
+        {
+            *span.get_mut() -= 1;
+            if *span.get() == 0 {
+                span.remove();
+            }
+        }
+    }
+
+    /// The largest `size` any live row has, or 0 when there are none.
+    fn max_ipa_span(&self) -> u64 {
+        self.ipa_span_counts
+            .last_key_value()
+            .map(|(span, _)| *span)
+            .unwrap_or_default()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -29809,7 +29868,7 @@ impl TaskMappingIndex {
                     .is_some_and(|left| can_coalesce_mappings(left, &region))
             });
         if let Some(key) = predecessor
-            && let Some(mut left) = self.live.remove(&key)
+            && let Some(mut left) = self.live_remove(&key)
         {
             coalesce_mappings_into_left(&mut left, region);
             region = left;
@@ -29820,12 +29879,12 @@ impl TaskMappingIndex {
             .live
             .get(&successor)
             .is_some_and(|right| can_coalesce_mappings(&region, right))
-            && let Some(right) = self.live.remove(&successor)
+            && let Some(right) = self.live_remove(&successor)
         {
             coalesce_mappings_into_left(&mut region, right);
         }
 
-        self.live.insert(GuestVa(region.start), region);
+        self.live_insert(region);
         self.assert_invariants();
     }
 
@@ -29843,7 +29902,7 @@ impl TaskMappingIndex {
                 .map(|(key, _)| *key),
         );
         for key in displaced {
-            if let Some(row) = self.live.remove(&key) {
+            if let Some(row) = self.live_remove(&key) {
                 self.shadowed.push(row);
             }
         }
@@ -29865,7 +29924,7 @@ impl TaskMappingIndex {
         }
         doomed.extend(self.live.range(va..GuestVa(end)).map(|(key, _)| *key));
         for key in doomed {
-            self.live.remove(&key);
+            self.live_remove(&key);
         }
         self.shadowed
             .retain(|row| row.end <= va.0 || row.start >= end);
@@ -29876,7 +29935,15 @@ impl TaskMappingIndex {
     where
         F: FnMut(&HvfMappedRegion) -> bool,
     {
-        self.live.retain(|_, row| predicate(row));
+        let dropped: Vec<GuestVa> = self
+            .live
+            .iter()
+            .filter(|(_, row)| !predicate(row))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in dropped {
+            self.live_remove(&key);
+        }
         self.shadowed.retain(|row| predicate(row));
         self.assert_invariants();
     }
@@ -29884,6 +29951,8 @@ impl TaskMappingIndex {
     pub(crate) fn clear(&mut self) {
         self.live.clear();
         self.shadowed.clear();
+        self.by_ipa.clear();
+        self.ipa_span_counts.clear();
     }
 
     /// Total row count, live and displaced.
@@ -29927,12 +29996,6 @@ impl TaskMappingIndex {
 
     pub(crate) fn into_values(self) -> impl DoubleEndedIterator<Item = HvfMappedRegion> {
         self.shadowed.into_iter().chain(self.live.into_values())
-    }
-
-    /// Rows in the order the vector's `iter().rev()` produced them: newest
-    /// (highest-VA live row) first, displaced rows last.
-    pub(crate) fn newest_first(&self) -> impl Iterator<Item = &HvfMappedRegion> {
-        self.live.values().rev().chain(self.shadowed.iter().rev())
     }
 
     /// Rows that can overlap `[va, va + length)`, newest first.
@@ -30011,6 +30074,37 @@ impl TaskMappingIndex {
             .any(|row| row.start < current.0 && row.end > floor)
     }
 
+    /// Rows that can cover `[ipa, ipa + length)` in the stage-2 IPA domain,
+    /// nearest-IPA first, then the displaced rows.
+    ///
+    /// A row covers the query only if `row.ipa <= ipa`, so the walk starts at
+    /// the query and descends; no row beginning more than `max_ipa_span` below
+    /// it can still reach it, which ends the walk. Where the old reverse
+    /// vector scan visited every row to find the page-table root, this visits
+    /// the rows whose IPA is actually near the one asked for.
+    pub(crate) fn candidates_for_ipa_range(
+        &self,
+        ipa: u64,
+        length: u64,
+    ) -> impl Iterator<Item = &HvfMappedRegion> {
+        let floor = ipa.saturating_sub(self.max_ipa_span());
+        self.by_ipa
+            .range(..=(ipa, u64::MAX))
+            .rev()
+            .take_while(move |(row_ipa, _)| *row_ipa >= floor)
+            .filter_map(|(_, start)| self.live.get(&GuestVa(*start)))
+            .filter(move |row| {
+                row.ipa
+                    .checked_add(row.size as u64)
+                    .is_some_and(|limit| ipa >= row.ipa && ipa.saturating_add(length) <= limit)
+            })
+            .chain(self.shadowed.iter().rev().filter(move |row| {
+                row.ipa
+                    .checked_add(row.size as u64)
+                    .is_some_and(|limit| ipa >= row.ipa && ipa.saturating_add(length) <= limit)
+            }))
+    }
+
     /// The row covering `[va, va + length)`, or `None`.
     pub(crate) fn mapping_for_range(&self, va: GuestVa, length: usize) -> Option<&HvfMappedRegion> {
         self.candidates_for_range(va, length as u64)
@@ -30038,7 +30132,7 @@ impl TaskMappingIndex {
                 .map(|(key, _)| *key),
         );
         for key in keys {
-            if let Some(row) = self.live.remove(&key) {
+            if let Some(row) = self.live_remove(&key) {
                 affected.push(row);
             }
         }
@@ -30551,6 +30645,56 @@ mod task_mapping_index_tests {
             candidates,
             vec![semantic_va],
             "a row starting above the queried VA must still be offered when the range overlaps it",
+        );
+    }
+
+    #[test]
+    fn a_raw_ipa_lookup_does_not_walk_the_table_to_reach_a_low_va_row() {
+        // The page-table root is published early at a LOW guest VA, so a
+        // reverse walk of the VA-ordered map reaches it LAST -- that is the
+        // scan that made this representation a net regression
+        // (docs/perf-results/2026-09-08-mapping-index-measurement.md). The IPA
+        // view must reach it without visiting the storm.
+        let root_va = 0x1_0000_u64;
+        let root_ipa = 0x8800_0000_0000_u64;
+        let mut index = TaskMappingIndex::new();
+        index.insert(thread_sibling_tests::mapped_region(
+            root_va,
+            root_va + 0x20_0000,
+            root_ipa,
+        ));
+        for extent in 0..5_000_u64 {
+            let va = 0x6000_0000_0000 + extent * 0x2_0000;
+            let ipa = 0x9b00_0000_0000 + extent * 0x2_0000;
+            let mut row = thread_sibling_tests::mapped_region(va, va + 0x1000, ipa);
+            row.owner_generation = extent + 1;
+            index.insert(row);
+        }
+        assert_eq!(
+            index.len(),
+            5_001,
+            "distinct owner generations do not merge"
+        );
+
+        let visited = index.candidates_for_ipa_range(root_ipa + 0x4000, 8).count();
+        assert_eq!(
+            visited, 1,
+            "the root row must be reached without walking the extent storm",
+        );
+        let resolved = index
+            .candidates_for_ipa_range(root_ipa + 0x4000, 8)
+            .next()
+            .expect("root row resolves by IPA");
+        assert_eq!(resolved.start, root_va);
+
+        // A raw IPA that no row backs must not walk the whole table either: the
+        // walk stops once no remaining row can still reach the query.
+        assert_eq!(
+            index
+                .candidates_for_ipa_range(0x9b00_0000_0000 - 0x100_0000, 8)
+                .count(),
+            0,
+            "an unbacked IPA below every extent resolves to nothing",
         );
     }
 
@@ -42890,21 +43034,20 @@ impl HvfVmState {
         backing_gpa: u64,
         persistent_vm_lifecycle: bool,
     ) -> Option<carrick_guest_mem::SharedFutexLocation> {
-        let end = backing_gpa.checked_add(4)?;
-        mappings.newest_first().find_map(|mapping| {
-            let mapping_end = mapping.ipa.checked_add(mapping.size as u64)?;
-            (mapping.sharing.has_shared_futex_identity()
-                && backing_gpa >= mapping.ipa
-                && end <= mapping_end
-                && (!persistent_vm_lifecycle
-                    || !is_reusable_global_frame_extent(
-                        mapping.physical_ipa,
-                        mapping.physical_size as u64,
-                    )
-                    || global_frame_region_owner_matches_in(custody, mapping)))
-            .then(|| mapping.view().shared_futex_location_for_ipa(backing_gpa))
-            .flatten()
-        })
+        backing_gpa.checked_add(4)?;
+        mappings
+            .candidates_for_ipa_range(backing_gpa, 4)
+            .find_map(|mapping| {
+                (mapping.sharing.has_shared_futex_identity()
+                    && (!persistent_vm_lifecycle
+                        || !is_reusable_global_frame_extent(
+                            mapping.physical_ipa,
+                            mapping.physical_size as u64,
+                        )
+                        || global_frame_region_owner_matches_in(custody, mapping)))
+                .then(|| mapping.view().shared_futex_location_for_ipa(backing_gpa))
+                .flatten()
+            })
     }
 
     #[cfg(test)]
@@ -43897,13 +44040,10 @@ impl HvfVmState {
         length: usize,
     ) -> Option<MappingView> {
         let length = u64::try_from(length).ok()?;
-        let end = ipa.checked_add(length)?;
+        ipa.checked_add(length)?;
         mappings
-            .newest_first()
-            .find(|mapping| {
-                let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
-                ipa >= mapping.ipa && mapping_end.is_some_and(|limit| end <= limit)
-            })
+            .candidates_for_ipa_range(ipa, length)
+            .next()
             .map(HvfMappedRegion::view)
     }
 
