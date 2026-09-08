@@ -2946,16 +2946,16 @@ impl HvpatchKernelDebugAuxProvider {
 
 impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvider {
     fn scheduler_rows(&self) -> Vec<crate::kernel::debug::DebugSchedulerRow> {
-        let (lifecycle, queued_len, claimed, waiters, control_epoch, need_resched, snapshot_count) =
-            self.scheduler.scheduler_summary();
+        let summary = self.scheduler.scheduler_summary();
         vec![crate::kernel::debug::DebugSchedulerRow {
-            lifecycle,
-            queued_len,
-            claimed,
-            waiters,
-            control_epoch,
-            need_resched,
-            snapshot_count,
+            lifecycle: summary.lifecycle,
+            queued_len: summary.queued_len,
+            claimed: summary.claimed,
+            waiters: summary.waiters.exact(),
+            run_queue_locked: summary.waiters.is_run_queue_locked(),
+            control_epoch: summary.control_epoch,
+            need_resched: summary.need_resched,
+            snapshot_count: summary.snapshot_count,
         }]
     }
 
