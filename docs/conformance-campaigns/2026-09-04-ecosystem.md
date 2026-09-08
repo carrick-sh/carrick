@@ -2992,3 +2992,9 @@ post-instrumentation wedge; the four now-loud `notify_child_exit`
 refusal paths fired 0 times; the `TaskBusy` arm's unsampled precheck trades
 a lost wake for redispatches while a fork reservation is held (bounded,
 unmeasured).
+
+**Post-round-6 receipt (main 4b8b6b056, binary 8cb456a7… rebuilt from the
+same source mid-run by the probe-gate reproduction; host load 32–104):**
+smoke ok, go-build reducer 8/8 zero abort lines at load 104, rows 6/6 MATCH
+(go_types, asyncio, compile, importlib, subprocess, threading) — the first
+row run tonight with no crash under heavy load. Ratios not cited.
