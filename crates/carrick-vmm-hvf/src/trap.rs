@@ -4280,7 +4280,7 @@ mod foreign_mm_tests {
         assert_eq!(published_vvar_extent.frame, vvar_extent.frame);
         assert_eq!(published_vvar_extent.stage2_owner, vvar_extent.stage2_owner);
         let mut parent = HvfTaskState {
-            mappings: vec![page_tables, vvar, overlay],
+            mappings: TaskMappingIndex::from_iter([page_tables, vvar, overlay]),
             mm_root_slot: Some((0x9a00_2000_0000, 0x20_0000)),
             container_root: ContainerRootToken::from_raw(1),
             pending_exec_mm_root_slot: None,
@@ -6002,7 +6002,7 @@ mod foreign_mm_tests {
         )
         .expect("register parent cow owner");
 
-        let parent_mappings = vec![
+        let parent_mappings = TaskMappingIndex::from_iter([
             HvfMappedRegion {
                 start: crate::memory::LINUX_PAGE_TABLES_BASE,
                 end: crate::memory::LINUX_PAGE_TABLES_BASE + crate::memory::LINUX_PAGE_TABLES_SIZE,
@@ -6124,7 +6124,7 @@ mod foreign_mm_tests {
                 shared_key_offset: 0,
                 owner_generation: parent_cow_gen,
             },
-        ];
+        ]);
 
         let parent_inventory = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory {
             initialized: true,
@@ -24384,7 +24384,7 @@ mod carrier_vm_custody_tests {
         region.start += projection_offset;
         region.ipa += projection_offset;
         region.host_addr = region.host_addr.wrapping_add(projection_offset as usize);
-        let mut mappings = TaskMappingIndex::from_region(region);
+        let mut mappings = super::TaskMappingIndex::from_region(region);
         // `unowned_runtime_region` intentionally retains the physical owner
         // size even when this row is only an offset semantic projection.
         assert_eq!(
@@ -24526,7 +24526,7 @@ mod carrier_vm_custody_tests {
         let pin = custody
             .pin_stage2_record(identity)
             .expect("pin structural root slot");
-        let mut mappings = TaskMappingIndex::from_region(region);
+        let mut mappings = super::TaskMappingIndex::from_region(region);
 
         let retirement_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
             &custody,
@@ -29706,46 +29706,100 @@ struct MappingView {
     shared_key_offset: u64,
 }
 
+/// Where one row lives inside a [`TaskMappingIndex`].
+///
+/// The ordered live map is keyed by `start`, so a row that has been displaced
+/// into the shadow list cannot be named by a `GuestVa`. Retirement takes a
+/// handle out and hands the same handle back on rollback.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MappingRowRef {
+    Live(GuestVa),
+    Shadowed(usize),
+}
+
+/// The per-task mapping table: sorted by construction, non-overlapping, and
+/// coalescing.
+///
+/// This replaces the `Vec<HvfMappedRegion>` whose linear `iter().rev().find()`
+/// scans made every first-touch fault cost O(rows): the row count grew by one
+/// per materialized extent (~40k-100k rows compiling a deeply nested CPython
+/// expression) and eight scans ran per fault, so fault handling was quadratic
+/// in the number of extents. Two properties fix that:
+///
+/// * **Ordered.** `live` is a `BTreeMap` keyed by `HvfMappedRegion::start`, so
+///   a VA lookup is `range(..=va).next_back()` — O(log N) instead of O(N).
+/// * **Coalescing.** [`Self::insert`] merges a new row into an adjacent one
+///   when the two describe the same VMA in every load-bearing respect (owner
+///   generation, structural owner identity, permissions, sharing, and both
+///   virtual AND physical contiguity), so a first-touch storm inside one VMA
+///   stays ONE row. The row count is then O(#VMAs), not O(#faults).
+///
+/// **Displaced rows.** The vector this replaces allowed overlapping rows and
+/// resolved them newest-first, so a new row shadowed an older one without
+/// dropping it. Dropping it eagerly would change when a `stage2_lease` or a
+/// backing handle is released — the exact hazard behind the earlier
+/// window-corruption bug — so an overlapped row is moved to `shadowed` instead
+/// of being destroyed. It keeps its handles, it is still visited by every
+/// full-table pass (retirement, fork copy, `retain`), and it is still
+/// consulted by VA lookups after the ordered probe misses, but it is out of
+/// the ordered fast path. In practice this list stays empty; it exists so that
+/// making the table non-overlapping cannot change object lifetimes.
+///
+/// Row identity is still authenticated per lookup by `row_projection_is_current`
+/// and the owner-generation checks; ordering only decides which row is offered.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default)]
-pub(crate) struct TaskMappingIndex(std::collections::BTreeMap<GuestVa, HvfMappedRegion>);
+pub(crate) struct TaskMappingIndex {
+    live: std::collections::BTreeMap<GuestVa, HvfMappedRegion>,
+    /// Rows an overlapping insert displaced. Retained only so that displacing
+    /// a row never changes when its handles drop.
+    shadowed: Vec<HvfMappedRegion>,
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl TaskMappingIndex {
     pub(crate) fn new() -> Self {
-        Self(std::collections::BTreeMap::new())
+        Self {
+            live: std::collections::BTreeMap::new(),
+            shadowed: Vec::new(),
+        }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_region(region: HvfMappedRegion) -> Self {
         let mut index = Self::new();
         index.insert(region);
         index
     }
 
+    /// Strict ordering and non-overlap of the live map, checked after every
+    /// mutation in debug builds.
     #[cfg(debug_assertions)]
     fn assert_invariants(&self) {
-        let mut prev_end: Option<u64> = None;
-        for (va, region) in &self.0 {
-            assert_eq!(
+        let mut prev: Option<(u64, u64)> = None;
+        for (va, region) in &self.live {
+            debug_assert_eq!(
                 va.0, region.start,
-                "key must match region.start: key=0x{:x}, start=0x{:x}",
+                "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
                 va.0, region.start
             );
-            assert!(
+            debug_assert!(
                 region.start < region.end,
-                "region must have start < end: [0x{:x}, 0x{:x})",
+                "TaskMappingIndex row must be non-empty: [0x{:x}, 0x{:x})",
                 region.start,
                 region.end
             );
-            if let Some(prev) = prev_end {
-                assert!(
-                    prev <= region.start,
-                    "mappings must be strictly increasing and non-overlapping: prev_end 0x{:x} > start 0x{:x}",
-                    prev,
-                    region.start
+            if let Some((prev_start, prev_end)) = prev {
+                debug_assert!(
+                    prev_end <= region.start,
+                    "TaskMappingIndex rows must be strictly increasing and non-overlapping: \
+                     [0x{prev_start:x}, 0x{prev_end:x}) then [0x{:x}, 0x{:x})",
+                    region.start,
+                    region.end
                 );
             }
-            prev_end = Some(region.end);
+            prev = Some((region.start, region.end));
         }
     }
 
@@ -29753,180 +29807,153 @@ impl TaskMappingIndex {
     #[inline(always)]
     fn assert_invariants(&self) {}
 
+    /// Publish `region`, coalescing it into an adjacent row when the two
+    /// describe the same extent of the same VMA.
+    ///
+    /// Any live row the new one overlaps is displaced into `shadowed` rather
+    /// than dropped: the new row wins every lookup (as the newest row did in
+    /// the vector this replaces) without altering when the old row's handles
+    /// are released.
     pub(crate) fn insert(&mut self, mut region: HvfMappedRegion) {
-        // Check predecessor (strictly before region.start)
-        let pred_key = self
-            .0
+        if region.end > region.start {
+            self.displace_overlapping(region.start, region.end);
+        }
+
+        let predecessor = self
+            .live
             .range(..GuestVa(region.start))
             .next_back()
-            .map(|(k, _)| *k);
-        if let Some(pred_key) = pred_key {
-            let can_merge = {
-                let pred = &self.0[&pred_key];
-                can_coalesce_mappings(pred, &region)
-            };
-            if can_merge {
-                let mut pred = self.0.remove(&pred_key).unwrap();
-                coalesce_mappings_into_left(&mut pred, region);
-                region = pred;
-            }
+            .map(|(key, _)| *key)
+            .filter(|key| {
+                self.live
+                    .get(key)
+                    .is_some_and(|left| can_coalesce_mappings(left, &region))
+            });
+        if let Some(key) = predecessor
+            && let Some(mut left) = self.live.remove(&key)
+        {
+            coalesce_mappings_into_left(&mut left, region);
+            region = left;
         }
 
-        // Check successor (at region.end)
-        let succ_key = GuestVa(region.end);
-        let can_merge_succ = self
-            .0
-            .get(&succ_key)
-            .is_some_and(|succ| can_coalesce_mappings(&region, succ));
-        if can_merge_succ {
-            let succ = self.0.remove(&succ_key).unwrap();
-            coalesce_mappings_into_left(&mut region, succ);
+        let successor = GuestVa(region.end);
+        if self
+            .live
+            .get(&successor)
+            .is_some_and(|right| can_coalesce_mappings(&region, right))
+            && let Some(right) = self.live.remove(&successor)
+        {
+            coalesce_mappings_into_left(&mut region, right);
         }
 
-        self.0.insert(GuestVa(region.start), region);
+        self.live.insert(GuestVa(region.start), region);
         self.assert_invariants();
     }
 
+    /// Move every live row intersecting `[start, end)` into `shadowed`.
+    fn displace_overlapping(&mut self, start: u64, end: u64) {
+        let mut displaced = Vec::new();
+        if let Some((&key, row)) = self.live.range(..GuestVa(start)).next_back()
+            && row.end > start
+        {
+            displaced.push(key);
+        }
+        displaced.extend(
+            self.live
+                .range(GuestVa(start)..GuestVa(end))
+                .map(|(key, _)| *key),
+        );
+        for key in displaced {
+            if let Some(row) = self.live.remove(&key) {
+                self.shadowed.push(row);
+            }
+        }
+    }
+
+    /// Drop every row intersecting `[va, va + len)` outright.
+    ///
+    /// Used where the caller has already unmapped the extent and the rows
+    /// describing it must not outlive that unmap.
     pub(crate) fn remove_range(&mut self, va: GuestVa, len: usize) {
         let Some(end) = va.0.checked_add(len as u64) else {
             return;
         };
-        let mut to_remove = Vec::new();
-        if let Some((&k, m)) = self.0.range(..va).next_back() {
-            if m.end > va.0 {
-                to_remove.push(k);
-            }
+        let mut doomed = Vec::new();
+        if let Some((&key, row)) = self.live.range(..va).next_back()
+            && row.end > va.0
+        {
+            doomed.push(key);
         }
-        for (&k, _) in self.0.range(va..GuestVa(end)) {
-            to_remove.push(k);
+        doomed.extend(self.live.range(va..GuestVa(end)).map(|(key, _)| *key));
+        for key in doomed {
+            self.live.remove(&key);
         }
-        for k in to_remove {
-            self.0.remove(&k);
-        }
+        self.shadowed
+            .retain(|row| row.end <= va.0 || row.start >= end);
         self.assert_invariants();
     }
 
-    pub(crate) fn retain<F>(&mut self, mut f: F)
+    pub(crate) fn retain<F>(&mut self, mut predicate: F)
     where
         F: FnMut(&HvfMappedRegion) -> bool,
     {
-        self.0.retain(|_, v| f(v));
-        self.assert_invariants();
-    }
-
-    pub(crate) fn split_for_unmap(&mut self, va: GuestVa, len: usize) {
-        let Some(end) = va.0.checked_add(len as u64) else {
-            return;
-        };
-        let mut candidate_keys = Vec::new();
-        if let Some((&k, m)) = self.0.range(..va).next_back() {
-            if m.end > va.0 {
-                candidate_keys.push(k);
-            }
-        }
-        for (&k, _) in self.0.range(va..GuestVa(end)) {
-            candidate_keys.push(k);
-        }
-
-        let mut tails = Vec::new();
-        for k in candidate_keys {
-            let Some(mut row) = self.0.remove(&k) else {
-                continue;
-            };
-            if !row.is_dynamic_alias {
-                self.0.insert(k, row);
-                continue;
-            }
-            let row_size = semantic_extent_size(row.start, row.end);
-            let Some(row_end) = row.start.checked_add(row_size as u64) else {
-                self.0.insert(k, row);
-                continue;
-            };
-            if row_end <= va.0 || row.start >= end {
-                self.0.insert(k, row);
-                continue;
-            }
-            let head_survives = row.start < va.0;
-            let tail_survives = row_end > end;
-            if tail_survives {
-                let delta = end.saturating_sub(row.start);
-                tails.push(HvfMappedRegion {
-                    start: end,
-                    end: row.end,
-                    ipa: row.ipa.saturating_add(delta),
-                    physical_ipa: row.physical_ipa,
-                    physical_size: row.physical_size,
-                    host_addr: row.host_addr.wrapping_add(delta as usize),
-                    size: usize::try_from(row_end.saturating_sub(end)).unwrap_or_default(),
-                    perms: row.perms,
-                    memory: None,
-                    host_mapping: None,
-                    structural_owner: row.structural_owner.clone(),
-                    stage2_lease: None,
-                    is_dynamic_alias: true,
-                    sharing: row.sharing,
-                    guest_writable: row.guest_writable,
-                    shared_key_base: row.shared_key_base,
-                    shared_key_offset: row.shared_key_offset.saturating_add(delta),
-                    owner_generation: row.owner_generation,
-                });
-            }
-            if head_survives {
-                row.end = va.0;
-                row.size = usize::try_from(va.0.saturating_sub(row.start)).unwrap_or_default();
-                self.0.insert(GuestVa(row.start), row);
-            }
-        }
-
-        for tail in tails {
-            self.0.insert(GuestVa(tail.start), tail);
-        }
-
+        self.live.retain(|_, row| predicate(row));
+        self.shadowed.retain(|row| predicate(row));
         self.assert_invariants();
     }
 
     pub(crate) fn clear(&mut self) {
-        self.0.clear();
+        self.live.clear();
+        self.shadowed.clear();
     }
 
+    /// Total row count, live and displaced.
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.live.len() + self.shadowed.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.live.is_empty() && self.shadowed.is_empty()
     }
 
+    /// Live rows only, ordered by start. Used only for exact-start lookups.
     pub(crate) fn get(&self, key: &GuestVa) -> Option<&HvfMappedRegion> {
-        self.0.get(key)
+        self.live.get(key)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn first(&self) -> Option<&HvfMappedRegion> {
-        self.0.values().next()
+        self.live.values().next()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn first_mut(&mut self) -> Option<&mut HvfMappedRegion> {
-        self.0.values_mut().next()
+        self.live.values_mut().next()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn last(&self) -> Option<&HvfMappedRegion> {
-        self.0.values().next_back()
+        self.live.values().next_back()
     }
 
+    /// Every row, ascending by start; displaced rows lead so that a reversed
+    /// walk still yields the newest row first, as the vector did.
     pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &HvfMappedRegion> {
-        self.0.values()
+        self.shadowed.iter().chain(self.live.values())
     }
 
     pub(crate) fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut HvfMappedRegion> {
-        self.0.values_mut()
-    }
-
-    pub(crate) fn values(&self) -> impl DoubleEndedIterator<Item = &HvfMappedRegion> {
-        self.0.values()
+        self.shadowed.iter_mut().chain(self.live.values_mut())
     }
 
     pub(crate) fn into_values(self) -> impl DoubleEndedIterator<Item = HvfMappedRegion> {
-        self.0.into_values()
+        self.shadowed.into_iter().chain(self.live.into_values())
+    }
+
+    /// Rows in the order the vector's `iter().rev()` produced them: newest
+    /// (highest-VA live row) first, displaced rows last.
+    pub(crate) fn newest_first(&self) -> impl Iterator<Item = &HvfMappedRegion> {
+        self.live.values().rev().chain(self.shadowed.iter().rev())
     }
 
     pub(crate) fn range<R>(
@@ -29936,37 +29963,76 @@ impl TaskMappingIndex {
     where
         R: std::ops::RangeBounds<GuestVa>,
     {
-        self.0.range(range)
+        self.live.range(range)
     }
 
+    /// Rows that can contain `va`, cheapest first: the single ordered live
+    /// candidate, then any displaced row. O(log N) when nothing is displaced.
+    pub(crate) fn candidates_for_va(&self, va: GuestVa) -> impl Iterator<Item = &HvfMappedRegion> {
+        self.live
+            .range(..=va)
+            .next_back()
+            .map(|(_, row)| row)
+            .into_iter()
+            .chain(self.shadowed.iter().rev())
+    }
+
+    /// The live row covering `[va, va + length)`, or `None`.
     pub(crate) fn mapping_for_range(&self, va: GuestVa, length: usize) -> Option<&HvfMappedRegion> {
-        let (_, mapping) = self.0.range(..=va).next_back()?;
-        if mapping.contains_range(va.0, length) {
-            Some(mapping)
-        } else {
-            None
-        }
+        self.candidates_for_va(va)
+            .find(|row| row.contains_range(va.0, length))
     }
 
-    pub(crate) fn has_range_overlap(&self, start: GuestVa, end: GuestVa) -> bool {
-        if self.0.range(start..end).next().is_some() {
-            return true;
+    /// Split every dynamic-alias row across `[va, va + len)`.
+    ///
+    /// Rebasing a row changes its key, so affected rows are lifted out, run
+    /// through the one shared splitting routine, and re-published.
+    pub(crate) fn split_local_rows_for_unmap(&mut self, va: u64, len: usize) {
+        let Some(end) = va.checked_add(len as u64) else {
+            return;
+        };
+        let mut affected: Vec<HvfMappedRegion> = Vec::new();
+        let mut keys = Vec::new();
+        if let Some((&key, row)) = self.live.range(..GuestVa(va)).next_back()
+            && row.end > va
+        {
+            keys.push(key);
         }
-        if let Some((_, m)) = self.0.range(..start).next_back() {
-            if m.end > start.0 {
-                return true;
+        keys.extend(
+            self.live
+                .range(GuestVa(va)..GuestVa(end))
+                .map(|(key, _)| *key),
+        );
+        for key in keys {
+            if let Some(row) = self.live.remove(&key) {
+                affected.push(row);
             }
         }
-        false
+        let mut index = 0;
+        while index < self.shadowed.len() {
+            let row = &self.shadowed[index];
+            if row.start < end && va < row.end {
+                affected.push(self.shadowed.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        split_local_mapping_rows_for_unmap(&mut affected, va, len);
+        for row in affected {
+            self.insert(row);
+        }
+        self.assert_invariants();
     }
 
+    /// Detach the structural owner claiming `[ipa, ipa + length)`, naming the
+    /// row so a failed retirement can put it back.
     pub(crate) fn take_structural_owner(
         &mut self,
         ipa: u64,
         length: u64,
-    ) -> Option<(GuestVa, std::sync::Arc<StructuralBackingOwner>)> {
-        for (&va, mapping) in self.0.iter_mut() {
-            let matches = mapping.structural_owner.as_ref().is_some_and(|owner| {
+    ) -> Option<(MappingRowRef, std::sync::Arc<StructuralBackingOwner>)> {
+        let claims = |mapping: &HvfMappedRegion| {
+            mapping.structural_owner.as_ref().is_some_and(|owner| {
                 (mapping.physical_ipa, mapping.physical_size as u64) == (ipa, length)
                     || (owner.physical_ipa <= ipa
                         && ipa.checked_add(length).is_some_and(|candidate_end| {
@@ -29975,22 +30041,41 @@ impl TaskMappingIndex {
                                 .checked_add(owner.physical_size as u64)
                                 .is_some_and(|owner_end| candidate_end <= owner_end)
                         }))
-            });
-            if matches {
+            })
+        };
+        for (position, mapping) in self.shadowed.iter_mut().enumerate() {
+            if claims(mapping) {
                 let owner = mapping.structural_owner.take()?;
-                return Some((va, owner));
+                return Some((MappingRowRef::Shadowed(position), owner));
+            }
+        }
+        for (&va, mapping) in self.live.iter_mut() {
+            if claims(mapping) {
+                let owner = mapping.structural_owner.take()?;
+                return Some((MappingRowRef::Live(va), owner));
             }
         }
         None
     }
 
+    pub(crate) fn row(&self, row: MappingRowRef) -> Option<&HvfMappedRegion> {
+        match row {
+            MappingRowRef::Live(va) => self.live.get(&va),
+            MappingRowRef::Shadowed(position) => self.shadowed.get(position),
+        }
+    }
+
     pub(crate) fn restore_structural_owner(
         &mut self,
-        va: GuestVa,
+        row: MappingRowRef,
         owner: std::sync::Arc<StructuralBackingOwner>,
     ) {
-        if let Some(m) = self.0.get_mut(&va) {
-            m.structural_owner = Some(owner);
+        let slot = match row {
+            MappingRowRef::Live(va) => self.live.get_mut(&va),
+            MappingRowRef::Shadowed(position) => self.shadowed.get_mut(position),
+        };
+        if let Some(mapping) = slot {
+            mapping.structural_owner = Some(owner);
         }
     }
 
@@ -29999,16 +30084,14 @@ impl TaskMappingIndex {
         ipa: u64,
         length: u64,
     ) -> Option<GlobalFrameStage2Lease> {
-        for mapping in self.0.values_mut() {
-            let matches = mapping.stage2_lease.as_ref().is_some_and(|lease| {
+        self.iter_mut().find_map(|mapping| {
+            (mapping.stage2_lease.as_ref().is_some_and(|lease| {
                 let (base, len) = lease.key();
                 base <= ipa && ipa.checked_add(length).is_some_and(|end| end <= base + len)
-            });
-            if matches {
-                return mapping.stage2_lease.take();
-            }
-        }
-        None
+            }))
+            .then(|| mapping.stage2_lease.take())
+            .flatten()
+        })
     }
 
     pub(crate) fn take_exact_unowned_stage2_lease(
@@ -30021,17 +30104,35 @@ impl TaskMappingIndex {
             host_addr,
             generation: 0,
         };
-        for mapping in self.0.values_mut() {
+        self.iter_mut().find_map(|mapping| {
             let exact_owner = mapped_region_stage2_owner_identity(mapping) == Some(expected);
             let exact_lease = mapping
                 .stage2_lease
                 .as_ref()
                 .is_some_and(|lease| lease.key() == (ipa, length) && lease.active && lease.mapped);
-            if exact_owner && exact_lease {
-                return mapping.stage2_lease.take();
-            }
-        }
-        None
+            (exact_owner && exact_lease)
+                .then(|| mapping.stage2_lease.take())
+                .flatten()
+        })
+    }
+}
+
+/// Positional access for tests only. Production code addresses rows by
+/// `GuestVa` or by an ordered range; a positional index would reintroduce the
+/// push-order assumption this type exists to remove.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", test))]
+impl std::ops::Index<usize> for TaskMappingIndex {
+    type Output = HvfMappedRegion;
+
+    fn index(&self, position: usize) -> &Self::Output {
+        self.iter().nth(position).expect("mapping row in range")
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", test))]
+impl std::ops::IndexMut<usize> for TaskMappingIndex {
+    fn index_mut(&mut self, position: usize) -> &mut Self::Output {
+        self.iter_mut().nth(position).expect("mapping row in range")
     }
 }
 
@@ -30039,9 +30140,7 @@ impl TaskMappingIndex {
 impl FromIterator<HvfMappedRegion> for TaskMappingIndex {
     fn from_iter<I: IntoIterator<Item = HvfMappedRegion>>(iter: I) -> Self {
         let mut index = Self::new();
-        for region in iter {
-            index.insert(region);
-        }
+        index.extend(iter);
         index
     }
 }
@@ -30058,52 +30157,74 @@ impl Extend<HvfMappedRegion> for TaskMappingIndex {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl IntoIterator for TaskMappingIndex {
     type Item = HvfMappedRegion;
-    type IntoIter = std::collections::btree_map::IntoValues<GuestVa, HvfMappedRegion>;
+    type IntoIter = std::iter::Chain<
+        std::vec::IntoIter<HvfMappedRegion>,
+        std::collections::btree_map::IntoValues<GuestVa, HvfMappedRegion>,
+    >;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_values()
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<'a> IntoIterator for &'a TaskMappingIndex {
-    type Item = &'a HvfMappedRegion;
-    type IntoIter = std::collections::btree_map::Values<'a, GuestVa, HvfMappedRegion>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.values()
+        self.shadowed.into_iter().chain(self.live.into_values())
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl<'a> IntoIterator for &'a mut TaskMappingIndex {
     type Item = &'a mut HvfMappedRegion;
-    type IntoIter = std::collections::btree_map::ValuesMut<'a, GuestVa, HvfMappedRegion>;
+    type IntoIter = std::iter::Chain<
+        std::slice::IterMut<'a, HvfMappedRegion>,
+        std::collections::btree_map::ValuesMut<'a, GuestVa, HvfMappedRegion>,
+    >;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.values_mut()
+        self.shadowed.iter_mut().chain(self.live.values_mut())
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> IntoIterator for &'a TaskMappingIndex {
+    type Item = &'a HvfMappedRegion;
+    type IntoIter = std::iter::Chain<
+        std::slice::Iter<'a, HvfMappedRegion>,
+        std::collections::btree_map::Values<'a, GuestVa, HvfMappedRegion>,
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.shadowed.iter().chain(self.live.values())
+    }
+}
+
+/// Whether two adjacent rows describe one extent of one VMA and may be merged.
+///
+/// Every field that a lookup or a retirement keys on must agree, and the two
+/// rows must be contiguous in BOTH the semantic VA domain and the physical
+/// domain. A row carrying an owned handle (`memory`, `host_mapping`,
+/// `stage2_lease`) never merges: merging would have to choose which handle the
+/// survivor keeps.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn can_coalesce_mappings(left: &HvfMappedRegion, right: &HvfMappedRegion) -> bool {
     if left.end != right.start {
         return false;
     }
-    if left.owner_generation != right.owner_generation {
+    // A row whose `size` is not its semantic extent is an offset projection of
+    // a larger physical owner; its `size` cannot be added.
+    if left.end.saturating_sub(left.start) != left.size as u64
+        || right.end.saturating_sub(right.start) != right.size as u64
+    {
         return false;
     }
-    match (&left.structural_owner, &right.structural_owner) {
-        (None, None) => {}
-        (Some(a), Some(b)) if std::sync::Arc::ptr_eq(a, b) => {}
-        _ => return false,
-    }
-    if left.perms != right.perms
+    if left.owner_generation != right.owner_generation
+        || left.perms != right.perms
         || left.is_dynamic_alias != right.is_dynamic_alias
         || left.sharing != right.sharing
         || left.guest_writable != right.guest_writable
     {
         return false;
+    }
+    match (&left.structural_owner, &right.structural_owner) {
+        (None, None) => {}
+        (Some(left_owner), Some(right_owner))
+            if std::sync::Arc::ptr_eq(left_owner, right_owner) => {}
+        _ => return false,
     }
     if left.memory.is_some()
         || right.memory.is_some()
@@ -30118,28 +30239,24 @@ fn can_coalesce_mappings(left: &HvfMappedRegion, right: &HvfMappedRegion) -> boo
         return false;
     }
     if !left.host_addr.is_null() || !right.host_addr.is_null() {
-        if (left.host_addr as usize).saturating_add(left.size) != (right.host_addr as usize) {
+        if (left.host_addr as usize).saturating_add(left.size) != right.host_addr as usize {
             return false;
         }
     }
     if left.shared_key_base != right.shared_key_base {
         return false;
     }
-    if left.shared_key_base != 0 {
-        if left.shared_key_offset.saturating_add(left.size as u64) != right.shared_key_offset {
-            return false;
-        }
-    } else if left.shared_key_offset != 0 || right.shared_key_offset != 0 {
+    if left.shared_key_base == 0 && left.shared_key_offset == 0 && right.shared_key_offset == 0 {
+        // Neither row carries a shared-key projection.
+    } else if left.shared_key_offset.saturating_add(left.size as u64) != right.shared_key_offset {
         return false;
     }
     let adjacent_physical =
         left.physical_ipa.saturating_add(left.physical_size as u64) == right.physical_ipa;
-    let same_compound =
-        left.physical_ipa == right.physical_ipa && left.physical_size == right.physical_size;
-    if !adjacent_physical && !same_compound {
-        return false;
-    }
-    true
+    let same_compound = left.physical_ipa == right.physical_ipa
+        && left.physical_size == right.physical_size
+        && left.size.saturating_add(right.size) <= left.physical_size;
+    adjacent_physical || same_compound
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -30147,9 +30264,9 @@ fn coalesce_mappings_into_left(left: &mut HvfMappedRegion, right: HvfMappedRegio
     let adjacent_physical =
         left.physical_ipa.saturating_add(left.physical_size as u64) == right.physical_ipa;
     left.end = right.end;
-    left.size += right.size;
+    left.size = left.size.saturating_add(right.size);
     if adjacent_physical {
-        left.physical_size += right.physical_size;
+        left.physical_size = left.physical_size.saturating_add(right.physical_size);
     }
 }
 
@@ -36094,8 +36211,10 @@ impl HvfVmState {
         {
             return Ok(());
         }
-        if let Some((va, owner)) = mappings.take_structural_owner(ipa, length) {
-            let mapping = mappings.get(&va).expect("mapping exists");
+        if let Some((row, owner)) = mappings.take_structural_owner(ipa, length) {
+            let Some(mapping) = mappings.row(row) else {
+                unreachable!("structural claim named a row that is not in the index")
+            };
             let identity = authenticated_structural_owner_record_in(
                 custody,
                 &owner,
@@ -36108,7 +36227,7 @@ impl HvfVmState {
             let Some(identity) = identity
                 .filter(|_| mapping.physical_ipa == ipa && mapping.physical_size as u64 == length)
             else {
-                mappings.restore_structural_owner(va, owner);
+                mappings.restore_structural_owner(row, owner);
                 return Err(TrapError::Hypervisor(format!(
                     "structural retirement owner for IPA 0x{ipa:x} size {length} is not the exact current custody owner"
                 )));
@@ -36130,11 +36249,11 @@ impl HvfVmState {
                 &mut release_retired_stage2_ipa,
             );
             if let Err(error) = retirement {
-                mappings.restore_structural_owner(va, owner);
+                mappings.restore_structural_owner(row, owner);
                 return Err(error);
             }
             if custody.stage2_record_snapshot(identity.record_id).is_some() {
-                mappings.restore_structural_owner(va, owner);
+                mappings.restore_structural_owner(row, owner);
                 return Err(TrapError::Hypervisor(format!(
                     "structural retirement owner for IPA 0x{ipa:x} size {length} did not reach terminal retirement"
                 )));
@@ -38000,7 +38119,7 @@ impl HvfVmState {
             task: HvfTaskState {
                 #[cfg(not(test))]
                 custody,
-                mappings: Vec::new(),
+                mappings: TaskMappingIndex::new(),
                 mm_root_slot: None,
                 container_root: ContainerRootToken::next(),
                 pending_exec_mm_root_slot: None,
@@ -38093,7 +38212,7 @@ impl HvfVmState {
                             std::sync::Arc::clone(owner),
                         )?;
                     }
-                    state.mappings.push(region);
+                    state.mappings.insert(region);
                 }
                 if !stage2_leases.is_empty() {
                     return Err(TrapError::Hypervisor(format!(
@@ -38134,7 +38253,7 @@ impl HvfVmState {
                             std::sync::Arc::clone(owner),
                         )?;
                     }
-                    state.mappings.push(region);
+                    state.mappings.insert(region);
                 }
                 plan
             }
@@ -39327,13 +39446,9 @@ impl HvfVmState {
         let page_granular_arm = published.page_granular_arm;
         let semantic_ipa = published.region.ipa;
         for ext in published.extension_regions {
-            let pos = self.mappings.partition_point(|m| m.start < ext.start);
-            self.mappings.insert(pos, ext);
+            self.mappings.insert(ext);
         }
-        let pos = self
-            .mappings
-            .partition_point(|m| m.start < published.region.start);
-        self.mappings.insert(pos, published.region);
+        self.mappings.insert(published.region);
         if page_granular_arm {
             // Every page of the view starts clean: the first guest (or host
             // syscall) write to a page must move THAT page, and only that
@@ -39823,7 +39938,7 @@ impl HvfVmState {
             shared_key_offset: 0,
             owner_generation,
         });
-        self.mappings.push(HvfMappedRegion {
+        self.mappings.insert(HvfMappedRegion {
             start: page_va,
             ipa: new_ipa,
             physical_ipa: new_physical_ipa,
@@ -40083,7 +40198,7 @@ impl HvfTaskState {
             shared_key_offset,
             owner_generation,
         });
-        self.mappings.push(HvfMappedRegion {
+        self.mappings.insert(HvfMappedRegion {
             start: va,
             ipa: target_ipa,
             physical_ipa,
@@ -40982,7 +41097,7 @@ impl HvfTaskState {
             new_physical_ipa,
             alias_registry().lock().revision(),
         );
-        self.mappings.push(HvfMappedRegion {
+        self.mappings.insert(HvfMappedRegion {
             start: span.va,
             ipa: new_ipa,
             physical_ipa: new_physical_ipa,
@@ -42136,7 +42251,7 @@ impl HvfVmState {
             shared_key_offset,
             owner_generation,
         });
-        self.mappings.push(HvfMappedRegion {
+        self.mappings.insert(HvfMappedRegion {
             start: va,
             ipa,
             physical_ipa: ipa,
@@ -42462,12 +42577,12 @@ impl HvfVmState {
 
     fn shared_futex_mapping_for_ipa_in(
         custody: &CarrierVmCustody,
-        mappings: &[HvfMappedRegion],
+        mappings: &TaskMappingIndex,
         backing_gpa: u64,
         persistent_vm_lifecycle: bool,
     ) -> Option<carrick_guest_mem::SharedFutexLocation> {
         let end = backing_gpa.checked_add(4)?;
-        mappings.iter().rev().find_map(|mapping| {
+        mappings.newest_first().find_map(|mapping| {
             let mapping_end = mapping.ipa.checked_add(mapping.size as u64)?;
             (mapping.sharing.has_shared_futex_identity()
                 && backing_gpa >= mapping.ipa
@@ -42485,7 +42600,7 @@ impl HvfVmState {
 
     #[cfg(test)]
     fn shared_futex_mapping_for_ipa(
-        mappings: &[HvfMappedRegion],
+        mappings: &TaskMappingIndex,
         backing_gpa: u64,
         persistent_vm_lifecycle: bool,
     ) -> Option<carrick_guest_mem::SharedFutexLocation> {
@@ -43116,7 +43231,7 @@ impl HvfVmState {
     /// registry drops such an entry outright, and excluding a dead row from
     /// fork is correct.
     fn split_local_rows_for_unmap(&mut self, va: u64, len: usize) {
-        split_local_mapping_rows_for_unmap(&mut self.mappings, va, len);
+        self.mappings.split_local_rows_for_unmap(va, len);
     }
 
     pub(crate) fn unregister_process_alias(
@@ -43468,15 +43583,14 @@ impl HvfVmState {
     /// the VA lookup here could select no mapping (or an unrelated mapping at
     /// the same VA) when editing a non-identity backing.
     fn mapping_for_ipa_range(
-        mappings: &[HvfMappedRegion],
+        mappings: &TaskMappingIndex,
         ipa: u64,
         length: usize,
     ) -> Option<MappingView> {
         let length = u64::try_from(length).ok()?;
         let end = ipa.checked_add(length)?;
         mappings
-            .iter()
-            .rev()
+            .newest_first()
             .find(|mapping| {
                 let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
                 ipa >= mapping.ipa && mapping_end.is_some_and(|limit| end <= limit)
@@ -43492,15 +43606,14 @@ impl HvfVmState {
     /// vCPU's metadata solely to retain its host owner. Require the same row to
     /// cover the mailbox VA *and* express the live VA-to-IPA translation.
     fn mailbox_mapping_for_range(
-        mappings: &[HvfMappedRegion],
+        mappings: &TaskMappingIndex,
         semantic_va: u64,
         ipa: u64,
         length: usize,
     ) -> Option<MappingView> {
         let semantic_end = semantic_va.checked_add(u64::try_from(length).ok()?)?;
         mappings
-            .iter()
-            .rev()
+            .candidates_for_va(GuestVa(semantic_va))
             .find(|mapping| {
                 semantic_va >= mapping.start
                     && semantic_end <= mapping.end
@@ -44284,7 +44397,7 @@ impl HvfVmState {
             task: HvfTaskState {
                 #[cfg(not(test))]
                 custody,
-                mappings: Vec::with_capacity(mappings.len()),
+                mappings: TaskMappingIndex::new(),
                 mm_root_slot,
                 container_root,
                 pending_exec_mm_root_slot: None,
@@ -44325,7 +44438,7 @@ impl HvfVmState {
             // an already-mapped no-op and at worst map-table churn while other
             // vCPUs are running. Keep only local metadata used by syscall-path
             // guest-memory accessors.
-            state.mappings.push(mapping.into_unowned_region());
+            state.mappings.insert(mapping.into_unowned_region());
         }
 
         let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
@@ -45927,7 +46040,7 @@ impl HvfVmState {
         let (vm, plan) = spec.into_plan();
         let vcpu = create_vcpu(&vm)?;
         enable_el0_counter_access(vcpu.id());
-        let mut mapped: Vec<HvfMappedRegion> = Vec::with_capacity(plan.mappings.len());
+        let mut mapped = TaskMappingIndex::new();
         let mut structural_owners = std::collections::BTreeMap::new();
         let mut structural_identities = Vec::new();
         let mut registered_global_owners = Vec::new();
@@ -46165,7 +46278,7 @@ impl HvfVmState {
                     rebind_inherited_alias_to_process(alias, plan.mm_root_slot)
                 });
             }
-            mapped.push(HvfMappedRegion {
+            mapped.insert(HvfMappedRegion {
                 start: mapping.start,
                 ipa: mapping.ipa,
                 physical_ipa: mapping.physical_ipa,
@@ -46933,12 +47046,12 @@ impl HvfVmState {
                             std::process::abort();
                         });
                 }
-                self.mappings.push(region);
+                self.mappings.insert(region);
             }
         } else {
             for mapping in &plan.mappings {
                 self.mappings
-                    .push(map_region_raw_in(&custody, mapping, false, false)?);
+                    .insert(map_region_raw_in(&custody, mapping, false, false)?);
             }
             let replayed =
                 replayed_global_frame_owners_for_regions_in(&custody, self.mappings.iter());
@@ -49971,7 +50084,7 @@ mod frame_inventory_backend_tests {
             crate::memory::LINUX_MMAP_BASE,
         );
         region.physical_size = 0x4000;
-        second.mappings.push(region);
+        second.mappings.insert(region);
         assert!(
             second.retire_initial_mmap_arena().is_ok(),
             "a later container must skip retirement entirely"
@@ -50003,7 +50116,7 @@ mod frame_inventory_backend_tests {
             crate::memory::LINUX_MMAP_BASE,
         );
         region.physical_size = 0x4000;
-        state.mappings.push(region);
+        state.mappings.insert(region);
         assert!(state.retire_initial_mmap_arena().is_err());
     }
 
@@ -50123,7 +50236,7 @@ mod frame_inventory_backend_tests {
         let mut task = hvpatch_task_state_test_fixture(7, 0x4000, 7);
         let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
         task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
-            mappings: vec![mapping],
+            mappings: TaskMappingIndex::from_region(mapping),
             extents: [(
                 (0x1234_0000, 0x4000),
                 InventoryStage2OwnerIdentity {
@@ -50159,7 +50272,7 @@ mod frame_inventory_backend_tests {
         let task = hvpatch_task_state_test_fixture(19, 0x4000, 23);
         let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
         let mut cleanup = PendingExecStage2Cleanup {
-            mappings: Vec::new(),
+            mappings: TaskMappingIndex::new(),
             extents: std::collections::BTreeMap::new(),
             predecessor_aliases: Vec::new(),
             frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
@@ -50263,7 +50376,7 @@ mod frame_inventory_backend_tests {
             },
         ));
         task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
-            mappings: vec![mapping],
+            mappings: TaskMappingIndex::from_region(mapping),
             extents: [(
                 lease_key,
                 InventoryStage2OwnerIdentity {
@@ -50349,11 +50462,11 @@ mod frame_inventory_backend_tests {
         let mut task = hvpatch_task_state_test_fixture(18, 0x4000, 18);
         let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
         task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
-            mappings: vec![thread_sibling_tests::mapped_region(
+            mappings: TaskMappingIndex::from_region(thread_sibling_tests::mapped_region(
                 lease_key.0,
                 lease_key.0 + lease_key.1 as u64,
                 lease_key.0,
-            )],
+            )),
             extents: [((lease_key.0, lease_key.1), stale_generation)]
                 .into_iter()
                 .map(|(key, generation)| {
@@ -50462,7 +50575,7 @@ mod frame_inventory_backend_tests {
         old_mapping.is_dynamic_alias = true;
         old_mapping.owner_generation = old_generation;
         let mut cleanup = PendingExecStage2Cleanup {
-            mappings: vec![old_mapping],
+            mappings: TaskMappingIndex::from_region(old_mapping),
             extents: [(
                 lease_key,
                 InventoryStage2OwnerIdentity {
@@ -51435,7 +51548,7 @@ mod frame_inventory_backend_tests {
         let mut task = hvpatch_task_state_test_fixture(12, root_slot.0, 12);
         task.mm_root_slot = Some(root_slot);
         task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
-        task.mappings = vec![root_region];
+        task.mappings = TaskMappingIndex::from_region(root_region);
         task.mm_access
             .install_structural_mapping_authority(
                 Some(root_slot),
@@ -51571,7 +51684,7 @@ mod frame_inventory_backend_tests {
         let mut task = hvpatch_task_state_test_fixture(12, root_slot.0, 12);
         task.mm_root_slot = Some(root_slot);
         task.shared_process_mm = true;
-        task.mappings = vec![root_region];
+        task.mappings = TaskMappingIndex::from_region(root_region);
         task.mm_access
             .install_structural_mapping_authority(Some(root_slot), std::sync::Arc::clone(&owner))
             .expect("install shared-inventory exact root authority");
@@ -51764,7 +51877,11 @@ mod frame_inventory_backend_tests {
         );
         assert!(
             HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
-                HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+                HvfVmState::retire_stage2_extent_from_mappings(
+                    &mut TaskMappingIndex::new(),
+                    key.0,
+                    key.1,
+                )
             })
             .unwrap(),
         );
@@ -51906,7 +52023,8 @@ mod frame_inventory_backend_tests {
         ] {
             let mut stale = hvpatch_task_state_test_fixture(13, key.0, 13)
                 .mappings
-                .pop()
+                .into_values()
+                .next_back()
                 .unwrap();
             stale.start = key.0;
             stale.end = key.0 + key.1;
@@ -51918,7 +52036,7 @@ mod frame_inventory_backend_tests {
             stale.owner_generation = stale_generation;
             stale.is_dynamic_alias = true;
             stale.stage2_lease = None;
-            task.mappings.insert(0, stale);
+            task.mappings.insert(stale);
         }
 
         HvfVmState::retire_task_state_process_mappings(&mut task)
@@ -52281,7 +52399,7 @@ mod frame_inventory_backend_tests {
         let mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
         let mut task = hvpatch_task_state_test_fixture(12, key.0, 12);
         task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-        task.mappings = vec![region];
+        task.mappings = TaskMappingIndex::from_region(region);
         {
             let mut inventory = task.frame_inventory.lock();
             inventory.initialized = true;
@@ -52389,7 +52507,7 @@ mod frame_inventory_backend_tests {
         // Build a task state with unowned runtime region holding the stamped owner_generation
         let mut task = hvpatch_task_state_test_fixture(21, key.0, 21);
         task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-        task.mappings = vec![HvfMappedRegion {
+        task.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
             start: 0x7fff_0000,
             ipa: key.0,
             physical_ipa: key.0,
@@ -52408,7 +52526,7 @@ mod frame_inventory_backend_tests {
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation,
-        }];
+        });
 
         let frame = carrick_hal::FrameId::from_kernel_allocation(id(201));
         let mapping = carrick_hal::MappingId::from_kernel_allocation(id(202));
@@ -52515,7 +52633,7 @@ mod frame_inventory_backend_tests {
         // 1. Negative test: generation == 0 fails because reusable global frame extent requires owner
         let mut task_gen0 = hvpatch_task_state_test_fixture(22, key.0, 22);
         task_gen0.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-        task_gen0.mappings = vec![HvfMappedRegion {
+        task_gen0.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
             start: 0x7fff_0000,
             ipa: key.0,
             physical_ipa: key.0,
@@ -52534,7 +52652,7 @@ mod frame_inventory_backend_tests {
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation: 0,
-        }];
+        });
         let frame = carrick_hal::FrameId::from_kernel_allocation(id(203));
         let mapping = carrick_hal::MappingId::from_kernel_allocation(id(204));
         {
@@ -52584,7 +52702,7 @@ mod frame_inventory_backend_tests {
         let absent_key = (key.0 + 0x10_0000, key.1);
         let mut task_absent = hvpatch_task_state_test_fixture(23, absent_key.0, 23);
         task_absent.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-        task_absent.mappings = vec![HvfMappedRegion {
+        task_absent.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
             start: 0x7fff_0000,
             ipa: absent_key.0,
             physical_ipa: absent_key.0,
@@ -52603,7 +52721,7 @@ mod frame_inventory_backend_tests {
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation: 42,
-        }];
+        });
         {
             let mut inventory = task_absent.frame_inventory.lock();
             inventory.initialized = true;
@@ -52653,7 +52771,7 @@ mod frame_inventory_backend_tests {
         disarm_test_owner_stage2_unmap(key, owner_generation);
         let mut task_valid = hvpatch_task_state_test_fixture(24, key.0, 24);
         task_valid.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(1)));
-        task_valid.mappings = vec![HvfMappedRegion {
+        task_valid.mappings = TaskMappingIndex::from_region(HvfMappedRegion {
             start: 0x7fff_0000,
             ipa: key.0,
             physical_ipa: key.0,
@@ -52672,7 +52790,7 @@ mod frame_inventory_backend_tests {
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation,
-        }];
+        });
         {
             let mut inventory = task_valid.frame_inventory.lock();
             inventory.initialized = true;
@@ -53074,7 +53192,11 @@ mod frame_inventory_backend_tests {
         );
         assert!(
             HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, old_key, || {
-                HvfVmState::retire_stage2_extent_from_mappings(&mut [], old_key.0, old_key.1)
+                HvfVmState::retire_stage2_extent_from_mappings(
+                    &mut TaskMappingIndex::new(),
+                    old_key.0,
+                    old_key.1,
+                )
             })
             .unwrap(),
         );
@@ -53128,7 +53250,11 @@ mod frame_inventory_backend_tests {
         );
         assert!(
             HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
-                HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+                HvfVmState::retire_stage2_extent_from_mappings(
+                    &mut TaskMappingIndex::new(),
+                    key.0,
+                    key.1,
+                )
             })
             .unwrap(),
         );
@@ -53194,7 +53320,11 @@ mod frame_inventory_backend_tests {
         frames.lock().stage2_references.remove(&key);
         assert!(
             HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
-                HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+                HvfVmState::retire_stage2_extent_from_mappings(
+                    &mut TaskMappingIndex::new(),
+                    key.0,
+                    key.1,
+                )
             })
             .unwrap(),
         );
@@ -53218,7 +53348,7 @@ mod frame_inventory_backend_tests {
 
         assert!(global_frame_ipa_allocator().lock().is_live(key.0, key.1));
         assert!(carrier_stage2_leases().lock().contains_key(&key));
-        HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+        HvfVmState::retire_stage2_extent_from_mappings(&mut TaskMappingIndex::new(), key.0, key.1)
             .expect("explicit safe point performs requested carrier retirement");
         assert!(!global_frame_ipa_allocator().lock().is_live(key.0, key.1));
         assert!(!carrier_stage2_leases().lock().contains_key(&key));
@@ -53310,7 +53440,7 @@ mod frame_inventory_backend_tests {
         let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
         let key = lease.key();
-        let mut mappings = vec![HvfMappedRegion {
+        let mut mappings = TaskMappingIndex::from_region(HvfMappedRegion {
             start: 0x7000_0000,
             end: 0x7000_4000,
             ipa: key.0,
@@ -53329,7 +53459,7 @@ mod frame_inventory_backend_tests {
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation: 0,
-        }];
+        });
         let error = HvfVmState::retire_unowned_stage2_extent_from_mappings(
             &mut mappings,
             key.0,
@@ -53458,7 +53588,7 @@ mod frame_inventory_backend_tests {
         assert!(ledger.extents.is_empty());
         assert!(ledger.frames.lock().stage2_references.is_empty());
         drop(ledger);
-        HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+        HvfVmState::retire_stage2_extent_from_mappings(&mut TaskMappingIndex::new(), key.0, key.1)
             .expect("directory rollback safe point performs requested carrier retirement");
         assert!(
             !carrier_stage2_leases().lock().contains_key(&key),
@@ -55584,10 +55714,13 @@ mod thread_sibling_tests {
         let mut shared = mapped_region(0x100_0080_0000, 0x100_0080_4000, backing_ipa);
         shared.host_addr = 0x1046_78000usize as *mut u8;
         shared.sharing = GuestMappingSharing::GlobalShared;
-        let mut retired_private = mapped_region(0x6000_005000, 0x6000_009000, backing_ipa);
+        // The ordered index walks rows newest-VA-first, so a private row ABOVE
+        // the shared one is the first candidate an unfiltered raw-IPA lookup
+        // would take. Its VA is incidental to what this test proves: only the
+        // shared-futex identity filter may decide the route.
+        let mut retired_private = mapped_region(0x100_0090_0000, 0x100_0094_0000, backing_ipa);
         retired_private.host_addr = 0x1177_d0000usize as *mut u8;
-        // Newest-first raw IPA lookup sees this unrelated private row first.
-        let mappings = [shared, retired_private];
+        let mappings = TaskMappingIndex::from_iter([shared, retired_private]);
 
         let location = HvfVmState::shared_futex_mapping_for_ipa(&mappings, backing_ipa + 4, false)
             .expect("the older exact shared owner must remain routable");
@@ -55953,11 +56086,11 @@ mod thread_sibling_tests {
     fn raw_ipa_lookup_selects_rebased_mm_global_frame_backing() {
         let guest_va = crate::memory::LINUX_PAGE_TABLES_BASE;
         let root_slot_ipa = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
-        let mappings = vec![mapped_region(
+        let mappings = TaskMappingIndex::from_region(mapped_region(
             guest_va,
             guest_va + crate::memory::LINUX_PAGE_TABLES_SIZE,
             root_slot_ipa,
-        )];
+        ));
 
         let mapping = HvfVmState::mapping_for_ipa_range(&mappings, root_slot_ipa + 0x4000, 8)
             .expect("rebased page-table IPA must resolve by IPA, not guest VA");
@@ -55976,12 +56109,14 @@ mod thread_sibling_tests {
         let recycled_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x3c_000;
         let mut mailbox = mapped_region(mailbox_va, mailbox_va + 0x1_0000, recycled_ipa);
         mailbox.host_addr = 0x1177_bc000usize as *mut u8;
-        let mut retired = mapped_region(0x6000_005000, 0x6000_009000, recycled_ipa);
+        // A retired row that kept the recycled IPA, placed ABOVE the mailbox in
+        // VA order so it is the first row a raw-IPA search would reach. It
+        // cannot represent the mailbox VA in the live stage-1 graph, so the
+        // route must still authenticate the VA-to-IPA translation.
+        let mut retired =
+            mapped_region(mailbox_va + 0x10_0000, mailbox_va + 0x10_4000, recycled_ipa);
         retired.host_addr = 0x10e2_90000usize as *mut u8;
-        // The retired row is newer in this vCPU-local metadata Vec. A raw IPA
-        // search therefore selects it even though it cannot represent the
-        // mailbox VA in the live stage-1 graph.
-        let mappings = [mailbox, retired];
+        let mappings = TaskMappingIndex::from_iter([mailbox, retired]);
 
         let selected = HvfVmState::mailbox_mapping_for_range(
             &mappings,
@@ -56069,7 +56204,8 @@ mod thread_sibling_tests {
 
     #[test]
     fn persistent_carrier_authority_outlives_terminal_task_cleanup_and_drops_stage2_first() {
-        let mut task_mappings = vec![mapped_region(0x0040_0000, 0x0040_4000, 0x0040_0000)];
+        let mut task_mappings =
+            TaskMappingIndex::from_region(mapped_region(0x0040_0000, 0x0040_4000, 0x0040_0000));
         let mut drop_observations = Vec::new();
         for (start, size) in [
             (
@@ -56107,7 +56243,7 @@ mod thread_sibling_tests {
             region.host_addr = host_addr;
             region.host_mapping = Some(host);
             region.stage2_lease = Some(lease);
-            task_mappings.push(region);
+            task_mappings.insert(region);
             drop_observations.push((host_addr as usize, observed));
         }
         assert_eq!(
@@ -56166,7 +56302,7 @@ mod thread_sibling_tests {
         mapping.physical_ipa = start;
         mapping.physical_size = usize::try_from(crate::memory::LINUX_EL0_TRAMPOLINE_SIZE).unwrap();
         let authority = PersistentCarrierMappings {
-            mappings: vec![mapping],
+            mappings: TaskMappingIndex::from_region(mapping),
             custody: std::sync::Arc::clone(&custody),
             vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
         };
@@ -57783,7 +57919,7 @@ mod tag_strip_tests {
         let physical_host = physical.as_ptr() as *mut u8;
         let semantic_host = physical_host.wrapping_add(0x1000);
         let mut task = super::HvfTaskState::neutral();
-        task.mappings.push(HvfMappedRegion {
+        task.mappings.insert(HvfMappedRegion {
             start: semantic_va,
             ipa: semantic_ipa,
             physical_ipa,
