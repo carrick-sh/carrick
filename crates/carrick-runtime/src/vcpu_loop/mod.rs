@@ -3756,6 +3756,7 @@ impl HvpatchLoopResult {
         }
         *slot = Some(result);
         self.state.ready.notify_all();
+        crate::event_ring::rec_hvpatch_settle_object(Arc::as_ptr(&self.state) as usize, 18);
     }
 
     #[cfg(test)]
@@ -3866,7 +3867,13 @@ impl HvpatchLoopResult {
                         // formed. A real result always beats an abort: the job
                         // was published, so the premise of the verdict is gone.
                         Some(result) => result,
-                        None => Err(liveness.liveness_abort(census, 1)),
+                        None => {
+                            crate::event_ring::rec_hvpatch_settle_object(
+                                Arc::as_ptr(&self.state) as usize,
+                                19,
+                            );
+                            Err(liveness.liveness_abort(census, 1))
+                        }
                     };
                 }
                 Some((observed, _)) if observed == census => {}

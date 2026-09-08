@@ -491,6 +491,22 @@ pub fn rec_hvpatch_settle_step(tid: i32, generation: u64, step: i32) {
     rec(HVPSETTLE, tid, generation.min(i32::MAX as u64) as i32, step);
 }
 
+/// The `HVPSETTLE` variant whose `a:b` pair is a 64-bit object address rather
+/// than a thread identity: steps 18 and 19 name the exact
+/// `HvpatchLoopResultState` a job result was published into and the one a
+/// container wait gave up on, which is the only way to tell "nobody published
+/// this job" apart from "someone published a DIFFERENT job".
+#[inline]
+pub fn rec_hvpatch_settle_object(address: usize, step: i32) {
+    let address = address as u64;
+    rec(
+        HVPSETTLE,
+        (address & 0xffff_ffff) as u32 as i32,
+        (address >> 32) as u32 as i32,
+        step,
+    );
+}
+
 #[inline]
 pub fn rec_hvpatch_blocked_continuation(
     pid: i32,
@@ -963,6 +979,8 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
                 15 => "claim-dropped-unsettled/running",
                 16 => "claim-dropped-unsettled/switching-out",
                 17 => "claim-dropped-unsettled/uninitialized",
+                18 => "job-result-published",
+                19 => "job-result-wait-abandoned",
                 _ => "unknown",
             }
         ),
