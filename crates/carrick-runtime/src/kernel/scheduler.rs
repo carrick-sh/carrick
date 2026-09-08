@@ -18,7 +18,7 @@ pub use carrick_hal::{
 use super::Kernel;
 use super::objects::{
     BlockedReason, ExecutionGeneration, ExecutorId, Thread, ThreadExecutionError,
-    ThreadExecutionLease, ThreadKey, ThreadSchedulerAction,
+    ThreadExecutionLease, ThreadExecutionState, ThreadKey, ThreadSchedulerAction,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2544,8 +2544,42 @@ impl RunnableThread {
     }
 }
 
+/// The `HVPSETTLE` sub-step code for a thread execution state, offset into the
+/// `claim-dropped-unsettled/<state>` range.
+fn stranded_claim_state_code(state: ThreadExecutionState) -> i32 {
+    9 + match state {
+        ThreadExecutionState::Runnable { .. } => 1,
+        ThreadExecutionState::Blocked {
+            reason: BlockedReason::ChildState,
+            ..
+        } => 2,
+        ThreadExecutionState::Blocked {
+            reason: BlockedReason::HostWait,
+            ..
+        } => 3,
+        ThreadExecutionState::Exited { .. } => 4,
+        ThreadExecutionState::Failed { .. } => 5,
+        ThreadExecutionState::Running { .. } => 6,
+        ThreadExecutionState::SwitchingOut { .. } => 7,
+        ThreadExecutionState::Uninitialized => 8,
+    }
+}
+
 impl Drop for RunnableThread {
     fn drop(&mut self) {
+        // A claim released here rather than by a settlement is the stranded
+        // shape: nothing publishes the thread's process job and nothing
+        // re-queues it, so the graph goes quiet with the row frozen in
+        // whatever state `begin_switch_out` last wrote. Record it before the
+        // count drops so a post-mortem names the strand instead of showing an
+        // unexplained gap after `HVPEXEC_BOUNDARY`.
+        if self.active_claim {
+            crate::event_ring::rec_hvpatch_settle_step(
+                self.key.thread.tid.raw(),
+                self.key.generation.raw(),
+                stranded_claim_state_code(self.thread.execution_state()),
+            );
+        }
         self.finish_claim();
     }
 }
@@ -3673,6 +3707,9 @@ impl Scheduler {
     }
 
     pub fn settle_exited(&self, mut running: RunnableThread) -> Result<(), SchedulerError> {
+        let settle_tid = running.thread_key().tid.raw();
+        let settle_generation = running.generation().raw();
+        crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 1);
         let _transition = self.generation_transition.lock();
         let predecessor = running.generation();
         let lease = running.take_lease();
@@ -3680,6 +3717,7 @@ impl Scheduler {
             .thread
             .exit_from_executor(lease)
             .map_err(|(error, _lease)| error)?;
+        crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 2);
         let successor = running
             .thread
             .execution_state()
@@ -3708,8 +3746,10 @@ impl Scheduler {
         }
         let task_key = TaskKey::new(running.thread.task_key().serial.raw());
         self.queue.inner.policy.on_exit(task_key, bound_cpu);
+        crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 3);
         drop(_transition);
         running.finish_claim();
+        crate::event_ring::rec_hvpatch_settle_step(settle_tid, settle_generation, 4);
         Ok(())
     }
 
@@ -4009,7 +4049,7 @@ mod tests {
     };
     use crate::compat::SyscallArgs;
     use crate::dispatch::SyscallRequest;
-    use crate::kernel::objects::{BlockedReason, MigratableTaskState, ThreadExecutionState};
+    use crate::kernel::objects::MigratableTaskState;
     use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap};
     use crate::vcpu_loop::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationBackend, ContinuationCapture,

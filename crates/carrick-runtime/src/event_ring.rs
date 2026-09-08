@@ -190,6 +190,22 @@ pub const HVPBLOCK_ARG0: u8 = 48;
 /// Raw low 32 bits of syscall arguments 1 and 2 for HVPBLOCK. `a` is arg1,
 /// `b` is arg2, and `c` is the guest TID join key.
 pub const HVPBLOCK_ARGS: u8 = 49;
+/// HVPatch scheduler settlement sub-step for one exact thread claim. `a` is
+/// the guest TID, `b` the `ExecutionGeneration` the claim was taken at, and
+/// `c` the sub-step code decoded below. Steps 5..=7 are the binding's
+/// publication gate, which has no thread identity: there `a` is 0 and `b` is
+/// the binding's `MmId`.
+///
+/// This exists because a stranded terminal settlement is invisible in the
+/// boundary/settlement pair: `HVPEXEC_BOUNDARY` says the quantum ended and
+/// `HVPEXEC_SETTLEMENT` is only written when a settlement SUCCEEDED, so a
+/// claim that is released without ever settling leaves no record at all. Code
+/// Codes 10..=17 (`claim-dropped-unsettled/<state>`) are that missing record:
+/// `RunnableThread`'s `Drop` released a live claim, which leaves the thread in
+/// whatever state `begin_switch_out` last published and its process job
+/// unpublished forever. The trailing state names the exact
+/// `ThreadExecutionState` the strand froze at.
+pub const HVPSETTLE: u8 = 50;
 
 const HVPWAIT_ID_MASK: u32 = 0x00ff_ffff;
 
@@ -468,6 +484,11 @@ pub fn rec_hvpatch_executor_boundary(pid: i32, tid: i32, boundary: i32) {
 #[inline]
 pub fn rec_hvpatch_executor_settlement(pid: i32, tid: i32, state: i32) {
     rec(HVPEXEC_SETTLEMENT, pid, tid, state);
+}
+
+#[inline]
+pub fn rec_hvpatch_settle_step(tid: i32, generation: u64, step: i32) {
+    rec(HVPSETTLE, tid, generation.min(i32::MAX as u64) as i32, step);
 }
 
 #[inline]
@@ -920,6 +941,28 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
                 6 => "running",
                 7 => "switching-out",
                 8 => "uninitialized",
+                _ => "unknown",
+            }
+        ),
+        HVPSETTLE => format!(
+            "HVPSETTLE tid={a} generation={b} step={}",
+            match c {
+                1 => "settle-exited-enter",
+                2 => "settle-exited-state-published",
+                3 => "settle-exited-unbound",
+                4 => "settle-exited-claim-finished",
+                5 => "publish-terminal-active",
+                6 => "publish-terminal-exec-transferred",
+                7 => "publish-terminal-already-settled",
+                8 => "claim-dropped-settled",
+                10 => "claim-dropped-unsettled/runnable",
+                11 => "claim-dropped-unsettled/blocked-child",
+                12 => "claim-dropped-unsettled/blocked-host",
+                13 => "claim-dropped-unsettled/exited",
+                14 => "claim-dropped-unsettled/failed",
+                15 => "claim-dropped-unsettled/running",
+                16 => "claim-dropped-unsettled/switching-out",
+                17 => "claim-dropped-unsettled/uninitialized",
                 _ => "unknown",
             }
         ),
