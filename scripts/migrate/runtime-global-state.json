@@ -2194,6 +2194,14 @@
       "rationale": "Host thread-local counter of source-mapping rows visited while answering the fork overlay-owner question, backing fork_overlay_owner_lookup_does_not_rescan_every_source_mapping. Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED: it measures the forking thread's own work and carries no Linux process semantics."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "symbol": "TASK_MAPPING_ROWS_SCANNED",
+      "fingerprint": "476e97a36c4b9a69f322816d15b90d5552754fc54380db16c752f072c69abf7f",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local counter of TaskMappingIndex rows one lookup offered its consumer, read by the per-fault mapping-index census probe and by a_lookup_walks_a_bounded_number_of_rows_regardless_of_table_size. Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED and FORK_MAPPING_ROWS_SCANNED: it measures the faulting thread's own walk length and carries no Linux process semantics."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "INJECT_AT_EL1",
