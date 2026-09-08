@@ -3124,3 +3124,19 @@ worktree; build, lint, shards, the full `just conformance-probes` gate and
 the memory rows chained on main. Expected gate state after this: 643
 probe executions, failing only on `mqnotifycrossproc` until its wake-audit
 fix lands (brief written, dispatch after scheduler round 7).
+
+### 2026-09-08 19:00 — first pass at the goal's own condition (contaminated, not citable)
+
+The self-gated closing run fired at 11:22 in a brief quiet window on the
+activation-reservation binary (d81b2093…, main 62ced7952) and finished its
+two measurement phases before round 7's hogs and guests contaminated it
+(load 4.5 → 25 during phase 1). **Both phases 11/11 MATCH, zero crashes:**
+`--workers 1` and, for the first time tonight, **the `--workers 4` cached
+ledger itself**. Ratios are not citable at that load (w1: compile 24.5x,
+tarfile 14.2x; w4: compile 19.9x, mp_main 16.7x, importlib 12.1x, net_http
+14.5x, tarfile 12.1x), and the three fork-to-wait samples taken during the
+four-worker phase (p50 826 / 1081 / 981 µs vs the 251 µs quiet reference)
+carry three `yes` hogs and a sibling agent's guests on top of the four
+workers, so they overstate the goal's condition. The run was stopped in
+phase 3 and re-armed to execute from a hash-pinned copy of the binary on
+the next genuinely quiet window.
