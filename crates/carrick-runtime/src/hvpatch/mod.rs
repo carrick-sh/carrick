@@ -1075,6 +1075,14 @@ impl ProcessContext {
         }
     }
 
+    /// Publish this EL0 abort on the guest-fault probes.
+    ///
+    /// Called on EVERY EL0 abort, so it reads the task's live MM binding for
+    /// the ASID only while a consumer has the probes enabled: the read is an
+    /// `RwLock` acquire plus an `Arc` clone and drop, and `cpython-compile`
+    /// takes 110k aborts whose faults are ordinary anonymous first touches
+    /// that no consumer is watching. Same lazy-argument contract as
+    /// `vcpu_fault_regs_with` immediately upstream in the fault arm.
     pub(crate) fn trace_fault(
         &self,
         syndrome: u64,
@@ -1082,22 +1090,18 @@ impl ProcessContext {
         far: u64,
         tid: crate::thread::ThreadId,
     ) {
-        let Some(binding) = self.mm_binding() else {
-            tracing::error!(pid = self.pid(), "hvpatch task has no mm backend");
-            return;
-        };
-        let event = carrick_observability::probes::HvpatchGuestFault::new(
-            syndrome,
-            elr,
-            far,
-            self.pid(),
-            tid.raw(),
-            u32::from(binding.asid.raw()),
-        );
-        match event {
-            Ok(event) => crate::probes::hvpatch_guest_fault(event),
-            Err(error) => tracing::error!(pid = self.pid(), %error, "invalid hvpatch fault event"),
-        }
+        crate::probes::hvpatch_guest_fault_with(|| {
+            let binding = self.mm_binding()?;
+            carrick_observability::probes::HvpatchGuestFault::new(
+                syndrome,
+                elr,
+                far,
+                self.pid(),
+                tid.raw(),
+                u32::from(binding.asid.raw()),
+            )
+            .ok()
+        });
     }
 
     #[cfg(test)]
