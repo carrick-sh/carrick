@@ -6,8 +6,10 @@
 /*
  * GUEST FS SYSCALL -> HOST SYSCALL AMPLIFICATION BREAKDOWN
  *
- * (a) What it measures: for guest `unlinkat` (nr 35) and `mkdirat` (nr 34),
- *     aggregates which Darwin host syscalls are executed by Carrick per call.
+ * (a) What it measures: for guest openat (56), fstat (80), newfstatat (79),
+ *     getdents64 (61), read (63), write (64), close (57), mmap (222), munmap (215),
+ *     mkdirat (34), and unlinkat (35), aggregates which Darwin host syscalls
+ *     are executed by Carrick per call.
  *
  * (b) Provider ABI facts (qualified live on macOS 26 / arm64, 2026-09-07):
  *     `carrick*:::syscall-entry`: arg0 = canonical Linux syscall nr.
@@ -23,7 +25,7 @@ dtrace:::BEGIN
 }
 
 carrick*:::syscall-entry
-/(pid == $target || progenyof($target)) && (arg0 == 34 || arg0 == 35)/
+/(pid == $target || progenyof($target)) && (arg0 == 34 || arg0 == 35 || arg0 == 56 || arg0 == 57 || arg0 == 61 || arg0 == 63 || arg0 == 64 || arg0 == 79 || arg0 == 80 || arg0 == 215 || arg0 == 222)/
 {
 	self->in_fs = 1;
 	self->guest_nr = arg0;
