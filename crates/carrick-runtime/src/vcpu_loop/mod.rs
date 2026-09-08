@@ -8500,16 +8500,12 @@ where
                     let x = |n: u32| engine.get_reg(carrick_hal::Reg::X(n)).unwrap_or(0);
                     (x(0), x(1), x(2), x(3), x(4), x(5))
                 });
-                if let Some((ttbr, descriptors)) = engine.diagnostic_fault_page_tables(far) {
-                    crate::probes::pt_fault_walk(
-                        far,
-                        descriptors[0],
-                        descriptors[1],
-                        descriptors[2],
-                        descriptors[3],
-                    );
-                    crate::probes::pt_fault_ttbr(far, ttbr);
-                }
+                // Same lazy-argument contract as the two probes above, and for
+                // the same reason: the stage-1 walk is a `TTBR0_EL1` sysreg
+                // read, a backend lookup for the table root and four
+                // descriptor reads, and it was running on EVERY data abort to
+                // feed two probes that are a no-op with no D script attached.
+                crate::probes::pt_fault_with(far, || engine.diagnostic_fault_page_tables(far));
                 if let Some(process) = self.kernel.hvpatch_process.as_ref() {
                     process.trace_fault(syndrome, elr, far, self.state.this_tid);
                 }
@@ -8548,15 +8544,6 @@ where
                 let si_code =
                     signal::upgrade_protection_si_code(&*engine, signum, si_code, si_addr);
                 let interrupted_pc = from_el0_direct.then_some(elr);
-                let fault_context = self
-                    .kernel
-                    .dispatcher
-                    .capture_kernel_context(self.state.linux_tid)
-                    .map_err(|error| {
-                        RuntimeError::Configuration(format!(
-                            "capture synchronous-fault signal context: {error}"
-                        ))
-                    })?;
                 let faulting_tid = self.state.linux_tid;
                 if self.kernel.dispatcher.fault_requires_mm_mutation(si_addr)
                     && self
@@ -8575,6 +8562,20 @@ where
                 {
                     return Ok(executor::ExecutorExit::Syscall);
                 }
+                // Captured only now: a first touch resolved above never
+                // delivers a signal, and this capture is an `RwLock` read plus
+                // a kernel-graph snapshot that only `deliver_fault_signal`
+                // consumes. Hoisting it out of the resolved path takes it off
+                // the hot arm of every anonymous first-touch fault.
+                let fault_context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture synchronous-fault signal context: {error}"
+                        ))
+                    })?;
                 if let Some(outcome) = deliver_fault_signal(
                     &self.kernel,
                     &fault_context,
@@ -8603,15 +8604,6 @@ where
                 let si_code =
                     signal::upgrade_protection_si_code(&*engine, signum, si_code, fault_addr);
                 let interrupted_pc = Some(engine.current_pc()?);
-                let fault_context = self
-                    .kernel
-                    .dispatcher
-                    .capture_kernel_context(self.state.linux_tid)
-                    .map_err(|error| {
-                        RuntimeError::Configuration(format!(
-                            "capture guest-fault signal context: {error}"
-                        ))
-                    })?;
                 let faulting_tid = self.state.linux_tid;
                 if self
                     .kernel
@@ -8636,6 +8628,17 @@ where
                 {
                     return Ok(executor::ExecutorExit::Syscall);
                 }
+                // Same hoist as the aarch64 arm above: only the delivered
+                // path needs the captured kernel context.
+                let fault_context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture guest-fault signal context: {error}"
+                        ))
+                    })?;
                 if let Some(outcome) = deliver_fault_signal(
                     &self.kernel,
                     &fault_context,

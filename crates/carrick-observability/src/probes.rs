@@ -6247,6 +6247,45 @@ mod real {
         ));
     }
 
+    /// [`hvpatch_guest_fault`] with the EVENT CONSTRUCTION deferred until a
+    /// consumer is attached.
+    ///
+    /// Building the event needs the task's live MM binding for its ASID — an
+    /// `RwLock` read plus an `Arc` clone and drop — which the eager form paid
+    /// on every EL0 abort so that two disabled probes could be handed
+    /// arguments. `event` is `Fn` because the two probes arm independently
+    /// and share one memo cell, so the binding is read at most once per
+    /// fault.
+    ///
+    /// One deliberate difference from the eager form: an identity the probe
+    /// ABI rejects (`asid == 0`) used to log an error and fire nothing, and
+    /// now fires both probes with zeroed identity. `pid == 0` is not a value
+    /// [`super::HvpatchGuestFault::new`] can produce, so a consumer reads it
+    /// unambiguously as "identity unavailable" — which beats a probe that
+    /// silently does not fire.
+    #[inline(never)]
+    pub fn hvpatch_guest_fault_with(event: impl Fn() -> Option<super::HvpatchGuestFault>) {
+        let built = std::cell::OnceCell::new();
+        carrick_usdt::hvpatch__guest__fault__asid!(|| {
+            let event = *built.get_or_init(&event);
+            (
+                event.map_or(0, super::HvpatchGuestFault::pid),
+                event.map_or(0, super::HvpatchGuestFault::tid),
+                event.map_or(0, super::HvpatchGuestFault::asid),
+            )
+        });
+        carrick_usdt::hvpatch__guest__fault!(|| {
+            let event = *built.get_or_init(&event);
+            (
+                event.map_or(0, super::HvpatchGuestFault::syndrome),
+                event.map_or(0, super::HvpatchGuestFault::elr),
+                event.map_or(0, super::HvpatchGuestFault::far),
+                event.map_or(0, super::HvpatchGuestFault::pid),
+                event.map_or(0, super::HvpatchGuestFault::tid),
+            )
+        });
+    }
+
     #[inline(never)]
     pub fn hvpatch_frame_cow(event: super::HvpatchFrameCow) {
         carrick_usdt::hvpatch__frame__cow__intent!(|| event.intent().raw());
@@ -7396,6 +7435,44 @@ mod real {
         carrick_usdt::pt__fault__ttbr!(|| (far, ttbr));
     }
 
+    /// [`pt_fault_walk`] and [`pt_fault_ttbr`] with the stage-1 WALK ITSELF
+    /// deferred until a consumer is attached.
+    ///
+    /// The eager form made every EL0 abort pay a `TTBR0_EL1` sysreg read, a
+    /// backend mapping lookup for the table root and a four-level descriptor
+    /// walk, purely to compute arguments for two probes that are a no-op
+    /// unless a D script enabled them. On `cpython-compile` that is 110k
+    /// walks for a workload whose faults are 99.6% ordinary anonymous first
+    /// touches. `walk` is `Fn`, not `FnOnce`, because the two probes arm
+    /// independently and each memoizes through the same cell, so the walk
+    /// runs at most once per fault however many of the two are enabled.
+    ///
+    /// One deliberate difference from the eager form: when the walk cannot
+    /// resolve the table root it used to fire NEITHER probe, and now fires
+    /// both with zeroed descriptors. A consumer cannot distinguish that from
+    /// a walk of a genuinely unmapped VA, which already produced zeros — and
+    /// the alternative, a probe that silently does not fire, is the failure
+    /// mode `scripts/dtrace` headers warn about.
+    pub fn pt_fault_with(far: u64, walk: impl Fn() -> Option<(u64, [u64; 4])>) {
+        let walked = std::cell::OnceCell::new();
+        carrick_usdt::pt__fault__walk!(|| {
+            let descriptors = walked
+                .get_or_init(&walk)
+                .map_or([0_u64; 4], |(_, descriptors)| descriptors);
+            (
+                far,
+                descriptors[0],
+                descriptors[1],
+                descriptors[2],
+                descriptors[3],
+            )
+        });
+        carrick_usdt::pt__fault__ttbr!(|| {
+            let ttbr = walked.get_or_init(&walk).map_or(0, |(ttbr, _)| ttbr);
+            (far, ttbr)
+        });
+    }
+
     pub mod guest_mem_dir {
         pub const READ_GUEST: u32 = 0;
         pub const WRITE_GUEST: u32 = 1;
@@ -8195,6 +8272,11 @@ mod stub {
     stub!(mmap_lowering_error(va: u64, len: u64, offset: u64, error: &dyn std::fmt::Display));
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
     stub!(hvpatch_guest_fault(event: super::HvpatchGuestFault));
+    #[allow(dead_code, unused_variables)]
+    #[inline(always)]
+    pub fn hvpatch_guest_fault_with(event: impl Fn() -> Option<super::HvpatchGuestFault>) {
+        let _ = event;
+    }
     stub!(hvpatch_stale_stage1_retry(far: u64, access: u32, tid: i32));
     stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
@@ -8295,6 +8377,11 @@ mod stub {
     stub!(pt_pool(in_use: u32, free_list: u32, capacity: u32, changed: i32));
     stub!(pt_fault_walk(far: u64, l0: u64, l1: u64, l2: u64, l3: u64));
     stub!(pt_fault_ttbr(far: u64, ttbr: u64));
+    #[allow(dead_code, unused_variables)]
+    #[inline(always)]
+    pub fn pt_fault_with(far: u64, walk: impl Fn() -> Option<(u64, [u64; 4])>) {
+        let _ = walk;
+    }
     stub!(guest_mem_bytes(direction: u32, address: u64, bytes: &[u8]));
     stub!(vcpu_trap(regs: &crate::compat::GuestRegs));
     stub!(execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64));
