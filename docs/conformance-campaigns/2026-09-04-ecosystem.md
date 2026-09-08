@@ -2366,3 +2366,13 @@ post-mortem capture must record it rather than refuse (lane B).
 Fix under gate: `opus/exitwedge-sep07` rebased (df0a28a4d publish-on-lost-
 claim, e42253f68 bounded signed exec/exit-storm test); unit reproducer 20/20
 red → green; signed embed test running before the fast-forward.
+
+**Landed 2026-09-07 22:35:** exit-wedge publish fix on main (f8487d23b,
+8a27b53f1, reconcile 1152ced70; signed binary 93632a2e…). Gates run by the
+director: unit reproducer green, `just lint-domains` 0, probe shards 3/3,
+signed build 0. The signed embed test `go_types_exit_publishes_every_process_job`
+compiles but did **not** execute: `just test-embed` shells out to Docker on
+the image path although the go image is in the local store and both local
+registries were down; fixing that lane is part of lane B. Post-landing rows
+in `post-exitwedge.log`. Lane B (KernelAbort sink, post-mortem, debug abort,
+deadline, exit budgets) dispatched on the same worktree.
