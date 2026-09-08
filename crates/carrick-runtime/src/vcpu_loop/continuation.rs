@@ -5066,9 +5066,15 @@ mod tests {
             );
         }
 
+        // Anchored on the reactor itself rather than on the Nth textual
+        // occurrence of `ReadinessProbe::RecordLock`: an occurrence index
+        // silently reaims at unrelated code the moment another match arm on
+        // that variant is added anywhere earlier in the file (the diagnostic
+        // renderer did exactly that), and a test that reaims is worse than no
+        // test. This region is exactly the reactor body.
         let record_reactor = continuation_source
-            .split("ReadinessProbe::RecordLock")
-            .nth(2)
+            .split("fn run_reactor")
+            .nth(1)
             .and_then(|tail| tail.split("impl Drop for CarrierWaitServiceInner").next())
             .expect("shared record-lock reactor path");
         assert!(record_reactor.contains("try_drive_blocking_record_lock"));

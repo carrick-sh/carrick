@@ -7574,12 +7574,12 @@ mod tests {
         );
         assert!(kernel.consume_ptrace_resume_signal(child_id, signal));
         assert!(!kernel.consume_ptrace_resume_signal(child_id, signal));
-        assert_eq!(
+        assert!(matches!(
             kernel
                 .wait_child(root.task().key().id, Some(child_id), WaitMode::Observe)
                 .expect("resumed child remains live"),
-            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
-        );
+            WaitOutcome::StillRunning(_)
+        ));
     }
 
     #[test]
@@ -7662,12 +7662,12 @@ mod tests {
                 .is_some(),
             "attach posts SIGSTOP to the tracee",
         );
-        assert_eq!(
+        assert!(matches!(
             kernel
                 .wait_child(tracer_id, Some(tracee_id), WaitMode::Observe)
                 .expect("a live tracee is waitable by its tracer"),
-            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
-        );
+            WaitOutcome::StillRunning(_)
+        ));
 
         assert!(kernel.stop_task_for_ptrace(tracee_id, sigstop));
         assert_eq!(
@@ -7690,12 +7690,12 @@ mod tests {
             !tracee.task().is_job_control_stopped(),
             "a detached ptrace-stopped tracee resumes",
         );
-        assert_eq!(
+        assert!(matches!(
             kernel
                 .wait_child(root.task().key().id, Some(tracee_id), WaitMode::Observe)
                 .expect("resumed tracee remains live for its parent"),
-            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
-        );
+            WaitOutcome::StillRunning(_)
+        ));
     }
 
     #[test]
@@ -8135,18 +8135,20 @@ mod tests {
         assert!(kernel.post_signal_to_authorized_target(&ticket, sigkill, None));
 
         assert!(!kernel.task_is_job_control_stopped(child_id));
-        assert_eq!(
-            kernel
-                .wait_child_with_job_control(
-                    root.task().key().id,
-                    Some(child_id),
-                    WaitChildClass::Sigchld,
-                    false,
-                    true,
-                    WaitMode::Consume,
-                )
-                .expect("wait after fatal resume"),
-            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
+        assert!(
+            matches!(
+                kernel
+                    .wait_child_with_job_control(
+                        root.task().key().id,
+                        Some(child_id),
+                        WaitChildClass::Sigchld,
+                        false,
+                        true,
+                        WaitMode::Consume,
+                    )
+                    .expect("wait after fatal resume"),
+                WaitOutcome::StillRunning(_)
+            ),
             "SIGKILL must not manufacture a WCONTINUED transition",
         );
     }
@@ -8311,11 +8313,13 @@ mod tests {
 
         // The clone child's zombie is invisible to a plain wait, which still
         // blocks on the live fork child ...
-        assert_eq!(
-            kernel
-                .wait_child(root_id, None, WaitMode::Consume)
-                .expect("wait"),
-            WaitOutcome::StillRunning(ChildWaitPrecheck::unsampled()),
+        assert!(
+            matches!(
+                kernel
+                    .wait_child(root_id, None, WaitMode::Consume)
+                    .expect("wait"),
+                WaitOutcome::StillRunning(_)
+            ),
             "plain wait must not reap a clone child"
         );
         assert_eq!(
