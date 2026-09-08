@@ -153,7 +153,7 @@ impl fmt::Display for AuditReason {
             Self::OrphanZombie { task } => {
                 write!(
                     f,
-                    "zombie {task} has no parent although its pid-namespace init was live"
+                    "orphan zombie {task} has no reaper: no parent, and its pid-namespace init was still live"
                 )
             }
             Self::ProcessGraphEmptyWithUnpublishedJobs { unpublished_jobs } => {
@@ -837,6 +837,12 @@ mod tests {
         );
 
         let reason = AuditReason::OrphanZombie { task: parent };
-        assert!(reason.to_string().contains("orphan zombie"));
+        let rendered = reason.to_string();
+        assert!(rendered.contains("orphan zombie"));
+        // The reason names WHY it is orphaned. "not pid 1" used to appear
+        // here and was wrong: `TaskKey::id` is a carrier-global allocation,
+        // never an ns-pid.
+        assert!(rendered.contains("pid-namespace init was still live"));
+        assert!(!rendered.contains("pid 1"));
     }
 }
