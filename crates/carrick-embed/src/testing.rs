@@ -48,9 +48,11 @@ pub struct TestContainer {
     interceptors: Vec<Arc<dyn SyscallInterceptor>>,
     auditors: Vec<Arc<dyn KernelAuditor>>,
     disabled_invariants: BTreeSet<InvariantKind>,
-    every_child_runs_timeout: Duration,
-    exit_budget_matcher: ExitBudgetMatcher,
-    exit_budget_timeout: Duration,
+    /// `None` until a test body arms `EveryChildRuns` — see
+    /// [`Self::every_child_runs_timeout`].
+    every_child_runs_timeout: Option<Duration>,
+    /// `None` until a test body arms `ExitBudget` — see [`Self::exit_budget`].
+    exit_budget: Option<(ExitBudgetMatcher, Duration)>,
     deadline: Option<std::time::Duration>,
 }
 
@@ -91,13 +93,20 @@ impl TestContainer {
             interceptors: Vec::new(),
             auditors: Vec::new(),
             disabled_invariants: BTreeSet::new(),
-            every_child_runs_timeout: Duration::from_secs(5),
-            exit_budget_matcher: ExitBudgetMatcher::Any,
-            exit_budget_timeout: Duration::from_secs(10),
+            every_child_runs_timeout: None,
+            exit_budget: None,
             deadline: None,
         }
     }
 
+    /// Turn off one of the STRUCTURAL invariants that ship on by default
+    /// ([`InvariantKind::NoOrphanZombie`], [`InvariantKind::ProcessGraphLiveness`],
+    /// [`InvariantKind::NoWakeOfReapedTask`],
+    /// [`InvariantKind::FirstTouchNeverDelivered`]).
+    ///
+    /// The TIMED invariants ([`InvariantKind::EveryChildRuns`],
+    /// [`InvariantKind::ExitBudget`]) are not on by default, so naming one here
+    /// only guarantees it stays off even if a later builder call arms it.
     pub fn without_invariant(mut self, invariant: InvariantKind) -> Self {
         self.disabled_invariants.insert(invariant);
         self
@@ -108,15 +117,81 @@ impl TestContainer {
         self
     }
 
+    /// ARM the timed [`EveryChildRuns`] invariant with `timeout`.
+    ///
+    /// Off unless a test body calls this: the bound is a number a human chose
+    /// for one test's workload, so it cannot be a container-wide default. A
+    /// legitimately slow first child (image resolution, a cold guest) is not a
+    /// kernel defect, and defaulting it on aborted every long run.
     pub fn every_child_runs_timeout(mut self, timeout: Duration) -> Self {
-        self.every_child_runs_timeout = timeout;
+        self.every_child_runs_timeout = Some(timeout);
         self
     }
 
+    /// ARM the timed [`ExitBudget`] invariant: tasks matched by `select` must
+    /// reach `exit_settled` within `within`.
+    ///
+    /// Off unless a test body calls this, for the same reason as
+    /// [`Self::every_child_runs_timeout`] — a wall-clock exit budget is a
+    /// per-test assertion, not a property of every container. A default 10 s
+    /// budget aborted the probe lane's first case (image resolution plus a
+    /// cold guest) with `exceeded exit budget of 10s`.
     pub fn exit_budget(mut self, select: ExitBudgetMatcher, within: Duration) -> Self {
-        self.exit_budget_matcher = select;
-        self.exit_budget_timeout = within;
+        self.exit_budget = Some((select, within));
         self
+    }
+
+    /// The built-in invariants this container installs, in install order.
+    ///
+    /// The four STRUCTURAL invariants are load-independent judgements about
+    /// the kernel graph, so they ship ON and come off only through
+    /// [`Self::without_invariant`]. The two TIMED invariants appear ONLY when
+    /// a test body armed them ([`Self::every_child_runs_timeout`],
+    /// [`Self::exit_budget`]): a wall-clock bound is a number a human chose
+    /// for one workload, and as a container-wide default it turns any
+    /// legitimately long run into a kernel abort.
+    fn invariant_auditors(&self) -> Vec<(InvariantKind, Arc<dyn KernelAuditor>)> {
+        let structural: [(InvariantKind, Arc<dyn KernelAuditor>); 4] = [
+            (InvariantKind::NoOrphanZombie, Arc::new(NoOrphanZombie)),
+            (
+                InvariantKind::ProcessGraphLiveness,
+                Arc::new(ProcessGraphLiveness),
+            ),
+            (
+                InvariantKind::NoWakeOfReapedTask,
+                Arc::new(NoWakeOfReapedTask),
+            ),
+            (
+                InvariantKind::FirstTouchNeverDelivered,
+                Arc::new(FirstTouchNeverDelivered),
+            ),
+        ];
+        let mut installed: Vec<(InvariantKind, Arc<dyn KernelAuditor>)> = structural
+            .into_iter()
+            .filter(|(kind, _)| !self.disabled_invariants.contains(kind))
+            .collect();
+
+        if let Some(timeout) = self.every_child_runs_timeout
+            && !self
+                .disabled_invariants
+                .contains(&InvariantKind::EveryChildRuns)
+        {
+            installed.push((
+                InvariantKind::EveryChildRuns,
+                Arc::new(EveryChildRuns::new(timeout)),
+            ));
+        }
+        if let Some((select, within)) = &self.exit_budget
+            && !self
+                .disabled_invariants
+                .contains(&InvariantKind::ExitBudget)
+        {
+            installed.push((
+                InvariantKind::ExitBudget,
+                Arc::new(ExitBudget::new(select.clone(), *within)),
+            ));
+        }
+        installed
     }
 
     /// Bound every [`Self::run`] by wall clock, ending in a POST-MORTEM.
@@ -256,44 +331,8 @@ impl TestContainer {
         for interceptor in &self.interceptors {
             builder = builder.interceptor(Arc::clone(interceptor));
         }
-        if !self
-            .disabled_invariants
-            .contains(&InvariantKind::NoOrphanZombie)
-        {
-            builder = builder.auditor(Arc::new(NoOrphanZombie));
-        }
-        if !self
-            .disabled_invariants
-            .contains(&InvariantKind::ProcessGraphLiveness)
-        {
-            builder = builder.auditor(Arc::new(ProcessGraphLiveness));
-        }
-        if !self
-            .disabled_invariants
-            .contains(&InvariantKind::NoWakeOfReapedTask)
-        {
-            builder = builder.auditor(Arc::new(NoWakeOfReapedTask));
-        }
-        if !self
-            .disabled_invariants
-            .contains(&InvariantKind::FirstTouchNeverDelivered)
-        {
-            builder = builder.auditor(Arc::new(FirstTouchNeverDelivered));
-        }
-        if !self
-            .disabled_invariants
-            .contains(&InvariantKind::EveryChildRuns)
-        {
-            builder = builder.auditor(Arc::new(EveryChildRuns::new(self.every_child_runs_timeout)));
-        }
-        if !self
-            .disabled_invariants
-            .contains(&InvariantKind::ExitBudget)
-        {
-            builder = builder.auditor(Arc::new(ExitBudget::new(
-                self.exit_budget_matcher.clone(),
-                self.exit_budget_timeout,
-            )));
+        for (_kind, auditor) in self.invariant_auditors() {
+            builder = builder.auditor(auditor);
         }
         for auditor in &self.auditors {
             builder = builder.auditor(Arc::clone(auditor));
@@ -469,6 +508,95 @@ mod tests {
         assert_eq!(container.interceptors.len(), 2);
         assert!(Arc::ptr_eq(&container.interceptors[0], &first));
         assert!(Arc::ptr_eq(&container.interceptors[1], &second));
+    }
+
+    fn installed_kinds(container: &TestContainer) -> Vec<InvariantKind> {
+        container
+            .invariant_auditors()
+            .into_iter()
+            .map(|(kind, _)| kind)
+            .collect()
+    }
+
+    const STRUCTURAL: [InvariantKind; 4] = [
+        InvariantKind::NoOrphanZombie,
+        InvariantKind::ProcessGraphLiveness,
+        InvariantKind::NoWakeOfReapedTask,
+        InvariantKind::FirstTouchNeverDelivered,
+    ];
+
+    /// The four STRUCTURAL invariants ship on; the two TIMED ones do not.
+    ///
+    /// A default `ExitBudget { Any, 10s }` aborted the first case of every
+    /// `just conformance-probes` shard with `exceeded exit budget of 10s`,
+    /// because image resolution plus a cold guest legitimately takes longer
+    /// than a bound nobody in that test chose.
+    #[test]
+    fn timed_invariants_are_not_armed_by_default() {
+        let container = TestContainer::new("ubuntu:24.04");
+        assert_eq!(container.every_child_runs_timeout, None);
+        assert_eq!(container.exit_budget, None);
+        assert_eq!(installed_kinds(&container), STRUCTURAL.to_vec());
+    }
+
+    #[test]
+    fn arming_a_timed_invariant_installs_exactly_that_auditor() {
+        let base = TestContainer::new("ubuntu:24.04");
+
+        let with_budget = base
+            .clone()
+            .exit_budget(ExitBudgetMatcher::Any, Duration::from_secs(30));
+        assert_eq!(
+            with_budget.exit_budget,
+            Some((ExitBudgetMatcher::Any, Duration::from_secs(30)))
+        );
+        assert_eq!(
+            installed_kinds(&with_budget),
+            [STRUCTURAL.as_slice(), &[InvariantKind::ExitBudget]].concat()
+        );
+
+        let with_children = base
+            .clone()
+            .every_child_runs_timeout(Duration::from_secs(7));
+        assert_eq!(
+            with_children.every_child_runs_timeout,
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            installed_kinds(&with_children),
+            [STRUCTURAL.as_slice(), &[InvariantKind::EveryChildRuns]].concat()
+        );
+
+        let with_both = with_budget.every_child_runs_timeout(Duration::from_secs(7));
+        assert_eq!(
+            installed_kinds(&with_both),
+            [
+                STRUCTURAL.as_slice(),
+                &[InvariantKind::EveryChildRuns, InvariantKind::ExitBudget]
+            ]
+            .concat()
+        );
+    }
+
+    /// `without_invariant` still governs the structural invariants, and still
+    /// wins over an armed timed one.
+    #[test]
+    fn without_invariant_removes_structural_and_overrides_an_armed_timed_one() {
+        let container =
+            TestContainer::new("ubuntu:24.04").without_invariant(InvariantKind::NoOrphanZombie);
+        assert_eq!(
+            installed_kinds(&container),
+            [
+                InvariantKind::ProcessGraphLiveness,
+                InvariantKind::NoWakeOfReapedTask,
+                InvariantKind::FirstTouchNeverDelivered,
+            ]
+        );
+
+        let armed_then_disabled = TestContainer::new("ubuntu:24.04")
+            .exit_budget(ExitBudgetMatcher::Any, Duration::from_secs(30))
+            .without_invariant(InvariantKind::ExitBudget);
+        assert_eq!(installed_kinds(&armed_then_disabled), STRUCTURAL.to_vec());
     }
 }
 

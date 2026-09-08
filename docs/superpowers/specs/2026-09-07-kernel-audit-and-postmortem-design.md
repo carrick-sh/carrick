@@ -58,8 +58,13 @@ must not block. The events are emitted from the same points as the existing
 `carrick*:::` USDT probes and event-ring records, so the three views (probe,
 ring, auditor) can never disagree about *when* something happened.
 
-**Built-in invariants** (ship ON in `TestContainer`, opt-out per test; opt-in
-through the builder for production embeds):
+**Built-in invariants.** The four STRUCTURAL ones ship ON in `TestContainer`
+(opt-out per test with `without_invariant`; opt-in through the builder for
+production embeds); the two TIMED ones (`EveryChildRuns`, `ExitBudget`) are
+OPT-IN per test — `TestContainer::every_child_runs_timeout(..)` /
+`TestContainer::exit_budget(..)` arm them, because a wall-clock bound is a
+number a human chooses for one workload and a container-wide default aborts
+every legitimately long run:
 
 - `NoOrphanZombie` — a zombie whose parent is `None` and whose pid is not 1.
 - `ProcessGraphLiveness` — `process_graph_empty` with `unpublished_jobs > 0`.
