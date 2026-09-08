@@ -2765,3 +2765,15 @@ next compile attribution; `widest_ipa` keeps the same latent shape; the
 `carrick-vmm-hvf` parallel-test flake is pre-existing on main. No citable
 ratio yet (load 9–55); a quiet-window compile re-measure is queued by the
 agent behind a load < 5 gate.
+
+### 2026-09-08 07:15 — a live-task HostWait hang on a go build (main 2f3e0288b)
+
+The post-alias go-build reducer wedged for 45 min with CPU creeping half a
+second; the watchdog missed it (any CPU change counted as progress — now a
+< 2 s delta over 3 min is frozen). Snapshot
+`target/perf/wedges/gbl-post-alias-25182/`: 3 tasks, 17 threads, every one
+`Blocked { HostWait, continuation }`, no zombies, run queue empty,
+executors parked, reactor idle. Not the pid-1 exit wedge (tasks live) and
+not the importlib orphan cause (nothing died): a lost wake into a host wait
+on the go toolchain's fork/exec/pipe path. Dispatched
+(`brief-gobuild-hostwait.md`) with the classification-first method.
