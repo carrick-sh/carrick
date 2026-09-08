@@ -2393,3 +2393,19 @@ commits (a0f0323f4, b4a8fa2e1, aa3913412 — the auditor WIP compiles with
 tests) and re-dispatched as short-turn workers (kernel-auditor2, attr-tarfile2
 continuing; attr-compile2 fresh from main, attribution-first, because the
 first turn scattered unverified edits across three subsystems).
+
+### 2026-09-08 00:30 — a fifth wedge class: orphaned pool workers parked in HostWait (main)
+
+Two watchdog reaps of `cpython-importlib` coupling runs on main's binary
+(`cpl-cpython-importlib-L0-5062`, `-L1-8919`; the 326 s and 311 s "wedge"
+rows in the scheduler round-2 table) are not the exit wedge: the kernel
+graph has pid 1 plus 18 (resp. 11) `hvpatch-child-of-1592` tasks reparented
+to pid 1 after 1592 became a zombie, and **every** thread is
+`Blocked { reason: HostWait, continuation: Some(..) }` with the run queue
+empty and the reactor idle. This is `test_multiprocessing_pool_circular_import`:
+on Linux the pool parent's exit SIGTERMs its workers and the script's
+stdout pipe reaches EOF; here the orphans never leave their host wait and
+pid 1 waits on a pipe they still hold. Hypotheses (signal into HostWait not
+cancelling the continuation; exit-path signal send lost; EOF not propagated
+when the last in-zone writer exits) are in `brief-hostwait-orphans.md`;
+dispatched to a dedicated agent with both snapshots.
