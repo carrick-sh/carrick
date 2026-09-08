@@ -3202,3 +3202,29 @@ threading 202/202. Ratios not cited (load >5). The chain itself wedged six
 minutes on a gate marker grepped from the wrong log — rule recorded. The
 closing measurement (`quiet-close.sh`) now waits for a quiet host and pins
 its own copy of this binary.
+
+**`coredumpfile` was a carrick bug, not a probe flake (opus-coredump-sep08,
+`ec3db6d2d`).** Measured with `carrick*:::hvpatch-core-context/-census`,
+`mn-clone-outcome`, `hvpatch-thread-terminal` and `hvpatch-core-lifecycle`
+under `dtrace -Z`, plus NT_PRSTATUS parsing of the retained cores: pre-fix
+8/10 shard-0 runs under three hogs DIFFed with (required, collected) = (2, 2)
+in 13 of 34 samples — the writer never dropped a thread it was asked for; the
+task graph itself held only two. The fatal owner claims the process terminal
+BEFORE it advertises a capture generation, so a sibling kicked to its safe
+point in that window is retired at the vCPU-loop top with no generation to
+publish into, and its note vanished (always the RUNNING worker). Fix: the
+loop-top process-terminal drain deposits the departing thread's register file
+(with its container-visible tid, resolved while still a namespace member)
+with `CrashCaptureAuthority`; `CrashQuorum` writes deposited notes without
+waiting for them. Post-fix 0/10 DIFF, (3, 3) in 20/20; shard 0 green 3× under
+hogs (298 rows each); probe and oracle untouched. Not a probe-side wait,
+so the probe's spin bound stays. Residual: `ProcessTerminalLoser` route does
+not deposit (unimplicated by measurement).
+
+**`mq_notify` fixes (opus-mqnotify-sep08, three commits):** wake audit tells an
+Exited target from a Reaped one; liveness census bounds the executor-claim
+term by claim age; the two `just doc` links repaired. Agent receipts: fix
+5/5 under load, worktree gates 0 (5219 tests). The agent was stopped by the
+director for a background-poll loop (40 `sleep 595` shells, 90 harness
+tasks) after its work was committed; lesson: every brief now states "run
+every wait in the foreground; never background a sleep."
