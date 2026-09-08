@@ -4211,12 +4211,17 @@ impl HvpatchTaskBinding {
                 }
                 HvpatchBindingTerminalGeneration::ExecTransferred => {
                     *generation = HvpatchBindingTerminalGeneration::Settled;
+                    crate::event_ring::rec_hvpatch_settle_step(0, self.identity.mm.raw(), 6);
                     false
                 }
-                HvpatchBindingTerminalGeneration::Settled => return,
+                HvpatchBindingTerminalGeneration::Settled => {
+                    crate::event_ring::rec_hvpatch_settle_step(0, self.identity.mm.raw(), 7);
+                    return;
+                }
             }
         };
         if publish_logical_result {
+            crate::event_ring::rec_hvpatch_settle_step(0, self.identity.mm.raw(), 5);
             self.quantum.after_terminal_settlement();
         }
     }
