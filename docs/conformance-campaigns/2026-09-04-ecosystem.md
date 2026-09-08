@@ -2908,3 +2908,19 @@ authority leak closed, M = P as a hatch (`CARRICK_BOUND_EXECUTORS`, not
 flipped). With this, the recurring `lost exact transition` abort under
 load ≥30 should be gone from main; the post-landing reducer and rows are
 the receipt.
+
+**Post-scheduler rows (main 32e678d87, binary fd1b5e75…, load 12–33):**
+lint 0, shards 3/3, smoke ok, go-build reducer **8/8 with zero abort
+lines** (first clean reducer under load ≥20 tonight). Rows 9/11 MATCH;
+first loaded tarfile number since its fix: 36.2 s / 7.61x (was 75–84 s);
+pprof 2.04x, threading 1.35x, itertools 2.28x at load ~20. Two failures
+under attribution: `cpython-asyncio` CRASH at 667 = the activation-window
+residual signature (clone-rollback fatal, confirmed by stderr; agent in
+flight); `cpython-compile` **TIMEOUT [blocked]** after the guest printed
+`Result: SUCCESS` — the carrier never exited, stderr empty (no `kernel
+aborted` line, so the process graph was NOT empty: a live thread never ran
+to exit). No binary before the scheduler landing hung compile tonight, so
+this is a candidate scheduler regression at exit (suspect: a row deferred
+by the ported claimability gate on the per-CPU path never released).
+Reproduction with the sink armed and a rebuilt pre-scheduler control are
+running.
