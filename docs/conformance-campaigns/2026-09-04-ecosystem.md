@@ -2504,3 +2504,23 @@ round-2 wedge was the exit-wedge class), but the timing ablation was
 order-confounded and is redone in round 4. Round 4 (dispatched): rebase over
 lane A, close the reaped-path `SubmissionAuthority` leak, signed adversarial
 receipt, probe shards, un-confounded M=P.
+
+### 2026-09-08 03:30 — the importlib live-task hang was carrick killing the pool parent (fixed on branch)
+
+Not a lost signal into `HostWait`: the pool parent (pid 1592) is a zombie
+with `wait_status 127<<8`, carrick's own `PersistentTerminal::Error`. Under
+load a real producer woke a just-forked task before its dormant submission
+was activated; the exact `(thread, generation)` row was already queued and
+`SubmissionPublication::publish_unique` rejected ITS OWN row, which callers
+lowered to a fatal `TrapError` → exit 127 for the whole Linux process, so
+`Pool._terminate_pool` never ran and the orphans held the pipe writers pid 1
+was reading. `SubmissionRejected` had also been carrying seven unrelated
+conditions under one "closing" message. Fix (`opus/hostwait-sep08`
+79ce8103a): publication is idempotent — coalescing onto the exact queued row
+is success, `AlreadyQueued` deleted; bd1563e78 names the rejections. Red-
+first unit test; interleaved 16-pair A/B on the importlib argv, load 3–11:
+pre-fix 15/16 + 1 hang (stderr `the exact runnable generation is already
+queued`), fixed 16/16; rows importlib and mp_main MATCH; gates 0. Open, the
+other half of the same window: a wake-queued row claimed before `activate`
+→ `SnapshotRestoreFailed` → carrier abort (seen once, rc=134); brief
+`brief-activation-window.md`, dispatched after this lands.
