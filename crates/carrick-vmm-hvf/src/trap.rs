@@ -28706,36 +28706,10 @@ impl HvfTaskState {
                 ));
             }
         }
-        let candidate = self
+        let mapping = self
             .mappings
-            .range(..=GuestVa(semantic_va))
-            .next_back()
-            .map(|(_, m)| m);
-        let mapping = if let Some(mapping) = candidate {
-            let physical_mapping_end = mapping
-                .physical_ipa
-                .checked_add(mapping.physical_size as u64);
-            if mapping.start < semantic_end
-                && semantic_va < mapping.end
-                && affine_translation_matches(mapping.start, mapping.ipa)
-                && physical_ipa >= mapping.physical_ipa
-                && physical_mapping_end.is_some_and(|limit| physical_end <= limit)
-                && (!self.persistent_vm_lifecycle
-                    || !is_reusable_global_frame_extent(
-                        mapping.physical_ipa,
-                        mapping.physical_size as u64,
-                    )
-                    || global_frame_region_owner_matches_in(custody, mapping))
-            {
-                Some(mapping)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let mapping = mapping.or_else(|| {
-            self.mappings.iter().rev().find(|mapping| {
+            .candidates_for_range(GuestVa(semantic_va), CowArmedRanges::COMPOUND_SIZE)
+            .find(|mapping| {
                 let physical_mapping_end = mapping
                     .physical_ipa
                     .checked_add(mapping.physical_size as u64);
@@ -28750,8 +28724,7 @@ impl HvfTaskState {
                             mapping.physical_size as u64,
                         )
                         || global_frame_region_owner_matches_in(custody, mapping))
-            })
-        });
+            });
         if let Some(mapping) = mapping
             && let Some(physical_host_addr) = mapped_region_physical_host_addr(mapping)
             && let Ok(offset) = usize::try_from(physical_ipa - mapping.physical_ipa)
@@ -28931,15 +28904,18 @@ impl HvfTaskState {
                 )
         };
         if let Some(ipa) = stage1_ipa {
-            if let Some((_, mapping)) = self.mappings.range(..=GuestVa(address)).next_back() {
-                if ipa >= mapping.ipa
-                    && ipa < mapping.ipa.saturating_add(mapping.size as u64)
-                    && mapping.contains_range(address, length)
-                    && mapping.ipa.checked_add(address - mapping.start) == Some(ipa)
-                    && region_is_live(mapping)
-                {
-                    return Some(mapping.view());
-                }
+            if let Some(mapping) = self
+                .mappings
+                .candidates_for_range(GuestVa(address), length as u64)
+                .find(|mapping| {
+                    ipa >= mapping.ipa
+                        && ipa < mapping.ipa.saturating_add(mapping.size as u64)
+                        && mapping.contains_range(address, length)
+                        && mapping.ipa.checked_add(address - mapping.start) == Some(ipa)
+                        && region_is_live(mapping)
+                })
+            {
+                return Some(mapping.view());
             }
             if let Some(alias) = alias_registry().lock().newest_containing_ipa(ipa, |alias| {
                 // A fork peer can retain the same physical frame at a
@@ -29013,13 +28989,16 @@ impl HvfTaskState {
                 )
                 .is_some()
         };
-        if let Some((_, mapping)) = self.mappings.range(..=GuestVa(address)).next_back() {
-            if mapping.contains_range(address, length)
-                && region_is_live(mapping)
-                && row_projection_is_current(mapping)
-            {
-                return Some(mapping.view());
-            }
+        if let Some(mapping) = self
+            .mappings
+            .candidates_for_range(GuestVa(address), length as u64)
+            .find(|mapping| {
+                mapping.contains_range(address, length)
+                    && region_is_live(mapping)
+                    && row_projection_is_current(mapping)
+            })
+        {
+            return Some(mapping.view());
         }
         if !self.protections.range_no_access(address, length) {
             if let Some(alias) = alias_registry().lock().newest_process_alias_containing_va(
@@ -29956,30 +29935,33 @@ impl TaskMappingIndex {
         self.live.values().rev().chain(self.shadowed.iter().rev())
     }
 
-    pub(crate) fn range<R>(
+    /// Rows that can overlap `[va, va + length)`, newest first.
+    ///
+    /// Live rows are ordered and non-overlapping, so the walk starts just below
+    /// the range end and stops at the first row ending at or before `va` --
+    /// every earlier row ends there too. That is O(overlapping rows + 1), not
+    /// O(N). A lookup may legitimately name a VA below the row it wants (a
+    /// compound COW span begins before its live semantic view), which is why
+    /// this is an overlap query and not a `range(..=va).next_back()` probe.
+    /// Displaced rows follow, preserving the vector's newest-first resolution.
+    pub(crate) fn candidates_for_range(
         &self,
-        range: R,
-    ) -> impl DoubleEndedIterator<Item = (&GuestVa, &HvfMappedRegion)>
-    where
-        R: std::ops::RangeBounds<GuestVa>,
-    {
-        self.live.range(range)
-    }
-
-    /// Rows that can contain `va`, cheapest first: the single ordered live
-    /// candidate, then any displaced row. O(log N) when nothing is displaced.
-    pub(crate) fn candidates_for_va(&self, va: GuestVa) -> impl Iterator<Item = &HvfMappedRegion> {
+        va: GuestVa,
+        length: u64,
+    ) -> impl Iterator<Item = &HvfMappedRegion> {
+        let start = va.0;
+        let end = GuestVa(start.saturating_add(length.max(1)));
         self.live
-            .range(..=va)
-            .next_back()
+            .range(..end)
+            .rev()
             .map(|(_, row)| row)
-            .into_iter()
+            .take_while(move |row| row.end > start)
             .chain(self.shadowed.iter().rev())
     }
 
-    /// The live row covering `[va, va + length)`, or `None`.
+    /// The row covering `[va, va + length)`, or `None`.
     pub(crate) fn mapping_for_range(&self, va: GuestVa, length: usize) -> Option<&HvfMappedRegion> {
-        self.candidates_for_va(va)
+        self.candidates_for_range(va, length as u64)
             .find(|row| row.contains_range(va.0, length))
     }
 
@@ -30267,6 +30249,286 @@ fn coalesce_mappings_into_left(left: &mut HvfMappedRegion, right: HvfMappedRegio
     left.size = left.size.saturating_add(right.size);
     if adjacent_physical {
         left.physical_size = left.physical_size.saturating_add(right.physical_size);
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod task_mapping_index_tests {
+    use super::*;
+
+    /// A first-touch page inside one VMA, with a host pointer that tracks the
+    /// physical extent the way sparse materialization publishes it.
+    fn touched_page(start: u64, ipa: u64, host_base: usize) -> HvfMappedRegion {
+        let mut region = thread_sibling_tests::mapped_region(start, start + 0x1000, ipa);
+        region.host_addr = host_base as *mut u8;
+        region.is_dynamic_alias = true;
+        region.owner_generation = 7;
+        region
+    }
+
+    #[test]
+    fn a_first_touch_storm_inside_one_vma_stays_one_row() {
+        // The defect this type replaces: the vector grew one row per
+        // materialized extent, so every fault's scans grew with the fault
+        // count. 10k contiguous 4 KiB extents describe ONE 40 MiB VMA.
+        const PAGES: u64 = 10_000;
+        let va_base = 0x6000_0000_u64;
+        let ipa_base = 0x9b00_0000_u64;
+        let host_base = 0x1_0000_0000_usize;
+
+        let mut index = TaskMappingIndex::new();
+        for page in 0..PAGES {
+            let offset = page * 0x1000;
+            index.insert(touched_page(
+                va_base + offset,
+                ipa_base + offset,
+                host_base + offset as usize,
+            ));
+        }
+
+        assert_eq!(
+            index.len(),
+            1,
+            "contiguous first-touch extents inside one VMA must coalesce to one row",
+        );
+        let row = index.iter().next().expect("the coalesced row");
+        assert_eq!(row.start, va_base);
+        assert_eq!(row.end, va_base + PAGES * 0x1000);
+        assert_eq!(row.size as u64, PAGES * 0x1000);
+        assert_eq!(row.physical_ipa, ipa_base);
+        assert_eq!(row.physical_size as u64, PAGES * 0x1000);
+
+        // Every page must still resolve through the single row.
+        for page in [0, 1, PAGES / 2, PAGES - 1] {
+            let offset = page * 0x1000;
+            let found = index
+                .mapping_for_range(GuestVa(va_base + offset), 0x1000)
+                .expect("every coalesced page must still resolve");
+            assert_eq!(found.start, va_base);
+        }
+    }
+
+    #[test]
+    fn faults_arriving_out_of_order_still_coalesce_and_stay_sorted() {
+        // Fork copies, extension arenas and unmap tails publish out of order;
+        // that is exactly why the vector could not be binary-searched.
+        let va_base = 0x6000_0000_u64;
+        let ipa_base = 0x9b00_0000_u64;
+        let host_base = 0x1_0000_0000_usize;
+        let mut index = TaskMappingIndex::new();
+        for page in [3_u64, 0, 4, 2, 1] {
+            let offset = page * 0x1000;
+            index.insert(touched_page(
+                va_base + offset,
+                ipa_base + offset,
+                host_base + offset as usize,
+            ));
+        }
+        assert_eq!(
+            index.len(),
+            1,
+            "out-of-order publication must still coalesce"
+        );
+        let row = index.iter().next().expect("row");
+        assert_eq!((row.start, row.end), (va_base, va_base + 5 * 0x1000));
+    }
+
+    #[test]
+    fn a_discontiguity_in_any_domain_keeps_the_rows_separate() {
+        let va_base = 0x6000_0000_u64;
+        let ipa_base = 0x9b00_0000_u64;
+        let host_base = 0x1_0000_0000_usize;
+
+        // Virtually contiguous but physically disjoint.
+        let mut split_physical = TaskMappingIndex::new();
+        split_physical.insert(touched_page(va_base, ipa_base, host_base));
+        split_physical.insert(touched_page(
+            va_base + 0x1000,
+            ipa_base + 0x8000,
+            host_base + 0x8000,
+        ));
+        assert_eq!(
+            split_physical.len(),
+            2,
+            "physically disjoint pages must not merge into one row",
+        );
+
+        // Physically contiguous but virtually disjoint.
+        let mut split_virtual = TaskMappingIndex::new();
+        split_virtual.insert(touched_page(va_base, ipa_base, host_base));
+        split_virtual.insert(touched_page(
+            va_base + 0x8000,
+            ipa_base + 0x1000,
+            host_base + 0x1000,
+        ));
+        assert_eq!(
+            split_virtual.len(),
+            2,
+            "virtually disjoint pages must not merge into one row",
+        );
+
+        // Contiguous everywhere but a different owner generation: a different
+        // incarnation of the frame, which retirement keys on.
+        let mut split_generation = TaskMappingIndex::new();
+        split_generation.insert(touched_page(va_base, ipa_base, host_base));
+        let mut newer = touched_page(va_base + 0x1000, ipa_base + 0x1000, host_base + 0x1000);
+        newer.owner_generation = 8;
+        split_generation.insert(newer);
+        assert_eq!(
+            split_generation.len(),
+            2,
+            "rows of different owner generations must not merge",
+        );
+
+        // Contiguous everywhere but differently writable: coalescing here would
+        // hand a lookup the wrong protection.
+        let mut split_perms = TaskMappingIndex::new();
+        split_perms.insert(touched_page(va_base, ipa_base, host_base));
+        let mut read_only = touched_page(va_base + 0x1000, ipa_base + 0x1000, host_base + 0x1000);
+        read_only.guest_writable = false;
+        split_perms.insert(read_only);
+        assert_eq!(
+            split_perms.len(),
+            2,
+            "rows with different guest writability must not merge",
+        );
+    }
+
+    #[test]
+    fn a_fork_copy_publishes_in_order_and_an_unmap_split_keeps_the_tail_sorted() {
+        let va_base = 0x6000_0000_u64;
+        let ipa_base = 0x9b00_0000_u64;
+        let host_base = 0x1_0000_0000_usize;
+
+        // Two VMAs separated by a hole, published child-style (highest first).
+        let mut index = TaskMappingIndex::new();
+        for base in [0x10_0000_u64, 0x0_u64] {
+            for page in 0..4_u64 {
+                let offset = base + page * 0x1000;
+                index.insert(touched_page(
+                    va_base + offset,
+                    ipa_base + offset,
+                    host_base + offset as usize,
+                ));
+            }
+        }
+        assert_eq!(index.len(), 2, "each VMA coalesces to exactly one row");
+        let starts: Vec<u64> = index.iter().map(|row| row.start).collect();
+        assert_eq!(starts, vec![va_base, va_base + 0x10_0000]);
+
+        // Punch a hole in the middle of the first VMA. The head keeps its
+        // start, the tail is re-keyed at the end of the unmap, and iteration
+        // stays strictly increasing and non-overlapping.
+        index.split_local_rows_for_unmap(va_base + 0x1000, 0x1000);
+        let rows: Vec<(u64, u64)> = index.iter().map(|row| (row.start, row.end)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                (va_base, va_base + 0x1000),
+                (va_base + 0x2000, va_base + 0x4000),
+                (va_base + 0x10_0000, va_base + 0x10_4000),
+            ],
+            "an unmap split must leave a sorted, non-overlapping table",
+        );
+        let tail = index
+            .mapping_for_range(GuestVa(va_base + 0x2000), 0x1000)
+            .expect("the split tail must still resolve");
+        assert_eq!(
+            tail.ipa,
+            ipa_base + 0x2000,
+            "the tail keeps its translation"
+        );
+        assert!(
+            index
+                .mapping_for_range(GuestVa(va_base + 0x1000), 0x1000)
+                .is_none(),
+            "the unmapped page must no longer resolve",
+        );
+    }
+
+    #[test]
+    fn an_overlapping_publication_wins_lookups_without_dropping_the_row_it_shadows() {
+        // The vector resolved overlaps newest-first and kept the shadowed row
+        // alive; a fork child's rebased vvar row overlaps its parent's exactly.
+        let va = 0x2e00_0000_0000_u64;
+        let mut index = TaskMappingIndex::new();
+        let mut parent = thread_sibling_tests::mapped_region(va, va + 0x4000, 0x2e00_0000_0000);
+        parent.owner_generation = 1;
+        let mut child = thread_sibling_tests::mapped_region(va, va + 0x4000, 0x2e00_0000_4000);
+        child.owner_generation = 2;
+        index.insert(parent);
+        index.insert(child);
+
+        assert_eq!(index.len(), 2, "the shadowed row must not be dropped");
+        let resolved = index
+            .mapping_for_range(GuestVa(va), 0x1000)
+            .expect("the newest row resolves");
+        assert_eq!(
+            resolved.owner_generation, 2,
+            "the newest publication must win the lookup",
+        );
+        let generations: Vec<u64> = index
+            .candidates_for_range(GuestVa(va), 0x1000)
+            .map(|row| row.owner_generation)
+            .collect();
+        assert_eq!(
+            generations,
+            vec![2, 1],
+            "both incarnations stay reachable, newest first",
+        );
+    }
+
+    #[test]
+    fn a_compound_span_beginning_below_its_semantic_view_is_still_a_candidate() {
+        // A 16 KiB COW compound is looked up by the compound base, which is
+        // BELOW the start of the live 4 KiB semantic row.
+        let semantic_va = 0x6001_17d000_u64;
+        let compound_va = semantic_va - 0x1000;
+        let mut index = TaskMappingIndex::new();
+        index.insert(thread_sibling_tests::mapped_region(
+            semantic_va,
+            semantic_va + 0x1000,
+            0x9b03_b61000,
+        ));
+        let candidates: Vec<u64> = index
+            .candidates_for_range(GuestVa(compound_va), CowArmedRanges::COMPOUND_SIZE)
+            .map(|row| row.start)
+            .collect();
+        assert_eq!(
+            candidates,
+            vec![semantic_va],
+            "a row starting above the queried VA must still be offered when the range overlaps it",
+        );
+    }
+
+    #[test]
+    fn a_lookup_walks_a_bounded_number_of_rows_regardless_of_table_size() {
+        // The property the fault path needs: resolution cost must not grow
+        // with the number of unrelated VMAs.
+        let mut index = TaskMappingIndex::new();
+        for vma in 0..2_000_u64 {
+            let va = 0x6000_0000 + vma * 0x20_0000;
+            index.insert(thread_sibling_tests::mapped_region(
+                va,
+                va + 0x1000,
+                0x9b00_0000 + vma * 0x20_0000,
+            ));
+        }
+        assert_eq!(index.len(), 2_000);
+        let probe = 0x6000_0000 + 1_999 * 0x20_0000;
+        assert_eq!(
+            index.candidates_for_range(GuestVa(probe), 0x1000).count(),
+            1,
+            "an ordered probe must offer only the rows that overlap the query",
+        );
+        assert_eq!(
+            index
+                .candidates_for_range(GuestVa(0x5000_0000), 0x1000)
+                .count(),
+            0,
+            "a query below every row must offer nothing",
+        );
     }
 }
 
@@ -43613,7 +43875,7 @@ impl HvfVmState {
     ) -> Option<MappingView> {
         let semantic_end = semantic_va.checked_add(u64::try_from(length).ok()?)?;
         mappings
-            .candidates_for_va(GuestVa(semantic_va))
+            .candidates_for_range(GuestVa(semantic_va), length as u64)
             .find(|mapping| {
                 semantic_va >= mapping.start
                     && semantic_end <= mapping.end
