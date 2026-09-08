@@ -128,7 +128,7 @@ fn apply_alias_frame_inventory(
         .map(|_| ())
 }
 
-/// The alias-install arm's (guest `mmap(2)`) fail-closed sink.
+/// The alias-install arm's (the guest map-file syscall) fail-closed sink.
 ///
 /// Every step after `map_host_alias` has succeeded runs with the alias already
 /// committed to stage-2, so none of them can be lowered to a guest errno: a

@@ -955,7 +955,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::redispatch_threaded_syscall_for_executor",
       "ordinal_in_function": 1,
-      "fingerprint": "6abc62c1b64ea2231c51d8ec9c7d3e42c94a23fed40da4a04f5e58116f9e126a",
+      "fingerprint": "e986bf02e6e29bf4d64fa631f1045cbb831ba3a2d7d79fb480d35b6474f61e04",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::mm_stage1_authority",
       "rationale": "Syscall requiring MM mutation dispatch lacks outer stage-1 authority phase; proceeding would mutate page tables without exclusive stage-1 pause or sole lease."
@@ -964,7 +964,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::redispatch_threaded_syscall_for_executor",
       "ordinal_in_function": 2,
-      "fingerprint": "6abc62c1b64ea2231c51d8ec9c7d3e42c94a23fed40da4a04f5e58116f9e126a",
+      "fingerprint": "e986bf02e6e29bf4d64fa631f1045cbb831ba3a2d7d79fb480d35b6474f61e04",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::mm_stage1_authority",
       "rationale": "Ordinary syscall dispatch unexpectedly holds stage-1 mutation authority; indicates phase desynchronization between syscall classifier and MM executor."
@@ -973,7 +973,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::redispatch_threaded_syscall_for_executor",
       "ordinal_in_function": 3,
-      "fingerprint": "6abc62c1b64ea2231c51d8ec9c7d3e42c94a23fed40da4a04f5e58116f9e126a",
+      "fingerprint": "e986bf02e6e29bf4d64fa631f1045cbb831ba3a2d7d79fb480d35b6474f61e04",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::mm_stage1_authority",
       "rationale": "Host-alias installation phase lacks outer stage-1 authority; proceeding would install host alias without stage-1 mutation permit."
