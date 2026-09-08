@@ -2483,3 +2483,24 @@ next process-lifecycle round. Every ratio in that run is inflated by the
 load and is not cited. Rule for the rest of the campaign: no ecosystem
 ratio is measured while the host load exceeds ~5; gates under load count
 only crashes and wedges.
+
+### 2026-09-08 02:40 — scheduler round 3: the crash is fixed at its real site
+
+Round 2's crash was NOT a stale row reaching `backend.load` (the queue
+already discards those). `observe_generation_transition`'s reaped-target
+rejection propagated with `?` out of every settlement arm before
+`executors.unbind()` / `running.finish_claim()`, so a reap mid-settlement
+abandoned the transaction with the lease taken: worker death → ASID
+retirement failure → `FATAL: published HVPatch inventory dropped before
+exact retirement`. Fix 5d7efe418: the observer returns
+`GenerationTransitionOutcome::{Recorded, TargetReaped}`; settlements always
+complete and only the successor publication is withheld; the fatal meaning
+is unrepresentable to callers. Red-first unit tests, `kernel::scheduler`
+45/45, go_types **5/5 interleaved vs main 5/5** under load 12–27 with
+0-byte `.err` files, means 58.4 s vs 58.2 s. Also landed on the branch:
+adversarial + record/replay embed policies (e123f2a34), the M=P ablation
+hatch `CARRICK_BOUND_EXECUTORS` (0aca74c42). M=4 no longer wedges (the
+round-2 wedge was the exit-wedge class), but the timing ablation was
+order-confounded and is redone in round 4. Round 4 (dispatched): rebase over
+lane A, close the reaped-path `SubmissionAuthority` leak, signed adversarial
+receipt, probe shards, un-confounded M=P.
