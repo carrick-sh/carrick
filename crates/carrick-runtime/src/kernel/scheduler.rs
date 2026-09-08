@@ -2981,49 +2981,86 @@ impl Scheduler {
         }
     }
 
+    /// Classify a rejected wake for the auditors.
+    ///
+    /// The verdict is read from the TYPED execution state and from exact key
+    /// ownership in the graph, never from which list the target happened to
+    /// be found in. The distinction that matters is `Exited` (the identity is
+    /// still owned by the graph and simply cannot run -- an ordinary lost
+    /// race) versus `Reaped` (nothing owns the identity any more -- the waker
+    /// holds a stale authority). Reading list membership instead labelled a
+    /// zombie `Reaped`, which is backwards: a zombie is exited-but-not-yet-
+    /// waited-for, so its identity is still the parent's to consume.
     fn audit_wake_rejection(&self, thread: ThreadKey, err: &SchedulerError) {
         let state = self.kernel.registry().state.read();
         let mut target = None;
         let mut reason = None;
 
+        // A live task still owning the thread: its typed execution state is
+        // the authority. A terminal state means an exit beat this wake.
         for record in state.tasks.values() {
             if let Some(t) = record.task.thread(thread.tid) {
                 if t.key() == thread {
                     target = Some(record.task.key());
-                    reason = Some(match err {
-                        SchedulerError::Queue(RunQueueError::Closed) => {
-                            crate::observe::WakeRejectionReason::Closed
+                    reason = Some(match t.execution_state() {
+                        super::objects::ThreadExecutionState::Exited { .. }
+                        | super::objects::ThreadExecutionState::Failed { .. } => {
+                            crate::observe::WakeRejectionReason::Exited
                         }
-                        SchedulerError::Queue(RunQueueError::AuthorityMismatch) => {
-                            crate::observe::WakeRejectionReason::StaleGeneration
-                        }
-                        SchedulerError::Thread(
-                            super::objects::ThreadExecutionError::SchedulerThreadMismatch {
-                                ..
-                            },
-                        ) => crate::observe::WakeRejectionReason::StaleGeneration,
-                        _ => crate::observe::WakeRejectionReason::Other(err.to_string()),
+                        _ => match err {
+                            SchedulerError::Queue(RunQueueError::Closed) => {
+                                crate::observe::WakeRejectionReason::Closed
+                            }
+                            SchedulerError::Queue(RunQueueError::AuthorityMismatch) => {
+                                crate::observe::WakeRejectionReason::StaleGeneration
+                            }
+                            SchedulerError::Thread(
+                                super::objects::ThreadExecutionError::SchedulerThreadMismatch {
+                                    ..
+                                },
+                            ) => crate::observe::WakeRejectionReason::StaleGeneration,
+                            _ => crate::observe::WakeRejectionReason::Other(err.to_string()),
+                        },
                     });
                     break;
                 }
             }
         }
 
+        // The thread retired out of its task. Whether that is an exit or a
+        // stale identity is a question about the TASK, answered by exact key:
+        // a task id can be reallocated, so `contains_key` alone would call a
+        // successor's liveness this thread's own.
         if target.is_none() {
             for retired in &state.retired_threads {
                 if retired._key == thread {
                     target = Some(retired._task);
-                    reason = Some(crate::observe::WakeRejectionReason::Reaped);
+                    let owned = state
+                        .tasks
+                        .get(&retired._task.id)
+                        .is_some_and(|record| record.task.key() == retired._task)
+                        || state
+                            .zombies
+                            .get(&retired._task.id)
+                            .is_some_and(|record| record.zombie.key == retired._task);
+                    reason = Some(if owned {
+                        crate::observe::WakeRejectionReason::Exited
+                    } else {
+                        crate::observe::WakeRejectionReason::Reaped
+                    });
                     break;
                 }
             }
         }
 
+        // A zombie leader: exited, and its identity is still the parent's to
+        // consume with `wait`. Delivering a wake to it is a no-op, not a use
+        // of a reaped identity.
         if target.is_none() {
             for zombie_rec in state.zombies.values() {
                 if super::ids::LinuxTid::for_task_leader(zombie_rec.zombie.key.id) == thread.tid {
                     target = Some(zombie_rec.zombie.key);
-                    reason = Some(crate::observe::WakeRejectionReason::Reaped);
+                    reason = Some(crate::observe::WakeRejectionReason::Exited);
                     break;
                 }
             }
@@ -3033,7 +3070,7 @@ impl Scheduler {
             return;
         };
         let reason = reason.unwrap_or_else(|| match err {
-            SchedulerError::UnknownThread => crate::observe::WakeRejectionReason::Reaped,
+            SchedulerError::UnknownThread => crate::observe::WakeRejectionReason::UnknownThread,
             SchedulerError::Queue(RunQueueError::Closed) => {
                 crate::observe::WakeRejectionReason::Closed
             }
@@ -4081,7 +4118,7 @@ mod tests {
     use crate::compat::SyscallArgs;
     use crate::dispatch::SyscallRequest;
     use crate::kernel::objects::{BlockedReason, MigratableTaskState, ThreadExecutionState};
-    use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap};
+    use crate::kernel::{ClonePlan, Kernel, KernelContext, LinuxWaitStatus, RootBootstrap};
     use crate::vcpu_loop::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationBackend, ContinuationCapture,
         RestartClass,
@@ -4179,6 +4216,75 @@ mod tests {
             .thread()
             .publish_initial_task_state(task_state(context, marker))
             .expect("publish task state");
+    }
+
+    /// Records every wake rejection the scheduler classifies, so a test can
+    /// assert the REASON and not merely that a wake failed.
+    #[derive(Debug, Default)]
+    struct RecordingWakeAuditor {
+        rejections: parking_lot::Mutex<
+            Vec<(
+                crate::kernel::objects::TaskKey,
+                crate::observe::WakeRejectionReason,
+            )>,
+        >,
+    }
+
+    impl crate::observe::KernelAuditor for RecordingWakeAuditor {
+        fn wake_rejected(
+            &self,
+            target: crate::kernel::objects::TaskKey,
+            reason: crate::observe::WakeRejectionReason,
+        ) -> crate::observe::AuditVerdict {
+            self.rejections.lock().push((target, reason));
+            crate::observe::AuditVerdict::Continue
+        }
+    }
+
+    /// A wake aimed at a task that has exited but not yet been waited for is
+    /// `Exited`, never `Reaped`.
+    ///
+    /// The classification used to read LIST MEMBERSHIP: a target found among
+    /// `state.retired_threads` or `state.zombies` was reported as `Reaped`.
+    /// Both are backwards. A retired thread's task may still be live, and a
+    /// zombie is exited-but-not-yet-waited-for, so in both cases the identity
+    /// is still owned by the graph -- nothing has been reaped, and the wake is
+    /// the ordinary lost race Linux drops on the floor. `NoWakeOfReapedTask`
+    /// aborts on `Reaped`, so under load this ended carriers whose guest
+    /// output matched the Docker oracle line for line (`mqnotifycrossproc`).
+    ///
+    /// This exercises the RETIRED-THREAD arm, the one the probe hit: exiting
+    /// the child retires its leader thread and leaves the task a zombie, so
+    /// the wake resolves through `state.retired_threads` and the verdict turns
+    /// on whether anything still owns `retired._task`.
+    #[test]
+    fn a_wake_of_a_zombie_is_classified_exited_not_reaped() {
+        let (kernel, root) = bootstrap(12_461);
+        let child = process_child(&kernel, &root, 9_461, "wake-audit-target");
+        let child_thread = child.thread().key();
+        let child_task = child.task().key();
+
+        let recorder = Arc::new(RecordingWakeAuditor::default());
+        kernel.set_auditors(Arc::new(crate::observe::auditor::AuditorChain::new(vec![
+            Arc::clone(&recorder) as Arc<dyn crate::observe::KernelAuditor>,
+        ])));
+
+        drop(child);
+        kernel
+            .exit_task_key_eventually(child_task, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit the child");
+        assert!(!kernel.task_is_live(child_task.id), "the child is a zombie");
+        assert!(kernel.task_exists(child_task.id), "not yet waited for");
+
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        assert!(
+            scheduler.wake(child_thread).is_err(),
+            "a zombie's thread cannot be made runnable"
+        );
+        assert_eq!(
+            *recorder.rejections.lock(),
+            vec![(child_task, crate::observe::WakeRejectionReason::Exited)]
+        );
     }
 
     #[derive(Debug, Default)]

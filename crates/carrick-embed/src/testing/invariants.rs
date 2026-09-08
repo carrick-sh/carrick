@@ -69,7 +69,16 @@ impl KernelAuditor for ProcessGraphLiveness {
     }
 }
 
-/// Invariant: Reaped tasks must never have scheduler wakeups attempted.
+/// Invariant: a wake must never name an identity the kernel graph has
+/// already let go of.
+///
+/// Only [`WakeRejectionReason::Reaped`] is a defect. A wake that loses the
+/// race with its target's exit -- [`WakeRejectionReason::Exited`] -- is
+/// ordinary Linux behaviour and is not evidence of anything: `mq_notify`'s
+/// SIGEV_THREAD delivery, a signal post and a futex wake can all be aimed at
+/// a task that becomes a zombie in the same instant. Classifying those as
+/// reaped aborted `mqnotifycrossproc` under load on a carrier whose output
+/// matched the Docker oracle line for line.
 #[derive(Clone, Debug, Default)]
 pub struct NoWakeOfReapedTask;
 
@@ -408,6 +417,15 @@ mod tests {
         );
         assert_eq!(
             auditor.wake_rejected(task, WakeRejectionReason::StaleGeneration),
+            AuditVerdict::Continue
+        );
+        assert_eq!(
+            auditor.wake_rejected(task, WakeRejectionReason::Exited),
+            AuditVerdict::Continue,
+            "a wake that lost the race with its target's exit is a no-op, not a defect"
+        );
+        assert_eq!(
+            auditor.wake_rejected(task, WakeRejectionReason::UnknownThread),
             AuditVerdict::Continue
         );
         assert_eq!(
