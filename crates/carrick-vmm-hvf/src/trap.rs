@@ -29960,6 +29960,17 @@ impl TaskMappingIndex {
         self.live.len() + self.shadowed.len()
     }
 
+    /// Rows in the ordered live map. Read by the per-fault census so a probe
+    /// consumer can separate the population from the displaced backlog.
+    pub(crate) fn live_len(&self) -> usize {
+        self.live.len()
+    }
+
+    /// Rows an overlapping insert displaced, still holding their handles.
+    pub(crate) fn shadowed_len(&self) -> usize {
+        self.shadowed.len()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.live.is_empty() && self.shadowed.is_empty()
     }
@@ -29987,7 +29998,10 @@ impl TaskMappingIndex {
     /// Every row, ascending by start; displaced rows lead so that a reversed
     /// walk still yields the newest row first, as the vector did.
     pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &HvfMappedRegion> {
-        self.shadowed.iter().chain(self.live.values())
+        self.shadowed
+            .iter()
+            .chain(self.live.values())
+            .inspect(|_| note_task_mapping_row_visited())
     }
 
     pub(crate) fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut HvfMappedRegion> {
@@ -30020,6 +30034,7 @@ impl TaskMappingIndex {
             .map(|(_, row)| row)
             .take_while(move |row| row.end > start)
             .chain(self.shadowed.iter().rev())
+            .inspect(|_| note_task_mapping_row_visited())
     }
 
     /// The lowest row start strictly inside `(after, before)` for which
@@ -30043,8 +30058,10 @@ impl TaskMappingIndex {
             .live
             .range((Bound::Excluded(after), Bound::Excluded(before)))
             .map(|(_, row)| row)
+            .inspect(|_| note_task_mapping_row_visited())
             .find(|row| accept(row))
             .map(|row| row.start);
+        note_hot_path_rows(HotPathScan::TaskMappings, self.shadowed.len());
         let displaced = self
             .shadowed
             .iter()
@@ -30061,6 +30078,7 @@ impl TaskMappingIndex {
     /// Live rows are ordered and non-overlapping, so `end` is monotonic and
     /// only the row immediately below `current` can reach furthest down.
     pub(crate) fn any_lower_row_reaches(&self, current: GuestVa, floor: u64) -> bool {
+        note_task_mapping_row_visited();
         if self
             .live
             .range(..current)
@@ -30069,6 +30087,7 @@ impl TaskMappingIndex {
         {
             return true;
         }
+        note_hot_path_rows(HotPathScan::TaskMappings, self.shadowed.len());
         self.shadowed
             .iter()
             .any(|row| row.start < current.0 && row.end > floor)
@@ -30091,6 +30110,7 @@ impl TaskMappingIndex {
         self.by_ipa
             .range(..=(ipa, u64::MAX))
             .rev()
+            .inspect(|_| note_task_mapping_row_visited())
             .take_while(move |(row_ipa, _)| *row_ipa >= floor)
             .filter_map(|(_, start)| self.live.get(&GuestVa(*start)))
             .filter(move |row| {
@@ -30098,11 +30118,17 @@ impl TaskMappingIndex {
                     .checked_add(row.size as u64)
                     .is_some_and(|limit| ipa >= row.ipa && ipa.saturating_add(length) <= limit)
             })
-            .chain(self.shadowed.iter().rev().filter(move |row| {
-                row.ipa
-                    .checked_add(row.size as u64)
-                    .is_some_and(|limit| ipa >= row.ipa && ipa.saturating_add(length) <= limit)
-            }))
+            .chain(
+                self.shadowed
+                    .iter()
+                    .rev()
+                    .inspect(|_| note_task_mapping_row_visited())
+                    .filter(move |row| {
+                        row.ipa.checked_add(row.size as u64).is_some_and(|limit| {
+                            ipa >= row.ipa && ipa.saturating_add(length) <= limit
+                        })
+                    }),
+            )
     }
 
     /// The row covering `[va, va + length)`, or `None`.
@@ -34056,12 +34082,23 @@ pub(crate) enum HotPathScan {
     AliasState,
     /// Passes over one forking process's source mappings.
     ForkMappings,
+    /// Rows one task's [`TaskMappingIndex`] offered to a lookup. The ordered
+    /// views are meant to make this a function of the ANSWER -- the covering
+    /// row and its neighbours -- not of the table, so a per-fault count that
+    /// tracks the row population names a surviving full-table walk.
+    ///
+    /// Unlike the other two variants this is counted per ROW, not per pass:
+    /// the index's queries are lazy ordered walks whose length is not known
+    /// until the consumer stops pulling, so one thread-local `Cell` add per
+    /// visited row is the price of knowing the walk length at all.
+    TaskMappings,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 thread_local! {
     static ALIAS_STATE_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FORK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TASK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Account one linear pass over the CARRIER-GLOBAL alias / replay / version
@@ -34100,18 +34137,34 @@ fn note_hot_path_rows(scan: HotPathScan, rows: usize) {
     let counter = match scan {
         HotPathScan::AliasState => &ALIAS_STATE_ROWS_SCANNED,
         HotPathScan::ForkMappings => &FORK_MAPPING_ROWS_SCANNED,
+        HotPathScan::TaskMappings => &TASK_MAPPING_ROWS_SCANNED,
     };
     counter.with(|cell| cell.set(cell.get().saturating_add(rows as u64)));
+}
+
+/// Account one row a [`TaskMappingIndex`] ordered query offered its consumer.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline]
+fn note_task_mapping_row_visited() {
+    TASK_MAPPING_ROWS_SCANNED.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+
+/// Visited rows for one hot path on the CALLING thread, readable by shipped
+/// code. Monotonic; callers difference two reads around the operation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hot_path_rows_scanned_live(scan: HotPathScan) -> u64 {
+    match scan {
+        HotPathScan::AliasState => ALIAS_STATE_ROWS_SCANNED.with(std::cell::Cell::get),
+        HotPathScan::ForkMappings => FORK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
+        HotPathScan::TaskMappings => TASK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
+    }
 }
 
 /// Visited rows for one hot path on the CALLING thread. Monotonic; callers
 /// compare two reads around the operation under test.
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn hot_path_rows_scanned(scan: HotPathScan) -> u64 {
-    match scan {
-        HotPathScan::AliasState => ALIAS_STATE_ROWS_SCANNED.with(std::cell::Cell::get),
-        HotPathScan::ForkMappings => FORK_MAPPING_ROWS_SCANNED.with(std::cell::Cell::get),
-    }
+    hot_path_rows_scanned_live(scan)
 }
 
 /// Total rows visited by linear passes over the carrier-global alias state.
@@ -39435,7 +39488,48 @@ impl HvfVmState {
     /// sparse HVPatch mmap arena. One VMA hole becomes one host mapping, one
     /// stage-2 lease, and one inventory frame; there is no shared source frame
     /// and therefore no shared-zero COW authority.
+    ///
+    /// This is the first-touch fault service, so it is where the mapping-index
+    /// census is taken: the row populations both lookup structures hold, the
+    /// rows their walks visited for THIS fault, and the nanoseconds it cost.
+    /// `docs/perf-results/2026-09-08-mapping-index-measurement.md` closed the
+    /// full-table walk it could see by wall time alone and had to leave the
+    /// residual super-linearity unnamed, because no probe reported a scan
+    /// count. This is that probe.
     pub(crate) fn ensure_sparse_mmap_backing(
+        &mut self,
+        va: u64,
+        len: usize,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        let Some(started) = carrick_observability::probes::hvpatch_mapping_index_begin(
+            self.mappings.live_len() as u64,
+            self.mappings.shadowed_len() as u64,
+        ) else {
+            return self.ensure_sparse_mmap_backing_censused(va, len, flush_stage1);
+        };
+        let mapping_rows_before = hot_path_rows_scanned_live(HotPathScan::TaskMappings);
+        let alias_rows_before = hot_path_rows_scanned_live(HotPathScan::AliasState);
+        let outcome = self.ensure_sparse_mmap_backing_censused(va, len, flush_stage1);
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let (alias_rows, widest_va) = {
+            let registry = alias_registry().lock();
+            (registry.len() as u64, registry.widest_va)
+        };
+        carrick_observability::probes::hvpatch_mapping_index_fault(
+            va,
+            self.mappings.live_len() as u64,
+            hot_path_rows_scanned_live(HotPathScan::TaskMappings).wrapping_sub(mapping_rows_before),
+            alias_rows,
+            hot_path_rows_scanned_live(HotPathScan::AliasState).wrapping_sub(alias_rows_before),
+            nanos,
+            widest_va,
+            self.mappings.shadowed_len() as u64,
+        );
+        outcome
+    }
+
+    fn ensure_sparse_mmap_backing_censused(
         &mut self,
         va: u64,
         len: usize,
