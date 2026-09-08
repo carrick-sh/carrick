@@ -10901,6 +10901,8 @@ impl SyscallDispatcher {
                     comm,
                     user_cpu_us: thread.cpu_us(),
                     system_cpu_us: thread.system_cpu_us(),
+                    processor: thread.last_cpu(),
+                    cpus_allowed: thread.affinity(),
                 })
             })
             .collect::<Option<Vec<_>>>()?;

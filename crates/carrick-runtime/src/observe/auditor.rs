@@ -12,9 +12,12 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::kernel::objects::{ExecutionGeneration, ExecutorId, LinuxWaitStatus, TaskKey};
 
-#[path = "../../../carrick-hal/src/scheduler.rs"]
-pub mod scheduler;
-pub use scheduler::GuestCpuId;
+// The guest CPU the auditor surface names is the SAME identity the scheduler
+// places tasks on and the guest reads back through `sched_getcpu`. There is one
+// definition of it, in `carrick-hal`; a second copy compiled into this crate
+// would make `crate::observe::GuestCpuId` a different type from the one the run
+// queue hands out and force a placeholder at every emit site.
+pub use carrick_hal::scheduler::GuestCpuId;
 
 /// The kind of process or thread creation admitted by the kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

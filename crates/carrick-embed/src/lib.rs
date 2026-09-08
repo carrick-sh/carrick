@@ -35,6 +35,7 @@
 //! | Interception | Repeated [`ContainerBuilder::interceptor`] calls append [`SyscallInterceptor`] implementations; cumulative [`InterceptAction::RewriteArgs`] changes flow forward and the first return/errno proposal stops the chain | no syscall-number change, guest-pointer dereference, or guest-memory mutation |
 //! | VFS | [`ContainerBuilder::vfs_mount`] installs [`Vfs`] implementations at absolute guest paths, including [`InMemoryFileVfs`], [`LayeredVfs`], [`FilterVfs`], and [`RecordingVfs`] | mount behavior only; no arbitrary private-page access |
 //! | Time | [`ContainerBuilder::time`] installs the last [`TimeControl`] value for the container's [`ClockDomain`] | controls Carrick-modeled guest clocks/waits, not host time |
+//! | Scheduling | [`ContainerBuilder::scheduler`] installs one [`SchedulingPolicy`] for the CARRIER's run queue: placement ([`TaskPlacement`]/[`CpuLoad`]), `pick_next`, `steal` and `on_tick`; its `cpu_count()` is the single authority for the guest's `nproc`, `sched_getaffinity`, `/proc/cpuinfo` and `/sys/devices/system/cpu` | policy only — exact-generation claims, wake admission, settlement and close/drain observation are mechanism and not pluggable; a second, different policy on one carrier (or one installed after it booted) is an error, not a silent no-op |
 //! | Faults/budgets | [`ContainerBuilder::fault_injector`] installs ordered [`FaultInjector`] rules whose first match wins; [`ContainerBuilder::resource_budget`] installs one [`ResourceBudget`] before user observers | a pure [`FaultAction::Delay`] uses the container clock domain and returns [`SyscallAction::Allow`], so later observers and the handler continue but later rules in that injector do not; only shipped [`FaultAction`], [`ExceedAction`], and resource counters are enforced |
 //! | Network | [`ContainerBuilder::network_interposer`] installs the last [`NetworkInterposer`], whose outbound rules can use [`MockService`] or [`HttpMock`] | not a general packet-filter or raw-packet API |
 //! | Shared buffers | [`ContainerBuilder::shared_buffer`] exposes a [`SharedBuffer`] at `/dev/carrick/shm/<name>`; [`PreparedContainer::shared_buffer_lease`] returns a generation-stamped [`SharedBufferLease`] | leases fail closed after retirement/generation drift; no arbitrary private-page access |
@@ -98,6 +99,10 @@ pub use vfs::{
 pub use carrick_abi::{CanonicalNr, LinuxErrno};
 pub use carrick_engine::{ResolveWarning, RunRequest};
 pub use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError, SharedFutexLocation};
+pub use carrick_hal::{
+    CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, PreemptOrContinue,
+    SchedulingPolicy, TaskPlacement,
+};
 pub use carrick_image::{ImageStore, PullPolicy};
 pub use carrick_runtime::compat::CompatReport;
 pub use carrick_runtime::dispatch::Signal;
@@ -113,9 +118,9 @@ pub use carrick_runtime::observe::{
     ArgFilter, AuditEvent, AuditObserver, AuditReason, AuditVerdict, AuditorChain, BudgetCounters,
     BudgetResource, BudgetSnapshot, ExceedAction, ExitOwner, ExitStatus, FastPathVisibility,
     FaultAction, FaultCondition, FaultInjector, FaultPredicate, FaultRule, FaultRuleBuilder,
-    FirstTouchDeliverReason, ForkKind, GuestCpuId, InterceptAction, InterceptedSyscall,
-    KernelAuditor, PolicyObserver, PolicyRule, ProcessInfo, ResourceBudget, SandboxObserver,
-    SandboxPreset, SyscallAction, SyscallArgIndexError, SyscallArgs, SyscallBitset, SyscallInfo,
+    FirstTouchDeliverReason, ForkKind, InterceptAction, InterceptedSyscall, KernelAuditor,
+    PolicyObserver, PolicyRule, ProcessInfo, ResourceBudget, SandboxObserver, SandboxPreset,
+    SyscallAction, SyscallArgIndexError, SyscallArgs, SyscallBitset, SyscallInfo,
     SyscallInterceptor, SyscallObserver, SyscallOutcome, WakeRejectionReason, is_shortable_syscall,
 };
 pub use carrick_runtime::runtime::{RunResult, RuntimeError, TerminalReason};

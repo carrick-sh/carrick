@@ -123,3 +123,58 @@ fn go_types_exit_publishes_every_process_job() {
         jitter.matched()
     );
 }
+
+/// The scheduler's own transitions, driven through the SCHEDULER.
+///
+/// The design (phase 2) names an adversarial policy as the policy hook's first
+/// consumer for a reason the round-2 crash makes concrete: the load-coupled
+/// abort lives in claim/settle/generation-observation orderings, and host load
+/// or syscall jitter only reaches them by accident. `AdversarialPolicy` reaches
+/// them on purpose — it migrates every wake off `last_cpu`, runs each queue in
+/// a shuffled order, steals at every opportunity and preempts on every tick —
+/// with a seed, so a failing interleaving has a name.
+///
+/// Three seeds, because one seed is one interleaving family. RED when the
+/// carrier aborts (the process dies and the harness reports a failure) or when
+/// the guest is killed; green when the run completes, whatever the guest's own
+/// verdict. The policy is also asserted to have been CONSULTED: the mechanism
+/// only calls `pick_next`/`steal` when `inspects_queues()` is true, so a policy
+/// that is installed but never asked would make this test a very slow no-op.
+#[test]
+fn go_types_survives_an_adversarial_scheduling_policy() {
+    let _guest = common::guest_lock();
+    for seed in [1_u64, 0x9E37_79B9_7F4A_7C15, 0xDEAD_BEEF_CAFE_F00D] {
+        // The guest CPU count comes from the ONE authority the design names,
+        // never from a second reading of the host: the policy's `cpu_count()`
+        // is also the guest's `nproc`.
+        let policy = Arc::new(carrick_embed::testing::AdversarialPolicy::new(
+            carrick_runtime::kernel::scheduler::default_guest_cpu_count(),
+            seed,
+        ));
+        let result = ContainerBuilder::from_image(GO_IMAGE)
+            .image_store(ImageStore::default_for_user())
+            .pull_policy(PullPolicy::Missing)
+            .workdir("/usr/local/go/src/go/types")
+            .command([
+                "/conformance/go_types.test",
+                "-test.run",
+                "TestCheck|TestMapping",
+                "-test.short",
+            ])
+            .scheduler(Arc::clone(&policy) as Arc<dyn carrick_embed::SchedulingPolicy>)
+            .run_blocking()
+            .unwrap_or_else(|error| {
+                panic!("seed {seed:#x}: container aborted under the adversarial policy: {error}")
+            });
+        assert!(
+            policy.decisions() > 100,
+            "seed {seed:#x}: the policy was installed but barely consulted ({} decisions)",
+            policy.decisions()
+        );
+        assert!(
+            result.signal.is_none(),
+            "seed {seed:#x}: guest killed by signal {:?}",
+            result.signal
+        );
+    }
+}

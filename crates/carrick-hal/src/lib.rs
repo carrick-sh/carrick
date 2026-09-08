@@ -94,3 +94,8 @@ pub use x8664_arch::{
     GDT_LEN, SYSCALL_DOORBELL_PORT, X8664BootSysregs, X8664GuestArch, X8664Mmu, X8664SyscallTable,
     entry_trampoline_bytes as x8664_entry_trampoline_bytes,
 };
+pub mod scheduler;
+pub use scheduler::{
+    CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, MAX_GUEST_CPUS,
+    PreemptOrContinue, SchedulingPolicy, TaskKey, TaskPlacement,
+};

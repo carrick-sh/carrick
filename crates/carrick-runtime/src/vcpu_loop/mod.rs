@@ -1068,6 +1068,11 @@ pub(crate) struct HvpatchRuntimeDirectory {
     /// `shutdown_wait` immediately parked again on the jobs of guest tasks that
     /// are still running -- moving the hang instead of removing it.
     kernel_abort: Arc<Mutex<Option<KernelAbortRecord>>>,
+    /// The policy this carrier's scheduler runs, if an embedder installed one.
+    /// CARRIER-scoped, not container-scoped: HVPatch multiplexes every Linux
+    /// task of every container in one carrier with ONE run queue, so the `P`
+    /// set and the placement policy over it belong to the carrier.
+    scheduling_policy: Mutex<Option<Arc<dyn carrick_hal::SchedulingPolicy>>>,
     persistent_bindings: Arc<executor::HvpatchTaskBindingDirectory>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     carrier_tasks:
@@ -1470,6 +1475,19 @@ fn wait_for_physical_job_retirement(
         })
 }
 
+impl HvpatchRuntimeDirectory {
+    /// The carrier's directory, running `policy` (or the default per-CPU
+    /// policy when the embedder installed none).
+    pub(crate) fn with_scheduling_policy(
+        policy: Option<Arc<dyn carrick_hal::SchedulingPolicy>>,
+    ) -> Self {
+        Self {
+            scheduling_policy: Mutex::new(policy),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for HvpatchRuntimeDirectory {
     fn default() -> Self {
         Self {
@@ -1478,6 +1496,7 @@ impl Default for HvpatchRuntimeDirectory {
             scheduler: Mutex::new(None),
             liveness_kernel: Mutex::new(None),
             kernel_abort: Arc::default(),
+            scheduling_policy: Mutex::new(None),
             persistent_bindings: Arc::default(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             carrier_tasks: Mutex::new(None),
@@ -1567,14 +1586,22 @@ impl HvpatchRuntimeDirectory {
         if pool.is_some() {
             return Ok(false);
         }
-        let physical_cores = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1);
+        // The scheduler's `P` count is the guest CPU count; the `M` count is
+        // still host parallelism, and the executors bind to the `P`s
+        // round-robin. Cutting `M` to `P` is the design's steady state and it
+        // no longer wedges — see `ExecutorPoolConfig` for the 2026-09-08
+        // measurement that retired that claim, and for why the timing
+        // comparison that replaced it is not yet conclusive.
+        // `CARRICK_BOUND_EXECUTORS` is the exact hatch that settles it without
+        // a rebuild.
+        let bound_workers = executor::configured_bound_executors(services.scheduler.cpu_count());
+        let spare_executors = executor::configured_spare_executors(services.scheduler.cpu_count());
         let factory = Arc::new(executor::HvpatchPersistentExecutorFactory::new(authority));
         let started = self.start_services_transaction(services, || {
             executor::ExecutorPool::start(
                 executor::ExecutorPoolConfig {
-                    physical_cores,
+                    bound_workers,
+                    spare_executors,
                     vcpu_ceiling,
                     reserve: 0,
                 },
@@ -1639,7 +1666,7 @@ impl HvpatchRuntimeDirectory {
                 wait_service,
             };
         }
-        let scheduler = Arc::new(crate::kernel::Scheduler::new(Arc::clone(kernel)));
+        let scheduler = self.carrier_scheduler(kernel);
         let wait_service = Arc::new(continuation::CarrierWaitService::new(Arc::clone(
             &scheduler,
         )));
@@ -1647,6 +1674,33 @@ impl HvpatchRuntimeDirectory {
             scheduler,
             wait_service,
         }
+    }
+
+    /// Build THE carrier's scheduler and publish the CPU count its policy
+    /// fixes, which is from here on the guest's `nproc`. This is the only
+    /// place that publishes: `RunQueue::new` is also driven by every in-crate
+    /// reference-model kernel with its own CPU count, and none of those is the
+    /// guest's answer.
+    fn carrier_scheduler(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+    ) -> Arc<crate::kernel::scheduler::Scheduler> {
+        let policy = self.scheduling_policy();
+        crate::kernel::scheduler::publish_guest_cpu_count(policy.cpu_count());
+        Arc::new(crate::kernel::Scheduler::new_with_policy(
+            Arc::clone(kernel),
+            policy,
+        ))
+    }
+
+    /// The policy to build the carrier's scheduler with: the installed one, or
+    /// the default per-CPU policy sized by the host's guest CPU count.
+    fn scheduling_policy(&self) -> Arc<dyn carrick_hal::SchedulingPolicy> {
+        self.scheduling_policy.lock().clone().unwrap_or_else(|| {
+            Arc::new(carrick_hal::GuestCpuPolicy::new(
+                crate::kernel::scheduler::default_guest_cpu_count(),
+            ))
+        })
     }
 
     fn publish_persistent_services(&self, services: &PreparedPersistentServices) {
@@ -1685,13 +1739,15 @@ impl HvpatchRuntimeDirectory {
         Arc<continuation::CarrierWaitService>,
     ) {
         self.bind_liveness_kernel(kernel);
-        let scheduler =
-            {
-                let mut slot = self.scheduler.lock();
-                Arc::clone(slot.get_or_insert_with(|| {
-                    Arc::new(crate::kernel::Scheduler::new(Arc::clone(kernel)))
-                }))
-            };
+        let scheduler = {
+            let mut slot = self.scheduler.lock();
+            Arc::clone(slot.get_or_insert_with(|| {
+                Arc::new(crate::kernel::Scheduler::new_with_policy(
+                    Arc::clone(kernel),
+                    self.scheduling_policy(),
+                ))
+            }))
+        };
         for endpoint in self.endpoints.lock().values_mut() {
             if endpoint.scheduler.is_none() {
                 endpoint.scheduler = Some(Arc::clone(&scheduler));

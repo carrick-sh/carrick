@@ -736,6 +736,7 @@ impl ForkReservation {
             child_registry_id,
             Arc::clone(&child_resources),
             self.caller_thread.signal_state(),
+            self.caller_thread.affinity(),
         )?;
         check_failpoint(self.failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(self.failpoint, KernelFailpoint::AfterBackendPrepare)?;
@@ -1103,6 +1104,7 @@ impl ThreadCloneReservation {
             registry_id,
             Arc::clone(&resources),
             self.caller.signal_state(),
+            self.caller.affinity(),
         );
         check_failpoint(self.failpoint, KernelFailpoint::AfterObjects)?;
         check_failpoint(self.failpoint, KernelFailpoint::AfterBackendPrepare)?;
@@ -2697,6 +2699,16 @@ impl Kernel {
             (thread.key() == key).then_some(thread)
         })?;
         thread.with_active_execution_generation(generation, commit)
+    }
+
+    /// Test-only: drop one task's registry record while a caller still holds
+    /// an `Arc<Thread>` for it — exactly what a concurrent reap does to a
+    /// scheduler transition that is already in flight, which is the shape
+    /// behind the captured `lost exact transition ... kernel_view=thread
+    /// absent from registry` carrier abort.
+    #[cfg(test)]
+    pub(crate) fn reap_task_record_for_test(&self, task: super::ids::TaskId) -> bool {
+        self.registry().state.write().tasks.remove(&task).is_some()
     }
 
     /// Diagnostic projection of one scheduler thread's execution state for the

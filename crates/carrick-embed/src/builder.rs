@@ -125,6 +125,7 @@ pub struct ContainerBuilder {
     stdout: StdioConfig,
     stderr: StdioConfig,
     time: Option<carrick_runtime::kernel::TimeControl>,
+    scheduler: Option<std::sync::Arc<dyn carrick_hal::SchedulingPolicy>>,
     budget: Option<carrick_runtime::observe::ResourceBudget>,
     max_traps: usize,
     observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
@@ -167,6 +168,7 @@ impl ContainerBuilder {
             stdout: StdioConfig::Captured,
             stderr: StdioConfig::Captured,
             time: None,
+            scheduler: None,
             budget: None,
             max_traps: DEFAULT_MAX_TRAPS,
             observers: Vec::new(),
@@ -355,6 +357,30 @@ impl ContainerBuilder {
         self
     }
 
+    /// Install the scheduling policy the guest runs under.
+    ///
+    /// The policy decides placement (`select_cpu`), what a CPU runs next
+    /// (`pick_next`), what an idle CPU steals (`steal`) and preemption
+    /// (`on_tick`). Mechanism — exact-generation claims, wake admission,
+    /// settlement, close/drain observation — is NOT pluggable, so no policy
+    /// can express a wrong invariant.
+    ///
+    /// `SchedulingPolicy::cpu_count()` is the single authority for the guest's
+    /// CPU surface: `nproc`, `sched_getaffinity`, `/proc/cpuinfo`,
+    /// `/proc/stat` and `/sys/devices/system/cpu/*` all follow it, so a
+    /// four-`P` policy is a four-CPU guest and there is no second source to
+    /// disagree with it.
+    ///
+    /// The policy is CARRIER-scoped, not container-scoped: HVPatch runs every
+    /// Linux task of every container on one run queue. Installing a second,
+    /// different policy on the same carrier — or installing one after the
+    /// carrier has booted — is an [`EmbedError`](crate::EmbedError) from
+    /// `start`, never a silent no-op.
+    pub fn scheduler(mut self, policy: std::sync::Arc<dyn carrick_hal::SchedulingPolicy>) -> Self {
+        self.scheduler = Some(policy);
+        self
+    }
+
     /// Configure time control for the container.
     pub fn time(mut self, control: carrick_runtime::kernel::TimeControl) -> Self {
         self.time = Some(control);
@@ -489,6 +515,9 @@ impl ContainerBuilder {
         }
         if let Some(time) = self.time {
             extensions = extensions.time(time);
+        }
+        if let Some(policy) = self.scheduler {
+            extensions = extensions.scheduler(policy);
         }
         if let Some(budget) = self.budget {
             extensions = extensions.resource_budget(budget);

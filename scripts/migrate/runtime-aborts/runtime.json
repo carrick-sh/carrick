@@ -32,21 +32,21 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/creds.rs",
-      "function": "SyscallDispatcher::identity_pid",
-      "ordinal_in_function": 1,
-      "fingerprint": "653cd6af4637294b814ca28a0a57cc2c94aa13da90ec021d65bc9166727f9abf",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::pid_identity",
-      "rationale": "An HVPatch dispatcher retained an internal PID without the namespace-local identity captured from its exact live task binding; continuing would expose carrier-global identity through a container-scoped Linux PID surface."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/creds.rs",
       "function": "SyscallDispatcher::cred_snapshot",
       "ordinal_in_function": 1,
       "fingerprint": "dd519f45bc4e86846b696b70e74e73fbd56b252a0747a2c708af417511a08d42",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::credentials",
       "rationale": "Credentials read attempted outside captured KernelContext resource scope; cannot access task credentials without active thread context."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/creds.rs",
+      "function": "SyscallDispatcher::identity_pid",
+      "ordinal_in_function": 1,
+      "fingerprint": "653cd6af4637294b814ca28a0a57cc2c94aa13da90ec021d65bc9166727f9abf",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::pid_identity",
+      "rationale": "An HVPatch dispatcher retained an internal PID without the namespace-local identity captured from its exact live task binding; continuing would expose carrier-global identity through a container-scoped Linux PID surface."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/creds.rs",
@@ -70,13 +70,13 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "function": "kernel_file_description",
+      "function": "OpenDescription::stat_source",
       "ordinal_in_function": 1,
-      "fingerprint": "94d748a787822ccfe6dbbebd0596964c5659340867bd4a5d03d8b6ae32ada048",
+      "fingerprint": "021515a43b138f8b6d90ddc2db661897b465eebaaecb36183d1830fa66568614",
       "verdict": "typed_error_debt",
       "failure_domain": "dispatch::fd_table",
-      "rationale": "FileDescription identity allocation occurs before publication and should return a typed allocation error instead of aborting.",
-      "typed_error": "KernelOperationError"
+      "rationale": "Closed file description encountered in stat_source represents a normal close observation and should lower to EBADF instead of aborting.",
+      "typed_error": "LinuxErrno"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
@@ -90,73 +90,13 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "function": "OpenDescription::stat_source",
+      "function": "kernel_file_description",
       "ordinal_in_function": 1,
-      "fingerprint": "021515a43b138f8b6d90ddc2db661897b465eebaaecb36183d1830fa66568614",
+      "fingerprint": "94d748a787822ccfe6dbbebd0596964c5659340867bd4a5d03d8b6ae32ada048",
       "verdict": "typed_error_debt",
       "failure_domain": "dispatch::fd_table",
-      "rationale": "Closed file description encountered in stat_source represents a normal close observation and should lower to EBADF instead of aborting.",
-      "typed_error": "LinuxErrno"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "function": "FsState::vfs_mounts_mut",
-      "ordinal_in_function": 1,
-      "fingerprint": "02d7e1fd7c00d181a4fd9fd5d766af73ec52b0f17ca2781582219011e95ad3f0",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_mounts",
-      "rationale": "Mutating shared VFS mounts after fork occurs before execution and should return a typed configuration error instead of aborting.",
-      "typed_error": "RuntimeError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "function": "FsState::rootfs_vfs_mut",
-      "ordinal_in_function": 1,
-      "fingerprint": "46cf3fc85c7bd4212289f4a14ea59cf820145b6e696e4bed064127c0a6a1e0e9",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_mounts",
-      "rationale": "Mutating shared rootfs VFS after fork occurs before execution and should return a typed configuration error instead of aborting.",
-      "typed_error": "RuntimeError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "function": "SyscallDispatcher::write_output_fd_inner",
-      "ordinal_in_function": 1,
-      "fingerprint": "bbb0acf8e01796030d0c477e8e31b638faa72a5e995f876b489132c85b14dc90",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_io",
-      "rationale": "Missing captured slot authority on pipe write in write_output_fd_inner is a normal concurrent close observation that should lower to EBADF.",
-      "typed_error": "LinuxErrno"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "function": "SyscallDispatcher::write_output_fd_inner",
-      "ordinal_in_function": 2,
-      "fingerprint": "bbb0acf8e01796030d0c477e8e31b638faa72a5e995f876b489132c85b14dc90",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_io",
-      "rationale": "Missing captured slot authority on host pipe write in write_output_fd_inner is a normal concurrent close observation that should lower to EBADF.",
-      "typed_error": "LinuxErrno"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "function": "SyscallDispatcher::write_output_fd_inner",
-      "ordinal_in_function": 3,
-      "fingerprint": "bbb0acf8e01796030d0c477e8e31b638faa72a5e995f876b489132c85b14dc90",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_io",
-      "rationale": "Missing captured slot authority on host socket write in write_output_fd_inner is a normal concurrent close observation that should lower to EBADF.",
-      "typed_error": "LinuxErrno"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "function": "SyscallDispatcher::write_output_fd_inner",
-      "ordinal_in_function": 4,
-      "fingerprint": "bbb0acf8e01796030d0c477e8e31b638faa72a5e995f876b489132c85b14dc90",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_io",
-      "rationale": "Missing captured slot authority on host file write in write_output_fd_inner is a normal concurrent close observation that should lower to EBADF.",
-      "typed_error": "LinuxErrno"
+      "rationale": "FileDescription identity allocation occurs before publication and should return a typed allocation error instead of aborting.",
+      "typed_error": "KernelOperationError"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
@@ -230,6 +170,46 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "function": "SyscallDispatcher::write_output_fd_inner",
+      "ordinal_in_function": 1,
+      "fingerprint": "bbb0acf8e01796030d0c477e8e31b638faa72a5e995f876b489132c85b14dc90",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::fs_io",
+      "rationale": "Missing captured slot authority on pipe write in write_output_fd_inner is a normal concurrent close observation that should lower to EBADF.",
+      "typed_error": "LinuxErrno"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "function": "SyscallDispatcher::write_output_fd_inner",
+      "ordinal_in_function": 2,
+      "fingerprint": "bbb0acf8e01796030d0c477e8e31b638faa72a5e995f876b489132c85b14dc90",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::fs_io",
+      "rationale": "Missing captured slot authority on host pipe write in write_output_fd_inner is a normal concurrent close observation that should lower to EBADF.",
+      "typed_error": "LinuxErrno"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "function": "SyscallDispatcher::write_output_fd_inner",
+      "ordinal_in_function": 3,
+      "fingerprint": "bbb0acf8e01796030d0c477e8e31b638faa72a5e995f876b489132c85b14dc90",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::fs_io",
+      "rationale": "Missing captured slot authority on host socket write in write_output_fd_inner is a normal concurrent close observation that should lower to EBADF.",
+      "typed_error": "LinuxErrno"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "function": "SyscallDispatcher::write_output_fd_inner",
+      "ordinal_in_function": 4,
+      "fingerprint": "bbb0acf8e01796030d0c477e8e31b638faa72a5e995f876b489132c85b14dc90",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::fs_io",
+      "rationale": "Missing captured slot authority on host file write in write_output_fd_inner is a normal concurrent close observation that should lower to EBADF.",
+      "typed_error": "LinuxErrno"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
       "function": "SyscallDispatcher::writev",
       "ordinal_in_function": 1,
       "fingerprint": "9ce81a9cec81022b9cbcb03459729ec446620ef80f6d6f8d09351278da0956ed",
@@ -279,6 +259,53 @@
       "typed_error": "LinuxErrno"
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "FsState::rootfs_vfs_mut",
+      "ordinal_in_function": 1,
+      "fingerprint": "46cf3fc85c7bd4212289f4a14ea59cf820145b6e696e4bed064127c0a6a1e0e9",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::fs_mounts",
+      "rationale": "Mutating shared rootfs VFS after fork occurs before execution and should return a typed configuration error instead of aborting.",
+      "typed_error": "RuntimeError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "FsState::vfs_mounts_mut",
+      "ordinal_in_function": 1,
+      "fingerprint": "02d7e1fd7c00d181a4fd9fd5d766af73ec52b0f17ca2781582219011e95ad3f0",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::fs_mounts",
+      "rationale": "Mutating shared VFS mounts after fork occurs before execution and should return a typed configuration error instead of aborting.",
+      "typed_error": "RuntimeError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "MountRetirement::clear",
+      "ordinal_in_function": 1,
+      "fingerprint": "d0b524ccb1694f46852a77c809976706339b2ce8f16c1ecad14f780be5656529",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mount_retirement",
+      "rationale": "Mount destruction was requested without first proving sole ownership; continuing could publish a retired container while live dispatchers still use its mount table."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "MountRetirement::clear",
+      "ordinal_in_function": 2,
+      "fingerprint": "464f92a45a1a126ab184e1b81b432d922e8da1c9683fd3bf7013f1219c699bbe",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mount_retirement",
+      "rationale": "A prepared mount-retirement token lost its exact table before destruction; continuing would fabricate cleanup accounting for a table that was already removed."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "MountRetirement::clear",
+      "ordinal_in_function": 3,
+      "fingerprint": "8392fef40138b7ff4387400aa13b18683696617d7d8378927fcf7a8c916353f2",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mount_retirement",
+      "rationale": "A new mount-table owner appeared after sole ownership was proven; continuing could destroy storage still reachable by another container executor."
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
       "function": "<CrossProcessLock<'_> as Drop>::drop",
       "ordinal_in_function": 1,
@@ -300,15 +327,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "MemAuthority::fork_private_with_policy",
-      "ordinal_in_function": 1,
-      "fingerprint": "b804ddcec8828a4d06f58e88bb72c4ca64c0776a8217906fb633de6c804fadf0",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::deferred_anonymous_fork",
-      "rationale": "A WIPEONFORK projection supplied an invalid or unaligned range after the child memory authority was cloned; continuing would leave stale logical residency attached to the child's zeroed mapping."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "MemAuthority::bump_revision",
       "ordinal_in_function": 1,
       "fingerprint": "ba8397ea38cf5e3fe19feedb109e5aa226cac3928810396cdaa6a663bb81eb23",
@@ -318,12 +336,39 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::recover_private_repoint_failure",
+      "function": "MemAuthority::fork_private_with_policy",
       "ordinal_in_function": 1,
-      "fingerprint": "e44f1eb52810b2aad243028d5247b3ac54b320a84b540b293855938bc3323b9b",
+      "fingerprint": "b804ddcec8828a4d06f58e88bb72c4ca64c0776a8217906fb633de6c804fadf0",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mem_overlay",
-      "rationale": "Freeing candidate private overlay slot failed during clean repoint failure recovery; overlay allocator state is corrupted."
+      "failure_domain": "dispatch::deferred_anonymous_fork",
+      "rationale": "A WIPEONFORK projection supplied an invalid or unaligned range after the child memory authority was cloned; continuing would leave stale logical residency attached to the child's zeroed mapping."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::brk",
+      "ordinal_in_function": 1,
+      "fingerprint": "8c81972ea666cfb3d0e9c99b672d30cad143240db594aa324df29d54859fa2b8",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::brk",
+      "rationale": "protect_range failed during brk heap expansion; leaves heap in invalid memory protection state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::brk",
+      "ordinal_in_function": 2,
+      "fingerprint": "8c81972ea666cfb3d0e9c99b672d30cad143240db594aa324df29d54859fa2b8",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::brk",
+      "rationale": "protect_range failed during brk heap contraction; leaves contracted heap in invalid memory protection state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::brk",
+      "ordinal_in_function": 3,
+      "fingerprint": "8c81972ea666cfb3d0e9c99b672d30cad143240db594aa324df29d54859fa2b8",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::brk",
+      "rationale": "zero_backing failed during brk heap contraction; cannot safely scrub contracted heap backing for reuse."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
@@ -354,33 +399,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::record_remapped_dynamic_mapping",
-      "ordinal_in_function": 1,
-      "fingerprint": "77fe783fcb60b78f123d3cb4e394702d831bdd895562017369b4f0a35f914e99",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mremap",
-      "rationale": "Backend remap is already committed but destination semantic and dynamic-map authority cannot publish."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::record_alias_vma",
-      "ordinal_in_function": 1,
-      "fingerprint": "651e097c56996b551089d33d59bd371df08b2fc64f7a7e4e1212f37584d169ac",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::host_alias",
-      "rationale": "Protection and dynamic/semantic metadata are published but alias-VMA end address overflows and cannot record ownership."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::record_alias_vma",
-      "ordinal_in_function": 2,
-      "fingerprint": "2c70cc727a02ff3074ff104dc1a1b77925f766a1ee538a4f60e4783674d4adc1",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::host_alias",
-      "rationale": "Protection and dynamic/semantic metadata are published but alias-VMA range is invalid and cannot record ownership."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::commit_mmap_growdown",
       "ordinal_in_function": 1,
       "fingerprint": "a410dd21bab3f2a7324f75fd75ab5669b2907a85bd1db0d6defb610124a5b94b",
@@ -390,30 +408,12 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::brk",
+      "function": "SyscallDispatcher::commit_resident_fault",
       "ordinal_in_function": 1,
-      "fingerprint": "8c81972ea666cfb3d0e9c99b672d30cad143240db594aa324df29d54859fa2b8",
+      "fingerprint": "a410dd21bab3f2a7324f75fd75ab5669b2907a85bd1db0d6defb610124a5b94b",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::brk",
-      "rationale": "protect_range failed during brk heap expansion; leaves heap in invalid memory protection state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::brk",
-      "ordinal_in_function": 2,
-      "fingerprint": "8c81972ea666cfb3d0e9c99b672d30cad143240db594aa324df29d54859fa2b8",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::brk",
-      "rationale": "protect_range failed during brk heap contraction; leaves contracted heap in invalid memory protection state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::brk",
-      "ordinal_in_function": 3,
-      "fingerprint": "8c81972ea666cfb3d0e9c99b672d30cad143240db594aa324df29d54859fa2b8",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::brk",
-      "rationale": "zero_backing failed during brk heap contraction; cannot safely scrub contracted heap backing for reuse."
+      "failure_domain": "dispatch::resident_fault",
+      "rationale": "Caller lacks host alias dispatch exclusion during commit_resident_fault; cannot update resident fault page without synchronization."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
@@ -507,39 +507,12 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::munmap",
+      "function": "SyscallDispatcher::mprotect",
       "ordinal_in_function": 1,
-      "fingerprint": "97d82c0072c5e3511482dfccae73e49b2f74544fa57c21db7695b34286be8fbf",
+      "fingerprint": "1fcb0054b1d6697ac7b47319e1362261a9df8eb3592c0f2976c0eda842b583fd",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::munmap_overlay",
-      "rationale": "Overlay carve_source_range failed during private overlay munmap; leaves unmapped overlay range in inconsistent state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::munmap",
-      "ordinal_in_function": 2,
-      "fingerprint": "fd921dd7b3acf8fa438c8624bcbcf71f021ae7dab36c9179433f39a034a66cde",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::munmap_overlay",
-      "rationale": "Overlay carve_source_range failed during shared/overlay munmap; leaves unmapped overlay range in inconsistent state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::munmap",
-      "ordinal_in_function": 3,
-      "fingerprint": "fd921dd7b3acf8fa438c8624bcbcf71f021ae7dab36c9179433f39a034a66cde",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::munmap_shared",
-      "rationale": "Shared aperture carve_guest_range failed during munmap after unmap completed; shared aperture allocation state is corrupted."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::munmap",
-      "ordinal_in_function": 4,
-      "fingerprint": "e4f550bf487083c8183888dd734bc54841ea1d812ddeafaac70c18f16d378382",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::munmap_overlay",
-      "rationale": "Overlay carve_source_range failed during anonymous arena munmap; leaves unmapped range in inconsistent overlay state."
+      "failure_domain": "dispatch::mprotect",
+      "rationale": "Stored reservation fork semantics contradict selected VMA subrange, corrupting semantic-VMA authority during host alias transaction commit."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
@@ -597,30 +570,75 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mprotect",
+      "function": "SyscallDispatcher::munmap",
       "ordinal_in_function": 1,
-      "fingerprint": "1fcb0054b1d6697ac7b47319e1362261a9df8eb3592c0f2976c0eda842b583fd",
+      "fingerprint": "97d82c0072c5e3511482dfccae73e49b2f74544fa57c21db7695b34286be8fbf",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mprotect",
-      "rationale": "Stored reservation fork semantics contradict selected VMA subrange, corrupting semantic-VMA authority during host alias transaction commit."
+      "failure_domain": "dispatch::munmap_overlay",
+      "rationale": "Overlay carve_source_range failed during private overlay munmap; leaves unmapped overlay range in inconsistent state."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::commit_resident_fault",
-      "ordinal_in_function": 1,
-      "fingerprint": "a410dd21bab3f2a7324f75fd75ab5669b2907a85bd1db0d6defb610124a5b94b",
+      "function": "SyscallDispatcher::munmap",
+      "ordinal_in_function": 2,
+      "fingerprint": "fd921dd7b3acf8fa438c8624bcbcf71f021ae7dab36c9179433f39a034a66cde",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::resident_fault",
-      "rationale": "Caller lacks host alias dispatch exclusion during commit_resident_fault; cannot update resident fault page without synchronization."
+      "failure_domain": "dispatch::munmap_overlay",
+      "rationale": "Overlay carve_source_range failed during shared/overlay munmap; leaves unmapped overlay range in inconsistent state."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::rollback_shared_anon_mapping",
-      "ordinal_in_function": 1,
-      "fingerprint": "008ec0d28526a761ce2e6e24020bddb47b4555697870dd784963d686a1163406",
+      "function": "SyscallDispatcher::munmap",
+      "ordinal_in_function": 3,
+      "fingerprint": "fd921dd7b3acf8fa438c8624bcbcf71f021ae7dab36c9179433f39a034a66cde",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mmap_rollback",
-      "rationale": "Unmapping host memory range failed under concurrent-exec protection, leaving a live host mapping outside VMA/arena allocation ownership."
+      "failure_domain": "dispatch::munmap_shared",
+      "rationale": "Shared aperture carve_guest_range failed during munmap after unmap completed; shared aperture allocation state is corrupted."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::munmap",
+      "ordinal_in_function": 4,
+      "fingerprint": "e4f550bf487083c8183888dd734bc54841ea1d812ddeafaac70c18f16d378382",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::munmap_overlay",
+      "rationale": "Overlay carve_source_range failed during anonymous arena munmap; leaves unmapped range in inconsistent overlay state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::record_alias_vma",
+      "ordinal_in_function": 1,
+      "fingerprint": "651e097c56996b551089d33d59bd371df08b2fc64f7a7e4e1212f37584d169ac",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::host_alias",
+      "rationale": "Protection and dynamic/semantic metadata are published but alias-VMA end address overflows and cannot record ownership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::record_alias_vma",
+      "ordinal_in_function": 2,
+      "fingerprint": "2c70cc727a02ff3074ff104dc1a1b77925f766a1ee538a4f60e4783674d4adc1",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::host_alias",
+      "rationale": "Protection and dynamic/semantic metadata are published but alias-VMA range is invalid and cannot record ownership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::record_remapped_dynamic_mapping",
+      "ordinal_in_function": 1,
+      "fingerprint": "77fe783fcb60b78f123d3cb4e394702d831bdd895562017369b4f0a35f914e99",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mremap",
+      "rationale": "Backend remap is already committed but destination semantic and dynamic-map authority cannot publish."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::recover_private_repoint_failure",
+      "ordinal_in_function": 1,
+      "fingerprint": "e44f1eb52810b2aad243028d5247b3ac54b320a84b540b293855938bc3323b9b",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mem_overlay",
+      "rationale": "Freeing candidate private overlay slot failed during clean repoint failure recovery; overlay allocator state is corrupted."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
@@ -632,13 +650,22 @@
       "rationale": "Unmapping host memory range failed under concurrent-exec protection, leaving a live host mapping outside VMA/arena allocation ownership."
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
-      "function": "from_pt_pause",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "function": "SyscallDispatcher::rollback_shared_anon_mapping",
       "ordinal_in_function": 1,
-      "fingerprint": "b9c13fcd0a74f8dfc82ea9b7134de5ec9bc88d3d7b5aa96ec96210fcc9d414e8",
+      "fingerprint": "008ec0d28526a761ce2e6e24020bddb47b4555697870dd784963d686a1163406",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mmap_rollback",
+      "rationale": "Unmapping host memory range failed under concurrent-exec protection, leaving a live host mapping outside VMA/arena allocation ownership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
+      "function": "<MmSnapshotGuard as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "3f70b0e00aaeda60afd5b18ca4f9a4d8b0c87c47e3249aae8ab198f22cc98a0a",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_mutation",
-      "rationale": "Active PtPauseGuard missing mutation identity (coordinator/MM); continuing would construct MmMutationGuard without valid MM coordinator authority while page-table exclusion is active."
+      "rationale": "snapshot_readers counter underflow during MmSnapshotGuard drop indicates corrupted coordinator reader accounting."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
@@ -651,30 +678,30 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mm_mutation.rs",
-      "function": "<MmSnapshotGuard as Drop>::drop",
+      "function": "from_pt_pause",
       "ordinal_in_function": 1,
-      "fingerprint": "3f70b0e00aaeda60afd5b18ca4f9a4d8b0c87c47e3249aae8ab198f22cc98a0a",
+      "fingerprint": "b9c13fcd0a74f8dfc82ea9b7134de5ec9bc88d3d7b5aa96ec96210fcc9d414e8",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_mutation",
-      "rationale": "snapshot_readers counter underflow during MmSnapshotGuard drop indicates corrupted coordinator reader accounting."
+      "rationale": "Active PtPauseGuard missing mutation identity (coordinator/MM); continuing would construct MmMutationGuard without valid MM coordinator authority while page-table exclusion is active."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "MmExecutorParticipation::participation_mut",
+      "function": "<HostAliasDispatchGuard<'_> as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "b1477e4159bdbf95462d6d7fe36c57fc8db3f1d3250719e267d1ca710ec0af53",
+      "fingerprint": "647ae84d915eee12ca825debc3308248177857b5592c816b808bcefad4574160",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_executor_participation",
-      "rationale": "Stage-1 authority attempted to use an executor token while its exact-MM census participation was temporarily absent; continuing would authorize mutation without accounting for the running caller."
+      "failure_domain": "dispatch::mem_revision",
+      "rationale": "VMA revision atomic generation counter overflow in HostAliasDispatchGuard drop would wrap revision identity and corrupt change detection."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "MmExecutorParticipation::reenter_exact",
+      "function": "DispatchMmBinding::rebind_prepared_root",
       "ordinal_in_function": 1,
-      "fingerprint": "bf34c7c182c2eabdbb53270b21a75809f1a46f360259e0c75da144a6fa3de082",
+      "fingerprint": "c6abce235563aa121422a0a460e71035ff4ec9ceed5de177ad11f671bf5105eb",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_executor_participation",
-      "rationale": "Exact-MM executor re-entry was attempted while the token still owned live participation; this is a corrupted release/re-entry state transition that could duplicate census identity."
+      "failure_domain": "dispatch::mm_binding",
+      "rationale": "A newly prepared carrier root already had an exec MM staged while its bootstrap MM identity was being rebound; continuing would mix two MM generations in one dispatcher."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -684,33 +711,6 @@
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_binding",
       "rationale": "Duplicate staged exec MM authority in DispatchMmBinding; indicates concurrent or overlapping exec staging transactions."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "PreparedDispatchMmExec::commit",
-      "ordinal_in_function": 1,
-      "fingerprint": "7c9ff175076a04a73992322c5f4deb179f28c8dd6ffd29c15605c9d641b1c702",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_exec_commit",
-      "rationale": "Staged exec MM authority changed or vanished prior to commit; indicates corrupted exec transaction lifecycle."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "PreparedDispatchMmExec::commit",
-      "ordinal_in_function": 2,
-      "fingerprint": "5fdbbdb6575bfe0c68cb6cc285d67d25a8e9f1ec5bedd674c8e81499c471846b",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_exec_commit",
-      "rationale": "Predecessor MM authority mutated concurrently during exec commit CAS; continuing would overwrite uncoordinated MM binding transition."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "HostAliasDispatchGuard<'_>::with_authority",
-      "ordinal_in_function": 1,
-      "fingerprint": "0267bea011b5128f256b8a1887f3a675bdbaf358d9131072306f4c6388fa3e8c",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::host_alias_transactions",
-      "rationale": "Mismatched HostAliasTransactions reference on DispatchMmAuthority during with_authority; dispatch synchronization domain is corrupted."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -733,32 +733,48 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "<HostAliasDispatchGuard<'_> as Drop>::drop",
+      "function": "HostAliasDispatchGuard<'_>::with_authority",
       "ordinal_in_function": 1,
-      "fingerprint": "647ae84d915eee12ca825debc3308248177857b5592c816b808bcefad4574160",
+      "fingerprint": "0267bea011b5128f256b8a1887f3a675bdbaf358d9131072306f4c6388fa3e8c",
       "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mem_revision",
-      "rationale": "VMA revision atomic generation counter overflow in HostAliasDispatchGuard drop would wrap revision identity and corrupt change detection."
+      "failure_domain": "dispatch::host_alias_transactions",
+      "rationale": "Mismatched HostAliasTransactions reference on DispatchMmAuthority during with_authority; dispatch synchronization domain is corrupted."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "bootstrap_one_task_binding",
+      "function": "MmExecutorParticipation::participation_mut",
       "ordinal_in_function": 1,
-      "fingerprint": "6d8cc5e867ac7a90ab0d353545975bd0e05cc9fb7316cfbf41f3f44563d71141",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::bootstrap",
-      "rationale": "RootBootstrap construction failure occurs during one-task kernel adapter initialization and should return a typed RuntimeError.",
-      "typed_error": "RuntimeError"
+      "fingerprint": "b1477e4159bdbf95462d6d7fe36c57fc8db3f1d3250719e267d1ca710ec0af53",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_participation",
+      "rationale": "Stage-1 authority attempted to use an executor token while its exact-MM census participation was temporarily absent; continuing would authorize mutation without accounting for the running caller."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "bootstrap_one_task_binding",
+      "function": "MmExecutorParticipation::reenter_exact",
+      "ordinal_in_function": 1,
+      "fingerprint": "bf34c7c182c2eabdbb53270b21a75809f1a46f360259e0c75da144a6fa3de082",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_participation",
+      "rationale": "Exact-MM executor re-entry was attempted while the token still owned live participation; this is a corrupted release/re-entry state transition that could duplicate census identity."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "PreparedDispatchMmExec::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "7c9ff175076a04a73992322c5f4deb179f28c8dd6ffd29c15605c9d641b1c702",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_exec_commit",
+      "rationale": "Staged exec MM authority changed or vanished prior to commit; indicates corrupted exec transaction lifecycle."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "PreparedDispatchMmExec::commit",
       "ordinal_in_function": 2,
-      "fingerprint": "395de5219932f9565c6c50b283c37ae4c348006745c126adf23ca0fa6faed064",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::bootstrap",
-      "rationale": "Kernel root bootstrap failure occurs during initial execution graph setup and should return a typed RuntimeError.",
-      "typed_error": "RuntimeError"
+      "fingerprint": "5fdbbdb6575bfe0c68cb6cc285d67d25a8e9f1ec5bedd674c8e81499c471846b",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_exec_commit",
+      "rationale": "Predecessor MM authority mutated concurrently during exec commit CAS; continuing would overwrite uncoordinated MM binding transition."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -789,30 +805,58 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::captured_file_table",
+      "ordinal_in_function": 1,
+      "fingerprint": "bbf168f59f9b9daaa61505584dc6048fd060fa4153eac2e18756e0f522db4be2",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::file_authority",
+      "rationale": "FileTable read attempted outside active thread-local captured KernelContext scope; violates descriptor table boundaries."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::captured_fs_context",
+      "ordinal_in_function": 1,
+      "fingerprint": "342842438966a6db4985141a8e57731ee8cd0d38204ebf4571a65cbdf960e0db",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::fs_context",
+      "rationale": "FsContext read attempted outside active thread-local captured KernelContext scope; violates filesystem namespace boundaries."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::captured_mm",
+      "ordinal_in_function": 1,
+      "fingerprint": "87e3e94c3a2b2bc8333121240b832f4350a28456fd4eb1dec9119a9e37580b35",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_authority",
+      "rationale": "Mm read attempted outside active thread-local captured KernelContext scope; violates memory isolation boundaries."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::commit_host_alias_install",
+      "ordinal_in_function": 1,
+      "fingerprint": "58f405119bb6359c51311ffe85d34479c81b924a4a3287eb796a4544ed7ae753",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::host_alias_commit",
+      "rationale": "io_uring mapping commit missing target Mm reference during commit_host_alias_install; cannot record mapping in address space."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::cwd",
+      "ordinal_in_function": 1,
+      "fingerprint": "8769d0bbe22c237502c95e088ce7bafcc77096c207757548d7b080118947b556",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::fs_context",
+      "rationale": "Capturing task context for cwd query occurs before filesystem operations and should return a typed LinuxErrno instead of aborting.",
+      "typed_error": "LinuxErrno"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::enter_mm_executor_inner",
       "ordinal_in_function": 1,
       "fingerprint": "33847525eef86c7dff8b8ffd4923ec2610ca6a03f679a5e3457811b797a0065c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mm_executor_admission",
       "rationale": "Internal executor admission supplied a thread identity without its exact pause endpoint recipe; admitting that malformed identity would make page-table pause accounting incomplete."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::with_current_mm_executor_released",
-      "ordinal_in_function": 1,
-      "fingerprint": "0bb1aa9f47d871902f9e5a2fd55de6071b62bb0784a59ffc47570618b4a5e57f",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_executor_reentry",
-      "rationale": "Caller-MM participation could not be re-admitted after the scoped foreign-MM operation; returning to guest execution without census membership would make subsequent page-table pauses unsound."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::with_current_mm_executor_released",
-      "ordinal_in_function": 2,
-      "fingerprint": "9fc3fb1ead3686f916316d9c0e760aedf8a01d17b612f08564582edfb4776269",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_executor_reentry",
-      "rationale": "Dispatcher, MM, thread, or running-lease identity drifted while unwinding a released operation; continuing the unwind after failed exact re-entry authentication could leave a live executor outside its authoritative census."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -825,12 +869,13 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::commit_host_alias_install",
+      "function": "SyscallDispatcher::mem_snapshot",
       "ordinal_in_function": 1,
-      "fingerprint": "58f405119bb6359c51311ffe85d34479c81b924a4a3287eb796a4544ed7ae753",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::host_alias_commit",
-      "rationale": "io_uring mapping commit missing target Mm reference during commit_host_alias_install; cannot record mapping in address space."
+      "fingerprint": "6b3d3aea2123f9a86d4ba55e04199eb4e2522717611d077598e39fa73357e9e5",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::mem_snapshot",
+      "rationale": "Synthetic proc MemState snapshot acquisition timeout occurs during non-destructive read before synthetic VFS publication and should propagate SnapshotError instead of aborting.",
+      "typed_error": "SnapshotError"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -854,43 +899,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::captured_mm",
-      "ordinal_in_function": 1,
-      "fingerprint": "87e3e94c3a2b2bc8333121240b832f4350a28456fd4eb1dec9119a9e37580b35",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_authority",
-      "rationale": "Mm read attempted outside active thread-local captured KernelContext scope; violates memory isolation boundaries."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::captured_file_table",
-      "ordinal_in_function": 1,
-      "fingerprint": "bbf168f59f9b9daaa61505584dc6048fd060fa4153eac2e18756e0f522db4be2",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::file_authority",
-      "rationale": "FileTable read attempted outside active thread-local captured KernelContext scope; violates descriptor table boundaries."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::captured_fs_context",
-      "ordinal_in_function": 1,
-      "fingerprint": "342842438966a6db4985141a8e57731ee8cd0d38204ebf4571a65cbdf960e0db",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::fs_context",
-      "rationale": "FsContext read attempted outside active thread-local captured KernelContext scope; violates filesystem namespace boundaries."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::cwd",
-      "ordinal_in_function": 1,
-      "fingerprint": "8769d0bbe22c237502c95e088ce7bafcc77096c207757548d7b080118947b556",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_context",
-      "rationale": "Capturing task context for cwd query occurs before filesystem operations and should return a typed LinuxErrno instead of aborting.",
-      "typed_error": "LinuxErrno"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::set_cwd",
       "ordinal_in_function": 1,
       "fingerprint": "d2c795348dd11c49c441227e2db2f8cefcd96018964504b9abaac96b9f5f96b7",
@@ -901,13 +909,41 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::mem_snapshot",
+      "function": "SyscallDispatcher::with_current_mm_executor_released",
       "ordinal_in_function": 1,
-      "fingerprint": "6b3d3aea2123f9a86d4ba55e04199eb4e2522717611d077598e39fa73357e9e5",
+      "fingerprint": "0bb1aa9f47d871902f9e5a2fd55de6071b62bb0784a59ffc47570618b4a5e57f",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_reentry",
+      "rationale": "Caller-MM participation could not be re-admitted after the scoped foreign-MM operation; returning to guest execution without census membership would make subsequent page-table pauses unsound."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "SyscallDispatcher::with_current_mm_executor_released",
+      "ordinal_in_function": 2,
+      "fingerprint": "9fc3fb1ead3686f916316d9c0e760aedf8a01d17b612f08564582edfb4776269",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mm_executor_reentry",
+      "rationale": "Dispatcher, MM, thread, or running-lease identity drifted while unwinding a released operation; continuing the unwind after failed exact re-entry authentication could leave a live executor outside its authoritative census."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "bootstrap_one_task_binding",
+      "ordinal_in_function": 1,
+      "fingerprint": "6d8cc5e867ac7a90ab0d353545975bd0e05cc9fb7316cfbf41f3f44563d71141",
       "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::mem_snapshot",
-      "rationale": "Synthetic proc MemState snapshot acquisition timeout occurs during non-destructive read before synthetic VFS publication and should propagate SnapshotError instead of aborting.",
-      "typed_error": "SnapshotError"
+      "failure_domain": "dispatch::bootstrap",
+      "rationale": "RootBootstrap construction failure occurs during one-task kernel adapter initialization and should return a typed RuntimeError.",
+      "typed_error": "RuntimeError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "function": "bootstrap_one_task_binding",
+      "ordinal_in_function": 2,
+      "fingerprint": "395de5219932f9565c6c50b283c37ae4c348006745c126adf23ca0fa6faed064",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::bootstrap",
+      "rationale": "Kernel root bootstrap failure occurs during initial execution graph setup and should return a typed RuntimeError.",
+      "typed_error": "RuntimeError"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/resources.rs",
@@ -938,6 +974,15 @@
       "rationale": "Target thread ID not found in task during signal authority creation; operating on missing thread violates task thread membership invariants."
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+      "function": "ns_visible_sender_pid",
+      "ordinal_in_function": 1,
+      "fingerprint": "e439d9187eda293b1be3c31f26c0980092218a9d5abede24df8c2341d3a1879f",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::signal_identity",
+      "rationale": "A live signal sender lacked an i32 namespace-visible PID; continuing would attribute a signal to no valid Linux process or to a different container identity."
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
       "function": "<PendingShmat as Drop>::drop",
       "ordinal_in_function": 1,
@@ -945,6 +990,15 @@
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::sysv_shm",
       "rationale": "SysV shared memory segment path mismatch or zero pending_attaches during PendingShmat drop; indicates corrupted SysV IPC segment registry state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "function": "SyscallDispatcher::shmdt",
+      "ordinal_in_function": 1,
+      "fingerprint": "fd82e771c1205d0b061aad33b34f9270cf28cb16813a43c42469db5dfb9e6fd3",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::sysv_shmdt",
+      "rationale": "Backend unmap_alias_range failed during shmdt; continuing would leave guest execution with indeterminate split attachment and backend state."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
@@ -981,15 +1035,6 @@
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::sysv_shmat",
       "rationale": "PendingShmat reservation commit failed during remapped attachment reuse; continuing would leave uncommitted SysV IPC attachment state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "function": "SyscallDispatcher::shmdt",
-      "ordinal_in_function": 1,
-      "fingerprint": "fd82e771c1205d0b061aad33b34f9270cf28cb16813a43c42469db5dfb9e6fd3",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::sysv_shmdt",
-      "rationale": "Backend unmap_alias_range failed during shmdt; continuing would leave guest execution with indeterminate split attachment and backend state."
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs",
@@ -1038,12 +1083,21 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
-      "function": "ExecMmReservation::active",
+      "function": "<OwnerSetEditHold as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "ae57cd1fe40d2a4895ab2c32d9e3d8cfba3b26c82f4d26da52a9d5c1903d3e57",
+      "fingerprint": "85c9c087ed03edf279bfc7356b5398341d8067c89dc93aaeaaa9f22a26fb94d9",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_reservation",
-      "rationale": "Attempted to access active components on a settled or fail-closed ExecMmReservation; indicates illegal state transition in MM reservation lifecycle."
+      "rationale": "Owner-set edit hold count underflow on release; indicates a double-release or corrupted hold accounting for the mm generation."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
+      "function": "<OwnerSetEditHold as Drop>::drop",
+      "ordinal_in_function": 2,
+      "fingerprint": "85c9c087ed03edf279bfc7356b5398341d8067c89dc93aaeaaa9f22a26fb94d9",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_reservation",
+      "rationale": "Owner-set edit hold released for a generation with no hold entry; indicates the hold table was mutated out from under a live hold."
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
@@ -1056,12 +1110,39 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
+      "function": "ExecMmReservation::abort",
+      "ordinal_in_function": 2,
+      "fingerprint": "fdad1832f285f9202525a88a9f8aed989c4b9b51f38b8bb063ada05ca7ffaf8f",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_reservation",
+      "rationale": "Exec reservation marker vanished between validate and clear under the same resources lock; indicates a corrupted reservation table (validate just proved the marker was ours)."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
+      "function": "ExecMmReservation::active",
+      "ordinal_in_function": 1,
+      "fingerprint": "ae57cd1fe40d2a4895ab2c32d9e3d8cfba3b26c82f4d26da52a9d5c1903d3e57",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_reservation",
+      "rationale": "Attempted to access active components on a settled or fail-closed ExecMmReservation; indicates illegal state transition in MM reservation lifecycle."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
       "function": "ExecMmReservation::commit",
       "ordinal_in_function": 1,
       "fingerprint": "fbac204bc2b74ae7988a446128bc30e9ec9e8e20379a4464c155c9b681f312f4",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_reservation",
       "rationale": "ExecMmReservation was not in Active state during commit; indicates double-commit or corrupted reservation state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
+      "function": "ExecMmReservation::commit",
+      "ordinal_in_function": 2,
+      "fingerprint": "fdad1832f285f9202525a88a9f8aed989c4b9b51f38b8bb063ada05ca7ffaf8f",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::mm_reservation",
+      "rationale": "Exec reservation marker vanished between validate and clear under the same resources lock during commit; indicates a corrupted reservation table."
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
@@ -1102,50 +1183,13 @@
       "typed_error": "MmResourcesError"
     },
     {
-      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
-      "function": "ExecMmReservation::abort",
-      "ordinal_in_function": 2,
-      "fingerprint": "fdad1832f285f9202525a88a9f8aed989c4b9b51f38b8bb063ada05ca7ffaf8f",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_reservation",
-      "rationale": "Exec reservation marker vanished between validate and clear under the same resources lock; indicates a corrupted reservation table (validate just proved the marker was ours)."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
-      "function": "ExecMmReservation::commit",
-      "ordinal_in_function": 2,
-      "fingerprint": "fdad1832f285f9202525a88a9f8aed989c4b9b51f38b8bb063ada05ca7ffaf8f",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_reservation",
-      "rationale": "Exec reservation marker vanished between validate and clear under the same resources lock during commit; indicates a corrupted reservation table."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
-      "function": "<OwnerSetEditHold as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "85c9c087ed03edf279bfc7356b5398341d8067c89dc93aaeaaa9f22a26fb94d9",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_reservation",
-      "rationale": "Owner-set edit hold count underflow on release; indicates a double-release or corrupted hold accounting for the mm generation."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/mm_resources.rs",
-      "function": "<OwnerSetEditHold as Drop>::drop",
-      "ordinal_in_function": 2,
-      "fingerprint": "85c9c087ed03edf279bfc7356b5398341d8067c89dc93aaeaaa9f22a26fb94d9",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::mm_reservation",
-      "rationale": "Owner-set edit hold released for a generation with no hold entry; indicates the hold table was mutated out from under a live hold."
-    },
-    {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "function": "ProcessContext::with_foreign_mm_endpoint",
+      "function": "PreparedRootInitialization::process",
       "ordinal_in_function": 1,
-      "fingerprint": "294b05deb834f9b3e3b50f77993dbe4c4a450d5f89deb946e3fac6c69ae4bdcf",
-      "verdict": "typed_error_debt",
-      "failure_domain": "hvpatch::bootstrap",
-      "rationale": "Foreign MM endpoint installation failure on root ProcessContext occurs during root bootstrap before guest execution and should return a typed RuntimeError instead of aborting.",
-      "typed_error": "RuntimeError"
+      "fingerprint": "c50e8d08ba546e6a456544396cbbbddb173faf4e5358f403ea11fc70b31d5e22",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::root_initialization",
+      "rationale": "The prepared first-root transaction lost its process context before activation; continuing could commit inventory and lifecycle state without the root that owns them."
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
@@ -1220,6 +1264,97 @@
       "rationale": "Exec MM reservation commit failed after predecessor VMA freeze was already committed; state is irreversible and cannot resume predecessor or child."
     },
     {
+      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
+      "function": "ProcessContext::wait_result",
+      "ordinal_in_function": 1,
+      "fingerprint": "12ec014e0bcdf5297e0536b76b956abb36b8bab9ea992c2415f4f820df26a4b1",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::wait_identity",
+      "rationale": "An exited child carried a namespace PID outside the Linux wait ABI range; continuing would return a status for an unrepresentable or aliased child identity."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
+      "function": "ProcessContext::with_foreign_mm_endpoint",
+      "ordinal_in_function": 1,
+      "fingerprint": "294b05deb834f9b3e3b50f77993dbe4c4a450d5f89deb946e3fac6c69ae4bdcf",
+      "verdict": "typed_error_debt",
+      "failure_domain": "hvpatch::bootstrap",
+      "rationale": "Foreign MM endpoint installation failure on root ProcessContext occurs during root bootstrap before guest execution and should return a typed RuntimeError instead of aborting.",
+      "typed_error": "RuntimeError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "PreparedStage1MmRetirement::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "c9c4b64737d9c60569f6bced285768c30e230741b37ba0622a9c4d0b161c7ea7",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_retirement",
+      "rationale": "PreparedStage1MmRetirement missing residency state during commit; indicates double-commit or corrupted retirement state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "PreparedStage1MmRetirement::commit",
+      "ordinal_in_function": 2,
+      "fingerprint": "edb97380c885be08e904bbc6179df16908c2a0289f42e4adca4972227f65de8f",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_retirement",
+      "rationale": "PreparedStage1MmRetirement missing ASID state during commit; indicates double-commit or corrupted ASID retirement state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "PreparedStage1MmRetirement::commit",
+      "ordinal_in_function": 3,
+      "fingerprint": "7e5e1640631352f61645713dd49b284a14ef6e0154453d182b985aa0259171dc",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_retirement",
+      "rationale": "Stage-1 root retirement nonce overflow would reuse proof identity and permit an old backend retirement proof to authenticate a later root-slot generation."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "PreparedStage1MmRetirement::pending",
+      "ordinal_in_function": 1,
+      "fingerprint": "b201f84d38f7d3658115a583fa22e540172f072597e1dbda8e0155c14f3afe8c",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_retirement",
+      "rationale": "PreparedStage1MmRetirement missing residency state during pending query; indicates invalid retirement lifecycle transition."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "PreparedStage1MmRetirement::requires_quarantine",
+      "ordinal_in_function": 1,
+      "fingerprint": "b201f84d38f7d3658115a583fa22e540172f072597e1dbda8e0155c14f3afe8c",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_retirement",
+      "rationale": "PreparedStage1MmRetirement missing residency state during requires_quarantine check; indicates invalid retirement lifecycle transition."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmBackend::bump_revision",
+      "ordinal_in_function": 1,
+      "fingerprint": "6365dd43e2ebf977a4119aa84df6032c482d55a2d49179487db0574e1cca4238",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_revision",
+      "rationale": "Stage1MmBackend revision atomic generation counter overflow would wrap revision identity and corrupt memory change detection."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::acknowledge_cow_invalidation",
+      "ordinal_in_function": 1,
+      "fingerprint": "b8758b2503bb419b499218177276b9bc9134ed01ee6b3830776f398e50b676ed",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Executor present in pending set but missing from observed map during acknowledge_cow_invalidation; internal invalidation state is corrupted."
+    },
+    {
+      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "function": "Stage1MmLease::cow_invalidation_observer",
+      "ordinal_in_function": 1,
+      "fingerprint": "92bec361fae983953fb95b9f8a268aae8969834402a7e6aa03a20d3aab7576b6",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage1_mm",
+      "rationale": "Executor missing from CowInvalidationState observed map in cow_invalidation_observer; executor was not properly admitted or observer state is corrupted."
+    },
+    {
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
       "function": "Stage1MmLease::foreign_stage1_identity",
       "ordinal_in_function": 1,
@@ -1257,12 +1392,12 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "function": "Stage1MmLease::cow_invalidation_observer",
+      "function": "Stage1MmLease::pending_cow_invalidation",
       "ordinal_in_function": 1,
-      "fingerprint": "92bec361fae983953fb95b9f8a268aae8969834402a7e6aa03a20d3aab7576b6",
+      "fingerprint": "ca18c917ec7dbdb1367e191e97ffe8223ef55b3d050e898bdf5a38794ff322d6",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::stage1_mm",
-      "rationale": "Executor missing from CowInvalidationState observed map in cow_invalidation_observer; executor was not properly admitted or observer state is corrupted."
+      "rationale": "Zero COW invalidation generation in pending_cow_invalidation with active pending executors; violates non-zero invalidation generation invariant."
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
@@ -1281,24 +1416,6 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::stage1_mm",
       "rationale": "Zero COW invalidation generation encountered after increment in publish_cow_invalidation; violates non-zero generation invariant."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "function": "Stage1MmLease::pending_cow_invalidation",
-      "ordinal_in_function": 1,
-      "fingerprint": "ca18c917ec7dbdb1367e191e97ffe8223ef55b3d050e898bdf5a38794ff322d6",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::stage1_mm",
-      "rationale": "Zero COW invalidation generation in pending_cow_invalidation with active pending executors; violates non-zero invalidation generation invariant."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "function": "Stage1MmLease::acknowledge_cow_invalidation",
-      "ordinal_in_function": 1,
-      "fingerprint": "b8758b2503bb419b499218177276b9bc9134ed01ee6b3830776f398e50b676ed",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::stage1_mm",
-      "rationale": "Executor present in pending set but missing from observed map during acknowledge_cow_invalidation; internal invalidation state is corrupted."
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
@@ -1328,601 +1445,13 @@
       "rationale": "Acknowledging COW invalidation failed after hardware invalidation completed in service_pending_cow_invalidation; leaves invalidation ticket in indeterminate state."
     },
     {
-      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "function": "PreparedStage1MmRetirement::pending",
+      "file": "crates/carrick-runtime/src/interactive_supervisor.rs",
+      "function": "<InteractiveSessionAdmission as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "b201f84d38f7d3658115a583fa22e540172f072597e1dbda8e0155c14f3afe8c",
+      "fingerprint": "e1bbb53d76f2380aa0c56e5c18b3673281b641bc05a1f85ee6df321ed5f0aef0",
       "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::stage1_retirement",
-      "rationale": "PreparedStage1MmRetirement missing residency state during pending query; indicates invalid retirement lifecycle transition."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "function": "PreparedStage1MmRetirement::requires_quarantine",
-      "ordinal_in_function": 1,
-      "fingerprint": "b201f84d38f7d3658115a583fa22e540172f072597e1dbda8e0155c14f3afe8c",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::stage1_retirement",
-      "rationale": "PreparedStage1MmRetirement missing residency state during requires_quarantine check; indicates invalid retirement lifecycle transition."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "function": "PreparedStage1MmRetirement::commit",
-      "ordinal_in_function": 1,
-      "fingerprint": "c9c4b64737d9c60569f6bced285768c30e230741b37ba0622a9c4d0b161c7ea7",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::stage1_retirement",
-      "rationale": "PreparedStage1MmRetirement missing residency state during commit; indicates double-commit or corrupted retirement state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "function": "PreparedStage1MmRetirement::commit",
-      "ordinal_in_function": 2,
-      "fingerprint": "edb97380c885be08e904bbc6179df16908c2a0289f42e4adca4972227f65de8f",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::stage1_retirement",
-      "rationale": "PreparedStage1MmRetirement missing ASID state during commit; indicates double-commit or corrupted ASID retirement state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "function": "PreparedStage1MmRetirement::commit",
-      "ordinal_in_function": 3,
-      "fingerprint": "7e5e1640631352f61645713dd49b284a14ef6e0154453d182b985aa0259171dc",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::stage1_retirement",
-      "rationale": "Stage-1 root retirement nonce overflow would reuse proof identity and permit an old backend retirement proof to authenticate a later root-slot generation."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "function": "Stage1MmBackend::bump_revision",
-      "ordinal_in_function": 1,
-      "fingerprint": "6365dd43e2ebf977a4119aa84df6032c482d55a2d49179487db0574e1cca4238",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::stage1_revision",
-      "rationale": "Stage1MmBackend revision atomic generation counter overflow would wrap revision identity and corrupt memory change detection."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
-      "function": "ReservationGate::subscribe",
-      "ordinal_in_function": 1,
-      "fingerprint": "f73a49b04580d45b49786e6fb8a634103bd3e9098d875584315354069227879e",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::reservation_gate",
-      "rationale": "Subscriber ID counter exhaustion during gate subscription is a local typed failure and should return an error or fallback instead of aborting.",
-      "typed_error": "KernelOperationError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
-      "function": "ReservationGate::subscribe",
-      "ordinal_in_function": 2,
-      "fingerprint": "c6e60af5f50a730ec6ac541c8aa4b8ba48d52966029b4412d98d51bc627a0ed5",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::reservation_gate",
-      "rationale": "ReservationGate allocated subscriber ID 0; violates non-zero subscriber token invariant."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
-      "function": "VforkParentWait::subscribe_release",
-      "ordinal_in_function": 1,
-      "fingerprint": "17acb3838006379f8748451d8fd59649d65ee05e28513ad35961a58b8fc62819",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::vfork_gate",
-      "rationale": "VforkParentWait subscriber ID exhaustion during release subscription should return a local typed error instead of aborting.",
-      "typed_error": "KernelOperationError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
-      "function": "RegistryState::publish_epoch",
-      "ordinal_in_function": 1,
-      "fingerprint": "9697fff91a11848169f148bfaa29b4407ac044821ca15e483a31a6c99a51039c",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::registry_epoch",
-      "rationale": "Kernel RegistryState epoch counter overflow would wrap epoch identity and corrupt process registry generation checks."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/frame_inventory.rs",
-      "function": "FrameInventoryAuthority::apply_with_receipt",
-      "ordinal_in_function": 1,
-      "fingerprint": "44c4ab9d911edf06306527da4be15ab3b2737b022ea17b1d360baa3c6552c324",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::frame_inventory",
-      "rationale": "MmId raw value evaluated to zero in FrameInventoryAuthority::apply_with_receipt; violates NonZeroU64 MM identity invariant during inventory commit."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/frame_inventory.rs",
-      "function": "FrameInventoryAuthority::apply_retirement_with_receipt",
-      "ordinal_in_function": 1,
-      "fingerprint": "44c4ab9d911edf06306527da4be15ab3b2737b022ea17b1d360baa3c6552c324",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::frame_inventory",
-      "rationale": "MmId raw value evaluated to zero in FrameInventoryAuthority::apply_retirement_with_receipt; violates NonZeroU64 MM identity invariant during retirement commit."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/guest_execution.rs",
-      "function": "<GuestExecutorParticipation as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "beb57309cd7079e70269fe4c89487a6af7bc1b128056b2a4b0e5c474d3a108a3",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::guest_executor_census",
-      "rationale": "An exact guest-executor participation identity disappeared before its unique RAII guard dropped; continuing would undercount an admitted executor and permit unsafe stage-1 mutation."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "next_file_slot_generation",
-      "ordinal_in_function": 1,
-      "fingerprint": "1501dfb0abc8790ccaf659b8822dd0670670789d12942885a17b7414a1a06e0e",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::file_slot_generation",
-      "rationale": "FileSlot generation atomic counter overflow or zero; wrapping slot generations would cause ABA aliasing across file slot lifecycle."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "<CrashSafePointParticipation as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "f022e996d54a77053ed52100ab989c1d05066cb11baf70d8fc5441b5595c941d",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::crash_safe_point_participation",
-      "rationale": "A stale crash-safe-point guard observed a different live successor generation for the same exact thread; clearing it would erase the successor, while continuing exposes overlapping executor ownership."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "ObjectRevision::publish",
-      "ordinal_in_function": 1,
-      "fingerprint": "28c0f523865ff66ef27aac9fa8e33466bc0235affc0e43365a8acea34cf7c90d",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::object_revision",
-      "rationale": "ObjectRevision atomic counter overflow would wrap revision numbers and corrupt kernel object change observation."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "Mm::replace_io_uring_mappings",
-      "ordinal_in_function": 1,
-      "fingerprint": "651e097c56996b551089d33d59bd371df08b2fc64f7a7e4e1212f37584d169ac",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::mm_io_uring",
-      "rationale": "Checked addition overflow occurs after production callers already committed backend map/unmap and dispatcher metadata, causing memory attachment authority to diverge."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "Mm::copy_io_uring_mappings_for_host_fork",
-      "ordinal_in_function": 1,
-      "fingerprint": "1b83a8168aa5f883d3189349f02c00d7b32993855aace09f2036cc91b929cbb8",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::mm_io_uring",
-      "rationale": "Non-empty target Mm during host fork copy can reject the not-yet-published child MM through its existing outer Result instead of aborting.",
-      "typed_error": "KernelOperationError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "DescriptionCommon::release_fd_ref",
-      "ordinal_in_function": 1,
-      "fingerprint": "02cbe478c2568a9be531c3f4f6fb7117855d6310b7eddd861cbb82a57e286ec7",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::file_description_refs",
-      "rationale": "Logical fd reference count underflow on DescriptionCommon; indicates double-release or corrupted epoll interest tracking."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "<FileTableFunctionalLease as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "84f8e7339c83740c82bd3b2802fd1b18a64fa0838ee5483a4f963486c7ec06b7",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::file_table_gate",
-      "rationale": "FileTable active functional lease count underflow during lease drop; indicates double-release or corrupted gate synchronization."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "<FileTableMutationLease as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "3da6ee466306ab10673367ef52e6c412d558d59c38b7aa556367d7bc24f1481f",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::file_table_gate",
-      "rationale": "FileTable active mutation lease count underflow during lease drop; indicates double-release or corrupted gate synchronization."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "FileTable::mutation_lease",
-      "ordinal_in_function": 1,
-      "fingerprint": "21f4fa35faade52a8c778eed4a20173d72d9601da29b9e326fcc8039cc056405",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::file_table_gate",
-      "rationale": "Acquiring a mutation lease on a draining FileTable should return KernelOperationError::FileTableDraining instead of aborting.",
-      "typed_error": "KernelOperationError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "PendingQueue::enqueue_standard",
-      "ordinal_in_function": 1,
-      "fingerprint": "15664d4f30a60f0453d453652adc0a8f70e9d194d030d17c18430e8f1dc9c5bd",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::pending_signals",
-      "rationale": "Standard signal queue class routing mismatch is local typed validation and should return an error instead of aborting.",
-      "typed_error": "KernelOperationError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "PendingQueue::enqueue_realtime",
-      "ordinal_in_function": 1,
-      "fingerprint": "be32783f76807d237e9b6dece2e099f858829e6a14b904c3edde463ad45a83c9",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::pending_signals",
-      "rationale": "Realtime signal queue class routing mismatch is local typed validation and should return an error instead of aborting.",
-      "typed_error": "KernelOperationError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "PendingQueue::entries",
-      "ordinal_in_function": 1,
-      "fingerprint": "93ea6865074acd7f4a00e428346a26acecd6916d39b2416935616df5dda62be3",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::pending_signals",
-      "rationale": "Present bitset contains invalid signal number in PendingQueue::entries; indicates corrupted pending signal mask."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "advance_job_control_stop_invalidation_generation",
-      "ordinal_in_function": 1,
-      "fingerprint": "a86a3a799c391ab28991415303b695a9925c211665c49b913ca39faa5e0e0008",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::job_control",
-      "rationale": "Task job-control stop invalidation generation counter overflow would wrap generation identity and misroute stop invalidations."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "advance_ptrace_stop_generation",
-      "ordinal_in_function": 1,
-      "fingerprint": "1eb2aa0347d1d244ca615e62d64915fa431b8f4660cc6517687a5a449a8f6f77",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::ptrace_stop_authority",
-      "rationale": "Ptrace stop generation overflow would wrap an exact stopped-task capability and permit a stale memory-access witness to authenticate a later stop."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "Task::publish_wake",
-      "ordinal_in_function": 1,
-      "fingerprint": "8b44ac2d863e3ab1f46cc76583787e515d3ec40608d8a4a2a2e0323160a6377e",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::task_wake",
-      "rationale": "Task wake generation counter overflow is explicitly a notification hint and should use fallback synchronization instead of aborting.",
-      "typed_error": "KernelOperationError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "Task::subscribe_wake",
-      "ordinal_in_function": 1,
-      "fingerprint": "13a320c2ebafe2001b56ef449de752a3e0811594bfce7d1880f4276aaa21efb9",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::task_wake",
-      "rationale": "Task wake listener token exhaustion is a local subscription failure and should return an error or fallback instead of aborting.",
-      "typed_error": "KernelOperationError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "Thread::fail_unsettled_execution_lease",
-      "ordinal_in_function": 1,
-      "fingerprint": "c0820b85396918e055223aca00ddb252719cd0677020ba56d118895c863fed35",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::execution_lease",
-      "rationale": "Execution generation counter overflow in fail_unsettled_execution_lease should return ThreadExecutionError::GenerationExhausted instead of aborting.",
-      "typed_error": "ThreadExecutionError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "Thread::invalidate_execution_for_exec",
-      "ordinal_in_function": 1,
-      "fingerprint": "1f2ee91e24410fce6490463713fb70e2b3ca6de147972ff0a75090836f6a1d38",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::execution_lease",
-      "rationale": "Execution generation counter overflow in invalidate_execution_for_exec should return ThreadExecutionError::GenerationExhausted instead of aborting.",
-      "typed_error": "ThreadExecutionError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "function": "Kernel::update_fs_umask",
-      "ordinal_in_function": 1,
-      "fingerprint": "419803a4f3bf734e31b7698a2a720b4ee5ad6813a222aa9799c14c8a20a1ec6e",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::fs_context_publication",
-      "rationale": "Caller thread publication record missing after sibling thread resources were already replaced in update_fs_umask; leaves shared FsContext state partially published."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueueInner::poke_control",
-      "ordinal_in_function": 1,
-      "fingerprint": "bc30194f957ed20cca071e41440481a18a88b188c2e1ad42bc40613847405c6a",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::scheduler_control",
-      "rationale": "RunQueue control_epoch counter overflow would wrap epoch identity and corrupt scheduler executor control observation."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueueInner::release_wake_admission",
-      "ordinal_in_function": 1,
-      "fingerprint": "8831c5dcc94fc22b75ef53bbbc966fe3b7717d993b523da635092a8010562182",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::run_queue_admissions",
-      "rationale": "RunQueue wake admission count underflow during release; indicates double-release or corrupted wake admission accounting."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueueInner::finish_claim",
-      "ordinal_in_function": 1,
-      "fingerprint": "77ed5035f1ed23a52724d73a8b49b4b608de7d15ec42aaf6cef0551ad27becc0",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::run_queue",
-      "rationale": "RunQueue claimed count underflow in finish_claim; indicates double-finish or corrupted run queue claim accounting."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueueInner::release_authority",
-      "ordinal_in_function": 1,
-      "fingerprint": "1bf358d7e3562cabd6fc2231f48f515f528496d079f63b1ba08db25a12d52872",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::run_queue",
-      "rationale": "RunQueue active_authorities count underflow in release_authority; indicates double-release or corrupted queue authority accounting."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueue::take_row",
-      "ordinal_in_function": 1,
-      "fingerprint": "21eefb4c9cb561a6592521f9eb936823c92e1735d46f61f4fb7b5fdf8591af79",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::run_queue",
-      "rationale": "RunQueue claimed count overflow in take_row; corrupts run queue claim accounting."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueue::take_row",
-      "ordinal_in_function": 2,
-      "fingerprint": "21eefb4c9cb561a6592521f9eb936823c92e1735d46f61f4fb7b5fdf8591af79",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::run_queue",
-      "rationale": "RunQueue closed_waiter_observations count overflow in take_row; corrupts queue close draining synchronization."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueue::take_row",
-      "ordinal_in_function": 3,
-      "fingerprint": "21eefb4c9cb561a6592521f9eb936823c92e1735d46f61f4fb7b5fdf8591af79",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::run_queue",
-      "rationale": "RunQueue waiters count overflow in take_row; corrupts waiter tracking."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueue::take_row",
-      "ordinal_in_function": 4,
-      "fingerprint": "21eefb4c9cb561a6592521f9eb936823c92e1735d46f61f4fb7b5fdf8591af79",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::run_queue",
-      "rationale": "RunQueue waiters count underflow in take_row; indicates corrupted waiter accounting."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueue::close",
-      "ordinal_in_function": 1,
-      "fingerprint": "debdb13731eac0a5c34c28ed6e15b8d7e5231b580f6e2ef9dc01208413cc3da1",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::run_queue",
-      "rationale": "RunQueue close_epoch counter overflow in close; wrapping epoch numbers corrupts queue close synchronization."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunQueue::retire_executor",
-      "ordinal_in_function": 1,
-      "fingerprint": "62ccb2c4d297a75d0109928a1f65d93c878a4fabee1ca64882b90518b84b03a4",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::run_queue",
-      "rationale": "RunQueue closed_waiter_observations count overflow in retire_executor; corrupts queue close draining synchronization."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunnableThread::lease",
-      "ordinal_in_function": 1,
-      "fingerprint": "6521e03152db70672cef570a46f752289f503a3bbdd1eda55f3ab92f96343e74",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::runnable_thread",
-      "rationale": "Execution lease missing on RunnableThread during lease access; indicates taken lease or invalid thread execution authority."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "RunnableThread::take_lease",
-      "ordinal_in_function": 1,
-      "fingerprint": "2ae01cee8b3e23b20f61c2850dca9d5328c4bc7f9dc8acf89f2ffc899d5cb4c0",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::runnable_thread",
-      "rationale": "Execution lease missing on RunnableThread during take_lease; indicates double-take or corrupted execution lease ownership."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "Scheduler::observe_generation_transition",
-      "ordinal_in_function": 1,
-      "fingerprint": "0b6f9522566c460dffe3c5bb1743421c6dfad33386b5d4ba80f4ea87a7f312e4",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::scheduler_observer",
-      "rationale": "Scheduler generation observer failed transition after kernel execution state advanced; stranding successor outside authority directory."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "Scheduler::retarget_running_exec",
-      "ordinal_in_function": 1,
-      "fingerprint": "8ebcb1633985aa7ebee6e023c4291cce633bd35af274515a6ab16f88c7460e92",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::scheduler_exec_retarget",
-      "rationale": "Exec publication closure invoked multiple times in Scheduler::retarget_running_exec; violates single-publication guarantee."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "Scheduler::retarget_running_exec",
-      "ordinal_in_function": 2,
-      "fingerprint": "9c7139a75cd212ae7550a0a6b16a0b70f7c3269bc317f05455bf514fa1b48ec6",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::scheduler_exec_retarget",
-      "rationale": "Executor rebind failed after exec replacement was published; continuing without matching kick token would split worker execution authority."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "Scheduler::retarget_running_exec",
-      "ordinal_in_function": 3,
-      "fingerprint": "bca54cc6426ed711b398891a2bf811cc753aac7a975cdfbe4ad4b8c2ed311643",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::scheduler_exec_retarget",
-      "rationale": "Publication result missing following successful executor rebind in retarget_running_exec; exec publication state is inconsistent."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
-      "function": "Scheduler::settle_failed",
-      "ordinal_in_function": 1,
-      "fingerprint": "5185ef63d40272bdda4613c1411b2afa3e5ff96eb7d072529558442ac95e1cfc",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::thread_settlement",
-      "rationale": "Execution generation missing from Thread execution state after transitioning to Failed in settle_failed."
-    },
-    {
-      "file": "crates/carrick-runtime/src/run_state.rs",
-      "function": "clear_guest_process",
-      "ordinal_in_function": 1,
-      "fingerprint": "e275498926345c3b0f99624fc6d6594689b7fa030389e520a9d2ea52364b9c98",
-      "verdict": "typed_error_debt",
-      "failure_domain": "run_state::process_section",
-      "rationale": "Process record transition timeout in clear_guest_process indicates temporary lock contention that should be retryable or returned as ArenaError::Busy instead of aborting.",
-      "typed_error": "ArenaError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/run_state.rs",
-      "function": "abort_on_arena_error",
-      "ordinal_in_function": 1,
-      "fingerprint": "453c27246c5a8f4a60ea0d015bc746e9568734385ffa22ffdfcb5708c5c187d3",
-      "verdict": "typed_error_debt",
-      "failure_domain": "run_state::kernel_arena",
-      "rationale": "Kernel arena errors like ArenaError::Exhausted explicitly translate to Linux errno and should be returned as typed errors instead of aborting.",
-      "typed_error": "ArenaError"
-    },
-    {
-      "file": "crates/carrick-runtime/src/runtime.rs",
-      "function": "run_combined_syscall_loop_with_dispatcher",
-      "ordinal_in_function": 1,
-      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
-      "verdict": "carrier_fault",
-      "failure_domain": "runtime::host_alias_mapping",
-      "rationale": "runtime.map_host_alias backend failure during alias installation; leaves hardware page tables and stage-2 mappings in an unrecoverable split state."
-    },
-    {
-      "file": "crates/carrick-runtime/src/runtime.rs",
-      "function": "run_combined_syscall_loop_with_dispatcher",
-      "ordinal_in_function": 2,
-      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
-      "verdict": "carrier_fault",
-      "failure_domain": "runtime::host_alias_mapping",
-      "rationale": "Host alias mapping length overflowed usize after backend mapping was installed; cannot apply memory protection to live mapping."
-    },
-    {
-      "file": "crates/carrick-runtime/src/runtime.rs",
-      "function": "run_combined_syscall_loop_with_dispatcher",
-      "ordinal_in_function": 3,
-      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
-      "verdict": "carrier_fault",
-      "failure_domain": "runtime::host_alias_mapping",
-      "rationale": "runtime.protect_range failed to apply PROT_NONE to installed host alias mapping; continuing would leave inaccessible memory readable."
-    },
-    {
-      "file": "crates/carrick-runtime/src/runtime.rs",
-      "function": "run_combined_syscall_loop_with_dispatcher",
-      "ordinal_in_function": 4,
-      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
-      "verdict": "carrier_fault",
-      "failure_domain": "runtime::host_alias_mapping",
-      "rationale": "Host alias bus fault length overflowed usize after backend mapping was installed; cannot apply bus-fault guard protection."
-    },
-    {
-      "file": "crates/carrick-runtime/src/runtime.rs",
-      "function": "run_combined_syscall_loop_with_dispatcher",
-      "ordinal_in_function": 5,
-      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
-      "verdict": "carrier_fault",
-      "failure_domain": "runtime::host_alias_mapping",
-      "rationale": "runtime.protect_range failed to apply guard protection to bus fault range of host alias mapping; leaves invalid file region accessible."
-    },
-    {
-      "file": "crates/carrick-runtime/src/runtime.rs",
-      "function": "run_combined_syscall_loop_with_dispatcher",
-      "ordinal_in_function": 6,
-      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
-      "verdict": "carrier_fault",
-      "failure_domain": "runtime::host_alias_mapping",
-      "rationale": "dispatcher.commit_host_alias_install failed after backend host mapping was installed; leaves uncommitted alias mapping in guest address space."
-    },
-    {
-      "file": "crates/carrick-runtime/src/threaded_loop.rs",
-      "function": "prepare_initial_frame_inventory",
-      "ordinal_in_function": 1,
-      "fingerprint": "bec45a7e313f5fba812c28e1fc63954a2fcd51c88fa05810dee1c0b3186f034b",
-      "verdict": "carrier_fault",
-      "failure_domain": "threaded_loop::initial_frame_inventory",
-      "rationale": "Initial boot frame inventory publication failed after hypervisor mappings were already established in HVF; leaves hypervisor and kernel graph state diverging."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "function": "MountRetirement::clear",
-      "ordinal_in_function": 1,
-      "fingerprint": "d0b524ccb1694f46852a77c809976706339b2ce8f16c1ecad14f780be5656529",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mount_retirement",
-      "rationale": "Mount destruction was requested without first proving sole ownership; continuing could publish a retired container while live dispatchers still use its mount table."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "function": "MountRetirement::clear",
-      "ordinal_in_function": 2,
-      "fingerprint": "464f92a45a1a126ab184e1b81b432d922e8da1c9683fd3bf7013f1219c699bbe",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mount_retirement",
-      "rationale": "A prepared mount-retirement token lost its exact table before destruction; continuing would fabricate cleanup accounting for a table that was already removed."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "function": "MountRetirement::clear",
-      "ordinal_in_function": 3,
-      "fingerprint": "8392fef40138b7ff4387400aa13b18683696617d7d8378927fcf7a8c916353f2",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mount_retirement",
-      "rationale": "A new mount-table owner appeared after sole ownership was proven; continuing could destroy storage still reachable by another container executor."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "DispatchMmBinding::rebind_prepared_root",
-      "ordinal_in_function": 1,
-      "fingerprint": "c6abce235563aa121422a0a460e71035ff4ec9ceed5de177ad11f671bf5105eb",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::mm_binding",
-      "rationale": "A newly prepared carrier root already had an exec MM staged while its bootstrap MM identity was being rebound; continuing would mix two MM generations in one dispatcher."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "function": "ns_visible_sender_pid",
-      "ordinal_in_function": 1,
-      "fingerprint": "e439d9187eda293b1be3c31f26c0980092218a9d5abede24df8c2341d3a1879f",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::signal_identity",
-      "rationale": "A live signal sender lacked an i32 namespace-visible PID; continuing would attribute a signal to no valid Linux process or to a different container identity."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "function": "PreparedRootInitialization::process",
-      "ordinal_in_function": 1,
-      "fingerprint": "c50e8d08ba546e6a456544396cbbbddb173faf4e5358f403ea11fc70b31d5e22",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::root_initialization",
-      "rationale": "The prepared first-root transaction lost its process context before activation; continuing could commit inventory and lifecycle state without the root that owns them."
-    },
-    {
-      "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "function": "ProcessContext::wait_result",
-      "ordinal_in_function": 1,
-      "fingerprint": "12ec014e0bcdf5297e0536b76b956abb36b8bab9ea992c2415f4f820df26a4b1",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::wait_identity",
-      "rationale": "An exited child carried a namespace PID outside the Linux wait ABI range; continuing would return a status for an unrepresentable or aliased child identity."
+      "failure_domain": "interactive::session_ownership",
+      "rationale": "An interactive admission token released a singleton gate that was no longer held; continuing would hide double release and make terminal ownership unauthenticated."
     },
     {
       "file": "crates/carrick-runtime/src/interactive_supervisor.rs",
@@ -1934,15 +1463,6 @@
       "rationale": "Interactive setup completed without the admission token that owns process stdio and SIGWINCH routing; continuing could let two containers overwrite the same host facilities."
     },
     {
-      "file": "crates/carrick-runtime/src/interactive_supervisor.rs",
-      "function": "<InteractiveSessionAdmission as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "e1bbb53d76f2380aa0c56e5c18b3673281b641bc05a1f85ee6df321ed5f0aef0",
-      "verdict": "carrier_fault",
-      "failure_domain": "interactive::session_ownership",
-      "rationale": "An interactive admission token released a singleton gate that was no longer held; continuing would hide double release and make terminal ownership unauthenticated."
-    },
-    {
       "file": "crates/carrick-runtime/src/kernel/core.rs",
       "function": "DebugAuxProviderRegistry::reserve_id",
       "ordinal_in_function": 1,
@@ -1950,24 +1470,6 @@
       "verdict": "carrier_fault",
       "failure_domain": "kernel::debug_provider_identity",
       "rationale": "The carrier-wide debug provider generation exhausted u64; wrapping would let a stale auxiliary provider authenticate as a new one."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
-      "function": "PreparedContainerRoot::commit",
-      "ordinal_in_function": 1,
-      "fingerprint": "73003166eb59270c3719c950b8cd42a0d7a0e4b188d2f39264e37f2ae9f77fd4",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::container_root_publication",
-      "rationale": "A root without a PID namespace had an internal task identity outside the Linux namespace-ID domain; publishing it would create an unaddressable container init."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
-      "function": "PreparedContainerRoot::commit",
-      "ordinal_in_function": 2,
-      "fingerprint": "68c5b9e42e448e12973fe50731cfb950da9aac9dc2fd1e0f005338501c32f83d",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::container_root_publication",
-      "rationale": "Rollback after PID-root publication failure could not remove every exact staged graph edge; continuing would leave a partially published container root."
     },
     {
       "file": "crates/carrick-runtime/src/kernel/core.rs",
@@ -2034,21 +1536,39 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "PreparedContainerRoot::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "73003166eb59270c3719c950b8cd42a0d7a0e4b188d2f39264e37f2ae9f77fd4",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_root_publication",
+      "rationale": "A root without a PID namespace had an internal task identity outside the Linux namespace-ID domain; publishing it would create an unaddressable container init."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "PreparedContainerRoot::commit",
+      "ordinal_in_function": 2,
+      "fingerprint": "68c5b9e42e448e12973fe50731cfb950da9aac9dc2fd1e0f005338501c32f83d",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::container_root_publication",
+      "rationale": "Rollback after PID-root publication failure could not remove every exact staged graph edge; continuing would leave a partially published container root."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "RegistryState::publish_epoch",
+      "ordinal_in_function": 1,
+      "fingerprint": "9697fff91a11848169f148bfaa29b4407ac044821ca15e483a31a6c99a51039c",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::registry_epoch",
+      "rationale": "Kernel RegistryState epoch counter overflow would wrap epoch identity and corrupt process registry generation checks."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
       "function": "RegistryState::publish_process_group",
       "ordinal_in_function": 1,
       "fingerprint": "1657b188134cb1e64db3171b5a6bf02e0bc1b473ca177340bf5676967d401ed6",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::process_group_index",
       "rationale": "Process-group publication collided in either the internal or container namespace index; continuing would make the two authoritative identity maps disagree."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
-      "function": "RegistryState::remove_process_group",
-      "ordinal_in_function": 1,
-      "fingerprint": "c4a5db7588f7b23897bbdd56e3af71da937366ec4316c0911d4cf41fd41102c1",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::process_group_index",
-      "rationale": "Removing an internal process-group record did not remove the matching container namespace index edge; continuing would leave a stale group alias."
     },
     {
       "file": "crates/carrick-runtime/src/kernel/core.rs",
@@ -2061,12 +1581,180 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "RegistryState::remove_process_group",
+      "ordinal_in_function": 1,
+      "fingerprint": "c4a5db7588f7b23897bbdd56e3af71da937366ec4316c0911d4cf41fd41102c1",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::process_group_index",
+      "rationale": "Removing an internal process-group record did not remove the matching container namespace index edge; continuing would leave a stale group alias."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
       "function": "RegistryState::remove_session",
       "ordinal_in_function": 1,
       "fingerprint": "b995289c6ea4edef9a3cad760be3610d3e3939e0708465570a927492b1a76bdb",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::session_index",
       "rationale": "Removing an internal session record did not remove the matching container namespace index edge; continuing would leave a stale session alias."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "ReservationGate::subscribe",
+      "ordinal_in_function": 1,
+      "fingerprint": "f73a49b04580d45b49786e6fb8a634103bd3e9098d875584315354069227879e",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::reservation_gate",
+      "rationale": "Subscriber ID counter exhaustion during gate subscription is a local typed failure and should return an error or fallback instead of aborting.",
+      "typed_error": "KernelOperationError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "ReservationGate::subscribe",
+      "ordinal_in_function": 2,
+      "fingerprint": "c6e60af5f50a730ec6ac541c8aa4b8ba48d52966029b4412d98d51bc627a0ed5",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::reservation_gate",
+      "rationale": "ReservationGate allocated subscriber ID 0; violates non-zero subscriber token invariant."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/core.rs",
+      "function": "VforkParentWait::subscribe_release",
+      "ordinal_in_function": 1,
+      "fingerprint": "17acb3838006379f8748451d8fd59649d65ee05e28513ad35961a58b8fc62819",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::vfork_gate",
+      "rationale": "VforkParentWait subscriber ID exhaustion during release subscription should return a local typed error instead of aborting.",
+      "typed_error": "KernelOperationError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/frame_inventory.rs",
+      "function": "FrameInventoryAuthority::apply_retirement_with_receipt",
+      "ordinal_in_function": 1,
+      "fingerprint": "44c4ab9d911edf06306527da4be15ab3b2737b022ea17b1d360baa3c6552c324",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::frame_inventory",
+      "rationale": "MmId raw value evaluated to zero in FrameInventoryAuthority::apply_retirement_with_receipt; violates NonZeroU64 MM identity invariant during retirement commit."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/frame_inventory.rs",
+      "function": "FrameInventoryAuthority::apply_with_receipt",
+      "ordinal_in_function": 1,
+      "fingerprint": "44c4ab9d911edf06306527da4be15ab3b2737b022ea17b1d360baa3c6552c324",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::frame_inventory",
+      "rationale": "MmId raw value evaluated to zero in FrameInventoryAuthority::apply_with_receipt; violates NonZeroU64 MM identity invariant during inventory commit."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/guest_execution.rs",
+      "function": "<GuestExecutorParticipation as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "beb57309cd7079e70269fe4c89487a6af7bc1b128056b2a4b0e5c474d3a108a3",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::guest_executor_census",
+      "rationale": "An exact guest-executor participation identity disappeared before its unique RAII guard dropped; continuing would undercount an admitted executor and permit unsafe stage-1 mutation."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "<CrashSafePointParticipation as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "f022e996d54a77053ed52100ab989c1d05066cb11baf70d8fc5441b5595c941d",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::crash_safe_point_participation",
+      "rationale": "A stale crash-safe-point guard observed a different live successor generation for the same exact thread; clearing it would erase the successor, while continuing exposes overlapping executor ownership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "<FileTableFunctionalLease as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "84f8e7339c83740c82bd3b2802fd1b18a64fa0838ee5483a4f963486c7ec06b7",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_table_gate",
+      "rationale": "FileTable active functional lease count underflow during lease drop; indicates double-release or corrupted gate synchronization."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "<FileTableMutationLease as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "3da6ee466306ab10673367ef52e6c412d558d59c38b7aa556367d7bc24f1481f",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_table_gate",
+      "rationale": "FileTable active mutation lease count underflow during lease drop; indicates double-release or corrupted gate synchronization."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "DescriptionCommon::release_fd_ref",
+      "ordinal_in_function": 1,
+      "fingerprint": "02cbe478c2568a9be531c3f4f6fb7117855d6310b7eddd861cbb82a57e286ec7",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_description_refs",
+      "rationale": "Logical fd reference count underflow on DescriptionCommon; indicates double-release or corrupted epoll interest tracking."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "FileTable::mutation_lease",
+      "ordinal_in_function": 1,
+      "fingerprint": "21f4fa35faade52a8c778eed4a20173d72d9601da29b9e326fcc8039cc056405",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::file_table_gate",
+      "rationale": "Acquiring a mutation lease on a draining FileTable should return KernelOperationError::FileTableDraining instead of aborting.",
+      "typed_error": "KernelOperationError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "Mm::copy_io_uring_mappings_for_host_fork",
+      "ordinal_in_function": 1,
+      "fingerprint": "1b83a8168aa5f883d3189349f02c00d7b32993855aace09f2036cc91b929cbb8",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::mm_io_uring",
+      "rationale": "Non-empty target Mm during host fork copy can reject the not-yet-published child MM through its existing outer Result instead of aborting.",
+      "typed_error": "KernelOperationError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "Mm::replace_io_uring_mappings",
+      "ordinal_in_function": 1,
+      "fingerprint": "651e097c56996b551089d33d59bd371df08b2fc64f7a7e4e1212f37584d169ac",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_io_uring",
+      "rationale": "Checked addition overflow occurs after production callers already committed backend map/unmap and dispatcher metadata, causing memory attachment authority to diverge."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "ObjectRevision::publish",
+      "ordinal_in_function": 1,
+      "fingerprint": "28c0f523865ff66ef27aac9fa8e33466bc0235affc0e43365a8acea34cf7c90d",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::object_revision",
+      "rationale": "ObjectRevision atomic counter overflow would wrap revision numbers and corrupt kernel object change observation."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "PendingQueue::enqueue_realtime",
+      "ordinal_in_function": 1,
+      "fingerprint": "be32783f76807d237e9b6dece2e099f858829e6a14b904c3edde463ad45a83c9",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::pending_signals",
+      "rationale": "Realtime signal queue class routing mismatch is local typed validation and should return an error instead of aborting.",
+      "typed_error": "KernelOperationError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "PendingQueue::enqueue_standard",
+      "ordinal_in_function": 1,
+      "fingerprint": "15664d4f30a60f0453d453652adc0a8f70e9d194d030d17c18430e8f1dc9c5bd",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::pending_signals",
+      "rationale": "Standard signal queue class routing mismatch is local typed validation and should return an error instead of aborting.",
+      "typed_error": "KernelOperationError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "PendingQueue::entries",
+      "ordinal_in_function": 1,
+      "fingerprint": "93ea6865074acd7f4a00e428346a26acecd6916d39b2416935616df5dda62be3",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::pending_signals",
+      "rationale": "Present bitset contains invalid signal number in PendingQueue::entries; indicates corrupted pending signal mask."
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
@@ -2076,6 +1764,46 @@
       "verdict": "carrier_fault",
       "failure_domain": "kernel::process_group_generation",
       "rationale": "The monotone process-group object generation exhausted u64; wrapping would let stale group authority authenticate as a new object."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "Task::publish_wake",
+      "ordinal_in_function": 1,
+      "fingerprint": "8b44ac2d863e3ab1f46cc76583787e515d3ec40608d8a4a2a2e0323160a6377e",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::task_wake",
+      "rationale": "Task wake generation counter overflow is explicitly a notification hint and should use fallback synchronization instead of aborting.",
+      "typed_error": "KernelOperationError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "Task::subscribe_wake",
+      "ordinal_in_function": 1,
+      "fingerprint": "13a320c2ebafe2001b56ef449de752a3e0811594bfce7d1880f4276aaa21efb9",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::task_wake",
+      "rationale": "Task wake listener token exhaustion is a local subscription failure and should return an error or fallback instead of aborting.",
+      "typed_error": "KernelOperationError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "Thread::fail_unsettled_execution_lease",
+      "ordinal_in_function": 1,
+      "fingerprint": "c0820b85396918e055223aca00ddb252719cd0677020ba56d118895c863fed35",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::execution_lease",
+      "rationale": "Execution generation counter overflow in fail_unsettled_execution_lease should return ThreadExecutionError::GenerationExhausted instead of aborting.",
+      "typed_error": "ThreadExecutionError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "Thread::invalidate_execution_for_exec",
+      "ordinal_in_function": 1,
+      "fingerprint": "1f2ee91e24410fce6490463713fb70e2b3ca6de147972ff0a75090836f6a1d38",
+      "verdict": "typed_error_debt",
+      "failure_domain": "kernel::execution_lease",
+      "rationale": "Execution generation counter overflow in invalidate_execution_for_exec should return ThreadExecutionError::GenerationExhausted instead of aborting.",
+      "typed_error": "ThreadExecutionError"
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
@@ -2096,58 +1824,31 @@
       "rationale": "A live namespace member disappeared before its zombie captured the visible PID; continuing would make wait and signal identity disagree."
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "function": "PreparedThreadClone::commit",
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "advance_job_control_stop_invalidation_generation",
       "ordinal_in_function": 1,
-      "fingerprint": "5f3afa81b717fb948923a836a274f61640cf7586e09cf055a8c9800db1abde12",
+      "fingerprint": "a86a3a799c391ab28991415303b695a9925c211665c49b913ca39faa5e0e0008",
       "verdict": "carrier_fault",
-      "failure_domain": "kernel::thread_publication",
-      "rationale": "Thread publication failed after its namespace membership committed; returning an ordinary error would leave a ghost TID without a task-thread edge."
+      "failure_domain": "kernel::job_control",
+      "rationale": "Task job-control stop invalidation generation counter overflow would wrap generation identity and misroute stop invalidations."
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "function": "Kernel::initialize_launch_controlling_tty",
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "advance_ptrace_stop_generation",
       "ordinal_in_function": 1,
-      "fingerprint": "becaf649b27fd3005928cdc85a13f3c51254835b079a391e79a437ec0692d1ae",
+      "fingerprint": "1eb2aa0347d1d244ca615e62d64915fa431b8f4660cc6517687a5a449a8f6f77",
       "verdict": "carrier_fault",
-      "failure_domain": "kernel::tty_identity",
-      "rationale": "A live root task's session was absent or belonged to another container during terminal-route activation; continuing could route signals across containers."
+      "failure_domain": "kernel::ptrace_stop_authority",
+      "rationale": "Ptrace stop generation overflow would wrap an exact stopped-task capability and permit a stale memory-access witness to authenticate a later stop."
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "function": "Kernel::initialize_launch_controlling_tty",
-      "ordinal_in_function": 2,
-      "fingerprint": "87b325d3016453c4e2fe22e6271e5885e2735a1012a388c57fcd306a34855784",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::tty_identity",
-      "rationale": "A live root task's process group was absent or belonged to another container during terminal-route activation; continuing could route signals across containers."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "function": "Kernel::exit_thread",
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "next_file_slot_generation",
       "ordinal_in_function": 1,
-      "fingerprint": "e5b06e0d0356de449a56cbdf38d7f62212a0df8fb585b4c1ff91fde9560be59b",
+      "fingerprint": "1501dfb0abc8790ccaf659b8822dd0670670789d12942885a17b7414a1a06e0e",
       "verdict": "carrier_fault",
-      "failure_domain": "kernel::thread_retirement",
-      "rationale": "A published secondary thread identity exceeded the namespace member domain during exact retirement; continuing would leak that TID membership."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "function": "Kernel::exit_thread",
-      "ordinal_in_function": 2,
-      "fingerprint": "e5b06e0d0356de449a56cbdf38d7f62212a0df8fb585b4c1ff91fde9560be59b",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::thread_retirement",
-      "rationale": "The PID namespace refused to remove the exact secondary thread already retired from the task graph; continuing would leave a stale TID alias."
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "function": "Kernel::set_process_group",
-      "ordinal_in_function": 1,
-      "fingerprint": "02fed4406864ec4afb2550e559f71439596d24a379488ad95de7ecae91ed1f1a",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::process_group_identity",
-      "rationale": "The new-group branch lost the namespace identity it had already proven while holding the registry lock; continuing would publish an unnamed process group."
+      "failure_domain": "kernel::file_slot_generation",
+      "rationale": "FileSlot generation atomic counter overflow or zero; wrapping slot generations would cause ABA aliasing across file slot lifecycle."
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
@@ -2169,6 +1870,60 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::exit_thread",
+      "ordinal_in_function": 1,
+      "fingerprint": "e5b06e0d0356de449a56cbdf38d7f62212a0df8fb585b4c1ff91fde9560be59b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::thread_retirement",
+      "rationale": "A published secondary thread identity exceeded the namespace member domain during exact retirement; continuing would leak that TID membership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::exit_thread",
+      "ordinal_in_function": 2,
+      "fingerprint": "e5b06e0d0356de449a56cbdf38d7f62212a0df8fb585b4c1ff91fde9560be59b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::thread_retirement",
+      "rationale": "The PID namespace refused to remove the exact secondary thread already retired from the task graph; continuing would leave a stale TID alias."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::initialize_launch_controlling_tty",
+      "ordinal_in_function": 1,
+      "fingerprint": "becaf649b27fd3005928cdc85a13f3c51254835b079a391e79a437ec0692d1ae",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::tty_identity",
+      "rationale": "A live root task's session was absent or belonged to another container during terminal-route activation; continuing could route signals across containers."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::initialize_launch_controlling_tty",
+      "ordinal_in_function": 2,
+      "fingerprint": "87b325d3016453c4e2fe22e6271e5885e2735a1012a388c57fcd306a34855784",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::tty_identity",
+      "rationale": "A live root task's process group was absent or belonged to another container during terminal-route activation; continuing could route signals across containers."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::set_process_group",
+      "ordinal_in_function": 1,
+      "fingerprint": "02fed4406864ec4afb2550e559f71439596d24a379488ad95de7ecae91ed1f1a",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::process_group_identity",
+      "rationale": "The new-group branch lost the namespace identity it had already proven while holding the registry lock; continuing would publish an unnamed process group."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "Kernel::update_fs_umask",
+      "ordinal_in_function": 1,
+      "fingerprint": "419803a4f3bf734e31b7698a2a720b4ee5ad6813a222aa9799c14c8a20a1ec6e",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::fs_context_publication",
+      "rationale": "Caller thread publication record missing after sibling thread resources were already replaced in update_fs_umask; leaves shared FsContext state partially published."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
       "function": "Kernel::wait_child_matching",
       "ordinal_in_function": 1,
       "fingerprint": "dc192e2b30821f268c32654d42e1757fb3f8f374752fcae2b1ce849864e00040",
@@ -2184,6 +1939,213 @@
       "verdict": "carrier_fault",
       "failure_domain": "kernel::child_reaping",
       "rationale": "The PID namespace refused to remove the exact child just consumed by wait; continuing would permit stale PID reuse or double reaping."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "function": "PreparedThreadClone::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "5f3afa81b717fb948923a836a274f61640cf7586e09cf055a8c9800db1abde12",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::thread_publication",
+      "rationale": "Thread publication failed after its namespace membership committed; returning an ordinary error would leave a ghost TID without a task-thread edge."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "IdleAnnouncement<'a>::release",
+      "ordinal_in_function": 1,
+      "fingerprint": "bb60ae40f16c33c06a8f1d5ea957644224ac0aaaba443b4987bc50cf855e74cb",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "Per-guest-CPU idle-executor count underflow when an executor releases an announcement it never took; a negative idle count makes every later placement and wake target read a free executor that does not exist, so there is no value to continue from."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueue::close",
+      "ordinal_in_function": 1,
+      "fingerprint": "7aac6fd1f576ee6387ae764e1738cd030d39f7d36d67b68e290338e7465c70ea",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue close_epoch counter overflow in close; wrapping epoch numbers corrupts queue close synchronization."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueue::observe_close",
+      "ordinal_in_function": 1,
+      "fingerprint": "9de3a8d38ed617ade2768dc86c449d1995948664ff15d6adf89f47735355b65e",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue closed_waiter_observations count overflow in observe_close; corrupts queue close draining synchronization."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueue::park_spare",
+      "ordinal_in_function": 1,
+      "fingerprint": "25ac457c8415435844fba3dd58768021de47fd53bb27508c0782f30de8c31817",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue closed_waiter_observations count overflow while a spare executor observes the close; corrupts queue close draining synchronization."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueue::park_spare",
+      "ordinal_in_function": 2,
+      "fingerprint": "25ac457c8415435844fba3dd58768021de47fd53bb27508c0782f30de8c31817",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue spare_waiters count overflow in park_spare; corrupts the parked-spare accounting that sizes the close-observation debt."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueue::park_spare",
+      "ordinal_in_function": 3,
+      "fingerprint": "25ac457c8415435844fba3dd58768021de47fd53bb27508c0782f30de8c31817",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue spare_waiters count underflow in park_spare; indicates corrupted spare-executor waiter accounting."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueue::retire_executor",
+      "ordinal_in_function": 1,
+      "fingerprint": "62ccb2c4d297a75d0109928a1f65d93c878a4fabee1ca64882b90518b84b03a4",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue closed_waiter_observations count overflow in retire_executor; corrupts queue close draining synchronization."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueue::take_row",
+      "ordinal_in_function": 1,
+      "fingerprint": "c6f289037d5772e9debfc69eef63be975a1b8cf3d8e8f2380987995345172048",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue claimed count overflow in take_row; corrupts run queue claim accounting."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueue::take_row",
+      "ordinal_in_function": 2,
+      "fingerprint": "c6f289037d5772e9debfc69eef63be975a1b8cf3d8e8f2380987995345172048",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue closed_waiter_observations count overflow in take_row; corrupts queue close draining synchronization."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueueInner::finish_claim",
+      "ordinal_in_function": 1,
+      "fingerprint": "c0b5819064af60e4f4bc117ea460ac1050cc6e3627ff049aefe5c48003631faa",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue claimed count underflow in finish_claim; indicates double-finish or corrupted run queue claim accounting."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueueInner::poke_control",
+      "ordinal_in_function": 1,
+      "fingerprint": "bc30194f957ed20cca071e41440481a18a88b188c2e1ad42bc40613847405c6a",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::scheduler_control",
+      "rationale": "RunQueue control_epoch counter overflow would wrap epoch identity and corrupt scheduler executor control observation."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueueInner::release_authority",
+      "ordinal_in_function": 1,
+      "fingerprint": "fc31504935ecde862e08943fd1f2304998ec7be7373c5009bb74cb44a3d496fb",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "RunQueue active_authorities count underflow in release_authority; indicates double-release or corrupted queue authority accounting."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueueInner::release_wake_admission",
+      "ordinal_in_function": 1,
+      "fingerprint": "8831c5dcc94fc22b75ef53bbbc966fe3b7717d993b523da635092a8010562182",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue_admissions",
+      "rationale": "RunQueue wake admission count underflow during release; indicates double-release or corrupted wake admission accounting."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunQueueInner::set_executor_online",
+      "ordinal_in_function": 1,
+      "fingerprint": "e54547859f4363cd215e65ffc7c8fe4894fd5bacf066c4b7685ae4f29dd22861",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::run_queue",
+      "rationale": "Per-guest-CPU online executor count underflow; a CPU credited with fewer executors than are bound to it makes placement skip a live CPU or target a dead one."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunnableThread::lease",
+      "ordinal_in_function": 1,
+      "fingerprint": "6521e03152db70672cef570a46f752289f503a3bbdd1eda55f3ab92f96343e74",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::runnable_thread",
+      "rationale": "Execution lease missing on RunnableThread during lease access; indicates taken lease or invalid thread execution authority."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "RunnableThread::take_lease",
+      "ordinal_in_function": 1,
+      "fingerprint": "2ae01cee8b3e23b20f61c2850dca9d5328c4bc7f9dc8acf89f2ffc899d5cb4c0",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::runnable_thread",
+      "rationale": "Execution lease missing on RunnableThread during take_lease; indicates double-take or corrupted execution lease ownership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "Scheduler::observe_generation_transition",
+      "ordinal_in_function": 1,
+      "fingerprint": "4bdcc8cc8e5fd8bae621f4140fb81bbda74ca6105ef81c07d203cb82b3637d79",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::scheduler_observer",
+      "rationale": "Scheduler generation observer failed transition after kernel execution state advanced; stranding successor outside authority directory."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "Scheduler::retarget_running_exec",
+      "ordinal_in_function": 1,
+      "fingerprint": "8ebcb1633985aa7ebee6e023c4291cce633bd35af274515a6ab16f88c7460e92",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::scheduler_exec_retarget",
+      "rationale": "Exec publication closure invoked multiple times in Scheduler::retarget_running_exec; violates single-publication guarantee."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "Scheduler::retarget_running_exec",
+      "ordinal_in_function": 2,
+      "fingerprint": "9c7139a75cd212ae7550a0a6b16a0b70f7c3269bc317f05455bf514fa1b48ec6",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::scheduler_exec_retarget",
+      "rationale": "Executor rebind failed after exec replacement was published; continuing without matching kick token would split worker execution authority."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "Scheduler::retarget_running_exec",
+      "ordinal_in_function": 3,
+      "fingerprint": "bca54cc6426ed711b398891a2bf811cc753aac7a975cdfbe4ad4b8c2ed311643",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::scheduler_exec_retarget",
+      "rationale": "Publication result missing following successful executor rebind in retarget_running_exec; exec publication state is inconsistent."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "Scheduler::settle_failed",
+      "ordinal_in_function": 1,
+      "fingerprint": "5185ef63d40272bdda4613c1411b2afa3e5ff96eb7d072529558442ac95e1cfc",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::thread_settlement",
+      "rationale": "Execution generation missing from Thread execution state after transitioning to Failed in settle_failed."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "function": "publish_guest_cpu_count",
+      "ordinal_in_function": 1,
+      "fingerprint": "910d6c83d757288c55ad2e836ec56be8261c628956bdc7100805b2d1c1e66fbf",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::scheduler",
+      "rationale": "A second, different guest CPU count was published for this carrier; nproc, sched_getaffinity and /proc/cpuinfo have already answered the first, and there is no correct value to answer with next."
     },
     {
       "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -2204,6 +2166,80 @@
       "rationale": "A live task was absent from its exact container PID region; returning zero or the carrier-global ID would violate Linux self-PID identity."
     },
     {
+      "file": "crates/carrick-runtime/src/run_state.rs",
+      "function": "abort_on_arena_error",
+      "ordinal_in_function": 1,
+      "fingerprint": "453c27246c5a8f4a60ea0d015bc746e9568734385ffa22ffdfcb5708c5c187d3",
+      "verdict": "typed_error_debt",
+      "failure_domain": "run_state::kernel_arena",
+      "rationale": "Kernel arena errors like ArenaError::Exhausted explicitly translate to Linux errno and should be returned as typed errors instead of aborting.",
+      "typed_error": "ArenaError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/run_state.rs",
+      "function": "clear_guest_process",
+      "ordinal_in_function": 1,
+      "fingerprint": "e275498926345c3b0f99624fc6d6594689b7fa030389e520a9d2ea52364b9c98",
+      "verdict": "typed_error_debt",
+      "failure_domain": "run_state::process_section",
+      "rationale": "Process record transition timeout in clear_guest_process indicates temporary lock contention that should be retryable or returned as ArenaError::Busy instead of aborting.",
+      "typed_error": "ArenaError"
+    },
+    {
+      "file": "crates/carrick-runtime/src/runtime.rs",
+      "function": "run_combined_syscall_loop_with_dispatcher",
+      "ordinal_in_function": 1,
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
+      "verdict": "carrier_fault",
+      "failure_domain": "runtime::host_alias_mapping",
+      "rationale": "runtime.map_host_alias backend failure during alias installation; leaves hardware page tables and stage-2 mappings in an unrecoverable split state."
+    },
+    {
+      "file": "crates/carrick-runtime/src/runtime.rs",
+      "function": "run_combined_syscall_loop_with_dispatcher",
+      "ordinal_in_function": 2,
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
+      "verdict": "carrier_fault",
+      "failure_domain": "runtime::host_alias_mapping",
+      "rationale": "Host alias mapping length overflowed usize after backend mapping was installed; cannot apply memory protection to live mapping."
+    },
+    {
+      "file": "crates/carrick-runtime/src/runtime.rs",
+      "function": "run_combined_syscall_loop_with_dispatcher",
+      "ordinal_in_function": 3,
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
+      "verdict": "carrier_fault",
+      "failure_domain": "runtime::host_alias_mapping",
+      "rationale": "runtime.protect_range failed to apply PROT_NONE to installed host alias mapping; continuing would leave inaccessible memory readable."
+    },
+    {
+      "file": "crates/carrick-runtime/src/runtime.rs",
+      "function": "run_combined_syscall_loop_with_dispatcher",
+      "ordinal_in_function": 4,
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
+      "verdict": "carrier_fault",
+      "failure_domain": "runtime::host_alias_mapping",
+      "rationale": "Host alias bus fault length overflowed usize after backend mapping was installed; cannot apply bus-fault guard protection."
+    },
+    {
+      "file": "crates/carrick-runtime/src/runtime.rs",
+      "function": "run_combined_syscall_loop_with_dispatcher",
+      "ordinal_in_function": 5,
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
+      "verdict": "carrier_fault",
+      "failure_domain": "runtime::host_alias_mapping",
+      "rationale": "runtime.protect_range failed to apply guard protection to bus fault range of host alias mapping; leaves invalid file region accessible."
+    },
+    {
+      "file": "crates/carrick-runtime/src/runtime.rs",
+      "function": "run_combined_syscall_loop_with_dispatcher",
+      "ordinal_in_function": 6,
+      "fingerprint": "05c15722d40d8fbb372668de2b3a91daf870cb07ed961e59c3ccfe058dfc285b",
+      "verdict": "carrier_fault",
+      "failure_domain": "runtime::host_alias_mapping",
+      "rationale": "dispatcher.commit_host_alias_install failed after backend host mapping was installed; leaves uncommitted alias mapping in guest address space."
+    },
+    {
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
       "function": "<PreparedInitialFrameInventory as Drop>::drop",
       "ordinal_in_function": 1,
@@ -2211,6 +2247,15 @@
       "verdict": "carrier_fault",
       "failure_domain": "threaded_loop::initial_frame_inventory",
       "rationale": "Rollback of an unpublished initial frame-inventory apply failed; continuing would leave hardware mappings and the kernel frame authority describing different ownership."
+    },
+    {
+      "file": "crates/carrick-runtime/src/threaded_loop.rs",
+      "function": "prepare_initial_frame_inventory",
+      "ordinal_in_function": 1,
+      "fingerprint": "bec45a7e313f5fba812c28e1fc63954a2fcd51c88fa05810dee1c0b3186f034b",
+      "verdict": "carrier_fault",
+      "failure_domain": "threaded_loop::initial_frame_inventory",
+      "rationale": "Initial boot frame inventory publication failed after hypervisor mappings were already established in HVF; leaves hypervisor and kernel graph state diverging."
     },
     {
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
