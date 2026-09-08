@@ -4658,12 +4658,19 @@
   },
   {
     "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the operator-selected post-mortem directory"
+    },
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
       "macos-cli-default",
       "macos-runtime-default"
     ],
+    "rationale": "At crates/carrick-runtime/src/kernel/debug/post_mortem.rs:384 in `PostMortem::write_to_dir`, `std::fs::create_dir_all` accesses only the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "review_id": "HA-000646",
     "source": {
       "byte_end": 15617,
       "byte_start": 15594,
@@ -4674,14 +4681,7 @@
       "line": 384,
       "line_end": 384,
       "line_start": 384
-    },
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "the operator-selected post-mortem directory"
-    },
-    "rationale": "At crates/carrick-runtime/src/kernel/debug/post_mortem.rs:384 in `PostMortem::write_to_dir`, `std::fs::create_dir_all` accesses only the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
-    "review_id": "HA-000646"
+    }
   },
   {
     "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
@@ -11091,12 +11091,19 @@
   },
   {
     "catalog_id": "HA-CATALOG-FS-WRITE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the post-mortem JSON inside the operator-selected post-mortem directory"
+    },
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
       "macos-cli-default",
       "macos-runtime-default"
     ],
+    "rationale": "At crates/carrick-runtime/src/kernel/debug/post_mortem.rs:388 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem JSON inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "review_id": "HA-000647",
     "source": {
       "byte_end": 15828,
       "byte_start": 15814,
@@ -11107,23 +11114,23 @@
       "line": 388,
       "line_end": 388,
       "line_start": 388
-    },
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "the post-mortem JSON inside the operator-selected post-mortem directory"
-    },
-    "rationale": "At crates/carrick-runtime/src/kernel/debug/post_mortem.rs:388 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem JSON inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
-    "review_id": "HA-000647"
+    }
   },
   {
     "catalog_id": "HA-CATALOG-FS-WRITE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "the post-mortem event-ring JSONL inside the operator-selected post-mortem directory"
+    },
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
       "macos-cli-default",
       "macos-runtime-default"
     ],
+    "rationale": "At crates/carrick-runtime/src/kernel/debug/post_mortem.rs:397 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
+    "review_id": "HA-000648",
     "source": {
       "byte_end": 16154,
       "byte_start": 16140,
@@ -11134,14 +11141,7 @@
       "line": 397,
       "line_end": 397,
       "line_start": 397
-    },
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "the post-mortem event-ring JSONL inside the operator-selected post-mortem directory"
-    },
-    "rationale": "At crates/carrick-runtime/src/kernel/debug/post_mortem.rs:397 in `PostMortem::write_to_dir`, `std::fs::write` accesses only the post-mortem event-ring JSONL inside the operator-selected post-mortem directory. The path is supplied by the embedding caller (`ContainerBuilder::post_mortem_dir`), the CLI (`--post-mortem-dir`) or `CARRICK_POSTMORTEM_DIR`; nothing about it is derived from guest state, and the run's outcome does not depend on the write.",
-    "review_id": "HA-000648"
+    }
   },
   {
     "catalog_id": "HA-CATALOG-FS-WRITE",
@@ -15506,18 +15506,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:8461 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:8524 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 336993,
-      "byte_start": 336968,
+      "byte_end": 339874,
+      "byte_start": 339849,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 8461,
-      "line_end": 8461,
-      "line_start": 8461
+      "line": 8524,
+      "line_end": 8524,
+      "line_start": 8524
     }
   },
   {
@@ -16199,18 +16199,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9368 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9431 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000614",
     "source": {
-      "byte_end": 374958,
-      "byte_start": 374940,
+      "byte_end": 377839,
+      "byte_start": 377821,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9368,
-      "line_end": 9368,
-      "line_start": 9368
+      "line": 9431,
+      "line_end": 9431,
+      "line_start": 9431
     }
   },
   {
@@ -16886,18 +16886,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9202 in `capture_core_for_publication`, `std::thread::yield_now` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9265 in `capture_core_for_publication`, `std::thread::yield_now` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000639",
     "source": {
-      "byte_end": 365980,
-      "byte_start": 365958,
+      "byte_end": 368861,
+      "byte_start": 368839,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9202,
-      "line_end": 9202,
-      "line_start": 9202
+      "line": 9265,
+      "line_end": 9265,
+      "line_start": 9265
     }
   },
   {
