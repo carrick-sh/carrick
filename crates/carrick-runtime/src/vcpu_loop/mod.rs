@@ -5004,6 +5004,11 @@ trait ProductionHvpatchLoopPoll: Send {
 
     fn after_terminal_settlement(&mut self);
 
+    /// The scheduler settled this thread against a target the kernel graph
+    /// says is TERMINAL: no successor exists, so nothing will run this job
+    /// again and no other publisher is left for it.
+    fn after_reaped_settlement(&mut self);
+
     fn after_executor_failure_settlement(&mut self) -> continuation::ExecutorFailureSettlement;
 
     fn take_address_space_retirement(
@@ -8592,6 +8597,16 @@ where
         self.publish_terminal_result();
     }
 
+    fn after_reaped_settlement(&mut self) {
+        // Same publication the lost-process-exit-claim path makes, for the
+        // same reason: this thread is terminated and carries no outcome of its
+        // own, so the `ThreadDone` its owner's member drain would have
+        // published is published from the settlement that owns it. Without
+        // this the job's `HvpatchLoopResult` was never filled and its
+        // container process job waited on it forever (`go_types`).
+        self.publish_lost_claim_terminal_result();
+    }
+
     fn after_executor_failure_settlement(&mut self) -> continuation::ExecutorFailureSettlement {
         if self.terminal_settlement.is_published() {
             return continuation::ExecutorFailureSettlement::AlreadyPublished;
@@ -8912,6 +8927,12 @@ impl<E: 'static> continuation::PersistentQuantumJob for HvpatchLoopJob<E> {
     fn after_terminal_settlement(&mut self) {
         if let Some(production) = self.production.as_mut() {
             production.after_terminal_settlement();
+        }
+    }
+
+    fn after_reaped_settlement(&mut self) {
+        if let Some(production) = self.production.as_mut() {
+            production.after_reaped_settlement();
         }
     }
 
@@ -19697,9 +19718,11 @@ mod tests {
             .restore_lease(child_submission.lease.take().expect("returned child lease"))
             .expect("restore child lease");
         match exit {
-            executor::ExecutorExit::Blocked(reason) => scheduler
-                .settle_blocked(child_running, reason)
-                .expect("settle blocked external exec child"),
+            executor::ExecutorExit::Blocked(reason) => {
+                scheduler
+                    .settle_blocked(child_running, reason)
+                    .expect("settle blocked external exec child");
+            }
             executor::ExecutorExit::Exited => scheduler
                 .settle_exited(child_running)
                 .expect("settle exited external exec child"),

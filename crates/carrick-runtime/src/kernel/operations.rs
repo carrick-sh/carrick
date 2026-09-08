@@ -2708,6 +2708,89 @@ impl Kernel {
     /// absent from registry` carrier abort.
     #[cfg(test)]
     pub(crate) fn reap_task_record_for_test(&self, task: super::ids::TaskId) -> bool {
+        let mut state = self.registry().state.write();
+        let Some(record) = state.tasks.remove(&task) else {
+            return false;
+        };
+        // A real reap does not merely drop the live record: it RETIRES every
+        // thread of the task into the graph, which is how the kernel keeps
+        // proving that generation terminal after the record is gone
+        // (`commit_task_exit`). A fixture that skips it describes a graph Linux
+        // cannot produce -- a thread that is in no task, no zombie and no
+        // retirement -- and the generation-observer classifier is required to
+        // call exactly that shape a LOST transition rather than a reap.
+        let super::core::TaskRecord {
+            task: retired_task,
+            thread_claims,
+            dead_leader,
+            ..
+        } = record;
+        for (tid, claim) in thread_claims {
+            if let Some(thread) = retired_task.thread(tid) {
+                state
+                    .retired_threads
+                    .push(super::core::RetiredThreadRecord {
+                        _key: thread.key(),
+                        _task: thread.task_key(),
+                        thread: Arc::downgrade(&thread),
+                        _claim: claim,
+                    });
+            }
+        }
+        if let Some(dead_leader) = dead_leader {
+            state.retired_threads.push(dead_leader);
+        }
+        true
+    }
+
+    /// What the KERNEL GRAPH says about one exact scheduler thread, for the
+    /// generation observer's rejection classifier.
+    ///
+    /// `target` is the thread object the caller already holds, so its typed
+    /// `execution_state` is read directly; the registry is consulted only for
+    /// the two terminal facts the object itself cannot carry -- the thread is
+    /// RETIRED, or its task is a ZOMBIE. Registry ABSENCE is deliberately not
+    /// one of them: it answers "is this key resolvable right now", which is a
+    /// different question from "will this generation ever run again".
+    pub(crate) fn scheduler_target_liveness(
+        &self,
+        key: ThreadKey,
+        target: &super::objects::Thread,
+    ) -> super::scheduler::SchedulerTargetLiveness {
+        use super::scheduler::SchedulerTargetLiveness as Liveness;
+        if matches!(
+            target.execution_state(),
+            super::objects::ThreadExecutionState::Exited { .. }
+                | super::objects::ThreadExecutionState::Failed { .. }
+        ) {
+            return Liveness::Terminal;
+        }
+        let state = self.registry().state.read();
+        if state
+            .retired_threads
+            .iter()
+            .any(|retired| retired._key == key)
+        {
+            return Liveness::Terminal;
+        }
+        if state
+            .zombies
+            .values()
+            .any(|record| LinuxTid::for_task_leader(record.zombie.key.id) == key.tid)
+        {
+            return Liveness::Terminal;
+        }
+        Liveness::Reachable
+    }
+
+    /// Test-only: drop one task's registry record and record NOTHING else.
+    ///
+    /// The result is a thread that is in no live task, no zombie and no
+    /// retirement: the kernel graph cannot prove that generation terminal, only
+    /// that the key does not resolve right now. That is a different fact from a
+    /// reap, and this helper exists so the two can be told apart.
+    #[cfg(test)]
+    pub(crate) fn drop_task_record_for_test(&self, task: super::ids::TaskId) -> bool {
         self.registry().state.write().tasks.remove(&task).is_some()
     }
 

@@ -3553,6 +3553,13 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
 
     fn after_terminal_settlement(&mut self) {}
 
+    /// See [`crate::vcpu_loop::HvpatchProduction::after_reaped_settlement`].
+    /// The default is the terminal publication: a job with no separate reaped
+    /// story still must not end unpublished.
+    fn after_reaped_settlement(&mut self) {
+        self.after_terminal_settlement();
+    }
+
     fn after_executor_failure_settlement(&mut self) -> ExecutorFailureSettlement {
         self.after_terminal_settlement();
         ExecutorFailureSettlement::PublishCurrent
@@ -3612,6 +3619,11 @@ impl HvpatchTaskQuantum {
 
     pub(crate) fn after_terminal_settlement(&self) {
         self.job.lock().after_terminal_settlement();
+        self.completion.publish();
+    }
+
+    pub(crate) fn after_reaped_settlement(&self) {
+        self.job.lock().after_reaped_settlement();
         self.completion.publish();
     }
 
@@ -3875,6 +3887,30 @@ impl HvpatchTaskBinding {
         };
         if publish_logical_result {
             self.quantum.after_terminal_settlement();
+        }
+    }
+
+    /// The reaped-settlement twin of [`Self::after_terminal_settlement`],
+    /// sharing its one-shot gate: an exec-transferred binding still must not
+    /// publish over its successor's result, and a binding already settled
+    /// stays settled.
+    pub(crate) fn after_reaped_settlement(&self) {
+        let publish_logical_result = {
+            let mut generation = self.terminal_generation.lock();
+            match *generation {
+                HvpatchBindingTerminalGeneration::Active => {
+                    *generation = HvpatchBindingTerminalGeneration::Settled;
+                    true
+                }
+                HvpatchBindingTerminalGeneration::ExecTransferred => {
+                    *generation = HvpatchBindingTerminalGeneration::Settled;
+                    false
+                }
+                HvpatchBindingTerminalGeneration::Settled => return,
+            }
+        };
+        if publish_logical_result {
+            self.quantum.after_reaped_settlement();
         }
     }
 

@@ -161,14 +161,23 @@ pub(crate) enum SchedulerGenerationTransition {
 /// An OUTCOME, not an error. "The observer refused" has two completely
 /// different meanings and only one of them is survivable, so returning
 /// `Result` let a caller write `if let Err(_)` and treat both as the benign
-/// one — the round-2 swallow. There is now nothing to swallow: the fatal
-/// meaning is NOT REPRESENTABLE in this type (it aborts inside
-/// `observe_generation_transition`), and `TargetReaped` is a fact every caller
-/// must branch on exhaustively.
+/// one — the round-2 swallow. There is nothing to swallow: each meaning is a
+/// distinct variant every caller must branch on exhaustively. Round 4 kept the
+/// fatal one out of the type by calling `std::process::abort()` inside
+/// `observe_generation_transition`; it is a variant now, because the abort
+/// goes through lane B's post-mortem sink and the transaction that observed it
+/// still has to finish.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GenerationTransitionOutcome {
     /// The observer recorded the successor. It is reachable and publishable.
     Recorded,
+    /// The observer rejected the transition while the kernel graph still calls
+    /// the target REACHABLE. The carrier is being aborted through the
+    /// post-mortem sink, and this transaction still finishes so the capture
+    /// describes a settled graph; the successor is withheld exactly as it is
+    /// for a reaped target, but NOTHING is retired -- a reachable generation's
+    /// authority is not this side's to drop.
+    LostExactTransition,
     /// The target was REAPED while this transition was in flight. The
     /// successor generation is unreachable by construction — nothing can
     /// resolve the thread again — so it strands nothing, and Linux answers a
@@ -192,18 +201,66 @@ pub(crate) enum TransitionRejection {
     LostExactTransition,
 }
 
-/// Classify one observer rejection from the single fact that separates the two
-/// meanings: whether the transition's target is still in the kernel graph.
+/// What the kernel graph says about the target of one rejected transition.
 ///
-/// Split out as a pure function so BOTH arms are unit-testable. The fatal arm
-/// aborts the process, which no in-process test can observe, so without this
-/// seam only the benign direction could ever be asserted — and the benign
-/// direction is exactly the one a too-wide swallow makes look correct.
-const fn classify_transition_rejection(target_still_live: bool) -> TransitionRejection {
-    if target_still_live {
-        TransitionRejection::LostExactTransition
-    } else {
-        TransitionRejection::TargetReaped
+/// Registry PRESENCE is not the question, and answering it was the round-4
+/// defect. A thread can be missing from the exact scheduler registry for
+/// reasons that have nothing to do with having exited — a reap that is still
+/// in flight, an exec replacement mid-swap — and calling that "reaped"
+/// withheld a FINISHED `go_types` process job's result: the settlement
+/// published nothing, the job's `HvpatchLoopResult` was never filled, and
+/// eighteen executors parked forever on an empty queue while the guest had
+/// already printed PASS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerTargetLiveness {
+    /// The exact thread's own execution state is terminal: `Exited` or
+    /// `Failed`. Nothing will resolve this generation again.
+    Terminal,
+    /// The kernel graph still calls this generation reachable: the thread's
+    /// execution state is not terminal, it is in no retirement record, and its
+    /// task is not a zombie.
+    Reachable,
+}
+
+/// Classify one observer rejection from the single fact that separates the two
+/// meanings.
+///
+/// Split out as a pure function so BOTH arms are unit-testable.
+const fn classify_transition_rejection(liveness: SchedulerTargetLiveness) -> TransitionRejection {
+    match liveness {
+        SchedulerTargetLiveness::Reachable => TransitionRejection::LostExactTransition,
+        SchedulerTargetLiveness::Terminal => TransitionRejection::TargetReaped,
+    }
+}
+
+/// What one settlement did about the thread's NEXT generation.
+///
+/// A settlement used to answer only "did it error", which cannot express the
+/// case the exit wedge lives in: the transaction succeeded, no successor
+/// exists, and the thread's process job therefore has no publisher left.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettlementDisposition {
+    /// The successor is recorded; the thread is reachable again.
+    Settled,
+    /// The target was REAPED in flight. No successor exists and none ever
+    /// will, so nothing will run this thread again and nothing else will fill
+    /// its process job: the caller must publish the job's terminal result
+    /// here. "A settled job with an unpublished result is unrepresentable"
+    /// applies to this path too.
+    TargetReaped,
+    /// The observer and the kernel graph disagreed about a REACHABLE
+    /// generation. The carrier is being aborted through the post-mortem sink,
+    /// which answers the job wait; the settlement itself still finishes.
+    LostExactTransition,
+}
+
+impl SettlementDisposition {
+    const fn from_outcome(outcome: GenerationTransitionOutcome) -> Self {
+        match outcome {
+            GenerationTransitionOutcome::Recorded => Self::Settled,
+            GenerationTransitionOutcome::TargetReaped => Self::TargetReaped,
+            GenerationTransitionOutcome::LostExactTransition => Self::LostExactTransition,
+        }
     }
 }
 
@@ -2452,8 +2509,14 @@ impl Scheduler {
         Ok(())
     }
 
+    /// `target` is the exact thread object the caller already holds. It is
+    /// passed in rather than looked up because the LOOKUP is what round 4 got
+    /// wrong: a registry miss answers "is this key resolvable right now",
+    /// which is not the same question as "will this generation ever run
+    /// again", and the thread object carries the kernel graph's own answer.
     fn observe_generation_transition(
         &self,
+        target: &Thread,
         thread: ThreadKey,
         predecessor: ExecutionGeneration,
         successor: ExecutionGeneration,
@@ -2464,8 +2527,9 @@ impl Scheduler {
             && let Err(error) = observer.transition(thread, predecessor, successor, kind)
         {
             let kernel_view = self.kernel.scheduler_thread_execution_diagnostic(thread);
-            let target_still_live = self.kernel.exact_thread_for_scheduler(thread).is_some();
-            return match classify_transition_rejection(target_still_live) {
+            let execution_state = target.execution_state();
+            let liveness = self.kernel.scheduler_target_liveness(thread, target);
+            return match classify_transition_rejection(liveness) {
                 TransitionRejection::TargetReaped => {
                     // Captured live on 2026-09-07 under eight CPU hogs as
                     // `thread=ThreadKey { tid: LinuxTid(1864), serial:
@@ -2490,8 +2554,28 @@ impl Scheduler {
                     GenerationTransitionOutcome::TargetReaped
                 }
                 TransitionRejection::LostExactTransition => {
-                    tracing::error!(?thread, ?predecessor, ?successor, ?kind, %error, %kernel_view, "scheduler generation observer lost exact transition");
-                    std::process::abort();
+                    // Round 4 called `std::process::abort()` here: a signal,
+                    // no evidence, and — because the abort happened INSIDE the
+                    // scheduler — no chance for the container's job wait to
+                    // report anything at all. Lane B's sink turns it into a
+                    // named `RuntimeError::KernelAborted` carrying a
+                    // post-mortem of this exact graph, which the container job
+                    // group picks up at its next poll. The settlement below
+                    // still finishes, so the capture describes a settled
+                    // graph rather than one frozen mid-transaction.
+                    tracing::error!(?thread, ?predecessor, ?successor, ?kind, %error, ?execution_state, %kernel_view, "scheduler generation observer lost exact transition");
+                    crate::kernel::debug::request_abort(
+                        crate::kernel::debug::AbortReason::LostExactTransition {
+                            tid: thread.tid.raw(),
+                            serial: thread.serial.raw(),
+                            predecessor: predecessor.raw(),
+                            successor: successor.raw(),
+                            transition: format!("{kind:?}"),
+                            execution_state: format!("{execution_state:?}"),
+                            kernel_view,
+                        },
+                    );
+                    GenerationTransitionOutcome::LostExactTransition
                 }
             };
         }
@@ -2640,6 +2724,7 @@ impl Scheduler {
         // A terminal transition publishes nothing, so a reaped target changes
         // nothing here: the cancellation already happened in the Kernel.
         let _ = self.observe_generation_transition(
+            &thread,
             key,
             generation,
             successor,
@@ -2803,6 +2888,7 @@ impl Scheduler {
                 // replaced.
                 if let Some(predecessor) = predecessor {
                     match self.observe_generation_transition(
+                        &thread,
                         key,
                         predecessor,
                         generation,
@@ -2811,6 +2897,12 @@ impl Scheduler {
                         GenerationTransitionOutcome::Recorded => {}
                         GenerationTransitionOutcome::TargetReaped => {
                             tracing::debug!(?key, "wake of a reaped task is a no-op");
+                            return Ok(WakeAction::Pending);
+                        }
+                        // The carrier is already being aborted; a wake that
+                        // would publish a generation the observer refused must
+                        // not also strand it.
+                        GenerationTransitionOutcome::LostExactTransition => {
                             return Ok(WakeAction::Pending);
                         }
                     }
@@ -2865,6 +2957,7 @@ impl Scheduler {
                 // replaced.
                 if let Some(predecessor) = predecessor {
                     match self.observe_generation_transition(
+                        &thread,
                         key,
                         predecessor,
                         generation,
@@ -2873,6 +2966,12 @@ impl Scheduler {
                         GenerationTransitionOutcome::Recorded => {}
                         GenerationTransitionOutcome::TargetReaped => {
                             tracing::debug!(?key, "wake of a reaped task is a no-op");
+                            return Ok(WakeAction::Pending);
+                        }
+                        // The carrier is already being aborted; a wake that
+                        // would publish a generation the observer refused must
+                        // not also strand it.
+                        GenerationTransitionOutcome::LostExactTransition => {
                             return Ok(WakeAction::Pending);
                         }
                     }
@@ -3016,7 +3115,7 @@ impl Scheduler {
         &self,
         mut running: RunnableThread,
         reason: BlockedReason,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<SettlementDisposition, SchedulerError> {
         let _transition = self.generation_transition.lock();
         let predecessor = running.generation();
         let lease = running.take_lease();
@@ -3043,8 +3142,13 @@ impl Scheduler {
         // and dropped a published MM authority — the `conf-60360-c00` /
         // `conf-76099-c00` carrier FATAL. Settle exactly as usual; only the
         // successor publication below is withheld.
-        let observed =
-            self.observe_generation_transition(running.thread_key(), predecessor, successor, kind);
+        let observed = self.observe_generation_transition(
+            &running.thread,
+            running.thread_key(),
+            predecessor,
+            successor,
+            kind,
+        );
         self.executors.unbind(running.binding);
         let bound_cpu = self
             .executors
@@ -3069,7 +3173,7 @@ impl Scheduler {
             )?;
         }
         running.finish_claim();
-        Ok(())
+        Ok(SettlementDisposition::from_outcome(observed))
     }
 
     pub fn settle_blocked_continuation(
@@ -3077,7 +3181,7 @@ impl Scheduler {
         mut running: RunnableThread,
         mut continuation: crate::vcpu_loop::continuation::BlockedContinuation,
         registration: crate::vcpu_loop::continuation::ContinuationRegistration,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<SettlementDisposition, SchedulerError> {
         let _transition = self.generation_transition.lock();
         let predecessor = running.generation();
         if continuation.authority().thread() != running.thread_key()
@@ -3112,8 +3216,13 @@ impl Scheduler {
         // and dropped a published MM authority — the `conf-60360-c00` /
         // `conf-76099-c00` carrier FATAL. Settle exactly as usual; only the
         // successor publication below is withheld.
-        let observed =
-            self.observe_generation_transition(running.thread_key(), predecessor, successor, kind);
+        let observed = self.observe_generation_transition(
+            &running.thread,
+            running.thread_key(),
+            predecessor,
+            successor,
+            kind,
+        );
         self.executors.unbind(running.binding);
         let bound_cpu = self
             .executors
@@ -3143,7 +3252,7 @@ impl Scheduler {
             )?;
         }
         running.finish_claim();
-        Ok(())
+        Ok(SettlementDisposition::from_outcome(observed))
     }
 
     pub(crate) fn begin_switch_out(&self, running: &RunnableThread) -> Result<(), SchedulerError> {
@@ -3278,6 +3387,7 @@ impl Scheduler {
                 // Terminal: nothing is published either way, and a reaped
                 // target must not abandon the retirement transaction.
                 let _ = self.observe_generation_transition(
+                    &running.thread,
                     running.thread_key(),
                     predecessor,
                     successor,
@@ -3317,7 +3427,7 @@ impl Scheduler {
     pub(crate) fn settle_runnable_successor(
         &self,
         mut running: RunnableThread,
-    ) -> Result<Option<ExecutionGeneration>, SchedulerError> {
+    ) -> Result<SettlementDisposition, SchedulerError> {
         let _transition = self.generation_transition.lock();
         let predecessor = running.generation();
         let lease = running.take_lease();
@@ -3340,6 +3450,7 @@ impl Scheduler {
         // pool cascaded into a carrier FATAL.
         let observed = match successor {
             Some(successor) => self.observe_generation_transition(
+                &running.thread,
                 running.thread_key(),
                 predecessor,
                 successor,
@@ -3371,11 +3482,11 @@ impl Scheduler {
             )?;
         }
         running.finish_claim();
-        // A reaped target has no reachable successor to report.
-        Ok(match observed {
-            GenerationTransitionOutcome::Recorded => successor,
-            GenerationTransitionOutcome::TargetReaped => None,
-        })
+        // A reaped target has no reachable successor to report. Its process
+        // job's terminal result is published by the CALLER, which owns the
+        // job; reporting the disposition is how it learns it must.
+        let _ = successor;
+        Ok(SettlementDisposition::from_outcome(observed))
     }
 
     pub fn settle_exited(&self, mut running: RunnableThread) -> Result<(), SchedulerError> {
@@ -3394,6 +3505,7 @@ impl Scheduler {
         // Terminal: nothing is published either way, and a reaped target must
         // not abandon the exit transaction.
         let _ = self.observe_generation_transition(
+            &running.thread,
             running.thread_key(),
             predecessor,
             successor,
@@ -5998,8 +6110,144 @@ mod tests {
         }
     }
 
+    /// An observer whose transition drops the task's registry record and
+    /// records NOTHING else: the thread is in no live task, no zombie and no
+    /// retirement, so the kernel graph cannot prove that generation terminal.
+    #[derive(Debug)]
+    struct RecordDroppingObserver {
+        kernel: Arc<Kernel>,
+        task: crate::kernel::ids::TaskId,
+        on_kind: super::SchedulerGenerationTransition,
+        held: parking_lot::Mutex<
+            BTreeMap<
+                (
+                    crate::kernel::objects::ThreadKey,
+                    crate::kernel::objects::ExecutionGeneration,
+                ),
+                super::SubmissionAuthority,
+            >,
+        >,
+        retired: parking_lot::Mutex<
+            Vec<(
+                crate::kernel::objects::ThreadKey,
+                crate::kernel::objects::ExecutionGeneration,
+            )>,
+        >,
+    }
+
+    impl super::SchedulerGenerationObserver for RecordDroppingObserver {
+        fn transition(
+            &self,
+            thread: crate::kernel::objects::ThreadKey,
+            predecessor: crate::kernel::objects::ExecutionGeneration,
+            successor: crate::kernel::objects::ExecutionGeneration,
+            kind: super::SchedulerGenerationTransition,
+        ) -> Result<(), RunQueueError> {
+            let mut held = self.held.lock();
+            let Some(record) = held.remove(&(thread, predecessor)) else {
+                return Ok(());
+            };
+            if kind != self.on_kind {
+                held.insert((thread, successor), record);
+                return Ok(());
+            }
+            assert!(self.kernel.drop_task_record_for_test(self.task));
+            held.insert((thread, predecessor), record);
+            Err(RunQueueError::AuthorityMismatch)
+        }
+
+        fn retire_reaped(
+            &self,
+            thread: crate::kernel::objects::ThreadKey,
+            predecessor: crate::kernel::objects::ExecutionGeneration,
+        ) {
+            self.retired.lock().push((thread, predecessor));
+            self.held.lock().remove(&(thread, predecessor));
+        }
+    }
+
+    /// A thread that is merely ABSENT from the exact scheduler registry is not
+    /// a reaped thread: the kernel graph has no zombie and no retirement for
+    /// it, so nothing proves that generation will never run again. Round 4
+    /// called that shape a reap, retired a reachable authority and published
+    /// nothing — RED here as `retired = [(thread, generation)]` and no abort
+    /// request. It is now a lost exact transition, which ends the carrier
+    /// through lane B's sink with a post-mortem that names the thread, both
+    /// generations and both kernel views.
+    #[test]
+    fn an_absent_but_non_terminal_target_is_a_lost_transition_not_a_reap() {
+        let (kernel, root) = bootstrap(12_413);
+        publish(&root, 83);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let key = root.thread().key();
+        let generation = root
+            .thread()
+            .execution_state()
+            .generation()
+            .expect("published root generation");
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()) as Arc<dyn ExecutorKick>)
+            .unwrap();
+        let authority = scheduler.admit_root(key, generation).unwrap();
+        scheduler.make_runnable(key).unwrap();
+        authority
+            .publish(&scheduler, Arc::clone(root.thread()))
+            .expect("activation publishes the admitted row");
+        let running = scheduler.take(&executor).unwrap();
+        let claimed_generation = running.generation();
+
+        let observer = Arc::new(RecordDroppingObserver {
+            kernel: Arc::clone(&kernel),
+            task: root.thread().task_key().id,
+            on_kind: super::SchedulerGenerationTransition::Runnable,
+            held: parking_lot::Mutex::new(BTreeMap::from([((key, claimed_generation), authority)])),
+            retired: parking_lot::Mutex::new(Vec::new()),
+        });
+        scheduler
+            .install_generation_observer(
+                Arc::clone(&observer) as Arc<dyn super::SchedulerGenerationObserver>
+            )
+            .unwrap();
+
+        // The settlement still FINISHES: an abandoned transaction leaves the
+        // executor bound with the claim unfinished, which is a second failure
+        // on top of the first.
+        let disposition = scheduler
+            .settle_runnable_successor(running)
+            .expect("the settlement itself always finishes");
+        assert_eq!(
+            disposition,
+            super::SettlementDisposition::LostExactTransition
+        );
+
+        assert!(
+            observer.retired.lock().is_empty(),
+            "a reachable generation's authority is not the scheduler's to retire"
+        );
+        let reason = crate::kernel::debug::take_abort_request()
+            .expect("a lost exact transition ends the carrier through the post-mortem sink");
+        match reason {
+            crate::kernel::debug::AbortReason::LostExactTransition {
+                tid,
+                serial,
+                predecessor,
+                successor,
+                ..
+            } => {
+                assert_eq!(tid, key.tid.raw());
+                assert_eq!(serial, key.serial.raw());
+                assert_eq!(predecessor, claimed_generation.raw());
+                assert_eq!(successor, claimed_generation.raw() + 1);
+            }
+            other => panic!("wrong abort reason: {other:?}"),
+        }
+    }
+
     /// A wake whose target is reaped in flight must leave NOTHING holding the
-    /// queue open.
+    /// queue open. `reap_task_record_for_test` retires the task's threads the
+    /// way a real reap does, so the kernel graph can still prove the target
+    /// terminal after its live record is gone — which is what separates this
+    /// from the lost-transition case above.
     ///
     /// Round 3 stopped the reaped rejection from killing the executor and from
     /// publishing an unreachable successor, which is what the two settlement
@@ -6058,7 +6306,7 @@ mod tests {
             .settle_runnable_successor(running)
             .expect("a yield whose target was reaped settles; it never fails the executor");
         assert_eq!(observer.fired.load(Ordering::SeqCst), 1);
-        assert_eq!(successor, None);
+        assert_eq!(successor, super::SettlementDisposition::TargetReaped);
 
         assert_eq!(
             scheduler.queue.active_authority_count(),
@@ -6083,11 +6331,11 @@ mod tests {
     #[test]
     fn a_transition_rejection_is_fatal_unless_the_target_left_the_graph() {
         assert_eq!(
-            super::classify_transition_rejection(false),
+            super::classify_transition_rejection(super::SchedulerTargetLiveness::Terminal),
             super::TransitionRejection::TargetReaped,
         );
         assert_eq!(
-            super::classify_transition_rejection(true),
+            super::classify_transition_rejection(super::SchedulerTargetLiveness::Reachable),
             super::TransitionRejection::LostExactTransition,
         );
     }
@@ -6130,7 +6378,8 @@ mod tests {
             .expect("a yield whose target was reaped settles; it never fails the executor");
         assert_eq!(observer.fired.load(Ordering::SeqCst), 1);
         assert_eq!(
-            successor, None,
+            successor,
+            super::SettlementDisposition::TargetReaped,
             "a reaped target has no reachable successor to report"
         );
         assert!(

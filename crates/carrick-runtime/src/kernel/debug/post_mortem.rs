@@ -148,6 +148,27 @@ pub enum AbortReason {
         frame: Option<u64>,
         pending_reservation: Option<u64>,
     },
+    /// The scheduler's generation observer rejected an exact transition whose
+    /// target the kernel graph says is still REACHABLE. The observer and the
+    /// kernel therefore disagree about a generation something can still
+    /// resolve, so the successor would be stranded outside the combined
+    /// binding/authority directory.
+    ///
+    /// This used to be a bare `std::process::abort()` in
+    /// `Scheduler::observe_generation_transition`, which produced a signal and
+    /// no evidence. It names the thread, both generations and the two kernel
+    /// views (the thread's own typed execution state, and what the registry
+    /// projection saw) so the post-mortem answers "which generation, on what
+    /// evidence" without a debugger.
+    LostExactTransition {
+        tid: i32,
+        serial: u64,
+        predecessor: u64,
+        successor: u64,
+        transition: String,
+        execution_state: String,
+        kernel_view: String,
+    },
 }
 
 /// Which step of the HVPatch alias install refused. Ordered as the arm runs.
@@ -245,6 +266,19 @@ impl AbortReason {
                      {prot:#x} shared={shared} prot_none={prot_none}){frame}: {error}{pending}"
                 )
             }
+            Self::LostExactTransition {
+                tid,
+                serial,
+                predecessor,
+                successor,
+                transition,
+                execution_state,
+                kernel_view,
+            } => format!(
+                "lost exact transition: thread#{tid}:{serial} {transition} {predecessor} -> \
+                 {successor} was rejected while the kernel graph still calls it reachable \
+                 (execution state {execution_state}; registry view: {kernel_view})"
+            ),
         }
     }
 }
