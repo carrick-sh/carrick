@@ -993,6 +993,16 @@ pub(crate) struct HvpatchRuntimeDirectory {
     /// because the directory outlives no kernel: the runner OBSERVES the graph,
     /// it never keeps it alive.
     liveness_kernel: Mutex<Option<Weak<crate::kernel::Kernel>>>,
+    /// The one abort this carrier has suffered, if any.
+    ///
+    /// An abort is CARRIER-terminal, not job-terminal. The kernel graph it
+    /// describes is the carrier's only graph, so once it is captured every
+    /// later job wait in this carrier is answered by that same record rather
+    /// than starting a fresh wait. Without this, the container's own
+    /// `ContainerJobGroup::join` unwedged and the implicit carrier's
+    /// `shutdown_wait` immediately parked again on the jobs of guest tasks that
+    /// are still running -- moving the hang instead of removing it.
+    kernel_abort: Arc<Mutex<Option<KernelAbortRecord>>>,
     persistent_bindings: Arc<executor::HvpatchTaskBindingDirectory>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     carrier_tasks:
@@ -1305,6 +1315,9 @@ fn wait_process_jobs(
     liveness: &ProcessGraphLiveness,
 ) -> Result<usize, RuntimeError> {
     let joined = jobs.len();
+    if let Some(recorded) = liveness.recorded() {
+        return Err(recorded);
+    }
     // Every job's result cell, kept so an abort can COMPLETE the ones this
     // loop has not reached. A judge that proved nobody will publish job N has
     // proved it for the whole group, and leaving the others pending would just
@@ -1399,6 +1412,7 @@ impl Default for HvpatchRuntimeDirectory {
             continuation_wait_service: Mutex::new(None),
             scheduler: Mutex::new(None),
             liveness_kernel: Mutex::new(None),
+            kernel_abort: Arc::default(),
             persistent_bindings: Arc::default(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             carrier_tasks: Mutex::new(None),
@@ -1428,6 +1442,7 @@ impl HvpatchRuntimeDirectory {
         ProcessGraphLiveness {
             kernel: self.liveness_kernel.lock().clone(),
             scheduler: self.scheduler.lock().clone(),
+            recorded: Arc::clone(&self.kernel_abort),
             #[cfg(test)]
             fixed_census: None,
             poll: LIVENESS_POLL,
@@ -3400,10 +3415,29 @@ const LIVENESS_CONFIRM: std::time::Duration = std::time::Duration::from_secs(2);
 /// the process. `f8487d23b` removed that particular publisher gap. This removes
 /// the CLASS: after this, a job with no result and no live task is not a hang,
 /// it is a named `RuntimeError::KernelAborted` carrying a post-mortem.
+/// The one abort a carrier suffered, kept so every later wait is answered by
+/// the SAME capture rather than a second, later answer to the same question.
+#[derive(Clone)]
+pub(crate) struct KernelAbortRecord {
+    reason: String,
+    post_mortem: Arc<crate::kernel::debug::PostMortem>,
+}
+
+impl KernelAbortRecord {
+    fn error(&self) -> RuntimeError {
+        RuntimeError::KernelAborted {
+            reason: self.reason.clone(),
+            post_mortem: Arc::clone(&self.post_mortem),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ProcessGraphLiveness {
     kernel: Option<Weak<crate::kernel::Kernel>>,
     scheduler: Option<Arc<crate::kernel::scheduler::Scheduler>>,
+    /// Where this carrier's one abort is recorded and re-read.
+    recorded: Arc<Mutex<Option<KernelAbortRecord>>>,
     /// Test seam: a census the fixture drives directly, so the confirm state
     /// machine can be exercised without retiring a real root task. Never
     /// constructed outside `cfg(test)`; the shipped path has exactly one
@@ -3450,6 +3484,7 @@ impl ProcessGraphLiveness {
         Self {
             kernel: None,
             scheduler: None,
+            recorded: Arc::default(),
             fixed_census: None,
             poll: LIVENESS_POLL,
             confirm: LIVENESS_CONFIRM,
@@ -3465,6 +3500,7 @@ impl ProcessGraphLiveness {
         Self {
             kernel: kernel.map(Arc::downgrade),
             scheduler: None,
+            recorded: Arc::default(),
             fixed_census,
             poll: std::time::Duration::from_millis(10),
             confirm,
@@ -3497,6 +3533,12 @@ impl ProcessGraphLiveness {
     /// next boundary and cannot claim a new row, so the capture reads a graph
     /// nothing is mutating. No new lock is taken.
     fn abort(&self, reason: crate::kernel::debug::AbortReason) -> RuntimeError {
+        // One capture per carrier. A second abort would describe a graph that
+        // the FIRST abort already froze and published over, so it could only
+        // ever be a later, weaker answer to the same question.
+        if let Some(recorded) = self.recorded.lock().as_ref() {
+            return recorded.error();
+        }
         if let Some(scheduler) = &self.scheduler {
             scheduler.poke_executor_control();
         }
@@ -3514,10 +3556,18 @@ impl ProcessGraphLiveness {
             "kernel aborted"
         );
         post_mortem.persist_if_configured();
-        RuntimeError::KernelAborted {
+        let record = KernelAbortRecord {
             reason: summary,
             post_mortem: Arc::new(post_mortem),
-        }
+        };
+        let error = record.error();
+        *self.recorded.lock() = Some(record);
+        error
+    }
+
+    /// The abort this carrier already suffered, if any.
+    fn recorded(&self) -> Option<RuntimeError> {
+        self.recorded.lock().as_ref().map(KernelAbortRecord::error)
     }
 
     fn liveness_abort(&self, census: GraphCensus, unpublished_jobs: usize) -> RuntimeError {
@@ -3569,14 +3619,6 @@ impl HvpatchLoopResult {
         self.state.result.lock().is_some()
     }
 
-    fn wait(self) -> Result<VcpuLoopOutcome, RuntimeError> {
-        let mut slot = self.state.result.lock();
-        while slot.is_none() {
-            self.state.ready.wait(&mut slot);
-        }
-        slot.take().unwrap_or_else(|| std::process::abort())
-    }
-
     /// Publish `result` only if nothing has published yet.
     ///
     /// [`Self::publish`] aborts the process on a double publication, which is
@@ -3593,6 +3635,21 @@ impl HvpatchLoopResult {
         *slot = Some(result);
         self.state.ready.notify_all();
         true
+    }
+
+    /// Unsupervised wait, for FIXTURES ONLY.
+    ///
+    /// The shipped path has exactly one wait — [`Self::wait_supervised`] — so
+    /// a job that nothing can publish is a named abort rather than a parked
+    /// thread. A unit fixture publishes its own result before waiting, so the
+    /// invariant has nothing to judge and would only add its poll interval.
+    #[cfg(test)]
+    pub(crate) fn wait(self) -> Result<VcpuLoopOutcome, RuntimeError> {
+        let mut slot = self.state.result.lock();
+        while slot.is_none() {
+            self.state.ready.wait(&mut slot);
+        }
+        slot.take().unwrap_or_else(|| std::process::abort())
     }
 
     /// Wait for this job's terminal result under the always-on
@@ -3615,6 +3672,12 @@ impl HvpatchLoopResult {
             self.state.ready.wait_for(&mut slot, liveness.poll);
             if slot.is_some() {
                 continue;
+            }
+            // An abort is carrier-terminal: once one exists, every wait in
+            // this carrier is answered by it, including the implicit carrier's
+            // own `shutdown_wait` on jobs whose guest tasks are still running.
+            if let Some(recorded) = liveness.recorded() {
+                return Err(recorded);
             }
             // An operator's `carrick debug abort --run-id` is latched by the
             // debug server and executed HERE, through the same sink, so a
@@ -10547,6 +10610,12 @@ pub(crate) enum VcpuLoopLaunch {
         result: HvpatchLoopResult,
         completion: continuation::LogicalJobCompletion,
         process_retirement: ProcessPhysicalRetirement,
+        /// The always-on runner invariant, carried so the CONTAINER ROOT's own
+        /// wait is supervised too. The exit wedge parked here as readily as in
+        /// `ContainerJobGroup::join`: this is the main thread's wait for the
+        /// root process job, and an unsupervised wait here would leave the
+        /// wedge in place for exactly the run every other lane goes through.
+        liveness: ProcessGraphLiveness,
     },
 }
 
@@ -10704,8 +10773,19 @@ impl VcpuLoopLaunch {
                 result,
                 completion,
                 process_retirement,
+                liveness,
             } => {
-                let outcome = result.wait();
+                let outcome = result.wait_supervised(&liveness);
+                // An aborted kernel's executor bindings are not going to
+                // retire: the abort exists precisely because the graph will
+                // not progress, and its guest threads are still loaded. Waiting
+                // for retirement here reported "logical HVPatch job N published
+                // before its executor binding retired" and MASKED the abort,
+                // turning the one answer the caller needs into a generic
+                // carrier failure.
+                if matches!(outcome, Err(RuntimeError::KernelAborted { .. })) {
+                    return outcome;
+                }
                 wait_for_physical_job_retirement(&completion)?;
                 match &outcome {
                     Ok(_) => process_retirement.wait()?,
@@ -11082,6 +11162,7 @@ where
             result: logical.result,
             completion: logical.completion,
             process_retirement: logical.process_retirement,
+            liveness: directory.process_graph_liveness(),
         }
     }
 }
@@ -12320,6 +12401,47 @@ mod tests {
             waiter.join().expect("waiter"),
             Ok(VcpuLoopOutcome::ThreadDone)
         ));
+    }
+
+    /// An abort is CARRIER-terminal. Without this, the container's own join
+    /// unwedged and the implicit carrier's `shutdown_wait` parked again on the
+    /// jobs of guest tasks that are still running — moving the hang instead of
+    /// removing it. Every later wait must be answered by the same record.
+    #[test]
+    fn a_recorded_abort_answers_every_later_wait_in_the_carrier() {
+        let census = Arc::new(Mutex::new(Some(dead_census())));
+        let liveness = ProcessGraphLiveness::for_tests(
+            None,
+            Some(Arc::clone(&census)),
+            Duration::from_millis(30),
+        );
+        assert!(liveness.recorded().is_none());
+
+        let first = HvpatchLoopResult::pending();
+        let Err(RuntimeError::KernelAborted {
+            reason: first_reason,
+            post_mortem: first_capture,
+        }) = first.wait_supervised(&liveness)
+        else {
+            panic!("the first wait must abort");
+        };
+
+        // A LIVE graph now: a later wait must still be refused, because the
+        // carrier's kernel was already frozen and published over.
+        *census.lock() = Some(live_census());
+        let second = HvpatchLoopResult::pending();
+        let Err(RuntimeError::KernelAborted {
+            reason: second_reason,
+            post_mortem: second_capture,
+        }) = second.wait_supervised(&liveness)
+        else {
+            panic!("a later wait must be answered by the recorded abort");
+        };
+        assert_eq!(first_reason, second_reason);
+        assert!(
+            Arc::ptr_eq(&first_capture, &second_capture),
+            "one abort must produce exactly one capture"
+        );
     }
 
     /// An unbound liveness sees no graph, so it must never judge one. Failing
@@ -13951,6 +14073,7 @@ mod tests {
             completion.clone(),
         ));
         let launch = VcpuLoopLaunch::Persistent {
+            liveness: ProcessGraphLiveness::unbound(),
             result: result.clone(),
             completion: completion.clone(),
             process_retirement: ProcessPhysicalRetirement::default(),
@@ -14007,6 +14130,7 @@ mod tests {
             .publish(vec![root_completion.clone(), sibling_completion.clone()])
             .unwrap();
         let launch = VcpuLoopLaunch::Persistent {
+            liveness: ProcessGraphLiveness::unbound(),
             result: result.clone(),
             completion: root_completion.clone(),
             process_retirement,
@@ -14153,6 +14277,7 @@ mod tests {
             sibling_completion,
         ));
         let launch = VcpuLoopLaunch::Persistent {
+            liveness: ProcessGraphLiveness::unbound(),
             result: root_result,
             completion: root_completion,
             process_retirement: kernel.process_physical_retirement.clone(),
@@ -14271,6 +14396,7 @@ mod tests {
             sibling_completion.clone(),
         ));
         let launch = VcpuLoopLaunch::Persistent {
+            liveness: ProcessGraphLiveness::unbound(),
             result: root_result.clone(),
             completion: root_completion.clone(),
             process_retirement: {

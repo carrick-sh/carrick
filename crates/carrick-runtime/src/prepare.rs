@@ -603,6 +603,12 @@ fn classify_run_outcome(
             }),
         ) => Err(e),
         Err(e @ RuntimeError::Configuration(_)) => Err(e),
+        // The kernel-abort sink carries the ONLY copy of the post-mortem. A
+        // `FsBackend(anyhow!)` wrap destroys it and relabels the one answer
+        // the caller needs ("kernel aborted: container deadline …") as
+        // "filesystem backend error: failed to run ELF from dispatcher: …" --
+        // the same mislabelling `Configuration` is passed through for.
+        Err(e @ RuntimeError::KernelAborted { .. }) => Err(e),
         Err(e) => Err(RuntimeError::FsBackend(anyhow::anyhow!("{label}: {e}"))),
     }
 }
