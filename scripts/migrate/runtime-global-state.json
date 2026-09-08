@@ -370,6 +370,14 @@
       "rationale": "Environment variable CARRICK_STRICT_DURABILITY read in strict_durability_enabled::CARRICK_STRICT_DURABILITY (crates/carrick-runtime/src/dispatch/fs/state.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "VMA_VISIT_COUNT",
+      "fingerprint": "1c4d18b8e7c751bce669e8f2b97b9fc31f1e40bb69697754f820f8138a20edcc",
+      "classification": "carrier_infra",
+      "rationale": "cfg(test)-only host thread-local counter of SemanticVma entries visited by one VmaMap mutation, backing the vma_map mutation-complexity test (single insert/remove/modify on 20,000 disjoint VMAs visits O(log n + affected) entries). Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED: it measures the mutating thread's own work and carries no Linux process semantics."
+    },
+    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "symbol": "debug_mmap_next_lowering::CARRICK_FORK_DEBUG_VA",
@@ -906,20 +914,20 @@
       "rationale": "Carrier-wide monotonic allocator ANON_FD_COUNTER in crates/carrick-runtime/src/fs_backend.rs generating unique IDs across the host process."
     },
     {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "HOST_XATTR_READS",
-      "fingerprint": "7c214600b35d2b01f0bc7f2b286479655384d920343399de997e2bad88e5cd0b",
-      "classification": "test_only",
-      "rationale": "cfg(test)-only atomic counter of host xattr reads, backing the fstat dentry cache regression test to verify zero host xattr reads on repeat fstat."
-    },
-    {
       "kind": "thread_local",
       "file": "crates/carrick-runtime/src/fs_backend.rs",
       "symbol": "EXCLUSIVE_ARCHIVE_GATES",
       "fingerprint": "f2d82442711502ce92f2b201cce414a32749146c1a91c11fb4843e7483c3a8a4",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell EXCLUSIVE_ARCHIVE_GATES in crates/carrick-runtime/src/fs_backend.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "HOST_XATTR_READS",
+      "fingerprint": "7c214600b35d2b01f0bc7f2b286479655384d920343399de997e2bad88e5cd0b",
+      "classification": "test_only",
+      "rationale": "cfg(test)-only atomic counter of host xattr reads, backing the fstat dentry cache regression test to verify zero host xattr reads on repeat fstat."
     },
     {
       "kind": "static",
@@ -978,20 +986,20 @@
       "rationale": "Carrier-wide host infrastructure static scratch_cleanup_sender::SENDER in crates/carrick-runtime/src/fs_backend.rs maintaining host process lifecycle or VM resources."
     },
     {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "tests::FS_RLIMIT_TEST_LOCK",
-      "fingerprint": "7773663f610e1202f0096166c01a64cc03201032928b18a2e5395a7ab6b584ef",
-      "classification": "test_only",
-      "rationale": "The cfg(test) mutex serializes host descriptor exhaustion tests that manipulate process rlimits."
-    },
-    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/fs_backend.rs",
       "symbol": "stat_cache_enabled::CARRICK_FS_STATCACHE",
       "fingerprint": "b16c7c1b5f4416fbfbeb65325342c905d6bb273050817180ef0318d722c2294a",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_FS_STATCACHE read in stat_cache_enabled::CARRICK_FS_STATCACHE (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "tests::FS_RLIMIT_TEST_LOCK",
+      "fingerprint": "7773663f610e1202f0096166c01a64cc03201032928b18a2e5395a7ab6b584ef",
+      "classification": "test_only",
+      "rationale": "The cfg(test) mutex serializes host descriptor exhaustion tests that manipulate process rlimits."
     },
     {
       "kind": "static",
@@ -1136,6 +1144,30 @@
       "fingerprint": "b22671436a90593b2a6cf5e38ea89268074463dd166be57269ed653c5718e430",
       "classification": "config_debug",
       "rationale": "Environment variable BASE_DIR_ENV read in base_directory::BASE_DIR_ENV (crates/carrick-runtime/src/kernel/debug/endpoint.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/kernel/debug/post_mortem.rs",
+      "symbol": "ABORT_REQUEST",
+      "fingerprint": "5688857f939b817680046312ba2d93688bc8c0e399932e682ce685cb30c4bcd8",
+      "classification": "carrier_infra",
+      "rationale": "A latch for `carrick debug abort --run-id`, set by the debug server thread and consumed exactly once by the runner's supervised wait. The artifact it triggers describes the CARRIER's one kernel graph, so carrier scope is the artifact's own scope, not an approximation of a narrower one."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/kernel/debug/post_mortem.rs",
+      "symbol": "INSTALLED_DIR",
+      "fingerprint": "0e3d6ca3c71cb6a3e0e101b0f089c59ca43786a7424f405875c60816e89bce5d",
+      "classification": "config_debug",
+      "rationale": "Where a kernel abort persists its capture, installed by --post-mortem-dir or ContainerBuilder::post_mortem_dir. A post-mortem describes the kernel and a host process owns one carrier and one kernel graph, so this is deliberately not per-container; the last caller wins and that is documented on the setter."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/kernel/debug/post_mortem.rs",
+      "symbol": "configured_dir::POST_MORTEM_DIR_ENV",
+      "fingerprint": "823e3b4fed734d90c869df9a51b4e6c57855b32b9b9d85be52a00f06c7c19186",
+      "classification": "config_debug",
+      "rationale": "CARRICK_POSTMORTEM_DIR is the environment spelling of --post-mortem-dir / ContainerBuilder::post_mortem_dir: where a kernel abort persists its capture. Diagnostic output location only; it changes no guest-visible behaviour and an installed directory takes precedence."
     },
     {
       "kind": "static",
@@ -1474,6 +1506,14 @@
       "rationale": "Carrier-wide host infrastructure static VCPU_RECLAIM_RESUME_NS in crates/carrick-runtime/src/vcpu_loop/mod.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "symbol": "abort::CARRICK_RUN_ID",
+      "fingerprint": "953114542a4126bc26109153a15da1a6aab9eace9d9e6bdcc2819659a277157a",
+      "classification": "carrier_infra",
+      "rationale": "The KernelAbort sink labels its post-mortem with the run identity the CARRIER was stamped with, which is exactly what scripts/sudo/kill.sh and the debug socket key on. It is carrier-scoped by construction (one carrier per host process) and is read once, at abort, purely as a label."
+    },
+    {
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "symbol": "capture_core_for_publication::CARRICK_CORE_FAILPOINT",
@@ -1698,6 +1738,22 @@
       "rationale": "Environment variable CARRICK_VDSO_MODE read in vdso_debug_mode::CARRICK_VDSO_MODE (crates/carrick-runtime/src/vdso_policy.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vfs/dentry.rs",
+      "symbol": "new::CARRICK_DENTRY_CACHE_CAPACITY_BYTES",
+      "fingerprint": "fb5398024873873ac5e1eb7fc687366e8c956cbba621890093646e94aa0b1f25",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DENTRY_CACHE_CAPACITY_BYTES read in new::CARRICK_DENTRY_CACHE_CAPACITY_BYTES (crates/carrick-runtime/src/vfs/dentry.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vfs/dentry.rs",
+      "symbol": "new::CARRICK_DENTRY_EVICT",
+      "fingerprint": "b5c916c6541e982f549357c4358c60c34a4fb16f0f727a4a0cb900e017fc656a",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DENTRY_EVICT read in new::CARRICK_DENTRY_EVICT (crates/carrick-runtime/src/vfs/dentry.rs) configuring carrier behavior or debug logging."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
       "symbol": "OOM_SCORE_ADJ_SINGLE_PROCESS",
@@ -1728,6 +1784,14 @@
       "fingerprint": "1bf7f880c4f5e57523a0a03a80507cccedb9294b89369c8e77209575120f64a1",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static sysctl_boot_id::BOOT_ID in crates/carrick-runtime/src/vfs/proc.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "CURRENT_MM_QUIESCE",
+      "fingerprint": "d5a264c79a63b6204c959aec0a18a36c2d09feab9b0108752c577babb66154bf",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
     },
     {
       "kind": "static",
@@ -2168,14 +2232,6 @@
       "fingerprint": "d4c0c2b4d0434b284b08ad53be54942e8a78fe5ab78362a24ab33dbb97953d8e",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell THREAD_VCPU_CREATED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs maintaining per-host-thread execution state for the carrier."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "VMA_VISIT_COUNT",
-      "fingerprint": "1c4d18b8e7c751bce669e8f2b97b9fc31f1e40bb69697754f820f8138a20edcc",
-      "classification": "carrier_infra",
-      "rationale": "cfg(test)-only host thread-local counter of SemanticVma entries visited by one VmaMap mutation, backing the vma_map mutation-complexity test (single insert/remove/modify on 20,000 disjoint VMAs visits O(log n + affected) entries). Same per-host-thread scope and rationale as ALIAS_STATE_ROWS_SCANNED: it measures the mutating thread's own work and carries no Linux process semantics."
     },
     {
       "kind": "static",
@@ -2664,30 +2720,6 @@
       "fingerprint": "ab0b08b97611e117782a41f621e4ace1ab4d3cc389433a60a25ff4abe830222f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static park_for_slot::GATE_MUTEX in crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vfs/dentry.rs",
-      "symbol": "new::CARRICK_DENTRY_CACHE_CAPACITY_BYTES",
-      "fingerprint": "fb5398024873873ac5e1eb7fc687366e8c956cbba621890093646e94aa0b1f25",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DENTRY_CACHE_CAPACITY_BYTES read in new::CARRICK_DENTRY_CACHE_CAPACITY_BYTES (crates/carrick-runtime/src/vfs/dentry.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vfs/dentry.rs",
-      "symbol": "new::CARRICK_DENTRY_EVICT",
-      "fingerprint": "b5c916c6541e982f549357c4358c60c34a4fb16f0f727a4a0cb900e017fc656a",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DENTRY_EVICT read in new::CARRICK_DENTRY_EVICT (crates/carrick-runtime/src/vfs/dentry.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-thread/src/fork_quiesce.rs",
-      "symbol": "CURRENT_MM_QUIESCE",
-      "fingerprint": "d5a264c79a63b6204c959aec0a18a36c2d09feab9b0108752c577babb66154bf",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
     }
   ]
 }

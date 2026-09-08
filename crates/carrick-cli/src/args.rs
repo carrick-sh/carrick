@@ -382,6 +382,12 @@ pub(crate) enum Commands {
         /// See `run-elf --debug-state-path`.
         #[arg(long = "debug-state-path")]
         debug_state_path: Option<PathBuf>,
+        /// Write `post-mortem.json` and `event-ring.jsonl` here if this run's
+        /// kernel is ever aborted — by the always-on process-graph liveness
+        /// invariant or by `carrick debug abort --run-id`. Equivalent to
+        /// setting `CARRICK_POSTMORTEM_DIR`.
+        #[arg(long = "post-mortem-dir")]
+        post_mortem_dir: Option<PathBuf>,
         /// Emit the JSON compat-report envelope (exit code, traps, report) on
         /// stdout instead of behaving like `docker run`. Opt-in; off by default.
         #[arg(long)]
@@ -973,6 +979,22 @@ pub(crate) enum DebugCommand {
         /// List the selectable table names and exit.
         #[arg(long)]
         list_tables: bool,
+    },
+    /// Abort a LIVE run's kernel and make it produce a post-mortem.
+    ///
+    /// The runtime freezes its scheduler, captures one `PostMortem` in
+    /// process (kernel graph, findings, event ring) and completes every
+    /// unpublished container job with `EmbedError::KernelAborted`, so a wedged
+    /// run ends with evidence instead of needing `lldb`. This is the Rust
+    /// replacement for the host-wide shell watchdog's backtrace step.
+    ///
+    /// The capture is written to the run's `--post-mortem-dir` /
+    /// `CARRICK_POSTMORTEM_DIR` when it has one; this command reports where.
+    Abort {
+        /// Exact external run identity the run was started with as
+        /// `CARRICK_RUN_ID`. The socket path carries only its digest.
+        #[arg(long)]
+        run_id: String,
     },
     /// Print the versioned native-x86 DSR context layout consumed by
     /// `scripts/native-x86-profile.py`. The running process's matching Carrick

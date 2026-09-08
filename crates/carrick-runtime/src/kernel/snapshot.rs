@@ -315,14 +315,42 @@ struct LeafChecks {
 
 impl Kernel {
     pub fn snapshot(&self, deadline: Instant) -> Result<KernelSnapshotV1, KernelSnapshotError> {
+        self.snapshot_with(deadline, SnapshotValidation::Strict)
+            .map(|forensic| forensic.snapshot)
+    }
+
+    /// Capture for a POST-MORTEM: never refuse, report what is broken.
+    ///
+    /// [`Self::snapshot`] is a served projection, so a graph that violates an
+    /// invariant is a refusal — a caller must not be handed state it cannot
+    /// trust. A post-mortem is the opposite contract: the graph is already
+    /// known to be wrong, and the violated invariant is the most valuable row
+    /// in the capture. A wedged carrier whose root mm had retired while an
+    /// alias-registry row outlived it made
+    /// `carrick debug hvpatch-kernel` answer only "mapping MappingId(22) names
+    /// mm MmId(1), which is not in the snapshot" and print nothing else, so the
+    /// investigation lost both the leak and the graph. Here every violated
+    /// clause becomes a [`SnapshotFinding`] carried BESIDE the tables.
+    pub fn forensic_snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<ForensicSnapshot, KernelSnapshotError> {
+        self.snapshot_with(deadline, SnapshotValidation::Forensic)
+    }
+
+    fn snapshot_with(
+        &self,
+        deadline: Instant,
+        validation: SnapshotValidation,
+    ) -> Result<ForensicSnapshot, KernelSnapshotError> {
         self.sweep_observations_until(deadline)?;
         let mut saw_race = false;
         for _ in 0..MAX_ATTEMPTS {
             if Instant::now() >= deadline {
                 return Err(KernelSnapshotError::TimedOut);
             }
-            match self.snapshot_once(deadline) {
-                Ok(snapshot) => return Ok(snapshot),
+            match self.snapshot_once(deadline, validation) {
+                Ok((snapshot, findings)) => return Ok(ForensicSnapshot { snapshot, findings }),
                 Err(AttemptError::Race) => saw_race = true,
                 Err(AttemptError::Public(error)) => return Err(error),
             }
@@ -331,7 +359,11 @@ impl Kernel {
         Err(KernelSnapshotError::Busy)
     }
 
-    fn snapshot_once(&self, deadline: Instant) -> Result<KernelSnapshotV1, AttemptError> {
+    fn snapshot_once(
+        &self,
+        deadline: Instant,
+        validation: SnapshotValidation,
+    ) -> Result<(KernelSnapshotV1, Vec<SnapshotFinding>), AttemptError> {
         let registry = self.copy_registry(deadline)?;
         let live_task_by_key: BTreeMap<_, _> = registry
             .tasks
@@ -929,8 +961,16 @@ impl Kernel {
 
         // Every revision and the registry epoch held, so these tables are one
         // coherent observation. Any invariant that fails now is real.
-        validate_snapshot(&snapshot)?;
-        Ok(snapshot)
+        match validation {
+            SnapshotValidation::Strict => {
+                validate_snapshot(&snapshot)?;
+                Ok((snapshot, Vec::new()))
+            }
+            SnapshotValidation::Forensic => {
+                let findings = audit_snapshot(&snapshot);
+                Ok((snapshot, findings))
+            }
+        }
     }
 
     fn copy_registry(&self, deadline: Instant) -> Result<RegistryCopy, AttemptError> {
@@ -1218,6 +1258,78 @@ fn sort_snapshot(snapshot: &mut KernelSnapshotV1) {
     snapshot.sighands.sort_by_key(|row| row.id);
     snapshot.task_signals.sort_by_key(|row| row.task);
     snapshot.thread_signals.sort_by_key(|row| row.thread);
+}
+
+/// How a collected snapshot is judged. Collection is identical either way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotValidation {
+    /// Refuse the whole snapshot on the first violated invariant.
+    Strict,
+    /// Keep the snapshot and record every violation as a finding.
+    Forensic,
+}
+
+/// A snapshot plus everything wrong with it. `findings` is empty for a strict
+/// snapshot by construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForensicSnapshot {
+    pub snapshot: KernelSnapshotV1,
+    pub findings: Vec<SnapshotFinding>,
+}
+
+/// One thing wrong with a captured kernel graph.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SnapshotFinding {
+    /// An alias-registry mapping row that outlived the mm it names — the
+    /// leak signature of the 2026-09-07 exit wedge, where the root mm retired
+    /// and its mapping row stayed behind.
+    #[error("dangling mapping {mapping:?}: it names mm {mm:?}, which no longer exists")]
+    DanglingMapping { mapping: MappingId, mm: MmId },
+    /// Any other invariant `validate_snapshot` would have refused on.
+    #[error("kernel snapshot invariant violated: {0}")]
+    Invariant(String),
+}
+
+/// Judge a snapshot without refusing it.
+///
+/// The dangling-mapping class is enumerated EXHAUSTIVELY first — `validate_snapshot`
+/// returns on the first violation, so it can only ever name one row, and a leak
+/// is a population question. Whatever `validate_snapshot` still objects to
+/// afterwards is recorded verbatim as an `Invariant` finding.
+fn audit_snapshot(snapshot: &KernelSnapshotV1) -> Vec<SnapshotFinding> {
+    let mut findings = Vec::new();
+    let mm_ids: BTreeSet<_> = snapshot.mms.iter().map(|row| row.id).collect();
+    let mut pruned = snapshot.clone();
+    pruned.mappings.retain(|mapping| {
+        if mm_ids.contains(&mapping.mm) {
+            return true;
+        }
+        findings.push(SnapshotFinding::DanglingMapping {
+            mapping: mapping.mapping,
+            mm: mapping.mm,
+        });
+        false
+    });
+    // Dangling rows also break the frame alias-list and per-mm join clauses,
+    // so those are re-judged against the pruned tables: reporting one leak
+    // three times under three names would bury the other findings.
+    if !findings.is_empty() {
+        for frame in &mut pruned.frames {
+            frame
+                .mappings
+                .retain(|mapping| pruned.mappings.iter().any(|row| row.mapping == *mapping));
+        }
+        for mm in &mut pruned.mms {
+            mm.mapping_ids
+                .retain(|mapping| pruned.mappings.iter().any(|row| row.mapping == *mapping));
+        }
+    }
+    if let Err(AttemptError::Public(KernelSnapshotError::InvariantViolation(message))) =
+        validate_snapshot(&pruned)
+    {
+        findings.push(SnapshotFinding::Invariant(message));
+    }
+    findings
 }
 
 fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
@@ -2129,6 +2241,94 @@ mod tests {
                 Err(KernelSnapshotError::InvariantViolation(_))
             ));
         }
+    }
+
+    /// The exact wedge signature: an alias-registry mapping row whose mm has
+    /// retired. `snapshot` REFUSES it (right for a served projection), and
+    /// `forensic_snapshot` must keep every table and name the leak instead.
+    ///
+    /// Two wedged carriers were captured on 2026-09-07 only as the single line
+    /// "mapping MappingId(22) names mm MmId(1), which is not in the snapshot" —
+    /// the refusal destroyed the very graph the investigation needed.
+    #[test]
+    fn a_dangling_mapping_is_a_forensic_finding_not_a_refused_capture() {
+        let (kernel, _root) = bootstrap(TestBackend::new(BackendMode::BrokenMappingJoin));
+        assert!(
+            matches!(
+                kernel.snapshot(deadline()),
+                Err(KernelSnapshotError::InvariantViolation(_))
+            ),
+            "the served projection must still fail closed"
+        );
+
+        let forensic = kernel
+            .forensic_snapshot(deadline())
+            .expect("a post-mortem capture must never refuse itself");
+        assert!(
+            !forensic.findings.is_empty(),
+            "the violated invariant is the most valuable row in a capture"
+        );
+        assert!(
+            !forensic.snapshot.tasks.is_empty(),
+            "the tables must survive the finding"
+        );
+    }
+
+    /// A dangling row is a POPULATION question, so every one is enumerated —
+    /// `validate_snapshot` returns on the first and can only ever name one.
+    #[test]
+    fn every_dangling_mapping_is_named_not_just_the_first() {
+        let (kernel, _root) = bootstrap(TestBackend::new(BackendMode::Good));
+        let mut snapshot = kernel.snapshot(deadline()).expect("clean snapshot");
+        let retired =
+            MmId::from_registry_allocation(NonZeroU64::new(u64::MAX).expect("retired mm identity"));
+        let dangling_row = |raw: u64| MappingRow {
+            mapping: MappingId::from_kernel_allocation(NonZeroU64::new(raw).expect("mapping id")),
+            frame: FrameId::from_kernel_allocation(NonZeroU64::new(raw).expect("frame id")),
+            mm: retired,
+            generation: carrick_hal::MappingGeneration::from_backend_counter(
+                NonZeroU64::new(1).expect("generation"),
+            ),
+            gpa: carrick_guest_mem::Gpa(raw * 0x1000),
+            length: carrick_hal::FrameLength::from_mapping_extent(
+                NonZeroU64::new(4096).expect("length"),
+            ),
+            permissions: carrick_hal::MemPerms {
+                read: true,
+                write: false,
+                exec: false,
+            },
+        };
+        snapshot.mappings.push(dangling_row(9_001));
+        snapshot.mappings.push(dangling_row(9_002));
+
+        let findings = audit_snapshot(&snapshot);
+        let dangling: Vec<_> = findings
+            .iter()
+            .filter(|finding| matches!(finding, SnapshotFinding::DanglingMapping { .. }))
+            .collect();
+        assert_eq!(dangling.len(), 2, "{findings:?}");
+        let rendered = dangling
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(rendered.contains("9001"), "{rendered}");
+        assert!(rendered.contains("9002"), "{rendered}");
+        assert!(rendered.contains("no longer exists"), "{rendered}");
+    }
+
+    /// A clean graph produces no findings: the forensic path must not invent
+    /// diagnoses, or every capture would read as broken.
+    #[test]
+    fn a_clean_graph_captures_with_no_findings() {
+        let (kernel, _root) = bootstrap(TestBackend::new(BackendMode::Good));
+        let forensic = kernel.forensic_snapshot(deadline()).expect("capture");
+        assert_eq!(forensic.findings, Vec::new());
+        assert_eq!(
+            forensic.snapshot,
+            kernel.snapshot(deadline()).expect("served snapshot")
+        );
     }
 
     #[test]

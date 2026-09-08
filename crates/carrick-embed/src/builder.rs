@@ -300,6 +300,19 @@ impl ContainerBuilder {
         self
     }
 
+    /// Write `post-mortem.json` and `event-ring.jsonl` here if the kernel is
+    /// ever aborted (`EmbedError::KernelAborted`).
+    ///
+    /// The capture always travels IN the error; this only persists a copy for
+    /// a harness that reads files rather than values. It is installed for the
+    /// host process, not this container: a post-mortem describes the kernel,
+    /// and a host process owns exactly one carrier and one kernel graph.
+    /// `CARRICK_POSTMORTEM_DIR` is the environment spelling of the same knob.
+    pub fn post_mortem_dir(self, dir: impl Into<std::path::PathBuf>) -> Self {
+        carrick_runtime::kernel::debug::PostMortem::install_dir(dir.into());
+        self
+    }
+
     /// Register a syscall observer to receive lifecycle and syscall events for this container.
     pub fn observer(
         mut self,

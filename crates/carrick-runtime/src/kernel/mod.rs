@@ -65,7 +65,7 @@ pub use debug::{
     EndpointError as KernelDebugEndpointError, KernelDebugAuxProvider, KernelDebugDtoError,
     KernelDebugRequest, KernelDebugServer, KernelDebugSnapshot, KernelDebugTable,
     ServerError as KernelDebugServerError, UnknownTable as UnknownKernelTable,
-    fetch as kernel_debug_fetch,
+    abort as kernel_debug_abort, fetch as kernel_debug_fetch,
 };
 pub use exec::{ExecError, PreparedExec};
 pub use frame_inventory::{
@@ -119,11 +119,12 @@ pub use scheduler::{
 };
 pub use snapshot::{
     CredentialsSnapshotRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,
-    FileSlotSnapshotRow, FileTableSnapshotRow, FsContextSnapshotRow, KERNEL_SNAPSHOT_V1_SCHEMA,
-    KernelSnapshotError, KernelSnapshotV1, MmSnapshotRow, ObjectSnapshotClass,
-    ProcessGroupSnapshotRow, SessionSnapshotRow, SighandSnapshotRow, TaskSharedObservationKey,
-    TaskSharedSnapshotRow, TaskSignalSnapshotRow, TaskSnapshotRow, ThreadResourcesObservationKey,
-    ThreadResourcesSnapshotRow, ThreadSignalSnapshotRow, ThreadSnapshotClass, ThreadSnapshotRow,
-    VmaSnapshotRow, ZombieSnapshotRow,
+    FileSlotSnapshotRow, FileTableSnapshotRow, ForensicSnapshot, FsContextSnapshotRow,
+    KERNEL_SNAPSHOT_V1_SCHEMA, KernelSnapshotError, KernelSnapshotV1, MmSnapshotRow,
+    ObjectSnapshotClass, ProcessGroupSnapshotRow, SessionSnapshotRow, SighandSnapshotRow,
+    SnapshotFinding, TaskSharedObservationKey, TaskSharedSnapshotRow, TaskSignalSnapshotRow,
+    TaskSnapshotRow, ThreadResourcesObservationKey, ThreadResourcesSnapshotRow,
+    ThreadSignalSnapshotRow, ThreadSnapshotClass, ThreadSnapshotRow, VmaSnapshotRow,
+    ZombieSnapshotRow,
 };
 pub use wait_set::{WaitEnrollment, WaitQueue, WaitSet, WaitSetOutcome};

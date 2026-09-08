@@ -406,6 +406,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 platform: None,
                 max_traps: DEFAULT_MAX_TRAPS,
                 debug_state_path: None,
+                post_mortem_dir: None,
                 json: false,
                 pull: crate::args::PullArg::Missing,
                 tty: interactive,
@@ -829,6 +830,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             platform,
             max_traps,
             debug_state_path,
+            post_mortem_dir,
             json,
             tty,
             interactive,
@@ -870,6 +872,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     // SAFETY: single-threaded at this point (pre-runtime).
                     unsafe { std::env::set_var(k, v) };
                 }
+            }
+            if let Some(dir) = post_mortem_dir {
+                carrick_runtime::kernel::debug::PostMortem::install_dir(dir);
             }
             let parsed_network = parse_network_mode_arg(&network)?;
             let published_ports = parse_publish_specs(parsed_network.mode, &publish)?;

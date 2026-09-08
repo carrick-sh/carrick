@@ -111,6 +111,20 @@ pub(crate) fn run_debug(
         } => {
             run_hvpatch_kernel_snapshot(run_id.as_deref(), &tables, list_tables)?;
         }
+        DebugCommand::Abort { run_id } => {
+            let ack = carrick_runtime::kernel::kernel_debug_abort(&run_id)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": ack.schema,
+                    "run_id": ack.run_id,
+                    "post_mortem_dir": ack.post_mortem_dir,
+                    "note": "the runtime performs one capture at its next runner boundary; \
+                             the run itself fails with EmbedError::KernelAborted",
+                }))?
+            );
+        }
         DebugCommand::NativeX86Layout => {
             println!(
                 "{}",
