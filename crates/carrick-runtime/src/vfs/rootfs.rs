@@ -137,33 +137,25 @@ impl OpenDispatchResult {
 
 impl RootFsVfs {
     pub fn new() -> Self {
-        let cache = Arc::new(crate::vfs::DentryCache::new(false));
-        let overlay = Box::new(MemoryBackend::new());
-        overlay.attach_dentry_cache(Arc::downgrade(&cache));
         Self {
             rootfs: None,
-            overlay,
-            dentry_cache: cache,
+            overlay: Box::new(MemoryBackend::new()),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
         }
     }
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
-        let cache = Arc::new(crate::vfs::DentryCache::new(false));
-        let overlay = Box::new(MemoryBackend::new());
-        overlay.attach_dentry_cache(Arc::downgrade(&cache));
         Self {
             rootfs: Some(rootfs),
-            overlay,
-            dentry_cache: cache,
+            overlay: Box::new(MemoryBackend::new()),
+            dentry_cache: Arc::new(crate::vfs::DentryCache::new(false)),
         }
     }
 
     /// Swap the writable overlay. Returns the previously-installed
     /// backend so the caller can decide what to do with it.
     pub fn set_overlay(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
-        let cache = Arc::new(crate::vfs::DentryCache::new(backend.is_shared()));
-        backend.attach_dentry_cache(Arc::downgrade(&cache));
-        self.dentry_cache = cache;
+        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(backend.is_shared()));
         std::mem::replace(&mut self.overlay, backend)
     }
 
@@ -297,9 +289,7 @@ impl RootFsVfs {
     /// Reset dentry cache on rootfs layer mutation.
     pub fn reset_dentry_cache(&mut self) {
         let is_shared = self.dentry_cache.is_shared();
-        let cache = Arc::new(crate::vfs::DentryCache::new(is_shared));
-        self.overlay.attach_dentry_cache(Arc::downgrade(&cache));
-        self.dentry_cache = cache;
+        self.dentry_cache = Arc::new(crate::vfs::DentryCache::new(is_shared));
     }
 
     /// Create raw host fd in writable overlay and announce creation to dentry cache.

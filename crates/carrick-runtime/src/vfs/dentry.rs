@@ -2806,36 +2806,6 @@ impl DentryCache {
         }
         false
     }
-
-    /// Retrieve the upper directory file descriptor for a guest-absolute path if cached.
-    pub fn upper_dir_fd_for_guest_path(&self, guest_path: &str) -> Option<Arc<OwnedFd>> {
-        let norm = guest_path.trim_end_matches('/');
-        let norm = if norm.is_empty() { "/" } else { norm };
-        let map = self.path_to_dir_id.read();
-        let dir_id = map
-            .get(norm)
-            .or_else(|| map.get(norm.trim_end_matches('/')))?;
-        let dirs = self.dirs.read();
-        let dir = dirs.get(dir_id)?;
-        dir.upper_dir_fd.clone()
-    }
-
-    /// Update the upper directory fd for a cached directory.
-    pub fn publish_dir_upper_fd(&self, guest_path: &str, fd: &Arc<OwnedFd>) {
-        let norm = guest_path.trim_end_matches('/');
-        let norm = if norm.is_empty() { "/" } else { norm };
-        let map = self.path_to_dir_id.read();
-        if let Some(dir_id) = map
-            .get(norm)
-            .or_else(|| map.get(norm.trim_end_matches('/')))
-        {
-            let mut dirs = self.dirs.write();
-            if let Some(dir) = dirs.get_mut(dir_id) {
-                dir.upper_dir_fd = Some(fd.clone());
-                dir.upper_probed_gen = u64::MAX;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
