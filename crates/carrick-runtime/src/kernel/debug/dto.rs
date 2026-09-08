@@ -257,6 +257,13 @@ pub struct DebugZombieRow {
 pub struct DebugThreadRow {
     pub key: DebugThreadKey,
     pub execution: String,
+    /// The parked continuation, when the thread is blocked on one. `execution`
+    /// reports only that a continuation exists; this reports what it waits on
+    /// and whether the wait service still holds a registration for it, which
+    /// is the difference between "no producer can wake this" and "a producer
+    /// did wake it and the scheduler dropped the edge".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<DebugContinuationRow>,
     pub task: DebugTaskKey,
     pub registry_id: Option<i32>,
     pub class: DebugClass,
@@ -264,6 +271,39 @@ pub struct DebugThreadRow {
     pub fs_context: Option<u64>,
     pub credentials: Option<u64>,
     pub exec_invalidation_pending: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugContinuationRow {
+    pub id: u64,
+    pub family: String,
+    pub detail: String,
+    pub deadline_ms_remaining: Option<i64>,
+    pub registration: Option<DebugContinuationRegistrationRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugContinuationRegistrationRow {
+    pub continuation: u64,
+    pub thread_serial: u64,
+    pub execution_generation: u64,
+    pub registration_generation: u64,
+    pub service_alive: bool,
+    pub state: String,
+    pub event: Option<String>,
+    pub probe: String,
+    pub poll_fds: Vec<DebugPollFdRow>,
+    pub subscriptions: usize,
+    pub has_task_waker: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugPollFdRow {
+    pub fd: i32,
+    pub events: i16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -717,6 +757,7 @@ impl KernelDebugSnapshot {
                     .iter()
                     .map(|row| DebugThreadRow {
                         execution: row.execution.clone(),
+                        continuation: row.continuation.as_ref().map(continuation_row),
                         key: thread_key(row.key),
                         task: task_key(row.task),
                         registry_id: row.registry_id.map(|id| id.raw()),
@@ -1285,6 +1326,39 @@ impl KernelDebugSnapshot {
         )?;
 
         Ok(())
+    }
+}
+
+fn continuation_row(
+    diagnostic: &crate::vcpu_loop::continuation::ContinuationDiagnostic,
+) -> DebugContinuationRow {
+    DebugContinuationRow {
+        id: diagnostic.id,
+        family: diagnostic.family.to_owned(),
+        detail: diagnostic.detail.clone(),
+        deadline_ms_remaining: diagnostic.deadline_ms_remaining,
+        registration: diagnostic.registration.as_ref().map(|registration| {
+            DebugContinuationRegistrationRow {
+                continuation: registration.continuation,
+                thread_serial: registration.thread_serial,
+                execution_generation: registration.execution_generation,
+                registration_generation: registration.registration_generation,
+                service_alive: registration.service_alive,
+                state: registration.state.clone(),
+                event: registration.event.map(str::to_owned),
+                probe: registration.probe.clone(),
+                poll_fds: registration
+                    .poll_fds
+                    .iter()
+                    .map(|poll_fd| DebugPollFdRow {
+                        fd: poll_fd.fd,
+                        events: poll_fd.events,
+                    })
+                    .collect(),
+                subscriptions: registration.subscriptions,
+                has_task_waker: registration.has_task_waker,
+            }
+        }),
     }
 }
 

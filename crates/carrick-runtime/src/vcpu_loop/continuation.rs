@@ -378,6 +378,188 @@ pub enum ChildSelector {
     HostPid(i32),
 }
 
+/// Pointer-free diagnostic view of one parked continuation. See
+/// [`BlockedContinuation::diagnostic`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuationDiagnostic {
+    pub id: u64,
+    pub family: &'static str,
+    pub detail: String,
+    pub deadline_ms_remaining: Option<i64>,
+    pub registration: Option<ContinuationRegistrationDiagnostic>,
+}
+
+/// The wait-service side of a parked continuation: the registration the
+/// producers publish into, as the service actually holds it right now.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuationRegistrationDiagnostic {
+    pub continuation: u64,
+    pub thread_serial: u64,
+    pub execution_generation: u64,
+    pub registration_generation: u64,
+    /// `false` once the owning [`CarrierWaitService`] has been dropped: no
+    /// reactor exists to poll this registration's fds any more.
+    pub service_alive: bool,
+    /// `prepared` / `enrolled` / `ready` / `cancelled(<cause>)` / `consumed`,
+    /// or `absent` / `token-mismatch` / `service-dropped` when the service
+    /// holds no entry this continuation can be woken through.
+    pub state: String,
+    pub event: Option<&'static str>,
+    pub probe: String,
+    /// Host fds the reactor polls for this registration, with their `poll(2)`
+    /// event mask. Empty for probes that are not fd-driven.
+    pub poll_fds: Vec<DiagnosticPollFd>,
+    pub subscriptions: usize,
+    pub has_task_waker: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiagnosticPollFd {
+    pub fd: i32,
+    pub events: i16,
+}
+
+fn detail_diagnostic(detail: &ContinuationDetail) -> String {
+    match detail {
+        ContinuationDetail::Futex { wait, index } => {
+            format!("futex addr={:#x} index={index:?}", wait.addr)
+        }
+        ContinuationDetail::SharedFutex {
+            generation, value, ..
+        } => format!("shared-futex addr={:#x} value={value}", generation.addr),
+        ContinuationDetail::SharedWord {
+            generation, value, ..
+        } => format!("shared-word addr={:#x} value={value}", generation.addr),
+        ContinuationDetail::Fds {
+            registrations,
+            on_timeout,
+            ..
+        } => format!("fds n={} on_timeout={on_timeout}", registrations.len()),
+        ContinuationDetail::Select { registrations, .. } => {
+            format!("select n={}", registrations.len())
+        }
+        ContinuationDetail::HostWrite(_) => "host-write".to_owned(),
+        ContinuationDetail::RecordLock(_) => "record-lock".to_owned(),
+        ContinuationDetail::Process { selector, .. } => match selector {
+            ChildSelector::Exact(task) => {
+                format!("process exact={}.{}", task.id.raw(), task.serial.raw())
+            }
+            ChildSelector::AnyChildOf(task) => {
+                format!(
+                    "process any-child-of={}.{}",
+                    task.id.raw(),
+                    task.serial.raw()
+                )
+            }
+            ChildSelector::HostPid(pid) => format!("process host-pid={pid}"),
+        },
+        ContinuationDetail::Signals { wait_set, .. } => {
+            format!("signals wait_set={:#x}", wait_set.raw())
+        }
+        ContinuationDetail::Sleep => "sleep".to_owned(),
+        ContinuationDetail::Vfork { child, .. } => {
+            format!("vfork child={}.{}", child.id.raw(), child.serial.raw())
+        }
+    }
+}
+
+fn probe_diagnostic(probe: &ReadinessProbe) -> (String, Vec<DiagnosticPollFd>) {
+    match probe {
+        ReadinessProbe::Futex { wait, .. } => (format!("futex addr={:#x}", wait.addr), Vec::new()),
+        ReadinessProbe::Fds { registrations, .. } => (
+            format!("fds n={}", registrations.len()),
+            registrations
+                .iter()
+                .map(|registration| DiagnosticPollFd {
+                    fd: registration.fd.as_raw_fd(),
+                    events: registration.events,
+                })
+                .collect(),
+        ),
+        ReadinessProbe::SharedWord { generation, .. } => (
+            format!("shared-word addr={:#x}", generation.addr),
+            Vec::new(),
+        ),
+        ReadinessProbe::HostWrite { write, .. } => (
+            format!("host-write fd={}", write.lock().host_fd()),
+            Vec::new(),
+        ),
+        ReadinessProbe::RecordLock { .. } => ("record-lock".to_owned(), Vec::new()),
+        ReadinessProbe::TaskWake { task, observed, .. } => (
+            format!(
+                "task-wake observed={observed} task_alive={}",
+                task.upgrade().is_some()
+            ),
+            Vec::new(),
+        ),
+        ReadinessProbe::Vfork { .. } => ("vfork".to_owned(), Vec::new()),
+        ReadinessProbe::Timer { .. } => ("timer".to_owned(), Vec::new()),
+        ReadinessProbe::Passive { .. } => ("passive".to_owned(), Vec::new()),
+    }
+}
+
+fn event_diagnostic(event: &ContinuationEvent) -> &'static str {
+    match event {
+        ContinuationEvent::Ready => "ready",
+        ContinuationEvent::Timeout => "timeout",
+        ContinuationEvent::Signal => "signal",
+        ContinuationEvent::ReservedSignal(_) => "reserved-signal",
+    }
+}
+
+fn registration_state_diagnostic(state: RegistrationState) -> String {
+    match state {
+        RegistrationState::Prepared => "prepared".to_owned(),
+        RegistrationState::Enrolled => "enrolled".to_owned(),
+        RegistrationState::Ready => "ready".to_owned(),
+        RegistrationState::Consumed => "consumed".to_owned(),
+        RegistrationState::Cancelled(cause) => format!("cancelled({cause:?})"),
+    }
+}
+
+fn registration_diagnostic(binding: &RegistrationBinding) -> ContinuationRegistrationDiagnostic {
+    let token = binding.token;
+    let absent = |state: &str| ContinuationRegistrationDiagnostic {
+        continuation: token.continuation.raw(),
+        thread_serial: token.thread_serial,
+        execution_generation: token.execution_raw,
+        registration_generation: token.registration_generation,
+        service_alive: true,
+        state: state.to_owned(),
+        event: None,
+        probe: "none".to_owned(),
+        poll_fds: Vec::new(),
+        subscriptions: 0,
+        has_task_waker: false,
+    };
+    let Some(service) = binding.service.upgrade() else {
+        let mut row = absent("service-dropped");
+        row.service_alive = false;
+        return row;
+    };
+    let state = service.state.lock();
+    let Some(entry) = state.entries.get(&token.continuation) else {
+        return absent("absent");
+    };
+    if entry.token != token {
+        return absent("token-mismatch");
+    }
+    let (probe, poll_fds) = probe_diagnostic(&entry.probe);
+    ContinuationRegistrationDiagnostic {
+        continuation: token.continuation.raw(),
+        thread_serial: token.thread_serial,
+        execution_generation: token.execution_raw,
+        registration_generation: token.registration_generation,
+        service_alive: true,
+        state: registration_state_diagnostic(entry.state),
+        event: entry.event.as_ref().map(event_diagnostic),
+        probe,
+        poll_fds,
+        subscriptions: entry.subscriptions.len(),
+        has_task_waker: entry.task_waker.is_some(),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct OwnedFdRegistration {
     #[allow(dead_code)]
@@ -579,6 +761,30 @@ impl ContinuationFamily {
             Self::WaitOnSignals => 14,
             Self::WaitOnSleep => 15,
             Self::VforkParent => 16,
+        }
+    }
+
+    /// Stable snapshot spelling. Same rule as `event_code`: a wedge snapshot
+    /// outlives the build that produced it, so the name is written out rather
+    /// than derived from the Rust variant.
+    pub(crate) const fn wire_name(self) -> &'static str {
+        match self {
+            Self::FutexWait => "futex-wait",
+            Self::FutexWaitv => "futex-waitv",
+            Self::SharedFutexWait => "shared-futex-wait",
+            Self::SharedFutexWaitv => "shared-futex-waitv",
+            Self::WaitOnSharedWord => "wait-on-shared-word",
+            Self::WaitOnFds => "wait-on-fds",
+            Self::WaitOnFdsSelect => "wait-on-fds-select",
+            Self::WaitOnPollFds => "wait-on-poll-fds",
+            Self::BlockingHostWrite => "blocking-host-write",
+            Self::BlockingRecordLock => "blocking-record-lock",
+            Self::WaitOnProcExit => "wait-on-proc-exit",
+            Self::WaitOnProcState => "wait-on-proc-state",
+            Self::WaitOnHvpatchChild => "wait-on-hvpatch-child",
+            Self::WaitOnSignals => "wait-on-signals",
+            Self::WaitOnSleep => "wait-on-sleep",
+            Self::VforkParent => "vfork-parent",
         }
     }
 
@@ -1108,6 +1314,37 @@ impl BlockedContinuation {
 
     pub fn deadline(&self) -> Option<Instant> {
         self.state().deadline
+    }
+
+    /// Pointer-free diagnostic view of this parked continuation, for the
+    /// kernel debug snapshot.
+    ///
+    /// `Blocked { reason: HostWait, continuation: Some(..) }` says a thread is
+    /// parked; it does not say WHAT it is parked on, and a watchdog wedge
+    /// snapshot is usually the only evidence a lost wake leaves behind. This
+    /// names the family, the exact readiness probe with its polled host fds,
+    /// and — decisively — whether the wait service still holds a live
+    /// registration for it. A blocked thread whose registration reads
+    /// `absent`, `token-mismatch`, `cancelled(..)` or `service-dropped` has no
+    /// producer that can ever wake it; one that reads `ready` was woken and
+    /// the *scheduler* dropped the edge. Those are different bugs and the
+    /// snapshot must tell them apart without a live process to attach to.
+    pub fn diagnostic(&self) -> ContinuationDiagnostic {
+        let state = self.state();
+        let now = Instant::now();
+        ContinuationDiagnostic {
+            id: state.id.raw(),
+            family: self.family().wire_name(),
+            detail: detail_diagnostic(&state.detail),
+            deadline_ms_remaining: state.deadline.map(|deadline| {
+                i64::try_from(deadline.saturating_duration_since(now).as_millis())
+                    .unwrap_or(i64::MAX)
+            }),
+            // `None` here is the starkest form of the same defect: the
+            // continuation carries no binding at all, so nothing anywhere can
+            // publish an event for it.
+            registration: state.registration.as_ref().map(registration_diagnostic),
+        }
     }
 
     pub fn guest_outputs(&self) -> &[GuestOutputRange] {
@@ -5907,6 +6144,84 @@ mod tests {
                 .state,
             RegistrationState::Ready,
             "a real task event must redispatch the child wait"
+        );
+    }
+
+    #[test]
+    fn diagnostic_names_the_wait_and_whether_a_producer_can_still_reach_it() {
+        let (kernel, context) = bootstrap(15_120);
+        let generation = publish(&context, 0x360);
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnHvpatchChild {
+                target: None,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("kernel child continuation");
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        service
+            .enroll(&mut registration)
+            .expect("enroll child wait");
+        continuation
+            .attach_registration(registration)
+            .expect("bind registration");
+
+        let enrolled = continuation.diagnostic();
+        assert_eq!(enrolled.id, continuation.id().raw());
+        assert_eq!(enrolled.family, "wait-on-hvpatch-child");
+        assert!(
+            enrolled.detail.starts_with("process any-child-of="),
+            "detail must name the child selector, got {}",
+            enrolled.detail
+        );
+        let bound = enrolled.registration.expect("registration diagnostic");
+        assert_eq!(bound.state, "enrolled");
+        assert!(bound.service_alive);
+        assert_eq!(bound.event, None);
+        assert_eq!(bound.continuation, token.continuation.raw());
+
+        // A wake the thread has not consumed yet reads `ready`: the producer
+        // fired and the scheduler owes the thread a redispatch. That is a
+        // different bug from "nothing can wake it", so the two must not
+        // render the same.
+        assert!(kernel.publish_task_event_and_wake(context.task().key(), || true));
+        assert_eq!(
+            continuation
+                .diagnostic()
+                .registration
+                .expect("registration diagnostic")
+                .state,
+            "ready"
+        );
+        assert_eq!(
+            continuation
+                .diagnostic()
+                .registration
+                .expect("registration diagnostic")
+                .event,
+            Some("ready")
+        );
+
+        // Once the service forgets the entry, nothing can publish into it.
+        // This is the lost-wake signature a wedge snapshot has to be able to
+        // state on its own.
+        service
+            .inner
+            .state
+            .lock()
+            .entries
+            .remove(&token.continuation);
+        assert_eq!(
+            continuation
+                .diagnostic()
+                .registration
+                .expect("registration diagnostic")
+                .state,
+            "absent"
         );
     }
 

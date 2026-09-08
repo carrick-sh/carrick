@@ -105,6 +105,11 @@ pub struct ThreadSnapshotRow {
     /// sets, and NO way to ask "what is this thread blocked on" until this
     /// existed.
     pub execution: String,
+    /// What the parked continuation (if any) is waiting on, and whether the
+    /// wait service still holds a registration a producer can publish into.
+    /// `execution` says a thread is blocked; this says whether anything can
+    /// ever unblock it.
+    pub continuation: Option<crate::vcpu_loop::continuation::ContinuationDiagnostic>,
     pub task: TaskKey,
     pub registry_id: Option<ThreadId>,
     pub class: ObjectSnapshotClass,
@@ -572,6 +577,7 @@ impl Kernel {
             thread_rows.push(ThreadSnapshotRow {
                 key: *key,
                 execution: thread.execution_diagnostic(),
+                continuation: thread.continuation_diagnostic(),
                 task: *task_key,
                 registry_id: Some(thread.registry_id()),
                 class,

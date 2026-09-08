@@ -6423,6 +6423,26 @@ impl Thread {
         )
     }
 
+    /// What the parked continuation on this thread is actually waiting on.
+    ///
+    /// `execution_diagnostic` reports only that a continuation is present.
+    /// A lost wake needs the next question answered — which family, which
+    /// probe, and whether the wait service still holds a registration a
+    /// producer can publish into — and a watchdog wedge snapshot is normally
+    /// the only evidence available. See
+    /// [`BlockedContinuation::diagnostic`](crate::vcpu_loop::continuation::BlockedContinuation::diagnostic).
+    pub fn continuation_diagnostic(
+        &self,
+    ) -> Option<crate::vcpu_loop::continuation::ContinuationDiagnostic> {
+        let execution = self.execution.lock();
+        let diagnostic = execution
+            .blocked_continuation
+            .as_ref()
+            .map(|c| c.diagnostic());
+        drop(execution);
+        diagnostic
+    }
+
     pub fn execution_state(&self) -> ThreadExecutionState {
         self.execution.lock().state
     }
