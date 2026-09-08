@@ -2523,6 +2523,64 @@ mod foreign_mm_tests {
         ));
     }
 
+    /// A page inside a readable VMA with NO stage-1 entry and NO pristine
+    /// recipe still reads as zeros, and the transfer runs to full length.
+    ///
+    /// That combination is what the 64 KiB anonymous fault window produces:
+    /// it materializes zeroed backing across the whole window while installing
+    /// stage-1 only for the page that faulted, so the rest of the window is
+    /// backed (gone from `pristine`) yet invisible to a foreign stage-1 walk.
+    /// Refusing it ended `process_vm_readv` early — `processvmsparse` returned
+    /// short from the moment the wide window became the default (9ac383a69).
+    /// The fixture reproduces the state by dropping the deferred recipe after
+    /// install, which is exactly what materialization does.
+    #[test]
+    fn foreign_mm_read_backed_page_without_stage1_or_recipe_reads_zeros() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let transport = CarrierForeignMmTransport::new();
+        let page_size = CowArmedRanges::COMPOUND_SIZE as usize;
+        let vma_len = page_size * 2;
+        let installed = install_mm_sparse(
+            &transport,
+            118,
+            0x9600_0900_0000,
+            0x9700_0900_0000,
+            page_size,
+            vma_len,
+            b"hello world",
+        );
+        // The fault window materialized the tail: backed, no longer pristine,
+        // and stage-1 still only covers the first page.
+        *installed.state.deferred_anonymous.write() = None;
+
+        let mut dst = vec![0xaa_u8; vma_len];
+        let receipt = read_installed(&transport, &installed, &mut dst)
+            .expect("read a materialized-but-untranslated page inside a readable VMA");
+        assert_eq!(receipt.bytes_read(), vma_len);
+        assert_eq!(&dst[..11], b"hello world");
+        assert!(dst[page_size..vma_len].iter().all(|&b| b == 0));
+
+        // Past the readable VMA is still a hard translation failure.
+        let mut beyond = vec![0xaa_u8; page_size];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
+        let lease = endpoint
+            .retain(&installed.snapshot, deadline)
+            .expect("retain MM");
+        let beyond_res = lease.read(
+            &installed.live,
+            &installed.snapshot,
+            GuestVa(TEST_VA + vma_len as u64),
+            &mut beyond,
+            deadline,
+        );
+        assert!(matches!(
+            beyond_res,
+            Err(carrick_hal::ForeignMmTransportError::Translation(va))
+                if va == GuestVa(TEST_VA + vma_len as u64)
+        ));
+    }
+
     #[test]
     fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
@@ -27276,9 +27334,33 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
                                 .unwrap_or(false)
                     });
                     if !copied_from_deferred {
-                        return Err(carrick_hal::ForeignMmTransportError::Translation(
-                            current_va,
-                        ));
+                        // Reaching here means: inside a readable VMA, no
+                        // stage-1 translation, and no pristine recipe. That
+                        // combination is NOT a hole. The anonymous fault
+                        // window materializes zeroed backing up to 64 KiB
+                        // wide while installing stage-1 only for the page
+                        // that faulted, so the rest of the window leaves
+                        // `pristine` (it is backed) without gaining a
+                        // stage-1 entry (the target has not touched it). A
+                        // page in that state has never been written -- a
+                        // write would have faulted and installed the entry --
+                        // so its bytes are zeros, which is exactly what Linux
+                        // reads from an untouched anonymous page. Refusing
+                        // instead ended the transfer early and made
+                        // `process_vm_readv` return short.
+                        //
+                        // A retained PRIVATE FILE recipe we could not read is
+                        // the one case where zeros would be a lie: that page
+                        // has real file bytes behind it, so it still fails.
+                        if deferred
+                            .as_ref()
+                            .is_some_and(|state| state.covers_private_file(current_va, chunk))
+                        {
+                            return Err(carrick_hal::ForeignMmTransportError::Translation(
+                                current_va,
+                            ));
+                        }
+                        dst[completed..completed + chunk].fill(0);
                     }
                     chunk
                 }
