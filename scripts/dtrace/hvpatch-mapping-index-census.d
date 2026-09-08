@@ -23,7 +23,11 @@
  *   hvpatch-mapping-index-begin (uint64_t live_rows, uint64_t shadowed_rows)
  *       -- fires FIRST, and is the census ARM: the producer takes its start
  *          `Instant` inside this probe's closure, so nothing below fires
- *          unless this probe is enabled.
+ *          unless this probe is enabled. THIS SCRIPT MUST NAME IT. DTrace
+ *          enables only the probes a script mentions, so a census script that
+ *          matches just `-fault` and `-cost` arms nothing and reports a
+ *          perfectly formatted EMPTY table -- which cost one capture to learn.
+ *          The `begins` counter below exists to make that failure loud.
  *   hvpatch-mapping-index-fault (uint64_t far, uint64_t index_live_rows,
  *       uint64_t index_rows_visited, uint64_t alias_rows,
  *       uint64_t alias_rows_visited)
@@ -48,14 +52,66 @@
  * visited counts and nanoseconds, plus quantized distributions.
  */
 
-BEGIN
+dtrace:::BEGIN
 {
-    printf("MAPIDX|start|ns=%d\n", timestamp);
-    @faults = count();
+    live = 1;
+    seconds = 0;
+    complete = 0;
+    begins = 0;
+    faults = 0;
+    printf("MAPIDX|start|ns=%d|target=%d\n", timestamp, $target);
+}
+
+/*
+ * Self-termination. `carrick trace` fails a custom script that does not exit
+ * within 60 s of the traced child ending, so the script must own its own
+ * bound: leave it out and a perfectly good capture is thrown away with
+ * "custom D script did not exit within 60 s".
+ */
+proc:::exit
+/pid == $target/
+{
+    live = 0;
+}
+
+tick-100ms
+/live == 0 && !complete/
+{
+    complete = 1;
+    exit(0);
+}
+
+tick-1s
+{
+    seconds++;
+}
+
+tick-1s
+/seconds >= 1800 && !complete/
+{
+    complete = 1;
+    printf("MAPIDX|TRUNCATED|seconds=%d\n", seconds);
+    exit(3);
+}
+
+dtrace:::ERROR
+{
+    printf("MAPIDX|ERROR|cpu=%d|epid=%d\n", cpu, arg1);
+    exit(2);
+}
+
+/*
+ * Arms the census in the producer. Enabling this probe is the whole reason it
+ * is here; the count is the receipt that it was enabled.
+ */
+carrick*:::hvpatch-mapping-index-begin
+{
+    begins++;
 }
 
 carrick*:::hvpatch-mapping-index-fault
 {
+    faults++;
     self->far = arg0;
     self->live = arg1;
     self->visited = arg2;
@@ -103,9 +159,17 @@ carrick*:::hvpatch-mapping-index-cost
     self->alias_visited = 0;
 }
 
-END
+dtrace:::END
+/begins == 0 || faults == 0/
 {
-    printf("\nMAPIDX|end|ns=%d\n", timestamp);
+    printf("\nMAPIDX|EMPTY|begins=%d|faults=%d\n", begins, faults);
+    printf("MAPIDX|EMPTY|a capture with no events is a FAILED capture, not a result: either the guest never took an anonymous first-touch fault, or the census was never armed (see the header on naming hvpatch-mapping-index-begin)\n");
+}
+
+dtrace:::END
+{
+    printf("\nMAPIDX|end|ns=%d|begins=%d|faults=%d\n", timestamp, begins,
+        faults);
     printf("\n%-8s %10s %10s %10s %12s %12s %12s %12s %12s %12s %12s %14s\n",
         "decade", "faults", "idx_rows", "shadowed", "idx_visit",
         "idx_vmax", "alias_rows", "ali_visit", "ali_vmax", "ns_mean",
