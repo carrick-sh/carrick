@@ -417,8 +417,18 @@ struct QueueRow {
 #[derive(Debug)]
 struct RunQueueState {
     lifecycle: QueueLifecycle,
+    /// Rows an executor may claim right now. A row reaches this deque only
+    /// once the submission that owns its exact key has been published.
     rows: VecDeque<QueueRow>,
     queued: BTreeSet<QueueKey>,
+    /// Exact keys whose submission authority has been admitted but not yet
+    /// published. A wake for such a key is durable and coalescing, but its
+    /// row is held in `deferred` instead of becoming claimable: the task's
+    /// binding is still dormant, so a claim could only fail it.
+    unpublished: BTreeSet<QueueKey>,
+    /// The one row a wake enqueued for an unpublished key, held until that
+    /// key is published (or until its authority is released).
+    deferred: BTreeMap<QueueKey, QueueRow>,
     active_authorities: usize,
     claimed: usize,
     waiters: usize,
@@ -433,6 +443,8 @@ impl Default for RunQueueState {
             lifecycle: QueueLifecycle::Open,
             rows: VecDeque::new(),
             queued: BTreeSet::new(),
+            unpublished: BTreeSet::new(),
+            deferred: BTreeMap::new(),
             active_authorities: 0,
             claimed: 0,
             waiters: 0,
@@ -440,6 +452,28 @@ impl Default for RunQueueState {
             close_waiters_expected: 0,
             closed_waiter_observations: 0,
         }
+    }
+}
+
+/// What a queue insertion did with one exact row. A bare `bool` said only
+/// "queued or coalesced", which cannot express the third case the pre-
+/// activation window needs: durably queued but deliberately NOT claimable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnqueueOutcome {
+    /// The row is queued and an executor may claim it now.
+    Claimable,
+    /// The row is queued and held until its submission is published.
+    Deferred,
+    /// An exact row for this key was already queued.
+    Coalesced,
+}
+
+impl EnqueueOutcome {
+    /// Whether this insertion took ownership of the wake edge. A deferred row
+    /// is queued exactly as a claimable one is -- `Scheduler::wake` reports
+    /// `Queued` for it and a second wake coalesces onto it.
+    const fn queued(self) -> bool {
+        !matches!(self, Self::Coalesced)
     }
 }
 
@@ -533,21 +567,75 @@ impl RunQueueInner {
         }
     }
 
-    fn enqueue(&self, row: QueueRow, closing_authorized: bool) -> Result<bool, RunQueueError> {
+    fn enqueue(
+        &self,
+        row: QueueRow,
+        closing_authorized: bool,
+    ) -> Result<EnqueueOutcome, RunQueueError> {
         let mut state = self.state.lock();
         if state.lifecycle == QueueLifecycle::Closed {
             return Err(RunQueueError::Closed);
         }
         if state.queued.contains(&row.key) {
-            return Ok(false);
+            return Ok(EnqueueOutcome::Coalesced);
         }
         if state.lifecycle == QueueLifecycle::Closing && !closing_authorized {
             return Err(RunQueueError::SubmissionRejected);
         }
         state.queued.insert(row.key);
+        if state.unpublished.contains(&row.key) {
+            // The submission that owns this exact generation is admitted but
+            // still dormant. Own the wake edge -- it must not be lost -- and
+            // hold the row until publication makes the binding resolvable.
+            state.deferred.insert(row.key, row);
+            return Ok(EnqueueOutcome::Deferred);
+        }
         state.rows.push_back(row);
         self.changed.notify_one();
-        Ok(true)
+        Ok(EnqueueOutcome::Claimable)
+    }
+
+    /// Publish the exact row an activated submission owns, releasing any row
+    /// a wake queued for it while it was dormant.
+    ///
+    /// This is the ONLY transition that clears a key's unpublished mark, and
+    /// it is the same critical section that makes the row claimable, so a row
+    /// can never be claimed before its submission is active.
+    fn publish(&self, row: QueueRow) -> Result<EnqueueOutcome, RunQueueError> {
+        let mut state = self.state.lock();
+        if state.lifecycle == QueueLifecycle::Closed {
+            return Err(RunQueueError::Closed);
+        }
+        state.unpublished.remove(&row.key);
+        if let Some(held) = state.deferred.remove(&row.key) {
+            state.rows.push_back(held);
+            self.changed.notify_one();
+            return Ok(EnqueueOutcome::Claimable);
+        }
+        if state.queued.contains(&row.key) {
+            return Ok(EnqueueOutcome::Coalesced);
+        }
+        state.queued.insert(row.key);
+        state.rows.push_back(row);
+        self.changed.notify_one();
+        Ok(EnqueueOutcome::Claimable)
+    }
+
+    /// Mark one admitted-but-unpublished exact key. Called under the same
+    /// state lock that counts the authority, so an authority never exists
+    /// without its gate.
+    fn mark_unpublished(state: &mut RunQueueState, key: QueueKey) {
+        state.unpublished.insert(key);
+    }
+
+    /// Drop an exact key's unpublished gate and any row held behind it. The
+    /// wake edge is discarded with the row because the submission it named is
+    /// gone; nothing can claim that generation again.
+    fn clear_unpublished(state: &mut RunQueueState, key: QueueKey) {
+        state.unpublished.remove(&key);
+        if state.deferred.remove(&key).is_some() {
+            state.queued.remove(&key);
+        }
     }
 
     fn finish_claim(&self) {
@@ -560,12 +648,13 @@ impl RunQueueInner {
         self.changed.notify_all();
     }
 
-    fn release_authority(&self) {
+    fn release_authority(&self, key: QueueKey) {
         let mut state = self.state.lock();
         state.active_authorities = state
             .active_authorities
             .checked_sub(1)
             .unwrap_or_else(|| std::process::abort());
+        Self::clear_unpublished(&mut state, key);
         self.maybe_finish_close(&mut state);
         self.changed.notify_all();
     }
@@ -647,11 +736,34 @@ impl SubmissionAuthority {
         {
             return Err((RunQueueError::AuthorityMismatch, self));
         }
+        self.retarget_unpublished_gate(&queue, successor_thread, successor_generation);
         self.key = QueueKey {
             thread: successor_thread,
             generation: successor_generation,
         };
         Ok(self)
+    }
+
+    /// Move an unpublished gate onto the successor key. A submission that has
+    /// never been published owns no claimable row, and that stays true across
+    /// a generation rollover or an exec replacement: the gate travels with the
+    /// key rather than being silently left on the retired one.
+    fn retarget_unpublished_gate(
+        &self,
+        queue: &Arc<RunQueueInner>,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) {
+        let mut state = queue.state.lock();
+        if state.unpublished.remove(&self.key) {
+            state.unpublished.insert(QueueKey { thread, generation });
+        }
+        if let Some(mut held) = state.deferred.remove(&self.key) {
+            state.queued.remove(&self.key);
+            held.key = QueueKey { thread, generation };
+            state.queued.insert(held.key);
+            state.deferred.insert(held.key, held);
+        }
     }
 
     pub(crate) fn park_exact(
@@ -664,7 +776,7 @@ impl SubmissionAuthority {
         let mut authority =
             self.rollover_exact(scheduler, thread, predecessor, thread, successor)?;
         if let Some(queue) = authority.queue.upgrade() {
-            queue.release_authority();
+            queue.release_authority(authority.key);
         }
         authority.active = false;
         Ok(authority)
@@ -698,6 +810,7 @@ impl SubmissionAuthority {
         {
             return Err((RunQueueError::AuthorityMismatch, self));
         }
+        self.retarget_unpublished_gate(&queue, successor_thread, successor_generation);
         self.key = QueueKey {
             thread: successor_thread,
             generation: successor_generation,
@@ -771,10 +884,12 @@ impl SubmissionAuthority {
                         .active_authorities
                         .checked_add(1)
                         .ok_or(RunQueueError::AuthoritiesExhausted)?;
+                    let key = QueueKey { thread, generation };
+                    RunQueueInner::mark_unpublished(&mut state, key);
                     Ok(Self {
                         queue: Arc::downgrade(&queue),
                         kernel: Arc::downgrade(&kernel),
-                        key: QueueKey { thread, generation },
+                        key,
                         active: true,
                     })
                 },
@@ -837,10 +952,12 @@ impl SubmissionAuthority {
                 .active_authorities
                 .checked_add(1)
                 .ok_or(RunQueueError::AuthoritiesExhausted)?;
+            let key = QueueKey { thread, generation };
+            RunQueueInner::mark_unpublished(&mut state, key);
             Ok(Self {
                 queue: Arc::downgrade(&queue),
                 kernel: Arc::downgrade(&kernel),
-                key: QueueKey { thread, generation },
+                key,
                 active: true,
             })
         };
@@ -928,7 +1045,7 @@ impl SubmissionPublication {
             return Err(RunQueueError::AuthorityMismatch.into());
         }
         scheduler
-            .enqueue_exact(thread, self.key, true)
+            .publish_exact(thread, self.key)
             .map_err(Into::into)
     }
 }
@@ -939,7 +1056,7 @@ impl Drop for SubmissionAuthority {
             return;
         }
         if let Some(queue) = self.queue.upgrade() {
-            queue.release_authority();
+            queue.release_authority(self.key);
         }
         self.active = false;
     }
@@ -954,6 +1071,12 @@ impl RunQueue {
     fn remove_exact(&self, key: QueueKey) -> bool {
         let mut state = self.inner.state.lock();
         let Some(index) = state.rows.iter().position(|row| row.key == key) else {
+            if state.deferred.remove(&key).is_some() {
+                state.queued.remove(&key);
+                self.inner.maybe_finish_close(&mut state);
+                self.inner.changed.notify_all();
+                return true;
+            }
             return false;
         };
         state.rows.remove(index);
@@ -986,6 +1109,7 @@ impl RunQueue {
             .active_authorities
             .checked_add(1)
             .ok_or(RunQueueError::AuthoritiesExhausted)?;
+        RunQueueInner::mark_unpublished(&mut state, key);
         Ok(SubmissionAuthority {
             queue: Arc::downgrade(&self.inner),
             kernel: Arc::downgrade(kernel),
@@ -1764,7 +1888,7 @@ impl Scheduler {
         key: QueueKey,
         closing_authorized: bool,
     ) -> Result<bool, RunQueueError> {
-        let inserted = self.queue.inner.enqueue(
+        let outcome = self.queue.inner.enqueue(
             QueueRow {
                 key,
                 thread,
@@ -1772,10 +1896,28 @@ impl Scheduler {
             },
             closing_authorized,
         )?;
-        if inserted && self.executors.has_running() {
+        self.after_insertion(outcome);
+        Ok(outcome.queued())
+    }
+
+    /// Publish the exact row of a submission whose activation has just made
+    /// its binding resolvable. Distinct from `enqueue_exact` because this is
+    /// the transition that lifts the key's unpublished gate.
+    fn publish_exact(&self, thread: Arc<Thread>, key: QueueKey) -> Result<bool, RunQueueError> {
+        let outcome = self.queue.inner.publish(QueueRow {
+            key,
+            thread,
+            closing_authorized: true,
+        })?;
+        self.after_insertion(outcome);
+        Ok(outcome.queued())
+    }
+
+    /// Only a claimable row is work an executor can be sent looking for.
+    fn after_insertion(&self, outcome: EnqueueOutcome) {
+        if outcome == EnqueueOutcome::Claimable && self.executors.has_running() {
             self.need_resched.store(true, Ordering::Release);
         }
-        Ok(inserted)
     }
 
     pub fn take(&self, executor: &ExecutorRegistration) -> Result<RunnableThread, RunQueueError> {
@@ -3537,6 +3679,82 @@ mod tests {
     }
 
     #[test]
+    fn a_wake_for_an_admitted_unpublished_key_is_durable_but_not_claimable() {
+        // The run queue is the single authority for claimability. An admitted
+        // submission has no resolvable binding until it publishes, so a wake
+        // in that window owns the edge (it must not be lost, and a second
+        // wake must coalesce onto it) without ever handing an executor a row
+        // it can only fail.
+        let (kernel, context) = bootstrap(12_130);
+        publish(&context, 30);
+        let generation = context.thread().execution_state().generation().unwrap();
+        let scheduler = Scheduler::new(kernel);
+        let authority = scheduler
+            .admit_root(context.thread().key(), generation)
+            .unwrap();
+
+        assert_eq!(
+            scheduler.make_runnable(context.thread().key()).unwrap(),
+            WakeDisposition::Queued
+        );
+        assert_eq!(scheduler.queued_len(), 0, "held, not claimable");
+        assert_eq!(
+            scheduler.wake(context.thread().key()).unwrap(),
+            WakeDisposition::Coalesced,
+            "a held row still owns the exact key"
+        );
+        assert_eq!(scheduler.queued_len(), 0);
+
+        // Publication is the transition that releases it, exactly once.
+        authority
+            .publish(&scheduler, Arc::clone(context.thread()))
+            .unwrap();
+        assert_eq!(scheduler.queued_len(), 1);
+        authority
+            .publish(&scheduler, Arc::clone(context.thread()))
+            .unwrap();
+        assert_eq!(scheduler.queued_len(), 1);
+    }
+
+    #[test]
+    fn releasing_an_unpublished_authority_drops_the_row_it_was_holding() {
+        // An admitted submission that dies before activating takes its held
+        // row with it: nothing is left queued under a key no binding can
+        // resolve, and the queue can still drain to closed.
+        let (kernel, context) = bootstrap(12_131);
+        publish(&context, 31);
+        let generation = context.thread().execution_state().generation().unwrap();
+        let scheduler = Scheduler::new(kernel);
+        let authority = scheduler
+            .admit_root(context.thread().key(), generation)
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        assert_eq!(scheduler.queued_len(), 0);
+
+        drop(authority);
+        // The held row went with it: the exact key is unqueued (a fresh wake
+        // reports `Queued`, not `Coalesced`) and, with no gate left, that
+        // wake is claimable immediately.
+        assert_eq!(
+            scheduler.make_runnable(context.thread().key()).unwrap(),
+            WakeDisposition::Queued
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+
+        // And the queue still drains once that row is settled.
+        scheduler
+            .fail_runnable_exact(
+                context.thread().key(),
+                generation,
+                crate::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
+            )
+            .unwrap();
+        assert_eq!(scheduler.queued_len(), 0);
+        scheduler.close();
+        scheduler.wait_closed();
+    }
+
+    #[test]
     fn exited_grant_cannot_authorize_a_descendant_during_close() {
         let (kernel, root) = bootstrap(12_118);
         let child = process_child(&kernel, &root, 22_118, "exited grant child");
@@ -3551,6 +3769,12 @@ mod tests {
             .unwrap();
         let executor = scheduler
             .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        // Publish before waking: an admitted submission's row is not
+        // claimable until its authority publishes, which is the order every
+        // production path takes (`prepare_submission` then `activate`).
+        authority
+            .publish(&scheduler, Arc::clone(root.thread()))
             .unwrap();
         scheduler.make_runnable(root.thread().key()).unwrap();
         let running = scheduler.take(&executor).unwrap();

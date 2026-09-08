@@ -6862,7 +6862,10 @@ pub(crate) mod tests {
         scheduler
             .make_runnable(context.thread().key())
             .expect("a real producer wakes the freshly published task");
-        assert_eq!(scheduler.queued_len(), 1);
+        // The wake is durable but its row is held: a dormant submission owns
+        // no claimable row (`a_wake_before_activation_leaves_the_dormant_row_
+        // unclaimable`).
+        assert_eq!(scheduler.queued_len(), 0);
         let start_gate = context
             .thread()
             .take_opened_start_gate(generation)
@@ -6888,6 +6891,106 @@ pub(crate) mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_wake_before_activation_leaves_the_dormant_row_unclaimable() {
+        // The other half of the pre-activation wake window. A fork child, a
+        // cloned thread and an exec successor are all published to the Kernel
+        // as runnable BEFORE the dormant submission that owns them is
+        // activated, so a real producer can wake them in that window and
+        // enqueue the exact `(thread, generation)` row. Idempotent
+        // publication (50503566a) stops that row from failing its own
+        // ACTIVATION -- it does not stop an EXECUTOR from claiming it first.
+        //
+        // A claim in that window resolves a binding record whose `active` is
+        // still false, so `resolve` reports "missing exact HVPatch task
+        // binding", the worker fails the task with `SnapshotRestoreFailed`,
+        // and the clone rollback aborts the carrier (rc=134, run `hwfix-4`).
+        //
+        // The row must therefore not be CLAIMABLE until the submission that
+        // owns it is published: the wake stays durable, the run queue holds
+        // it, and activation releases it.
+        let (kernel, context) = bootstrap(13_995);
+        let state = task_state(&context, 110);
+        let generation = context
+            .thread()
+            .publish_initial_task_state(state.clone())
+            .expect("publish root state");
+        let scheduler = Scheduler::new(kernel);
+        let executor = scheduler
+            .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+            .unwrap();
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let binding = hvpatch_test_binding(&context, &state, 110);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(context.thread()),
+                generation,
+                Arc::clone(&binding),
+            )
+            .expect("prepare dormant root");
+        scheduler
+            .make_runnable(context.thread().key())
+            .expect("a real producer wakes the freshly published task");
+
+        // Drive the exact order the field hit: wake, then CLAIM, then
+        // activate. `take` is only reached when a claimable row exists, so
+        // this cannot block once the window is closed.
+        let claimable = scheduler.queued_len();
+        if claimable != 0 {
+            let running = scheduler
+                .take(&executor)
+                .expect("claim the wake-queued row");
+            let resolved = <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                directory.as_ref(),
+                running.thread_key(),
+                running.generation(),
+            );
+            assert!(
+                resolved.is_ok(),
+                "an executor claimed a row whose submission is still dormant: {:?}",
+                resolved.err(),
+            );
+        }
+        assert_eq!(
+            claimable, 0,
+            "a wake before activation must not publish a claimable row",
+        );
+
+        let start_gate = context
+            .thread()
+            .take_opened_start_gate(generation)
+            .expect("opened root start gate");
+        let proof = HvpatchActivationProof::validate(
+            &context,
+            &state,
+            generation,
+            binding.identity(),
+            start_gate,
+        )
+        .unwrap();
+        dormant
+            .activate(&scheduler, Arc::clone(context.thread()), proof)
+            .expect("activation publishes the wake's held row");
+
+        // Activation is publication: the held row becomes claimable exactly
+        // once, and the claim now resolves.
+        assert_eq!(scheduler.queued_len(), 1);
+        let running = scheduler
+            .take(&executor)
+            .expect("claim the row activation released");
+        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+            directory.as_ref(),
+            running.thread_key(),
+            running.generation(),
+        )
+        .expect("an activated submission resolves for its claimant");
+        scheduler.settle_runnable(running).unwrap();
+        scheduler.unregister_executor(&executor).unwrap();
     }
 
     #[test]
