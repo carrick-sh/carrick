@@ -3525,10 +3525,19 @@ pub enum QuantumExit {
     Failed,
 }
 
+/// What an executor-failure settlement did with the job's logical result.
+///
+/// There is no "someone else will publish it later" answer. A logical job's
+/// `HvpatchLoopResult` is the only thing `wait_process_jobs` can wait on, and
+/// nothing bounds that wait, so a settlement that ends a job without a
+/// published result strands the container forever. `AlreadyPublished` is
+/// therefore a statement about the past — the process terminal owner's member
+/// drain published this job before the executor failure ran — and it is
+/// returnable only from a branch that observed `is_published()`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutorFailureSettlement {
     PublishCurrent,
-    DeferredToProcessOwner,
+    AlreadyPublished,
 }
 
 /// Object-safe job state driven by the one authoritative Task 4 executor pool.
@@ -3607,10 +3616,20 @@ impl HvpatchTaskQuantum {
     }
 
     pub(crate) fn after_executor_failure_settlement(&self) {
-        if self.job.lock().after_executor_failure_settlement()
-            == ExecutorFailureSettlement::PublishCurrent
-        {
-            self.completion.publish();
+        match self.job.lock().after_executor_failure_settlement() {
+            ExecutorFailureSettlement::PublishCurrent => self.completion.publish(),
+            // Fail closed on the one shape that cannot be recovered later: an
+            // unpublished job whose executor is gone has no remaining
+            // publisher, and its container job wait would never return.
+            ExecutorFailureSettlement::AlreadyPublished => {
+                if !self.completion.is_finished() {
+                    tracing::error!(
+                        job = self.completion.id().raw(),
+                        "executor-failure settlement claimed a prior publication that never happened"
+                    );
+                    self.completion.publish();
+                }
+            }
         }
     }
 
