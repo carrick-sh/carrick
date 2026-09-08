@@ -5090,6 +5090,10 @@ impl Task {
             crash_safe_point_participant: AtomicU64::new(0),
             next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
+            last_cpu: AtomicU32::new(u32::MAX),
+            affinity: RwLock::new(carrick_hal::CpuAffinity::all(
+                crate::kernel::scheduler::guest_cpu_count(),
+            )),
         })
     }
 
@@ -5099,6 +5103,7 @@ impl Task {
         registry_id: ThreadId,
         resources: Arc<ThreadResources>,
         caller_signal_state: ThreadSignalState,
+        caller_affinity: carrick_hal::CpuAffinity,
     ) -> ThreadRef {
         Arc::new(Thread {
             key,
@@ -5119,6 +5124,11 @@ impl Task {
             crash_safe_point_participant: AtomicU64::new(0),
             next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
+            last_cpu: AtomicU32::new(u32::MAX),
+            // Linux inherits the CPU affinity mask across `clone` and `fork`;
+            // `last_cpu` is NOT inherited, because the new thread has not run
+            // anywhere yet and its first placement should be the idlest CPU.
+            affinity: RwLock::new(caller_affinity),
         })
     }
 
@@ -5128,6 +5138,7 @@ impl Task {
         registry_id: ThreadId,
         resources: Arc<ThreadResources>,
         caller_signal_state: ThreadSignalState,
+        caller_affinity: carrick_hal::CpuAffinity,
     ) -> ThreadRef {
         Arc::new(Thread {
             key,
@@ -5148,6 +5159,11 @@ impl Task {
             crash_safe_point_participant: AtomicU64::new(0),
             next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
+            last_cpu: AtomicU32::new(u32::MAX),
+            // Linux inherits the CPU affinity mask across `clone` and `fork`;
+            // `last_cpu` is NOT inherited, because the new thread has not run
+            // anywhere yet and its first placement should be the idlest CPU.
+            affinity: RwLock::new(caller_affinity),
         })
     }
 
@@ -5181,6 +5197,8 @@ impl Task {
             crash_safe_point_participant: AtomicU64::new(0),
             next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
+            last_cpu: AtomicU32::new(caller.last_cpu_raw()),
+            affinity: RwLock::new(caller.affinity()),
         })
     }
 
@@ -5211,8 +5229,15 @@ impl Task {
         registry_id: ThreadId,
         resources: Arc<ThreadResources>,
         caller_signal_state: ThreadSignalState,
+        caller_affinity: carrick_hal::CpuAffinity,
     ) -> Result<ThreadRef, ObjectGraphError> {
-        let thread = self.prepare_fork_thread(key, registry_id, resources, caller_signal_state);
+        let thread = self.prepare_fork_thread(
+            key,
+            registry_id,
+            resources,
+            caller_signal_state,
+            caller_affinity,
+        );
         self.publish_thread(Arc::clone(&thread))?;
         Ok(thread)
     }
@@ -6240,6 +6265,8 @@ pub struct Thread {
     /// keyring a `fork` child does NOT inherit, which every constructor here
     /// gets for free by starting it at `None`.
     thread_keyring: Mutex<Option<KeySerial>>,
+    last_cpu: AtomicU32,
+    affinity: RwLock<carrick_hal::CpuAffinity>,
 }
 
 #[derive(Debug, Default)]
@@ -6300,6 +6327,33 @@ impl OpenedStartGate {
 }
 
 impl Thread {
+    pub fn last_cpu(&self) -> Option<carrick_hal::GuestCpuId> {
+        let raw = self.last_cpu.load(Ordering::Relaxed);
+        if raw == u32::MAX {
+            None
+        } else {
+            Some(carrick_hal::GuestCpuId::new(raw))
+        }
+    }
+
+    pub fn last_cpu_raw(&self) -> u32 {
+        self.last_cpu.load(Ordering::Relaxed)
+    }
+
+    pub fn set_last_cpu(&self, cpu: carrick_hal::GuestCpuId) {
+        self.last_cpu.store(cpu.as_u32(), Ordering::Relaxed);
+    }
+
+    /// The guest CPUs this thread may be placed on. `Copy`, so the placement
+    /// path reads it without allocating.
+    pub fn affinity(&self) -> carrick_hal::CpuAffinity {
+        *self.affinity.read()
+    }
+
+    pub fn set_affinity(&self, affinity: carrick_hal::CpuAffinity) {
+        *self.affinity.write() = affinity;
+    }
+
     pub(super) fn open_start_gate(&self) {
         self.start_gate_open.store(true, Ordering::Release);
     }

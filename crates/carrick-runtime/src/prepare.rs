@@ -105,6 +105,7 @@ pub struct RuntimeExtensions {
     observers: Vec<Arc<dyn crate::observe::SyscallObserver>>,
     interceptors: Vec<Arc<dyn crate::observe::SyscallInterceptor>>,
     time: Option<crate::kernel::container::TimeControl>,
+    scheduler: Option<Arc<dyn carrick_hal::SchedulingPolicy>>,
     budget: Option<Arc<crate::observe::ResourceBudget>>,
     network_interposer: Option<crate::network::interposer::NetworkInterposer>,
 }
@@ -165,6 +166,18 @@ impl RuntimeExtensions {
     }
 
     /// Time control for the container.
+    /// Install the scheduling policy the carrier's run queue will use.
+    ///
+    /// CARRIER-scoped: one HVPatch carrier has one run queue, so the policy
+    /// and the guest CPU count it fixes apply to every container the carrier
+    /// runs. Installing after the carrier's scheduler exists, or installing a
+    /// second, different policy, is a `RuntimeError::Configuration` — never a
+    /// silent no-op.
+    pub fn scheduler(mut self, policy: Arc<dyn carrick_hal::SchedulingPolicy>) -> Self {
+        self.scheduler = Some(policy);
+        self
+    }
+
     pub fn time(mut self, control: crate::kernel::container::TimeControl) -> Self {
         self.time = Some(control);
         self
@@ -464,9 +477,13 @@ fn prepare_with_lease(
         observers,
         interceptors,
         time,
+        scheduler,
         budget,
         network_interposer,
     } = ext;
+    if let Some(policy) = scheduler {
+        carrier.install_scheduling_policy(policy)?;
+    }
     let sink = resolve_stdio(spec, stdio)?;
     if spec.platform == Platform::Amd64 {
         rosetta_license_notice();

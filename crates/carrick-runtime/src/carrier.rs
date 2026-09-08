@@ -368,6 +368,9 @@ struct CarrierInner {
     changed: parking_lot::Condvar,
     kernel_runtime: parking_lot::Mutex<CarrierKernelRuntimeSlot>,
     kernel_runtime_changed: parking_lot::Condvar,
+    /// The scheduling policy an embedder installed for this carrier's run
+    /// queue, read once when the carrier boots its kernel runtime.
+    scheduling_policy: parking_lot::Mutex<Option<Arc<dyn carrick_hal::SchedulingPolicy>>>,
     lifecycle: crate::vm_lifecycle::VmLifecycleWindow,
     implicit_hold: parking_lot::Mutex<Option<Arc<CarrierInner>>>,
 }
@@ -390,6 +393,44 @@ pub struct CarrierRuntime {
 }
 
 impl CarrierRuntime {
+    /// Install the scheduling policy this carrier's run queue will use.
+    ///
+    /// CARRIER-scoped, because HVPatch multiplexes every Linux task of every
+    /// container onto ONE run queue: the `P` set, the placement policy over
+    /// it, and the `nproc` the guest reads are all fixed together when the
+    /// carrier boots its kernel runtime. Installing after that boot, or
+    /// installing a second and different policy, is refused rather than
+    /// silently ignored — a guest that has already read `sched_getaffinity`
+    /// cannot be told a different CPU count later.
+    pub fn install_scheduling_policy(
+        &self,
+        policy: Arc<dyn carrick_hal::SchedulingPolicy>,
+    ) -> Result<(), RuntimeError> {
+        let mut slot = self.inner.scheduling_policy.lock();
+        if let Some(installed) = slot.as_ref() {
+            if Arc::ptr_eq(installed, &policy) {
+                return Ok(());
+            }
+            return Err(RuntimeError::Configuration(
+                "a different scheduling policy is already installed on this carrier; the \
+                 policy and the guest CPU count it fixes are carrier-scoped, not per-container"
+                    .to_owned(),
+            ));
+        }
+        if !matches!(
+            *self.inner.kernel_runtime.lock(),
+            CarrierKernelRuntimeSlot::Vacant
+        ) {
+            return Err(RuntimeError::Configuration(
+                "this carrier's kernel runtime has already booted; a scheduling policy must \
+                 be installed before the carrier's first container starts"
+                    .to_owned(),
+            ));
+        }
+        *slot = Some(policy);
+        Ok(())
+    }
+
     fn allocate(owner_kind: CarrierOwnerKind, retain_implicit: bool) -> Result<Self, RuntimeError> {
         let generation = NEXT_CARRIER_GENERATION
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -415,6 +456,7 @@ impl CarrierRuntime {
             }),
             changed: parking_lot::Condvar::new(),
             kernel_runtime: parking_lot::Mutex::new(CarrierKernelRuntimeSlot::Vacant),
+            scheduling_policy: parking_lot::Mutex::new(None),
             kernel_runtime_changed: parking_lot::Condvar::new(),
             lifecycle,
             implicit_hold: parking_lot::Mutex::new(None),
@@ -579,7 +621,11 @@ impl CarrierRuntime {
             task: context.task().key(),
             armed: true,
         };
-        let directory = Arc::new(crate::vcpu_loop::HvpatchRuntimeDirectory::default());
+        let directory = Arc::new(
+            crate::vcpu_loop::HvpatchRuntimeDirectory::with_scheduling_policy(
+                self.inner.scheduling_policy.lock().clone(),
+            ),
+        );
         let initialization = initialize(&kernel, &directory, &context)?;
         let runtime = Arc::new(CarrierKernelRuntime { kernel, directory });
         let mut slot = self.inner.kernel_runtime.lock();
@@ -1550,6 +1596,34 @@ mod tests {
     use super::*;
 
     static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// The policy fixes the carrier's `P` set AND the guest's `nproc`, so a
+    /// second, different one cannot be accepted quietly: the guest may
+    /// already have read `sched_getaffinity`.
+    #[test]
+    fn a_second_different_scheduling_policy_is_refused_not_ignored() {
+        let carrier =
+            CarrierRuntime::allocate(CarrierOwnerKind::Explicit, false).expect("allocate carrier");
+        let four: Arc<dyn carrick_hal::SchedulingPolicy> =
+            Arc::new(carrick_hal::GuestCpuPolicy::new(4));
+        let two: Arc<dyn carrick_hal::SchedulingPolicy> =
+            Arc::new(carrick_hal::GuestCpuPolicy::new(2));
+        carrier
+            .install_scheduling_policy(Arc::clone(&four))
+            .expect("first install");
+        // The same policy twice is the same answer, so it is idempotent.
+        carrier
+            .install_scheduling_policy(Arc::clone(&four))
+            .expect("re-installing the same policy is idempotent");
+        let error = carrier
+            .install_scheduling_policy(two)
+            .expect_err("a different policy must be refused");
+        assert!(
+            matches!(error, RuntimeError::Configuration(ref message)
+                if message.contains("carrier-scoped")),
+            "unexpected error: {error:?}",
+        );
+    }
 
     struct ArtifactEnvGuard {
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,

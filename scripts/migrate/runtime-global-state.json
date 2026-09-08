@@ -1235,6 +1235,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
+      "symbol": "EXPOSED_GUEST_CPUS",
+      "fingerprint": "824718d45ea7131a8342c91ac002435730ef9629093bf75e48a41706555c3838",
+      "classification": "carrier_infra",
+      "rationale": "The guest CPU count the carrier's installed scheduling policy fixes, published once when the carrier builds its scheduler and read by every guest-visible CPU surface (nproc, sched_getaffinity, /proc/cpuinfo, /proc/stat, /sys/devices/system/cpu). It replaces the equally process-global host_facts::LOGICAL_CPUS OnceLock as that surface's authority rather than adding a second one; HVPatch runs one carrier per process, so one answer is the whole truth, and a second DIFFERENT publication aborts because nproc has already answered. It selects nothing container-owned and cannot overwrite container state."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-runtime/src/kernel/tty.rs",
       "symbol": "slot::SLOT",
       "fingerprint": "ce379d8b235f81fdcbcc1cdfefa4db0c7d455b43c56b04886cc8265673c26e7c",
@@ -1464,6 +1472,22 @@
       "fingerprint": "fbba5cbdfd1fe6923542b013fe8828c2b3a6774ecdf07765037c1b61e2c8a642",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock VFORK_ACTIVATION_HOOK in crates/carrick-runtime/src/vcpu_loop/executor.rs scoped strictly to test harness execution."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "symbol": "configured_bound_executors::CARRICK_BOUND_EXECUTORS",
+      "fingerprint": "24ec3e21b53638b48f187def34df0e03f263e9a25089abf7932463b94a42e92c",
+      "classification": "config_debug",
+      "rationale": "Bisection hatch for the bound-executor count (one M per guest CPU by default; `=<host parallelism>` restores the previous over-subscribed shape for an exact M-vs-P A/B on one binary). Read once when the carrier starts its executor pool; it sizes host threads only and cannot select or overwrite container-owned state. The backend's vCPU ceiling remains the real bound."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "symbol": "configured_spare_executors::CARRICK_SPARE_EXECUTORS",
+      "fingerprint": "42e302bc90efd233ad13b83fa844d65b448c00696e81df3c19e4adbbb6db277d",
+      "classification": "config_debug",
+      "rationale": "Bisection hatch for the spare-executor budget (2 x nproc by default, `=0` to disable). Read once when the carrier starts its executor pool; it sizes host threads only and cannot select or overwrite container-owned state. The backend's vCPU ceiling remains the real bound."
     },
     {
       "kind": "static",

@@ -137,6 +137,13 @@ pub struct SyntheticProcThread {
     pub comm: Option<String>,
     pub user_cpu_us: u64,
     pub system_cpu_us: u64,
+    /// The guest CPU this thread last ran on — `/proc/<pid>/stat` field 39
+    /// (`processor`) and the same `P` `sched_getcpu` reports. `None` before
+    /// its first claim.
+    pub processor: Option<carrick_hal::GuestCpuId>,
+    /// This thread's `sched_setaffinity` mask, for `/proc/<pid>/status`
+    /// `Cpus_allowed`. The scheduler honours the same value.
+    pub cpus_allowed: carrick_hal::CpuAffinity,
 }
 
 /// One LIVE Linux process other than the reader, rendered by the in-process
@@ -2769,7 +2776,7 @@ fn synthetic_proc_cpuinfo(arch: GuestReportedArch) -> Vec<u8> {
     // block shape is per-ISA: an x86_64 guest (native x86 backends or a
     // Rosetta-translated guest) must NOT read an ARM block — that contradicts
     // `uname(2)` and breaks lscpu / language runtimes that parse cpuinfo.
-    let ncpu = crate::host_facts::logical_cpu_count();
+    let ncpu = crate::kernel::scheduler::guest_cpu_count();
     let mut out = String::new();
     match arch {
         GuestReportedArch::Aarch64 => {
@@ -2852,7 +2859,7 @@ fn synthetic_proc_uptime() -> String {
     // across all CPUs (>= field 1 on a multi-CPU box). Both 2-dp floats. The
     // old code emitted epoch-seconds here, yielding a ~56-year "uptime".
     let up = boot_elapsed().as_secs_f64();
-    let idle = up * crate::host_facts::logical_cpu_count().max(1) as f64;
+    let idle = up * crate::kernel::scheduler::guest_cpu_count().max(1) as f64;
     format!("{up:.2} {idle:.2}\n")
 }
 
@@ -2923,7 +2930,7 @@ fn synthetic_proc_stat() -> Vec<u8> {
     // Aggregate "cpu" line followed by one "cpuN" line per logical CPU, so the
     // per-CPU count agrees with sched_getaffinity and /proc/cpuinfo. The jiffy
     // columns are zero (carrick has no global CPU-time accounting yet).
-    let ncpu = crate::host_facts::logical_cpu_count();
+    let ncpu = crate::kernel::scheduler::guest_cpu_count();
     let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0\n");
     for cpu in 0..ncpu {
         out.push_str(&format!("cpu{cpu} 0 0 0 0 0 0 0 0 0 0\n"));
@@ -2944,15 +2951,17 @@ softirq 0\n",
 /// Kernel `Cpus_allowed` bitmask format: comma-separated 32-bit groups, most
 /// significant first, the high group unpadded and lower groups zero-padded to
 /// 8 hex digits (e.g. 10 CPUs → "000003ff" is shown as "3ff"; 33 CPUs →
-/// "1,ffffffff"). Built from the online set.
-fn cpus_allowed_hex(ncpu: usize) -> String {
+/// "1,ffffffff"). Rendered from the thread's OWN mask, so a
+/// `sched_setaffinity` shows up here exactly as Linux shows it.
+fn cpus_allowed_hex(mask: &carrick_hal::CpuAffinity, ncpu: usize) -> String {
     let groups = ncpu.div_ceil(32).max(1);
     let mut parts = Vec::with_capacity(groups);
     for g in (0..groups).rev() {
         let lo = g * 32;
         let mut word: u32 = 0;
         for bit in 0..32 {
-            if lo + bit < ncpu {
+            let cpu = lo + bit;
+            if cpu < ncpu && mask.is_allowed(carrick_hal::GuestCpuId::new(cpu as u32)) {
                 word |= 1u32 << bit;
             }
         }
@@ -2965,13 +2974,37 @@ fn cpus_allowed_hex(ncpu: usize) -> String {
     parts.join(",")
 }
 
-/// Kernel `Cpus_allowed_list` range list: "0" for a uniprocessor, "0-9" for 10.
-fn cpus_allowed_list(ncpu: usize) -> String {
-    if ncpu <= 1 {
-        "0".to_owned()
-    } else {
-        format!("0-{}", ncpu - 1)
+/// Kernel `Cpus_allowed_list` range list: "0" for a uniprocessor, "0-9" for
+/// ten contiguous CPUs, "0,3-4" for a sparse mask.
+fn cpus_allowed_list(mask: &carrick_hal::CpuAffinity, ncpu: usize) -> String {
+    let allowed: Vec<usize> = (0..ncpu.max(1))
+        .filter(|cpu| mask.is_allowed(carrick_hal::GuestCpuId::new(*cpu as u32)))
+        .collect();
+    if allowed.is_empty() {
+        return "0".to_owned();
     }
+    let mut ranges: Vec<String> = Vec::new();
+    let mut start = allowed[0];
+    let mut end = allowed[0];
+    for cpu in allowed.into_iter().skip(1) {
+        if cpu == end + 1 {
+            end = cpu;
+            continue;
+        }
+        ranges.push(if start == end {
+            format!("{start}")
+        } else {
+            format!("{start}-{end}")
+        });
+        start = cpu;
+        end = cpu;
+    }
+    ranges.push(if start == end {
+        format!("{start}")
+    } else {
+        format!("{start}-{end}")
+    });
+    ranges.join(",")
 }
 
 /// The guest's committed VMA spans for `/proc/self/status`: every snapshot
@@ -3065,9 +3098,20 @@ fn synthetic_proc_self_status(ctx: &OpenContext<'_>) -> String {
             |threads| threads.len(),
         )
         .max(1);
-    let ncpu = crate::host_facts::logical_cpu_count();
-    let cpus_hex = cpus_allowed_hex(ncpu);
-    let cpus_list = cpus_allowed_list(ncpu);
+    let ncpu = crate::kernel::scheduler::guest_cpu_count();
+    let self_thread = ctx.threads().and_then(|threads| {
+        let self_pid = crate::namespace::pid::self_ns_pid();
+        threads
+            .iter()
+            .find(|thread| thread.tid == self_pid)
+            .or_else(|| threads.first())
+            .cloned()
+    });
+    let cpus_allowed = self_thread
+        .as_ref()
+        .map_or_else(|| carrick_hal::CpuAffinity::all(ncpu), |t| t.cpus_allowed);
+    let cpus_hex = cpus_allowed_hex(&cpus_allowed, ncpu);
+    let cpus_list = cpus_allowed_list(&cpus_allowed, ncpu);
     let host = crate::host_proc::self_resource_usage().unwrap_or_default();
     // VmSize must reflect the guest's committed virtual size, NOT carrick's host
     // virtual size — which includes the 512 GiB sparse mmap window and made the
@@ -3271,15 +3315,21 @@ fn synthetic_proc_self_stat(ctx: &OpenContext<'_>) -> String {
             )
         },
     );
+    let mut processor = 0u32;
     let (nthreads, state) = match ctx.threads() {
-        Some(threads) => (
-            threads.len().max(1),
-            threads
+        Some(threads) => {
+            let self_thread = threads
                 .iter()
                 .find(|thread| thread.tid == pid)
-                .or_else(|| threads.first())
-                .map_or('R', |thread| thread.state),
-        ),
+                .or_else(|| threads.first());
+            processor = self_thread
+                .and_then(|thread| thread.processor)
+                .map_or(0, carrick_hal::GuestCpuId::as_u32);
+            (
+                threads.len().max(1),
+                self_thread.map_or('R', |thread| thread.state),
+            )
+        }
         None => {
             let thread_states = ctx
                 .runtime_endpoint_container
@@ -3305,6 +3355,7 @@ fn synthetic_proc_self_stat(ctx: &OpenContext<'_>) -> String {
         nthreads,
         utime_ticks,
         stime_ticks,
+        processor,
     )
 }
 
@@ -3342,6 +3393,7 @@ fn proc_stat_line(
     num_threads: usize,
     utime_ticks: u64,
     stime_ticks: u64,
+    processor: u32,
 ) -> String {
     // Field 14 is utime (user CPU, in clock ticks). It MUST advance: a real test
     // setup spins `do { read } while (utime == 0)` to confirm CPU was consumed
@@ -3353,6 +3405,11 @@ fn proc_stat_line(
     // to decide whether to emit the multi-threaded-fork DeprecationWarning
     // (test_threading.test_*_after_fork). Was a hardcoded 1.
     //
+    // Field 39 is `processor`: the CPU the task last ran on. It was a
+    // hardcoded 17 — a CPU that does not exist on a guest told `nproc` = 4,
+    // which is what "executors are not guest CPUs" looked like from inside the
+    // guest. It now names the real `P` the scheduler ran the thread on.
+    //
     // The line must carry exactly 52 space-separated fields through field 52
     // (exit_code) per proc_pid_stat(5); a strict parser that splits and indexes
     // the tail (Go runtime, ps, monitoring agents) reads a short array if any
@@ -3360,17 +3417,47 @@ fn proc_stat_line(
     format!(
         "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 -1 4194560 0 0 0 0 {utime_ticks} {stime_ticks} 0 0 \
 20 0 {num_threads} 0 1 10485760 256 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 \
-17 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+{processor} 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
 }
 
 #[cfg(test)]
 #[test]
 fn proc_stat_line_renders_exact_logical_user_and_system_ticks() {
-    let line = proc_stat_line(7, "task", 'R', 1, 7, 7, 1, 17, 19);
+    let line = proc_stat_line(7, "task", 'R', 1, 7, 7, 1, 17, 19, 2);
     let fields: Vec<_> = line.split_whitespace().collect();
+    assert_eq!(fields.len(), 52, "proc_pid_stat(5) has 52 fields");
     assert_eq!(fields[13], "17");
     assert_eq!(fields[14], "19");
+    // Field 39 is `processor`: the guest CPU the task last ran on. It was a
+    // hardcoded 17, a CPU that does not exist on a four-CPU guest.
+    assert_eq!(fields[38], "2");
+}
+
+#[cfg(test)]
+#[test]
+fn cpus_allowed_renders_the_threads_own_mask_not_the_online_set() {
+    use carrick_hal::{CpuAffinity, GuestCpuId};
+
+    let all = CpuAffinity::all(4);
+    assert_eq!(cpus_allowed_hex(&all, 4), "f");
+    assert_eq!(cpus_allowed_list(&all, 4), "0-3");
+
+    // A `sched_setaffinity` that pins one CPU has to be visible here, or the
+    // guest reads a mask it did not set.
+    let pinned = CpuAffinity::single(GuestCpuId::new(2));
+    assert_eq!(cpus_allowed_hex(&pinned, 4), "4");
+    assert_eq!(cpus_allowed_list(&pinned, 4), "2");
+
+    // A sparse mask renders as Linux's comma-separated range list.
+    let sparse = CpuAffinity::from_words(&[0b1101]);
+    assert_eq!(cpus_allowed_hex(&sparse, 4), "d");
+    assert_eq!(cpus_allowed_list(&sparse, 4), "0,2-3");
+
+    // Ten CPUs still render the documented "3ff" / "0-9" pair.
+    let ten = CpuAffinity::all(10);
+    assert_eq!(cpus_allowed_hex(&ten, 10), "3ff");
+    assert_eq!(cpus_allowed_list(&ten, 10), "0-9");
 }
 
 #[cfg(test)]
@@ -3393,6 +3480,8 @@ fn synthetic_self_thread_and_peer_stat_use_published_logical_cpu() {
             comm: Some("worker".to_owned()),
             user_cpu_us: 2_300_000,
             system_cpu_us: 2_900_000,
+            processor: None,
+            cpus_allowed: carrick_hal::CpuAffinity::all(4),
         }]),
         processes: Some(vec![SyntheticProcProcess {
             pid: 7,
@@ -3516,6 +3605,7 @@ fn synthetic_proc_pid_file(
                         threads.len().max(1),
                         cpu_us_to_ticks(thread.user_cpu_us),
                         cpu_us_to_ticks(thread.system_cpu_us),
+                        thread.processor.map_or(0, carrick_hal::GuestCpuId::as_u32),
                     )
                     .into_bytes(),
                 );
@@ -3564,6 +3654,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{count}\n",
                     1,
                     cpu_us_to_ticks(zombie.user_cpu_us),
                     cpu_us_to_ticks(zombie.system_cpu_us),
+                    0,
                 )
                 .into_bytes(),
             ),
@@ -3612,6 +3703,10 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
                     threads,
                     cpu_us_to_ticks(process.user_cpu_us),
                     cpu_us_to_ticks(process.system_cpu_us),
+                    // A peer PROCESS snapshot carries no per-thread CPU;
+                    // its leader's is read through
+                    // `/proc/<pid>/task/<tid>/stat`.
+                    0,
                 )
                 .into_bytes(),
             ),
@@ -3693,6 +3788,7 @@ Threads:\t{threads}\n",
                         own_threads.len().max(1),
                         self_utime_ticks(),
                         0,
+                        0,
                     )
                     .into_bytes(),
                 );
@@ -3731,7 +3827,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         let me = std::process::id();
         let comm = self_comm;
         return match rest {
-            "stat" => Some(proc_stat_line(pid, comm, state, ppid, me, me, 1, 0, 0).into_bytes()),
+            "stat" => Some(proc_stat_line(pid, comm, state, ppid, me, me, 1, 0, 0, 0).into_bytes()),
             "comm" => Some(format!("{comm}\n").into_bytes()),
             "cmdline" => {
                 let mut b = comm.as_bytes().to_vec();
@@ -3815,8 +3911,10 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
         // a single thread (num_threads=1). The multi-threaded-fork warning only
         // reads the caller's OWN /proc/self/stat, which uses the live count.
         "stat" => Some(
-            proc_stat_line(pid, &comm, state, disp_ppid, disp_pgid, disp_pgid, 1, 0, 0)
-                .into_bytes(),
+            proc_stat_line(
+                pid, &comm, state, disp_ppid, disp_pgid, disp_pgid, 1, 0, 0, 0,
+            )
+            .into_bytes(),
         ),
         "comm" => Some(format!("{comm}\n").into_bytes()),
         "cmdline" => {
@@ -4294,6 +4392,8 @@ mod tests {
                     comm: Some("mainthread".to_owned()),
                     user_cpu_us: 0,
                     system_cpu_us: 0,
+                    processor: None,
+                    cpus_allowed: carrick_hal::CpuAffinity::all(4),
                 },
                 SyntheticProcThread {
                     tid: 2,
@@ -4301,6 +4401,8 @@ mod tests {
                     comm: Some("worker-thread".to_owned()),
                     user_cpu_us: 0,
                     system_cpu_us: 0,
+                    processor: None,
+                    cpus_allowed: carrick_hal::CpuAffinity::all(4),
                 },
             ]),
             ..SyntheticProcContext::default()
@@ -4392,6 +4494,8 @@ mod tests {
                 comm: Some("leader".to_owned()),
                 user_cpu_us: 0,
                 system_cpu_us: 0,
+                processor: None,
+                cpus_allowed: carrick_hal::CpuAffinity::all(4),
             },
             SyntheticProcThread {
                 tid: 74,
@@ -4399,6 +4503,8 @@ mod tests {
                 comm: Some("waiter".to_owned()),
                 user_cpu_us: 0,
                 system_cpu_us: 0,
+                processor: None,
+                cpus_allowed: carrick_hal::CpuAffinity::all(4),
             },
         ];
         let ctx = OpenContext {

@@ -326,7 +326,7 @@ impl Vfs for SysVfs {
 /// `lscpu`, and `sysconf(_SC_NPROCESSORS_*)` parse. Derived from the
 /// Linux-visible CPU count so it agrees with `sched_getaffinity`/`/proc/cpuinfo`.
 fn cpu_range_list() -> Vec<u8> {
-    let ncpu = crate::host_facts::logical_cpu_count();
+    let ncpu = crate::kernel::scheduler::guest_cpu_count();
     if ncpu <= 1 {
         b"0\n".to_vec()
     } else {
@@ -348,7 +348,11 @@ fn synthetic_sys_cpu_present() -> Vec<u8> {
 
 fn synthetic_sys_cpu_kernel_max() -> Vec<u8> {
     // Highest CPU index the kernel could ever support (CONFIG_NR_CPUS-1).
-    format!("{}\n", crate::host_facts::logical_cpu_count().max(1) - 1).into_bytes()
+    format!(
+        "{}\n",
+        crate::kernel::scheduler::guest_cpu_count().max(1) - 1
+    )
+    .into_bytes()
 }
 
 fn synthetic_sys_cpu0_online() -> &'static [u8] {

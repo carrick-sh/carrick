@@ -697,17 +697,6 @@ pub(super) struct ProcState {
     /// signal pump's kqueue (see crate::itimer). VIRTUAL/PROF are keyed to
     /// guest CPU accounting and use wall-clock kqueue timers only as rechecks.
     pub itimers: [Option<ItimerState>; 3],
-    /// CPU affinity mask, one bit per Linux-visible logical CPU (word 0 holds
-    /// CPUs 0..64). Seeded to "all online CPUs" from `host_facts` so
-    /// `sched_getaffinity` reports Carrick's effective vCPU capacity — the Go
-    /// runtime sizes `GOMAXPROCS` from its population count, and `nproc`/OpenMP
-    /// read it too.
-    /// `sched_setaffinity` updates it (intersected with the online set) so a
-    /// set→get round-trips; Apple Silicon scheduling is advisory, so we honour
-    /// the observable mask without physically pinning the host thread. Affinity
-    /// is inherited across `fork`, which the address-space copy gives us for
-    /// free. See `host_facts`.
-    pub affinity: Vec<u64>,
     /// Whether hardware x86_64 TSO memory ordering is active for this guest
     /// (`prctl(PR_SET_MEM_MODEL, PR_SET_MEM_MODEL_TSO)`, set by Rosetta). Tracked
     /// so `PR_GET_MEM_MODEL` reports the current model. The actual ACTLR_EL1
@@ -730,17 +719,6 @@ pub(super) struct ProcState {
     /// but Linux does not inherit the membarrier registration across fork, so
     /// the fork path clears it). See `SyscallDispatcher::membarrier`.
     pub membarrier_ready: u64,
-}
-
-/// Default affinity mask for `ncpu` logical CPUs: the low `ncpu` bits set
-/// across `ceil(ncpu/64)` 64-bit words.
-pub(super) fn default_affinity(ncpu: usize) -> Vec<u64> {
-    let words = ncpu.div_ceil(64).max(1);
-    let mut mask = vec![0u64; words];
-    for cpu in 0..ncpu {
-        mask[cpu / 64] |= 1u64 << (cpu % 64);
-    }
-    mask
 }
 
 /// Serialize an affinity word-mask into exactly `out_len` little-endian bytes
@@ -771,16 +749,6 @@ fn rusage_from_us(user_us: u64, system_us: u64) -> LinuxRusage {
     ru.ru_utime = tv(user_us);
     ru.ru_stime = tv(system_us);
     ru
-}
-
-/// Lowest CPU index set in a word-mask, or `None` if empty.
-pub(super) fn lowest_set_cpu(mask: &[u64]) -> Option<u32> {
-    for (i, word) in mask.iter().enumerate() {
-        if *word != 0 {
-            return Some((i as u32) * 64 + word.trailing_zeros());
-        }
-    }
-    None
 }
 
 /// Parse a little-endian CPU bitmask from user bytes into `words` 64-bit words.
@@ -833,7 +801,6 @@ impl ProcState {
             namespace_pid: None,
             hvpatch_process: None,
             itimers: [None, None, None],
-            affinity: default_affinity(crate::host_facts::logical_cpu_count()),
             tso_enabled: false,
             ptrace_traceme: false,
             virtual_ptrace_stops: std::collections::HashMap::new(),
@@ -1781,7 +1748,22 @@ impl SyscallDispatcher {
 
         fn getcpu(this, cx, cpu_address: GuestPtr, node_address: GuestPtr) {
             let memory = &mut *cx.memory;
-            let cpu = lowest_set_cpu(&this.proc.lock().affinity).unwrap_or(0);
+            // The guest CPU this thread is running on right now — the same
+            // `P` its run queue, `sched_getaffinity` mask and
+            // `/proc/<pid>/stat` field 39 name. `sched_getcpu(3)` is this
+            // syscall. Before a thread's first claim it has no `last_cpu`;
+            // report the lowest CPU its mask allows, which is where the
+            // scheduler would place it.
+            let thread = cx.kernel.thread();
+            let cpu = thread
+                .last_cpu()
+                .filter(|cpu| thread.affinity().is_allowed(*cpu))
+                .or_else(|| {
+                    thread
+                        .affinity()
+                        .first_allowed(crate::kernel::scheduler::guest_cpu_count())
+                })
+                .map_or(0, carrick_hal::GuestCpuId::as_u32);
             let cpu_value = cpu.to_ne_bytes();
             let node_value = 0u32.to_ne_bytes();
 
@@ -2035,12 +2017,12 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let memory = &mut *cx.memory;
-            let kernel_bytes = crate::host_facts::logical_cpu_count().div_ceil(64) * 8;
+            let kernel_bytes = crate::kernel::scheduler::guest_cpu_count().div_ceil(64) * 8;
             if size < kernel_bytes {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let mask = this.proc.lock().affinity.clone();
-            let buf = affinity_to_bytes(&mask, kernel_bytes);
+            let mask = cx.kernel.thread().affinity();
+            let buf = affinity_to_bytes(mask.words(), kernel_bytes);
             memory.write_bytes(address.0, &buf)?;
             Ok(DispatchOutcome::Returned {
                 value: kernel_bytes as i64,
@@ -2062,19 +2044,21 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
-            let ncpu = crate::host_facts::logical_cpu_count();
-            let online = default_affinity(ncpu);
-            let requested = affinity_from_bytes(&bytes, online.len());
-            let effective: Vec<u64> = online
-                .iter()
-                .zip(requested.iter())
-                .map(|(o, r)| o & r)
-                .collect();
-            if effective.iter().all(|w| *w == 0) {
+            let ncpu = crate::kernel::scheduler::guest_cpu_count();
+            let online = carrick_hal::CpuAffinity::all(ncpu);
+            let requested = carrick_hal::CpuAffinity::from_words(&affinity_from_bytes(
+                &bytes,
+                carrick_hal::MAX_GUEST_CPUS.div_ceil(64),
+            ));
+            let effective = online.intersect(&requested);
+            if effective.is_empty() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if target == SchedTarget::SelfProc {
-                this.proc.lock().affinity = effective;
+                // This is not decoration: the run queue reads the same mask
+                // when it places a wake and when an idle guest CPU tries to
+                // steal, so a pinned thread really does stay on its CPU.
+                cx.kernel.thread().set_affinity(effective);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -8247,29 +8231,11 @@ mod native_virtual_ptrace_tests {
 
 #[cfg(test)]
 mod affinity_tests {
-    use super::{affinity_from_bytes, affinity_to_bytes, default_affinity, lowest_set_cpu};
-
-    #[test]
-    fn lowest_set_cpu_finds_first_bit() {
-        assert_eq!(lowest_set_cpu(&[0x1]), Some(0));
-        assert_eq!(lowest_set_cpu(&[0x3ff]), Some(0)); // full 10-CPU mask → CPU 0
-        assert_eq!(lowest_set_cpu(&[1 << 9]), Some(9)); // pinned to CPU 9
-        assert_eq!(lowest_set_cpu(&[0, 0x1]), Some(64)); // second word
-        assert_eq!(lowest_set_cpu(&[0, 0]), None);
-    }
-
-    #[test]
-    fn default_affinity_sets_low_ncpu_bits() {
-        assert_eq!(default_affinity(1), vec![0x1]);
-        assert_eq!(default_affinity(10), vec![0x3ff]);
-        assert_eq!(default_affinity(64), vec![u64::MAX]);
-        // 65 CPUs spill into a second word.
-        assert_eq!(default_affinity(65), vec![u64::MAX, 0x1]);
-    }
+    use super::{affinity_from_bytes, affinity_to_bytes};
 
     #[test]
     fn affinity_bytes_round_trip() {
-        let mask = default_affinity(10);
+        let mask = vec![0x3ffu64];
         let bytes = affinity_to_bytes(&mask, 8);
         assert_eq!(bytes, vec![0xff, 0x03, 0, 0, 0, 0, 0, 0]);
         assert_eq!(affinity_from_bytes(&bytes, 1), mask);

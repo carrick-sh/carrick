@@ -520,3 +520,503 @@ impl SyscallInterceptor for SyscallJitter {
         carrick_runtime::observe::InterceptAction::Continue
     }
 }
+
+/// A deterministic, seeded PRNG for the scheduling policies below.
+///
+/// `rand` is not a dependency of this crate and a scheduling policy must not
+/// take a lock to answer a placement, so this is a plain xorshift64* over one
+/// atomic word: `fetch_update` is wait-free, and every draw advances the same
+/// stream, so a seed plus a call COUNT reproduces a decision exactly.
+#[derive(Debug)]
+struct SeededStream {
+    state: std::sync::atomic::AtomicU64,
+    draws: std::sync::atomic::AtomicU64,
+}
+
+impl SeededStream {
+    fn new(seed: u64) -> Self {
+        Self {
+            // xorshift is degenerate at zero, so no seed may reach it.
+            state: std::sync::atomic::AtomicU64::new(seed | 1),
+            draws: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn next(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.draws.fetch_add(1, Ordering::Relaxed);
+        let mut drawn = 0u64;
+        let _ = self
+            .state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                let mut x = current;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                drawn = x;
+                Some(x)
+            });
+        drawn
+    }
+
+    /// Draws taken so far. A test asserts on this to prove the policy was
+    /// actually consulted rather than silently bypassed — the mechanism only
+    /// calls `pick_next`/`steal` when `inspects_queues()` is true, so a policy
+    /// that forgets to override it looks correct and decides nothing.
+    fn draws(&self) -> u64 {
+        self.draws.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A scheduling policy that makes the WORST legal choice it can, seeded so the
+/// choice sequence is reproducible.
+///
+/// The point is not fairness or throughput; it is to drive the mechanism's own
+/// transitions — claims, steals, settlements, generation observation — through
+/// orderings that the default policy's locality rules make rare. The design
+/// (`docs/superpowers/specs/2026-09-07-guest-cpu-scheduler-design.md`, phase 2)
+/// names this as the policy hook's first consumer, precisely so a race in the
+/// scheduler is reproduced THROUGH THE SCHEDULER rather than only through host
+/// load or syscall jitter.
+///
+/// Every answer stays inside the contract: `select_cpu` returns an
+/// affinity-allowed CPU below `cpu_count()`, `pick_next` returns a task that
+/// is in the view it was handed, and `steal` never names the stealer as its
+/// own victim. A policy cannot express an unsafe scheduling decision — the
+/// mechanism re-validates affinity and the exact generation either way — so
+/// "adversarial" here means maximally cache-hostile and maximally
+/// order-shuffling, never invalid.
+#[derive(Debug)]
+pub struct AdversarialPolicy {
+    cpu_count: usize,
+    stream: SeededStream,
+}
+
+impl AdversarialPolicy {
+    /// `cpu_count` guest CPUs, decisions drawn from `seed`.
+    pub fn new(cpu_count: usize, seed: u64) -> Self {
+        Self {
+            cpu_count: cpu_count.clamp(1, carrick_hal::MAX_GUEST_CPUS),
+            stream: SeededStream::new(seed),
+        }
+    }
+
+    /// How many decisions this policy has been asked for.
+    pub fn decisions(&self) -> u64 {
+        self.stream.draws()
+    }
+}
+
+impl carrick_hal::SchedulingPolicy for AdversarialPolicy {
+    fn cpu_count(&self) -> usize {
+        self.cpu_count
+    }
+
+    fn select_cpu(&self, placement: &carrick_hal::TaskPlacement<'_>) -> carrick_hal::GuestCpuId {
+        // Anywhere the affinity mask allows EXCEPT `last_cpu` when there is a
+        // choice: the default policy's whole placement rule is locality, so
+        // the adversary spends every wake migrating.
+        let allowed: Vec<carrick_hal::GuestCpuId> = (0..self.cpu_count)
+            .map(|index| carrick_hal::GuestCpuId::new(index as u32))
+            .filter(|cpu| placement.affinity.is_allowed(*cpu))
+            .collect();
+        if allowed.is_empty() {
+            return placement
+                .last_cpu
+                .unwrap_or(carrick_hal::GuestCpuId::new(0));
+        }
+        let elsewhere: Vec<carrick_hal::GuestCpuId> = allowed
+            .iter()
+            .copied()
+            .filter(|cpu| Some(*cpu) != placement.last_cpu)
+            .collect();
+        let pool = if elsewhere.is_empty() {
+            &allowed
+        } else {
+            &elsewhere
+        };
+        pool[(self.stream.next() % pool.len() as u64) as usize]
+    }
+
+    fn inspects_queues(&self) -> bool {
+        true
+    }
+
+    fn pick_next(&self, view: &carrick_hal::CpuQueueView<'_>) -> Option<carrick_hal::TaskKey> {
+        // Not the FIFO head: run the queue in a shuffled order so a settlement
+        // is as likely to race a late row as an early one.
+        if view.queued.is_empty() {
+            return None;
+        }
+        Some(view.queued[(self.stream.next() % view.queued.len() as u64) as usize])
+    }
+
+    fn steal(
+        &self,
+        cpu: carrick_hal::GuestCpuId,
+        victims: &[carrick_hal::CpuQueueView<'_>],
+    ) -> Option<(carrick_hal::GuestCpuId, carrick_hal::TaskKey)> {
+        // Steal at every opportunity, from a random victim and a random
+        // position, rather than the mechanism's longest-queue-tail scan.
+        let stealable: Vec<&carrick_hal::CpuQueueView<'_>> = victims
+            .iter()
+            .filter(|view| view.cpu != cpu && !view.queued.is_empty())
+            .collect();
+        if stealable.is_empty() {
+            return None;
+        }
+        let view = stealable[(self.stream.next() % stealable.len() as u64) as usize];
+        let task = view.queued[(self.stream.next() % view.queued.len() as u64) as usize];
+        Some((view.cpu, task))
+    }
+
+    fn on_tick(&self, _cpu: carrick_hal::GuestCpuId) -> carrick_hal::PreemptOrContinue {
+        // Preempt on every tick: maximal switching, maximal settlement churn.
+        carrick_hal::PreemptOrContinue::Preempt
+    }
+}
+
+/// One scheduling decision, as recorded by [`RecordReplay`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulingDecision {
+    SelectCpu {
+        task: carrick_hal::TaskKey,
+        cpu: carrick_hal::GuestCpuId,
+    },
+    PickNext {
+        cpu: carrick_hal::GuestCpuId,
+        task: Option<carrick_hal::TaskKey>,
+    },
+    Steal {
+        cpu: carrick_hal::GuestCpuId,
+        stolen: Option<(carrick_hal::GuestCpuId, carrick_hal::TaskKey)>,
+    },
+}
+
+/// Records an inner policy's decision sequence, then replays it.
+///
+/// Recording answers exactly what the inner policy answers and appends the
+/// decision; replaying answers from the recording in order. This is what turns
+/// an [`AdversarialPolicy`] run that DID reproduce a defect into a fixed
+/// artifact: the seed reproduces the draw sequence, and the recording
+/// reproduces the decision sequence even when the draws are consumed in a
+/// different interleaving.
+///
+/// Replay is best-effort by construction and says so: a recorded answer that
+/// no longer applies (a CPU the task's affinity now forbids, a task that is
+/// not in the queue view being offered) is DISCARDED and the inner policy
+/// answers instead, because the mechanism re-validates every answer anyway and
+/// a policy that insisted would only be ignored. `divergences()` counts those,
+/// so a test can assert a replay actually followed its recording rather than
+/// silently degenerating into a second live run.
+#[derive(Debug)]
+pub struct RecordReplay {
+    inner: Arc<dyn carrick_hal::SchedulingPolicy>,
+    recording: parking_lot::Mutex<Vec<SchedulingDecision>>,
+    replay: bool,
+    cursor: std::sync::atomic::AtomicUsize,
+    divergences: std::sync::atomic::AtomicU64,
+}
+
+impl RecordReplay {
+    /// Record `inner`'s decisions.
+    pub fn recording(inner: Arc<dyn carrick_hal::SchedulingPolicy>) -> Self {
+        Self {
+            inner,
+            recording: parking_lot::Mutex::new(Vec::new()),
+            replay: false,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+            divergences: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Replay `recorded`, falling back to `inner` where a recorded answer no
+    /// longer applies.
+    pub fn replaying(
+        inner: Arc<dyn carrick_hal::SchedulingPolicy>,
+        recorded: Vec<SchedulingDecision>,
+    ) -> Self {
+        Self {
+            inner,
+            recording: parking_lot::Mutex::new(recorded),
+            replay: true,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+            divergences: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The decisions recorded so far, in order.
+    pub fn recorded(&self) -> Vec<SchedulingDecision> {
+        self.recording.lock().clone()
+    }
+
+    /// Recorded answers that no longer applied on replay.
+    pub fn divergences(&self) -> u64 {
+        self.divergences.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record(&self, decision: SchedulingDecision) {
+        if !self.replay {
+            self.recording.lock().push(decision);
+        }
+    }
+
+    /// The next recorded decision, or `None` when recording or exhausted.
+    fn next_recorded(&self) -> Option<SchedulingDecision> {
+        if !self.replay {
+            return None;
+        }
+        let index = self
+            .cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.recording.lock().get(index).copied()
+    }
+
+    fn diverged(&self) {
+        self.divergences
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl carrick_hal::SchedulingPolicy for RecordReplay {
+    fn cpu_count(&self) -> usize {
+        self.inner.cpu_count()
+    }
+
+    fn select_cpu(&self, placement: &carrick_hal::TaskPlacement<'_>) -> carrick_hal::GuestCpuId {
+        if let Some(SchedulingDecision::SelectCpu { task, cpu }) = self.next_recorded() {
+            if task == placement.task && placement.affinity.is_allowed(cpu) {
+                return cpu;
+            }
+            self.diverged();
+        }
+        let cpu = self.inner.select_cpu(placement);
+        self.record(SchedulingDecision::SelectCpu {
+            task: placement.task,
+            cpu,
+        });
+        cpu
+    }
+
+    fn inspects_queues(&self) -> bool {
+        self.inner.inspects_queues()
+    }
+
+    fn pick_next(&self, view: &carrick_hal::CpuQueueView<'_>) -> Option<carrick_hal::TaskKey> {
+        if let Some(SchedulingDecision::PickNext { cpu, task }) = self.next_recorded() {
+            match task {
+                Some(task) if cpu == view.cpu && view.queued.contains(&task) => {
+                    return Some(task);
+                }
+                None if cpu == view.cpu && view.queued.is_empty() => return None,
+                _ => self.diverged(),
+            }
+        }
+        let task = self.inner.pick_next(view);
+        self.record(SchedulingDecision::PickNext {
+            cpu: view.cpu,
+            task,
+        });
+        task
+    }
+
+    fn steal(
+        &self,
+        cpu: carrick_hal::GuestCpuId,
+        victims: &[carrick_hal::CpuQueueView<'_>],
+    ) -> Option<(carrick_hal::GuestCpuId, carrick_hal::TaskKey)> {
+        if let Some(SchedulingDecision::Steal {
+            cpu: recorded_cpu,
+            stolen,
+        }) = self.next_recorded()
+        {
+            let still_applies = match stolen {
+                Some((victim, task)) => victims
+                    .iter()
+                    .any(|view| view.cpu == victim && view.queued.contains(&task)),
+                None => true,
+            };
+            if recorded_cpu == cpu && still_applies {
+                return stolen;
+            }
+            self.diverged();
+        }
+        let stolen = self.inner.steal(cpu, victims);
+        self.record(SchedulingDecision::Steal { cpu, stolen });
+        stolen
+    }
+
+    fn on_tick(&self, cpu: carrick_hal::GuestCpuId) -> carrick_hal::PreemptOrContinue {
+        self.inner.on_tick(cpu)
+    }
+
+    fn on_runnable(&self, task: carrick_hal::TaskKey, cpu: carrick_hal::GuestCpuId) {
+        self.inner.on_runnable(task, cpu);
+    }
+
+    fn on_block(&self, task: carrick_hal::TaskKey, cpu: carrick_hal::GuestCpuId) {
+        self.inner.on_block(task, cpu);
+    }
+
+    fn on_exit(&self, task: carrick_hal::TaskKey, cpu: carrick_hal::GuestCpuId) {
+        self.inner.on_exit(task, cpu);
+    }
+}
+
+#[cfg(test)]
+mod scheduling_policy_tests {
+    use super::{AdversarialPolicy, RecordReplay, SchedulingDecision};
+    use carrick_hal::{
+        CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, PreemptOrContinue,
+        SchedulingPolicy, TaskKey, TaskPlacement,
+    };
+    use std::sync::Arc;
+
+    fn placement<'a>(task: u64, last: Option<u32>, cpus: &'a [CpuLoad]) -> TaskPlacement<'a> {
+        TaskPlacement {
+            task: TaskKey::new(task),
+            last_cpu: last.map(GuestCpuId::new),
+            affinity: CpuAffinity::all(cpus.len()),
+            cpus,
+        }
+    }
+
+    /// Adversarial means cache-hostile, never invalid: the answer is always a
+    /// CPU the affinity mask allows, and it is never `last_cpu` while another
+    /// allowed CPU exists.
+    #[test]
+    fn the_adversary_migrates_but_stays_inside_the_affinity_mask() {
+        let policy = AdversarialPolicy::new(4, 12_345);
+        let cpus = [CpuLoad::default(); 4];
+        for _ in 0..64 {
+            let chosen = policy.select_cpu(&placement(7, Some(2), &cpus));
+            assert!(chosen.as_usize() < 4);
+            assert_ne!(chosen, GuestCpuId::new(2), "the adversary never stays put");
+        }
+
+        // A one-CPU mask leaves nothing to migrate to, so the pin still wins.
+        let pinned = TaskPlacement {
+            task: TaskKey::new(7),
+            last_cpu: Some(GuestCpuId::new(2)),
+            affinity: CpuAffinity::single(GuestCpuId::new(2)),
+            cpus: &cpus,
+        };
+        assert_eq!(policy.select_cpu(&pinned), GuestCpuId::new(2));
+        assert!(policy.decisions() > 0, "the policy recorded its draws");
+    }
+
+    #[test]
+    fn the_adversary_only_ever_names_a_task_it_was_offered() {
+        let policy = AdversarialPolicy::new(2, 999);
+        assert!(policy.inspects_queues(), "or it is never consulted at all");
+        let queued: Vec<TaskKey> = (1..=5).map(TaskKey::new).collect();
+        let view = CpuQueueView {
+            cpu: GuestCpuId::new(0),
+            queued: &queued,
+        };
+        for _ in 0..32 {
+            let picked = policy.pick_next(&view).expect("a non-empty queue");
+            assert!(queued.contains(&picked));
+        }
+        assert_eq!(
+            policy.pick_next(&CpuQueueView {
+                cpu: GuestCpuId::new(0),
+                queued: &[],
+            }),
+            None
+        );
+        assert_eq!(
+            policy.on_tick(GuestCpuId::new(0)),
+            PreemptOrContinue::Preempt
+        );
+    }
+
+    #[test]
+    fn the_adversary_never_steals_from_itself() {
+        let policy = AdversarialPolicy::new(3, 4_242);
+        let mine: Vec<TaskKey> = vec![TaskKey::new(1)];
+        let theirs: Vec<TaskKey> = vec![TaskKey::new(2), TaskKey::new(3)];
+        let views = [
+            CpuQueueView {
+                cpu: GuestCpuId::new(0),
+                queued: &mine,
+            },
+            CpuQueueView {
+                cpu: GuestCpuId::new(1),
+                queued: &theirs,
+            },
+        ];
+        for _ in 0..32 {
+            let (victim, task) = policy
+                .steal(GuestCpuId::new(0), &views)
+                .expect("a loaded victim");
+            assert_eq!(victim, GuestCpuId::new(1));
+            assert!(theirs.contains(&task));
+        }
+        // Nothing to take is not a steal.
+        assert_eq!(policy.steal(GuestCpuId::new(0), &[]), None);
+    }
+
+    /// The same seed reproduces the same decision sequence, which is the only
+    /// reason an adversarial run is worth reporting: a failing interleaving
+    /// gets a name.
+    #[test]
+    fn a_seed_reproduces_the_decision_sequence() {
+        let cpus = [CpuLoad::default(); 4];
+        let draw = |seed: u64| {
+            let policy = AdversarialPolicy::new(4, seed);
+            (0..32)
+                .map(|_| policy.select_cpu(&placement(7, None, &cpus)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(draw(7), draw(7));
+        assert_ne!(draw(7), draw(8));
+    }
+
+    #[test]
+    fn a_recording_replays_its_own_decisions() {
+        let cpus = [CpuLoad::default(); 4];
+        let inner: Arc<dyn SchedulingPolicy> = Arc::new(AdversarialPolicy::new(4, 55));
+        let recorder = RecordReplay::recording(Arc::clone(&inner));
+        let live: Vec<GuestCpuId> = (0..16)
+            .map(|task| recorder.select_cpu(&placement(task, None, &cpus)))
+            .collect();
+        let recorded = recorder.recorded();
+        assert_eq!(recorded.len(), 16);
+
+        // A different inner policy proves the answers come from the RECORDING.
+        let replay = RecordReplay::replaying(
+            Arc::new(GuestCpuPolicy::new(4)) as Arc<dyn SchedulingPolicy>,
+            recorded,
+        );
+        let replayed: Vec<GuestCpuId> = (0..16)
+            .map(|task| replay.select_cpu(&placement(task, None, &cpus)))
+            .collect();
+        assert_eq!(replayed, live);
+        assert_eq!(replay.divergences(), 0);
+    }
+
+    /// A recorded answer that no longer applies is discarded, counted, and the
+    /// inner policy answers — the mechanism re-validates every answer anyway,
+    /// so insisting would only be ignored silently.
+    #[test]
+    fn a_stale_recorded_answer_diverges_instead_of_lying() {
+        let cpus = [CpuLoad::default(); 4];
+        let replay = RecordReplay::replaying(
+            Arc::new(GuestCpuPolicy::new(4)) as Arc<dyn SchedulingPolicy>,
+            vec![SchedulingDecision::SelectCpu {
+                task: TaskKey::new(1),
+                cpu: GuestCpuId::new(3),
+            }],
+        );
+        // CPU 3 is not in this task's affinity mask any more.
+        let pinned = TaskPlacement {
+            task: TaskKey::new(1),
+            last_cpu: None,
+            affinity: CpuAffinity::single(GuestCpuId::new(0)),
+            cpus: &cpus,
+        };
+        assert_eq!(replay.select_cpu(&pinned), GuestCpuId::new(0));
+        assert_eq!(replay.divergences(), 1);
+    }
+}

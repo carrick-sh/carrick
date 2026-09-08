@@ -5,10 +5,15 @@
 //! state, never authority for it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::{Condvar, Mutex};
+
+pub use carrick_hal::{
+    CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, PreemptOrContinue,
+    SchedulingPolicy, TaskKey, TaskPlacement,
+};
 
 use super::Kernel;
 use super::objects::{
@@ -128,6 +133,19 @@ pub(crate) trait SchedulerGenerationObserver: Send + Sync {
         successor: ExecutionGeneration,
         kind: SchedulerGenerationTransition,
     ) -> Result<(), RunQueueError>;
+
+    /// The scheduler classified the rejection this observer just returned as
+    /// [`TransitionRejection::TargetReaped`]: the exact thread is gone from
+    /// the kernel graph, so no successor will ever be published for
+    /// `predecessor` and nothing will ever resolve that record again.
+    ///
+    /// An observer that keeps per-generation state — the HVPatch binding
+    /// directory keeps the task binding AND its `SubmissionAuthority` — must
+    /// retire the predecessor record here. Only the scheduler can make this
+    /// call: the observer sees a rejected rollover, which is also what a live
+    /// target under a racing generation looks like, and retiring THAT would
+    /// drop a reachable authority. Liveness is the scheduler's fact.
+    fn retire_reaped(&self, _thread: ThreadKey, _predecessor: ExecutionGeneration) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +153,58 @@ pub(crate) enum SchedulerGenerationTransition {
     Runnable,
     Blocked,
     Terminal,
+}
+
+/// What the generation observer did with one exact transition, as its callers
+/// see it.
+///
+/// An OUTCOME, not an error. "The observer refused" has two completely
+/// different meanings and only one of them is survivable, so returning
+/// `Result` let a caller write `if let Err(_)` and treat both as the benign
+/// one — the round-2 swallow. There is now nothing to swallow: the fatal
+/// meaning is NOT REPRESENTABLE in this type (it aborts inside
+/// `observe_generation_transition`), and `TargetReaped` is a fact every caller
+/// must branch on exhaustively.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GenerationTransitionOutcome {
+    /// The observer recorded the successor. It is reachable and publishable.
+    Recorded,
+    /// The target was REAPED while this transition was in flight. The
+    /// successor generation is unreachable by construction — nothing can
+    /// resolve the thread again — so it strands nothing, and Linux answers a
+    /// wake of an exited task with a no-op rather than a fault. The caller
+    /// must still finish whatever transaction it is in; it must not publish
+    /// the successor.
+    TargetReaped,
+}
+
+/// The two meanings of one observer REJECTION, before the fatal one is acted
+/// on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionRejection {
+    /// Benign: the target left the kernel graph under the transition.
+    TargetReaped,
+    /// Fatal: the thread IS still live, so the observer and the Kernel
+    /// disagree about a REACHABLE generation. The Kernel execution state has
+    /// already advanced, so an ordinary error would strand the successor
+    /// outside the combined binding/authority directory and bypass logical
+    /// completion.
+    LostExactTransition,
+}
+
+/// Classify one observer rejection from the single fact that separates the two
+/// meanings: whether the transition's target is still in the kernel graph.
+///
+/// Split out as a pure function so BOTH arms are unit-testable. The fatal arm
+/// aborts the process, which no in-process test can observe, so without this
+/// seam only the benign direction could ever be asserted — and the benign
+/// direction is exactly the one a too-wide swallow makes look correct.
+const fn classify_transition_rejection(target_still_live: bool) -> TransitionRejection {
+    if target_still_live {
+        TransitionRejection::LostExactTransition
+    } else {
+        TransitionRejection::TargetReaped
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +280,8 @@ impl ExecutorBinding {
 #[derive(Clone, Debug)]
 pub struct ExecutorRegistration {
     id: ExecutorId,
+    bound_cpu: Option<GuestCpuId>,
+    is_spare: bool,
     close_observation_epoch: Arc<AtomicU64>,
     control_observation_epoch: Arc<AtomicU64>,
 }
@@ -218,11 +290,20 @@ impl ExecutorRegistration {
     pub const fn id(&self) -> ExecutorId {
         self.id
     }
+
+    pub const fn bound_cpu(&self) -> Option<GuestCpuId> {
+        self.bound_cpu
+    }
+
+    pub const fn is_spare(&self) -> bool {
+        self.is_spare
+    }
 }
 
 #[derive(Debug)]
 struct ExecutorEntry {
     kick: Arc<dyn ExecutorKick>,
+    bound_cpu: Option<GuestCpuId>,
     close_observation_epoch: Arc<AtomicU64>,
     control_observation_epoch: Arc<AtomicU64>,
 }
@@ -230,6 +311,11 @@ struct ExecutorEntry {
 #[derive(Debug)]
 struct ExecutorDirectoryState {
     next_id: u32,
+    /// Round-robin cursor for binding the next executor to a guest CPU. Every
+    /// non-spare executor IS one guest CPU's `M`; there is no unbound
+    /// executor, so a carrier with fewer executors than CPUs simply leaves the
+    /// surplus CPUs offline rather than stranding work on a CPU nothing runs.
+    next_cpu: usize,
     entries: BTreeMap<ExecutorId, ExecutorEntry>,
 }
 
@@ -237,6 +323,7 @@ impl Default for ExecutorDirectoryState {
     fn default() -> Self {
         Self {
             next_id: 1,
+            next_cpu: 0,
             entries: BTreeMap::new(),
         }
     }
@@ -248,8 +335,23 @@ struct ExecutorDirectory {
 }
 
 impl ExecutorDirectory {
-    fn register(&self, kick: Arc<dyn ExecutorKick>) -> Result<ExecutorRegistration, RunQueueError> {
+    fn register(
+        &self,
+        kick: Arc<dyn ExecutorKick>,
+        requested_cpu: Option<GuestCpuId>,
+        is_spare: bool,
+        cpu_count: usize,
+    ) -> Result<ExecutorRegistration, RunQueueError> {
         let mut state = self.state.lock();
+        let bound_cpu = if is_spare {
+            None
+        } else {
+            Some(requested_cpu.unwrap_or_else(|| {
+                let index = state.next_cpu % cpu_count.max(1);
+                state.next_cpu = state.next_cpu.wrapping_add(1);
+                GuestCpuId::new(index as u32)
+            }))
+        };
         let raw = state.next_id;
         if raw == 0 {
             return Err(RunQueueError::ExecutorIdExhausted);
@@ -264,12 +366,15 @@ impl ExecutorDirectory {
             id,
             ExecutorEntry {
                 kick,
+                bound_cpu,
                 close_observation_epoch: Arc::clone(&close_observation_epoch),
                 control_observation_epoch: Arc::clone(&control_observation_epoch),
             },
         );
         Ok(ExecutorRegistration {
             id,
+            bound_cpu,
+            is_spare,
             close_observation_epoch,
             control_observation_epoch,
         })
@@ -400,26 +505,181 @@ impl ExecutorDirectory {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
 enum QueueLifecycle {
-    Open,
-    Closing,
-    Closed,
+    #[default]
+    Open = 0,
+    Closing = 1,
+    Closed = 2,
+}
+
+impl QueueLifecycle {
+    const fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Open,
+            1 => Self::Closing,
+            _ => Self::Closed,
+        }
+    }
 }
 
 #[derive(Debug)]
-struct QueueRow {
-    key: QueueKey,
-    thread: Arc<Thread>,
-    closing_authorized: bool,
+pub(crate) struct QueueRow {
+    pub(crate) key: QueueKey,
+    pub(crate) thread: Arc<Thread>,
+    pub(crate) closing_authorized: bool,
 }
 
-#[derive(Debug)]
-struct RunQueueState {
-    lifecycle: QueueLifecycle,
-    /// Rows an executor may claim right now. A row reaches this deque only
-    /// once the submission that owns its exact key has been published.
+/// One guest CPU's local run queue and parking bookkeeping, behind that CPU's
+/// OWN mutex. The carrier-wide [`RunQueueInner::state`] lock is reserved for
+/// lifecycle (close/drain) and is never taken to enqueue or claim.
+#[derive(Debug, Default)]
+struct GuestCpuLocalState {
     rows: VecDeque<QueueRow>,
+    /// Executors parked on this CPU's condvar. Exact: incremented and
+    /// decremented under this lock, so `close` can snapshot it.
+    waiters: usize,
+    /// Bumped by any publisher that wants this CPU to re-run its scan.
+    ///
+    /// A CPU samples the ticket BEFORE it announces itself idle and re-reads
+    /// it under this lock immediately before parking, so a publication that
+    /// lands on ANOTHER CPU in that window (which this CPU could only have
+    /// found by stealing, and which therefore cannot be re-checked under this
+    /// lock) is never lost: either the publisher saw the idle flag and bumped
+    /// the ticket, or it did not, in which case the flag was stored after the
+    /// publisher's load and this CPU's steal scan runs after the publication.
+    wake_ticket: u64,
+}
+
+/// A guest CPU — `P` in Go's G/M/P. The unit of guest parallelism: it owns a
+/// local run queue, the current task, an idle condvar for the executor bound
+/// to it, and the identity the guest observes through `sched_getcpu`,
+/// `getcpu(2)`, `sched_getaffinity` and `/proc/<pid>/stat` field 39.
+#[derive(Debug)]
+pub struct GuestCpu {
+    id: GuestCpuId,
+    state: Mutex<GuestCpuLocalState>,
+    idle_condvar: Condvar,
+    /// `rows.len()` published for lock-free load reads on the placement path.
+    depth: AtomicUsize,
+    /// Executors bound to this CPU that are parked, or have announced
+    /// idleness and are about to park. COUNTED, not a flag: several `M`s may
+    /// share one `P`, and a bool made a CPU with one executor running and two
+    /// parked read "busy" to every placement and wake decision — the round-1
+    /// defect that serialized a fork burst behind the parent's CPU.
+    ///
+    /// Incremented `SeqCst` before the final steal scan; see `wake_ticket`.
+    idle: AtomicUsize,
+    current_task: Mutex<Option<ThreadKey>>,
+}
+
+impl GuestCpu {
+    fn new(id: GuestCpuId) -> Self {
+        Self {
+            id,
+            state: Mutex::new(GuestCpuLocalState::default()),
+            idle_condvar: Condvar::new(),
+            depth: AtomicUsize::new(0),
+            idle: AtomicUsize::new(0),
+            current_task: Mutex::new(None),
+        }
+    }
+
+    pub const fn id(&self) -> GuestCpuId {
+        self.id
+    }
+
+    /// Queue depth. Lock-free; a placement decision reads every CPU's depth.
+    pub fn queue_len(&self) -> usize {
+        self.depth.load(Ordering::Acquire)
+    }
+
+    /// Executors here that are parked or about to park. Lock-free; this is
+    /// the availability half of the placement signal.
+    pub fn idle_executors(&self) -> usize {
+        self.idle.load(Ordering::SeqCst)
+    }
+
+    pub fn current_task(&self) -> Option<ThreadKey> {
+        *self.current_task.lock()
+    }
+
+    pub(crate) fn set_current_task(&self, task: Option<ThreadKey>) {
+        *self.current_task.lock() = task;
+    }
+
+    /// Signal this CPU so a parked (or about-to-park) executor re-runs its
+    /// scan. Takes the CPU lock so the bump cannot slip into the window
+    /// between an executor's pre-park re-check and its `wait`.
+    fn nudge(&self) {
+        {
+            let mut local = self.state.lock();
+            local.wake_ticket = local.wake_ticket.wrapping_add(1);
+        }
+        self.idle_condvar.notify_all();
+    }
+}
+
+/// One executor's idle announcement on one guest CPU.
+///
+/// A guard rather than two bare stores: `take_row` leaves the idle state
+/// through six different returns, and a counted announcement that is dropped
+/// on any of them would credit the CPU with a phantom free executor forever —
+/// placement would keep aiming rows at a CPU that will never take them. The
+/// count is exact because releasing is the destructor.
+struct IdleAnnouncement<'a> {
+    cpu: &'a GuestCpu,
+    held: bool,
+}
+
+impl<'a> IdleAnnouncement<'a> {
+    fn new(cpu: &'a GuestCpu) -> Self {
+        Self { cpu, held: false }
+    }
+
+    /// Announce BEFORE the final scan, so a publisher either sees this
+    /// executor and bumps the ticket, or stored its row first and the scan
+    /// finds it. Idempotent within one loop iteration.
+    fn announce(&mut self) {
+        if !self.held {
+            self.cpu.idle.fetch_add(1, Ordering::SeqCst);
+            self.held = true;
+        }
+    }
+
+    fn is_held(&self) -> bool {
+        self.held
+    }
+
+    fn release(&mut self) {
+        if self.held {
+            if self.cpu.idle.fetch_sub(1, Ordering::SeqCst) == 0 {
+                // An idle count that went negative means an executor released
+                // an announcement it never took: placement and wake targeting
+                // would both be reading a fiction from here on.
+                std::process::abort();
+            }
+            self.held = false;
+        }
+    }
+}
+
+impl Drop for IdleAnnouncement<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// One shard of the carrier-wide exact-key directory.
+///
+/// A key may be queued on only one guest CPU at a time; stealing moves the
+/// row, not the membership, so membership, the unpublished gate and the row
+/// deferred behind that gate all live here rather than on a CPU.
+#[derive(Debug, Default)]
+struct QueueKeyShard {
+    /// Exact keys that own a queue slot: a claimable row on some CPU, or a
+    /// row held in `deferred`.
     queued: BTreeSet<QueueKey>,
     /// Exact keys whose submission authority has been admitted but not yet
     /// published. A wake for such a key is durable and coalescing, but its
@@ -429,30 +689,17 @@ struct RunQueueState {
     /// The one row a wake enqueued for an unpublished key, held until that
     /// key is published (or until its authority is released).
     deferred: BTreeMap<QueueKey, QueueRow>,
-    active_authorities: usize,
-    claimed: usize,
-    waiters: usize,
+}
+
+#[derive(Debug, Default)]
+struct RunQueueState {
+    lifecycle: QueueLifecycle,
+    /// Spare executors parked on `changed`. Per-CPU waiters live in each
+    /// [`GuestCpuLocalState`]; `close` snapshots both.
+    spare_waiters: usize,
     close_epoch: u64,
     close_waiters_expected: usize,
     closed_waiter_observations: usize,
-}
-
-impl Default for RunQueueState {
-    fn default() -> Self {
-        Self {
-            lifecycle: QueueLifecycle::Open,
-            rows: VecDeque::new(),
-            queued: BTreeSet::new(),
-            unpublished: BTreeSet::new(),
-            deferred: BTreeMap::new(),
-            active_authorities: 0,
-            claimed: 0,
-            waiters: 0,
-            close_epoch: 0,
-            close_waiters_expected: 0,
-            closed_waiter_observations: 0,
-        }
-    }
 }
 
 /// What a queue insertion did with one exact row. A bare `bool` said only
@@ -477,28 +724,142 @@ impl EnqueueOutcome {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RunQueueInner {
+    /// Lifecycle ONLY. Never taken to enqueue, claim, finish a claim or
+    /// release an authority while the queue is open — that carrier-wide
+    /// convoy is what this design exists to remove.
     state: Mutex<RunQueueState>,
+    /// Lifecycle waiters: parked spare executors and `wait_closed`.
     changed: Condvar,
+    /// Lock-free mirror of `state.lifecycle`, `SeqCst` so that a decrementer
+    /// that misses the close and a `close` that misses the decrement cannot
+    /// both happen (Dekker): one of the two always runs `maybe_finish_close`.
+    lifecycle: AtomicU8,
     wake_admissions: AtomicU64,
     control_epoch: AtomicU64,
+    claimed: AtomicUsize,
+    total_queued: AtomicUsize,
+    active_authorities: AtomicUsize,
+    close_epoch: AtomicU64,
+    /// Carrier-wide exact-key dedup, sharded so a wake never contends with an
+    /// unrelated wake. A key may be queued on only one CPU at a time; work
+    /// stealing moves the row, not the membership.
+    keys: Vec<Mutex<QueueKeyShard>>,
+    cpus: Vec<Arc<GuestCpu>>,
+    /// How many executors are bound to each CPU. A CPU with none is OFFLINE:
+    /// nothing runs there, so placement must never target it or the task
+    /// starves until an idle CPU steals it. Stealing still drains an offline
+    /// CPU, so an executor that retires never strands its queue.
+    online: Vec<AtomicUsize>,
+    policy: Arc<dyn SchedulingPolicy>,
     #[cfg(test)]
     close_observation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     root_admission_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     close_started_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    pre_park_gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 
 impl RunQueueInner {
     const CLOSING_BIT: u64 = 1 << 63;
+    const QUEUED_SHARDS: usize = 64;
+
+    fn shard_index(&self, key: QueueKey) -> usize {
+        (key.thread.serial.raw() as usize) % self.keys.len()
+    }
+
+    fn shard(&self, key: QueueKey) -> &Mutex<QueueKeyShard> {
+        &self.keys[self.shard_index(key)]
+    }
+
+    /// Mark one admitted-but-unpublished exact key. The gate lives in the same
+    /// shard the key's queue membership does, so a wake for the key and its
+    /// publication are ordered against each other by one lock even though the
+    /// row itself lands on a per-CPU queue.
+    fn mark_unpublished(&self, key: QueueKey) {
+        self.shard(key).lock().unpublished.insert(key);
+    }
+
+    /// Drop an exact key's unpublished gate and any row held behind it. The
+    /// wake edge is discarded with the row because the submission it named is
+    /// gone; nothing can claim that generation again. A deferred row was never
+    /// on a CPU queue, so `total_queued` never counted it and does not change.
+    fn clear_unpublished(&self, key: QueueKey) {
+        let mut shard = self.shard(key).lock();
+        shard.unpublished.remove(&key);
+        if shard.deferred.remove(&key).is_some() {
+            shard.queued.remove(&key);
+        }
+    }
+
+    /// Move an unpublished gate (and the row deferred behind it) from one
+    /// exact key to another. The two keys may hash to different shards, so
+    /// both are taken in index order.
+    fn retarget_unpublished_gate(&self, from: QueueKey, to: QueueKey) {
+        if from == to {
+            return;
+        }
+        let (source_index, target_index) = (self.shard_index(from), self.shard_index(to));
+        if source_index == target_index {
+            let mut shard = self.keys[source_index].lock();
+            if shard.unpublished.remove(&from) {
+                shard.unpublished.insert(to);
+            }
+            if let Some(mut held) = shard.deferred.remove(&from) {
+                shard.queued.remove(&from);
+                held.key = to;
+                shard.queued.insert(to);
+                shard.deferred.insert(to, held);
+            }
+            return;
+        }
+        let (low, high) = if source_index < target_index {
+            (source_index, target_index)
+        } else {
+            (target_index, source_index)
+        };
+        let mut low_shard = self.keys[low].lock();
+        let mut high_shard = self.keys[high].lock();
+        let (source, target) = if source_index < target_index {
+            (&mut *low_shard, &mut *high_shard)
+        } else {
+            (&mut *high_shard, &mut *low_shard)
+        };
+        if source.unpublished.remove(&from) {
+            target.unpublished.insert(to);
+        }
+        if let Some(mut held) = source.deferred.remove(&from) {
+            source.queued.remove(&from);
+            held.key = to;
+            target.queued.insert(to);
+            target.deferred.insert(to, held);
+        }
+    }
+
+    fn lifecycle(&self) -> QueueLifecycle {
+        QueueLifecycle::from_raw(self.lifecycle.load(Ordering::SeqCst))
+    }
+
+    fn publish_lifecycle(&self, state: &mut RunQueueState, next: QueueLifecycle) {
+        state.lifecycle = next;
+        self.lifecycle.store(next as u8, Ordering::SeqCst);
+    }
 
     fn poke_control(&self) {
         if self.control_epoch.fetch_add(1, Ordering::AcqRel) == u64::MAX {
             std::process::abort();
         }
+        self.nudge_all_cpus();
         self.changed.notify_all();
+    }
+
+    fn nudge_all_cpus(&self) {
+        for cpu in &self.cpus {
+            cpu.nudge();
+        }
     }
 
     fn try_admit_wake(self: &Arc<Self>) -> Result<WakeAdmission, RunQueueError> {
@@ -539,59 +900,171 @@ impl RunQueueInner {
     }
 
     fn release_wake_admission(&self) {
-        let previous = self.wake_admissions.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.wake_admissions.fetch_sub(1, Ordering::SeqCst);
         if previous & !Self::CLOSING_BIT == 0 {
             std::process::abort();
         }
-        let mut state = self.state.lock();
-        self.maybe_finish_close(&mut state);
-        self.changed.notify_all();
+        self.settle_close_if_closing();
     }
 
-    fn drain_ready(&self, state: &RunQueueState) -> bool {
-        state.rows.is_empty()
-            && state.active_authorities == 0
-            && state.claimed == 0
+    /// The one place a drain-relevant decrement pays for the carrier lock —
+    /// and only once the queue is closing. While open this is a single
+    /// `SeqCst` load, which is the whole point of the per-CPU design.
+    fn settle_close_if_closing(&self) {
+        if self.lifecycle() == QueueLifecycle::Open {
+            return;
+        }
+        {
+            let mut state = self.state.lock();
+            self.maybe_finish_close(&mut state);
+            self.changed.notify_all();
+        }
+        self.nudge_all_cpus();
+    }
+
+    /// Per-CPU executor availability and backlog, for the placement policy.
+    /// Lock-free: a placement is taken on every wake.
+    fn cpu_loads(&self, loads: &mut [CpuLoad; carrick_hal::MAX_GUEST_CPUS]) -> usize {
+        for (index, (slot, cpu)) in loads.iter_mut().zip(self.cpus.iter()).enumerate() {
+            *slot = CpuLoad {
+                queued: cpu.queue_len(),
+                idle: cpu.idle_executors(),
+                bound: self
+                    .online
+                    .get(index)
+                    .map(|slot| slot.load(Ordering::Acquire))
+                    .unwrap_or(0),
+            };
+        }
+        self.cpus.len()
+    }
+
+    fn set_executor_online(&self, cpu: GuestCpuId, online: bool) {
+        let Some(slot) = self.online.get(cpu.as_usize()) else {
+            return;
+        };
+        if online {
+            slot.fetch_add(1, Ordering::AcqRel);
+        } else if slot.fetch_sub(1, Ordering::AcqRel) == 0 {
+            std::process::abort();
+        }
+    }
+
+    /// The CPUs that currently have an executor. Empty only before the pool
+    /// starts, where any CPU is as good as another.
+    fn online_mask(&self) -> Option<CpuAffinity> {
+        let mut words = [0u64; carrick_hal::MAX_GUEST_CPUS.div_ceil(64)];
+        let mut any = false;
+        for (index, slot) in self.online.iter().enumerate() {
+            if slot.load(Ordering::Acquire) > 0 {
+                words[index / 64] |= 1u64 << (index % 64);
+                any = true;
+            }
+        }
+        any.then(|| CpuAffinity::from_words(&words))
+    }
+
+    fn select_cpu(&self, thread: &Thread) -> GuestCpuId {
+        let mut loads = [CpuLoad::default(); carrick_hal::MAX_GUEST_CPUS];
+        let ncpu = self.cpu_loads(&mut loads);
+        let declared = thread.affinity();
+        // The guest's mask says where the task MAY run; the online set says
+        // where anything runs at all. A policy is only ever offered CPUs that
+        // satisfy both, so it cannot place a task onto a CPU with no `M`.
+        let affinity = match self.online_mask() {
+            Some(online) if !declared.intersect(&online).is_empty() => declared.intersect(&online),
+            _ => declared,
+        };
+        let placement = TaskPlacement {
+            task: TaskKey::new(thread.task_key().serial.raw()),
+            last_cpu: thread.last_cpu(),
+            affinity,
+            cpus: &loads[..ncpu],
+        };
+        let chosen = self.policy.select_cpu(&placement);
+        // The mechanism, not the policy, owns the affinity guarantee: a policy
+        // that answers out of range or outside the mask does not get to place
+        // a task where the guest was promised it cannot run.
+        if chosen.as_usize() < ncpu && affinity.is_allowed(chosen) {
+            return chosen;
+        }
+        affinity
+            .first_allowed(ncpu)
+            .unwrap_or_else(|| GuestCpuId::new(0))
+    }
+
+    fn drain_ready(&self) -> bool {
+        self.total_queued.load(Ordering::SeqCst) == 0
+            && self.active_authorities.load(Ordering::SeqCst) == 0
+            && self.claimed.load(Ordering::SeqCst) == 0
             && self.active_wake_admissions() == 0
     }
 
     fn maybe_finish_close(&self, state: &mut RunQueueState) {
-        if state.lifecycle == QueueLifecycle::Closing
-            && self.drain_ready(state)
-            && state.closed_waiter_observations >= state.close_waiters_expected
-        {
-            state.lifecycle = QueueLifecycle::Closed;
-            self.changed.notify_all();
-        } else if state.lifecycle == QueueLifecycle::Closing && self.drain_ready(state) {
-            self.changed.notify_all();
+        if state.lifecycle != QueueLifecycle::Closing || !self.drain_ready() {
+            return;
         }
+        if state.closed_waiter_observations >= state.close_waiters_expected {
+            self.publish_lifecycle(state, QueueLifecycle::Closed);
+        }
+        self.changed.notify_all();
     }
 
     fn enqueue(
         &self,
         row: QueueRow,
         closing_authorized: bool,
+        target_cpu: Option<GuestCpuId>,
     ) -> Result<EnqueueOutcome, RunQueueError> {
-        let mut state = self.state.lock();
-        if state.lifecycle == QueueLifecycle::Closed {
-            return Err(RunQueueError::Closed);
+        match self.lifecycle() {
+            QueueLifecycle::Closed => return Err(RunQueueError::Closed),
+            QueueLifecycle::Closing if !closing_authorized => {
+                return Err(RunQueueError::SubmissionRejected);
+            }
+            _ => {}
         }
-        if state.queued.contains(&row.key) {
-            return Ok(EnqueueOutcome::Coalesced);
+        let affinity = row.thread.affinity();
+        let target = target_cpu
+            .filter(|cpu| cpu.as_usize() < self.cpus.len() && affinity.is_allowed(*cpu))
+            .unwrap_or_else(|| self.select_cpu(&row.thread));
+        let index = target.as_usize().min(self.cpus.len().saturating_sub(1));
+        let cpu = &self.cpus[index];
+        let key = row.key;
+        let task = TaskKey::new(row.thread.task_key().serial.raw());
+
+        let waiter_present = {
+            let mut local = cpu.state.lock();
+            let mut shard = self.shard(key).lock();
+            if shard.queued.contains(&key) {
+                return Ok(EnqueueOutcome::Coalesced);
+            }
+            shard.queued.insert(key);
+            if shard.unpublished.contains(&key) {
+                // The submission that owns this exact generation is admitted
+                // but still dormant. Own the wake edge -- it must not be lost
+                // -- and hold the row off every CPU queue until publication
+                // makes the binding resolvable. A deferred row is invisible to
+                // a claim, a steal and a nudge alike, which is the whole point:
+                // on the per-CPU representation "not claimable" also has to
+                // mean "not stealable".
+                shard.deferred.insert(key, row);
+                return Ok(EnqueueOutcome::Deferred);
+            }
+            drop(shard);
+            local.rows.push_back(row);
+            cpu.depth.store(local.rows.len(), Ordering::Release);
+            self.total_queued.fetch_add(1, Ordering::SeqCst);
+            local.wake_ticket = local.wake_ticket.wrapping_add(1);
+            local.waiters > 0
+        };
+        cpu.idle_condvar.notify_one();
+        if !waiter_present {
+            // Nobody is parked on the target CPU, so its executor is busy with
+            // a task and this row would wait behind it. Go's `wakep`: hand it
+            // to an idle CPU that can steal it.
+            self.wake_idle_cpu(cpu.id);
         }
-        if state.lifecycle == QueueLifecycle::Closing && !closing_authorized {
-            return Err(RunQueueError::SubmissionRejected);
-        }
-        state.queued.insert(row.key);
-        if state.unpublished.contains(&row.key) {
-            // The submission that owns this exact generation is admitted but
-            // still dormant. Own the wake edge -- it must not be lost -- and
-            // hold the row until publication makes the binding resolvable.
-            state.deferred.insert(row.key, row);
-            return Ok(EnqueueOutcome::Deferred);
-        }
-        state.rows.push_back(row);
-        self.changed.notify_one();
+        self.policy.on_runnable(task, cpu.id);
         Ok(EnqueueOutcome::Claimable)
     }
 
@@ -599,64 +1072,249 @@ impl RunQueueInner {
     /// a wake queued for it while it was dormant.
     ///
     /// This is the ONLY transition that clears a key's unpublished mark, and
-    /// it is the same critical section that makes the row claimable, so a row
-    /// can never be claimed before its submission is active.
+    /// it is the same critical section that moves the row onto a CPU queue, so
+    /// a row can never be claimed (or stolen) before its submission is active.
     fn publish(&self, row: QueueRow) -> Result<EnqueueOutcome, RunQueueError> {
-        let mut state = self.state.lock();
-        if state.lifecycle == QueueLifecycle::Closed {
+        if self.lifecycle() == QueueLifecycle::Closed {
             return Err(RunQueueError::Closed);
         }
-        state.unpublished.remove(&row.key);
-        if let Some(held) = state.deferred.remove(&row.key) {
-            state.rows.push_back(held);
-            self.changed.notify_one();
-            return Ok(EnqueueOutcome::Claimable);
+        let key = row.key;
+        let affinity = row.thread.affinity();
+        let target = self.select_cpu(&row.thread);
+        let index = target.as_usize().min(self.cpus.len().saturating_sub(1));
+        let index = if affinity.is_allowed(GuestCpuId::new(index as u32)) {
+            index
+        } else {
+            0
+        };
+        let cpu = &self.cpus[index];
+        let task = TaskKey::new(row.thread.task_key().serial.raw());
+
+        let waiter_present = {
+            let mut local = cpu.state.lock();
+            let mut shard = self.shard(key).lock();
+            shard.unpublished.remove(&key);
+            let publishable = if let Some(held) = shard.deferred.remove(&key) {
+                // The membership a deferred wake took stays; only the row moves.
+                held
+            } else if shard.queued.contains(&key) {
+                return Ok(EnqueueOutcome::Coalesced);
+            } else {
+                shard.queued.insert(key);
+                row
+            };
+            drop(shard);
+            local.rows.push_back(publishable);
+            cpu.depth.store(local.rows.len(), Ordering::Release);
+            self.total_queued.fetch_add(1, Ordering::SeqCst);
+            local.wake_ticket = local.wake_ticket.wrapping_add(1);
+            local.waiters > 0
+        };
+        cpu.idle_condvar.notify_one();
+        if !waiter_present {
+            self.wake_idle_cpu(cpu.id);
         }
-        if state.queued.contains(&row.key) {
-            return Ok(EnqueueOutcome::Coalesced);
-        }
-        state.queued.insert(row.key);
-        state.rows.push_back(row);
-        self.changed.notify_one();
+        self.policy.on_runnable(task, cpu.id);
         Ok(EnqueueOutcome::Claimable)
     }
 
-    /// Mark one admitted-but-unpublished exact key. Called under the same
-    /// state lock that counts the authority, so an authority never exists
-    /// without its gate.
-    fn mark_unpublished(state: &mut RunQueueState, key: QueueKey) {
-        state.unpublished.insert(key);
-    }
-
-    /// Drop an exact key's unpublished gate and any row held behind it. The
-    /// wake edge is discarded with the row because the submission it named is
-    /// gone; nothing can claim that generation again.
-    fn clear_unpublished(state: &mut RunQueueState, key: QueueKey) {
-        state.unpublished.remove(&key);
-        if state.deferred.remove(&key).is_some() {
-            state.queued.remove(&key);
+    /// Nudge one idle CPU other than `origin` so it re-runs its steal scan —
+    /// Go's `wakep`. Exactly one, never a herd: the woken executor continues
+    /// the chain itself (`propagate_wake`) if work is still queued when it
+    /// takes a row, so the wake spreads until either the queues are empty or
+    /// no CPU is idle.
+    ///
+    /// The scan starts after `origin` and wraps, so a burst does not pile
+    /// every nudge onto the lowest-numbered idle CPU.
+    fn wake_idle_cpu(&self, origin: GuestCpuId) {
+        let ncpu = self.cpus.len();
+        if ncpu == 0 {
+            return;
+        }
+        let start = (origin.as_usize() + 1) % ncpu;
+        for step in 0..ncpu {
+            let index = (start + step) % ncpu;
+            let cpu = &self.cpus[index];
+            if cpu.id != origin && cpu.idle_executors() > 0 {
+                cpu.nudge();
+                return;
+            }
         }
     }
 
+    /// The next link in the wake chain: an executor that was woken to scan and
+    /// FOUND work hands the remaining backlog to the next idle CPU before it
+    /// starts running.
+    ///
+    /// Without this, `enqueue`'s single nudge is lossy — the woken executor
+    /// may take a different row than the one that nudged it, and that row then
+    /// waits until its own CPU's running task blocks. With it, "a runnable row
+    /// exists while an executor is parked" is only ever transient.
+    fn propagate_wake(&self, stealer: GuestCpuId) {
+        if self.total_queued.load(Ordering::SeqCst) > 0 {
+            self.wake_idle_cpu(stealer);
+        }
+    }
+
+    /// Pop `cpu`'s FIFO head (or the policy's choice), accounting the claim.
+    fn pop_local(&self, cpu: &GuestCpu) -> Option<QueueRow> {
+        let mut local = cpu.state.lock();
+        if local.rows.is_empty() {
+            return None;
+        }
+        let position = self.policy_pick(cpu.id, &local).unwrap_or(0);
+        let row = local.rows.remove(position)?;
+        self.finish_removal(&mut local, cpu, row.key);
+        Some(row)
+    }
+
+    /// Consult `pick_next` only for a policy that asked to see the queues.
+    fn policy_pick(&self, cpu: GuestCpuId, local: &GuestCpuLocalState) -> Option<usize> {
+        if !self.policy.inspects_queues() {
+            return None;
+        }
+        let queued: Vec<TaskKey> = local
+            .rows
+            .iter()
+            .map(|row| TaskKey::new(row.thread.task_key().serial.raw()))
+            .collect();
+        let chosen = self.policy.pick_next(&CpuQueueView {
+            cpu,
+            queued: &queued,
+        })?;
+        queued.iter().position(|task| *task == chosen)
+    }
+
+    /// Common bookkeeping for taking a row out of a CPU queue: the claim is
+    /// accounted BEFORE the queue depth drops, so a concurrent `drain_ready`
+    /// can never observe a moment where the row is in neither count.
+    fn finish_removal(&self, local: &mut GuestCpuLocalState, cpu: &GuestCpu, key: QueueKey) {
+        self.claimed.fetch_add(1, Ordering::SeqCst);
+        self.shard(key).lock().queued.remove(&key);
+        cpu.depth.store(local.rows.len(), Ordering::Release);
+        self.total_queued.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// `findrunnable`'s steal: an idle CPU takes work from the longest queue,
+    /// honouring the stolen task's affinity mask.
+    fn try_steal(&self, stealer: GuestCpuId) -> Option<QueueRow> {
+        if self.policy.inspects_queues()
+            && let Some(row) = self.policy_steal(stealer)
+        {
+            return Some(row);
+        }
+        let mut victims: Vec<(usize, usize)> = self
+            .cpus
+            .iter()
+            .enumerate()
+            .filter(|(index, cpu)| *index != stealer.as_usize() && cpu.queue_len() > 0)
+            .map(|(index, cpu)| (index, cpu.queue_len()))
+            .collect();
+        victims.sort_by_key(|(_, depth)| std::cmp::Reverse(*depth));
+        for (index, _) in victims {
+            let victim = &self.cpus[index];
+            let mut local = victim.state.lock();
+            // Steal from the TAIL: the head is the oldest row and the most
+            // likely to still be warm on its owner.
+            let Some(position) = local
+                .rows
+                .iter()
+                .rposition(|row| row.thread.affinity().is_allowed(stealer))
+            else {
+                continue;
+            };
+            let row = local.rows.remove(position)?;
+            self.finish_removal(&mut local, victim, row.key);
+            return Some(row);
+        }
+        None
+    }
+
+    fn policy_steal(&self, stealer: GuestCpuId) -> Option<QueueRow> {
+        let snapshots: Vec<(GuestCpuId, Vec<TaskKey>)> = self
+            .cpus
+            .iter()
+            .filter(|cpu| cpu.id != stealer)
+            .map(|cpu| {
+                let local = cpu.state.lock();
+                (
+                    cpu.id,
+                    local
+                        .rows
+                        .iter()
+                        .map(|row| TaskKey::new(row.thread.task_key().serial.raw()))
+                        .collect(),
+                )
+            })
+            .collect();
+        let views: Vec<CpuQueueView<'_>> = snapshots
+            .iter()
+            .map(|(cpu, queued)| CpuQueueView {
+                cpu: *cpu,
+                queued: queued.as_slice(),
+            })
+            .collect();
+        let (victim_id, task) = self.policy.steal(stealer, &views)?;
+        if victim_id == stealer {
+            return None;
+        }
+        let victim = self.cpus.get(victim_id.as_usize())?;
+        let mut local = victim.state.lock();
+        let position = local.rows.iter().position(|row| {
+            row.thread.task_key().serial.raw() == task.as_u64()
+                && row.thread.affinity().is_allowed(stealer)
+        })?;
+        let row = local.rows.remove(position)?;
+        self.finish_removal(&mut local, victim, row.key);
+        Some(row)
+    }
+
     fn finish_claim(&self) {
-        let mut state = self.state.lock();
-        state.claimed = state
-            .claimed
-            .checked_sub(1)
-            .unwrap_or_else(|| std::process::abort());
-        self.maybe_finish_close(&mut state);
-        self.changed.notify_all();
+        if self.claimed.fetch_sub(1, Ordering::SeqCst) == 0 {
+            std::process::abort();
+        }
+        self.settle_close_if_closing();
     }
 
     fn release_authority(&self, key: QueueKey) {
-        let mut state = self.state.lock();
-        state.active_authorities = state
+        // Clear the gate BEFORE the count drops: once the count reaches zero a
+        // close may finish, and a gate (or a row deferred behind one) outliving
+        // its authority would be reachable by nothing.
+        self.clear_unpublished(key);
+        if self.active_authorities.fetch_sub(1, Ordering::SeqCst) == 0 {
+            std::process::abort();
+        }
+        self.settle_close_if_closing();
+    }
+
+    /// Admit one authority. The lifecycle check and the increment are one
+    /// transaction under the carrier lock, so a `close` can never observe a
+    /// drained queue while an admission is in flight.
+    fn admit_authority(&self) -> Result<(), RunQueueError> {
+        let state = self.state.lock();
+        if state.lifecycle == QueueLifecycle::Closed {
+            return Err(RunQueueError::Closed);
+        }
+        if self
             .active_authorities
-            .checked_sub(1)
-            .unwrap_or_else(|| std::process::abort());
-        Self::clear_unpublished(&mut state, key);
-        self.maybe_finish_close(&mut state);
-        self.changed.notify_all();
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_add(1)
+            })
+            .is_err()
+        {
+            return Err(RunQueueError::SubmissionRejected);
+        }
+        drop(state);
+        Ok(())
+    }
+
+    /// Admit one authority whose exact key is not published yet. Marking the
+    /// gate is part of the admission, so an admitted authority never exists
+    /// without it.
+    fn admit_unpublished_authority(&self, key: QueueKey) -> Result<(), RunQueueError> {
+        self.admit_authority()?;
+        self.mark_unpublished(key);
+        Ok(())
     }
 }
 
@@ -754,16 +1412,7 @@ impl SubmissionAuthority {
         thread: ThreadKey,
         generation: ExecutionGeneration,
     ) {
-        let mut state = queue.state.lock();
-        if state.unpublished.remove(&self.key) {
-            state.unpublished.insert(QueueKey { thread, generation });
-        }
-        if let Some(mut held) = state.deferred.remove(&self.key) {
-            state.queued.remove(&self.key);
-            held.key = QueueKey { thread, generation };
-            state.queued.insert(held.key);
-            state.deferred.insert(held.key, held);
-        }
+        queue.retarget_unpublished_gate(self.key, QueueKey { thread, generation });
     }
 
     pub(crate) fn park_exact(
@@ -844,16 +1493,9 @@ impl SubmissionAuthority {
         {
             return Err((RunQueueError::AuthorityMismatch, self));
         }
-        let mut state = queue.state.lock();
-        if state.lifecycle == QueueLifecycle::Closed {
-            return Err((RunQueueError::Closed, self));
+        if let Err(error) = queue.admit_authority() {
+            return Err((error, self));
         }
-        let Some(active_authorities) = state.active_authorities.checked_add(1) else {
-            drop(state);
-            return Err((RunQueueError::AuthoritiesExhausted, self));
-        };
-        state.active_authorities = active_authorities;
-        drop(state);
         self.key.generation = successor;
         self.active = true;
         Ok(self)
@@ -876,16 +1518,8 @@ impl SubmissionAuthority {
                 thread,
                 generation,
                 || {
-                    let mut state = queue.state.lock();
-                    if state.lifecycle == QueueLifecycle::Closed {
-                        return Err(RunQueueError::Closed);
-                    }
-                    state.active_authorities = state
-                        .active_authorities
-                        .checked_add(1)
-                        .ok_or(RunQueueError::AuthoritiesExhausted)?;
                     let key = QueueKey { thread, generation };
-                    RunQueueInner::mark_unpublished(&mut state, key);
+                    queue.admit_unpublished_authority(key)?;
                     Ok(Self {
                         queue: Arc::downgrade(&queue),
                         kernel: Arc::downgrade(&kernel),
@@ -944,16 +1578,8 @@ impl SubmissionAuthority {
         let kernel = self.kernel.upgrade().ok_or(RunQueueError::Closed)?;
         let queue = self.queue.upgrade().ok_or(RunQueueError::Closed)?;
         let mut commit = || {
-            let mut state = queue.state.lock();
-            if state.lifecycle == QueueLifecycle::Closed {
-                return Err(RunQueueError::Closed);
-            }
-            state.active_authorities = state
-                .active_authorities
-                .checked_add(1)
-                .ok_or(RunQueueError::AuthoritiesExhausted)?;
             let key = QueueKey { thread, generation };
-            RunQueueInner::mark_unpublished(&mut state, key);
+            queue.admit_unpublished_authority(key)?;
             Ok(Self {
                 queue: Arc::downgrade(&queue),
                 kernel: Arc::downgrade(&kernel),
@@ -1062,28 +1688,127 @@ impl Drop for SubmissionAuthority {
     }
 }
 
-#[derive(Debug, Default)]
+/// The guest CPU count the carrier's INSTALLED scheduling policy schedules
+/// onto, published when its run queue is built.
+///
+/// `0` = no run queue exists yet, in which case the default policy's answer
+/// stands. Publication is once per process because HVPatch runs one carrier
+/// per process and the guest may already have read `nproc`; a second, DIFFERENT
+/// answer would mean two `sched_getaffinity` truths in one guest, so it fails
+/// closed.
+static EXPOSED_GUEST_CPUS: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of guest CPUs (`P`s) this carrier schedules onto — and the ONE
+/// authority for every guest-visible CPU surface: `nproc`,
+/// `sched_getaffinity`, `/proc/cpuinfo`, `/proc/stat`, `/sys/devices/system/
+/// cpu/*` and `perf_event_open`'s CPU range.
+///
+/// It is the installed [`SchedulingPolicy`]'s `cpu_count()`, so an embedder
+/// that installs a policy with `ContainerBuilder::scheduler` moves the whole
+/// surface together and cannot end up telling the guest about CPUs the
+/// scheduler will never place a task on. With no policy installed this is
+/// still the default policy's answer, which is `host_facts::logical_cpu_count()`
+/// (on macOS the performance-core count) clamped to the run queue's fixed
+/// per-CPU lane width — so the shipped behaviour is unchanged.
+pub fn guest_cpu_count() -> usize {
+    match EXPOSED_GUEST_CPUS.load(Ordering::Acquire) {
+        0 => default_guest_cpu_count(),
+        published => published,
+    }
+}
+
+/// The default policy's CPU count, used until a run queue publishes one.
+pub fn default_guest_cpu_count() -> usize {
+    crate::host_facts::logical_cpu_count().clamp(1, carrick_hal::MAX_GUEST_CPUS)
+}
+
+/// Publish the count the guest will see.
+///
+/// Called ONLY where a carrier builds its scheduler — not from `RunQueue::new`,
+/// which every in-crate reference-model kernel and unit test also drives with
+/// its own CPU count. Idempotent for the same answer; aborts on a second,
+/// different one, because a guest cannot be told two different truths about
+/// how many CPUs it has and there is no correct value to continue from.
+pub(crate) fn publish_guest_cpu_count(ncpu: usize) {
+    let ncpu = ncpu.clamp(1, carrick_hal::MAX_GUEST_CPUS);
+    match EXPOSED_GUEST_CPUS.compare_exchange(0, ncpu, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(published) if published == ncpu => {}
+        Err(_published) => std::process::abort(),
+    }
+}
+
+#[derive(Debug)]
 pub struct RunQueue {
     inner: Arc<RunQueueInner>,
 }
 
+impl Default for RunQueue {
+    fn default() -> Self {
+        Self::new(Arc::new(GuestCpuPolicy::new(guest_cpu_count())))
+    }
+}
+
 impl RunQueue {
+    pub(crate) fn new(policy: Arc<dyn SchedulingPolicy>) -> Self {
+        let ncpu = policy.cpu_count().clamp(1, carrick_hal::MAX_GUEST_CPUS);
+        let cpus: Vec<Arc<GuestCpu>> = (0..ncpu)
+            .map(|index| Arc::new(GuestCpu::new(GuestCpuId::new(index as u32))))
+            .collect();
+        let keys = (0..RunQueueInner::QUEUED_SHARDS)
+            .map(|_| Mutex::new(QueueKeyShard::default()))
+            .collect();
+        Self {
+            inner: Arc::new(RunQueueInner {
+                state: Mutex::new(RunQueueState::default()),
+                changed: Condvar::new(),
+                lifecycle: AtomicU8::new(QueueLifecycle::Open as u8),
+                wake_admissions: AtomicU64::new(0),
+                control_epoch: AtomicU64::new(0),
+                claimed: AtomicUsize::new(0),
+                total_queued: AtomicUsize::new(0),
+                active_authorities: AtomicUsize::new(0),
+                close_epoch: AtomicU64::new(0),
+                keys,
+                online: (0..ncpu).map(|_| AtomicUsize::new(0)).collect(),
+                cpus,
+                policy,
+                #[cfg(test)]
+                close_observation_gate: Mutex::new(None),
+                #[cfg(test)]
+                root_admission_gate: Mutex::new(None),
+                #[cfg(test)]
+                close_started_gate: Mutex::new(None),
+                #[cfg(test)]
+                pre_park_gate: Mutex::new(None),
+            }),
+        }
+    }
+
     fn remove_exact(&self, key: QueueKey) -> bool {
-        let mut state = self.inner.state.lock();
-        let Some(index) = state.rows.iter().position(|row| row.key == key) else {
-            if state.deferred.remove(&key).is_some() {
-                state.queued.remove(&key);
-                self.inner.maybe_finish_close(&mut state);
-                self.inner.changed.notify_all();
-                return true;
-            }
-            return false;
-        };
-        state.rows.remove(index);
-        state.queued.remove(&key);
-        self.inner.maybe_finish_close(&mut state);
-        self.inner.changed.notify_all();
-        true
+        for cpu in &self.inner.cpus {
+            let mut local = cpu.state.lock();
+            let Some(index) = local.rows.iter().position(|row| row.key == key) else {
+                continue;
+            };
+            local.rows.remove(index);
+            self.inner.shard(key).lock().queued.remove(&key);
+            cpu.depth.store(local.rows.len(), Ordering::Release);
+            self.inner.total_queued.fetch_sub(1, Ordering::SeqCst);
+            drop(local);
+            self.inner.settle_close_if_closing();
+            return true;
+        }
+        // A row deferred behind an unpublished gate is on no CPU queue and was
+        // never counted, so removing it touches only the shard.
+        let mut shard = self.inner.shard(key).lock();
+        if shard.deferred.remove(&key).is_some() {
+            shard.queued.remove(&key);
+            drop(shard);
+            self.inner.settle_close_if_closing();
+            return true;
+        }
+        false
     }
 
     fn admit_root(
@@ -1099,17 +1824,20 @@ impl RunQueue {
             gate.wait();
             gate.wait();
         }
-        let mut state = self.inner.state.lock();
+        let state = self.inner.state.lock();
         if state.lifecycle != QueueLifecycle::Open
             || self.inner.wake_admissions.load(Ordering::Acquire) & RunQueueInner::CLOSING_BIT != 0
         {
             return Err(RunQueueError::SubmissionRejected);
         }
-        state.active_authorities = state
+        self.inner
             .active_authorities
-            .checked_add(1)
-            .ok_or(RunQueueError::AuthoritiesExhausted)?;
-        RunQueueInner::mark_unpublished(&mut state, key);
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| RunQueueError::SubmissionRejected)?;
+        drop(state);
+        self.inner.mark_unpublished(key);
         Ok(SubmissionAuthority {
             queue: Arc::downgrade(&self.inner),
             kernel: Arc::downgrade(kernel),
@@ -1118,11 +1846,179 @@ impl RunQueue {
         })
     }
 
+    /// Claim one row for `executor`.
+    ///
+    /// A bound executor is an `M` running one `P` for the carrier's life: it
+    /// serves its own CPU's queue, steals from the longest other queue when
+    /// its own is empty, and otherwise parks on ITS OWN condvar. No carrier
+    /// mutex is taken while the queue is open, and a wake signals exactly one
+    /// CPU, so there is no herd.
     fn take_row(
         &self,
         executor: &ExecutorRegistration,
         auditors: Option<&crate::observe::AuditorChain>,
     ) -> Result<QueueRow, RunQueueError> {
+        if executor.is_spare {
+            return self.park_spare(executor);
+        }
+        let index = executor
+            .bound_cpu
+            .map(|cpu| cpu.as_usize())
+            .unwrap_or(0)
+            .min(self.inner.cpus.len().saturating_sub(1));
+        let cpu = Arc::clone(&self.inner.cpus[index]);
+        // Exactly one announcement per executor, released by the guard on
+        // every path out of the idle state including the early returns.
+        let mut idle = IdleAnnouncement::new(&cpu);
+        loop {
+            let control_epoch = self.inner.control_epoch.load(Ordering::Acquire);
+            if executor
+                .control_observation_epoch
+                .swap(control_epoch, Ordering::AcqRel)
+                != control_epoch
+            {
+                return Err(RunQueueError::ControlPoked);
+            }
+
+            if let Some(row) = self.inner.pop_local(&cpu) {
+                return Ok(self.claim_taken(&mut idle, cpu.id, row));
+            }
+            if let Some(row) = self.inner.try_steal(cpu.id) {
+                return Ok(self.claim_taken(&mut idle, cpu.id, row));
+            }
+
+            if self.inner.lifecycle() != QueueLifecycle::Open
+                && let Some(error) = self.observe_close(executor)
+            {
+                return Err(error);
+            }
+
+            // Announce idleness BEFORE the last scan, so a publisher that
+            // posts to another CPU either sees this executor (and bumps the
+            // ticket, which the pre-park re-check below observes) or stored
+            // its row before the announcement was visible (and the scan finds
+            // it).
+            let ticket = {
+                let local = cpu.state.lock();
+                local.wake_ticket
+            };
+            idle.announce();
+            if let Some(row) = self
+                .inner
+                .pop_local(&cpu)
+                .or_else(|| self.inner.try_steal(cpu.id))
+            {
+                return Ok(self.claim_taken(&mut idle, cpu.id, row));
+            }
+
+            #[cfg(test)]
+            if let Some((arrived, resume)) = self.inner.pre_park_gate.lock().take() {
+                arrived.wait();
+                resume.wait();
+            }
+
+            let mut local = cpu.state.lock();
+            if !local.rows.is_empty() || local.wake_ticket != ticket {
+                drop(local);
+                // Stay announced: this executor is going straight back round
+                // the scan, and dropping the announcement here would make the
+                // CPU look busy to a placement taken in that window.
+                continue;
+            }
+            local.waiters = local
+                .waiters
+                .checked_add(1)
+                .unwrap_or_else(|| std::process::abort());
+            let close_epoch = self.inner.close_epoch.load(Ordering::Acquire);
+            // The executor is about to sleep with no row: report the park on
+            // the REAL guest CPU it serves, so an auditor reading the pair
+            // (claimed, parked) sees the same CPU identity the guest does.
+            if let Some(auditors) = auditors {
+                auditors.executor_parked(executor.id, cpu.id, None);
+            }
+            while local.rows.is_empty()
+                && local.wake_ticket == ticket
+                && self.inner.lifecycle() == QueueLifecycle::Open
+            {
+                cpu.idle_condvar.wait(&mut local);
+            }
+            local.waiters = local
+                .waiters
+                .checked_sub(1)
+                .unwrap_or_else(|| std::process::abort());
+            drop(local);
+            let observed_close_epoch = self.inner.close_epoch.load(Ordering::Acquire);
+            if observed_close_epoch != close_epoch {
+                executor
+                    .close_observation_epoch
+                    .store(observed_close_epoch, Ordering::Release);
+            }
+        }
+    }
+
+    /// Leave the idle state with a row in hand, continuing the wake chain.
+    ///
+    /// An executor that was woken (or had announced itself idle) consumed a
+    /// nudge. If it takes a row and work is still queued anywhere, the nudge
+    /// it consumed has to be replaced or that work waits for an unrelated
+    /// event — so it hands one on to the next idle CPU before it runs.
+    fn claim_taken(
+        &self,
+        idle: &mut IdleAnnouncement<'_>,
+        cpu: GuestCpuId,
+        row: QueueRow,
+    ) -> QueueRow {
+        if idle.is_held() {
+            // Release BEFORE reading the queue total. The two are `SeqCst`
+            // and so is `enqueue`'s (`total_queued` add, then idle load):
+            // either the publisher still sees this executor idle and nudges
+            // it, or this executor already sees the publisher's row and hands
+            // the nudge on. One of the two always fires, so a row cannot be
+            // left runnable with every other executor parked.
+            idle.release();
+            self.inner.propagate_wake(cpu);
+        }
+        row
+    }
+
+    /// The closing arm of a claim: pay this executor's close observation once
+    /// the queue has drained, or report the queue closed. `None` means the
+    /// queue is closing but not drained, so the caller parks normally and is
+    /// nudged again by whichever decrement drains it.
+    fn observe_close(&self, executor: &ExecutorRegistration) -> Option<RunQueueError> {
+        let mut state = self.inner.state.lock();
+        self.inner.maybe_finish_close(&mut state);
+        if state.lifecycle == QueueLifecycle::Closed {
+            return Some(RunQueueError::Closed);
+        }
+        if state.lifecycle == QueueLifecycle::Closing && self.inner.drain_ready() {
+            if executor.close_observation_epoch.swap(0, Ordering::AcqRel) != 0 {
+                #[cfg(test)]
+                let observation_gate = {
+                    let configured = self.inner.close_observation_gate.lock();
+                    configured.clone()
+                };
+                #[cfg(test)]
+                if let Some(gate) = observation_gate {
+                    drop(state);
+                    gate.wait();
+                    state = self.inner.state.lock();
+                }
+                state.closed_waiter_observations = state
+                    .closed_waiter_observations
+                    .checked_add(1)
+                    .unwrap_or_else(|| std::process::abort());
+                self.inner.maybe_finish_close(&mut state);
+            }
+            return Some(RunQueueError::Closed);
+        }
+        None
+    }
+
+    /// A spare `M`. It holds no `P`, so it never claims a row in this phase:
+    /// it parks on the lifecycle condvar until a control poke or the close.
+    /// Phase 3 (`handoffp`) is what will hand it a `P` to run.
+    fn park_spare(&self, executor: &ExecutorRegistration) -> Result<QueueRow, RunQueueError> {
         let mut state = self.inner.state.lock();
         loop {
             let control_epoch = self.inner.control_epoch.load(Ordering::Acquire);
@@ -1133,31 +2029,12 @@ impl RunQueue {
             {
                 return Err(RunQueueError::ControlPoked);
             }
-            if let Some(row) = state.rows.pop_front() {
-                state.queued.remove(&row.key);
-                state.claimed = state
-                    .claimed
-                    .checked_add(1)
-                    .unwrap_or_else(|| std::process::abort());
-                return Ok(row);
-            }
             self.inner.maybe_finish_close(&mut state);
             if state.lifecycle == QueueLifecycle::Closed {
                 return Err(RunQueueError::Closed);
             }
-            if state.lifecycle == QueueLifecycle::Closing && self.inner.drain_ready(&state) {
+            if state.lifecycle == QueueLifecycle::Closing && self.inner.drain_ready() {
                 if executor.close_observation_epoch.swap(0, Ordering::AcqRel) != 0 {
-                    #[cfg(test)]
-                    let observation_gate = {
-                        let configured = self.inner.close_observation_gate.lock();
-                        configured.clone()
-                    };
-                    #[cfg(test)]
-                    if let Some(gate) = observation_gate {
-                        drop(state);
-                        gate.wait();
-                        state = self.inner.state.lock();
-                    }
                     state.closed_waiter_observations = state
                         .closed_waiter_observations
                         .checked_add(1)
@@ -1166,18 +2043,14 @@ impl RunQueue {
                 }
                 return Err(RunQueueError::Closed);
             }
-            state.waiters = state
-                .waiters
+            state.spare_waiters = state
+                .spare_waiters
                 .checked_add(1)
                 .unwrap_or_else(|| std::process::abort());
             let close_epoch = state.close_epoch;
-            if let Some(auditors) = auditors {
-                let cpu = crate::observe::GuestCpuId::new(executor.id.raw_for_probe());
-                auditors.executor_parked(executor.id, cpu, None);
-            }
             self.inner.changed.wait(&mut state);
-            state.waiters = state
-                .waiters
+            state.spare_waiters = state
+                .spare_waiters
                 .checked_sub(1)
                 .unwrap_or_else(|| std::process::abort());
             if state.close_epoch != close_epoch {
@@ -1188,9 +2061,6 @@ impl RunQueue {
         }
     }
 
-    /// Claim the first row that still names the exact current Runnable
-    /// generation. Stale rows are consumed here and never escape as runnable
-    /// authority.
     pub(crate) fn take(
         &self,
         executor: &ExecutorRegistration,
@@ -1216,6 +2086,16 @@ impl RunQueue {
                         "stale_row_generation_or_state_mismatch".to_owned(),
                     );
                 }
+                // A discarded row is a wake that never reaches its target, so
+                // it is reported on the SAME auditor surface as a rejected
+                // wake. The `DiscardRecorder` stays: it is the diagnostic
+                // transcript, while this is the invariant surface.
+                if let Some(auditors) = auditors {
+                    auditors.wake_rejected(
+                        row.thread.task_key(),
+                        crate::observe::WakeRejectionReason::StaleGeneration,
+                    );
+                }
                 self.inner.finish_claim();
                 continue;
             }
@@ -1233,6 +2113,12 @@ impl RunQueue {
                         );
                     }
                     drop(lease);
+                    if let Some(auditors) = auditors {
+                        auditors.wake_rejected(
+                            row.thread.task_key(),
+                            crate::observe::WakeRejectionReason::StaleGeneration,
+                        );
+                    }
                     self.inner.finish_claim();
                     continue;
                 }
@@ -1258,18 +2144,34 @@ impl RunQueue {
         self.inner.begin_close();
         let mut state = self.inner.state.lock();
         if state.lifecycle == QueueLifecycle::Open {
-            state.lifecycle = QueueLifecycle::Closing;
+            self.inner
+                .publish_lifecycle(&mut state, QueueLifecycle::Closing);
             state.close_epoch = state
                 .close_epoch
                 .checked_add(1)
                 .unwrap_or_else(|| std::process::abort());
-            state.close_waiters_expected = state.waiters;
+            // Exactly the executors parked RIGHT NOW owe a close observation.
+            // Per-CPU waiters are counted under each CPU's own lock while this
+            // carrier lock is held, so an executor is either already parked
+            // (counted, and woken by the nudge below) or has not yet parked
+            // and will see the published lifecycle before it does.
+            let cpu_waiters: usize = self
+                .inner
+                .cpus
+                .iter()
+                .map(|cpu| cpu.state.lock().waiters)
+                .sum();
+            state.close_waiters_expected = cpu_waiters + state.spare_waiters;
+            self.inner
+                .close_epoch
+                .store(state.close_epoch, Ordering::Release);
         }
         #[cfg(test)]
         let close_started_gate = self.inner.close_started_gate.lock().clone();
         self.inner.maybe_finish_close(&mut state);
         self.inner.changed.notify_all();
         drop(state);
+        self.inner.nudge_all_cpus();
         #[cfg(test)]
         if let Some(gate) = close_started_gate {
             gate.wait();
@@ -1297,12 +2199,20 @@ impl RunQueue {
     }
 
     fn len(&self) -> usize {
-        self.inner.state.lock().rows.len()
+        self.inner.total_queued.load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
+    /// Executors parked right now, across every CPU plus the spare pool. Used
+    /// by the debug summary and, at `close`, to size the close-observation
+    /// debt.
     fn waiter_count(&self) -> usize {
-        self.inner.state.lock().waiters
+        let cpu_waiters: usize = self
+            .inner
+            .cpus
+            .iter()
+            .map(|cpu| cpu.state.lock().waiters)
+            .sum();
+        cpu_waiters + self.inner.state.lock().spare_waiters
     }
 
     #[cfg(test)]
@@ -1312,7 +2222,21 @@ impl RunQueue {
 
     #[cfg(test)]
     fn active_authority_count(&self) -> usize {
-        self.inner.state.lock().active_authorities
+        self.inner.active_authorities.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn drain_ready_for_test(&self) -> bool {
+        self.inner.drain_ready()
+    }
+
+    #[cfg(test)]
+    fn install_pre_park_gate(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        resume: Arc<std::sync::Barrier>,
+    ) {
+        *self.inner.pre_park_gate.lock() = Some((arrived, resume));
     }
 
     #[cfg(test)]
@@ -1343,6 +2267,11 @@ pub struct RunnableThread {
     lease: Option<ThreadExecutionLease>,
     queue: Weak<RunQueueInner>,
     active_claim: bool,
+    /// The guest CPU this claim runs on. This is the SAME value published to
+    /// the thread's `last_cpu` and read back by the guest through
+    /// `sched_getcpu`, so an observer that reports it is reporting the guest's
+    /// own answer rather than a host executor index.
+    guest_cpu: GuestCpuId,
 }
 
 impl std::fmt::Debug for RunnableThread {
@@ -1366,6 +2295,12 @@ impl RunnableThread {
 
     pub const fn executor(&self) -> ExecutorId {
         self.binding.executor
+    }
+
+    /// The guest CPU this claim runs on — the guest's own answer, not a host
+    /// executor index.
+    pub const fn guest_cpu(&self) -> GuestCpuId {
+        self.guest_cpu
     }
 
     pub const fn executor_epoch(&self) -> u64 {
@@ -1471,9 +2406,13 @@ impl std::fmt::Debug for Scheduler {
 
 impl Scheduler {
     pub fn new(kernel: Arc<Kernel>) -> Self {
+        Self::new_with_policy(kernel, Arc::new(GuestCpuPolicy::new(guest_cpu_count())))
+    }
+
+    pub fn new_with_policy(kernel: Arc<Kernel>, policy: Arc<dyn SchedulingPolicy>) -> Self {
         Self {
             kernel,
-            queue: RunQueue::default(),
+            queue: RunQueue::new(policy),
             executors: ExecutorDirectory::default(),
             need_resched: AtomicBool::new(false),
             snapshot_count: AtomicU64::new(0),
@@ -1483,6 +2422,18 @@ impl Scheduler {
             #[cfg(test)]
             continuation_settlement_barriers: Mutex::new(None),
         }
+    }
+
+    pub fn policy(&self) -> &Arc<dyn SchedulingPolicy> {
+        &self.queue.inner.policy
+    }
+
+    pub fn guest_cpus(&self) -> &[Arc<GuestCpu>] {
+        &self.queue.inner.cpus
+    }
+
+    pub fn guest_cpu(&self, id: GuestCpuId) -> Option<Arc<GuestCpu>> {
+        self.queue.inner.cpus.get(id.as_usize()).cloned()
     }
 
     pub(crate) fn install_discard_recorder(&self, recorder: Arc<dyn DiscardRecorder>) {
@@ -1507,25 +2458,70 @@ impl Scheduler {
         predecessor: ExecutionGeneration,
         successor: ExecutionGeneration,
         kind: SchedulerGenerationTransition,
-    ) -> Result<(), SchedulerError> {
-        if let Some(observer) = self.generation_observer.lock().as_ref()
+    ) -> GenerationTransitionOutcome {
+        let observer = self.generation_observer.lock().clone();
+        if let Some(observer) = observer
             && let Err(error) = observer.transition(thread, predecessor, successor, kind)
         {
-            // The Kernel execution state has already advanced. Returning an
-            // ordinary error would strand the successor outside the combined
-            // binding/authority directory and bypass logical completion.
             let kernel_view = self.kernel.scheduler_thread_execution_diagnostic(thread);
-            tracing::error!(?thread, ?predecessor, ?successor, ?kind, %error, %kernel_view, "scheduler generation observer lost exact transition");
-            std::process::abort();
+            let target_still_live = self.kernel.exact_thread_for_scheduler(thread).is_some();
+            return match classify_transition_rejection(target_still_live) {
+                TransitionRejection::TargetReaped => {
+                    // Captured live on 2026-09-07 under eight CPU hogs as
+                    // `thread=ThreadKey { tid: LinuxTid(1864), serial:
+                    // ThreadSerial(225511) } predecessor=84 successor=85
+                    // kind=Runnable error=AuthorityMismatch kernel_view=thread
+                    // absent from registry` — a carrier abort for a wake Linux
+                    // would have discarded
+                    // (`docs/conformance-campaigns/2026-09-04-ecosystem.md`).
+                    tracing::debug!(?thread, ?predecessor, ?successor, ?kind, %error, %kernel_view, "scheduler transition target was reaped; publication rejected");
+                    // Withholding the successor is only half of it. The
+                    // observer put its predecessor record BACK when the
+                    // rollover failed (correct for a live target), and for a
+                    // reaped one nothing will ever take it out again: no
+                    // successor is published, no executor runs that
+                    // generation, and no exit or exec path names it. The
+                    // `SubmissionAuthority` inside that record keeps
+                    // `active_authorities` non-zero, which is one of
+                    // `drain_ready`'s four terms — so the container's close
+                    // never finishes. Liveness is this side's fact, so the
+                    // retirement has to be ordered from here.
+                    observer.retire_reaped(thread, predecessor);
+                    GenerationTransitionOutcome::TargetReaped
+                }
+                TransitionRejection::LostExactTransition => {
+                    tracing::error!(?thread, ?predecessor, ?successor, ?kind, %error, %kernel_view, "scheduler generation observer lost exact transition");
+                    std::process::abort();
+                }
+            };
         }
-        Ok(())
+        GenerationTransitionOutcome::Recorded
     }
 
+    /// Register an `M` and bind it to the next guest CPU round-robin.
     pub fn register_executor(
         &self,
         kick: Arc<dyn ExecutorKick>,
     ) -> Result<ExecutorRegistration, RunQueueError> {
-        self.executors.register(kick)
+        self.register_executor_bound(kick, None, false)
+    }
+
+    /// Register an `M`. A spare holds no `P` and parks until phase 3's
+    /// `handoffp` gives it one; every other executor owns exactly one guest
+    /// CPU for the carrier's life.
+    pub fn register_executor_bound(
+        &self,
+        kick: Arc<dyn ExecutorKick>,
+        bound_cpu: Option<GuestCpuId>,
+        is_spare: bool,
+    ) -> Result<ExecutorRegistration, RunQueueError> {
+        let registration =
+            self.executors
+                .register(kick, bound_cpu, is_spare, self.queue.inner.cpus.len())?;
+        if let Some(cpu) = registration.bound_cpu {
+            self.queue.inner.set_executor_online(cpu, true);
+        }
+        Ok(registration)
     }
 
     pub(crate) fn unregister_executor(
@@ -1533,7 +2529,17 @@ impl Scheduler {
         registration: &ExecutorRegistration,
     ) -> Result<(), RunQueueError> {
         self.queue.retire_executor(registration);
-        self.executors.unregister(registration)
+        let result = self.executors.unregister(registration);
+        if result.is_ok()
+            && let Some(cpu) = registration.bound_cpu
+        {
+            self.queue.inner.set_executor_online(cpu, false);
+            // Whatever is still queued on a CPU that just lost its `M` is
+            // reachable only by stealing; nudge the others so it does not wait
+            // for the next unrelated wake.
+            self.queue.inner.nudge_all_cpus();
+        }
+        result
     }
 
     #[cfg(test)]
@@ -1631,12 +2637,14 @@ impl Scheduler {
             }
             Err(error) => return Err(error.into()),
         };
-        self.observe_generation_transition(
+        // A terminal transition publishes nothing, so a reaped target changes
+        // nothing here: the cancellation already happened in the Kernel.
+        let _ = self.observe_generation_transition(
             key,
             generation,
             successor,
             SchedulerGenerationTransition::Terminal,
-        )?;
+        );
         Ok(true)
     }
 
@@ -1782,13 +2790,30 @@ impl Scheduler {
                 generation,
                 closing_authorized,
             } => {
+                // `TargetReaped` is the ONLY outcome that is not `Recorded`
+                // here (a live disagreement aborts inside the observer, and
+                // the match is exhaustive, so this cannot widen into "any
+                // error is benign"). Linux answers a wake of an exited task
+                // with a no-op, so this is a no-op wake — NOT an error for the
+                // waker to carry. Round 1 stopped at "reject instead of abort"
+                // and left the rejection to propagate, which killed the
+                // executor that raised it ("executor worker died error=exact
+                // thread generation is not live", `conf-35614-c00`) and
+                // cascaded into a carrier FATAL: no better than the abort it
+                // replaced.
                 if let Some(predecessor) = predecessor {
-                    self.observe_generation_transition(
+                    match self.observe_generation_transition(
                         key,
                         predecessor,
                         generation,
                         SchedulerGenerationTransition::Runnable,
-                    )?;
+                    ) {
+                        GenerationTransitionOutcome::Recorded => {}
+                        GenerationTransitionOutcome::TargetReaped => {
+                            tracing::debug!(?key, "wake of a reaped task is a no-op");
+                            return Ok(WakeAction::Pending);
+                        }
+                    }
                 }
                 WakeAction::Queue {
                     thread,
@@ -1827,13 +2852,30 @@ impl Scheduler {
                 generation,
                 closing_authorized,
             } => {
+                // `TargetReaped` is the ONLY outcome that is not `Recorded`
+                // here (a live disagreement aborts inside the observer, and
+                // the match is exhaustive, so this cannot widen into "any
+                // error is benign"). Linux answers a wake of an exited task
+                // with a no-op, so this is a no-op wake — NOT an error for the
+                // waker to carry. Round 1 stopped at "reject instead of abort"
+                // and left the rejection to propagate, which killed the
+                // executor that raised it ("executor worker died error=exact
+                // thread generation is not live", `conf-35614-c00`) and
+                // cascaded into a carrier FATAL: no better than the abort it
+                // replaced.
                 if let Some(predecessor) = predecessor {
-                    self.observe_generation_transition(
+                    match self.observe_generation_transition(
                         key,
                         predecessor,
                         generation,
                         SchedulerGenerationTransition::Runnable,
-                    )?;
+                    ) {
+                        GenerationTransitionOutcome::Recorded => {}
+                        GenerationTransitionOutcome::TargetReaped => {
+                            tracing::debug!(?key, "wake of a reaped task is a no-op");
+                            return Ok(WakeAction::Pending);
+                        }
+                    }
                 }
                 WakeAction::Queue {
                     thread,
@@ -1888,6 +2930,16 @@ impl Scheduler {
         key: QueueKey,
         closing_authorized: bool,
     ) -> Result<bool, RunQueueError> {
+        self.enqueue_exact_on(thread, key, closing_authorized, None)
+    }
+
+    fn enqueue_exact_on(
+        &self,
+        thread: Arc<Thread>,
+        key: QueueKey,
+        closing_authorized: bool,
+        target_cpu: Option<GuestCpuId>,
+    ) -> Result<bool, RunQueueError> {
         let outcome = self.queue.inner.enqueue(
             QueueRow {
                 key,
@@ -1895,6 +2947,7 @@ impl Scheduler {
                 closing_authorized,
             },
             closing_authorized,
+            target_cpu,
         )?;
         self.after_insertion(outcome);
         Ok(outcome.queued())
@@ -1937,6 +2990,11 @@ impl Scheduler {
             self.queue.inner.finish_claim();
             return Err(error);
         }
+        let bound_cpu = executor.bound_cpu.unwrap_or(GuestCpuId::new(0));
+        row.thread.set_last_cpu(bound_cpu);
+        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
+            guest_cpu.set_current_task(Some(row.thread.key()));
+        }
         self.need_resched
             .store(self.queue.len() != 0, Ordering::Release);
         Ok(RunnableThread {
@@ -1946,6 +3004,7 @@ impl Scheduler {
             lease: Some(lease),
             queue: Arc::downgrade(&self.queue.inner),
             active_claim: true,
+            guest_cpu: bound_cpu,
         })
     }
 
@@ -1978,10 +3037,37 @@ impl Scheduler {
         } else {
             SchedulerGenerationTransition::Runnable
         };
-        self.observe_generation_transition(running.thread_key(), predecessor, successor, kind)?;
+        // A reaped target does NOT abandon this transaction. Returning early
+        // here left the executor bound, the claim unfinished and the lease
+        // already taken, and the pool then failed the terminal ASID retirement
+        // and dropped a published MM authority — the `conf-60360-c00` /
+        // `conf-76099-c00` carrier FATAL. Settle exactly as usual; only the
+        // successor publication below is withheld.
+        let observed =
+            self.observe_generation_transition(running.thread_key(), predecessor, successor, kind);
         self.executors.unbind(running.binding);
+        let bound_cpu = self
+            .executors
+            .state
+            .lock()
+            .entries
+            .get(&running.binding.executor)
+            .and_then(|e| e.bound_cpu)
+            .unwrap_or(GuestCpuId::new(0));
+        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
+            guest_cpu.set_current_task(None);
+        }
+        let task_key = TaskKey::new(running.thread.task_key().serial.raw());
+        self.queue.inner.policy.on_block(task_key, bound_cpu);
         drop(_transition);
-        self.apply_settlement_action(Some(running.binding.executor), &running.thread, action)?;
+        if observed == GenerationTransitionOutcome::Recorded {
+            self.apply_settlement_action(
+                Some(running.binding.executor),
+                &running.thread,
+                action,
+                None,
+            )?;
+        }
         running.finish_claim();
         Ok(())
     }
@@ -2020,15 +3106,42 @@ impl Scheduler {
         } else {
             SchedulerGenerationTransition::Runnable
         };
-        self.observe_generation_transition(running.thread_key(), predecessor, successor, kind)?;
+        // A reaped target does NOT abandon this transaction. Returning early
+        // here left the executor bound, the claim unfinished and the lease
+        // already taken, and the pool then failed the terminal ASID retirement
+        // and dropped a published MM authority — the `conf-60360-c00` /
+        // `conf-76099-c00` carrier FATAL. Settle exactly as usual; only the
+        // successor publication below is withheld.
+        let observed =
+            self.observe_generation_transition(running.thread_key(), predecessor, successor, kind);
         self.executors.unbind(running.binding);
+        let bound_cpu = self
+            .executors
+            .state
+            .lock()
+            .entries
+            .get(&running.binding.executor)
+            .and_then(|e| e.bound_cpu)
+            .unwrap_or(GuestCpuId::new(0));
+        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
+            guest_cpu.set_current_task(None);
+        }
+        let task_key = TaskKey::new(running.thread.task_key().serial.raw());
+        self.queue.inner.policy.on_block(task_key, bound_cpu);
         drop(_transition);
         #[cfg(test)]
         if let Some((at_clear, release)) = self.continuation_settlement_barriers.lock().clone() {
             at_clear.wait();
             release.wait();
         }
-        self.apply_settlement_action(Some(running.binding.executor), &running.thread, action)?;
+        if observed == GenerationTransitionOutcome::Recorded {
+            self.apply_settlement_action(
+                Some(running.binding.executor),
+                &running.thread,
+                action,
+                None,
+            )?;
+        }
         running.finish_claim();
         Ok(())
     }
@@ -2162,13 +3275,26 @@ impl Scheduler {
         };
         match failure {
             Ok(successor) => {
-                self.observe_generation_transition(
+                // Terminal: nothing is published either way, and a reaped
+                // target must not abandon the retirement transaction.
+                let _ = self.observe_generation_transition(
                     running.thread_key(),
                     predecessor,
                     successor,
                     SchedulerGenerationTransition::Terminal,
-                )?;
+                );
                 self.executors.unbind(running.binding);
+                let bound_cpu = self
+                    .executors
+                    .state
+                    .lock()
+                    .entries
+                    .get(&running.binding.executor)
+                    .and_then(|e| e.bound_cpu)
+                    .unwrap_or(GuestCpuId::new(0));
+                if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
+                    guest_cpu.set_current_task(None);
+                }
                 drop(_transition);
                 running.finish_claim();
                 Ok(())
@@ -2207,20 +3333,49 @@ impl Scheduler {
             | ThreadSchedulerAction::Kick { .. }
             | ThreadSchedulerAction::None => None,
         };
-        if let Some(successor) = successor {
-            self.observe_generation_transition(
+        // A yield whose target was reaped in flight still settles: the same
+        // early return that abandoned `settle_blocked` abandoned this one, and
+        // an abandoned yield is what the executor loop reported as "executor
+        // worker died error=exact thread generation is not live" before the
+        // pool cascaded into a carrier FATAL.
+        let observed = match successor {
+            Some(successor) => self.observe_generation_transition(
                 running.thread_key(),
                 predecessor,
                 successor,
                 SchedulerGenerationTransition::Runnable,
-            )?;
-        }
+            ),
+            None => GenerationTransitionOutcome::Recorded,
+        };
         self.executors.unbind(running.binding);
+        let bound_cpu = self
+            .executors
+            .state
+            .lock()
+            .entries
+            .get(&running.binding.executor)
+            .and_then(|e| e.bound_cpu)
+            .unwrap_or(GuestCpuId::new(0));
+        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
+            guest_cpu.set_current_task(None);
+        }
         drop(_transition);
         self.snapshot_count.fetch_add(1, Ordering::Relaxed);
-        self.apply_settlement_action(Some(running.binding.executor), &running.thread, action)?;
+        let target_cpu = running.thread.last_cpu();
+        if observed == GenerationTransitionOutcome::Recorded {
+            self.apply_settlement_action(
+                Some(running.binding.executor),
+                &running.thread,
+                action,
+                target_cpu,
+            )?;
+        }
         running.finish_claim();
-        Ok(successor)
+        // A reaped target has no reachable successor to report.
+        Ok(match observed {
+            GenerationTransitionOutcome::Recorded => successor,
+            GenerationTransitionOutcome::TargetReaped => None,
+        })
     }
 
     pub fn settle_exited(&self, mut running: RunnableThread) -> Result<(), SchedulerError> {
@@ -2236,13 +3391,28 @@ impl Scheduler {
             .execution_state()
             .generation()
             .ok_or(RunQueueError::AuthorityMismatch)?;
-        self.observe_generation_transition(
+        // Terminal: nothing is published either way, and a reaped target must
+        // not abandon the exit transaction.
+        let _ = self.observe_generation_transition(
             running.thread_key(),
             predecessor,
             successor,
             SchedulerGenerationTransition::Terminal,
-        )?;
+        );
         self.executors.unbind(running.binding);
+        let bound_cpu = self
+            .executors
+            .state
+            .lock()
+            .entries
+            .get(&running.binding.executor)
+            .and_then(|e| e.bound_cpu)
+            .unwrap_or(GuestCpuId::new(0));
+        if let Some(guest_cpu) = self.queue.inner.cpus.get(bound_cpu.as_usize()) {
+            guest_cpu.set_current_task(None);
+        }
+        let task_key = TaskKey::new(running.thread.task_key().serial.raw());
+        self.queue.inner.policy.on_exit(task_key, bound_cpu);
         drop(_transition);
         running.finish_claim();
         Ok(())
@@ -2253,6 +3423,7 @@ impl Scheduler {
         executor: Option<ExecutorId>,
         thread: &Arc<Thread>,
         action: ThreadSchedulerAction,
+        target_cpu: Option<GuestCpuId>,
     ) -> Result<(), SchedulerError> {
         match action {
             ThreadSchedulerAction::Queue {
@@ -2261,13 +3432,14 @@ impl Scheduler {
                 generation,
                 closing_authorized,
             } => {
-                if let Err(error) = self.enqueue_exact(
+                if let Err(error) = self.enqueue_exact_on(
                     Arc::clone(thread),
                     QueueKey {
                         thread: key,
                         generation,
                     },
                     closing_authorized,
+                    target_cpu,
                 ) {
                     if let Some(recorder) = self.discard_recorder.lock().as_ref() {
                         let exec_id = executor.unwrap_or_else(|| ExecutorId::from_scheduler(1));
@@ -2299,9 +3471,9 @@ impl Scheduler {
             QueueLifecycle::Closed => "closed",
         }
         .to_owned();
-        let queued_len = state.rows.len();
-        let claimed = state.claimed;
-        let waiters = state.waiters;
+        let queued_len = self.queue.inner.total_queued.load(Ordering::Acquire);
+        let claimed = self.queue.inner.claimed.load(Ordering::Acquire);
+        let waiters = self.queue.waiter_count();
         let control_epoch = self.queue.inner.control_epoch.load(Ordering::Acquire);
         let need_resched = self.need_resched();
         let snapshot_count = self.snapshot_count();
@@ -2317,12 +3489,14 @@ impl Scheduler {
     }
 
     pub fn snapshot_run_queue_rows(&self) -> Vec<(ThreadKey, ExecutionGeneration, bool)> {
-        let state = self.queue.inner.state.lock();
-        state
-            .rows
-            .iter()
-            .map(|row| (row.key.thread, row.key.generation, row.closing_authorized))
-            .collect()
+        let mut rows = Vec::new();
+        for cpu in &self.queue.inner.cpus {
+            let state = cpu.state.lock();
+            for row in &state.rows {
+                rows.push((row.key.thread, row.key.generation, row.closing_authorized));
+            }
+        }
+        rows
     }
 
     #[allow(clippy::type_complexity)]
@@ -2357,6 +3531,12 @@ impl Scheduler {
         self.executors.binding_for_thread(thread)
     }
 
+    /// Guest CPUs this scheduler places onto: the installed policy's
+    /// `cpu_count()`, which is also the guest's `nproc`.
+    pub fn cpu_count(&self) -> usize {
+        self.queue.inner.cpus.len()
+    }
+
     pub fn queued_len(&self) -> usize {
         self.queue.len()
     }
@@ -2381,6 +3561,30 @@ impl Scheduler {
             .into_iter()
             .filter(|token| self.executors.deliver(*token))
             .count()
+    }
+
+    pub fn tick_preemption(&self) -> usize {
+        let mut count = 0;
+        let entries: Vec<_> = {
+            let state = self.executors.state.lock();
+            state
+                .entries
+                .values()
+                .filter_map(|entry| {
+                    let cpu = entry.bound_cpu?;
+                    let binding = entry.kick.current_binding()?;
+                    Some((cpu, binding.token()))
+                })
+                .collect()
+        };
+        for (cpu, token) in entries {
+            if self.queue.inner.policy.on_tick(cpu) == PreemptOrContinue::Preempt
+                && self.executors.deliver(token)
+            {
+                count += 1;
+            }
+        }
+        count
     }
 
     pub fn note_syscall_boundary(&self, _running: &RunnableThread) {
@@ -2435,6 +3639,41 @@ impl Scheduler {
     fn install_root_admission_gate(&self, gate: Arc<std::sync::Barrier>) {
         self.queue.install_root_admission_gate(gate);
     }
+
+    #[cfg(test)]
+    pub(crate) fn install_pre_park_gate(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        resume: Arc<std::sync::Barrier>,
+    ) {
+        self.queue.install_pre_park_gate(arrived, resume);
+    }
+
+    /// Non-destructive `findrunnable` steal probe: run the steal scan `cpu`
+    /// would run, then put the row straight back. Exists so a test can assert
+    /// what IS and IS NOT stealable without blocking in `take`.
+    #[cfg(test)]
+    pub(crate) fn steal_probe(&self, cpu: GuestCpuId) -> Option<ThreadKey> {
+        let row = self.queue.inner.try_steal(cpu)?;
+        let key = row.key;
+        let closing_authorized = row.closing_authorized;
+        let thread = Arc::clone(&row.thread);
+        drop(row);
+        self.queue
+            .inner
+            .enqueue(
+                QueueRow {
+                    key,
+                    thread,
+                    closing_authorized,
+                },
+                closing_authorized,
+                None,
+            )
+            .expect("restore the probed row");
+        self.queue.inner.finish_claim();
+        Some(key.thread)
+    }
 }
 
 #[cfg(test)]
@@ -2445,12 +3684,31 @@ mod tests {
     use std::thread;
 
     use carrick_abi::LinuxCloneFlags;
+    /// Pin every placement to guest CPU 0.
+    ///
+    /// The wake-chain tests need a burst that placement CANNOT spread, and
+    /// after the claimability gate the way to get a row onto a queue is
+    /// publication — which places through the policy. Forcing the CPU is
+    /// therefore the policy's job, not a second enqueue entry point.
+    #[derive(Debug)]
+    struct PinToCpuZero(usize);
+
+    impl carrick_hal::SchedulingPolicy for PinToCpuZero {
+        fn cpu_count(&self) -> usize {
+            self.0
+        }
+
+        fn select_cpu(&self, _placement: &carrick_hal::TaskPlacement<'_>) -> GuestCpuId {
+            GuestCpuId::new(0)
+        }
+    }
+
     use carrick_hal::ThreadId;
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 
     use super::{
-        ExecutorBinding, ExecutorKick, ExecutorKickToken, QueueKey, RunQueueError, Scheduler,
-        WakeDisposition,
+        CpuAffinity, ExecutorBinding, ExecutorKick, ExecutorKickToken, GuestCpuId, GuestCpuPolicy,
+        QueueKey, RunQueueError, Scheduler, WakeDisposition,
     };
     use crate::compat::SyscallArgs;
     use crate::dispatch::SyscallRequest;
@@ -3576,6 +4834,226 @@ mod tests {
         drop(word);
     }
 
+    /// The wake chain, as an invariant: a burst of rows placed on ONE guest
+    /// CPU while every other CPU sits parked must end with every executor
+    /// running a row and nothing queued.
+    ///
+    /// Round 1 nudged at most one idle CPU per `enqueue`, and only when the
+    /// target had no parked waiter. A nudged executor that took a DIFFERENT
+    /// row consumed the wake, and the row it left behind then waited beside
+    /// parked executors until an unrelated event moved the queue. Go's answer
+    /// is `wakep` plus the spinning-`M` handoff: an executor woken to scan
+    /// that finds work nudges the next idle CPU before it runs.
+    #[test]
+    fn a_burst_onto_one_cpu_wakes_every_parked_executor_through_the_chain() {
+        const CPUS: usize = 4;
+        let (kernel, root) = bootstrap(12_400);
+        publish(&root, 40);
+        let children: Vec<KernelContext> = (0..CPUS)
+            .map(|index| {
+                let child = process_child(
+                    &kernel,
+                    &root,
+                    22_400 + index as i32,
+                    "scheduler chain child",
+                );
+                publish(&child, 41 + index as u64);
+                child
+            })
+            .collect();
+        let scheduler = Arc::new(Scheduler::new_with_policy(
+            Arc::clone(&kernel),
+            Arc::new(PinToCpuZero(CPUS)),
+        ));
+        let root_authority = scheduler
+            .admit_root(
+                root.thread().key(),
+                root.thread().execution_state().generation().unwrap(),
+            )
+            .unwrap();
+
+        // One `M` per `P`. Each takes exactly ONE row and then HOLDS it, so a
+        // row can only start on an executor the chain actually woke — no
+        // executor is available to pick up a second row.
+        let ready = Arc::new(Barrier::new(CPUS + 1));
+        let hold = Arc::new(Barrier::new(CPUS + 1));
+        let taken = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for index in 0..CPUS {
+            let scheduler = Arc::clone(&scheduler);
+            let ready = Arc::clone(&ready);
+            let hold = Arc::clone(&hold);
+            let taken = Arc::clone(&taken);
+            workers.push(thread::spawn(move || {
+                let executor = scheduler
+                    .register_executor_bound(
+                        Arc::new(RecordingKick::default()),
+                        Some(GuestCpuId::new(index as u32)),
+                        false,
+                    )
+                    .unwrap();
+                ready.wait();
+                let running = scheduler
+                    .take(&executor)
+                    .expect("every executor is reached by the wake chain");
+                taken.fetch_add(1, Ordering::SeqCst);
+                hold.wait();
+                scheduler.settle_exited(running).unwrap();
+                scheduler.unregister_executor(&executor).unwrap();
+            }));
+        }
+        ready.wait();
+        while scheduler.waiter_count() != CPUS {
+            thread::yield_now();
+        }
+
+        // The burst. Every row is FORCED onto guest CPU 0, so placement
+        // cannot spread it and only the chain can start the other three.
+        let _authorities: Vec<super::SubmissionAuthority> = children
+            .iter()
+            .map(|child| {
+                let authority = root_authority
+                    .admit_descendant(
+                        child.thread().key(),
+                        child.thread().execution_state().generation().unwrap(),
+                    )
+                    .unwrap();
+                // Activation IS publication: an admitted key's row is
+                // deferred until its submission publishes, so the burst has to
+                // arrive the way the shipped path makes rows claimable.
+                authority
+                    .publish(&scheduler, Arc::clone(child.thread()))
+                    .unwrap();
+                authority
+            })
+            .collect();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while taken.load(Ordering::SeqCst) < CPUS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wake chain stalled: {} of {CPUS} rows started, {} still queued, {} executors parked",
+                taken.load(Ordering::SeqCst),
+                scheduler.queued_len(),
+                scheduler.waiter_count(),
+            );
+            thread::yield_now();
+        }
+
+        // The invariant: nothing runnable is left beside a parked executor.
+        assert_eq!(scheduler.queued_len(), 0, "a row outlived the chain");
+        assert_eq!(
+            scheduler.waiter_count(),
+            0,
+            "an executor parked while a row was runnable",
+        );
+        for index in 0..CPUS {
+            assert_eq!(
+                scheduler.queue.inner.cpus[index].idle_executors(),
+                0,
+                "cpu#{index} kept a phantom idle announcement",
+            );
+        }
+
+        hold.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    /// The counted announcement is exact across a claim: an executor that
+    /// takes a row leaves no idle credit behind, and one that parks is
+    /// counted once — the placement policy reads this as "a free executor
+    /// lives here".
+    #[test]
+    fn an_idle_announcement_is_counted_per_executor_not_per_cpu() {
+        let (kernel, root) = bootstrap(12_450);
+        publish(&root, 50);
+        let child = process_child(&kernel, &root, 22_450, "scheduler idle-count child");
+        publish(&child, 51);
+        let scheduler = Arc::new(Scheduler::new_with_policy(
+            Arc::clone(&kernel),
+            Arc::new(PinToCpuZero(2)),
+        ));
+        let cpu0 = Arc::clone(&scheduler.queue.inner.cpus[0]);
+        // Two `M`s share guest CPU 0, which is what a bool could not express.
+        let ready = Arc::new(Barrier::new(3));
+        let hold = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let scheduler = Arc::clone(&scheduler);
+            let ready = Arc::clone(&ready);
+            let hold = Arc::clone(&hold);
+            workers.push(thread::spawn(move || {
+                let executor = scheduler
+                    .register_executor_bound(
+                        Arc::new(RecordingKick::default()),
+                        Some(GuestCpuId::new(0)),
+                        false,
+                    )
+                    .unwrap();
+                ready.wait();
+                match scheduler.take(&executor) {
+                    Ok(running) => {
+                        hold.wait();
+                        scheduler.settle_exited(running).unwrap();
+                    }
+                    Err(RunQueueError::Closed) => {}
+                    Err(error) => panic!("unexpected take error: {error:?}"),
+                }
+                scheduler.unregister_executor(&executor).unwrap();
+            }));
+        }
+        ready.wait();
+        while scheduler.waiter_count() != 2 {
+            thread::yield_now();
+        }
+        assert_eq!(
+            cpu0.idle_executors(),
+            2,
+            "both `M`s bound to cpu#0 must be counted idle, not collapsed to one flag",
+        );
+
+        let root_authority = scheduler
+            .admit_root(
+                root.thread().key(),
+                root.thread().execution_state().generation().unwrap(),
+            )
+            .unwrap();
+        let authority = root_authority
+            .admit_descendant(
+                child.thread().key(),
+                child.thread().execution_state().generation().unwrap(),
+            )
+            .unwrap();
+        // Activation IS publication: an admitted key's row is deferred until
+        // its submission publishes, so the row arrives the shipped way.
+        authority
+            .publish(&scheduler, Arc::clone(child.thread()))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while cpu0.idle_executors() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "one `M` took the row, so cpu#0 must be left with exactly one idle executor (saw {})",
+                cpu0.idle_executors(),
+            );
+            thread::yield_now();
+        }
+        hold.wait();
+        // Both authorities must go before the close: `drain_ready` counts
+        // them, so a live authority keeps the queue Closing forever and the
+        // second `M` never observes the close.
+        drop(authority);
+        drop(root_authority);
+        scheduler.close();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(cpu0.idle_executors(), 0);
+    }
+
     #[test]
     fn close_wakes_all_waiters_rejects_new_roots_and_drains_recursive_publication() {
         let (kernel, root) = bootstrap(12_110);
@@ -4108,5 +5586,635 @@ mod tests {
         sched_clone.wake(context.thread().key()).unwrap();
         assert!(rx.recv().unwrap());
         thread.join().unwrap();
+    }
+    // ---- Guest CPUs (design phase 2) --------------------------------------
+    //
+    // These exercise the `P` layer directly rather than through the pool, so a
+    // CPU count is fixed by the policy instead of inherited from the host.
+
+    fn scheduler_with_cpus(kernel: Arc<Kernel>, cpus: usize) -> Arc<Scheduler> {
+        Arc::new(Scheduler::new_with_policy(
+            kernel,
+            Arc::new(GuestCpuPolicy::new(cpus)),
+        ))
+    }
+
+    /// One bound executor per guest CPU, so every CPU is online and placement
+    /// is free to use all of them.
+    fn bind_one_executor_per_cpu(
+        scheduler: &Scheduler,
+        cpus: usize,
+    ) -> Vec<super::ExecutorRegistration> {
+        (0..cpus)
+            .map(|index| {
+                let registration = scheduler
+                    .register_executor(Arc::new(RecordingKick::default()))
+                    .expect("register executor");
+                assert_eq!(
+                    registration.bound_cpu(),
+                    Some(GuestCpuId::new(index as u32)),
+                    "executors bind to guest CPUs round-robin",
+                );
+                registration
+            })
+            .collect()
+    }
+
+    fn occupied_cpus(scheduler: &Scheduler) -> Vec<GuestCpuId> {
+        scheduler
+            .guest_cpus()
+            .iter()
+            .filter(|cpu| cpu.queue_len() > 0)
+            .map(|cpu| cpu.id())
+            .collect()
+    }
+
+    #[test]
+    fn a_wake_lands_on_exactly_one_guest_cpu() {
+        let (kernel, root) = bootstrap(12_401);
+        let sibling = sibling(&kernel, &root, 22_401);
+        publish(&root, 41);
+        publish(&sibling, 42);
+        let scheduler = scheduler_with_cpus(kernel, 4);
+        let _executors = bind_one_executor_per_cpu(&scheduler, 4);
+
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        assert_eq!(occupied_cpus(&scheduler).len(), 1);
+        assert_eq!(scheduler.queued_len(), 1);
+
+        // A second runnable task goes to a DIFFERENT idle CPU: placement is
+        // least-loaded once the first CPU is no longer empty.
+        scheduler.make_runnable(sibling.thread().key()).unwrap();
+        let occupied = occupied_cpus(&scheduler);
+        assert_eq!(occupied.len(), 2, "two wakes, two distinct guest CPUs");
+        assert_eq!(scheduler.queued_len(), 2);
+        for cpu in scheduler.guest_cpus() {
+            assert!(cpu.queue_len() <= 1);
+        }
+    }
+
+    #[test]
+    fn a_woken_task_returns_to_the_cpu_it_last_ran_on() {
+        let (kernel, root) = bootstrap(12_402);
+        publish(&root, 43);
+        let scheduler = scheduler_with_cpus(kernel, 4);
+        let executors = bind_one_executor_per_cpu(&scheduler, 4);
+        let key = root.thread().key();
+
+        scheduler.make_runnable(key).unwrap();
+        let placed = occupied_cpus(&scheduler)[0];
+        let running = scheduler.take(&executors[placed.as_usize()]).unwrap();
+        assert_eq!(root.thread().last_cpu(), Some(placed));
+        assert_eq!(
+            scheduler.guest_cpus()[placed.as_usize()].current_task(),
+            Some(key),
+        );
+        scheduler
+            .settle_blocked(running, BlockedReason::HostWait)
+            .unwrap();
+        assert_eq!(scheduler.queued_len(), 0);
+        assert_eq!(
+            scheduler.guest_cpus()[placed.as_usize()].current_task(),
+            None,
+        );
+
+        scheduler.wake(key).unwrap();
+        assert_eq!(
+            occupied_cpus(&scheduler),
+            vec![placed],
+            "an idle last_cpu keeps the task's warm ASID and TLB",
+        );
+    }
+
+    #[test]
+    fn an_executor_serves_its_own_cpu_before_it_steals() {
+        let (kernel, root) = bootstrap(12_403);
+        let other = sibling(&kernel, &root, 22_403);
+        publish(&root, 44);
+        publish(&other, 45);
+        let scheduler = scheduler_with_cpus(kernel, 2);
+        let executors = bind_one_executor_per_cpu(&scheduler, 2);
+        root.thread()
+            .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+        other
+            .thread()
+            .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        scheduler.make_runnable(other.thread().key()).unwrap();
+        assert_eq!(scheduler.guest_cpus()[0].queue_len(), 1);
+        assert_eq!(scheduler.guest_cpus()[1].queue_len(), 1);
+
+        // CPU 1's executor has local work, so it never reaches for CPU 0's.
+        let running = scheduler.take(&executors[1]).unwrap();
+        assert_eq!(running.thread_key(), other.thread().key());
+        assert_eq!(scheduler.guest_cpus()[0].queue_len(), 1);
+        scheduler.settle_exited(running).unwrap();
+
+        // Now CPU 1 is empty and CPU 0 still holds a row, but that row is
+        // pinned to CPU 0: an affinity mask of one CPU is not stealable.
+        assert_eq!(scheduler.steal_probe(GuestCpuId::new(1)), None);
+        assert_eq!(scheduler.guest_cpus()[0].queue_len(), 1);
+
+        // Widen the mask and the same row becomes stealable, because CPU 0's
+        // executor is busy with it and CPU 1 has nothing of its own.
+        root.thread().set_affinity(CpuAffinity::all(2));
+        assert_eq!(
+            scheduler.steal_probe(GuestCpuId::new(1)),
+            Some(root.thread().key()),
+        );
+    }
+
+    #[test]
+    fn an_affinity_mask_of_one_cpu_pins_every_placement() {
+        let (kernel, root) = bootstrap(12_404);
+        publish(&root, 46);
+        let scheduler = scheduler_with_cpus(kernel, 4);
+        let executors = bind_one_executor_per_cpu(&scheduler, 4);
+        let pinned = GuestCpuId::new(3);
+        root.thread().set_affinity(CpuAffinity::single(pinned));
+        let key = root.thread().key();
+
+        scheduler.make_runnable(key).unwrap();
+        assert_eq!(occupied_cpus(&scheduler), vec![pinned]);
+
+        // A yield requeues on the same P, still the pinned one.
+        let running = scheduler.take(&executors[pinned.as_usize()]).unwrap();
+        assert_eq!(root.thread().last_cpu(), Some(pinned));
+        scheduler.settle_runnable(running).unwrap();
+        assert_eq!(occupied_cpus(&scheduler), vec![pinned]);
+
+        // And a block/wake round trip does not launder it onto another CPU.
+        let running = scheduler.take(&executors[pinned.as_usize()]).unwrap();
+        scheduler
+            .settle_blocked(running, BlockedReason::HostWait)
+            .unwrap();
+        scheduler.wake(key).unwrap();
+        assert_eq!(occupied_cpus(&scheduler), vec![pinned]);
+    }
+
+    #[test]
+    fn placement_never_targets_a_cpu_with_no_executor() {
+        let (kernel, root) = bootstrap(12_405);
+        let other = sibling(&kernel, &root, 22_405);
+        publish(&root, 47);
+        publish(&other, 48);
+        let scheduler = scheduler_with_cpus(kernel, 4);
+        // Only two of the four guest CPUs have an `M`.
+        let _executors = bind_one_executor_per_cpu(&scheduler, 2);
+
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        scheduler.make_runnable(other.thread().key()).unwrap();
+        for cpu in scheduler.guest_cpus().iter().skip(2) {
+            assert_eq!(
+                cpu.queue_len(),
+                0,
+                "an offline CPU would strand the task until something stole it",
+            );
+        }
+        assert_eq!(scheduler.queued_len(), 2);
+    }
+
+    #[test]
+    fn a_cross_cpu_wake_in_the_pre_park_window_is_not_lost() {
+        let (kernel, root) = bootstrap(12_406);
+        publish(&root, 49);
+        let scheduler = scheduler_with_cpus(kernel, 2);
+        let executors = bind_one_executor_per_cpu(&scheduler, 2);
+        let key = root.thread().key();
+
+        // The row will be published on CPU 0 while CPU 1's executor is inside
+        // its pre-park window — after its own queue and its steal scan came up
+        // empty. Without the idle flag plus the wake-ticket re-check, the
+        // notification lands before the park and is lost forever.
+        let arrived = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        scheduler.install_pre_park_gate(Arc::clone(&arrived), Arc::clone(&resume));
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker_scheduler = Arc::clone(&scheduler);
+        let worker_executor = executors[1].clone();
+        let worker = thread::spawn(move || {
+            let outcome = worker_scheduler
+                .take(&worker_executor)
+                .map(|running| (running.thread_key(), running));
+            let key = outcome.as_ref().map(|(key, _)| *key).ok();
+            tx.send(key).ok();
+            if let Ok((_, running)) = outcome {
+                worker_scheduler.settle_exited(running).unwrap();
+            }
+        });
+
+        arrived.wait();
+        root.thread()
+            .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+        scheduler.make_runnable(key).unwrap();
+        assert_eq!(scheduler.guest_cpus()[0].queue_len(), 1);
+        // Widen the mask so CPU 1 is allowed to steal what CPU 0 was handed.
+        root.thread().set_affinity(CpuAffinity::all(2));
+        resume.wait();
+
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Some(claimed)) => assert_eq!(claimed, key),
+            Ok(None) => panic!("the parked executor reported no claim"),
+            Err(_) => {
+                // Release the parked executor so the suite does not wedge, then
+                // fail: a lost wakeup is the defect this test exists for.
+                scheduler.close();
+                worker.join().ok();
+                panic!("cross-CPU wake was lost: the executor parked and never woke");
+            }
+        }
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn close_drains_with_spare_executors_parked() {
+        let (kernel, root) = bootstrap(12_407);
+        publish(&root, 50);
+        let scheduler = scheduler_with_cpus(kernel, 2);
+        let closed = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(5));
+        let mut workers = Vec::new();
+        for index in 0..4 {
+            // Two bound `M`s and two spares, exactly the shape the pool starts.
+            let is_spare = index >= 2;
+            let scheduler = Arc::clone(&scheduler);
+            let closed = Arc::clone(&closed);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                let executor = scheduler
+                    .register_executor_bound(Arc::new(RecordingKick::default()), None, is_spare)
+                    .unwrap();
+                assert_eq!(executor.is_spare(), is_spare);
+                assert_eq!(executor.bound_cpu().is_none(), is_spare);
+                barrier.wait();
+                loop {
+                    match scheduler.take(&executor) {
+                        Ok(running) => scheduler.settle_exited(running).unwrap(),
+                        Err(RunQueueError::Closed) => {
+                            closed.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Err(RunQueueError::ControlPoked) => continue,
+                        Err(error) => panic!("unexpected take error: {error:?}"),
+                    }
+                }
+            }));
+        }
+        barrier.wait();
+        while scheduler.waiter_count() != 4 {
+            thread::yield_now();
+        }
+
+        scheduler.close();
+        scheduler.wait_closed();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(closed.load(Ordering::SeqCst), 4, "spares observe the close");
+    }
+    /// The `SchedulerGenerationObserver` a reap races: it removes the target's
+    /// registry record and THEN reports the mismatch, which is exactly what
+    /// `SubmissionAuthority::rollover_exact` does when its
+    /// `with_live_active_scheduler_thread` liveness check finds nothing.
+    #[derive(Debug)]
+    struct ReapingObserver {
+        kernel: Arc<Kernel>,
+        task: crate::kernel::ids::TaskId,
+        /// Which transition kind the reap races. Real reaps race whichever
+        /// transition the target happened to be taking, so every settlement
+        /// kind has to survive one, not just `Runnable`.
+        on_kind: super::SchedulerGenerationTransition,
+        fired: AtomicUsize,
+    }
+
+    impl ReapingObserver {
+        fn on(
+            kernel: &Arc<Kernel>,
+            context: &KernelContext,
+            on_kind: super::SchedulerGenerationTransition,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                kernel: Arc::clone(kernel),
+                task: context.thread().task_key().id,
+                on_kind,
+                fired: AtomicUsize::new(0),
+            })
+        }
+
+        fn install(self: &Arc<Self>, scheduler: &Scheduler) {
+            scheduler
+                .install_generation_observer(
+                    Arc::clone(self) as Arc<dyn super::SchedulerGenerationObserver>
+                )
+                .unwrap();
+        }
+    }
+
+    impl super::SchedulerGenerationObserver for ReapingObserver {
+        fn transition(
+            &self,
+            _thread: crate::kernel::objects::ThreadKey,
+            _predecessor: crate::kernel::objects::ExecutionGeneration,
+            _successor: crate::kernel::objects::ExecutionGeneration,
+            kind: super::SchedulerGenerationTransition,
+        ) -> Result<(), RunQueueError> {
+            if kind != self.on_kind {
+                return Ok(());
+            }
+            self.fired.fetch_add(1, Ordering::SeqCst);
+            assert!(self.kernel.reap_task_record_for_test(self.task));
+            Err(RunQueueError::AuthorityMismatch)
+        }
+    }
+
+    /// The observer shape the real `HvpatchTaskBindingDirectory` has: it holds
+    /// the target's `SubmissionAuthority` inside its binding record, and when
+    /// its rollover fails it RE-INSERTS that record under the PREDECESSOR key
+    /// (`crates/carrick-runtime/src/vcpu_loop/executor.rs`,
+    /// `SchedulerGenerationObserver::transition`).
+    ///
+    /// That re-insert is correct for a live target — the next attempt resolves
+    /// it — and a leak for a reaped one: no successor is ever published, no
+    /// executor ever runs that generation, so no exit or exec path retires the
+    /// record. The authority it holds keeps `active_authorities` above zero,
+    /// which is one of `drain_ready`'s four terms, so container teardown never
+    /// finishes closing.
+    #[derive(Debug)]
+    struct AuthorityHoldingReapingObserver {
+        kernel: Arc<Kernel>,
+        task: crate::kernel::ids::TaskId,
+        on_kind: super::SchedulerGenerationTransition,
+        held: parking_lot::Mutex<
+            BTreeMap<
+                (
+                    crate::kernel::objects::ThreadKey,
+                    crate::kernel::objects::ExecutionGeneration,
+                ),
+                super::SubmissionAuthority,
+            >,
+        >,
+        fired: AtomicUsize,
+        retired: parking_lot::Mutex<
+            Vec<(
+                crate::kernel::objects::ThreadKey,
+                crate::kernel::objects::ExecutionGeneration,
+            )>,
+        >,
+    }
+
+    impl super::SchedulerGenerationObserver for AuthorityHoldingReapingObserver {
+        fn transition(
+            &self,
+            thread: crate::kernel::objects::ThreadKey,
+            predecessor: crate::kernel::objects::ExecutionGeneration,
+            successor: crate::kernel::objects::ExecutionGeneration,
+            kind: super::SchedulerGenerationTransition,
+        ) -> Result<(), RunQueueError> {
+            let mut held = self.held.lock();
+            let Some(record) = held.remove(&(thread, predecessor)) else {
+                return Ok(());
+            };
+            if kind != self.on_kind {
+                held.insert((thread, successor), record);
+                return Ok(());
+            }
+            self.fired.fetch_add(1, Ordering::SeqCst);
+            assert!(self.kernel.reap_task_record_for_test(self.task));
+            // The rollover the real directory attempts fails against a reaped
+            // target, and it puts the record back where it came from.
+            held.insert((thread, predecessor), record);
+            Err(RunQueueError::AuthorityMismatch)
+        }
+
+        fn retire_reaped(
+            &self,
+            thread: crate::kernel::objects::ThreadKey,
+            predecessor: crate::kernel::objects::ExecutionGeneration,
+        ) {
+            self.retired.lock().push((thread, predecessor));
+            self.held.lock().remove(&(thread, predecessor));
+        }
+    }
+
+    /// A wake whose target is reaped in flight must leave NOTHING holding the
+    /// queue open.
+    ///
+    /// Round 3 stopped the reaped rejection from killing the executor and from
+    /// publishing an unreachable successor, which is what the two settlement
+    /// tests above assert. It did not close the other half: the observer still
+    /// holds the predecessor's `SubmissionAuthority`, and `drain_ready()`
+    /// counts it. Red against round 3 with `active authorities left = 1` and a
+    /// queue that never reports drained.
+    #[test]
+    fn a_wake_whose_target_was_reaped_retires_the_authority_it_stranded() {
+        let (kernel, root) = bootstrap(12_411);
+        publish(&root, 81);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let key = root.thread().key();
+        let generation = root
+            .thread()
+            .execution_state()
+            .generation()
+            .expect("published root generation");
+        let kick = Arc::new(RecordingKick::default());
+        let executor = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+            .unwrap();
+
+        let authority = scheduler.admit_root(key, generation).unwrap();
+        assert_eq!(
+            scheduler.queue.active_authority_count(),
+            1,
+            "the root authority is live before the reap"
+        );
+
+        scheduler.make_runnable(key).unwrap();
+        // The wake above owns the edge but its row is held: an admitted
+        // submission has no resolvable binding until it publishes. Publish it,
+        // exactly as activation does, so there is a claimable row to take.
+        authority
+            .publish(&scheduler, Arc::clone(root.thread()))
+            .expect("activation publishes the admitted row");
+        let running = scheduler.take(&executor).unwrap();
+        let claimed_generation = running.generation();
+
+        let observer = Arc::new(AuthorityHoldingReapingObserver {
+            kernel: Arc::clone(&kernel),
+            task: root.thread().task_key().id,
+            on_kind: super::SchedulerGenerationTransition::Runnable,
+            held: parking_lot::Mutex::new(BTreeMap::from([((key, claimed_generation), authority)])),
+            fired: AtomicUsize::new(0),
+            retired: parking_lot::Mutex::new(Vec::new()),
+        });
+        scheduler
+            .install_generation_observer(
+                Arc::clone(&observer) as Arc<dyn super::SchedulerGenerationObserver>
+            )
+            .unwrap();
+
+        let successor = scheduler
+            .settle_runnable_successor(running)
+            .expect("a yield whose target was reaped settles; it never fails the executor");
+        assert_eq!(observer.fired.load(Ordering::SeqCst), 1);
+        assert_eq!(successor, None);
+
+        assert_eq!(
+            scheduler.queue.active_authority_count(),
+            0,
+            "a reaped target strands no submission authority"
+        );
+        assert_eq!(
+            observer.retired.lock().as_slice(),
+            &[(key, claimed_generation)],
+            "the scheduler names the exact predecessor record it stranded"
+        );
+        assert!(
+            scheduler.queue.drain_ready_for_test(),
+            "the queue can finish closing after a reaped wake"
+        );
+    }
+
+    /// Both directions of the rejection classification, which is the whole
+    /// width of the swallow. Only the reaped direction may become a no-op; a
+    /// rejection naming a thread that is STILL LIVE is a lost exact transition
+    /// and is fatal, and round 2's `if let Err(_)` could not tell them apart.
+    #[test]
+    fn a_transition_rejection_is_fatal_unless_the_target_left_the_graph() {
+        assert_eq!(
+            super::classify_transition_rejection(false),
+            super::TransitionRejection::TargetReaped,
+        );
+        assert_eq!(
+            super::classify_transition_rejection(true),
+            super::TransitionRejection::LostExactTransition,
+        );
+    }
+
+    /// A yield/preempt settlement whose target is reaped in flight must still
+    /// unbind the executor and finish the claim.
+    ///
+    /// Round 2 left `observe_generation_transition`'s rejection propagating
+    /// out of every `settle_*`, and each of them returns BEFORE
+    /// `executors.unbind` and `running.finish_claim()`. The executor loop
+    /// stringifies that settlement error directly, which is the captured
+    /// `executor worker died index=5 error=exact thread generation is not
+    /// live` in `target/conformance/raw/conf-60360-c00.err`; the abandoned
+    /// binding then failed the terminal ASID retirement and dropped a
+    /// published HVPatch MM authority — `carrick: FATAL: ... published HVPatch
+    /// inventory dropped before exact retirement`.
+    #[test]
+    fn a_yield_whose_target_was_reaped_settles_instead_of_killing_the_executor() {
+        let (kernel, root) = bootstrap(12_409);
+        publish(&root, 61);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let key = root.thread().key();
+        let kick = Arc::new(RecordingKick::default());
+        let executor = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+            .unwrap();
+
+        scheduler.make_runnable(key).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+
+        let observer = ReapingObserver::on(
+            &kernel,
+            &root,
+            super::SchedulerGenerationTransition::Runnable,
+        );
+        observer.install(&scheduler);
+
+        let successor = scheduler
+            .settle_runnable_successor(running)
+            .expect("a yield whose target was reaped settles; it never fails the executor");
+        assert_eq!(observer.fired.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            successor, None,
+            "a reaped target has no reachable successor to report"
+        );
+        assert!(
+            kick.current_binding().is_none(),
+            "the executor is unbound, so its next claim is not refused as busy"
+        );
+        assert_eq!(
+            scheduler.queued_len(),
+            0,
+            "the unreachable successor is never published as a run-queue row"
+        );
+    }
+
+    /// The same abandonment on the blocking path: a task that parks while its
+    /// task record is reaped must still release the executor.
+    #[test]
+    fn a_block_whose_target_was_reaped_settles_instead_of_killing_the_executor() {
+        let (kernel, root) = bootstrap(12_410);
+        publish(&root, 71);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let key = root.thread().key();
+        let kick = Arc::new(RecordingKick::default());
+        let executor = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+            .unwrap();
+
+        scheduler.make_runnable(key).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+
+        let observer = ReapingObserver::on(
+            &kernel,
+            &root,
+            super::SchedulerGenerationTransition::Blocked,
+        );
+        observer.install(&scheduler);
+
+        scheduler
+            .settle_blocked(running, BlockedReason::HostWait)
+            .expect("a park whose target was reaped settles; it never fails the executor");
+        assert_eq!(observer.fired.load(Ordering::SeqCst), 1);
+        assert!(
+            kick.current_binding().is_none(),
+            "the executor is unbound, so its next claim is not refused as busy"
+        );
+        assert_eq!(scheduler.queued_len(), 0);
+    }
+
+    #[test]
+    fn a_wake_whose_target_was_reaped_is_rejected_not_fatal() {
+        let (kernel, root) = bootstrap(12_408);
+        publish(&root, 51);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let key = root.thread().key();
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+
+        // Put the thread in the state a producer wakes from.
+        scheduler.make_runnable(key).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        scheduler
+            .settle_blocked(running, BlockedReason::HostWait)
+            .unwrap();
+
+        let observer = ReapingObserver::on(
+            &kernel,
+            &root,
+            super::SchedulerGenerationTransition::Runnable,
+        );
+        observer.install(&scheduler);
+
+        // Linux answers a wake of a task that has already been reaped with a
+        // no-op — not an abort, and not an error for the waker to carry.
+        // This aborted the whole carrier before the rejection landed
+        // ("scheduler generation observer lost exact transition ...
+        // kernel_view=thread absent from registry"), and then FAILED the
+        // waker, which for an executor means "executor worker died
+        // error=exact thread generation is not live" and a cascade into a
+        // carrier FATAL (`conf-35614-c00`, go_types under load).
+        let disposition = scheduler
+            .wake(key)
+            .expect("a wake whose target was reaped is a no-op, never an error");
+        assert_eq!(disposition, WakeDisposition::Pending);
+        assert_eq!(observer.fired.load(Ordering::SeqCst), 1);
+        assert_eq!(scheduler.queued_len(), 0, "nothing was published");
     }
 }

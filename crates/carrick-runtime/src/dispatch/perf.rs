@@ -589,7 +589,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
             if cpu >= 0 {
-                if cpu as usize >= crate::host_facts::logical_cpu_count() {
+                if cpu as usize >= crate::kernel::scheduler::guest_cpu_count() {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 // Per-CPU counters have no honest carrick source.

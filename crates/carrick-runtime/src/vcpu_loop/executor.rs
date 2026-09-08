@@ -320,9 +320,60 @@ fn probe_executor_lifecycle(
     );
 }
 
+/// How many `M`s a carrier starts.
+///
+/// An executor is an `M` in Go's G/M/P: a host thread owning one HVF vCPU
+/// lease. Each one binds to a guest CPU (`P`) round-robin at registration, so
+/// with more `M`s than `P`s several `M`s share one `P`'s run queue.
+///
+/// The design's steady state is ONE `M` per `P`
+/// (`docs/superpowers/specs/2026-09-07-guest-cpu-scheduler-design.md`), because
+/// a carrier that runs ten host threads while telling the guest `nproc` = 4 is
+/// the over-subscription a four-worker harness turns into load coupling. That
+/// reduction is still NOT taken, but the reason recorded here in round 2 is
+/// STALE and the correction matters.
+///
+/// The shapes first: the guest CPU count is the P-core rule —
+/// `host_facts::logical_cpu_count()` is
+/// `min(hw.perflevel0.logicalcpu, hw.logicalcpu)` = `min(4, 10)` = 4 on the
+/// canonical host — while `bound_workers` is `available_parallelism()` = 10.
+/// So `M` = `P` means 4 `M`s, not 10, and it is a real reduction.
+///
+/// Round 2 recorded that `M` = 4 made `go-go_types` complete its tests
+/// (`PASS` on stdout) and then WEDGE in carrier teardown, waiting in
+/// `HvpatchLoopResult::wait` for a process-job result that was never
+/// published, and concluded that phase 3's `handoffp` was the blocker.
+/// **That wedge no longer reproduces.** Measured 2026-09-08 on this branch
+/// with `CARRICK_BOUND_EXECUTORS` alternating 4 and 10 on ONE signed binary
+/// (`7307cc50`), 3 runs each: every `M` = `P` run finished with 150 `--- PASS`
+/// and `wedged=0`. The wedge was the stranded process-job publication main has
+/// since fixed, and `carrick-embed`'s `go_types_exit_publishes_every_process_job`
+/// is its regression test — it was never the phase-3 dependency.
+///
+/// What blocks the reduction now is timing, and that measurement is NOT yet
+/// conclusive, so the count stays at host parallelism. The same run gave
+/// `M` = 4 at 186 s / 95 s / 35 s against `M` = 10 at 55 s (aborted) / 35 s /
+/// 50 s, but host load fell monotonically from 30 to 15 across the sequence
+/// and the `M` = 4 arm ran FIRST in every pair, so it systematically saw the
+/// heavier load; pair 3 (35 s at load 13.85 against 50 s at 15.44) points the
+/// other way. A single-variable rerun on a quiet host decides it — that is
+/// what `CARRICK_BOUND_EXECUTORS` exists for, and it needs no rebuild.
+///
+/// Phase 3 (`handoffp`: release the `P` to a spare on entry to a blocking host
+/// wait) is still unbuilt, and it remains the mechanism that would make `M` =
+/// `P` safe under inline host waits: with one `M` per `P` there is no second
+/// `M` on that `P` to cover one that blocks. That is the term to measure if
+/// the quiet-host rerun does show `M` = `P` slower.
+///
+/// `spare_executors` are extra `M`s that hold no `P` and park; phase 3 is what
+/// will hand one the `P` of an `M` entering a blocking host call. In THIS
+/// phase nothing hands off, so they only park.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutorPoolConfig {
-    pub physical_cores: usize,
+    /// `M`s bound to a guest CPU, round-robin. Several may share one `P`.
+    pub bound_workers: usize,
+    /// Spare `M`s beyond the bound set.
+    pub spare_executors: usize,
     pub vcpu_ceiling: usize,
     pub reserve: usize,
 }
@@ -334,12 +385,65 @@ pub enum ExecutorPoolConfigError {
 }
 
 impl ExecutorPoolConfig {
-    pub fn executor_count(self) -> Result<usize, ExecutorPoolConfigError> {
+    fn available(self) -> Result<usize, ExecutorPoolConfigError> {
         if self.vcpu_ceiling == 0 {
             return Err(ExecutorPoolConfigError::ZeroVcpuCeiling);
         }
-        let available = self.vcpu_ceiling.saturating_sub(self.reserve);
-        Ok(self.physical_cores.min(available).max(1))
+        Ok(self.vcpu_ceiling.saturating_sub(self.reserve))
+    }
+
+    /// `M`s bound to a guest CPU. At least one: a carrier with no `M` runs
+    /// nothing.
+    pub fn bound_worker_count(self) -> Result<usize, ExecutorPoolConfigError> {
+        Ok(self.bound_workers.min(self.available()?).max(1))
+    }
+
+    /// Spare `M`s, after the bound set has taken its share of the vCPU
+    /// budget. Bounded by the backend's ceiling, never by the request alone.
+    pub fn spare_worker_count(self) -> Result<usize, ExecutorPoolConfigError> {
+        let remaining = self.available()?.saturating_sub(self.bound_worker_count()?);
+        Ok(self.spare_executors.min(remaining))
+    }
+
+    pub fn executor_count(self) -> Result<usize, ExecutorPoolConfigError> {
+        Ok(self.bound_worker_count()? + self.spare_worker_count()?)
+    }
+}
+
+/// `M`s bound to a guest CPU.
+///
+/// Host parallelism by default, with `CARRICK_BOUND_EXECUTORS=` as the exact
+/// hatch — `=<guest CPU count>` is the design's `M` = `P`, and the two are the
+/// A and B of the ablation the doc on [`ExecutorPoolConfig`] describes. It is
+/// an env read rather than a rebuild precisely because the open question is a
+/// timing comparison that needs a quiet host and many alternating runs, and a
+/// second binary would put a second variable in it.
+///
+/// The backend's vCPU ceiling is the real bound; this is only the request.
+pub fn configured_bound_executors(guest_cpus: usize) -> usize {
+    let _ = guest_cpus;
+    let host_parallelism = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    match std::env::var("CARRICK_BOUND_EXECUTORS") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(host_parallelism)
+            .max(1),
+        Err(_) => host_parallelism,
+    }
+}
+
+/// Spare `M`s to start beyond the bound set.
+///
+/// `2 x nproc` per the design, with `CARRICK_SPARE_EXECUTORS=` as the exact
+/// hatch (`=0` disables spares for bisection). The backend's vCPU ceiling is
+/// the real bound; this is only the request.
+pub fn configured_spare_executors(guest_cpus: usize) -> usize {
+    match std::env::var("CARRICK_SPARE_EXECUTORS") {
+        Ok(raw) => raw.trim().parse::<usize>().unwrap_or(2 * guest_cpus),
+        Err(_) => 2 * guest_cpus,
     }
 }
 
@@ -1662,6 +1766,16 @@ impl crate::kernel::scheduler::SchedulerGenerationObserver for HvpatchTaskBindin
         }
         bindings.insert((thread, successor), record);
         Ok(())
+    }
+
+    fn retire_reaped(&self, thread: ThreadKey, predecessor: ExecutionGeneration) {
+        // The scheduler has established that the exact thread left the kernel
+        // graph, so the record this directory put back when its rollover
+        // failed is unreachable: `resolve` keys on (thread, generation) and
+        // nothing will ever ask for this pair again. Dropping it releases the
+        // `SubmissionAuthority` it holds, which is what lets the run queue
+        // drain and the container finish closing.
+        HvpatchTaskBindingDirectory::retire(self, thread, predecessor);
     }
 }
 
@@ -3139,13 +3253,21 @@ where
         resolver: Arc<R>,
         _audit: ExecutorBoundaryAudit,
     ) -> Result<Self, ExecutorPoolStartError> {
-        let configured_workers =
+        let bound_workers =
             config
-                .executor_count()
+                .bound_worker_count()
                 .map_err(|error| ExecutorPoolStartError {
                     configured_workers: 0,
                     message: error.to_string(),
                 })?;
+        let spare_workers =
+            config
+                .spare_worker_count()
+                .map_err(|error| ExecutorPoolStartError {
+                    configured_workers: 0,
+                    message: error.to_string(),
+                })?;
+        let configured_workers = bound_workers + spare_workers;
         resolver
             .install_scheduler(&scheduler)
             .map_err(|error| ExecutorPoolStartError {
@@ -3170,6 +3292,9 @@ where
         let (startup_tx, startup_rx) = mpsc::channel();
         let mut handles: Vec<WorkerHandle> = Vec::with_capacity(configured_workers);
         for index in 0..configured_workers {
+            // The first `bound_workers` bind a guest CPU each (the scheduler
+            // assigns them round-robin); the rest are spares that park.
+            let is_spare = index >= bound_workers;
             let (command_tx, command_rx) = mpsc::channel();
             let scheduler = Arc::clone(&scheduler);
             let factory = Arc::clone(&factory);
@@ -3181,7 +3306,7 @@ where
                 .name(format!("carrick-executor-{index}"))
                 .spawn(move || {
                     executor_worker(
-                        index,
+                        WorkerSlot { index, is_spare },
                         scheduler,
                         factory,
                         resolver,
@@ -3436,8 +3561,17 @@ fn append_failures(message: &mut String, failures: Vec<String>) {
     }
 }
 
-fn executor_worker<F, R>(
+/// Which slot in the pool a worker occupies: its startup-channel index and
+/// whether it is a spare `M` (no guest CPU, parks until phase 3's `handoffp`)
+/// rather than one guest CPU's own executor.
+#[derive(Clone, Copy, Debug)]
+struct WorkerSlot {
     index: usize,
+    is_spare: bool,
+}
+
+fn executor_worker<F, R>(
+    slot: WorkerSlot,
     scheduler: Arc<Scheduler>,
     factory: Arc<F>,
     resolver: Arc<R>,
@@ -3451,6 +3585,7 @@ where
         <<F as PersistentExecutorFactory>::Executor as PersistentExecutor>::TaskBinding,
     >,
 {
+    let WorkerSlot { index, is_spare } = slot;
     let WorkerChannels { commands, startup } = channels;
     if !matches!(commands.recv(), Ok(WorkerCommand::Initialize)) {
         return WorkerOutcome {
@@ -3460,8 +3595,11 @@ where
         };
     }
     let kick = Arc::new(WorkerKick::new(Arc::clone(&receipts)));
-    let registration = match scheduler.register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
-    {
+    let registration = match scheduler.register_executor_bound(
+        Arc::clone(&kick) as Arc<dyn ExecutorKick>,
+        None,
+        is_spare,
+    ) {
         Ok(registration) => registration,
         Err(error) => {
             let _ = startup.send(StartupStatus {
@@ -3698,6 +3836,7 @@ where
             Err(error) => return Err(error.to_string()),
         };
         let executor_id = running.executor();
+        let guest_cpu = running.guest_cpu();
         let mut thread = running.thread_key();
         let mut generation = running.generation();
         receipts.record(
@@ -3712,11 +3851,10 @@ where
             crate::event_ring::rec_hvpatch_executor_claim(pid, tid, executor_id.raw_for_probe());
         }
         if let Some(task) = kernel_task.as_ref() {
-            let cpu = crate::observe::GuestCpuId::new(executor_id.raw_for_probe());
             scheduler
                 .kernel()
                 .auditors()
-                .executor_claimed(executor_id, cpu, task.key());
+                .executor_claimed(executor_id, guest_cpu, task.key());
             // A scheduler claim is evidence even when the claimed snapshot is
             // malformed. Preserve the non-reused task/thread/generation join
             // and use zero only for the authority field that could not be
@@ -3834,11 +3972,10 @@ where
         );
         if let Some(task) = kernel_task.as_ref() {
             if task.mark_first_run() {
-                let cpu = crate::observe::GuestCpuId::new(executor_id.raw_for_probe());
                 scheduler
                     .kernel()
                     .auditors()
-                    .child_first_run(task.key(), executor_id, cpu);
+                    .child_first_run(task.key(), executor_id, guest_cpu);
             }
         }
 
@@ -4416,6 +4553,16 @@ where
             }
             ExecutorExit::Syscall | ExecutorExit::InvalidState => unreachable!(),
         };
+        // A guest `sched_yield` (or a preemption tick) requeued this task at
+        // the TAIL of its own guest CPU, which is the fairness mechanism; the
+        // executor then loops and claims whatever is now at the head. Any
+        // OTHER boundary is not a fairness event, and yielding the host core
+        // there hands it to any equal-priority competitor on the machine —
+        // measured as a 1.3x wall and 1.3x CPU-seconds penalty for a
+        // single-threaded row under three default-QoS hogs. Fairness between
+        // guest CPUs is the run queue and the tick, never `sched_yield`.
+        let yielded_or_preempted =
+            matches!(settlement, Ok(ExecutorPoolEvent::SettledRunnable { .. }));
         match settlement {
             Ok(event) => {
                 if let Some((pid, tid)) = post_run_event_identity {
@@ -4465,7 +4612,9 @@ where
             std::process::abort();
         }
         receipts.record(executor_id, ExecutorPoolEvent::AuditPassed);
-        std::thread::yield_now();
+        if yielded_or_preempted {
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -7354,7 +7503,8 @@ pub(crate) mod tests {
 
     fn config(workers: usize) -> ExecutorPoolConfig {
         ExecutorPoolConfig {
-            physical_cores: workers,
+            bound_workers: workers,
+            spare_executors: 0,
             vcpu_ceiling: workers + 1,
             reserve: 1,
         }
@@ -7402,35 +7552,70 @@ pub(crate) mod tests {
 
     #[test]
     fn pool_size_is_bounded_and_zero_host_capacity_fails_before_creation() {
+        // The per-CPU set is capped by the backend's vCPU budget.
         assert_eq!(
             ExecutorPoolConfig {
-                physical_cores: 12,
+                bound_workers: 12,
+                spare_executors: 0,
                 vcpu_ceiling: 8,
                 reserve: 2,
             }
-            .executor_count()
+            .bound_worker_count()
             .unwrap(),
             6
         );
         assert_eq!(
             ExecutorPoolConfig {
-                physical_cores: 0,
+                bound_workers: 0,
+                spare_executors: 0,
                 vcpu_ceiling: 8,
                 reserve: 99,
             }
-            .executor_count()
+            .bound_worker_count()
             .unwrap(),
             1
         );
         assert!(
             ExecutorPoolConfig {
-                physical_cores: 8,
+                bound_workers: 8,
+                spare_executors: 0,
                 vcpu_ceiling: 0,
                 reserve: 0,
             }
             .executor_count()
             .is_err()
         );
+    }
+
+    #[test]
+    fn spares_take_only_what_the_vcpu_budget_leaves_after_the_guest_cpus() {
+        let config = ExecutorPoolConfig {
+            bound_workers: 4,
+            spare_executors: 8,
+            vcpu_ceiling: 60,
+            reserve: 0,
+        };
+        assert_eq!(config.bound_worker_count().unwrap(), 4);
+        assert_eq!(config.spare_worker_count().unwrap(), 8);
+        assert_eq!(config.executor_count().unwrap(), 12);
+
+        // A tight ceiling spends it on guest CPUs first; spares get the rest.
+        let tight = ExecutorPoolConfig {
+            bound_workers: 4,
+            spare_executors: 8,
+            vcpu_ceiling: 6,
+            reserve: 0,
+        };
+        assert_eq!(tight.bound_worker_count().unwrap(), 4);
+        assert_eq!(tight.spare_worker_count().unwrap(), 2);
+
+        // The `=0` bisection hatch really yields no spares.
+        let none = ExecutorPoolConfig {
+            spare_executors: 0,
+            ..config
+        };
+        assert_eq!(none.spare_worker_count().unwrap(), 0);
+        assert_eq!(none.executor_count().unwrap(), 4);
     }
 
     #[test]
