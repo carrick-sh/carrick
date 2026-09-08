@@ -2569,3 +2569,14 @@ run):** 11/11 MATCH, no crash in the row run (the one silent abort was the
 go-build reducer before it, filed above). Ratios not cited (load). A quiet
 window opened at the end (load 3.2): `quiet-short.sh` is taking the
 fork-to-wait measurement and the short rows on this binary.
+
+**Quiet-window points on c6f2eeb70 (binary 79e957f1…, `--workers 1`, load
+2.8–3.3, the only three rows that finished before the fleet resumed):**
+itertools 3.67 (3787 ms), importlib 3.10 (8328 ms), threading 2.22
+(30738 ms). Unchanged from the pre-fleet receipt within noise, as expected:
+tonight's landings are correctness (wedges, crashes, hangs); the ratio
+levers are still on branches (scheduler placement/M=P for importlib,
+itertools and multiprocessing; the mapping index for compile; the dentry
+resolution for tarfile). The quiet fork-to-wait driver refused its
+preflight (two sibling guests alive); the goal's fork measurement is the
+four-sibling ledger condition and runs with the final ledger.
