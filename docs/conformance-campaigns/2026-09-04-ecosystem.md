@@ -2694,3 +2694,14 @@ classification from the kernel graph's execution state with the
 lost-transition arm becoming a `KernelAbort`; rebase onto a5f8592fc and
 port the claimability gate into the per-CPU queues; go_types 5/5 with
 zero reaps as the bar.
+
+**Post-claimability-gate rows (main a5f8592fc, load 22–32):** lint 0, shards
+3/3, smoke ok; rows asyncio, importlib, mp_main, subprocess MATCH; two
+crashes: `go-go_types` (executor-boundary cascade after the observer abort,
+the round-5 class) and **`cpython-threading`, new tonight**, inside
+`test_reinit_tls_after_fork`: the activation-window signature
+(`SnapshotRestoreFailed` → clone-rollback fatal) on the binary that carries
+the gate — an admission path the gate does not cover (fork from a threaded
+process). Kept the gate (its importlib A/B stands); residual dispatched
+(`brief-activation-residual.md`) with the rule that the rollback arm must
+stop aborting the carrier too.
