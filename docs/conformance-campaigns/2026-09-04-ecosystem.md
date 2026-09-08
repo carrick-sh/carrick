@@ -2785,3 +2785,12 @@ the harness was between rows, so `post-alias.jsonl` rows c00–c02 ran the
 fix; the verdicts stand for "main ≥ 2f3e0288b" only. A clean
 smoke-plus-rows on 65b3c791c runs after it finishes. Rule restated: the
 next landing's build waits for the previous post-landing script's DONE line.
+
+**Post-alias-VA-window receipt (main 65b3c791c, binary from
+build-65b3c791c.log, `--workers 1`, load 4.5–5.3 — the nearest to quiet
+tonight):** smoke ok, go-build reducer 8/8 zero fatal, rows 6/6 MATCH:
+`cpython-compile` **17.1 s / 6.41x** (campaign start 62.3 s / 23.3x),
+`cpython-itertools` 2.13 s / **2.06x** (was 3.7x), `cpython-mmap` 1.68x,
+`go-go_types` 20.0 s / 3.23x, `ltp-mmap18` 0.46x, `ltp-munmap01` 0.29x.
+Lint 0, probe shards 3/3. Disk: swept the build trees of eight landed,
+idle worktrees (66 GiB; 30 → 96 GiB free).
