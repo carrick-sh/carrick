@@ -6,6 +6,11 @@
 //! which thread mapped, unmapped or touched the page.
 //!
 //! Scenarios, in the order they run:
+//! 0. `sibling_handoff_first_touch`: threads created while siblings first-touch
+//!    fresh private anonymous chunks and others spin in guest. The reducer for
+//!    the Go startup SEGV_MAPERR: a sibling's first-run rebind of the MM's
+//!    frame-COW runtime binding landed inside another task's first-touch
+//!    quiesce, and the publication was refused and lowered to SIGSEGV.
 //! 1. `compound_retirement`: four pages of one 16 KiB compound, three of them
 //!    unmapped from another thread; the survivor keeps its bytes and its
 //!    frame while a fresh mapping is written.
@@ -659,10 +664,10 @@ enum PageState {
 fn fragment_stress(seed: u64, cross_thread: bool) -> (usize, usize, usize) {
     const PAGES: usize = 256; // 1 MiB region = 16 windows of 64 KiB
     const FRESH: usize = 64; // fresh 16 KiB mappings kept live
-                             // The cross-thread variant spawns a thread per unmap/remap, which is the
-                             // expensive part under a VMM; 1200 iterations keep the run inside the
-                             // gate budget while still reaching the iteration (663 with this seed) at
-                             // which the pre-fix binary livelocked on a stale row.
+    // The cross-thread variant spawns a thread per unmap/remap, which is the
+    // expensive part under a VMM; 1200 iterations keep the run inside the
+    // gate budget while still reaching the iteration (663 with this seed) at
+    // which the pre-fix binary livelocked on a stale row.
     let iters: u32 = if cross_thread { 1200 } else { 4000 };
     let region = unsafe {
         libc::mmap(
@@ -1068,8 +1073,97 @@ fn test_compound_retirement() {
     }
 }
 
+/// Deterministic reducer for the Go startup `SIGSEGV` (SEGV_MAPERR) on the
+/// first touch of a chunk the same thread just `mmap`ed.
+///
+/// Linux never faults a first touch inside a live private anonymous VMA. Under
+/// carrick that touch materializes backing through the MM-scoped frame-COW
+/// runtime binding: the faulting task reads the binding, quiesces the MM's
+/// vCPUs through it, then re-reads the binding and REFUSES the publication if
+/// it changed ("sparse publication MM changed during quiesce"), which the
+/// runtime lowers to SIGSEGV. Every new sibling thread's first run rebinds
+/// that same MM binding with its own authority object, so a thread being
+/// created while a sibling is inside its first-touch quiesce is enough.
+///
+/// Shape: two threads busy in guest (so every quiesce has vCPUs to kick and
+/// drain, widening the window), two threads that `mmap` fresh private
+/// anonymous chunks of random page counts, write and read back the first
+/// word, and `munmap`; one thread creating and joining short-lived siblings
+/// `SIBLING_HANDOFF_SPAWNS` times. A SEGV ends the process through the fatal
+/// signal reporter (`FATAL_SIGNAL sig=11`), so the two summary lines below
+/// are missing from the transcript; a wrong byte counts as a mismatch.
+const SIBLING_HANDOFF_SPAWNS: usize = 1500;
+static SIBLING_HANDOFF_TOUCH_MISMATCHES: AtomicUsize = AtomicUsize::new(0);
+
+fn test_sibling_handoff_first_touch() {
+    use std::sync::atomic::AtomicBool;
+    let stop = AtomicBool::new(false);
+    let touches = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                let mut x = 0x9e37_79b9_7f4a_7c15u64;
+                while !stop.load(Ordering::Relaxed) {
+                    x = std::hint::black_box(x).wrapping_mul(0x2545_f491_4f6c_dd1d);
+                }
+            });
+        }
+        for t in 0..2usize {
+            let stop = &stop;
+            let touches = &touches;
+            scope.spawn(move || {
+                let mut rng = XorShift::new(0x5eed_0000_0000_0001 ^ ((t as u64 + 1) << 32));
+                while !stop.load(Ordering::Relaxed) {
+                    let pages = 1 + (rng.next_u32() as usize % 96);
+                    let len = pages * PAGE_SIZE;
+                    let ptr = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            len,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    };
+                    if ptr == libc::MAP_FAILED {
+                        break;
+                    }
+                    let canary = canary(ptr as usize, touches.load(Ordering::Relaxed));
+                    let word = ptr as *mut u64;
+                    unsafe {
+                        word.write_volatile(canary);
+                        if word.read_volatile() != canary {
+                            SIBLING_HANDOFF_TOUCH_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        libc::munmap(ptr, len);
+                    }
+                    touches.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+        let mut spawned = 0usize;
+        for _ in 0..SIBLING_HANDOFF_SPAWNS {
+            if std::thread::spawn(|| {}).join().is_ok() {
+                spawned += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        println!("sibling_handoff_spawns={spawned}");
+    });
+    println!(
+        "sibling_handoff_touch_mismatches={}",
+        SIBLING_HANDOFF_TOUCH_MISMATCHES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "test_sibling_handoff_first_touch: touches = {}",
+        touches.load(Ordering::Relaxed)
+    );
+}
+
 fn main() {
     install_segv_reporter();
+    test_sibling_handoff_first_touch();
     test_compound_retirement();
     if std::env::var_os("WINDOWCOHERENCE_FAST").is_none() {
         test_fragment_stress();
@@ -1120,6 +1214,7 @@ fn main() {
         || REUSE_FRESH_SEES_SIBLING_WRITE.load(Ordering::Relaxed) != 0
         || FRAGMENT_STRESS_FAILURES.load(Ordering::Relaxed) != 0
         || COMPOUND_RETIREMENT_FAILURES.load(Ordering::Relaxed) != 0
+        || SIBLING_HANDOFF_TOUCH_MISMATCHES.load(Ordering::Relaxed) != 0
     {
         std::process::exit(1);
     }
