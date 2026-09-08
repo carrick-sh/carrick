@@ -1,0 +1,21 @@
+# Standalone (NOT a workspace member): this crate is cross-compiled for
+# aarch64-unknown-linux-musl and must not inherit the host workspace's
+# profile, lints, or target directory.
+[workspace]
+
+[package]
+name = "carrick-embed-interceptor-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "interceptor-probe"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+panic = "abort"
