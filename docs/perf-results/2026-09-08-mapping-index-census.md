@@ -116,3 +116,104 @@ them again:
 1. The fault-count and row-population growth above.
 2. The IPA axis of the registry keeps the same monotone bound (`widest_ipa`).
    It was not hot on this workload and is not measured here.
+
+---
+
+# The fix the census pointed at: bound the walk by the answer
+
+**Recorded 2026-09-08**, same branch. Fix binary `5256173ed660c5a1` at
+`155465983`; base binary `2576a8793c2333fe` at `b3d5cba62` (the census binary
+above). Both `just build`-signed with the hypervisor entitlement and
+`__dof_carrick` present.
+
+## What changed
+
+`AliasRegistry` gained `by_va_class_start`, the same rows keyed by
+`(class, start)` where `class = ceil(log2(size))`, plus an exact
+`va_class_counts` multiset. `AliasRegistry::va_window_rows` is now the single
+VA-axis candidate query and all six sites call it. Each class's walk is bounded
+by that class's OWN widest member, so the dense run of page-sized rows is
+searched over one page. `widest_va` is deleted. Every caller's exact overlap or
+containment test is unchanged; only the candidate set shrinks.
+
+## Same census, same reducer, both binaries
+
+| depth | alias rows visited, base | fix | | per fault, base | fix |
+|---:|---:|---:|---:|---:|---:|
+| 100,000 | 1,963,695 | **5,751** | 341x fewer | 341 | **1.00** |
+| 400,000 | 24,748,685 | **44,641** | 554x fewer | 545 | **0.98** |
+
+Worst single fault: 3,747 and 5,200 rows before, **12** and **13** after.
+
+The controls hold exactly. Fault counts (5,752 and 45,431), index rows visited
+(9,802 and 73,639), the index's per-fault visits (1.70 and 1.62) and both row
+populations are **identical across the two binaries** — the candidate set
+shrank and the answers did not. The alias walk is now ~1 row per fault at both
+depths, i.e. linear in faults where it was quadratic in extents.
+
+Same-instrument fault-service time fell 37.0 ms → 25.4 ms and 419 ms → 228 ms.
+Those are not cited as ratios: the base captures ran at host load 10-16 and the
+fix captures at load 30.
+
+## Rows on the fix binary
+
+`--tier full --workers 1 --carrick-timeout-cap-s 0 --require-cached-oracle`:
+
+| row | verdict | host load |
+|---|---|---:|
+| `cpython-compile` | **MATCH** 150/150 | 34.6 |
+| `cpython-mmap` | MATCH 38/38 | 47.4 |
+| `ltp-mmap18` | MATCH 4/4 | 51.6 |
+| `ltp-munmap01` | MATCH 2/2 | 55.0 |
+| `go-go_types` | MATCH 571/571 | 25.6 |
+
+Host load was 25-55 throughout (other agents), so **none of these ratios is
+citable** and none is quoted here. The verdicts are verdicts.
+
+## go-build reducer (the window-corruption check)
+
+`gobuild-loop.sh <label> 65536 8`, base and fix interleaved on one host:
+
+| binary | load | builds | SIGSEGV / fatal | scheduler abort |
+|---|---:|---:|---:|---:|
+| fix | 18.4 | 8/8 | 0 | no |
+| fix | 17.1 | aborted | 0 | yes |
+| fix | 13.9 | aborted | 0 | yes |
+| base | 8.8 | 8/8 | 0 | no |
+| fix | 11.4 | 8/8 | 0 | no |
+| base | 16.2 | aborted | 0 | yes |
+| fix | 16.1 | aborted | 0 | yes |
+| base | 15.9 | 8/8 | 0 | no |
+| fix | 33.1 | 8/8 | 0 | no |
+
+**Zero SIGSEGV and zero `fatal error` in all nine runs on both binaries**,
+which is the window-corruption criterion. The runs that did not reach 8/8 died
+on the `scheduler generation observer lost exact transition ... run queue
+publication authority does not match the submitted generation` abort in
+`carrick_runtime::kernel::scheduler`, which this change does not touch. The
+interleaved pair at load 16.2 / 16.1 hit it on BOTH binaries, which attributes
+it to main rather than to this change; `2026-09-08-mapping-index-measurement.md`
+recorded the same abort on both binaries a day earlier.
+
+## Gates
+
+`just clippy` 0, `just lint-domains` 0, `just doc` 0, `just test` 0,
+`just build` signed. `RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib`:
+465 passed. (A bare parallel `cargo test -p carrick-vmm-hvf` fails 2-4 tests in
+a different set every run on unmodified main too; the `just test` recipe already
+runs this crate serially for exactly that documented reason.)
+
+## Still open, after the fix
+
+1. **The fault count and row population remain super-linear in depth** — 8x
+   depth costs 22.8x faults and 14.9x rows, lumpily. Unexplained, and untouched
+   by this change.
+2. **The IPA axis keeps its monotone `widest_ipa` bound.** Same latent shape,
+   not measured hot on this workload.
+3. **The displaced-row backlog is still unbounded in principle.** See
+   `TaskMappingIndex::displace_overlapping` for why the obvious drop is unsafe
+   and `repeated_overlapping_publication_retains_one_row_per_incarnation` for
+   what accumulates; the census measured it at 1 row at every depth.
+4. **No citable ratio for `cpython-compile`.** Every conformance capture in this
+   round ran at host load 25-55. A quiet-window re-measure
+   (`target/perf/compile4/quiet-compile.sh`) is queued behind a load < 5 gate.
