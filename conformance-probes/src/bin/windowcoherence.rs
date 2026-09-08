@@ -1,12 +1,30 @@
-//! Fault window memory coherence reproducer probe.
+//! Fault window memory coherence probe.
 //!
-//! Exercises the 64 KiB anonymous fault window invariants:
-//! 1. 4 threads each owning 8 MiB private anonymous mappings.
-//! 2. Sparse touches in 64 KiB windows (non-monotonic order, e.g. chunk 1 then chunk 0).
-//! 3. `mprotect(PROT_NONE)` -> `mprotect(RW)` partial window re-protection (Go sysReserve/sysMap).
-//! 4. `mmap(MAP_FIXED)` over portions of anonymous windows.
-//! 5. `madvise(MADV_DONTNEED)` on sub-ranges (verifying zero on refault).
-//! 6. `fork()` child verification and COW isolation while parent continues writing.
+//! Every observation is a deterministic counter that Linux answers with zero:
+//! a page must read back exactly what was last written to it, a fresh or
+//! discarded anonymous page must read zero, and none of that may depend on
+//! which thread mapped, unmapped or touched the page.
+//!
+//! Scenarios, in the order they run:
+//! 1. `compound_retirement`: four pages of one 16 KiB compound, three of them
+//!    unmapped from another thread; the survivor keeps its bytes and its
+//!    frame while a fresh mapping is written.
+//! 2. `fragment_stress`: random page-granular `munmap`, `MAP_FIXED` remaps,
+//!    `MADV_DONTNEED` and fresh mappings over a window-materialized region,
+//!    once single-threaded and once with every unmap/remap issued from a
+//!    short-lived sibling thread. The sibling variant is the reducer for the
+//!    wide-window corruption: a partial unmap from a sibling left the other
+//!    threads' backing rows spanning the retired page, and the page's next
+//!    incarnation revalidated a retired frame (livelock on a stage-2 fault,
+//!    or silently stale bytes).
+//! 3. `partial_unmap_reuse`: one page of a compound unmapped and re-mapped
+//!    `MAP_FIXED` from a sibling, read back from the original thread.
+//! 4. The original cross-thread window read, the 4-thread 8 MiB workload
+//!    (non-monotonic touches, `mprotect` re-protection, `MADV_DONTNEED`,
+//!    `MAP_FIXED`, fork verification).
+//!
+//! `WINDOWCOHERENCE_TRACE=1` narrates the stress ops on stderr (`=2` also
+//! every verification read); `WINDOWCOHERENCE_FAST=1` skips the stress.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -36,7 +54,11 @@ struct XorShift {
 impl XorShift {
     fn new(seed: u64) -> Self {
         Self {
-            state: if seed == 0 { 0x8a5b_f789_0831_4961 } else { seed },
+            state: if seed == 0 {
+                0x8a5b_f789_0831_4961
+            } else {
+                seed
+            },
         }
     }
 
@@ -432,7 +454,627 @@ extern "C" fn worker_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
     std::ptr::null_mut()
 }
 
+/// Deterministic reducer for the wide-window partial-unmap hazard.
+///
+/// Thread A first-touches page 0 of a fresh anonymous mapping, which under
+/// the fault window materializes the whole 16 KiB compound as ONE backing
+/// row on A's executor, then writes a pattern into page 1 of that compound.
+/// Thread B `munmap`s page 1 alone (a PARTIAL unmap of A's row) and maps a
+/// fresh anonymous page back over the same VA with `MAP_FIXED`. Linux hands
+/// A a zero page on its next touch; a stale row on A that still spans the
+/// unmapped page instead revalidates the old leaf and resurrects the old
+/// bytes. The same sequence performed entirely on A is the control.
+///
+/// The second half retires the rest of the compound from B, then lets A
+/// write through its (possibly resurrected) page-1 leaf while B owns a fresh
+/// mapping: if A's leaf still names the retired frame, B's fresh mapping
+/// can observe A's write.
+struct ReuseArg {
+    base: *mut u8,
+    fresh: *mut u8,
+    step: *const AtomicUsize,
+    role: usize,
+}
+
+unsafe impl Send for ReuseArg {}
+unsafe impl Sync for ReuseArg {}
+
+static REUSE_STALE_SIBLING: AtomicUsize = AtomicUsize::new(0);
+static REUSE_STALE_SAME: AtomicUsize = AtomicUsize::new(0);
+static REUSE_FRESH_SEES_SIBLING_WRITE: AtomicUsize = AtomicUsize::new(0);
+
+fn wait_step(step: &AtomicUsize, want: usize) {
+    while step.load(Ordering::Acquire) != want {
+        std::hint::spin_loop();
+    }
+}
+
+extern "C" fn reuse_worker(arg_ptr: *mut libc::c_void) -> *mut libc::c_void {
+    let arg = unsafe { &*(arg_ptr as *const ReuseArg) };
+    let step = unsafe { &*arg.step };
+    let base = arg.base;
+    let page1 = unsafe { base.add(PAGE_SIZE) };
+    if arg.role == 0 {
+        // A: first touch page 0 (widens to the compound), then page 1.
+        unsafe {
+            (base as *mut u64).write_volatile(0x0101_0101_0101_0101);
+            (page1 as *mut u64).write_volatile(0xA5A5_A5A5_A5A5_A5A5);
+        }
+        step.store(1, Ordering::Release);
+        wait_step(step, 2);
+        // B unmapped page 1 and mapped a fresh anonymous page over it.
+        let v = unsafe { (page1 as *const u64).read_volatile() };
+        REUSE_STALE_SIBLING.store(v as usize, Ordering::Relaxed);
+        // Same-thread control: repeat the partial unmap + MAP_FIXED on A.
+        unsafe {
+            (page1 as *mut u64).write_volatile(0xB6B6_B6B6_B6B6_B6B6);
+            libc::munmap(page1 as *mut libc::c_void, PAGE_SIZE);
+            let p = libc::mmap(
+                page1 as *mut libc::c_void,
+                PAGE_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            );
+            if p != page1 as *mut libc::c_void {
+                REUSE_STALE_SAME.store(usize::MAX, Ordering::Relaxed);
+            } else {
+                let v = (page1 as *const u64).read_volatile();
+                REUSE_STALE_SAME.store(v as usize, Ordering::Relaxed);
+            }
+        }
+        step.store(3, Ordering::Release);
+        wait_step(step, 4);
+        // B retired the rest of the compound and owns a fresh mapping whose
+        // first page it touched. Write through A's page-1 leaf.
+        unsafe { (page1 as *mut u64).write_volatile(0xC7C7_C7C7_C7C7_C7C7) };
+        step.store(5, Ordering::Release);
+    } else {
+        wait_step(step, 1);
+        unsafe {
+            libc::munmap(page1 as *mut libc::c_void, PAGE_SIZE);
+            let p = libc::mmap(
+                page1 as *mut libc::c_void,
+                PAGE_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            );
+            if p != page1 as *mut libc::c_void {
+                REUSE_STALE_SIBLING.store(usize::MAX, Ordering::Relaxed);
+            }
+        }
+        step.store(2, Ordering::Release);
+        wait_step(step, 3);
+        unsafe {
+            // Retire pages 0, 2 and 3: the compound's last semantic owners.
+            libc::munmap(base as *mut libc::c_void, PAGE_SIZE);
+            libc::munmap(base.add(2 * PAGE_SIZE) as *mut libc::c_void, 2 * PAGE_SIZE);
+            // Fresh mapping; touching page 0 materializes its compound.
+            (arg.fresh as *mut u64).write_volatile(0x0F0F_0F0F_0F0F_0F0F);
+        }
+        step.store(4, Ordering::Release);
+        wait_step(step, 5);
+        let mut seen = 0usize;
+        for p in 0..4 {
+            let v = unsafe { (arg.fresh.add(p * PAGE_SIZE) as *const u64).read_volatile() };
+            if v == 0xC7C7_C7C7_C7C7_C7C7 {
+                seen = p + 1;
+            }
+        }
+        REUSE_FRESH_SEES_SIBLING_WRITE.store(seen, Ordering::Relaxed);
+    }
+    std::ptr::null_mut()
+}
+
+fn test_partial_unmap_reuse() {
+    let map = |len: usize| unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    // Two separate compound-aligned regions; `fresh` is mapped up front so
+    // its VA is fixed, but it is not touched until the retired frame exists.
+    let region = map(COMPOUND_SIZE * 2);
+    let fresh = map(COMPOUND_SIZE * 2);
+    if region == libc::MAP_FAILED || fresh == libc::MAP_FAILED {
+        println!("partial_unmap_reuse=mmap_failed");
+        return;
+    }
+    let align = |p: *mut libc::c_void| {
+        let a = (p as usize + COMPOUND_SIZE - 1) & !(COMPOUND_SIZE - 1);
+        a as *mut u8
+    };
+    let base = align(region);
+    let fresh_base = align(fresh);
+    let step = AtomicUsize::new(0);
+    let args = [
+        ReuseArg {
+            base,
+            fresh: fresh_base,
+            step: &step,
+            role: 0,
+        },
+        ReuseArg {
+            base,
+            fresh: fresh_base,
+            step: &step,
+            role: 1,
+        },
+    ];
+    let mut threads = [0 as libc::pthread_t; 2];
+    for i in 0..2 {
+        unsafe {
+            libc::pthread_create(
+                &mut threads[i],
+                std::ptr::null(),
+                reuse_worker,
+                &args[i] as *const ReuseArg as *mut libc::c_void,
+            );
+        }
+    }
+    for t in threads {
+        unsafe { libc::pthread_join(t, std::ptr::null_mut()) };
+    }
+    println!(
+        "partial_unmap_reuse_sibling_stale=0x{:x}",
+        REUSE_STALE_SIBLING.load(Ordering::Relaxed)
+    );
+    println!(
+        "partial_unmap_reuse_same_thread_stale=0x{:x}",
+        REUSE_STALE_SAME.load(Ordering::Relaxed)
+    );
+    println!(
+        "retired_frame_fresh_mapping_sees_sibling_write={}",
+        REUSE_FRESH_SEES_SIBLING_WRITE.load(Ordering::Relaxed)
+    );
+    unsafe {
+        libc::munmap(region, COMPOUND_SIZE * 2);
+        libc::munmap(fresh, COMPOUND_SIZE * 2);
+    }
+}
+
+/// Single-threaded fragment stress: random page-granular `munmap`,
+/// `MAP_FIXED` re-map, `MADV_DONTNEED` and fresh-mapping allocations over a
+/// region whose compounds were materialized by the fault window, with every
+/// page's expected content tracked. Any page that reads back something other
+/// than its tracked content is a coherence failure: a fresh or discarded
+/// page that is not zero (stale frame resurrected, or a frame shared with a
+/// live mapping) or a written page whose pattern changed (its frame was
+/// retired and handed to someone else while its leaf still named it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageState {
+    Unmapped,
+    Zero,
+    Pattern(u32),
+}
+
+fn fragment_stress(seed: u64, cross_thread: bool) -> (usize, usize, usize) {
+    const PAGES: usize = 256; // 1 MiB region = 16 windows of 64 KiB
+    const FRESH: usize = 64; // fresh 16 KiB mappings kept live
+                             // The cross-thread variant spawns a thread per unmap/remap, which is the
+                             // expensive part under a VMM; 1200 iterations keep the run inside the
+                             // gate budget while still reaching the iteration (663 with this seed) at
+                             // which the pre-fix binary livelocked on a stale row.
+    let iters: u32 = if cross_thread { 1200 } else { 4000 };
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            PAGES * PAGE_SIZE + WINDOW_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if region == libc::MAP_FAILED {
+        return (usize::MAX, 0, 0);
+    }
+    let base = ((region as usize + WINDOW_SIZE - 1) & !(WINDOW_SIZE - 1)) as *mut u8;
+    if std::env::var_os("WINDOWCOHERENCE_TRACE").is_some() {
+        eprintln!(
+            "fragment_stress cross_thread={cross_thread} region={:#x} base={:#x}",
+            region as usize, base as usize
+        );
+    }
+    let mut state = [PageState::Zero; PAGES];
+    let mut rng = XorShift::new(seed);
+    let mut fresh: Vec<(*mut u8, u32)> = Vec::new();
+    let mut stale_fresh = 0usize;
+    let mut lost_pattern = 0usize;
+    let mut nonzero_reuse = 0usize;
+    let page_ptr = |i: usize| unsafe { base.add(i * PAGE_SIZE) as *mut u64 };
+    let pattern = |i: usize, tag: u32| 0x5A5A_0000_0000_0000u64 ^ ((tag as u64) << 20) ^ (i as u64);
+    // Helper executed on another thread when `cross_thread` is set: page
+    // unmaps and MAP_FIXED remaps come from a sibling executor so its local
+    // rows, not the mutating thread's, are the ones that go stale.
+    let run_remote = |f: &mut (dyn FnMut() + Send)| {
+        if cross_thread {
+            std::thread::scope(|scope| {
+                scope.spawn(|| f());
+            });
+        } else {
+            f();
+        }
+    };
+    for iter in 1..=iters {
+        let op = rng.next_u32() % 16;
+        let i = (rng.next_u32() as usize) % PAGES;
+        if std::env::var_os("WINDOWCOHERENCE_TRACE").is_some() {
+            eprintln!(
+                "iter={iter} op={op} page={i} state={:?}",
+                match state[i] {
+                    PageState::Unmapped => 0u32,
+                    PageState::Zero => 1,
+                    PageState::Pattern(t) => 2 + t,
+                }
+            );
+        }
+        match op {
+            0..=6 => {
+                // Touch/write a page with a fresh pattern.
+                if state[i] != PageState::Unmapped {
+                    if state[i] == PageState::Zero {
+                        let v = unsafe { page_ptr(i).read_volatile() };
+                        if v != 0 {
+                            nonzero_reuse += 1;
+                        }
+                    }
+                    unsafe { page_ptr(i).write_volatile(pattern(i, iter)) };
+                    state[i] = PageState::Pattern(iter);
+                }
+            }
+            7..=8 => {
+                // munmap 1..3 pages (fragmenting compounds).
+                // Only pages this test still owns: a hole it opened earlier
+                // may since have been reused by the allocator or by a fresh
+                // mapping, exactly as on Linux.
+                let n = 1 + (rng.next_u32() as usize) % 3;
+                let mut end = i;
+                while end < (i + n).min(PAGES) && state[end] != PageState::Unmapped {
+                    end += 1;
+                }
+                if end > i {
+                    let ptr = page_ptr(i) as usize;
+                    if std::env::var_os("WINDOWCOHERENCE_TRACE").is_some() {
+                        eprintln!("munmap pages {i}..{end}");
+                    }
+                    run_remote(&mut || unsafe {
+                        libc::munmap(ptr as *mut libc::c_void, (end - i) * PAGE_SIZE);
+                    });
+                    for s in state[i..end].iter_mut() {
+                        *s = PageState::Unmapped;
+                    }
+                }
+            }
+            9..=10 => {
+                // MAP_FIXED a fresh anonymous mapping over 1..3 pages this
+                // test still owns (never over a hole someone else may have
+                // reused).
+                let n = 1 + (rng.next_u32() as usize) % 3;
+                let mut end = i;
+                while end < (i + n).min(PAGES) && state[end] != PageState::Unmapped {
+                    end += 1;
+                }
+                if end == i {
+                    continue;
+                }
+                let ptr = page_ptr(i) as usize;
+                let len = (end - i) * PAGE_SIZE;
+                if std::env::var_os("WINDOWCOHERENCE_TRACE").is_some() {
+                    eprintln!("mapfixed pages {i}..{end}");
+                }
+                let mut ok = false;
+                run_remote(&mut || unsafe {
+                    ok = libc::mmap(
+                        ptr as *mut libc::c_void,
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                        -1,
+                        0,
+                    ) as usize
+                        == ptr;
+                });
+                if ok {
+                    for s in state[i..end].iter_mut() {
+                        *s = PageState::Zero;
+                    }
+                }
+            }
+            11 => {
+                // MADV_DONTNEED 1..3 mapped pages.
+                let n = 1 + (rng.next_u32() as usize) % 3;
+                let end = (i + n).min(PAGES);
+                if state[i..end].iter().all(|s| *s != PageState::Unmapped) {
+                    if std::env::var_os("WINDOWCOHERENCE_TRACE").is_some() {
+                        eprintln!("dontneed pages {i}..{end}");
+                    }
+                    unsafe {
+                        libc::madvise(
+                            page_ptr(i) as *mut libc::c_void,
+                            (end - i) * PAGE_SIZE,
+                            libc::MADV_DONTNEED,
+                        );
+                    }
+                    for s in state[i..end].iter_mut() {
+                        *s = PageState::Zero;
+                    }
+                }
+            }
+            _ => {
+                // Fresh 16 KiB mapping: must read zero; keep it live with a pattern.
+                let p = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        COMPOUND_SIZE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                if p != libc::MAP_FAILED
+                    && (p as usize) >= base as usize
+                    && (p as usize) < base as usize + PAGES * PAGE_SIZE
+                {
+                    // Linux (and carrick) may place the fresh mapping in a
+                    // hole the region's own unmaps opened: those pages are
+                    // region pages again, tracked as zero.
+                    let first = (p as usize - base as usize) / PAGE_SIZE;
+                    for q in first..(first + 4).min(PAGES) {
+                        let v = unsafe { page_ptr(q).read_volatile() };
+                        if v != 0 {
+                            stale_fresh += 1;
+                        }
+                        state[q] = PageState::Zero;
+                    }
+                } else if p != libc::MAP_FAILED {
+                    let p = p as *mut u8;
+                    for q in 0..4 {
+                        let v = unsafe { (p.add(q * PAGE_SIZE) as *const u64).read_volatile() };
+                        if v != 0 {
+                            stale_fresh += 1;
+                        }
+                        unsafe {
+                            (p.add(q * PAGE_SIZE) as *mut u64).write_volatile(pattern(q, iter))
+                        };
+                    }
+                    if std::env::var_os("WINDOWCOHERENCE_TRACE").is_some() {
+                        eprintln!("fresh {:#x}", p as usize);
+                    }
+                    fresh.push((p, iter));
+                    if fresh.len() > FRESH {
+                        let (old, _) = fresh.remove((rng.next_u32() as usize) % fresh.len());
+                        unsafe { libc::munmap(old as *mut libc::c_void, COMPOUND_SIZE) };
+                    }
+                }
+            }
+        }
+        // Verify every tracked page after each op.
+        let trace = std::env::var("WINDOWCOHERENCE_TRACE").is_ok_and(|v| v == "2");
+        for (j, s) in state.iter().enumerate() {
+            if let PageState::Pattern(tag) = *s {
+                if trace {
+                    eprintln!("verify page={j} tag={tag}");
+                }
+                let v = unsafe { page_ptr(j).read_volatile() };
+                if v != pattern(j, tag) {
+                    lost_pattern += 1;
+                    unsafe { page_ptr(j).write_volatile(pattern(j, tag)) };
+                }
+            }
+        }
+        for &(p, tag) in &fresh {
+            for q in 0..4 {
+                if trace {
+                    eprintln!("verify fresh={:#x} q={q} tag={tag}", p as usize);
+                }
+                let v = unsafe { (p.add(q * PAGE_SIZE) as *const u64).read_volatile() };
+                if v != pattern(q, tag) {
+                    lost_pattern += 1;
+                    unsafe { (p.add(q * PAGE_SIZE) as *mut u64).write_volatile(pattern(q, tag)) };
+                }
+            }
+        }
+    }
+    if std::env::var_os("WINDOWCOHERENCE_TRACE").is_some() {
+        eprintln!("teardown");
+    }
+    for (p, _) in fresh {
+        unsafe { libc::munmap(p as *mut libc::c_void, COMPOUND_SIZE) };
+    }
+    // Unmap only what this test still owns: holes it opened may since have
+    // been handed to the allocator (a blanket unmap of the region would tear
+    // down a live malloc chunk, on Linux exactly as here).
+    let region_end = region as usize + PAGES * PAGE_SIZE + WINDOW_SIZE;
+    let mut owned: Vec<(usize, usize)> = Vec::new();
+    if (region as usize) < base as usize {
+        owned.push((region as usize, base as usize));
+    }
+    for (j, s) in state.iter().enumerate() {
+        if *s != PageState::Unmapped {
+            owned.push((
+                base as usize + j * PAGE_SIZE,
+                base as usize + (j + 1) * PAGE_SIZE,
+            ));
+        }
+    }
+    let tail = base as usize + PAGES * PAGE_SIZE;
+    if tail < region_end {
+        owned.push((tail, region_end));
+    }
+    for (s, e) in owned {
+        unsafe { libc::munmap(s as *mut libc::c_void, e - s) };
+    }
+    (stale_fresh, lost_pattern, nonzero_reuse)
+}
+
+fn test_fragment_stress() {
+    for (name, cross) in [("local", false), ("cross_thread", true)] {
+        let (stale_fresh, lost_pattern, nonzero_reuse) =
+            fragment_stress(0x9E37_79B9_7F4A_7C15, cross);
+        println!("fragment_stress_{name}_stale_fresh={stale_fresh}");
+        println!("fragment_stress_{name}_lost_pattern={lost_pattern}");
+        println!("fragment_stress_{name}_nonzero_reuse={nonzero_reuse}");
+        if stale_fresh != 0 || lost_pattern != 0 || nonzero_reuse != 0 {
+            FRAGMENT_STRESS_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+static FRAGMENT_STRESS_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// Fatal-fault reporter: a SIGSEGV inside the stress is a probe failure with
+/// an address; report it on stderr so the run names the page, then die with
+/// the signal's conventional status.
+extern "C" fn segv_reporter(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    unsafe {
+        let addr = if info.is_null() {
+            0
+        } else {
+            (*info).si_addr() as usize
+        };
+        let pc = if ctx.is_null() {
+            0
+        } else {
+            let uc = ctx as *const libc::ucontext_t;
+            (*uc).uc_mcontext.pc as usize
+        };
+        let msg = format!("FATAL_SIGNAL sig={sig} addr={addr:#x} pc={pc:#x}\n");
+        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::_exit(128 + sig);
+    }
+}
+
+fn install_segv_reporter() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = segv_reporter
+            as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+            as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Deterministic reducer for the compound-retirement hazard.
+///
+/// Four pages of one 16 KiB compound are touched and patterned on the main
+/// thread. Another thread then unmaps three of them (a PARTIAL unmap of the
+/// compound); the surviving page must keep its bytes and its frame. A fresh
+/// mapping is then allocated and written from the main thread: if the
+/// survivor's frame was retired under it, the fresh mapping is handed the
+/// recycled frame and the survivor observes the fresh mapping's write (or,
+/// unpooled, the survivor's leaf names an unmapped frame and every access
+/// faults). The same sequence with the unmap on the main thread is the
+/// control.
+fn compound_retirement(remote: bool, keep: usize) -> (u64, u64) {
+    let map = |len: usize| unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    let region = map(COMPOUND_SIZE * 2);
+    if region == libc::MAP_FAILED {
+        return (u64::MAX, u64::MAX);
+    }
+    let base = ((region as usize + COMPOUND_SIZE - 1) & !(COMPOUND_SIZE - 1)) as *mut u8;
+    let pattern = |q: usize| 0x7A7A_0000_0000_0000u64 ^ (q as u64 + 1) ^ ((keep as u64) << 8);
+    for q in 0..4 {
+        unsafe { (base.add(q * PAGE_SIZE) as *mut u64).write_volatile(pattern(q)) };
+    }
+    // Unmap every page but `keep`, in one or two calls.
+    let unmap = |ptr: usize, len: usize| unsafe {
+        libc::munmap(ptr as *mut libc::c_void, len);
+    };
+    let pieces: Vec<(usize, usize)> = if keep == 0 {
+        vec![(base as usize + PAGE_SIZE, 3 * PAGE_SIZE)]
+    } else if keep == 3 {
+        vec![(base as usize, 3 * PAGE_SIZE)]
+    } else {
+        vec![
+            (base as usize, keep * PAGE_SIZE),
+            (
+                base as usize + (keep + 1) * PAGE_SIZE,
+                (3 - keep) * PAGE_SIZE,
+            ),
+        ]
+    };
+    for (ptr, len) in pieces {
+        if remote {
+            std::thread::scope(|scope| {
+                scope.spawn(move || unmap(ptr, len));
+            });
+        } else {
+            unmap(ptr, len);
+        }
+    }
+    let survivor = unsafe { base.add(keep * PAGE_SIZE) as *mut u64 };
+    let after_unmap = unsafe { survivor.read_volatile() };
+    // Fresh compound: written from this thread; the survivor must not move.
+    let fresh = map(COMPOUND_SIZE * 2);
+    let mut after_fresh = after_unmap;
+    if fresh != libc::MAP_FAILED {
+        let fresh_base = ((fresh as usize + COMPOUND_SIZE - 1) & !(COMPOUND_SIZE - 1)) as *mut u8;
+        for q in 0..4 {
+            unsafe {
+                (fresh_base.add(q * PAGE_SIZE) as *mut u64).write_volatile(0x7777_7777_7777_7777)
+            };
+        }
+        after_fresh = unsafe { survivor.read_volatile() };
+        unsafe { libc::munmap(fresh, COMPOUND_SIZE * 2) };
+    }
+    unsafe {
+        libc::munmap(survivor as *mut libc::c_void, PAGE_SIZE);
+        if (region as usize) < base as usize {
+            libc::munmap(region, base as usize - region as usize);
+        }
+        let tail = base as usize + COMPOUND_SIZE;
+        let end = region as usize + COMPOUND_SIZE * 2;
+        if tail < end {
+            libc::munmap(tail as *mut libc::c_void, end - tail);
+        }
+    }
+    (after_unmap ^ pattern(keep), after_fresh ^ pattern(keep))
+}
+
+static COMPOUND_RETIREMENT_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+fn test_compound_retirement() {
+    for (name, remote) in [("local", false), ("sibling", true)] {
+        for keep in 0..4 {
+            let (after_unmap, after_fresh) = compound_retirement(remote, keep);
+            println!("compound_retirement_{name}_keep{keep}_after_unmap_xor=0x{after_unmap:x}");
+            println!("compound_retirement_{name}_keep{keep}_after_fresh_xor=0x{after_fresh:x}");
+            if after_unmap != 0 || after_fresh != 0 {
+                COMPOUND_RETIREMENT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 fn main() {
+    install_segv_reporter();
+    test_compound_retirement();
+    if std::env::var_os("WINDOWCOHERENCE_FAST").is_none() {
+        test_fragment_stress();
+    }
+    test_partial_unmap_reuse();
     test_cross_thread_window();
 
     let mut threads = [0 as libc::pthread_t; NUM_THREADS];
@@ -473,6 +1115,11 @@ fn main() {
         || nonzero_after_dontneed != 0
         || nonzero_pristine != 0
         || child_mismatches != 0
+        || REUSE_STALE_SIBLING.load(Ordering::Relaxed) != 0
+        || REUSE_STALE_SAME.load(Ordering::Relaxed) != 0
+        || REUSE_FRESH_SEES_SIBLING_WRITE.load(Ordering::Relaxed) != 0
+        || FRAGMENT_STRESS_FAILURES.load(Ordering::Relaxed) != 0
+        || COMPOUND_RETIREMENT_FAILURES.load(Ordering::Relaxed) != 0
     {
         std::process::exit(1);
     }
