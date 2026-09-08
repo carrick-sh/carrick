@@ -2613,3 +2613,30 @@ exact transition` (crash report `carrick-2026-09-08-034418.ips`,
 exec-generation class whose fix (5d7efe418, settlement outcome instead of
 `?`) is on the scheduler branch and lands with round 4 — second instance
 on a main reducer tonight, both at load ≥ 30. Rows in `post-tarfile.log`.
+
+### 2026-09-08 04:30 — compile mapping index landed (main)
+
+`HvfTaskState.mappings` is now `TaskMappingIndex` (agy/attr-compile2-sep07,
+9576bb27f…06d1bf317): a `BTreeMap<GuestVa, HvfMappedRegion>` of live rows
+that coalesces contiguous same-owner rows, keeps displaced rows reachable
+until their handles drop, plus an **IPA-ordered view** with a span
+multiset that bounds the raw-IPA walk. The worker measured its own
+regression first — ordered VA lookups alone were **1.39x slower** because
+`mapping_for_ipa_range` (every fault, via `diagnostic_fault_page_tables →
+host_ptr`) still walked the whole table and a reverse `BTreeMap` walk costs
+several times the vector — then the IPA view flipped it: reducer at 400k
+depth 3.98 s → 1.37 s (2.39x), at 1M 45.8 s → 7.76 s (5.91x);
+`cpython-compile` 62.3 s / 23.3x → **26.8 s / 10.0x** (load 8–14), `cpython-mmap`,
+`ltp-mmap18`, `ltp-munmap01`, `go-go_types` MATCH; go-build reducer zero
+SIGSEGV / zero fatal lines across 7 runs (the window-corruption criterion).
+Director gates on the rebase: 463 hvf lib tests serially, lint 0, workspace
+check 0. Not proven / follow-on: scaling is flatter but still super-linear
+(8x depth costs 23x, was 161x); coalescing cannot fire on this workload
+because each sparse extent has its own global-frame owner generation (the
+representation cost is now the per-extent owner, not the lookup); the
+per-fault row count is uninstrumented (probe requested — granted, lane:
+carrick-observability); `shadowed` rows are retained until handles drop
+and their growth under repeated MAP_FIXED is unbounded (review note);
+`carrick-vmm-hvf` tests are flaky in parallel at base (shared statics).
+The `lost exact transition` abort the worker hit under load ≥19 on both
+binaries is the scheduler lane's (round 4).
