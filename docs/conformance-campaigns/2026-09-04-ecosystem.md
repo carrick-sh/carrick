@@ -2883,3 +2883,28 @@ survivable rather than carrier-fatal. NOT proven: whether making it
 survivable is the whole answer for that residual, or only removes its loudest
 symptom; and only one interleaved asyncio pair was completed before the
 session ended (the second base run was still going).
+
+### 2026-09-08 08:45 — the guest-CPU scheduler landed (main 32e678d87)
+
+Rounds 1–5 collapsed onto lane B and the claimability gate (16e262602),
+plus the round-5 fix (60238bc06): the reaped settlement publishes the job
+it owns, "reaped" is judged from the kernel graph's execution state, and
+the lost-transition arm is a `KernelAbort` with a post-mortem instead of a
+bare `abort()`. Director gates on the rebase (the post-mortem enum merge
+was re-done by hand and folded into the fix commit): lint 0, workspace
+check 0, probe shards 3/3, `just test` 38/38, signed build, both signed
+embed tests green (`go_types_survives_an_adversarial_scheduling_policy`,
+`go_types_exit_publishes_every_process_job`), interleaved go_types **5/5
+vs main 5/5, zero wedges, zero reaps, zero abort lines**; importlib,
+itertools, multiprocessing_main_handling, subprocess MATCH on both arms
+twice. `cpython-threading` crashed on the branch 2/2 and on main 1/2 with
+the byte-identical activation-window residual signature at
+`test_reinit_tls_after_fork` — the residual agent's class, not a scheduler
+regression. What the scheduler brings: per-CPU run queues, placement by
+executor availability, the wake chain, the real guest CPU on every auditor
+emit, `ContainerBuilder::scheduler` with `cpu_count()` as the single nproc
+source, adversarial and record/replay embed policies, the reaped-path
+authority leak closed, M = P as a hatch (`CARRICK_BOUND_EXECUTORS`, not
+flipped). With this, the recurring `lost exact transition` abort under
+load ≥30 should be gone from main; the post-landing reducer and rows are
+the receipt.
