@@ -1633,7 +1633,7 @@ impl crate::kernel::scheduler::SchedulerGenerationObserver for HvpatchTaskBindin
         }
         if bindings.contains_key(&(thread, successor)) {
             bindings.insert((thread, predecessor), record);
-            return Err(crate::kernel::RunQueueError::SubmissionRejected);
+            return Err(crate::kernel::RunQueueError::DuplicateObserverBinding);
         }
         if let Some(authority) = record.authority.take() {
             let transition = match kind {

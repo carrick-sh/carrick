@@ -36,6 +36,24 @@ pub enum RunQueueError {
     Closed,
     #[error("new root submissions are rejected while the run queue is closing")]
     SubmissionRejected,
+    /// A publication found the exact `(thread, generation)` row already in the
+    /// run queue. This is NOT a closing queue: it says the same exact
+    /// generation was published twice. It has its own identity because the
+    /// shared `SubmissionRejected` spelling made a live HVPatch activation
+    /// failure read as "the run queue is closing" in a guest-fatal error, and
+    /// the run queue was demonstrably `open` in the wedge snapshot.
+    #[error("the exact runnable generation is already queued")]
+    AlreadyQueued,
+    /// A submission-authority counter would overflow. Distinct from a closing
+    /// queue for the same reason: an exhaustion is not a shutdown.
+    #[error("concurrent submission authorities are exhausted")]
+    AuthoritiesExhausted,
+    /// A generation observer already holds the exact successor binding.
+    #[error("generation observer already holds the successor binding")]
+    DuplicateObserverBinding,
+    /// A second generation observer was installed over a live one.
+    #[error("a generation observer is already installed")]
+    ObserverAlreadyInstalled,
     #[error("run queue publication authority does not match the submitted generation")]
     AuthorityMismatch,
     #[error("generation observer has no binding record for the predecessor generation")]
@@ -467,7 +485,7 @@ impl RunQueueInner {
             let next = count
                 .checked_add(1)
                 .filter(|next| *next < Self::CLOSING_BIT)
-                .ok_or(RunQueueError::SubmissionRejected)?;
+                .ok_or(RunQueueError::AuthoritiesExhausted)?;
             match self.wake_admissions.compare_exchange_weak(
                 observed,
                 next,
@@ -727,7 +745,7 @@ impl SubmissionAuthority {
         }
         let Some(active_authorities) = state.active_authorities.checked_add(1) else {
             drop(state);
-            return Err((RunQueueError::SubmissionRejected, self));
+            return Err((RunQueueError::AuthoritiesExhausted, self));
         };
         state.active_authorities = active_authorities;
         drop(state);
@@ -760,7 +778,7 @@ impl SubmissionAuthority {
                     state.active_authorities = state
                         .active_authorities
                         .checked_add(1)
-                        .ok_or(RunQueueError::SubmissionRejected)?;
+                        .ok_or(RunQueueError::AuthoritiesExhausted)?;
                     Ok(Self {
                         queue: Arc::downgrade(&queue),
                         kernel: Arc::downgrade(&kernel),
@@ -826,7 +844,7 @@ impl SubmissionAuthority {
             state.active_authorities = state
                 .active_authorities
                 .checked_add(1)
-                .ok_or(RunQueueError::SubmissionRejected)?;
+                .ok_or(RunQueueError::AuthoritiesExhausted)?;
             Ok(Self {
                 queue: Arc::downgrade(&queue),
                 kernel: Arc::downgrade(&kernel),
@@ -884,7 +902,7 @@ impl SubmissionPublication {
         if self.publish_row(scheduler, thread)? {
             Ok(())
         } else {
-            Err(RunQueueError::SubmissionRejected.into())
+            Err(RunQueueError::AlreadyQueued.into())
         }
     }
 
@@ -963,7 +981,7 @@ impl RunQueue {
         state.active_authorities = state
             .active_authorities
             .checked_add(1)
-            .ok_or(RunQueueError::SubmissionRejected)?;
+            .ok_or(RunQueueError::AuthoritiesExhausted)?;
         Ok(SubmissionAuthority {
             queue: Arc::downgrade(&self.inner),
             kernel: Arc::downgrade(kernel),
@@ -1349,7 +1367,7 @@ impl Scheduler {
     ) -> Result<(), RunQueueError> {
         let mut slot = self.generation_observer.lock();
         if slot.is_some() {
-            return Err(RunQueueError::SubmissionRejected);
+            return Err(RunQueueError::ObserverAlreadyInstalled);
         }
         *slot = Some(observer);
         Ok(())
@@ -2732,6 +2750,45 @@ mod tests {
         assert_eq!(
             scheduler.wake(context.thread().key()).unwrap(),
             WakeDisposition::Coalesced
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+    }
+
+    #[test]
+    fn a_duplicate_exact_publication_names_the_queued_row_not_a_closing_queue() {
+        // A live HVPatch activation that finds its exact (thread, generation)
+        // row already queued used to surface as `SubmissionRejected`, whose
+        // message says "new root submissions are rejected while the run queue
+        // is closing". That text reached a guest-fatal error on a run whose
+        // run queue was demonstrably `open`, so the message actively misled
+        // the investigation. A duplicate row must name itself.
+        let (kernel, context) = bootstrap(12_113);
+        publish(&context, 21);
+        let scheduler = Scheduler::new(kernel);
+        let generation = context.thread().execution_state().generation().unwrap();
+        let authority = scheduler
+            .admit_root(context.thread().key(), generation)
+            .expect("admit the exact root authority");
+        authority
+            .publication_handle()
+            .publish_unique(&scheduler, Arc::clone(context.thread()))
+            .expect("first publication of the exact row");
+        let error = authority
+            .publication_handle()
+            .publish_unique(&scheduler, Arc::clone(context.thread()))
+            .expect_err("the exact row is already queued");
+        assert!(
+            matches!(
+                error,
+                super::SchedulerError::Queue(RunQueueError::AlreadyQueued)
+            ),
+            "a duplicate exact row must be AlreadyQueued, got {error:?}"
+        );
+        let rendered = error.to_string();
+        assert_eq!(rendered, "the exact runnable generation is already queued");
+        assert!(
+            !rendered.contains("closing"),
+            "a duplicate exact row must never be reported as a closing run queue: {rendered}"
         );
         assert_eq!(scheduler.queued_len(), 1);
     }
