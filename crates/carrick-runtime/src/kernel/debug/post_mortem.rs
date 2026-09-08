@@ -123,12 +123,12 @@ pub enum AbortReason {
     },
     /// A `KernelAuditor` verdict (lane A's judgement surface).
     Auditor { invariant: String, detail: String },
-    /// The HVPatch mmap alias-install arm could not finish an install the
+    /// The HVPatch alias-install arm (guest `mmap(2)`) could not finish an install
     /// backend had already committed to stage-2. Until 2026-09-08 these were
     /// seven bare `abort()`s with no log line: the carrier died rc=134 with
     /// empty stderr and the only evidence was a macOS crash report. Every
     /// field is what the reader needed and did not have: which of the seven
-    /// sites, for which Linux task on which executor, over which mapping, and
+    /// sites, for which Linux task on which executor, over which VA range, and
     /// — for a refused inventory publication — whether the frame the batch
     /// names is still a candidate of some OTHER reserved, unapplied
     /// transaction (a staged-but-unpublished sibling install), which is the
@@ -159,7 +159,7 @@ pub enum HvpatchAliasInstallSite {
     InventoryCommitMissing,
     /// The kernel frame-inventory authority refused the staged batch.
     InventoryPublish,
-    /// The mapping length does not fit `usize` (unreachable on 64-bit hosts).
+    /// The range length does not fit `usize` (unreachable on 64-bit hosts).
     LenOverflow,
     /// `protect_range(PROT_NONE)` failed on the freshly installed range.
     ProtectNone,
