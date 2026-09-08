@@ -217,3 +217,61 @@ runs this crate serially for exactly that documented reason.)
 4. **No citable ratio for `cpython-compile`.** Every conformance capture in this
    round ran at host load 25-55. A quiet-window re-measure
    (`target/perf/compile4/quiet-compile.sh`) is queued behind a load < 5 gate.
+
+---
+
+# Reproduced on the rebased artifact
+
+**Recorded 2026-09-08.** The branch was rebased onto main `2f3e0288b` (17
+commits), and every receipt above was re-taken on the resulting signed binary
+`d153103e8d433d38` at `43d0b7d61` so that one artifact carries the whole
+result. Host load 9.2-20.6 throughout.
+
+The rebase conflicted only on the position-only inventory reconcile, which was
+skipped and re-run on the clean merged tree as the operating manual requires.
+
+**Census, byte-identical to the pre-rebase capture:**
+
+| depth | faults | index rows visited | alias rows visited |
+|---:|---:|---:|---:|
+| 100,000 | 5,752 | 9,802 | 5,751 |
+| 400,000 | 45,431 | 73,639 | 44,641 |
+
+**Rows**, `--tier full --workers 1 --carrick-timeout-cap-s 0
+--require-cached-oracle`:
+
+| row | verdict | host load |
+|---|---|---:|
+| `cpython-compile` | MATCH 150/150 | 14.3 |
+| `cpython-mmap` | MATCH 38/38 | 12.1 |
+| `ltp-mmap18` | MATCH 4/4 | 12.1 |
+| `ltp-munmap01` | MATCH 2/2 | 12.1 |
+| `go-go_types` | MATCH 571/571 | 20.6 |
+
+`cpython-compile` printed 20.46x (54,762 ms) at load 14.3 against 32.50x at load
+34.6 on the pre-rebase binary and 10.01x at load 8-14 on
+`2026-09-08-mapping-index-measurement.md`'s. **None of the three is citable and
+they are not comparable to each other**: the bar is load < 5 and every capture
+in this round ran well above it. What the row establishes is the verdict.
+
+**go-build reducer**, base and fix interleaved on the same host, five more runs:
+
+| binary | load | builds | SIGSEGV / fatal | scheduler abort |
+|---|---:|---:|---:|---:|
+| fix | 14.2 | aborted | 0 | yes |
+| fix | 14.2 | aborted | 0 | yes |
+| fix | 19.9 | 8/8 | 0 | no |
+| base `5c5d2495dfa30402` | 15.3 | aborted | 0 | yes |
+| fix | 12.0 | aborted | 0 | yes |
+| base `5c5d2495dfa30402` | 18.1 | aborted | 0 | yes |
+| fix | 9.2 | 8/8 | 0 | no |
+
+Zero SIGSEGV and zero `fatal error` in every run, on both binaries, which is the
+window-corruption criterion. The base binary — the exact rebase base, carrying
+none of this change — aborted in 2 of 2 runs where the fix aborted in 3 of 5, so
+the `carrick_runtime::kernel::scheduler` "lost exact transition" abort is main's
+and is if anything less frequent here.
+
+**Gates on `43d0b7d61`:** `just fmt-check` 0, `just clippy` 0,
+`just lint-domains` 0, `just doc` 0, `just test` 0, `just build` signed
+(`d153103e8d433d38`, hypervisor entitlement and `__dof_carrick` present).
