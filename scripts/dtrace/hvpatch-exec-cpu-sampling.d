@@ -10,6 +10,9 @@
  * Perturbation: 499 Hz stacks, no USDT probes. Rankings are diagnostic only;
  * accept performance only from separate untraced runs. Require target exit(0),
  * nonzero samples, zero errors/drops and natural completion within 45 seconds.
+ * Kernel-mode samples also retain the interrupted user stack to identify
+ * the caller without inventing names for unresolved kernel PCs. Qualify
+ * those user returns against the exact binary, just like user-mode stacks.
  * Do not symbolize kernel addresses using a mismatched KDK build.
  */
 #pragma D option quiet
@@ -25,7 +28,7 @@ profile-499
 
 profile-499
 /(pid == $target || progenyof($target)) && arg0 != 0/
-{ sample_seen = 1; @population[1] = count(); @kernel[stack(24)] = count(); }
+{ sample_seen = 1; @population[1] = count(); @kernel[stack(24)] = count(); @kernel_user[ustack(24)] = count(); }
 
 syscall::exit:entry
 /pid == $target/
@@ -48,4 +51,5 @@ dtrace:::END
     printa("EXECCPU|kernel-mode=%d|samples=%@d\n", @population);
     printa("EXECCPU|user=%k|samples=%@d\n", @user);
     printa("EXECCPU|kernel=%k|samples=%@d\n", @kernel);
+    printa("EXECCPU|kernel-user=%k|samples=%@d\n", @kernel_user);
 }
