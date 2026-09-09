@@ -1037,3 +1037,158 @@ this measurable copy hypothesis against the remaining filesystem cost before
 committing to smaller descriptor-wrapper savings. No stack/runtime change is
 present at this checkpoint. Current accepted normal spawn remains 12.310 ms /
 4.449 ms = 2.77x; the <=2x goal remains active.
+
+### Compact initial-stack payload experiment (in validation)
+
+Source review refutes a full 8 MiB HVPatch guest-stack copy: the default
+`CARRICK_HVPATCH_SPARSE_EXEC_STACK` path already copies only the initialized
+stack tail. The avoidable work is earlier: `build_linux_initial_stack` creates
+and zeros an 8 MiB host Vec. The candidate retains the semantic stack extent
+while storing an aligned initialized window. Legacy byte-slice consumers
+materialize a zero prefix lazily; direct GuestMemory reads copy only the
+intersection and return zero elsewhere. Writes retain copy-on-write isolation.
+The HVPatch mapping plan consumes the compact window directly. No stack limit,
+address, permission, ownership or publication contract is intentionally changed.
+
+`initial_stack_keeps_a_compact_tail_and_full_zero_extent` failed against an
+initial dense-payload accessor (`stack-tail-red.log`) and passes with the new
+representation. The initial full memory run passed 194 tests; the serial HVF
+run passed 473 with 3 ignored. These are development checks, not final gate
+closure. Additional argument/auxv boundary coverage has been added and awaits
+its test run. Full runtime, public signed probes and final artifact checks
+remain required.
+
+The signed development artifact `carrick-stack-tail` has SHA-256
+`5f63ef3fcf7063f1f8640d62ab899bd80ed88643bb0d9b10b4d8910e13dd7053`, UUID
+`F334088E-583F-3FE7-9EA7-EB972C109A90`; `stack-tail-provenance.json` binds its
+source patch, signature, entitlement and DOF. It predates the extra boundary
+test and explanatory comment; it is not claimed as the final gated artifact.
+
+Two untraced fixed-concurrency ABBA pairs against `carrick-entropy-gated`
+support the mechanism. The first normal-spawn pair improves 3.83%; the second
+improves 3.76%. The second was bracketed by fresh Docker runs on the identical
+pinned native-arm64 image (`stack-tail-refresh-image.json`):
+
+| Command | Docker ms | Entropy base ms | Stack candidate ms | Candidate / Docker |
+|---|---:|---:|---:|---:|
+| true | 0.17473 | 2.03948 | 1.77254 | 10.14x |
+| Python -S | 3.82773 | 11.33587 | 10.99779 | 2.87x |
+| Python | 4.62343 | 12.78987 | 12.30901 | 2.66x |
+
+`stack-tail-abba.json` and `stack-tail-refresh.json` retain every batch and
+artifact hash. Fresh oracle drift accounts for part of the ratio change;
+paired base/candidate improvement is the isolated claim. The complete CPython
+subprocess and multiprocessing_main_handling ABBA is running next, using a
+fresh oracle then its exact declaration cache. No acceptance or <=2x closure
+is claimed at this checkpoint.
+
+The full development-artifact CPython ABBA completed with all eight suite
+verdicts MATCH (`cpython-stack-tail-summary.json`): multiprocessing has 39
+passes per run; subprocess has 297 passes and 44 expected skips. Mean
+multiprocessing time is 9.3655 s base / 9.4755 s candidate (1.17% slower);
+subprocess is 59.0935 s / 58.9715 s (0.21% faster). Fresh Docker times are
+2.910 s and 20.877 s respectively. These results do not establish a broad
+suite-level speedup. The focused spawn gain remains the performance evidence.
+
+The added argument/auxv boundary test initially failed to compile because its
+helper lived in a sibling test module; a local auxv decoder fixes the test
+scope. The expanded full memory suite now passes 195/195
+(`stack-tail-mem-expanded.log`), including payload-page crossings, zero extent,
+clone isolation and overfull-stack rejection. The full serial runtime gate is
+in progress (`stack-tail-runtime.log`); signed public gates and final artifact
+refresh remain pending. No optimization acceptance is claimed yet.
+
+The full serial runtime suite completed successfully: 2,579 passed, 2 ignored,
+zero failures (`stack-tail-runtime.log`). `just conformance-probes` has now
+started, rebuilding/signing the CLI before the public guest gates; output is
+in `stack-tail-public-probes.log`. This later artifact still needs its own
+provenance and untraced refresh. Clippy/domain checks and scoped final cleanup
+also remain outstanding.
+
+The signed public gate has completed successfully (`stack-tail-public-probes.log`):
+876 unique generic arm64 rows, 25 dedicated cases, both entitlement negative
+controls, the CLI boundary and 46 retained tests (1 ignored). The existing
+30 amd64-musl report-only DIFFs and absent amd64-gnu probes remain outside
+this arm64 acceptance scope. The final CLI SHA-256 is
+`225ae58d75d6eb4f03adafe990be96b952809f8ff4274117b500531c86c9ddb6`, UUID
+`6977A88A-CC93-3C5F-8AB5-300F4926D8DA`; `stack-tail-gated-provenance.json`
+binds its source patch, signature, entitlement and DOF, and the release binary
+still matches that hash after the gate. It differs from the development
+artifact and must be timed separately.
+
+The first domain check reached host-authority compiler capture and refused the
+uncommitted tracked snapshot. It is not a successful domain receipt; rerun it
+after the validated code commit. Clippy is running. Final-artifact timing,
+profiling, domain closure and cleanup remain pending; the <=2x goal is active.
+
+Clippy passed (`stack-tail-clippy.log`). The final gated CLI's fresh serial
+Docker/base/candidate/candidate/base/Docker comparison also supports the change
+(`stack-tail-gated-refresh.json`, summary and native-arm64 image receipt):
+
+| Command | Docker ms | Entropy base ms | Gated stack ms | Gated stack / Docker |
+|---|---:|---:|---:|---:|
+| true | 0.17096 | 2.12874 | 1.74480 | 10.21x |
+| Python -S | 3.82332 | 11.37561 | 10.89461 | 2.85x |
+| Python | 4.64051 | 12.86964 | 12.43167 | 2.68x |
+
+The isolated paired gains are 18.04%, 4.23%, and 3.40%. Normal spawn remains
+3.15065 ms above twice the contemporaneous oracle. The final-artifact full
+CPython ABBA is running (`cpython-stack-tail-gated-abba.log`); earlier
+full-suite results belong to the development artifact and are not substituted
+for that run.
+
+A fresh 500-child CPU capture on the exact gated CLI completed naturally with
+zero errors/bound termination (`stack-tail-cpu.raw`, accompanying provenance).
+It retains 1,685 user and 2,243 kernel-mode samples; all 1,192 user return sites
+and 400 kernel-mode interrupted-user return sites validate against the binary
+at base 0x102880000. Host shared-cache symbols were resolved with dladdr on the
+same boot. Traced mean spawn is 14.995 ms versus the untraced 12.432 ms; use
+this capture only for attribution.
+
+No sampled stack contains `build_linux_initial_stack`, consistent with removal
+of its full-buffer zeroing. Inclusive COW windows still contain 447 user / 143
+kernel-mode samples. Within them alias registration appears in 70 user
+samples, while stage-1 maintenance appears in 49 user / 106 kernel samples.
+These are overlapping diagnostic counts, not additive wall-time savings.
+Copy leaves remain under exec preparation (12 user / 33 kernel-mode samples)
+and exec rebuilding (12 / 21), plus COW. The remaining exec copy sizes are
+still unqualified; do not revive the refuted full-stack-copy explanation.
+
+The next greedy question is whether fault count itself contains avoidable
+work: classify COW faults by anonymous versus private-file backing and qualify
+adjacent-page ownership before proposing a change. Any potential anonymous
+page optimization must preserve fork isolation, aliases, permissions and
+transaction rollback; private-file clean-neighbor visibility at Linux 4 KiB
+remains mandatory. Narrower TLB invalidation and alias/retirement collection
+changes were already measured without useful gains; this profile alone does
+not justify retrying them. No second runtime candidate is present yet.
+
+The final-artifact full CPython ABBA completed with all eight MATCH verdicts
+(`cpython-stack-tail-gated-summary.json`). Subprocess means are 58.8095 s base /
+58.8285 s candidate (effectively unchanged), Docker 20.570 s. Multiprocessing
+means are 9.035 s / 9.249 s, Docker 2.846 s: a 2.37% slowdown, consistent in
+direction with the development pair. An additional balanced eight-arm
+multiprocessing-only comparison also matches in every arm and measures
+9.4675 s base / 9.66775 s candidate (2.12% slower). The samples are retained in
+`cpython-stack-tail-mp-repeat-summary.json`. Do not describe full-suite
+performance as universally unchanged or improved: the small multiprocessing
+regression remains unresolved and must be carried into later comparisons.
+
+A qualified multiprocessing CPU sample (`stack-tail-mp-cpu.raw`) has 3,724 user
+and 4,245 kernel-mode samples, with 1,760/1,760 and 695/695 return sites
+validated. No sampled stack contains RegionPayload compatibility materialization
+or initial-stack construction. This weakens, but does not mathematically
+exclude, the hypothesis of repeated 8 MiB compatibility allocation causing the
+slowdown. It does not identify the actual cause. The focused spawn gain is
+retained as progress toward the primary objective with this explicit tradeoff;
+no broader performance closure is claimed.
+
+Source review sharpens the next COW hypothesis: `PrivateFileSource::ImmutableLower`
+already grants a host MAP_PRIVATE view because copy-up preserves the original
+inode, yet sparse preparation gives it the same page-granular COW arm and
+PrivateFileView inventory identity as Mutable. This may force unnecessary
+Carrick COW transactions for immutable interpreter pages. It requires direct
+signed guest proof of HVF-coherent host-private writes, immutable source
+preservation, independent mappings, fork isolation and 4 KiB discard behavior
+before changing the arming rule. Mutable clean-page visibility remains
+mandatory. No immutable-view optimization has been implemented at this point.
