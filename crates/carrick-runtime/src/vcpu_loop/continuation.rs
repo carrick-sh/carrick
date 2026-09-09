@@ -5,7 +5,7 @@
 //! to that Kernel identity; callbacks publish durable readiness and ask the
 //! scheduler to wake the exact thread, but never run guest code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
@@ -1653,7 +1653,7 @@ impl BlockedContinuation {
         };
         let (won, task_waker) = {
             let mut state = service.state.lock();
-            let Some(entry) = state.entries.get_mut(&binding.token.continuation) else {
+            let Some(mut entry) = state.registration_mut(binding.token.continuation) else {
                 return false;
             };
             if entry.token != binding.token
@@ -2691,6 +2691,15 @@ impl SignalReadinessProbe {
 }
 
 impl ReadinessProbe {
+    /// Whether a cycle of the carrier reactor has to touch this registration to
+    /// build its `pollfd` array. Everything else — a futex, a timer, a child
+    /// wait, a vfork release — is woken by its producer or by its deadline, and
+    /// re-examining it on every cycle is the O(live blocked tasks) scan
+    /// [`ReactorWorkSet`] exists to remove.
+    const fn contributes_pollfds(&self) -> bool {
+        matches!(self, Self::Fds { .. } | Self::HostWrite { .. })
+    }
+
     fn from_continuation(continuation: &BlockedContinuation) -> Self {
         let state = continuation.state();
         match &state.detail {
@@ -2901,11 +2910,205 @@ struct RegistrationEntry {
     signal_readiness: SignalReadinessProbe,
 }
 
+/// The reactor's O(1)-per-cycle view of the registration map.
+///
+/// The reactor used to derive its whole cycle by scanning EVERY registration
+/// three times — once to build the poll set and compute the nearest deadline,
+/// once to find expired deadlines, once to find record locks — while the rows
+/// that contribute a pollfd are a handful. Every futex, timer and child wait
+/// parked anywhere in the carrier sat in that scan, so ONE wake cost
+/// O(live blocked tasks), and the single reactor thread is on the wake path of
+/// every blocking guest syscall. Measured on `go-go_types` (main `251ab7b4f`):
+/// 107,881 reactor cycles, host `poll` width 1-4 in every one of them, and
+/// `BTreeMap::Values::next` the single hottest Carrick user symbol in the row's
+/// profile at 9.1% of carrier user CPU.
+///
+/// The three sets below carry exactly the three facts a cycle needs. They are
+/// maintained by [`CarrierWaitState`]'s mutators, which are the ONLY way to
+/// insert, remove or mutate a registration — a bare `entries.get_mut` would let
+/// a state transition desynchronise the index, so the source-shape test in this
+/// module refuses one.
+#[derive(Debug, Default)]
+struct ReactorWorkSet {
+    /// Enrolled registrations that contribute host pollfds.
+    pollable: BTreeSet<ContinuationId>,
+    /// Enrolled registrations carrying a deadline, ordered BY deadline, so the
+    /// nearest is the first key and the expired set is a prefix.
+    deadlines: BTreeSet<(Instant, ContinuationId)>,
+    /// Enrolled `RecordLock` registrations, each of which asks the cycle for a
+    /// 10 ms retry tick and a drive attempt.
+    record_locks: BTreeSet<ContinuationId>,
+}
+
+impl ReactorWorkSet {
+    /// Recompute this registration's membership from its CURRENT fields.
+    ///
+    /// Idempotent and total: it both adds and removes, so one call after any
+    /// mutation restores the invariant regardless of what changed.
+    fn sync(&mut self, id: ContinuationId, entry: &RegistrationEntry) {
+        let enrolled = entry.state == RegistrationState::Enrolled;
+        if enrolled && entry.probe.contributes_pollfds() {
+            self.pollable.insert(id);
+        } else {
+            self.pollable.remove(&id);
+        }
+        if let Some(deadline) = entry.deadline {
+            if enrolled {
+                self.deadlines.insert((deadline, id));
+            } else {
+                self.deadlines.remove(&(deadline, id));
+            }
+        }
+        if enrolled && matches!(entry.probe, ReadinessProbe::RecordLock { .. }) {
+            self.record_locks.insert(id);
+        } else {
+            self.record_locks.remove(&id);
+        }
+    }
+
+    /// Drop every trace of a registration that no longer exists.
+    fn forget(&mut self, id: ContinuationId, entry: &RegistrationEntry) {
+        self.pollable.remove(&id);
+        self.record_locks.remove(&id);
+        if let Some(deadline) = entry.deadline {
+            self.deadlines.remove(&(deadline, id));
+        }
+    }
+
+    fn nearest_deadline(&self) -> Option<Instant> {
+        self.deadlines.first().map(|(deadline, _)| *deadline)
+    }
+
+    /// Enrolled registrations whose deadline has already passed. The set is
+    /// ordered by deadline, so the expired rows are its prefix.
+    fn expired_at(&self, now: Instant) -> impl Iterator<Item = ContinuationId> + '_ {
+        self.deadlines
+            .iter()
+            .take_while(move |(deadline, _)| now >= *deadline)
+            .map(|(_, id)| *id)
+    }
+}
+
+/// A registration borrowed for mutation together with the index that must be
+/// resynchronised afterwards. `Drop` does the resync, so a caller cannot leave
+/// the reactor's view stale by taking an early return out of the borrow.
+struct IndexedEntryMut<'state> {
+    id: ContinuationId,
+    /// The two facts membership is derived from, read when the borrow opened.
+    /// `Drop` resynchronises only when one of them moved, so the many borrows
+    /// that merely READ a registration — every `ContinuationEventFuture::poll`,
+    /// every readiness recheck — cost nothing. The probe's discriminant is
+    /// carried rather than assumed constant: nothing in the type stops a future
+    /// caller from replacing a registration's probe in place.
+    membership: (RegistrationState, std::mem::Discriminant<ReadinessProbe>),
+    entry: &'state mut RegistrationEntry,
+    index: &'state mut ReactorWorkSet,
+}
+
+impl std::ops::Deref for IndexedEntryMut<'_> {
+    type Target = RegistrationEntry;
+    fn deref(&self) -> &Self::Target {
+        self.entry
+    }
+}
+
+impl std::ops::DerefMut for IndexedEntryMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.entry
+    }
+}
+
+impl Drop for IndexedEntryMut<'_> {
+    fn drop(&mut self) {
+        if membership_inputs(self.entry) != self.membership {
+            self.index.sync(self.id, self.entry);
+        }
+    }
+}
+
+/// Everything [`ReactorWorkSet::sync`] reads out of a registration. A borrow
+/// that leaves these untouched cannot have changed the registration's
+/// membership in any of the three sets.
+fn membership_inputs(
+    entry: &RegistrationEntry,
+) -> (RegistrationState, std::mem::Discriminant<ReadinessProbe>) {
+    (entry.state, std::mem::discriminant(&entry.probe))
+}
+
 #[derive(Debug, Default)]
 struct CarrierWaitState {
     entries: BTreeMap<ContinuationId, RegistrationEntry>,
+    reactor_work: ReactorWorkSet,
     #[cfg(test)]
     last_prepared: Option<ContinuationWakeToken>,
+}
+
+impl CarrierWaitState {
+    /// Publish a fresh registration. Returns the displaced row, if any — the
+    /// caller treats that as fatal.
+    fn insert_registration(
+        &mut self,
+        id: ContinuationId,
+        entry: RegistrationEntry,
+    ) -> Option<RegistrationEntry> {
+        let replaced = self.entries.insert(id, entry);
+        if let Some(replaced) = replaced.as_ref() {
+            self.reactor_work.forget(id, replaced);
+        }
+        if let Some(entry) = self.entries.get(&id) {
+            self.reactor_work.sync(id, entry);
+        }
+        replaced
+    }
+
+    /// Retire a registration and every index row derived from it.
+    fn remove_registration(&mut self, id: ContinuationId) -> Option<RegistrationEntry> {
+        let removed = self.entries.remove(&id);
+        if let Some(entry) = removed.as_ref() {
+            self.reactor_work.forget(id, entry);
+        }
+        removed
+    }
+
+    /// Borrow a registration for mutation; the index is resynchronised when the
+    /// guard drops, on every path.
+    fn registration_mut(&mut self, id: ContinuationId) -> Option<IndexedEntryMut<'_>> {
+        let Self {
+            entries,
+            reactor_work,
+            ..
+        } = self;
+        entries.get_mut(&id).map(|entry| IndexedEntryMut {
+            id,
+            membership: membership_inputs(entry),
+            entry,
+            index: reactor_work,
+        })
+    }
+
+    /// Cancel every registration still awaiting a wake, returning their wakers.
+    /// Bulk form of [`Self::registration_mut`] for service shutdown.
+    fn cancel_all_active(&mut self, cause: CancellationCause) -> Vec<Waker> {
+        let Self {
+            entries,
+            reactor_work,
+            ..
+        } = self;
+        let mut wakers = Vec::new();
+        for (id, entry) in entries.iter_mut() {
+            if matches!(
+                entry.state,
+                RegistrationState::Prepared | RegistrationState::Enrolled
+            ) {
+                entry.state = RegistrationState::Cancelled(cause);
+                if let Some(waker) = entry.task_waker.take() {
+                    wakers.push(waker);
+                }
+                reactor_work.sync(*id, entry);
+            }
+        }
+        wakers
+    }
 }
 
 #[derive(Debug)]
@@ -2918,6 +3121,11 @@ struct CarrierWaitServiceInner {
     control_read: OwnedFd,
     control_write: OwnedFd,
     reactor_poll_calls: AtomicU64,
+    /// Registrations the reactor has TOUCHED to build its poll sets, summed
+    /// over every cycle. The number a cycle adds is the reactor's per-wake
+    /// cost: it used to be the whole registration map, and this counter is how
+    /// a test proves it no longer is.
+    reactor_cycle_visits: AtomicU64,
     #[cfg(test)]
     fail_next_enroll: AtomicBool,
     #[cfg(test)]
@@ -2944,9 +3152,8 @@ impl CarrierWaitServiceInner {
         subscription: ProducerSubscription,
     ) {
         let mut state = self.state.lock();
-        let Some(entry) = state
-            .entries
-            .get_mut(&token.continuation)
+        let Some(mut entry) = state
+            .registration_mut(token.continuation)
             .filter(|entry| entry.token == token)
         else {
             return;
@@ -2993,7 +3200,7 @@ impl CarrierWaitServiceInner {
 
     fn cancel_exact(&self, token: ContinuationWakeToken, cause: CancellationCause) -> bool {
         let mut state = self.state.lock();
-        let Some(entry) = state.entries.get_mut(&token.continuation) else {
+        let Some(mut entry) = state.registration_mut(token.continuation) else {
             return false;
         };
         if entry.token != token
@@ -3006,6 +3213,7 @@ impl CarrierWaitServiceInner {
         }
         entry.state = RegistrationState::Cancelled(cause);
         let task_waker = entry.task_waker.take();
+        drop(entry);
         drop(state);
         self.nudge_reactor();
         if let Some(waker) = task_waker {
@@ -3019,16 +3227,16 @@ impl CarrierWaitServiceInner {
         token: ContinuationWakeToken,
     ) -> Result<(), ContinuationResumeError> {
         let mut state = self.state.lock();
-        let entry = state
-            .entries
-            .get_mut(&token.continuation)
+        let mut entry = state
+            .registration_mut(token.continuation)
             .filter(|entry| entry.token == token)
             .ok_or(ContinuationResumeError::MissingContinuation)?;
         if entry.state != RegistrationState::Ready {
             return Err(ContinuationResumeError::MissingContinuation);
         }
         entry.state = RegistrationState::Consumed;
-        state.entries.remove(&token.continuation);
+        drop(entry);
+        state.remove_registration(token.continuation);
         Ok(())
     }
 
@@ -3065,7 +3273,7 @@ impl CarrierWaitServiceInner {
     ) -> WakePublishReceipt {
         let (won, task_waker) = {
             let mut state = self.state.lock();
-            let Some(entry) = state.entries.get_mut(&token.continuation) else {
+            let Some(mut entry) = state.registration_mut(token.continuation) else {
                 return WakePublishReceipt::rejected();
             };
             if entry.token != token
@@ -3109,7 +3317,11 @@ impl CarrierWaitServiceInner {
                 return;
             }
             let control_fd = inner.control_read.as_raw_fd();
-            let (mut pollfds, sources, nearest_deadline) = {
+            // The cycle reads the reactor work set, never the registration map:
+            // the nearest deadline is one lookup and only the pollable rows are
+            // visited, so a carrier with thousands of tasks parked on futexes,
+            // timers and child waits costs the same here as one with none.
+            let (mut pollfds, sources, nearest_deadline, registrations, visited) = {
                 let state = inner.state.lock();
                 let mut pollfds = vec![libc::pollfd {
                     fd: control_fd,
@@ -3117,17 +3329,13 @@ impl CarrierWaitServiceInner {
                     revents: 0,
                 }];
                 let mut sources = Vec::new();
-                let mut nearest_deadline: Option<Instant> = None;
-                for entry in state
-                    .entries
-                    .values()
-                    .filter(|entry| entry.state == RegistrationState::Enrolled)
-                {
-                    if let Some(deadline) = entry.deadline {
-                        nearest_deadline = Some(
-                            nearest_deadline.map_or(deadline, |current| current.min(deadline)),
-                        );
-                    }
+                let mut nearest_deadline = state.reactor_work.nearest_deadline();
+                let mut visited = 0u32;
+                for id in &state.reactor_work.pollable {
+                    let Some(entry) = state.entries.get(id) else {
+                        continue;
+                    };
+                    visited = visited.saturating_add(1);
                     match &entry.probe {
                         ReadinessProbe::Fds { registrations, .. } => {
                             for registration in registrations {
@@ -3151,20 +3359,32 @@ impl CarrierWaitServiceInner {
                                 Arc::clone(completion),
                             ));
                         }
-                        ReadinessProbe::RecordLock { .. } => {
-                            let retry = Instant::now() + Duration::from_millis(10);
-                            nearest_deadline =
-                                Some(nearest_deadline.map_or(retry, |current| current.min(retry)));
-                        }
                         _ => {}
                     }
                 }
-                (pollfds, sources, nearest_deadline)
+                // A record lock has no readiness fd: it is retried on a tick, so
+                // its presence alone bounds the poll timeout.
+                if !state.reactor_work.record_locks.is_empty() {
+                    let retry = Instant::now() + Duration::from_millis(10);
+                    nearest_deadline =
+                        Some(nearest_deadline.map_or(retry, |current| current.min(retry)));
+                }
+                let registrations = u32::try_from(state.entries.len()).unwrap_or(u32::MAX);
+                (pollfds, sources, nearest_deadline, registrations, visited)
             };
             let timeout_ms = nearest_deadline.map_or(-1, |deadline| {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX)
             });
+            inner
+                .reactor_cycle_visits
+                .fetch_add(u64::from(visited), Ordering::Relaxed);
+            crate::probes::hvpatch_reactor_cycle(
+                registrations,
+                visited,
+                u32::try_from(pollfds.len()).unwrap_or(u32::MAX),
+                timeout_ms,
+            );
             drop(inner);
             let result = unsafe {
                 libc::poll(
@@ -3251,13 +3471,9 @@ impl CarrierWaitServiceInner {
             let expired = {
                 let state = inner.state.lock();
                 state
-                    .entries
-                    .values()
-                    .filter(|entry| {
-                        entry.state == RegistrationState::Enrolled
-                            && entry.deadline.is_some_and(|deadline| now >= deadline)
-                    })
-                    .map(|entry| entry.token)
+                    .reactor_work
+                    .expired_at(now)
+                    .filter_map(|id| state.entries.get(&id).map(|entry| entry.token))
                     .collect::<Vec<_>>()
             };
             for token in expired {
@@ -3266,12 +3482,11 @@ impl CarrierWaitServiceInner {
             let record_locks = {
                 let state = inner.state.lock();
                 state
-                    .entries
-                    .values()
-                    .filter_map(|entry| {
-                        if entry.state != RegistrationState::Enrolled {
-                            return None;
-                        }
+                    .reactor_work
+                    .record_locks
+                    .iter()
+                    .filter_map(|id| {
+                        let entry = state.entries.get(id)?;
                         let ReadinessProbe::RecordLock { lock, completion } = &entry.probe else {
                             return None;
                         };
@@ -3324,22 +3539,7 @@ impl Drop for CarrierWaitService {
         }
         let wakers = {
             let mut state = self.inner.state.lock();
-            state
-                .entries
-                .values_mut()
-                .filter_map(|entry| {
-                    if matches!(
-                        entry.state,
-                        RegistrationState::Prepared | RegistrationState::Enrolled
-                    ) {
-                        entry.state =
-                            RegistrationState::Cancelled(CancellationCause::ServiceShutdown);
-                        entry.task_waker.take()
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
+            state.cancel_all_active(CancellationCause::ServiceShutdown)
         };
         self.inner.shutdown.store(true, Ordering::Release);
         self.inner.nudge_reactor();
@@ -3366,6 +3566,7 @@ impl CarrierWaitService {
             control_read,
             control_write,
             reactor_poll_calls: AtomicU64::new(0),
+            reactor_cycle_visits: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_enroll: AtomicBool::new(false),
             #[cfg(test)]
@@ -3400,7 +3601,7 @@ impl CarrierWaitService {
         let probe = ReadinessProbe::from_continuation(continuation);
         let signal_readiness = SignalReadinessProbe::from_continuation(continuation);
         let mut state = self.inner.state.lock();
-        let replaced = state.entries.insert(
+        let replaced = state.insert_registration(
             token.continuation,
             RegistrationEntry {
                 token,
@@ -3444,15 +3645,15 @@ impl CarrierWaitService {
             return Err(WaitServiceError::StaleRegistration);
         }
         let mut state = self.inner.state.lock();
-        let entry = state
-            .entries
-            .get_mut(&registration.token.continuation)
+        let mut entry = state
+            .registration_mut(registration.token.continuation)
             .filter(|entry| entry.token == registration.token)
             .ok_or(WaitServiceError::StaleRegistration)?;
         if entry.state == RegistrationState::Prepared {
             entry.state = RegistrationState::Enrolled;
         }
         registration.enrolled = true;
+        drop(entry);
         drop(state);
         self.install_producer_subscriptions(registration.token)?;
         // A producer edge may already be reflected in authoritative state by
@@ -3604,9 +3805,8 @@ impl CarrierWaitService {
     ) -> Result<Option<ContinuationEvent>, WaitServiceError> {
         let event = {
             let mut state = self.inner.state.lock();
-            let entry = state
-                .entries
-                .get_mut(&registration.token.continuation)
+            let mut entry = state
+                .registration_mut(registration.token.continuation)
                 .filter(|entry| entry.token == registration.token)
                 .ok_or(WaitServiceError::StaleRegistration)?;
             if !matches!(
@@ -3701,6 +3901,11 @@ impl CarrierWaitService {
     }
 
     #[cfg(test)]
+    fn reactor_cycle_visits(&self) -> u64 {
+        self.inner.reactor_cycle_visits.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     fn nudge_reactor_for_test(&self) {
         self.inner.nudge_reactor();
     }
@@ -3724,9 +3929,8 @@ impl Future for ContinuationEventFuture {
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = self.service.state.lock();
-        let Some(entry) = state
-            .entries
-            .get_mut(&self.token.continuation)
+        let Some(mut entry) = state
+            .registration_mut(self.token.continuation)
             .filter(|entry| entry.token == self.token)
         else {
             return Poll::Ready(Err(WaitServiceError::StaleRegistration));
@@ -3739,7 +3943,8 @@ impl Future for ContinuationEventFuture {
                     .ok_or(WaitServiceError::StaleRegistration),
             ),
             RegistrationState::Cancelled(cause) => {
-                state.entries.remove(&self.token.continuation);
+                drop(entry);
+                state.remove_registration(self.token.continuation);
                 Poll::Ready(Err(WaitServiceError::Cancelled(cause)))
             }
             RegistrationState::Consumed => Poll::Ready(Err(WaitServiceError::StaleRegistration)),
@@ -8789,6 +8994,226 @@ mod tests {
             .expect("registration timing");
         assert_eq!(state.deadline(), None);
         assert!(!state.has_periodic_probe());
+    }
+
+    /// The reactor's per-cycle cost must not grow with the number of parked
+    /// tasks. Before `ReactorWorkSet`, one cycle scanned every registration
+    /// three times — poll set, expired deadlines, record locks — so a carrier
+    /// with 256 sleepers paid 256 row visits on the wake path of the ONE
+    /// registration that actually had a readiness fd. Ablate the index (walk
+    /// `state.entries` again in the cycle) and this fails with visits ~=257.
+    /// The index is only sound if it answers exactly what the full scan did.
+    /// Every question the reactor asks is checked against the scan it replaced,
+    /// across the state transitions that move a row in or out of the work set.
+    #[test]
+    fn the_reactor_work_set_answers_exactly_what_a_full_scan_would() {
+        fn scan_nearest(state: &CarrierWaitState) -> Option<Instant> {
+            state
+                .entries
+                .values()
+                .filter(|entry| entry.state == RegistrationState::Enrolled)
+                .filter_map(|entry| entry.deadline)
+                .min()
+        }
+        fn scan_expired(state: &CarrierWaitState, now: Instant) -> Vec<ContinuationId> {
+            let mut ids: Vec<_> = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.state == RegistrationState::Enrolled
+                        && entry.deadline.is_some_and(|deadline| now >= deadline)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        }
+        fn scan_pollable(state: &CarrierWaitState) -> Vec<ContinuationId> {
+            let mut ids: Vec<_> = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.state == RegistrationState::Enrolled && entry.probe.contributes_pollfds()
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        }
+        fn agree(state: &CarrierWaitState, now: Instant, at: &str) {
+            assert_eq!(
+                state.reactor_work.nearest_deadline(),
+                scan_nearest(state),
+                "nearest deadline disagrees with a full scan at {at}"
+            );
+            assert_eq!(
+                state.reactor_work.expired_at(now).collect::<Vec<_>>(),
+                scan_expired(state, now),
+                "expired set disagrees with a full scan at {at}"
+            );
+            assert_eq!(
+                state
+                    .reactor_work
+                    .pollable
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                scan_pollable(state),
+                "pollable set disagrees with a full scan at {at}"
+            );
+        }
+
+        let (kernel, context) = bootstrap(15_373);
+        let generation = publish(&context, 0x707);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
+        let now = Instant::now();
+        let mut owned = Vec::new();
+        for index in 0..8 {
+            let continuation = if index % 2 == 0 {
+                BlockedContinuation::from_dispatch_outcome(
+                    DispatchOutcome::WaitOnSleep {
+                        duration: Duration::from_millis(10 * (index + 1)),
+                        remaining: None,
+                    },
+                    capture(&context, generation, ContinuationBackend::Hvpatch),
+                )
+            } else {
+                BlockedContinuation::from_dispatch_outcome(
+                    DispatchOutcome::WaitOnFds {
+                        fds: WaitFds::empty(),
+                        timeout: None,
+                        on_timeout: 0,
+                        sig_mask: WaitSigMask::NONE,
+                    },
+                    capture(&context, generation, ContinuationBackend::Hvpatch),
+                )
+            }
+            .expect("continuation");
+            let registration = service.prepare_registration(&continuation);
+            owned.push((continuation, registration));
+        }
+        agree(&service.inner.state.lock(), now, "prepared");
+        for (_, registration) in owned.iter_mut() {
+            service.enroll(registration).expect("enroll");
+        }
+        agree(&service.inner.state.lock(), now, "enrolled");
+        agree(
+            &service.inner.state.lock(),
+            now + Duration::from_secs(1),
+            "enrolled, every deadline passed",
+        );
+        for (_, registration) in owned.iter().take(3) {
+            service.inner.cancel_exact(
+                registration.wake_token(),
+                CancellationCause::ServiceShutdown,
+            );
+        }
+        agree(&service.inner.state.lock(), now, "three cancelled");
+        let tokens: Vec<_> = owned
+            .iter()
+            .skip(3)
+            .map(|(_, registration)| registration.wake_token())
+            .collect();
+        for token in tokens {
+            service.inner.publish_event(token, ContinuationEvent::Ready);
+        }
+        agree(&service.inner.state.lock(), now, "the rest made ready");
+        {
+            let mut state = service.inner.state.lock();
+            let ids: Vec<_> = state.entries.keys().copied().collect();
+            for id in ids {
+                state.remove_registration(id);
+            }
+            assert!(state.reactor_work.pollable.is_empty());
+            assert!(state.reactor_work.deadlines.is_empty());
+            assert!(state.reactor_work.record_locks.is_empty());
+            agree(&state, now, "all removed");
+        }
+        drop(owned);
+    }
+
+    /// The index is only maintained because every mutation goes through
+    /// `CarrierWaitState`. A bare `entries.get_mut`/`insert`/`remove` outside
+    /// those three mutators is how it would silently go stale, so the shape is
+    /// asserted rather than left to review.
+    #[test]
+    fn every_registration_mutation_goes_through_the_indexed_mutators() {
+        let source = include_str!("continuation.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production half of the module");
+        for (needle, allowed) in [
+            ("entries.get_mut(", 1usize),
+            ("entries.insert(", 1),
+            ("entries.remove(", 1),
+            ("entries.values_mut(", 0),
+            ("entries.iter_mut(", 1),
+        ] {
+            assert_eq!(
+                production.matches(needle).count(),
+                allowed,
+                "`{needle}` must appear only inside CarrierWaitState's indexed mutators"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reactor_cycle_visits_only_its_pollable_registrations() {
+        let (kernel, context) = bootstrap(15_372);
+        let generation = publish(&context, 0x706);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
+        let mut owned = Vec::new();
+        // 256 timer-only parks: no readiness fd, nothing for a poll set.
+        for _ in 0..256 {
+            let continuation = BlockedContinuation::from_dispatch_outcome(
+                DispatchOutcome::WaitOnSleep {
+                    duration: Duration::from_secs(3_600),
+                    remaining: None,
+                },
+                capture(&context, generation, ContinuationBackend::Hvpatch),
+            )
+            .expect("timer continuation");
+            let mut registration = service.prepare_registration(&continuation);
+            service.enroll(&mut registration).expect("enroll");
+            owned.push((continuation, registration));
+        }
+        // One pollable park, so the cycle has real work to do.
+        let pollable = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("pollable continuation");
+        let mut pollable_registration = service.prepare_registration(&pollable);
+        service
+            .enroll(&mut pollable_registration)
+            .expect("enroll pollable");
+
+        let before_visits = service.reactor_cycle_visits();
+        let before_calls = service.reactor_poll_calls();
+        let observed = service.observe_next_reactor_poll();
+        service.nudge_reactor_for_test();
+        observed.wait();
+        assert!(
+            service.reactor_poll_calls() > before_calls,
+            "reactor did not complete a cycle"
+        );
+        let visits = service.reactor_cycle_visits() - before_visits;
+        assert!(
+            visits <= 8,
+            "a reactor cycle visited {visits} registrations with 257 enrolled: \
+             the poll set is being rebuilt by scanning the whole map"
+        );
+        drop(pollable);
+        drop(pollable_registration);
+        drop(owned);
     }
 
     #[test]

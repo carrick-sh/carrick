@@ -5564,6 +5564,15 @@ mod real {
         ///    held (the dispatcher host-alias phase; see the ABBA fixed by
         ///    hoisting the `MADV_DONTNEED` pause). `wait_us` is the budget.
         ///  * `pt__pause__end`: the pause was released and siblings resumed. `tid`.
+        /// One carrier wait-reactor cycle, fired just before the reactor's
+        /// host `poll(2)`. `registrations` is the whole registration map,
+        /// `visited` is how many of those rows the cycle actually touched to
+        /// build its poll set, `pollfds` is the resulting array width and
+        /// `timeout_ms` the computed poll timeout. `visited` growing with
+        /// `registrations` is the O(live blocked tasks) shape: every futex,
+        /// timer and child wait parked in the carrier re-scanned on the wake
+        /// path of every blocking guest syscall.
+        fn hvpatch__reactor__cycle(_: u32, _: u32, _: u32, _: i32) {}
         fn pt__pause__begin(_: i32, _: i32, _: i32, _: i32) {}
         fn pt__pause__ready(_: i32, _: i32, _: i64) {}
         fn pt__pause__timeout(_: i32, _: i64) {}
@@ -7393,6 +7402,10 @@ mod real {
         carrick_usdt::supervisor__child__exit!(|| (pid, status));
     }
 
+    pub fn hvpatch_reactor_cycle(registrations: u32, visited: u32, pollfds: u32, timeout_ms: i32) {
+        carrick_usdt::hvpatch__reactor__cycle!(|| (registrations, visited, pollfds, timeout_ms));
+    }
+
     pub fn pt_pause_begin(
         coordinator_tid: i32,
         other_in_guest: i32,
@@ -8364,6 +8377,12 @@ mod stub {
     stub!(supervisor_child_ready(runtime_pid: i32));
     stub!(supervisor_foreground_pgrp(pgid: i32, errno: i32));
     stub!(supervisor_child_exit(pid: i32, status: i32));
+    stub!(hvpatch_reactor_cycle(
+        registrations: u32,
+        visited: u32,
+        pollfds: u32,
+        timeout_ms: i32
+    ));
     stub!(pt_pause_begin(
         coordinator_tid: i32,
         other_in_guest: i32,
