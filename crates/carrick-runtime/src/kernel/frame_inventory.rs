@@ -48,6 +48,50 @@ pub struct FrameInventorySnapshot {
 #[derive(Debug, Default)]
 pub struct FrameInventoryAuthority {
     state: Mutex<InventoryState>,
+    entropy: Mutex<ProvenanceEntropyBatch>,
+}
+
+/// Eight independent OS-generated tokens; consumed slots are cleared and
+/// cached bytes are discarded if the authority is inherited by a host fork.
+#[derive(Default)]
+struct ProvenanceEntropyBatch {
+    tokens: [[u8; 32]; 8],
+    remaining: usize,
+    owner_pid: u32,
+}
+
+impl std::fmt::Debug for ProvenanceEntropyBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvenanceEntropyBatch")
+            .field("remaining", &self.remaining)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProvenanceEntropyBatch {
+    fn next(
+        &mut self,
+        pid: u32,
+        mut fill: impl FnMut(&mut [u8]) -> Result<(), FrameInventoryReserveError>,
+    ) -> Result<[u8; 32], FrameInventoryReserveError> {
+        if self.owner_pid != pid {
+            self.tokens.fill([0; 32]);
+            self.remaining = 0;
+            self.owner_pid = pid;
+        }
+        if self.remaining == 0 {
+            if let Err(error) = fill(self.tokens.as_flattened_mut()) {
+                // An entropy source may fail after a partial write. None of
+                // those bytes may become a later transaction's provenance.
+                self.tokens.fill([0; 32]);
+                return Err(error);
+            }
+            self.remaining = self.tokens.len();
+        }
+        let index = self.tokens.len() - self.remaining;
+        self.remaining -= 1;
+        Ok(std::mem::take(&mut self.tokens[index]))
+    }
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -220,8 +264,13 @@ impl FrameInventoryAuthority {
         mapping_candidates: usize,
         event_capacity: FrameEventCapacity,
     ) -> Result<FrameInventoryReservation, FrameInventoryReserveError> {
-        let (reservation, record) =
-            prepare_reservation(ids, frame_candidates, mapping_candidates, event_capacity)?;
+        let (reservation, record) = prepare_reservation(
+            ids,
+            frame_candidates,
+            mapping_candidates,
+            event_capacity,
+            &self.entropy,
+        )?;
         let transaction = reservation.transaction();
         if self
             .state
@@ -911,6 +960,7 @@ fn prepare_reservation(
     frame_candidates: usize,
     mapping_candidates: usize,
     event_capacity: FrameEventCapacity,
+    entropy: &Mutex<ProvenanceEntropyBatch>,
 ) -> Result<(FrameInventoryReservation, ReservationRecord), FrameInventoryReserveError> {
     if frame_candidates > event_capacity.get() || mapping_candidates > event_capacity.get() {
         return Err(FrameInventoryReserveError::CandidateCountExceedsEvents);
@@ -932,9 +982,9 @@ fn prepare_reservation(
         .try_reserve_exact(mapping_candidates)
         .map_err(|_| FrameInventoryReserveError::AllocationFailed)?;
     let transaction = ids.transaction_id()?;
-    let mut provenance_bytes = [0_u8; 32];
-    getrandom::fill(&mut provenance_bytes)
-        .map_err(|_| FrameInventoryReserveError::EntropyUnavailable)?;
+    let provenance_bytes = entropy.lock().next(std::process::id(), |bytes| {
+        getrandom::fill(bytes).map_err(|_| FrameInventoryReserveError::EntropyUnavailable)
+    })?;
     let provenance = FrameInventoryProvenance::from_kernel_entropy(provenance_bytes);
     let batch = FrameInventoryBatch::prepare(transaction, event_capacity)?;
     for _ in 0..frame_candidates {
@@ -1073,6 +1123,61 @@ impl FrameInventoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_entropy_batch_refills_once_per_eight_tokens() {
+        let mut batch = ProvenanceEntropyBatch::default();
+        let mut fills = 0;
+        let mut seen = BTreeSet::new();
+        for _ in 0..17 {
+            let token = batch
+                .next(1, |bytes| {
+                    fills += 1;
+                    for (i, chunk) in bytes.chunks_mut(32).enumerate() {
+                        chunk.fill((fills * 8 + i) as u8);
+                    }
+                    Ok(())
+                })
+                .expect("entropy fixture");
+            assert!(seen.insert(token), "tokens are consumed only once");
+        }
+        assert_eq!(fills, 3, "17 tokens need exactly three OS batches");
+        assert_eq!(batch.remaining, 7);
+        assert_eq!(batch.tokens[0], [0; 32], "consumed slot is cleared");
+    }
+
+    #[test]
+    fn provenance_entropy_batch_discards_inherited_and_failed_bytes() {
+        let mut batch = ProvenanceEntropyBatch::default();
+        assert_eq!(
+            batch
+                .next(10, |bytes| {
+                    bytes.fill(1);
+                    Ok(())
+                })
+                .unwrap(),
+            [1; 32]
+        );
+        let failed = batch.next(11, |bytes| {
+            bytes[..16].fill(2);
+            Err(FrameInventoryReserveError::EntropyUnavailable)
+        });
+        assert_eq!(failed, Err(FrameInventoryReserveError::EntropyUnavailable));
+        assert_eq!(batch.remaining, 0);
+        assert!(batch.tokens.iter().all(|token| *token == [0; 32]));
+        assert_eq!(
+            batch
+                .next(11, |bytes| {
+                    bytes.fill(3);
+                    Ok(())
+                })
+                .unwrap(),
+            [3; 32]
+        );
+        assert_eq!(batch.remaining, 7);
+        assert_eq!(batch.owner_pid, 11);
+        assert_eq!(batch.tokens[0], [0; 32]);
+    }
 
     fn nz(raw: u64) -> NonZeroU64 {
         NonZeroU64::new(raw).expect("nonzero fixture value")
