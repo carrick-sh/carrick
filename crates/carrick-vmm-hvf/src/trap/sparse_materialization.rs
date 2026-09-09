@@ -132,7 +132,12 @@ pub(super) fn prepare(
         let physical_host = host_mapping.as_ptr();
         let semantic_host = unsafe { physical_host.add(physical_offset as usize) };
         let (stage2_perms, inventory_backing, page_granular_arm) = match backing {
-            SparseExtentBacking::Anon | SparseExtentBacking::SeededAnon { .. } => (
+            SparseExtentBacking::Anon
+            | SparseExtentBacking::SeededAnon { .. }
+            | SparseExtentBacking::FileView {
+                source: carrick_guest_mem::PrivateFileSource::ImmutableLower,
+                ..
+            } => (
                 applevisor::memory::MemPerms::ReadWriteExec,
                 HvfVmState::private_backing_identity(),
                 false,
@@ -140,9 +145,10 @@ pub(super) fn prepare(
             SparseExtentBacking::FileView { .. } => {
                 // Mutable files use a writable host MAP_SHARED view so HVF can
                 // access the VM object and clean pages follow file writes.
-                // Immutable lower files use a writable MAP_PRIVATE view. In
-                // both cases stage-1 stays page-granular COW armed, so guest
-                // and foreign writes first create Carrick-owned private pages.
+                // Stage-1 remains page-granular COW armed so guest and foreign
+                // writes first create Carrick-owned private pages. Immutable
+                // lower views above already have private host backing; ordinary
+                // fork COW still protects those owners when another MM shares them.
                 (
                     applevisor::memory::MemPerms::ReadWriteExec,
                     HvfVmState::private_file_view_backing_identity(),

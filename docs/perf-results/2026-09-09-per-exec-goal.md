@@ -1192,3 +1192,261 @@ signed guest proof of HVF-coherent host-private writes, immutable source
 preservation, independent mappings, fork isolation and 4 KiB discard behavior
 before changing the arming rule. Mutable clean-page visibility remains
 mandatory. No immutable-view optimization has been implemented at this point.
+
+### Stack closure and immutable-view qualification blocker
+
+The stack implementation is committed as `0809c1f91`. Source-location-only
+inventory reconciliation is committed as `6889e6e4a`: 16 positions and their
+rationale line references changed, with unchanged operation counts and
+classifications (`stack-tail-inventory-diff-check.json`). The complete
+`just lint-domains` passes (`stack-tail-lint-domains-reconciled.log`), retaining
+the macOS-subset scope of its host-authority capture. Final scoped cleanup
+found no Carrick processes (`stack-tail-final-cleanup.json`). The primary
+measurement remains 2.68x, with the recorded ~2% multiprocessing regression
+still unresolved; neither the per-exec nor wider ecosystem goal is complete.
+
+The proposed immutable-view optimization has NOT been implemented. Its new
+signed conformance-next fixture, `immutable_private_file.rs`, maps an existing
+immutable lower `/bin/sh` privately and checks source preservation, independent
+views, fork isolation and a 4 KiB MADV_DONTNEED with a dirty neighbor. Native
+arm64 Docker passes (`immutable-private-file-values-oracle.json`, source hash
+bound). The unchanged runtime fails specifically at discard restoration:
+Carrick returns byte **0**, while the source/Docker value is **105**
+(`immutable-private-file-baseline-values.log`). All earlier assertions in that
+fixture pass; the signed negative control passes and scoped cleanup is zero.
+The initial failure without value diagnostics is separately retained in
+`immutable-private-file-baseline-embed.log`.
+
+Source identifies the existing cause in the dispatcher MADV_DONTNEED path:
+`meta.writable && !meta.shared` invokes zero_backing even for private FILE
+VMAs. Restoring source bytes must preserve the mapping's original file identity
+after fd close/unlink, not reopen its pathname. Existing shared-file alias
+metadata already retains FileDescription ownership; private mmap currently
+has a snapshot helper but lacks equivalent durable source ownership in
+MemState. Deferred private-file recipes are removed as ranges materialize,
+so they alone cannot serve later discard. The correction must preserve dirty
+neighbors, fork isolation, mutable clean-page visibility, offsets and partial
+unmap/remap metadata, and work for read-only/PROT_NONE ranges. Keep this red
+fixture; do not remove the discard assertion to make the optimization gate
+pass. Diagnose/fix this contract before accepting a changed immutable COW rule.
+
+
+### Private-file discard lifetime correction in progress
+
+The extended native-Docker-passing fixture exposed two more concrete issues:
+restored mprotect permissions leave proc-map fragments that mremap refused
+with EFAULT, then closing Python mmap's internal duplicate fd destroyed the
+OpenDescription backing while the moved mapping still needed it (EBADF).
+Retaining an Arc<FileDescription> alone is not a backing lifetime guarantee:
+on_last_fd_ref replaced its payload with Closed.
+
+The current uncommitted correction retains an explicit MappedFileReference
+across mapping fragments/fork/remap. Logical fd counts remain distinct; final
+fd-close notifications still fire immediately, and backing resource cleanup
+waits for both descriptors and mapping references to disappear. Exec reset
+replaces MemState, releasing its mapping registry. Two lifecycle unit tests
+pass (mapped-file-reference-unit.log). The signed extended guest now passes
+(private-file-discard-lifetime-embed-3.log), including the previously failing
+close/unlink/remap/partial-unmap sequence, with the entitlement negative
+control passing and zero scoped leftovers. Prior failing receipts remain
+private-file-discard-lifetime-embed.log (EFAULT) and
+private-file-discard-lifetime-embed-2.log (EBADF).
+
+This is not acceptance or a performance gain. The immutable-view arming
+optimization remains unimplemented. Remaining correction review includes
+boot ELF private-file provenance, noncongruent direct-view fallback semantics,
+transaction failure behavior, and remap metadata coverage; broad runtime,
+signed conformance, lint and exact-artifact performance gates remain due.
+
+The combined signed private_file filter passes all selected cases across three
+executables, including existing mutable clean-page visibility/fork isolation,
+both new discard cases, and the negative control; cleanup is zero
+(private-file-discard-focused.log). The full serial runtime suite passes
+2,581 tests with two ignored (private-file-discard-runtime-full.log). The
+candidate patch and fixture hashes are preserved in
+private-file-discard-lifetime-checkpoint.json and its companion patch. These
+passes qualify the lifetime correction so far; the outstanding review and
+broader acceptance requirements above remain open.
+
+
+### Immutable lower COW experiment: isolated gain, acceptance still open
+
+Sparse preparation now experimentally classifies ImmutableLower host-private
+views as private inventory backing without initial page-granular COW arming.
+Mutable file views retain their existing PrivateFileView identity and 4 KiB
+COW; ordinary fork COW remains in force. The signed private_file focus passes
+all four selected guest cases across three executables plus the negative
+control, with zero scoped leftovers (immutable-unarmed-focused.log).
+
+Two untraced serial Docker/base/candidate/candidate/base/Docker comparisons
+show a substantial effect. The first includes the discard correction versus
+the accepted stack artifact: normal spawn 12.37885 -> 9.23020 ms, Docker
+4.65950 ms (1.98094x). The second isolates only immutable arming, retaining the
+same discard/lifetime correction in both binaries: normal spawn 12.23281 ->
+9.14226 ms, Docker 4.63781 ms (1.97125x, 25.26% reduction). Python -S is
+10.91182 -> 7.79380 ms; /bin/true is 1.76122 -> 1.55999 ms. Raw batches and
+artifact hashes are in immutable-unarmed-isolated.json; summary is adjacent.
+The candidate SHA is 0d75939624e00eb1ae4fbfa0623a1a635e8ff8f6b5570c5e6d83d51dc4d253c9;
+control SHA is dacc52dee0de91bcf6550c4440e6845255f900c9966b62234ae32cffd6936760.
+Both have recorded signature/CDHash, UUID, entitlement, DOF and source patch.
+
+These are promising threshold-crossing screens, not goal completion. The
+full CPython ABBA is running (cpython-immutable-unarmed-abba.log), with a
+fresh serial oracle phase. COW-count attribution, remaining discard API
+correctness review, full signed probes, source/lint inventories and final
+exact-artifact qualification remain required. The existing materialization
+API refuses guest/file offsets noncongruent at host page size, and can retire
+prior aliases before a later materialization error; the new discard caller's
+use of it must not be declared transactionally complete without addressing
+those cases. No commit or broader acceptance is claimed here.
+
+
+The full CPython ABBA is complete: all eight verdicts MATCH. Multiprocessing
+means are 9.4185 s control / 7.8260 s candidate (16.91% improvement); subprocess
+means are 58.6695 s / 57.0955 s (2.68% improvement). The fresh oracle measures
+2.839 s and 20.555 s respectively. Both full suites still exceed 2x overall;
+the 1.97x result is the scoped normal-spawn microbenchmark, not ecosystem
+closure. See cpython-immutable-unarmed-summary.json. Captured runtime source
+patches differ only in sparse_materialization.rs, confirming isolated attribution.
+
+The original startup census rejects the optimized artifact because it
+requires nonzero sampled COW windows. Preserve that rejected capture; do not
+cite it as a passing profiler receipt. The new durable
+scripts/dtrace/hvpatch-exec-cow-counts.d requires repeated balanced execs,
+live guest fault events, balanced COW phases, successful natural exit and zero
+errors, while permitting zero COW when paired with a positive control. Both
+artifacts pass: for 200 child spawns and 201 balanced exec lifecycles, control
+records 64,735 stage2/stage1/commit events each; candidate records zero in all
+three phases. Fault totals fall from 111,780 to 47,045, exactly the removed
+COW count. No errors or bounded exits occur. The single /bin/true negative
+control rejects its zero exec-lifecycle population as required. Receipts:
+immutable-counts-*.raw and corresponding provenance/output files. Traced
+wall times are not performance evidence. Final checkpoint cleanup finds no
+Carrick processes, and target/release/carrick is the exact candidate artifact
+(immutable-unarmed-checkpoint-cleanup.json).
+
+The goal stays active. This turn establishes a large, isolated performance
+gain and its mechanism, with full CPython correctness preserved. Remaining
+acceptance: finish the discard semantic/failure review; full signed public
+probes and HVF host gates on the resulting source; clippy/domain inventory
+checks and narrow commits; then final exact-artifact performance refresh.
+No push is authorized or performed.
+
+
+### Shifted private-file discard review: new red acceptance case
+
+The new private_file_discard_shifted.py fixture moves an 8-page private file
+mapping by a 4 KiB-incongruent offset, dirties one page, discards it, then
+writes the source again. All three source/destination variants pass native
+Docker (private-file-discard-shifted-variants-oracle.json, final source hash):
+anonymous temp file + shared destination, named file + shared destination,
+and named file + private destination. Carrick restores the first source byte
+97 but fails to observe the subsequent write 98 with a shared destination.
+The dirty neighbor remains preserved. Keep this red assertion.
+
+An experimental layout correction now derives a file view's semantic host/IPA
+delta from file offset rather than guest VA and removes the congruence guard
+in the HVF materialization entry. Non-identity stage-1 can represent these
+separately aligned 4 KiB domains. This alone does NOT fix the shared-destination
+case. With that candidate, the private-destination variant passes, whereas
+both named and anonymous sources fail with a shared destination. The address
+receipt identifies source 0x6000bb4000 and destination 0x9000001000: the latter
+is the shared aperture, outside the private file-view API's accepted mmap
+arena. This refutes source naming as the cause and identifies a second
+eligibility boundary beyond alignment. The remaining fix must support private
+file restoration at the moved semantic VA without treating shared aperture
+backing as privately owned or weakening publication/retirement guarantees.
+
+Receipts: private-file-discard-shifted-embed.log (original failure),
+private-file-discard-shifted-fixed.log (alignment change insufficient),
+private-file-discard-shifted-named.log,
+private-file-discard-shifted-private-dest.log (pass), and
+private-file-discard-shifted-addresses.log (range qualification). All signed
+negative controls pass and scoped leftovers are zero. The two shared-destination
+cases remain red. These new runtime changes have not been rebuilt into the
+CLI or performance-qualified: the 1.97x receipt still belongs to the earlier
+immutable-unarmed-screen artifact. Do not claim the current tree accepted.
+
+
+### Shared-aperture private-file restoration corrected in candidate
+
+Allowing the shared aperture at both file-view API entry points changed the
+failure from stale data to ENOMEM. The existing mmap_lowering_error USDT probe
+now reports discard replacement failures too. A direct Python CLI reduction
+under trace_lowering_verdict.d reproduces the signed embed case and reports:
+"private file view at VA 0x9000003000 overlapped a mapping published
+mid-materialization" (private-file-aperture-direct-lowering.raw; 41 lowering
+events, zero trace errors). The shell-wrapped reduction instead fails earlier
+at mremap(EFAULT), so that capture is not used as discard evidence.
+
+The generic MappingView lookup falls back to the globally shared boot identity
+row after the old private overlay retires. The candidate now distinguishes
+only a globally shared, identity-mapped view fully inside the shared aperture
+from a concurrent live private frame mapping. The file-view loop and sparse
+publisher may replace that boot lookup fallback; live private aliases and
+owner-generation-authenticated mappings still obstruct publication, and
+non-private/non-dynamic ownership preflight remains unchanged. This does not
+grant ownership of the boot shared storage; replacement allocates fresh backing
+and repoints stage-1. File-view host/IPA offset uses the file-offset delta,
+allowing the separate 4 KiB guest VA alignment.
+
+All three shifted cases pass (private-file-discard-aperture-identity-fixed-3.log).
+The strengthened fixtures then verify post-discard guest writes preserve the
+source file and bytes immediately outside the moved mapping remain unchanged.
+All three variants pass Docker with final source hash
+(private-file-discard-shifted-neighbors-oracle.json). The full private_file
+signed focus passes seven guest cases in three executables plus entitlement
+negative control, with zero scoped leftovers
+(private-file-discard-aperture-all-focused.log). The HVF host suite passes
+473 tests, three ignored; runtime and shared-engine gates are being recorded
+in private-file-aperture-host-gates.json. No final artifact or performance
+acceptance is claimed for these additional changes yet.
+
+The host gates finished successfully: carrick-runtime 2,581 passed / two
+ignored; carrick-vmm-hvf 473 passed / three ignored; carrick-aarch64 49 passed.
+Clippy for runtime, HVF, aarch64 and conformance-next across all targets passes
+with warnings denied (private-file-aperture-clippy.log). The signed public
+probe gate is now running under just conformance-probes, including its CLI
+rebuild (private-file-aperture-public-probes.log). The runtime source must
+remain fixed for that gate; final artifact provenance, inventory reconciliation
+and renewed timing comparisons are still due.
+
+
+### Final-artifact probe attribution in progress
+
+The full public invocation completed its three generic shards, all 30 dedicated
+cases, both signed negative controls and the CLI boundary contract, but the
+retained phase failed one gating row: arm64:musl:sigchld printed
+sigchld_handler_ran=false (other lines match; exit 0). Its GNU counterpart
+passes. The 30 existing amd64 report-only differences remain non-gating. Do
+not label this invocation green. Generic and dedicated signed receipts were
+copied separately before replacement by the next phase.
+
+The rebuilt candidate is preserved as carrick-private-file-aperture-candidate,
+SHA b73f6a85d43940ae939deedc8b8b203409ebac7181ea3a72a7eece54dbe178d7,
+UUID 5FA41DD4-5EDD-3AD0-A7C3-309C58D5DA07, with full provenance and source patch.
+A focused SIGCHLD ABBA/BAAB passes all eight arms, four on the accepted stack
+artifact and four on the candidate (sigchld-attribution.json). This does not
+attribute the full-phase failure. Four full retained-phase arms are now running
+base/candidate/candidate/base (retained-attribution.json and per-arm logs),
+using the identical retained population and concurrency as the public gate.
+No runtime fixes or probe assertion changes were made for this failure.
+
+Inventory review classified the two new mapping-reference counter invariant
+aborts as carrier faults, with explicit rationales. K1 lexical inventory adds
+12 mapping-word rows (test/reference lifetime and remap metadata), and drops
+one description_guard row because snapshot_private_mmap_file now delegates
+to the retained-description snapshot helper. The guard itself remains in that
+helper. The exact delta and removed taxonomy row are receipted in
+private-file-k1-delta.json and private-file-k1-taxonomy-removed.json. Remaining
+inventory drift is source position/fingerprint rebinding; host-authority capture
+requires committed clean tracked inputs. No source commits yet.
+
+All four full retained-phase attribution arms pass (two baseline, two candidate;
+46 tests passed, one existing ignored in each). The candidate's initial SIGCHLD
+failure remains recorded as intermittent and not attributed to a source change;
+it did not reproduce in four focused and two full-phase candidate repeats.
+Do not describe it as proven pre-existing on the baseline. The exact candidate
+has now passed each broad gate component, but the original public invocation
+remains failed in the log. A fresh complete public invocation and renewed
+performance verification will qualify the final committed artifact.
