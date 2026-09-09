@@ -419,7 +419,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 1,
-      "fingerprint": "7d19e66b638a256b37d91cfebcee105bd4ad1d03317fa8f011f3dee33755e5cd",
+      "fingerprint": "1edc9abee3f5edb46acde28eebd60e8230c839c47e13432ae419a364af0d878c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_ioring",
       "rationale": "io_uring file description missing concrete IoUringBacking during mmap dispatch; description backing is corrupted."
@@ -428,7 +428,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 2,
-      "fingerprint": "641e2cef5b3dfd8824ec823d00474b0f32dca73db94d1b15c1518891e86674f6",
+      "fingerprint": "bae8490309bbbee97b033fa681bceb509c5d467d880b71847e807ddb1e63fe7c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_overlay",
       "rationale": "Private repoint failure entered indeterminate state during mmap; leaves hardware translation and ownership state unknown."
@@ -437,7 +437,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 3,
-      "fingerprint": "641e2cef5b3dfd8824ec823d00474b0f32dca73db94d1b15c1518891e86674f6",
+      "fingerprint": "bae8490309bbbee97b033fa681bceb509c5d467d880b71847e807ddb1e63fe7c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_overlay",
       "rationale": "Overlay carve_source_range failed after backend publication succeeded during mmap; ownership state is lost."
@@ -446,7 +446,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 4,
-      "fingerprint": "641e2cef5b3dfd8824ec823d00474b0f32dca73db94d1b15c1518891e86674f6",
+      "fingerprint": "bae8490309bbbee97b033fa681bceb509c5d467d880b71847e807ddb1e63fe7c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_overlay",
       "rationale": "Shared reserve_private_range failed after backend publication succeeded during mmap; ownership state is lost."
@@ -455,7 +455,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 5,
-      "fingerprint": "641e2cef5b3dfd8824ec823d00474b0f32dca73db94d1b15c1518891e86674f6",
+      "fingerprint": "bae8490309bbbee97b033fa681bceb509c5d467d880b71847e807ddb1e63fe7c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_overlay",
       "rationale": "protect_range failed on repointed memory range during mmap; prior mapping cannot be restored."
@@ -464,7 +464,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 6,
-      "fingerprint": "641e2cef5b3dfd8824ec823d00474b0f32dca73db94d1b15c1518891e86674f6",
+      "fingerprint": "bae8490309bbbee97b033fa681bceb509c5d467d880b71847e807ddb1e63fe7c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_overlay",
       "rationale": "Private repoint and replacement protection are live but bus-fault span cannot be represented, splitting backend/protection from bus-fault authority."
@@ -473,7 +473,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mmap",
       "ordinal_in_function": 7,
-      "fingerprint": "641e2cef5b3dfd8824ec823d00474b0f32dca73db94d1b15c1518891e86674f6",
+      "fingerprint": "bae8490309bbbee97b033fa681bceb509c5d467d880b71847e807ddb1e63fe7c",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_overlay",
       "rationale": "protect_range failed on bus fault range during mmap overlay setup; cannot apply guard protection."
@@ -509,7 +509,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mprotect",
       "ordinal_in_function": 1,
-      "fingerprint": "1fcb0054b1d6697ac7b47319e1362261a9df8eb3592c0f2976c0eda842b583fd",
+      "fingerprint": "b90af5c066d5bddee4c68adac71e6ab6ec082a5eda649675c24cb0c819f07f48",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mprotect",
       "rationale": "Stored reservation fork semantics contradict selected VMA subrange, corrupting semantic-VMA authority during host alias transaction commit."
