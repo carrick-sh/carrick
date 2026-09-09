@@ -321,16 +321,24 @@ pub unsafe fn walk_descriptors_host(host: *const u8, len: usize, base: u64, va: 
 /// Taking one-past-the-LAST non-zero page (not the first all-zero page) also
 /// treats any zeroed hole as used — safe (wasted at worst), never re-issued.
 fn discover_next_free_spare(bytes: &[u8]) -> u64 {
-    let mut next = SPARE_START_OFFSET;
-    let mut off = SPARE_START_OFFSET;
-    while (off + PT_PAGE) as usize <= bytes.len() {
-        let page = &bytes[off as usize..(off + PT_PAGE) as usize];
-        if page.iter().any(|&b| b != 0) {
-            next = off + PT_PAGE;
-        }
-        off += PT_PAGE;
-    }
-    next
+    let spare = bytes.get(SPARE_START_OFFSET as usize..).unwrap_or_default();
+    discover_spare_pages(spare.chunks_exact(PT_PAGE as usize))
+}
+
+fn discover_spare_pages<'a>(
+    pages: impl DoubleEndedIterator<Item = &'a [u8]> + ExactSizeIterator,
+) -> u64 {
+    // Only the last occupied page determines the cursor. Keep zero holes
+    // below it reserved, and compare whole pages so the zero tail uses the
+    // platform's bulk comparison instead of a byte-at-a-time predicate.
+    const ZERO_PAGE: [u8; PT_PAGE as usize] = [0; PT_PAGE as usize];
+    pages
+        .enumerate()
+        .rev()
+        .find(|(_, page)| *page != ZERO_PAGE)
+        .map_or(SPARE_START_OFFSET, |(index, _)| {
+            SPARE_START_OFFSET + (index as u64 + 1) * PT_PAGE
+        })
 }
 
 /// Mutable editor over a copy of the page-table region bytes.
@@ -2443,6 +2451,52 @@ impl PageTableManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spare_cursor_discovery_stops_at_the_last_used_page() {
+        use std::cell::Cell;
+        let mut pages = vec![0; 440 * super::PT_PAGE as usize];
+        // A hole is not reusable merely because it is zero; an occupied final
+        // page fixes the high-water mark without inspecting earlier pages.
+        *pages.last_mut().unwrap() = 0x80;
+        let visited = Cell::new(0);
+        let cursor = super::discover_spare_pages(
+            pages.chunks_exact(super::PT_PAGE as usize).inspect(|_| {
+                visited.set(visited.get() + 1);
+            }),
+        );
+        assert_eq!(cursor, super::SPARE_START_OFFSET + pages.len() as u64);
+        assert_eq!(visited.get(), 1, "only the final occupied page is needed");
+    }
+
+    #[test]
+    fn spare_cursor_discovery_preserves_holes_and_every_byte_position() {
+        let page = super::PT_PAGE as usize;
+        let start = super::SPARE_START_OFFSET as usize;
+        let mut image = vec![0; start + 4 * page + 17];
+        // An incomplete tail never constitutes an allocated table page.
+        image[start + 4 * page + 16] = 1;
+        assert_eq!(super::discover_next_free_spare(&image), start as u64);
+        for byte in 0..page {
+            image[start + 2 * page + byte] = 0x80;
+            assert_eq!(
+                super::discover_next_free_spare(&image),
+                (start + 3 * page) as u64
+            );
+            image[start + 2 * page + byte] = 0;
+        }
+        image[start] = 1;
+        image[start + 3 * page] = 1;
+        assert_eq!(
+            super::discover_next_free_spare(&image),
+            (start + 4 * page) as u64
+        );
+        // The public constructor still clamps the cursor for short images.
+        for len in [0, 1, start - 1, start] {
+            let manager = super::PageTableManager::new(vec![0; len], 0x10000);
+            assert_eq!(manager.copied_bytes(), len as u64);
+        }
+    }
+
     #[test]
     fn terminal_descriptor_permission_tracks_valid_af_ap_and_uxn() {
         use super::{LeafAccess, terminal_descriptor_permits_el0};
