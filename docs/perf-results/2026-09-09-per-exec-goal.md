@@ -1450,3 +1450,364 @@ Do not describe it as proven pre-existing on the baseline. The exact candidate
 has now passed each broad gate component, but the original public invocation
 remains failed in the log. A fresh complete public invocation and renewed
 performance verification will qualify the final committed artifact.
+
+### Committed final gate and fresh timing: progress, threshold still missed
+
+Source commits 54687b2a9 (private file discard correctness), 17e1e956f
+(immutable view COW optimization), and 49e28af35 (reviewed inventory rebinding)
+are now recorded. The inventory reconciliation changes positions/fingerprints,
+not classifications or counts; just lint-domains passes. The fresh complete
+just conformance-probes invocation exits 0 (private-file-public-final.log and
+private-file-public-final-result.json), including the retained phase's 46
+passed / one ignored. The earlier SIGCHLD failure remains intermittent and
+unattributed; this successful rerun does not erase it.
+
+The final signed CLI was copied after that gate, at source 49e28af35, with SHA
+5b92fb39c71f925f1c705c9b455683d371fa29ce048546922f24699fbd705ad8 and UUID
+78E249A1-61EE-386E-B59E-A72A959B13AF. Full signature, entitlement, DOF and
+clean source patch provenance is private-file-aperture-gated-provenance.json.
+The serial Docker/base/candidate/candidate/base/Docker microbenchmark gives
+normal Python spawn 12.19361 -> 9.24234 ms, Docker 4.51948 ms: 24.20% faster
+than the matched stack baseline, but 2.04500x oracle. The remaining threshold
+gap is 0.20337 ms per spawn. Python -S is 10.84611 -> 7.76421 ms versus
+3.66391 ms (2.11910x); true is 1.67732 -> 1.56477 ms versus 0.15779 ms
+(9.91677x). Raw arms and calculated means are private-file-aperture-gated.json
+and private-file-aperture-gated-summary.json. Earlier 1.97x screens do not
+override this latest exact-artifact result.
+
+The goal remains active. Full CPython ABBA is now running on this artifact;
+remaining discard provenance/failure-path review is still open. Re-rank the
+remaining measured cost before choosing the next optimization, and obtain
+margin below 2x rather than relying on a favorable oracle sample.
+
+### Final CPython controls, refreshed profile, and executable discard reduction
+
+The final-artifact CPython ABBA completes with all eight MATCH verdicts:
+39/39 multiprocessing and 297/297 subprocess per arm. Means are 9.4910 ->
+7.9325 s multiprocessing (16.42% gain; Docker 2.887 s, 2.7477x), and
+59.410 -> 57.501 s subprocess (3.21% gain; Docker 20.693 s, 2.7788x).
+See cpython-private-file-aperture-gated-summary.json. No wider <=2x claim.
+
+A fresh 500-child CPU capture exits naturally with zero trace errors on the
+same final artifact (private-file-final-cpu.raw and provenance). Traced mean
+10.8904 ms is diagnostic only. Offline symbolization validates all 962 user
+return sites and 339 kernel-mode user return sites against the exact binary,
+base 0x100d74000. Retained populations are 919 user and 1,962 kernel-mode
+samples. Inclusive user costs include sparse materialization 120, exec rebuild
+101 and PageTableManager::apply 52 samples; kernel-mode user stacks include
+openat 92 and getdents64 80, while 1,518 are under Vcpu::run (guest execution
+is not resolved by this host profiler). These overlap and are not additive
+wall-time savings. Re-rank from these current observations rather than treating
+the old COW-heavy profile as current.
+
+The discard review now has a concrete differential reduction. A first attempt
+selected a relocated read-only Docker mapping and crashed at shutdown; Carrick
+did not expose the exact matching path/permissions. Preserve that unsuitable
+capture as private-file-boot-discard-reduction-first.json. The revised test
+uses AT_PHDR rounded down to locate the executable's header page, captures
+16 bytes, calls MADV_DONTNEED, captures bytes again, then exits directly.
+Docker, accepted stack baseline and final candidate all return success/errno0.
+Docker preserves the ELF header 7f454c46020101000000000000000000; both Carrick
+artifacts replace it with zeros. All revised processes exit 0. Thus the
+specific ENOMEM hypothesis is refuted for this boot page, but an existing
+incorrect zero-fill is confirmed on baseline and candidate. Source/artifact
+hashes and output are private-file-boot-discard-reduction.json. This is a
+CLI diagnostic reduction, not yet durable embed probe acceptance. Boot-image
+backing classification/restoration and replacement error behavior remain open;
+the existing direct-view API can retire prior aliases before later failure.
+
+### Executable discard red-first coverage and metadata cause
+
+Added case_private_file_exec_discard_preserves_header to the existing signed
+immutable_private_file integration target, backed by private_file_exec_discard.py.
+The pinned Docker oracle exits 0 with private_file_exec_discard=ok and empty
+stderr (private-file-exec-discard-oracle.json, source SHA
+e9828f2410a7801165b7e34a9c2b0bd5aeb0dc37f8cf8cf977c91a7ef993d6d3).
+The signed embed test is RED before any runtime fix: its assertion records
+ELF magic before discard and sixteen zero bytes after discard; the damaged
+process subsequently exits SIGSEGV while unwinding the assertion. The signed
+negative control passes, scoped leftovers zero (private-file-exec-discard-red.log).
+
+A focused host test boot_vma_preserves_file_subranges_and_anonymous_bss is
+also RED (boot-file-vma-red.log). Given one boot region 0x1000..0x5000 and
+file subranges 0x1000..0x2000 and 0x3000..0x4000, production emits one
+PrivateAnonymous row instead of preserving the two file intervals and two
+anonymous intervals. semantic_vmas_from_boot_regions currently requires one
+FileMapping to cover the complete backing region. proc_maps_from_address_space
+gives ordinary regions empty paths, so a coalesced region without that full
+coverage falls through to PrivateAnonymous. This explains the zero-fill
+branch rather than the initially suspected ENOMEM.
+
+No production change yet. A complete correction must split file provenance
+at its actual boundaries AND retain restoration backing for those boot file
+subranges across close/unlink/fork/remap/exec lifetime. Merely reclassifying
+them would route into the new registry's missing-source ENOMEM. AddressSpace
+already exposes immutable Arc payloads (shared_initialized_bytes); evaluate
+that ownership seam without adding an eager per-exec image copy or confusing
+full anonymous BSS pages with file-backed tail pages. The two new tests remain
+intentionally red pending the correction; do not report the worktree green.
+
+### Boot file restoration candidate: focused green, broader review pending
+
+The metadata splitter now passes boot_vma_preserves_file_subranges_and_anonymous_bss
+(boot-file-vma-split.log). Retained private sources now distinguish open-file
+references from canonical loaded-image payloads. Boot publication and staged
+exec publication retain Arc initialized-byte windows, without copying image
+contents; the existing range clip/remap/retirement machinery carries that source.
+Discard restores the canonical window, including backend instruction patches
+and zero-filled partial tails, through the current-MM write transport. Full
+anonymous BSS pages remain separately classified and retain anonymous discard.
+
+That change alone still failed the live embed test with the same zero-fill
+(private-file-exec-discard-image.log). Source tracing exposed an additional
+boot-only omission: byte-based image construction left the main ELF paths empty,
+and both file metadata and retained-backing collection filtered them out.
+Native ELF boot now binds the resolved main path before final image preparation,
+matching the existing exec path. Redirected Rosetta boot retains its prior
+handling rather than labeling its interpreter bytes with the target path.
+The original signed regression now passes (private-file-exec-discard-bound.log).
+
+The fixture additionally dirties the header, forks, discards in the child,
+checks the parent remains dirty, and discards in the parent. Its final pinned
+Docker oracle passes (private-file-exec-discard-fork-oracle.json, source SHA
+126aec1f3b91fd322be999373d5bdef6df50365485c09ce278980b13ab9d5c16).
+An initial Docker launch timed out after 30 seconds with no output and left no
+container; a named repeat passes in 0.21 seconds. Do not attribute that launch
+anomaly to the guest. The strengthened signed case passes, negative control
+passes, and scoped leftovers are zero (private-file-exec-discard-fork.log).
+
+The complete private_file signed focus is now running (boot-private-file-group.log).
+This candidate is uncommitted and not performance-qualified. Full host/signed
+gates, inventories, source-lifetime review (including mutable executable source
+semantics), and the previously open direct-view replacement failure review
+remain due. The 2.045x measurement still belongs to the earlier gated artifact;
+no new performance result or goal completion is claimed.
+
+The full private_file focus passes eight guest cases in three signed executables,
+plus the entitlement negative control, with zero scoped leftovers. Its manifest
+is preserved as boot-private-file-group-signed-artifacts.jsonl. Candidate source
+patch/hash and the untracked workload hash are in boot-private-file-candidate.*.
+The full serial runtime suite is now running (boot-private-file-runtime-full.log).
+
+### Boot correction timing and next greedy attribution
+
+Full serial runtime passes 2,582 tests / two ignored. The signed CLI screen
+artifact is a1232634d4e10380ba790278e4a23579a8d1abf3ccfd50fe93f1c7f3f65c2441,
+UUID 1F8C94C4-68D3-3C77-806A-5E8A94933869 (boot-private-file-screen-provenance.json).
+The serial Docker/base/candidate/candidate/base/Docker screen measures normal
+spawn 9.26027 -> 9.24880 ms, Docker 4.66574 ms, 1.98228x. The 0.12% paired
+difference is effectively neutral; the ratio crossing relative to 2.045x is
+primarily a changed oracle measurement, not a demonstrated new optimization.
+Python-S improves 0.78% and true regresses 2.08% in this screen. Preserve all
+arms in boot-private-file-screen.json and its summary; no final acceptance.
+
+New durable hvpatch-exec-host-syscall-counts.d passes on 200 child spawns:
+102,988 host calls, 201 balanced execs, successful natural exit, errors0/bounded0.
+Counts include dup1,414, close_nocancel1,433, fcntl_nocancel1,433,
+fstatfs64 1,438, getdirentries64 2,852, lseek2,906, openat7,971,
+fstat64 9,738, and fstatat64 11,434 (boot-private-host-counts.raw).
+The single-true negative control exits naturally but is correctly rejected
+with zero repeated execs (boot-private-host-counts-negative.*).
+
+Directory setup was tested as a bounded host-only hypothesis. The temporary
+dirent-setup-screen.c compares matching inode/type/name checksums over 10,000
+listings per ABBA arm. DIR* averages 16.382 us/listing; the direct experiment
+14.528 us, roughly 1.85 us saved, or 13 us at seven listings per spawn. This
+is too small to prioritize against the earlier 203 us gap. The direct symbol
+is not exported; the experiment used deprecated unsupported syscall(2), not
+a production candidate. No runtime directory-reader change was made. Receipts:
+dirent-setup-screen.c and dirent-setup-screen.log.
+
+The existing COW count instrument now also groups ESR fault classes and coarse
+VA bands. Both positive control and boot candidate pass the extended instrument
+(boot-fault-class-*.raw and provenance). Control has 111,780 faults and 64,735
+balanced COW commits. Candidate has 47,045 faults, zero COW. Both have the
+same remaining translation classes: EC36/status5/write1=202,
+status6/write1=202, status7/write0=1,208, status7/write1=45,433. All occur
+in VA band 0x60. Coarse bands are event counts, not unique pages. These agree
+exactly with removal of the permission/COW class. Next attribute first-touch
+mapping work; widening physical windows was already refuted and does not
+permit falsely marking neighboring Linux pages resident. Clippy is running
+in boot-private-file-clippy.log. Goal remains active.
+
+### Primary-arena reuse experiment rejected
+
+Boot-correction Clippy passes for runtime and conformance-next across all
+targets with warnings denied. Source inspection refutes two more first-touch
+shortcuts: PageTableApplyOutcome already avoids TLBI for invalid-to-valid
+leaves, and try_coalesce returns immediately for live/non-offline tables.
+
+Tested only reversing the primary-arena resolver preference inside
+Aarch64EngineCore::pt_edit_locked: reuse the host pointer already resolved
+for this edit instead of resolving it again during sync. The signed candidate
+SHA is 4ef92156cda437c3d8324f3959124e6d9fce98dd72004eb5d5cbcdb279f19b69,
+UUID 82CFFA81-6ACF-35FB-8A0E-5D612635FFB0 (primary-arena-reuse-provenance.json).
+First serial ABBA screen: normal 9.15780 -> 9.09989 ms (0.63% gain),
+Python-S 7.73903 -> 7.85460 ms (1.49% regression). Repeat: normal
+9.12512 -> 9.22329 ms (1.08% regression), Python-S 7.72889 -> 7.90296 ms
+(2.25% regression). No repeatable gain; the isolated source hunk is reverted.
+Raw arms, candidate patch, and primary-arena-reuse-rejected-summary.json are
+retained. target/release/carrick was restored and SHA-checked against the
+boot-private-file-screen artifact a1232634d4e10380ba790278e4a23579a8d1abf3ccfd50fe93f1c7f3f65c2441.
+
+The full public signed probe command is now running on the boot correction
+(boot-private-public-probes.log), including its CLI rebuild. No performance
+workloads or source edits should overlap that gate. The direct private-file
+replacement error path is still open: it retires old aliases before the new
+sparse publication can fail. Sparse publication's own undo restores only its
+entry state, not aliases already retired by its caller. Do not claim whole
+replacement rollback from those narrower journals. A correct fix must retain
+old ownership through fallible preparation/publication, or commit a valid
+deferred file-restoration recipe through a safe discard transition; neither
+alternative is implemented yet. Goal remains active.
+
+### Public gate passed; replacement failure confirmed with LLDB
+
+The boot-correction public gate (session 5644, `just conformance-probes`)
+completed with terminal status 0. Receipt: boot-private-public-probes-result.json
+and boot-private-public-probes.log. The final retained test executable reports
+46 passed, 1 ignored; amd64 report-only DIFFs remain outside arm64 acceptance.
+This is not a substitute for final exact-artifact timing or inventory closure.
+
+A scoped LLDB reduction now confirms the previously static rollback concern.
+The guest maps a mutable file privately at offset 64 MiB, writes byte 90 over
+original byte 65, and discards the page. Control returns success and reads 65.
+The debugger intercepts only the replacement host mmap (offset 67108864,
+length 16384), records its stack through sparse publication and
+`discard_private_file_segment`, and returns MAP_FAILED. On BOTH the boot
+candidate a1232634d4e10380ba790278e4a23579a8d1abf3ccfd50fe93f1c7f3f65c2441
+and prior committed artifact
+5b92fb39c71f925f1c705c9b455683d371fa29ce048546922f24699fbd705ad8,
+MADV_DONTNEED returns -1/ENOMEM and the next read yields ZERO, not 90 or 65.
+Both guests exit 0; the predicted crash was refuted, but lost file contents
+are confirmed. This predates the uncommitted boot correction. No timing claims
+come from debugger runs. Initial sandboxed launches failed before guest entry
+creating scratch storage; authorized reruns outside the sandbox produced the
+reported evidence. Artifacts: private-file-discard-failure.py,
+run-discard-failure.py, run-discard-prior-failure.py,
+private-file-discard-{failure,prior}-result.json, and their scoped LLDB logs.
+
+Source confirms `materialize_private_file_backing` retires overlapping aliases
+before `sparse_materialization::publish` reserves inventory and prepares host
+backing. Merely preparing mmap earlier would close this injection point but
+not the later inventory/page-table failure cases. The replacement transaction
+must retain recoverable old ownership through all fallible publication stages;
+whole rollback remains an explicit open gate. Local HEAD is main at 49e28af35,
+and 0809c1f91 is verified its ancestor. Current boot correction and diagnostics
+remain uncommitted; no push or unrelated branch integration was performed.
+
+### Replacement transaction audit and second failure class
+
+A second scoped debugger experiment on the boot candidate forces only the
+replacement 16 KiB `hv_vm_map` to return nonzero. The control restores byte 65;
+the injected run returns -1/ENOMEM and reads zero, reproducing the host-mmap
+failure at a later stage. Both exit 0. The recorded stack reaches
+`map_global_frame_stage2_record` at trap.rs:49709; this is diagnostic fault
+injection, not a claim about a naturally occurring Hypervisor error code.
+Receipts: run-discard-stage2-failure.py,
+private-file-discard-stage2-result.json, execdiag-discard-stage2-*.lldb.log.
+No runtime source changes or new performance claims in this audit.
+
+The implementation boundary is now narrower and concrete:
+- `sparse_materialization::publish` already brackets descriptor writes in an
+  undo journal, retains provisional owner rollback through publication, and
+  rolls back unpublished inventory on a page-table error. Its old descriptors
+  cannot recover contents after its caller retires the old owner first.
+- `register_shared_alias` keys semantic rows by VA, IPA and scope: old and new
+  physical owners may coexist while publication is pending. A replacement
+  must distinguish their exact identities rather than unregistering a VA range
+  after inserting the replacement (that would remove the new row too).
+- Extract the existing alias retirement planning/reservation from mutation;
+  retain old aliases, backing, COW arms and receipts until successful new
+  publication. Plan uses `InventoryLeaseRetirement`, including VM-wide frame
+  counts and shared stage-2 populations; do not invent per-mm-only retirement.
+- The irreversible tail must consume the prepared old-row retirement after
+  descriptor publication/TLBI and before new alias registration, under one
+  topology exclusion. Existing `materialize_sparse_mmap_extent` hole/alias
+  short-circuits need an explicit replacement path rather than pretending the
+  old mapping is absent. Ordinary sparse first-touch and foreign copyout
+  callers must retain their current behavior.
+- Handle each replacement extent with its own preserved preimage; an error
+  must not silently zero an uncommitted remainder. Preserve partial 4 KiB
+  fragments sharing a 16 KiB host owner and sibling/fork ownership.
+
+Required verification remains both debugger failures green (old byte remains
+readable on error), red-first transaction failure coverage for reservation and
+page-table publication as well as allocation, file-discard/fork/remap gates,
+full host and signed gates, then final artifact performance. Moving only the
+host allocation before retirement is explicitly insufficient and was not
+implemented. Goal remains active on local main.
+
+### Replacement implementation: two red failure paths now green
+
+Implemented a prepared process-alias retirement value. Preparation retains
+aliases, COW arms and pending receipts and reserves inventory events without
+mutating the old mapping. The ordinary unmap path prepares then commits under
+its topology exclusion. Private-file replacement now keeps old aliases and
+backing through sparse publication's existing descriptor undo journal; after
+new inventory and descriptors commit, an infallible callback consumes old
+retirement before the publisher registers the new alias. Any later invariant
+or backend retirement failure is fatal, not a recoverable error exposing an
+invalid mapping. Normal sparse-hole/foreign callers retain their existing
+entry points. This implementation still needs full failure and broad gates.
+
+Compile check passes. Signed candidate SHA
+cf3141499300b2aeb37392f93ad8133036524b2d99958847511414a56a019786
+is recorded with source patch, CDHash, UUID, entitlements and load commands in
+private-file-replacement-screen-provenance.json. Both prior red injections
+are now green on this exact artifact: host mmap failure and hv_vm_map failure
+return -1/ENOMEM and read the original DIRTY byte 90. Both controls return
+success and read original FILE byte 65. All four guests and debugger sessions
+exit 0. Receipts: private-file-replacement-{mmap,stage2}-result.json and
+execdiag-replacement-{mmap,stage2}-*.lldb.log. These are correctness diagnostics,
+not performance samples. The signed private_file group is running in
+private-file-replacement-signed-group.log (session 85317); source is frozen
+while it rebuilds/runs. Reservation and page-table error coverage, review,
+Clippy, full host/signed gates and new exact-artifact timing remain open.
+
+The replacement signed private_file group completed with status 0: 8 guest
+cases in 3 executables, entitlement negative control passed, both scoped
+process counts zero. Copied manifest: private-file-replacement-signed-artifacts.jsonl.
+HVF Clippy across all targets with warnings denied also passes. Full serial
+HVF host suite is now running in private-file-replacement-hvf-full.log.
+No final completion or performance claim; source remains uncommitted on main.
+
+Full serial HVF host suite completed: 473 passed, 3 ignored, terminal 0
+(private-file-replacement-hvf-full.log). A serial untraced screen then compared
+Docker/base/candidate/candidate/base/Docker on the same pinned image.
+['/bin/true']: base 1.62659 -> candidate 1.61108 ms; Docker 0.17642 ms; 9.13220x, paired gain 0.953%.
+['python3', '-S', '-c', 'pass']: base 8.34215 -> candidate 8.12163 ms; Docker 3.95677 ms; 2.05259x, paired gain 2.643%.
+['python3', '-c', 'pass']: base 9.55536 -> candidate 9.50620 ms; Docker 4.82727 ms; 1.96927x, paired gain 0.515%.
+Receipts: private-file-replacement-screen.json and its summary. This is one
+screen, not final acceptance; normal-spawn improvement is small and oracle
+timing has moved. No substantial new speedup is claimed. Goal remains active.
+
+### Boundary coverage and reviewed checkpoint
+
+Full serial runtime completed with 2582 passed, 2 ignored (terminal 0,
+private-file-replacement-runtime-full.log). Added host rollback coverage for
+inventory staging and failure after page-table synchronization, checking exact
+stage-1 bytes, owner-set/inventory fingerprint, aliases, COW arm and file bytes.
+The first short --exact invocation selected zero tests and is NOT evidence.
+The initial broad error assertion also hid an unresolved-arena fixture error;
+a strengthened assertion exposed it. The shared fixture now backs the full
+primary arena while its software manager retains only initialized bytes.
+Qualified failure reasons now match the requested injection points.
+
+A temporary mutation moving retirement before publication makes the new test
+fail with "failed publication must not retire the preimage"; restoring source
+passes. This is a mutation control, distinct from the prior-artifact LLDB reds.
+Receipts: sparse-replacement-boundaries-{qualified,full-arena,restored}.log,
+sparse-replacement-retirement-order-negative.log and
+sparse-replacement-boundaries-control.json. The after-sync hook is cfg(test)
+only; no production guest-triggerable failure facility is added.
+
+Review additionally restored eligibility checking under topology exclusion:
+private replacement cannot bypass hole checks based only on pre-quiesce
+eligibility. The final reviewed source passes 474 HVF host tests (3 ignored),
+Clippy all-targets with warnings denied, and the signed private_file group
+(8 cases in 3 executables, negative control passed, both scoped counts zero).
+Receipts: private-file-replacement-reviewed-{hvf,clippy,signed}.log and copied
+signed manifest. The earlier 1.969x screen predates this eligibility recheck;
+it is not final timing for the reviewed source. Preparing narrow local-main
+commits now; inventories, full public gate and final timings remain outstanding.
