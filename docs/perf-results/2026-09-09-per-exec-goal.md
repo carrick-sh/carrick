@@ -580,3 +580,69 @@ amplifies. Count exact task/mm and source-physical groups before proposing reuse
 Any reuse must preserve fresh-file visibility of untouched 4 KiB pages, avoid
 overwriting a compound shared with a fork peer, and authenticate current owner
 generations. A smaller physical allocation count alone is not performance proof.
+
+### Neighboring COW amplification: repeated census, reuse still unproven
+
+Two ten-child captures on the restored signed artifact agree exactly. Each
+child has one MM and 322 committed COW transactions, 322 distinct destination
+FrameIds and 322 distinct destination 16 KiB IPAs. Grouping by exact
+`(guest, mm, old_frame, old_ipa)` produces 87 source compounds per child:
+75 groups have four transactions, three have three, four have two, and five
+have one. Every source group corresponds to exactly one aligned 16 KiB VA
+group. This is not an IPA-only join across unrelated MMs or frame identities.
+
+`scripts/dtrace/hvpatch-cow-compound-census.d` captures adjacent scalar
+identity/data probes. `scripts/perf/hvpatch_cow_compounds.py` requires exact
+phase 0/1/2 triples with identical payloads for every transaction, including
+the parent, and validates target exit, bounds, errors, event totals and child
+population. It ignores traced durations. Both captures contain 10,671 events
+(3,557 transactions including parent), target exit zero, errors zero and no
+bound termination. Synthetic missing/duplicate phases, payload drift, failed
+target, dropped records and missing-child controls were rejected. The revised
+script initially failed compilation because `self->ready` was read before a
+type-defining assignment; it was corrected in BEGIN and rerun successfully.
+
+Receipts under `target/perf/exec-overhead-20260909/`:
+`cow-pack-validated.json` validates the original capture, whose script is saved
+as `cow-pack-original.d`; `cow-pack-repeat-analysis.json` validates the revised
+script capture `cow-pack-validated.raw/.out/.err`.
+`cow-pack-validated-provenance.json` binds source HEAD `3129c5099`, script,
+command and binary SHA-256
+`e33490c116541179fbf30c02d7253144ab0c54bc6bb692b0ff5c6eb9e951af24`.
+The scoped process check found no remaining run command. The parent maps name
+libpython's writable range at `0x6000500000..0x600065e000`; 287 first-child
+receipts fall there. This associates receipts with the captured parent map,
+not a directly captured child map.
+
+The next hypothesis is that packing independently touched 4 KiB pages into
+one private physical compound can reduce owner registration, inventory growth
+and subsequent retirement work. The observed shape gives a potential owner
+count of 87 instead of 322 (235 fewer, 73%); it does not establish that all
+groups are eligible or that 73% of COW time can be saved. Fault handling,
+quiescence, source authentication and per-page publication still remain.
+
+Source inspection identifies the decisive unknown: `stage_cow_inventory_split`
+and `commit_cow_inventory_split` currently create and authenticate a new whole
+16 KiB mapping on every transaction, and reject an existing destination key.
+A packing cache alone cannot bypass those contracts. A bounded candidate
+must prove destination owner generation and exclusivity under the topology
+lock, reject fork-shared destinations, copy fresh source bytes only for the
+newly touched page, and publish source retirement plus destination projection
+with rollback. Clean neighbors must continue observing file changes until
+their own COW, and a failed attempt must not overwrite any published lane.
+No packing implementation or performance result exists yet.
+
+Greedy decision rule: prioritize expected removable wall time, using CPU
+sampling only to rank candidates. For this candidate, predeclare at least a
+5% normal-spawn improvement (~0.7 ms) in repeated untraced ABBA, no reproducible
+control regression, reduced owner counts in a separate diagnostic capture,
+and passing correctness gates. Refute or discard it if ownership eligibility
+rarely holds, the required bookkeeping consumes the saving, or any private-file,
+fork, generation, rollback or publication contract fails. Re-rank after each
+accepted improvement. Retirement interference remains the next independent
+hypothesis; the sleep experiment has not proved a usable optimization.
+
+The current accepted measurement remains 13.725 ms versus Docker 4.404 ms
+(3.12x). About 4.92 ms must still be removed to reach 2x on that pair. The
+goal remains active; these diagnostics do not improve that ratio or satisfy
+the eventual final artifact and broad gates.
