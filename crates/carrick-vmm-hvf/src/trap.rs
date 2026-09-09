@@ -9579,6 +9579,64 @@ mod task_only_carrier_directory_tests {
         assert_eq!(task.cow_identity, Some(identity));
     }
 
+    /// An unmap must void the deferred-COW promises naming the range it tears
+    /// down, before it tears anything down.
+    ///
+    /// `supersede_cow_receipts`' own contract is that "every stage-1 repointer
+    /// calls this before publishing its own receipt". An unmap repoints leaves
+    /// and publishes nothing, so it was the one repointer that never called it,
+    /// and a receipt could outlive the leaves it describes. The next mapping
+    /// over that VA then authenticated the stale promise against an absent
+    /// translation and failed — `deferred COW protection authentication failed
+    /// at VA 0x6047c96000: leaf=0x0 translated=None` — which the dispatcher can
+    /// only lower to a guest `ENOMEM`. `go-net` died on it with "fatal error:
+    /// runtime: cannot allocate memory" while mapping a 256 KiB arena whose
+    /// fifth page still held a one-page receipt from a freed mapping.
+    ///
+    /// Red-first shape: this fails on the revision that introduced the report,
+    /// where `unregister_process_alias` contains no `supersede_cow_receipts`
+    /// call at all. Asserted on the source because the entry point needs a live
+    /// carrier VM, the same reason
+    /// `pending_fork_frame_authentication_false_and_error_paths_fail_closed`
+    /// below reads the source rather than building one.
+    #[test]
+    fn an_unmap_supersedes_the_cow_receipts_naming_its_range_first() {
+        let source = include_str!("trap.rs");
+        // `rsplit_once`, not `split_once`: this test's own string literal is
+        // the FIRST occurrence in the file, and matching it makes the test
+        // inspect itself and pass unconditionally.
+        let tail = source
+            .rsplit_once("pub(crate) fn unregister_process_alias(")
+            .expect("process alias retirement entry point")
+            .1;
+        // Bound the search to THIS function: the file has other callers of
+        // `supersede_cow_receipts`, and an unbounded search finds one of them
+        // and passes on the very revision this test exists to fail.
+        let body = &tail[..tail
+            .find("\n    fn ")
+            .into_iter()
+            .chain(tail.find("\n    pub(crate) fn "))
+            .min()
+            .expect("end of unregister_process_alias")];
+        let supersede = body
+            .find("self.supersede_cow_receipts(")
+            .expect("an unmap must void the deferred-COW receipts naming its range");
+        for teardown in [
+            "self.cow_armed.lock().disarm(",
+            "unregister_alias(",
+            "self.split_local_rows_for_unmap(",
+        ] {
+            let at = body.find(teardown).unwrap_or_else(|| {
+                panic!("teardown step {teardown} not found in unregister_process_alias")
+            });
+            assert!(
+                supersede < at,
+                "receipts must be superseded BEFORE {teardown}: a promise voided after its \
+                 leaves are gone has already been authenticated against nothing"
+            );
+        }
+    }
+
     #[test]
     fn pending_fork_frame_authentication_false_and_error_paths_fail_closed() {
         let source = include_str!("trap.rs");
@@ -44347,6 +44405,17 @@ impl HvfVmState {
         va: u64,
         len: usize,
     ) -> Result<(), TrapError> {
+        // An unmap is a stage-1 repointer that publishes NO receipt of its own,
+        // so it has to void the promises naming the range it is tearing down —
+        // the contract `supersede_cow_receipts` states for every repointer.
+        // Without this a receipt outlives the leaves it describes, and the next
+        // mapping over that VA authenticates it against an absent translation:
+        // `deferred COW protection authentication failed ... leaf=0x0
+        // translated=None`, which the dispatcher can only lower to a guest
+        // `ENOMEM`. Seen as `go-net` dying with "fatal error: runtime: cannot
+        // allocate memory" on a 256 KiB arena mmap whose fifth page still held
+        // a one-page receipt from a freed mapping.
+        self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
         if !self.persistent_vm_lifecycle {
             if let Some(debug_va) = fork_debug_va()
                 && debug_va >= va
