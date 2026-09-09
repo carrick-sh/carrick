@@ -974,15 +974,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2052952,
-        "byte_start": 2052940,
+        "byte_end": 2062326,
+        "byte_start": 2062314,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 48958,
-        "line_end": 48958,
-        "line_start": 48958
+        "line": 49189,
+        "line_end": 49189,
+        "line_start": 49189
       }
     },
     {
@@ -995,15 +995,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2055583,
-        "byte_start": 2055571,
+        "byte_end": 2064957,
+        "byte_start": 2064945,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 49004,
-        "line_end": 49004,
-        "line_start": 49004
+        "line": 49235,
+        "line_end": 49235,
+        "line_start": 49235
       }
     },
     {
@@ -1016,15 +1016,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2057900,
-        "byte_start": 2057888,
+        "byte_end": 2067274,
+        "byte_start": 2067262,
         "column": 25,
         "column_end": 37,
         "column_start": 25,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 49045,
-        "line_end": 49045,
-        "line_start": 49045
+        "line": 49276,
+        "line_end": 49276,
+        "line_start": 49276
       }
     },
     {
@@ -9052,15 +9052,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 218749,
-        "byte_start": 218733,
+        "byte_end": 218899,
+        "byte_start": 218883,
         "column": 62,
         "column_end": 78,
         "column_start": 62,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 5650,
-        "line_end": 5650,
-        "line_start": 5650
+        "line": 5652,
+        "line_end": 5652,
+        "line_start": 5652
       }
     },
     {
@@ -9073,15 +9073,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 218936,
-        "byte_start": 218920,
+        "byte_end": 219086,
+        "byte_start": 219070,
         "column": 57,
         "column_end": 73,
         "column_start": 57,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 5655,
-        "line_end": 5655,
-        "line_start": 5655
+        "line": 5657,
+        "line_end": 5657,
+        "line_start": 5657
       }
     },
     {
@@ -9094,36 +9094,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 223426,
-        "byte_start": 223410,
+        "byte_end": 223576,
+        "byte_start": 223560,
         "column": 23,
         "column_end": 39,
         "column_start": 23,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 5818,
-        "line_end": 5818,
-        "line_start": 5818
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-PROCESS-ID",
-      "expansion": null,
-      "operation": "std::process::id",
-      "profiles": [
-        "macos-cli-default",
-        "macos-hvf-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 227045,
-        "byte_start": 227029,
-        "column": 39,
-        "column_end": 55,
-        "column_start": 39,
-        "file": "crates/carrick-observability/src/probes.rs",
-        "line": 5929,
-        "line_end": 5929,
-        "line_start": 5929
+        "line": 5820,
+        "line_end": 5820,
+        "line_start": 5820
       }
     },
     {
@@ -9138,13 +9117,13 @@
       "source": {
         "byte_end": 227195,
         "byte_start": 227179,
-        "column": 41,
-        "column_end": 57,
-        "column_start": 41,
+        "column": 39,
+        "column_end": 55,
+        "column_start": 39,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 5933,
-        "line_end": 5933,
-        "line_start": 5933
+        "line": 5931,
+        "line_end": 5931,
+        "line_start": 5931
       }
     },
     {
@@ -9157,15 +9136,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 227358,
-        "byte_start": 227342,
+        "byte_end": 227345,
+        "byte_start": 227329,
         "column": 41,
         "column_end": 57,
         "column_start": 41,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 5937,
-        "line_end": 5937,
-        "line_start": 5937
+        "line": 5935,
+        "line_end": 5935,
+        "line_start": 5935
       }
     },
     {
@@ -9178,15 +9157,36 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 227558,
-        "byte_start": 227542,
+        "byte_end": 227508,
+        "byte_start": 227492,
+        "column": 41,
+        "column_end": 57,
+        "column_start": 41,
+        "file": "crates/carrick-observability/src/probes.rs",
+        "line": 5939,
+        "line_end": 5939,
+        "line_start": 5939
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-ID",
+      "expansion": null,
+      "operation": "std::process::id",
+      "profiles": [
+        "macos-cli-default",
+        "macos-hvf-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 227708,
+        "byte_start": 227692,
         "column": 13,
         "column_end": 29,
         "column_start": 13,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 5942,
-        "line_end": 5942,
-        "line_start": 5942
+        "line": 5944,
+        "line_end": 5944,
+        "line_start": 5944
       }
     },
     {
@@ -9199,15 +9199,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 227796,
-        "byte_start": 227780,
+        "byte_end": 227946,
+        "byte_start": 227930,
         "column": 40,
         "column_end": 56,
         "column_start": 40,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 5952,
-        "line_end": 5952,
-        "line_start": 5952
+        "line": 5954,
+        "line_end": 5954,
+        "line_start": 5954
       }
     },
     {
@@ -9220,15 +9220,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 229342,
-        "byte_start": 229326,
+        "byte_end": 229492,
+        "byte_start": 229476,
         "column": 18,
         "column_end": 34,
         "column_start": 18,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 6005,
-        "line_end": 6005,
-        "line_start": 6005
+        "line": 6007,
+        "line_end": 6007,
+        "line_start": 6007
       }
     },
     {
@@ -9241,15 +9241,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 230605,
-        "byte_start": 230589,
+        "byte_end": 230755,
+        "byte_start": 230739,
         "column": 53,
         "column_end": 69,
         "column_start": 53,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 6032,
-        "line_end": 6032,
-        "line_start": 6032
+        "line": 6034,
+        "line_end": 6034,
+        "line_start": 6034
       }
     },
     {
@@ -9262,15 +9262,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 230726,
-        "byte_start": 230710,
+        "byte_end": 230876,
+        "byte_start": 230860,
         "column": 40,
         "column_end": 56,
         "column_start": 40,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 6036,
-        "line_end": 6036,
-        "line_start": 6036
+        "line": 6038,
+        "line_end": 6038,
+        "line_start": 6038
       }
     },
     {
@@ -9283,15 +9283,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 254860,
-        "byte_start": 254844,
+        "byte_end": 255160,
+        "byte_start": 255144,
         "column": 41,
         "column_end": 57,
         "column_start": 41,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 6757,
-        "line_end": 6757,
-        "line_start": 6757
+        "line": 6763,
+        "line_end": 6763,
+        "line_start": 6763
       }
     },
     {
@@ -9304,15 +9304,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 257180,
-        "byte_start": 257164,
+        "byte_end": 257480,
+        "byte_start": 257464,
         "column": 18,
         "column_end": 34,
         "column_start": 18,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 6803,
-        "line_end": 6803,
-        "line_start": 6803
+        "line": 6809,
+        "line_end": 6809,
+        "line_start": 6809
       }
     },
     {
@@ -9325,15 +9325,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 258703,
-        "byte_start": 258687,
+        "byte_end": 259003,
+        "byte_start": 258987,
         "column": 17,
         "column_end": 33,
         "column_start": 17,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 6841,
-        "line_end": 6841,
-        "line_start": 6841
+        "line": 6847,
+        "line_end": 6847,
+        "line_start": 6847
       }
     },
     {
@@ -9346,15 +9346,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 263106,
-        "byte_start": 263090,
+        "byte_end": 263406,
+        "byte_start": 263390,
         "column": 23,
         "column_end": 39,
         "column_start": 23,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 6949,
-        "line_end": 6949,
-        "line_start": 6949
+        "line": 6955,
+        "line_end": 6955,
+        "line_start": 6955
       }
     },
     {
@@ -9367,15 +9367,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 263156,
-        "byte_start": 263140,
+        "byte_end": 263456,
+        "byte_start": 263440,
         "column": 14,
         "column_end": 30,
         "column_start": 14,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 6950,
-        "line_end": 6950,
-        "line_start": 6950
+        "line": 6956,
+        "line_end": 6956,
+        "line_start": 6956
       }
     },
     {
@@ -9388,15 +9388,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 264891,
-        "byte_start": 264875,
+        "byte_end": 265191,
+        "byte_start": 265175,
         "column": 18,
         "column_end": 34,
         "column_start": 18,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 6992,
-        "line_end": 6992,
-        "line_start": 6992
+        "line": 6998,
+        "line_end": 6998,
+        "line_start": 6998
       }
     },
     {
@@ -9409,32 +9409,11 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 269638,
-        "byte_start": 269622,
+        "byte_end": 269938,
+        "byte_start": 269922,
         "column": 47,
         "column_end": 63,
         "column_start": 47,
-        "file": "crates/carrick-observability/src/probes.rs",
-        "line": 7115,
-        "line_end": 7115,
-        "line_start": 7115
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-PROCESS-ID",
-      "expansion": null,
-      "operation": "std::process::id",
-      "profiles": [
-        "macos-cli-default",
-        "macos-hvf-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 269907,
-        "byte_start": 269891,
-        "column": 45,
-        "column_end": 61,
-        "column_start": 45,
         "file": "crates/carrick-observability/src/probes.rs",
         "line": 7121,
         "line_end": 7121,
@@ -9451,15 +9430,36 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 270035,
-        "byte_start": 270019,
+        "byte_end": 270207,
+        "byte_start": 270191,
+        "column": 45,
+        "column_end": 61,
+        "column_start": 45,
+        "file": "crates/carrick-observability/src/probes.rs",
+        "line": 7127,
+        "line_end": 7127,
+        "line_start": 7127
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-ID",
+      "expansion": null,
+      "operation": "std::process::id",
+      "profiles": [
+        "macos-cli-default",
+        "macos-hvf-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 270335,
+        "byte_start": 270319,
         "column": 35,
         "column_end": 51,
         "column_start": 35,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 7125,
-        "line_end": 7125,
-        "line_start": 7125
+        "line": 7131,
+        "line_end": 7131,
+        "line_start": 7131
       }
     },
     {
@@ -9472,15 +9472,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 270181,
-        "byte_start": 270165,
+        "byte_end": 270481,
+        "byte_start": 270465,
         "column": 43,
         "column_end": 59,
         "column_start": 43,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 7129,
-        "line_end": 7129,
-        "line_start": 7129
+        "line": 7135,
+        "line_end": 7135,
+        "line_start": 7135
       }
     },
     {
@@ -9493,29 +9493,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 292384,
-        "byte_start": 292368,
-        "column": 19,
-        "column_end": 35,
-        "column_start": 19,
-        "file": "crates/carrick-observability/src/probes.rs",
-        "line": 7759,
-        "line_end": 7759,
-        "line_start": 7759
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-PROCESS-ID",
-      "expansion": null,
-      "operation": "std::process::id",
-      "profiles": [
-        "macos-cli-default",
-        "macos-hvf-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 292671,
-        "byte_start": 292655,
+        "byte_end": 292684,
+        "byte_start": 292668,
         "column": 19,
         "column_end": 35,
         "column_start": 19,
@@ -9535,15 +9514,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 292980,
-        "byte_start": 292964,
+        "byte_end": 292971,
+        "byte_start": 292955,
         "column": 19,
         "column_end": 35,
         "column_start": 19,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 7777,
-        "line_end": 7777,
-        "line_start": 7777
+        "line": 7771,
+        "line_end": 7771,
+        "line_start": 7771
       }
     },
     {
@@ -9556,15 +9535,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 293232,
-        "byte_start": 293216,
+        "byte_end": 293280,
+        "byte_start": 293264,
         "column": 19,
         "column_end": 35,
         "column_start": 19,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 7784,
-        "line_end": 7784,
-        "line_start": 7784
+        "line": 7783,
+        "line_end": 7783,
+        "line_start": 7783
       }
     },
     {
@@ -9577,15 +9556,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 293446,
-        "byte_start": 293430,
+        "byte_end": 293532,
+        "byte_start": 293516,
         "column": 19,
         "column_end": 35,
         "column_start": 19,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 7789,
-        "line_end": 7789,
-        "line_start": 7789
+        "line": 7790,
+        "line_end": 7790,
+        "line_start": 7790
       }
     },
     {
@@ -9598,15 +9577,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 294129,
-        "byte_start": 294113,
+        "byte_end": 293746,
+        "byte_start": 293730,
         "column": 19,
         "column_end": 35,
         "column_start": 19,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 7811,
-        "line_end": 7811,
-        "line_start": 7811
+        "line": 7795,
+        "line_end": 7795,
+        "line_start": 7795
       }
     },
     {
@@ -9619,15 +9598,36 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 294447,
-        "byte_start": 294431,
+        "byte_end": 294429,
+        "byte_start": 294413,
         "column": 19,
         "column_end": 35,
         "column_start": 19,
         "file": "crates/carrick-observability/src/probes.rs",
-        "line": 7823,
-        "line_end": 7823,
-        "line_start": 7823
+        "line": 7817,
+        "line_end": 7817,
+        "line_start": 7817
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-ID",
+      "expansion": null,
+      "operation": "std::process::id",
+      "profiles": [
+        "macos-cli-default",
+        "macos-hvf-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 294747,
+        "byte_start": 294731,
+        "column": 19,
+        "column_end": 35,
+        "column_start": 19,
+        "file": "crates/carrick-observability/src/probes.rs",
+        "line": 7829,
+        "line_end": 7829,
+        "line_start": 7829
       }
     },
     {
@@ -12618,9 +12618,9 @@
       }
     }
   ],
-  "rows_sha256": "5f703137ab0333276f19eb6f4ec687597bf70c6398e57599df3d12aa2966baf2",
+  "rows_sha256": "828558cfdf6a6821a0c4df1b10b3f26497e11961da761361cb0f18cddd622b93",
   "schema": 1,
-  "source_head": "875fe2e35ad6d2e585b355a1ec82c88b67c6c2fd",
+  "source_head": "486a4305ffaf54c2e4a931ea3369be5addc00f02",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
