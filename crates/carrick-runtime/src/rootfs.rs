@@ -1351,6 +1351,14 @@ impl RootFs {
             .collect()
     }
 
+    /// Dirent-only view; metadata mode/size are not populated on the host path.
+    pub(crate) fn stream_dirents(&self, path: &str) -> Option<Vec<RootFsDirEntry>> {
+        match self.immutable_host.as_ref() {
+            Some(host) => host.backend.stream_dirents(path),
+            None => self.directory_entries(path).ok(),
+        }
+    }
+
     /// Archive-only bounded directory enumeration. At most `limit + 1`
     /// entries are ever retained; the extra entry is used solely to prove the
     /// caller's cumulative archive budget was exceeded.

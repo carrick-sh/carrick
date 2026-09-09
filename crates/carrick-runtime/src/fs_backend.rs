@@ -586,6 +586,13 @@ pub trait FsBackend: Send + Sync {
     /// host syscalls per child on the fs-walk workload).
     fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)>;
 
+    /// Optional exact dirent-only listing. Mode and size are not populated;
+    /// callers may consume only name, kind and inode. A backend that cannot
+    /// classify marker nodes or directory records exactly returns None.
+    fn stream_dirents(&self, _dir: &str) -> Option<Vec<RootFsDirEntry>> {
+        None
+    }
+
     /// Archive-only bounded directory enumeration. Implementations must stop
     /// after producing `limit + 1` visible candidates and must never delegate
     /// to the unbounded [`FsBackend::child_names`] default. The extra entry is
@@ -6409,6 +6416,31 @@ impl FsBackend for HostFsBackend {
             .unwrap_or_default()
     }
 
+    #[cfg(target_os = "macos")]
+    fn stream_dirents(&self, dir: &str) -> Option<Vec<RootFsDirEntry>> {
+        use std::os::fd::AsRawFd;
+        if self.dir_has_overlay_interference(dir) {
+            return None;
+        }
+        let normalized = normalize(dir)?;
+        let rel = Self::rel_path(&normalized).unwrap_or_else(|| Path::new(""));
+        let parent = self.dir_fd_for(rel).ok()?;
+        // The cached capability fd's seek offset must not be touched by a
+        // concurrent enumeration. Give the stream its own open description.
+        let raw = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return None;
+        }
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        read_host_dir_entries(owned.as_raw_fd(), dir)
+    }
+
     fn child_names_bounded(
         &self,
         dir: &str,
@@ -8100,6 +8132,154 @@ pub fn layered_directory_entries(
     Ok(out)
 }
 
+/// One streamed readdir batch of a TRUSTED host dirfd, translated to the
+/// `RootFsDirEntry` shape `getdents64`'s `dirent64_record` encoder consumes —
+/// `d_name`/`d_type`/`d_ino` straight off the kernel, zero per-child stats.
+/// `dup` + `fdopendir` gives `DIR*` ownership of a separate descriptor, but
+/// shares its open-description offset. Callers must supply a private stream
+/// description or serialize its offset. Skips "."/".." (the getdents
+/// handler synthesizes deterministic dot entries) and carrick's internal
+/// sidecar names. `None` on any surprise (`DT_UNKNOWN`, an unmappable type,
+/// `fdopendir` failure) ⇒ the caller takes the exact layered path.
+#[cfg(target_os = "macos")]
+pub(crate) fn read_host_dir_entries(
+    host_dir_fd: i32,
+    dir_path: &str,
+) -> Option<Vec<RootFsDirEntry>> {
+    struct Dirp(*mut libc::DIR);
+    impl Drop for Dirp {
+        fn drop(&mut self) {
+            // SAFETY: closes the DIR* (and its adopted dup'd fd) exactly once.
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    // SAFETY: dup a descriptor for DIR* to adopt without closing the caller's
+    // descriptor. The open-description seek offset remains shared.
+    let dup = unsafe { libc::dup(host_dir_fd) };
+    if dup < 0 {
+        return None;
+    }
+    let raw_dirp = unsafe { libc::fdopendir(dup) };
+    if raw_dirp.is_null() {
+        // SAFETY: fdopendir did not adopt the fd, so it is still ours.
+        unsafe {
+            libc::close(dup);
+        }
+        return None;
+    }
+    let dirp = Dirp(raw_dirp);
+    // fdopendir adopts the fd's CURRENT offset; the dup shares the
+    // original's, so rewind to read the whole directory.
+    unsafe { libc::rewinddir(dirp.0) };
+    let mut out = Vec::new();
+    loop {
+        // SAFETY: dirp.0 is a live DIR*; readdir returns null at end.
+        let ent = unsafe { libc::readdir(dirp.0) };
+        if ent.is_null() {
+            break;
+        }
+        // SAFETY: `ent` points at the DIR*'s current record; d_name is
+        // NUL-terminated within the struct.
+        let (d_type, d_ino, name_bytes) = unsafe {
+            let e = &*ent;
+            (
+                e.d_type,
+                e.d_ino,
+                std::ffi::CStr::from_ptr(e.d_name.as_ptr()).to_bytes(),
+            )
+        };
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        // On-disk names are valid UTF-8 by construction (APFS rejects raw
+        // non-UTF-8; undecodable guest names live in the reversible escape
+        // form — see `fs_backend::normalize`), so this lossy read matches
+        // `child_names` byte-for-byte.
+        let name = String::from_utf8_lossy(name_bytes).into_owned();
+        if crate::fs_backend::is_internal_sidecar_name(&name) {
+            continue;
+        }
+        let kind = match d_type {
+            libc::DT_DIR => RootFsEntryKind::Directory,
+            libc::DT_REG => RootFsEntryKind::File,
+            libc::DT_LNK => RootFsEntryKind::Symlink,
+            libc::DT_FIFO => RootFsEntryKind::Fifo,
+            libc::DT_SOCK => RootFsEntryKind::Socket,
+            libc::DT_CHR => RootFsEntryKind::CharDevice,
+            // DT_UNKNOWN / DT_BLK / anything else: the stream cannot answer
+            // d_type faithfully — layered path for the WHOLE directory.
+            _ => return None,
+        };
+        let path = if dir_path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{dir_path}/{name}")
+        };
+        out.push(RootFsDirEntry {
+            name,
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from(path),
+                kind,
+                // getdents64 consumes only `kind` (→ d_type), the name and
+                // the ino; mode/size mirror the layered merge's defaults for
+                // entries it does not open.
+                mode: if kind == RootFsEntryKind::Directory {
+                    0o755
+                } else {
+                    0o644
+                },
+                size: 0,
+            },
+            ino: d_ino,
+        });
+    }
+    Some(out)
+}
+
+/// Trusted host dirfds are only ever minted by the macOS `--fs host` fast
+/// path; the streaming reader is unreachable elsewhere.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn read_host_dir_entries(
+    _host_dir_fd: i32,
+    _dir_path: &str,
+) -> Option<Vec<RootFsDirEntry>> {
+    None
+}
+
+/// Dirent-only layered merge, with the same upper shadowing and whiteout
+/// precedence as layered_directory_entries. None requests its exact fallback.
+/// Returned mode/size fields are placeholders, never stat metadata.
+pub(crate) fn try_layered_stream_dirents(
+    overlay: &dyn FsBackend,
+    rootfs: Option<&RootFs>,
+    dir: &str,
+) -> Option<Vec<RootFsDirEntry>> {
+    let upper = overlay.stream_dirents(dir)?;
+    let lower = match rootfs {
+        Some(rootfs) => rootfs.stream_dirents(dir)?,
+        None => Vec::new(),
+    };
+    let deleted: HashSet<String> = overlay.deleted_child_names(dir).into_iter().collect();
+    let upper_names: HashSet<&str> = upper.iter().map(|row| row.name.as_str()).collect();
+    let mut out: Vec<_> = lower
+        .into_iter()
+        .filter(|row| {
+            !is_internal_sidecar_name(&row.name)
+                && !deleted.contains(&row.name)
+                && !upper_names.contains(row.name.as_str())
+        })
+        .collect();
+    drop(upper_names);
+    out.extend(
+        upper
+            .into_iter()
+            .filter(|row| !is_internal_sidecar_name(&row.name) && !deleted.contains(&row.name)),
+    );
+    Some(out)
+}
+
 fn joined(base: &str, name: &str) -> String {
     if base == "/" {
         format!("/{name}")
@@ -8240,6 +8420,73 @@ mod tests {
         scenario_bounded_child_names_returns_only_limit_plus_one(&mut MemoryBackend::new());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_dirent_stream_preserves_names_types_and_inodes() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file"), b"contents").unwrap();
+        std::fs::create_dir(temp.path().join("subdir")).unwrap();
+        std::os::unix::fs::symlink("file", temp.path().join("link")).unwrap();
+        let backend = HostFsBackend::from_path(temp.path()).unwrap();
+        let entries = backend
+            .stream_dirents("/")
+            .expect("host directory supports dirent-only reads");
+        assert_eq!(entries.len(), 3);
+        for (name, kind) in [
+            ("file", RootFsEntryKind::File),
+            ("subdir", RootFsEntryKind::Directory),
+            ("link", RootFsEntryKind::Symlink),
+        ] {
+            let row = entries.iter().find(|row| row.name == name).unwrap();
+            assert_eq!(row.metadata.kind, kind);
+            assert_eq!(
+                row.ino,
+                std::fs::symlink_metadata(temp.path().join(name))
+                    .unwrap()
+                    .ino()
+            );
+            assert_eq!(
+                row.metadata.size, 0,
+                "dirent enumeration does not fetch file sizes"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn layered_dirent_stream_hides_memory_lower_sidecars() {
+        let mut tar = tar::Builder::new(Vec::new());
+        for name in ["visible", ".carrick-lnkown.hidden"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(0);
+            tar.append_data(&mut header, name, std::io::empty())
+                .unwrap();
+        }
+        let lower =
+            RootFs::from_layers([crate::rootfs::LayerSource::Tar(tar.into_inner().unwrap())])
+                .unwrap();
+        let (upper, _scratch) = host_backend();
+        let rows = try_layered_stream_dirents(&upper, Some(&lower), "/").unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["visible"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_dirent_stream_refuses_marker_node_classification() {
+        let (backend, _scratch) = host_backend();
+        backend.create_file("/plain").unwrap();
+        assert!(backend.stream_dirents("/").is_some());
+        backend.create_socket("/socket", 0o600).unwrap();
+        assert!(backend.stream_dirents("/").is_none());
+        assert!(try_layered_stream_dirents(&backend, None, "/").is_none());
+    }
+
     #[test]
     fn layered_directory_entries_hide_internal_sidecar_names() {
         let b = MemoryBackend::new();
@@ -8272,8 +8519,19 @@ mod tests {
         // publishes (getdents64's `d_type`), not merely by the name set — the
         // upper and the lower can hold the same name with different types.
         fn names(upper: &HostFsBackend, lower: &RootFs, dir: &str) -> Vec<String> {
-            let mut names: Vec<String> = layered_directory_entries(upper, Some(lower), dir)
-                .unwrap()
+            let entries = layered_directory_entries(upper, Some(lower), dir).unwrap();
+            if let Some(stream) = try_layered_stream_dirents(upper, Some(lower), dir) {
+                let project = |rows: &[RootFsDirEntry]| {
+                    let mut projected: Vec<_> = rows
+                        .iter()
+                        .map(|row| format!("{}:{:?}:{}", row.name, row.metadata.kind, row.ino))
+                        .collect();
+                    projected.sort();
+                    projected
+                };
+                assert_eq!(project(&stream), project(&entries));
+            }
+            let mut names: Vec<String> = entries
                 .into_iter()
                 .map(|entry| format!("{}:{:?}", entry.name, entry.metadata.kind))
                 .collect();
@@ -8305,6 +8563,7 @@ mod tests {
         // exactly the lower's — this is the shape the hot image directories
         // are actually in during a python spawn.
         upper.make_dir("/img").unwrap();
+        assert!(try_layered_stream_dirents(&upper, Some(&lower), "/img").is_some());
         assert!(!upper.fast_nofollow_absent("/img"));
         assert_eq!(names(&upper, &lower, "/img"), vec!["a:File", "b:File"]);
 

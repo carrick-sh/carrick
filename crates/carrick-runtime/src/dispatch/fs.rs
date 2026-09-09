@@ -4352,7 +4352,7 @@ impl SyscallDispatcher {
     ) -> Vec<RootFsDirEntry> {
         let streamed = match trusted {
             Some(trusted) if self.trusted_dir_stream_is_exact(trusted, dir_path) => {
-                read_host_dir_entries(trusted.fd.raw(), dir_path)
+                crate::fs_backend::read_host_dir_entries(trusted.fd.raw(), dir_path)
             }
             _ => None,
         };
@@ -4363,12 +4363,19 @@ impl SyscallDispatcher {
             // child exactly. A directory deleted or renamed away since the
             // open reads as empty by its stale path — Linux would list the
             // inode's live contents; only the trusted stream matches that.
-            None => crate::overlay::layered_directory_entries(
+            None => crate::fs_backend::try_layered_stream_dirents(
                 self.fs.rootfs_vfs.overlay.as_ref(),
                 self.fs.rootfs_vfs.rootfs.as_ref(),
                 dir_path,
             )
-            .unwrap_or_default(),
+            .unwrap_or_else(|| {
+                crate::overlay::layered_directory_entries(
+                    self.fs.rootfs_vfs.overlay.as_ref(),
+                    self.fs.rootfs_vfs.rootfs.as_ref(),
+                    dir_path,
+                )
+                .unwrap_or_default()
+            }),
         };
         self.inject_mount_dir_entries(dir_path, &mut entries);
         entries
@@ -17341,115 +17348,6 @@ impl SyscallDispatcher {
         }
 
     }
-}
-
-/// One streamed readdir batch of a TRUSTED host dirfd, translated to the
-/// `RootFsDirEntry` shape `getdents64`'s `dirent64_record` encoder consumes —
-/// `d_name`/`d_type`/`d_ino` straight off the kernel, zero per-child stats.
-/// `dup` + `fdopendir` so the `DIR*` lifecycle (its own buffer, `closedir`)
-/// never touches the description fd's state. Skips "."/".." (the getdents
-/// handler synthesizes deterministic dot entries) and carrick's internal
-/// sidecar names. `None` on any surprise (`DT_UNKNOWN`, an unmappable type,
-/// `fdopendir` failure) ⇒ the caller takes the exact layered path.
-#[cfg(target_os = "macos")]
-fn read_host_dir_entries(host_dir_fd: i32, dir_path: &str) -> Option<Vec<RootFsDirEntry>> {
-    struct Dirp(*mut libc::DIR);
-    impl Drop for Dirp {
-        fn drop(&mut self) {
-            // SAFETY: closes the DIR* (and its adopted dup'd fd) exactly once.
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
-    // SAFETY: dup a private fd for the DIR* to adopt; the description's own
-    // fd (and its seek state) stays untouched.
-    let dup = unsafe { libc::dup(host_dir_fd) };
-    if dup < 0 {
-        return None;
-    }
-    let raw_dirp = unsafe { libc::fdopendir(dup) };
-    if raw_dirp.is_null() {
-        // SAFETY: fdopendir did not adopt the fd, so it is still ours.
-        unsafe {
-            libc::close(dup);
-        }
-        return None;
-    }
-    let dirp = Dirp(raw_dirp);
-    // fdopendir adopts the fd's CURRENT offset; the dup shares the
-    // original's, so rewind to read the whole directory.
-    unsafe { libc::rewinddir(dirp.0) };
-    let mut out = Vec::new();
-    loop {
-        // SAFETY: dirp.0 is a live DIR*; readdir returns null at end.
-        let ent = unsafe { libc::readdir(dirp.0) };
-        if ent.is_null() {
-            break;
-        }
-        // SAFETY: `ent` points at the DIR*'s current record; d_name is
-        // NUL-terminated within the struct.
-        let (d_type, d_ino, name_bytes) = unsafe {
-            let e = &*ent;
-            (
-                e.d_type,
-                e.d_ino,
-                std::ffi::CStr::from_ptr(e.d_name.as_ptr()).to_bytes(),
-            )
-        };
-        if name_bytes == b"." || name_bytes == b".." {
-            continue;
-        }
-        // On-disk names are valid UTF-8 by construction (APFS rejects raw
-        // non-UTF-8; undecodable guest names live in the reversible escape
-        // form — see `fs_backend::normalize`), so this lossy read matches
-        // `child_names` byte-for-byte.
-        let name = String::from_utf8_lossy(name_bytes).into_owned();
-        if crate::fs_backend::is_internal_sidecar_name(&name) {
-            continue;
-        }
-        let kind = match d_type {
-            libc::DT_DIR => RootFsEntryKind::Directory,
-            libc::DT_REG => RootFsEntryKind::File,
-            libc::DT_LNK => RootFsEntryKind::Symlink,
-            libc::DT_FIFO => RootFsEntryKind::Fifo,
-            libc::DT_SOCK => RootFsEntryKind::Socket,
-            libc::DT_CHR => RootFsEntryKind::CharDevice,
-            // DT_UNKNOWN / DT_BLK / anything else: the stream cannot answer
-            // d_type faithfully — layered path for the WHOLE directory.
-            _ => return None,
-        };
-        let path = if dir_path == "/" {
-            format!("/{name}")
-        } else {
-            format!("{dir_path}/{name}")
-        };
-        out.push(RootFsDirEntry {
-            name,
-            metadata: RootFsMetadata {
-                path: std::path::PathBuf::from(path),
-                kind,
-                // getdents64 consumes only `kind` (→ d_type), the name and
-                // the ino; mode/size mirror the layered merge's defaults for
-                // entries it does not open.
-                mode: if kind == RootFsEntryKind::Directory {
-                    0o755
-                } else {
-                    0o644
-                },
-                size: 0,
-            },
-            ino: d_ino,
-        });
-    }
-    Some(out)
-}
-
-/// Trusted host dirfds are only ever minted by the macOS `--fs host` fast
-/// path; the streaming reader is unreachable elsewhere.
-#[cfg(not(target_os = "macos"))]
-fn read_host_dir_entries(_host_dir_fd: i32, _dir_path: &str) -> Option<Vec<RootFsDirEntry>> {
-    None
 }
 
 /// `read(2)` on a fanotify group fd: drain queued events into the guest buffer
