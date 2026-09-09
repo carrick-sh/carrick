@@ -905,7 +905,10 @@ mod foreign_mm_tests {
             .map_aliased(TEST_VA, data_ipa, data_len as u64, false, None)
             .expect("map foreign test leaf");
 
-        let table_bytes = tables.as_bytes().to_vec();
+        // The manager retains only populated bytes; the host owner must still
+        // cover the full primary arena that the publication resolver pins.
+        let mut table_bytes = tables.as_bytes().to_vec();
+        table_bytes.resize(carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize, 0);
         let (table_generation, table_host) = install_owner(root, &table_bytes);
         let mut data_bytes = vec![0_u8; data_len];
         data_bytes[..bytes.len()].copy_from_slice(bytes);
@@ -1131,6 +1134,83 @@ mod foreign_mm_tests {
         let inventory = format!("{:?}", *installed.state.frame_inventory.ledger.lock());
         let owners = global_frame_host_owners().lock().keys().copied().collect();
         (stage1, inventory, owners)
+    }
+
+    #[test]
+    fn sparse_replacement_failure_preserves_preimage_before_retirement() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        for after_sync in [false, true] {
+            let stub = ScopedStage2MapTestStub::enable();
+            let transport = CarrierForeignMmTransport::new();
+            let installed = install_mm(
+                &transport,
+                197,
+                0x9a00_6000_0000,
+                0x9b00_6000_0000,
+                *b"kept",
+            );
+            let (_authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+            let mut authority = TestForeignCowAuthority::new(&installed);
+            authority.allow_quiesce = true;
+            installed
+                .state
+                .cow_runtime
+                .write()
+                .as_mut()
+                .unwrap()
+                .authority = Arc::new(authority);
+            let identity = installed
+                .state
+                .cow_runtime
+                .read()
+                .as_ref()
+                .unwrap()
+                .identity;
+            let context = sparse_materialization::PublicationContext::for_local(
+                installed.state.clone(),
+                Arc::clone(legacy_test_carrier_vm_custody_arc()),
+                identity,
+            )
+            .unwrap();
+            let before = foreign_cow_fingerprint(&installed);
+            let aliases_before = alias_registry().lock().ordered();
+            let retired = std::cell::Cell::new(false);
+            if after_sync {
+                STAGE2_AUDIT_STATE
+                    .with(|s| s.borrow_mut().fail_sparse_publication_after_sync = true);
+            } else {
+                stub.set_fail_stage_mapping(true);
+            }
+            let result = sparse_materialization::publish_replacing(
+                &context,
+                TEST_VA,
+                TEST_VA + 4096,
+                SparseExtentBacking::SeededAnon { bytes: b"next" },
+                &mut || Ok(()),
+                &mut || retired.set(true),
+            );
+            let error = match result {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("injected publication must fail"),
+            };
+            let expected = if after_sync {
+                "injected sparse publication failure after sync"
+            } else {
+                "injected stage_mapping failure"
+            };
+            assert!(error.contains(expected), "wrong failure boundary: {error}");
+            assert!(
+                !retired.get(),
+                "failed publication must not retire the preimage"
+            );
+            assert_eq!(foreign_cow_fingerprint(&installed), before);
+            assert_eq!(alias_registry().lock().ordered(), aliases_before);
+            let mut bytes = [0; 4];
+            read_installed(&transport, &installed, &mut bytes).unwrap();
+            assert_eq!(&bytes, b"kept");
+            assert!(installed.state.cow_armed.lock().span_for(TEST_VA).is_some());
+        }
     }
 
     #[test]
@@ -20648,6 +20728,17 @@ struct InventoryLeaseRetirement {
     frames: std::collections::BTreeSet<carrick_hal::FrameId>,
     stage2_leases: std::collections::BTreeSet<(u64, u64)>,
     stage2_population_complete: std::collections::BTreeMap<(u64, u64), bool>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PreparedProcessAliasRetirement {
+    planned_leases: std::collections::BTreeSet<(u64, u64)>,
+    diagnostic_before: Vec<AliasBacking>,
+    disarm_spans: Vec<CowArmedSpan>,
+    inventory: Option<(
+        InventoryLeaseRetirement,
+        carrick_hal::FrameInventoryReservation,
+    )>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -40613,32 +40704,8 @@ impl HvfVmState {
             return Ok(false);
         }
 
-        if !overlapping_aliases.is_empty()
-            || self.mappings.iter().any(|m| {
-                m.start < end
-                    && m.end > va
-                    && m.is_dynamic_alias
-                    && global_frame_region_owner_matches_in(self.custody(), m)
-            })
-        {
-            self.unregister_process_alias(va, len)?;
-            flush_stage1()?;
-        }
-
         let mut current = va;
         while current < end {
-            if self.mapping_for_range(current, 1).is_some_and(|mapping| {
-                !crate::memory::va_in_shared_aperture(current, 1)
-                    || !mapping.is_shared_aperture_identity()
-            }) {
-                // The hole check / retirement above ran outside the topology lock;
-                // a mapping appearing here means a sibling publication raced this
-                // mmap. Fail closed: the dispatcher's snapshot fallback rewrites
-                // the bytes and the extents already materialized privatize on that write.
-                return Err(TrapError::Hypervisor(format!(
-                    "private file view at VA 0x{current:x} overlapped a mapping published mid-materialization"
-                )));
-            }
             let hole_end = if current < file_pages_end {
                 file_pages_end
             } else {
@@ -40653,12 +40720,13 @@ impl HvfVmState {
             } else {
                 SparseExtentBacking::Anon
             };
-            let next = self.materialize_sparse_mmap_extent(
+            let next = self.materialize_sparse_mmap_extent_inner(
                 current,
                 hole_end,
                 backing,
                 flush_stage1,
                 None,
+                true,
             )?;
             if next <= current {
                 return Err(TrapError::Hypervisor(format!(
@@ -40677,6 +40745,25 @@ impl HvfVmState {
         backing: SparseExtentBacking<'_>,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
         receipt_range: Option<std::ops::Range<u64>>,
+    ) -> Result<u64, TrapError> {
+        self.materialize_sparse_mmap_extent_inner(
+            start,
+            end,
+            backing,
+            flush_stage1,
+            receipt_range,
+            false,
+        )
+    }
+
+    fn materialize_sparse_mmap_extent_inner(
+        &mut self,
+        start: u64,
+        end: u64,
+        backing: SparseExtentBacking<'_>,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+        receipt_range: Option<std::ops::Range<u64>>,
+        replacing: bool,
     ) -> Result<u64, TrapError> {
         const PAGE_SIZE: u64 = 4 * 1024;
 
@@ -40698,80 +40785,112 @@ impl HvfVmState {
             identity.linux_pid,
             identity.linux_tid,
         );
-        if let Some(mapping) = self.mapping_for_range(start, 1) {
-            // An aperture identity row is a boot lookup fallback, not proof
-            // that a private file view raced this publication. The caller has
-            // already refused live shared aliases; process-scoped frame owners
-            // below remain authoritative even after an old overlay is retired.
-            let replaces_boot_identity = matches!(backing, SparseExtentBacking::FileView { .. })
-                && crate::memory::va_in_shared_aperture(start, end - start)
-                && mapping.is_shared_aperture_identity();
-            if !replaces_boot_identity {
-                return Ok(mapping.end.min(end));
-            }
-        }
-
-        // Another vCPU in this mm can publish the physical alias while its
-        // stage-1 receipt is deliberately still invalid.  Such an alias is
-        // invisible to `mapping_for_range` on this sibling until the later
-        // protection commit, so authenticate the process-shared physical owner
-        // directly before allocating a second overlapping frame.
-        let live_alias_end = alias_registry()
-            .lock()
-            .newest_process_alias_containing_va(
+        let end = if replacing {
+            // Eligibility was screened before exact-MM quiescence. Recheck
+            // under topology exclusion before bypassing the hole checks: a
+            // sibling must not turn a private replacement into a shared unmap.
+            let len = usize::try_from(end - start)
+                .map_err(|_| TrapError::MappingTooLarge(end - start))?;
+            let aliases = alias_registry().lock().overlapping_process_aliases(
                 start,
+                len,
                 self.mm_root_slot,
                 self.container_root,
-                |alias| {
-                    global_frame_host_owner_matches_in(
-                        self.custody(),
-                        alias.physical_ipa,
-                        alias.physical_size as u64,
-                        alias.physical_host_addr,
-                        alias.owner_generation,
-                    )
-                },
-            )
-            .map(|alias| alias.start.saturating_add(alias.size as u64));
-        if let Some(alias_end) = live_alias_end {
-            return Ok(alias_end.min(end));
-        }
-
-        // The caller found this hole before quiescing. Recompute its upper
-        // boundary under the topology lock so a sibling publication between
-        // those two points cannot be overlapped.
-        // Ordered range query (see the window arm above): this bound decides
-        // whether the new extent overlaps a live mapping, so it must still see
-        // every row -- including displaced ones -- that the exact live global
-        // owner still backs.
-        let custody = self.custody();
-        let next_local =
-            self.mappings
-                .first_start_between(GuestVa(start), GuestVa(end), |mapping| {
-                    global_frame_region_owner_matches_in(custody, mapping)
-                });
-        let next_alias = alias_registry()
-            .lock()
-            .first_matching_process_alias_start_between(
-                start,
-                end,
-                self.mm_root_slot,
-                self.container_root,
-                |alias| {
-                    global_frame_host_owner_matches_in(
-                        self.custody(),
-                        alias.physical_ipa,
-                        alias.physical_size as u64,
-                        alias.physical_host_addr,
-                        alias.owner_generation,
-                    )
-                },
             );
-        let end = next_local
-            .into_iter()
-            .chain(next_alias)
-            .min()
-            .unwrap_or(end);
+            let forbidden_alias = aliases.iter().any(|(_, alias)| {
+                alias.sharing != GuestMappingSharing::Private
+                    || !alias_backing_is_live(alias.physical_host_addr)
+            });
+            let forbidden_mapping = self.mappings.iter().any(|mapping| {
+                mapping.start < end
+                    && mapping.end > start
+                    && global_frame_region_owner_matches_in(self.custody(), mapping)
+                    && (!mapping.is_dynamic_alias
+                        || mapping.sharing != GuestMappingSharing::Private)
+            });
+            if forbidden_alias || forbidden_mapping {
+                return Err(TrapError::Hypervisor(
+                    "private-file replacement eligibility changed before quiescence".to_owned(),
+                ));
+            }
+            end
+        } else {
+            if let Some(mapping) = self.mapping_for_range(start, 1) {
+                // An aperture identity row is a boot lookup fallback, not proof
+                // that a private file view raced this publication. The caller has
+                // already refused live shared aliases; process-scoped frame owners
+                // below remain authoritative even after an old overlay is retired.
+                let replaces_boot_identity =
+                    matches!(backing, SparseExtentBacking::FileView { .. })
+                        && crate::memory::va_in_shared_aperture(start, end - start)
+                        && mapping.is_shared_aperture_identity();
+                if !replaces_boot_identity {
+                    return Ok(mapping.end.min(end));
+                }
+            }
+
+            // Another vCPU in this mm can publish the physical alias while its
+            // stage-1 receipt is deliberately still invalid.  Such an alias is
+            // invisible to `mapping_for_range` on this sibling until the later
+            // protection commit, so authenticate the process-shared physical owner
+            // directly before allocating a second overlapping frame.
+            let live_alias_end = alias_registry()
+                .lock()
+                .newest_process_alias_containing_va(
+                    start,
+                    self.mm_root_slot,
+                    self.container_root,
+                    |alias| {
+                        global_frame_host_owner_matches_in(
+                            self.custody(),
+                            alias.physical_ipa,
+                            alias.physical_size as u64,
+                            alias.physical_host_addr,
+                            alias.owner_generation,
+                        )
+                    },
+                )
+                .map(|alias| alias.start.saturating_add(alias.size as u64));
+            if let Some(alias_end) = live_alias_end {
+                return Ok(alias_end.min(end));
+            }
+
+            // The caller found this hole before quiescing. Recompute its upper
+            // boundary under the topology lock so a sibling publication between
+            // those two points cannot be overlapped.
+            // Ordered range query (see the window arm above): this bound decides
+            // whether the new extent overlaps a live mapping, so it must still see
+            // every row -- including displaced ones -- that the exact live global
+            // owner still backs.
+            let custody = self.custody();
+            let next_local =
+                self.mappings
+                    .first_start_between(GuestVa(start), GuestVa(end), |mapping| {
+                        global_frame_region_owner_matches_in(custody, mapping)
+                    });
+            let next_alias = alias_registry()
+                .lock()
+                .first_matching_process_alias_start_between(
+                    start,
+                    end,
+                    self.mm_root_slot,
+                    self.container_root,
+                    |alias| {
+                        global_frame_host_owner_matches_in(
+                            self.custody(),
+                            alias.physical_ipa,
+                            alias.physical_size as u64,
+                            alias.physical_host_addr,
+                            alias.owner_generation,
+                        )
+                    },
+                );
+            next_local
+                .into_iter()
+                .chain(next_alias)
+                .min()
+                .unwrap_or(end)
+        };
 
         let semantic_len =
             usize::try_from(end - start).map_err(|_| TrapError::MappingTooLarge(end - start))?;
@@ -40786,8 +40905,32 @@ impl HvfVmState {
                 TrapError::Hypervisor(format!("anonymous materialization range: {error}"))
             })?;
 
-        let published =
-            sparse_materialization::publish(&publication, start, end, backing, flush_stage1)?;
+        let mut retirement = if replacing {
+            Some(self.prepare_process_alias_retirement(start, semantic_len)?)
+        } else {
+            None
+        };
+        let published = sparse_materialization::publish_replacing(
+            &publication,
+            start,
+            end,
+            backing,
+            flush_stage1,
+            &mut || {
+                if let Some(retirement) = retirement.take() {
+                    // New descriptors and inventory are committed, but the new
+                    // alias is not registered yet. Retire only the old rows.
+                    // All ordinary allocation failures preceded this boundary.
+                    self.commit_process_alias_retirement(start, semantic_len, retirement)
+                        .unwrap_or_else(|error| {
+                            eprintln!(
+                                "carrick: FATAL: committed private-file retirement failed: {error}"
+                            );
+                            std::process::abort();
+                        });
+                }
+            },
+        )?;
         let page_granular_arm = published.page_granular_arm;
         let semantic_ipa = published.region.ipa;
         for ext in published.extension_regions {
@@ -44741,8 +44884,8 @@ impl HvfVmState {
         // `ENOMEM`. Seen as `go-net` dying with "fatal error: runtime: cannot
         // allocate memory" on a 256 KiB arena mmap whose fifth page still held
         // a one-page receipt from a freed mapping.
-        self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
         if !self.persistent_vm_lifecycle {
+            self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
             if let Some(debug_va) = fork_debug_va()
                 && debug_va >= va
                 && debug_va < va.saturating_add(len as u64)
@@ -44762,13 +44905,9 @@ impl HvfVmState {
             self.split_local_rows_for_unmap(va, len);
             return Ok(());
         }
-        let authority = self.cow_authority.as_ref().ok_or_else(|| {
-            TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
-        })?;
         let identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no mm identity".to_owned())
         })?;
-        let custody = self.carrier_vm_custody();
         // `GuestMemory::unmap_range` is reached only from the mmap-family
         // syscall set, whose runtime dispatch already owns the process-wide
         // page-table pause across invalidate + TLBI + this backend retirement.
@@ -44780,10 +44919,20 @@ impl HvfVmState {
             identity.linux_tid,
         );
 
-        // Plan against the live registry's scope-keyed indices before mutating
-        // the process-wide alias index. Reservation failure therefore leaves
-        // the exact pre-munmap lifetime graph intact; the checked stage-1
-        // invalidation has already made the guest range inaccessible.
+        let prepared = self.prepare_process_alias_retirement(va, len)?;
+        self.commit_process_alias_retirement(va, len, prepared)
+    }
+
+    /// Prepare while the caller holds topology exclusion. Dropping this value
+    /// leaves aliases, COW state, receipts and inventory unchanged.
+    fn prepare_process_alias_retirement(
+        &self,
+        va: u64,
+        len: usize,
+    ) -> Result<PreparedProcessAliasRetirement, TrapError> {
+        let authority = self.cow_authority.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
+        })?;
         let (planned_leases, registry_before, diagnostic_before) = {
             let registry = alias_registry().lock();
             let (planned_leases, registry_before) = registry.plan_unregister_process_alias(
@@ -44807,79 +44956,64 @@ impl HvfVmState {
             self.container_root,
             &planned_leases,
         );
-        if planned_leases.is_empty() {
-            let actual = unregister_alias(va, len, self.mm_root_slot, self.container_root);
-            debug_assert!(actual.is_empty());
-            record_alias_unmap_lifecycle(
-                CowDiagnosticLifecycleSite::AliasUnmap,
-                &custody,
-                Some(identity),
-                self.mm_root_slot,
-                self.container_root,
-                &diagnostic_before,
-            );
-            // Keep this engine's rows in step with the split the registry just
-            // took (see `split_local_rows_for_unmap`).
-            self.split_local_rows_for_unmap(va, len);
-            // A partial Linux unmap can remove the last semantic projection of
-            // one 4 KiB page while another fragment still retains the same
-            // 16 KiB HVPatch frame. Keep the compound armed: low-arena mmap
-            // reuses the invalid stage-1 output and zero_backing must split the
-            // still-fork-shared physical frame before scrubbing it. Disarming
-            // here made the next fork omit the reactivated page from its exact
-            // alias-derived COW ranges (mtforkcorrupt).
-            return Ok(());
-        }
-        let retirement = {
-            let inventory = self.frame_inventory.lock();
-            Self::inventory_lease_retirement_shape(&inventory, &planned_leases, &|frame| {
-                authority.frame_mapping_count(frame).map_err(|error| {
+        let inventory = if planned_leases.is_empty() {
+            None
+        } else {
+            let retirement = {
+                let inventory = self.frame_inventory.lock();
+                Self::inventory_lease_retirement_shape(&inventory, &planned_leases, &|frame| {
+                    authority.frame_mapping_count(frame).map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "query alias-retirement frame mapping count: {error}"
+                        ))
+                    })
+                })?
+            };
+            if retirement.mappings.is_empty() {
+                None
+            } else {
+                let event_count = retirement
+                    .mappings
+                    .len()
+                    .saturating_add(retirement.frames.len());
+                let mut reservation = authority.reserve(0, 0, event_count).map_err(|error| {
                     TrapError::Hypervisor(format!(
-                        "query alias-retirement frame mapping count: {error}"
+                        "reserve HVPatch alias retirement inventory: {error}"
                     ))
-                })
-            })?
-        };
-        if retirement.mappings.is_empty() {
-            let actual = unregister_alias(va, len, self.mm_root_slot, self.container_root);
-            debug_assert_eq!(actual, planned_leases);
-            record_alias_unmap_lifecycle(
-                CowDiagnosticLifecycleSite::AliasUnmap,
-                &custody,
-                Some(identity),
-                self.mm_root_slot,
-                self.container_root,
-                &diagnostic_before,
-            );
-            self.split_local_rows_for_unmap(va, len);
-            let mut armed = self.cow_armed.lock();
-            for span in disarm_spans {
-                if let Some(debug_va) = fork_debug_va()
-                    && debug_va >= span.va
-                    && debug_va < span.va.saturating_add(span.len as u64)
-                {
-                    eprintln!(
-                        "[DISARMDBG alias-unmap pid={:?} mm={:?}] span=({:#x},{:#x})",
-                        self.cow_identity.map(|identity| identity.linux_pid),
-                        self.cow_identity.map(|identity| identity.mm),
-                        span.va,
-                        span.len,
-                    );
-                }
-                armed.disarm(span);
+                })?;
+                Self::stage_inventory_lease_retirement(&mut reservation, &retirement)?;
+                Some((retirement, reservation))
             }
-            return Ok(());
-        }
-        let event_count = retirement
-            .mappings
-            .len()
-            .saturating_add(retirement.frames.len());
-        let mut reservation = authority.reserve(0, 0, event_count).map_err(|error| {
-            TrapError::Hypervisor(format!(
-                "reserve HVPatch alias retirement inventory: {error}"
-            ))
+        };
+        Ok(PreparedProcessAliasRetirement {
+            planned_leases,
+            diagnostic_before,
+            disarm_spans,
+            inventory,
+        })
+    }
+
+    /// Consume a retirement under the same topology exclusion as preparation.
+    fn commit_process_alias_retirement(
+        &mut self,
+        va: u64,
+        len: usize,
+        prepared: PreparedProcessAliasRetirement,
+    ) -> Result<(), TrapError> {
+        let authority = self.cow_authority.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
         })?;
-        Self::stage_inventory_lease_retirement(&mut reservation, &retirement)?;
+        let identity = self.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch alias retirement has no mm identity".to_owned())
+        })?;
+        let custody = self.carrier_vm_custody();
+        let PreparedProcessAliasRetirement {
+            planned_leases,
+            diagnostic_before,
+            disarm_spans,
+            inventory,
+        } = prepared;
+        self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
         let actual_leases = unregister_alias(va, len, self.mm_root_slot, self.container_root);
         if actual_leases != planned_leases {
             eprintln!(
@@ -44895,6 +45029,16 @@ impl HvfVmState {
             self.container_root,
             &diagnostic_before,
         );
+        let Some((retirement, reservation)) = inventory else {
+            self.split_local_rows_for_unmap(va, len);
+            // A surviving fragment of a compound still needs its COW arm.
+            // The planner emits spans only for leases it actually retires.
+            let mut armed = self.cow_armed.lock();
+            for span in disarm_spans {
+                armed.disarm(span);
+            }
+            return Ok(());
+        };
         if let Err(error) = authority.apply(reservation.commit(())) {
             // Name the retirement, not just the id that failed. This abort used
             // to print one MappingId and nothing else, which cannot distinguish
@@ -49543,6 +49687,7 @@ pub(crate) enum Stage2BackendEvent {
 #[derive(Default)]
 struct Stage2TestAuditState {
     enabled: bool,
+    fail_sparse_publication_after_sync: bool,
     fail_next_map: bool,
     fail_map_on_call: Option<usize>,
     map_call_count: usize,
@@ -49569,6 +49714,7 @@ impl ScopedStage2MapTestStub {
         STAGE2_AUDIT_STATE.with(|s| {
             let mut state = s.borrow_mut();
             state.enabled = true;
+            state.fail_sparse_publication_after_sync = false;
             state.fail_next_map = false;
             state.fail_map_on_call = None;
             state.map_call_count = 0;
