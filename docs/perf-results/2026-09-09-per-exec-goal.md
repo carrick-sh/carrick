@@ -127,3 +127,60 @@ marking neighbouring Linux 4 KiB pages dirty.
 `sampling-final.symbols.json` retains every resolved user stack. No production
 code changed in this diagnostic checkpoint. The performance goal, full ecosystem
 comparisons and final integrated-artifact gates remain open.
+
+## Rejected COW alias-window candidate
+
+A candidate replaced `physical_cow_source_in`'s full process-scope alias search
+with the existing size-class VA window index, retaining the exact predicate
+and newest sequence. The red-first complexity test visited 2,051 rows before
+the change; the candidate passed its bounded query test and all 472 HVF host
+tests (3 existing ignored). However, untraced ABBA did not establish a useful
+spawn improvement, so the production edit and test were discarded.
+
+| Spawn | Accepted scan binary ms | Window candidate ms |
+|---|---:|---:|
+| /bin/true | 2.0374 | 2.2370 |
+| Python -S | 12.9391 | 13.8365 |
+| Python | 14.6010 | 14.5107 |
+
+Ordinary Python's 0.62% change is too small to accept alongside the adverse
+other rows and within-arm variation. Receipts: `cow-window-abba.json`,
+`cow-window-provenance.json`, `cow-window-red.log`, `cow-window-green.log`,
+and `cow-window-rejected.patch`. Candidate SHA-256:
+`e80c0feb9530ea34042732f267db3c4a9e0cf74cea8497947c80dfec260c1954`.
+The preserved `carrick-cow` is a rejected experiment, not the accepted runtime.
+The next measured candidate targets the repeated removed-alias searches in
+address-space retirement.
+
+## Rejected removed-alias retirement candidate
+
+The next candidate carried the first original alias alongside each affected
+key, eliminating a repeated linear search of `removed_owned`. Instrumenting
+the original search made a 512-alias retirement visit 131,841 rows; the candidate
+passed the bounded-work assertion while preserving first-duplicate physical
+identity and replay-epoch semantics. All 472 HVF host tests passed, with 3
+existing ignored tests.
+
+The paired untraced spawn results again did not establish a useful improvement:
+
+| Spawn | Accepted scan binary ms | Retirement candidate ms |
+|---|---:|---:|
+| /bin/true | 2.0875 | 2.1283 |
+| Python -S | 12.9430 | 12.9922 |
+| Python | 14.4322 | 14.3276 |
+
+Ordinary Python improved only 0.72%, while the other rows worsened slightly.
+The production edit and regression test were discarded. Receipts:
+`retirement-abba.json`, `retirement-provenance.json`, `retirement-red.log`,
+`retirement-green.log`, and `retirement-rejected.patch`. Candidate SHA-256:
+`c0643dc4de40510e708450b146aeb89032f48be06ce0ef95c4791e73cce27937`.
+`carrick-retire` and the current `target/release/carrick` are this rejected
+experiment; rebuild the CLI from tracked source before using the default path
+for acceptance. `carrick-scan` remains the measured accepted optimization.
+
+These experiments reject the two local scan changes as sufficient progress on
+the spawn target, despite their synthetic scaling wins. Inspect the per-fault
+COW transaction's larger combined cost next, preserving Linux 4 KiB clean-page
+tracking, live owner authentication, and rollback across both translation
+stages and inventory. No further runtime improvement is claimed from this
+checkpoint. The original <=2x goal and every pending final gate remain active.
