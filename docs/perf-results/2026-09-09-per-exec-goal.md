@@ -812,3 +812,49 @@ position reconciliation remains to be completed after the code commit. The
 next greedy step is to refresh CPU attribution on this exact artifact, since
 its reduced allocation and retirement work can change the prior ranking.
 The full <=2x goal remains active.
+
+
+### Accepted packing checkpoint and refreshed ranking
+
+Code commit `486a4305f` and inventory commit `7a0ee177c` are local only.
+Inventory reconciliation changed positions/capture bindings only (31 host
+sites, one abort fingerprint); reviewed memberships and rationale text remain
+unchanged. `just lint-domains` passed (`pack-lint-domains.log`). Its host-authority
+census is explicitly the macOS subset; the listed Linux/FreeBSD/NetBSD profiles
+remain pending, not newly qualified. `pack-scoped-cleanup.json` records zero
+remaining Carrick processes after all tests, measurements and profiling.
+
+`pack-cpu.raw` samples the exact gated candidate, 500 normal Python spawns,
+without USDT enabled. The first attempt at the saved binary path was rejected
+by sudo before any guest execution. The allowed `target/release/carrick` path
+had the identical SHA-256 and completed naturally: target zero, zero errors,
+no bound hit, 1,645 user and 2,355 kernel samples. BL/BLR return-site validation
+found 1,171/1,171 user and 375/375 kernel-user sites at `0x1021fc000`. Source
+and artifact records are retained with the capture. Sampling raised mean spawn
+to 15.138 ms versus 13.254 ms untraced; these are directional CPU rankings,
+not additive wall-time savings. Each stack is assigned once according to the
+explicit rules in `pack-cpu-analysis.json`:
+
+| Classified path | User samples | Kernel samples | Sampled CPU ms/child |
+|---|---:|---:|---:|
+| COW resolution | 452 | 185 | 2.553 |
+| Syscall service | 361 | 205 | 2.269 |
+| Deferred retirement | 159 | 81 | 0.962 |
+| Translation/materialization fault | 148 | 46 | 0.778 |
+| Exec preparation | 73 | 4 | 0.309 |
+| Ordinary guest run | 109 | 1533 | 6.581 |
+| Other/unclassified | 343 | 301 | 2.581 |
+
+COW is still the largest named runtime service bucket, with syscall service
+close behind. The next discriminating investigation should split COW's
+remaining publication work: inventory reservation/application, page-table
+journal publication, alias publication, and stage-1 maintenance. The sample
+contains 90 reserve and 54 apply descendants, and 103 maintenance descendants;
+these inclusive subcounts overlap and cannot be summed as independent savings.
+Narrower invalidation alone was already empirically rejected. A new experiment
+must show avoidable transaction work before revisiting that path. In parallel
+as a sequence of local investigations, syscall attribution should separate
+getdents/openat/mmap from generic dispatch: the current inclusive service
+samples include 99 getdents, 91 openat, and 60 mmap descendants. Neither set of
+samples yet proves which removable operation can recover the remaining 4.06 ms.
+No new speculative runtime edit is present at this checkpoint.
