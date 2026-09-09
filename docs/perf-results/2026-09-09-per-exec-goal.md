@@ -896,3 +896,88 @@ host tests should inject an entropy source to verify refill count, exhaustion,
 PID invalidation, and failed-refill recovery. Compare untraced paired binaries
 before accepting the added state; reject the candidate if the expected small
 saving is not repeatable. No runtime entropy change exists at this checkpoint.
+
+
+### Entropy batching candidate: red-first and paired timing
+
+An uncommitted authority-owned `ProvenanceEntropyBatch` consumes eight distinct
+32-byte slices of each 256-byte OS fill. It introduces no PRNG or derived key.
+A mutex serializes draws; consumed slots are replaced with zero arrays. The
+buffer's Debug implementation omits entropy bytes. A host PID change discards
+remaining tokens before drawing, and a failed partial refill clears all slots
+without setting availability. Transaction IDs, commit provenance checks,
+reservation candidate registration, and rollback remain unchanged.
+
+`entropy-batch-red.log` proves the baseline per-token source fails the new
+17-draw/three-refill check. The implemented batch then passes all 22 frame
+inventory tests (`entropy-batch-green.log`), including PID invalidation and
+partial-refill recovery. The full serial runtime suite passes 2,579 tests,
+with two ignored (`entropy-batch-runtime.log`). Signed development artifact
+`carrick-entropy-batch` SHA-256
+`096c74028bb5cbf198e5c5b36246b20626ccb94d7b16b305866219cea5c66ed9`
+is bound by `entropy-batch-provenance.json` and `entropy-batch-source.patch`.
+
+Two untraced ABBA runs (`entropy-batch-abba.json`, `entropy-batch-abba2.json`)
+compare against accepted `carrick-pack-gated`:
+
+| Run | Command | Base mean ms | Candidate mean ms |
+|---|---|---:|---:|
+| 1 | true | 2.06849 | 2.00468 |
+| 1 | Python -S | 11.37946 | 11.13238 |
+| 1 | Python | 12.78423 | 12.49042 |
+| 2 | true | 2.14165 | 2.02619 |
+| 2 | Python -S | 11.75597 | 11.13779 |
+| 2 | Python | 12.86089 | 12.58057 |
+
+Normal spawn improves 2.30% and 2.18%; the larger control changes are variable
+and should not be overinterpreted. `batch-entropy.raw` confirms exactly 26,326
+256-byte calls replacing 210,608 32-byte calls, eightfold, with the same other
+size populations. All 27,833 entry/return pairs balance, all calls succeed,
+the target exits zero, and the trace has no errors/bound hit. Its durations
+are perturbed and not a timing acceptance result.
+
+The full signed public probe gate is running as
+`execdiag-sep09-entropy-probes` (`entropy-batch-probes.log`). Full CPython ABBA,
+fresh oracle timing, final artifact binding, clippy, and inventory review are
+pending. The new host PID query requires an explicit host-authority review row;
+it selects only the current host process for cache invalidation, never a guest
+identity. No final acceptance or new absolute oracle ratio is claimed yet.
+
+
+### Entropy candidate gates and final paired measurement
+
+The full public signed gate exited zero (`entropy-batch-probes.log`): 876
+unique generic runs, 25 signed case tests, both negative entitlement controls,
+the CLI contract, and 46 passing retained tests with one ignored. Report-only
+amd64 musl differences and unavailable gnu binaries are not x86 acceptance.
+The gated CLI is saved as `carrick-entropy-gated`, SHA-256
+`b9117bffa97b5bae49c97a99524d8345b1d1a58f59d35dae0a08215e87adb462`;
+`entropy-gated-provenance.json` binds signature, UUID, entitlement and DOF.
+
+Full pinned CPython ABBA also passed all eight suite results, 39 multiprocessing
+and 297 subprocess passes per arm (`cpython-entropy-summary.json`). Fresh Docker
+times were 2.845 s and 20.569 s. Base/candidate averages were 9.4235/9.3605 s and
+59.066/59.0505 s respectively: effectively unchanged, not a full-suite speedup.
+
+The exact gated artifact's serial Docker/base/candidate/candidate/base/Docker
+refresh (`entropy-refresh.json`, `entropy-refresh-summary.json`) measured:
+
+| Command | Docker ms | Base ms | Candidate ms | Candidate / Docker |
+|---|---:|---:|---:|---:|
+| true | 0.15463 | 2.00397 | 2.01941 | 13.06x |
+| Python -S | 3.59054 | 11.25823 | 11.05890 | 3.08x |
+| Python | 4.44899 | 12.55271 | 12.31022 | 2.77x |
+
+Normal spawn saves another 0.24250 ms (1.93%), supporting the two development
+artifact pairs. True is 0.77% slower in this pair, contrary to the earlier
+improvements; no repeatable true effect is established. The pinned image's
+native arm64 identity is recorded in `entropy-refresh-image.json`. Another
+3.41224 ms must be removed to reach 2x the current oracle. Do not interpret the
+change in ratios across dated oracle refreshes as the isolated optimization
+benefit; the paired base/candidate comparison supplies that number.
+
+`just clippy` passed (`entropy-batch-clippy.log`), and
+`entropy-scoped-cleanup.json` records no remaining Carrick processes. Runtime
+code is accepted as a small measured improvement. The required new host-PID
+inventory review and position reconciliation follow the code commit; domain
+closure is not claimed until that check passes. No push is authorized or made.
