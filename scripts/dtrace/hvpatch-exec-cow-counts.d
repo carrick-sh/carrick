@@ -5,6 +5,8 @@
  * begin, 2=exec success; frame-cow-identity arg4 0=stage2, 1=stage1,
  * 2=commit. syscall::exit:entry arg0 is the target process exit status.
  * All guest counts follow pid == target || progenyof(target).
+ * vcpu-fault arg0 is ESR and arg2 is FAR. Classify EC, low-six-bit fault
+ * status, and WnR; coarse VA bands count events, not unique guest pages.
  *
  * Require multiple balanced execs, live vcpu-fault events, balanced COW
  * phases, natural successful target exit, no DTrace errors or drops. Zero
@@ -30,7 +32,11 @@ dtrace:::BEGIN
 
 carrick*:::vcpu-fault
 /pid == $target || progenyof($target)/
-{ faults++; }
+{
+    faults++;
+    @fault_kind[(arg0 >> 26) & 63, arg0 & 63, (arg0 >> 6) & 1] = count();
+    @fault_region[arg2 >> 32] = count();
+}
 
 carrick*:::hvpatch-guest-lifecycle
 /(pid == $target || progenyof($target)) && arg0 == 6/
@@ -71,4 +77,6 @@ dtrace:::END
     printf("EXECCOW1|begins=%d|ends=%d|faults=%d|stage2=%d|stage1=%d|commits=%d|errors=%d|bounded=%d|target_exited=%d|target_exit_seen=%d|target_exit_code=%d\n",
         begins, ends, faults, stage2, stage1, commits, errors, bounded,
         target_exited, target_exit_seen, target_exit_code);
+    printa("EXECCOW1|ec=%d|status=%d|write=%d|count=%@d\n", @fault_kind);
+    printa("EXECCOW1|va-band=%x|count=%@d\n", @fault_region);
 }
