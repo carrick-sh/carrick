@@ -605,6 +605,7 @@ pub fn generic_probe_container(
 /// work and must not make the ordinary cached lane depend on Docker.
 pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "clockgetres",
+    "forkexecstorm",
     "forksleepfork",
     "futexextra",
     "futexghost",
@@ -625,8 +626,10 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "pidnsinitreap",
     "posixtimers",
     "ppollsig",
+    "ppollwaitset",
     "procselffdfail",
     "pselecteintr",
+    "ptyjobcontrol",
     "selecttimeout",
     "sigchld",
     "sigprofvdso",
