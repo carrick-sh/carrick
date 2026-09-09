@@ -2982,6 +2982,7 @@ pub(crate) fn apply_image_proc_state(
         proc_maps_from_address_space(image),
         image.linux_auxv_image().to_vec(),
         core_file_mappings_from_address_space(image),
+        crate::dispatch::boot_private_file_backings(image),
     )
 }
 
@@ -2996,6 +2997,7 @@ pub(crate) fn apply_exec_image_proc_state(
         proc_maps_from_address_space(image),
         image.linux_auxv_image().to_vec(),
         core_file_mappings_from_address_space(image),
+        crate::dispatch::boot_private_file_backings(image),
     )
 }
 
