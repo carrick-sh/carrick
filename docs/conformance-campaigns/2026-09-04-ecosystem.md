@@ -3450,3 +3450,47 @@ the function, then matched its own string literal — `rsplit_once`, as the
 neighbouring source-shape test already knew). **The crash itself did not
 reproduce in 3 interleaved runs per binary**, so it is committed as the
 contract repair it is, not as a demonstrated fix for that crash.
+
+### 2026-09-09 02:23 — the goal measured on the fully fixed binary
+
+Binary `6b576f1cc532c06d` (main `fc1450ef7`), pinned copy, cached oracle,
+quiet gate passed before EVERY phase (load 3.8 → 2.4 → 1.9, no guests, no
+builds). This is the first measurement carrying the whole day: readdir,
+reactor work-set index, constant-cost first touch, per-syscall tax,
+alias exact-first index, deferred-COW receipt fix.
+
+| row | w1 | w4 | move | prev w4 | goal |
+|---|---|---|---|---|---|
+| cpython-asyncio | 1.01 | 1.03 | 1.02 | 1.04 | **MET** |
+| cpython-threading | 1.15 | 1.14 | 0.99 | 1.16 | **MET** |
+| go-runtime_pprof | 1.29 | 1.50 | 1.16 | 1.52 | **MET** |
+| cpython-itertools | 1.88 | 2.43 | 1.29 | 2.65 | open |
+| go-go_types | 2.87 | 2.70 | 0.94 | 2.77 | open |
+| cpython-subprocess | 2.90 | 3.03 | 1.04 | 3.23 | open |
+| cpython-importlib | 2.80 | 3.16 | 1.13 | 2.99 | open |
+| go-net_http | 3.49 | 3.45 | 0.99 | 3.65 | open |
+| cpython-tarfile | 4.80 | 5.10 | 1.06 | 5.30 | open |
+| cpython-multiprocessing_main_handling | 3.53 | 5.34 | **1.51** | 5.54 | open |
+| cpython-compile | 5.07 | 7.83 | **1.54** | 8.80 | open |
+
+**11/11 MATCH at both worker counts; nothing regressed.** 3 of 11 rows meet
+≤2x. Every row improved or held against the 2026-09-08 15:40 scorecard;
+`cpython-importlib` is the one that moved the wrong way (2.99 → 3.16) and is
+worth a look. `cpython-itertools` is the closest miss at 2.43.
+
+**Fork-to-wait: MET.** Sampled three times during the 4-worker phase —
+p50 537 / 271 / 266 µs against a 247 µs quiet reference measured immediately
+after (`quiet-close8-fork.json`, load 1.66). The 537 µs sample is the
+workers starting; the steady-state ratio is **1.08x**, far inside 2x.
+
+**Load coupling: two defects remain**, both >1.5x and both fork/exec/fault
+bound: `cpython-compile` 1.54 and `cpython-multiprocessing_main_handling`
+1.51. Nine rows are flat or better under load (0.94–1.29), which is where
+the day's scheduler, reactor and alias work landed.
+
+**The gap that remains is per-operation cost, and it is named.** The compile
+row is 60% `munmap` → alias retirement (the exact-first index is fixed; the
+remaining term is the ordered-`Vec` + first-occurrence-index representation
+itself); the multiprocessing row is per-exec fixed cost (`python3 -c pass`
+16.6 ms vs Docker 4.5 ms). Those two are the whole load-coupling residue and
+most of the ratio residue.
