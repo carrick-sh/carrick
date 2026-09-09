@@ -576,6 +576,19 @@ pub(super) fn publish(
     backing: SparseExtentBacking<'_>,
     flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
 ) -> Result<PublishedSparseExtent, TrapError> {
+    publish_replacing(context, start, end, backing, flush_stage1, &mut || {})
+}
+
+/// Retain the caller's old ownership through every fallible publication step.
+/// The infallible retirement callback runs after commit and before alias insertion.
+pub(super) fn publish_replacing(
+    context: &PublicationContext<'_>,
+    start: u64,
+    end: u64,
+    backing: SparseExtentBacking<'_>,
+    flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    retire_previous: &mut dyn FnMut(),
+) -> Result<PublishedSparseExtent, TrapError> {
     #[cfg(debug_assertions)]
     const PAGE_SIZE: u64 = 4096;
     #[cfg(debug_assertions)]
@@ -712,6 +725,12 @@ pub(super) fn publish(
                             "sparse HVPatch mmap sync_to_host failed: {e:?}"
                         ))
                     })?;
+                    #[cfg(test)]
+                    if STAGE2_AUDIT_STATE.with(|state| state.borrow().fail_sparse_publication_after_sync) {
+                        return Err(TrapError::Hypervisor(
+                            "injected sparse publication failure after sync".to_owned(),
+                        ));
+                    }
                     #[cfg(debug_assertions)]
                     {
                         let mut page = start;
@@ -889,6 +908,8 @@ pub(super) fn publish(
             std::process::abort();
         }
     }
+
+    retire_previous();
 
     let sharing = GuestMappingSharing::Private;
     register_shared_alias(AliasBacking {
