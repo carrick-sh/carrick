@@ -184,3 +184,306 @@ COW transaction's larger combined cost next, preserving Linux 4 KiB clean-page
 tracking, live owner authentication, and rollback across both translation
 stages and inventory. No further runtime improvement is claimed from this
 checkpoint. The original <=2x goal and every pending final gate remain active.
+
+## Kernel-caller qualification and layered-dirent candidate
+
+The accepted tracked runtime was rebuilt after the rejected experiments;
+`carrick-accepted-current` has SHA-256
+`8b5870b8a36cd89776dcaa85501cb3a283126b7ee639fc5e466ae0d6a6830f76`.
+`kernel-caller.raw` adds interrupted user stacks to kernel-mode samples without
+arming USDT. It completed 500 child spawns, target exit zero, no errors or
+bound hit, with 2,091 user and 2,490 kernel samples. All 415 unique Carrick
+return sites in the kernel-mode user stacks validate as BL/BLR at load base
+`0x102774000`; the exact binary and script are in
+`kernel-caller-provenance.json`.
+
+Of the kernel samples, 1,494 are beneath ordinary `next_syscall` guest execution;
+those remain guest/HVF time, not a named host optimization opportunity. COW has
+494 user and 171 kernel samples inside `perform_frame_cow`; its kernel samples
+include 93 in stage-1 maintenance and 78 in inventory reservation. Directory
+reads have 260 combined user/kernel samples in `getdents64`, 246 through
+`list_directory_entries`, and 224 through `layered_directory_entries`.
+
+The directory path still collects sizes and full metadata per child even
+though getdents needs only names, types and inode numbers. The current candidate
+adds an optional dirent-only backend stream and merges upper/lower names with
+the same whiteout and shadowing rules. Marker-node interference, an unsupported
+stream, and unknown host record types select the old exact fallback. The
+full-metadata API remains separate. Each host stream gets an independent open
+description before using the existing reader. Candidate tests cover real inode
+and type equality, marker refusal, layered additions/shadows/deletions, and
+internal sidecars in both host and memory lower layers. The initial stream test
+failed before implementation (`dirent-red.log`). Performance and final candidate
+acceptance are still pending.
+
+The first untraced ABBA supports retaining this candidate for broader checks:
+
+| Spawn | Accepted current ms | Dirent candidate ms | Reduction |
+|---|---:|---:|---:|
+| /bin/true | 2.1313 | 2.1317 | -0.02% |
+| Python -S | 13.2033 | 12.4950 | 5.36% |
+| Python | 14.4554 | 14.0052 | 3.11% |
+
+Candidate SHA-256:
+`d54c4feb004ceec828cc8637a8d2a239508f1d94df6f01ab3b07a4804094d7a8`.
+`dirent-abba.json` and `dirent-provenance.json` bind the exact development
+artifact and paired runs. Runtime tests passed 2,576/2 ignored before the
+memory-sidecar edge was added; the subsequent full backend module passed all
+88 tests including that edge. The host override was then restricted to macOS
+(the measured lane) so other platforms use the existing None fallback without
+performing speculative directory opens. Signed probes, lint, inventory
+reconciliation and final integrated-artifact performance remain pending.
+
+## Decision reset: wall budget before the next optimization
+
+The signed dirent probe gate subsequently exited zero (`dirent-probes.log`):
+three generic shards, 24 scenario tests, the CLI boundary test, and 46 retained
+tests passed (one retained test ignored); both unsigned negative controls passed.
+Report-only amd64 differences remain outside this arm64 acceptance. This does
+not close the pending full workloads, inventory reconciliation, or final
+integrated-artifact performance comparison.
+
+The investigation has identified CPU consumers, but has not yet established an
+exclusive wall-time budget for the measured parent spawn-and-wait operation.
+Inclusive stack counts overlap; kernel samples underneath guest execution are
+not automatically runtime overhead. Neither is a valid additive savings budget.
+Hold additional optimization edits until this gap is addressed.
+
+### Hypotheses and refutations
+
+| Hypothesis | Evidence / attempted refutation | Current conclusion |
+|---|---|---|
+| Repeated spare-page discovery dominates exec reconstruction | Original exec samples concentrated in PageTableManager::new; reverse/bulk scan reduced paired normal-Python spawn by 4.6% and true by 28.9% | Supported and partially removed; remeasure remaining reconstruction |
+| Slow core placement explains the gap | 1,014 of 1,032 placement samples were on performance cores | Refuted as the primary explanation in that capture |
+| Increasing the anonymous fault window removes substantial cost | 64 KiB versus 256 KiB paired runs did not improve normal Python or -S | Not supported; retain existing default |
+| Most faults are redundant retries | Fault census had balanced real COW transactions; child COW addresses concentrated in writable libpython mapping | Retry explanation refuted; private-file startup writes remain relevant |
+| COW kernel samples prove a large HVF bottleneck | High-rate armed USDT return sites dominated the earlier kernel capture | That attribution is invalid; use the no-USDT capture |
+| COW alias lookup or retirement lookup is the next large saving | Both synthetic scaling improvements yielded under 1% normal-spawn improvement and worsened other controls | Both candidates discarded; not a claim that their scaling is ideal |
+| getdents pays unnecessary full metadata cost | Source and qualified samples agree; dirent candidate improves paired normal spawn 3.11% and -S 5.36%, true unchanged | Supported candidate; broader workload and final artifact acceptance pending |
+| The combined COW transaction is the largest recoverable remaining cost | 494 user + 171 kernel samples in perform_frame_cow in latest capture | Plausible, not established in exclusive wall milliseconds; individual transaction costs and safe avoidability unknown |
+
+### Measurements needed to choose successfully
+
+1. Refresh same-image native-arm64 Docker and Carrick measurements serially,
+   preserving distributions, exact artifacts, and the true/-S/normal controls.
+   The historical 14.06 ms / 4.274 ms = 3.29x baseline is not a current ratio.
+2. Partition the parent's measured spawn-and-wait interval into non-overlapping
+   critical-path intervals: launch/fork through exec entry; exec reconstruction;
+   post-publication interpreter execution; exit through parent wait return.
+   Parent blocked time overlaps child work and must not be added to it. Account
+   for timestamp boundaries, failed joins, and residual/unattributed time.
+3. Within the largest interval, measure counts and service cost per operation,
+   separating useful guest execution, syscall service, COW/translation work,
+   teardown, and scheduling delay. Treat true/-S/normal differences as controls,
+   not mechanically additive phase estimates.
+4. Validate low-frequency phase instrumentation against untraced controls and
+   reject captures with missing joins, failed guests, bounds, errors, or drops.
+   The existing exec-latency script covers only exec-begin to publication; it
+   cannot supply a complete spawn budget on its own.
+5. Run the two full CPython subprocess/multiprocessing workloads to check that
+   the microbenchmark explains a useful workload and preserves correctness.
+
+### Greedy selection rule
+
+Rank by credible removable milliseconds per spawn, not sample count or ease of
+editing. Estimate each opportunity as measured exclusive phase cost times the
+fraction plausibly avoidable, with uncertainty and semantic constraints stated.
+Choose the largest supported opportunity, state the predicted effect and an
+explicit refutation before editing, then make one bounded change. Accept only
+with paired untraced end-to-end evidence and the required correctness gates;
+otherwise revert. Remeasure and rerank after each accepted change. Retain an
+explicit residual instead of forcing an unexplained budget to sum by inference.
+The <=2x target and all original final acceptance requirements remain active.
+
+### Fresh comparison and a refuted wall-budget instrument
+
+`budget-refresh.json` records serial Docker / accepted / candidate / candidate /
+accepted / Docker runs, with the same pinned arm64 Python image and five batches
+of 50 spawns per command per arm. Docker inspection reconfirmed arm64 and the
+exact digest. Averaging the two per-run medians:
+
+| Command | Docker ms | Accepted current ms | Dirent candidate ms |
+|---|---:|---:|---:|
+| true | 0.1517 | 2.0922 | 2.0223 |
+| Python -S | 3.5713 | 13.5943 | 12.4437 |
+| Python | 4.4035 | 14.6397 | 13.7253 |
+
+The refreshed normal-Python candidate ratio is 3.117x, with 4.918 ms still to
+remove to meet twice this oracle. The development candidate remains separate
+from final integrated-artifact acceptance. Run-to-run variation remains visible
+in the raw batches; do not infer precision from the displayed decimal places.
+
+The new low-frequency `hvpatch-spawn-wall-boundaries.d` capture completed 100
+children with target exit zero, 403 events, zero errors and no bound hit. After
+sorting per-CPU output by timestamp, every child had identity-consistent ordered
+phases 1/6/2/5. However, subtracting these spans from guest spawn-and-wait totals
+produced 23 negative residuals (minimum -1.285 ms). This REFUTES their use as an
+exclusive wall budget, despite complete joins. Source inspection explains why:
+`record_process_exit_begin` prepares an event, but retirement `complete` emits
+it after resources retire; parent wait return can precede that emission.
+
+The capture's 1.355 ms mean exec-entry-to-publication window is a diagnostic
+span; the 11.910 ms publication-to-phase-5 span includes retirement and can
+overlap subsequent work. It must not be labeled interpreter startup or added
+to a parent critical-path budget. `wall-boundaries.raw`, `.out`, `.err`, and
+`wall-boundaries-analysis.json` retain the attempted analysis and artifact hash;
+the analysis's old `published_to_exit_begin_ns` field is MISLABELED and invalid
+as exit-begin evidence. The script header now records the corrected boundary.
+Next instrumentation must distinguish guest exit request, wait completion, and
+asynchronous retirement rather than assuming lifecycle event names locate them.
+
+### Qualified syscall boundaries and retirement interference hypothesis
+
+The boundary script now also arms service-begin (clone/clone3, exit/exit_group,
+wait4) and successful wait4 return. Predicates restrict output, but the generic
+USDT sites still fire per syscall: these are potentially perturbing diagnostic
+captures, not performance acceptance. A positive wait4 result identifies the
+child without relying on host-thread identity across executor suspension.
+`scripts/perf/hvpatch_spawn_wall.py` sorts per-CPU records, validates one ordered
+lifecycle and exact exit/wait joins per child, checks unique clone attribution,
+target success/errors/bounds, and rejects negative outside-window residuals.
+It accepts the new 100-child captures and rejects the original lifecycle-only
+capture for missing exit/wait joins. `wall-budget-provenance.json` binds the
+current executable and instruments.
+
+The normal-Python `wall-syscall` run yielded this exclusive diagnostic budget:
+
+| Interval | Mean ms |
+|---|---:|
+| Clone service entry to child prepared | 1.440 |
+| Prepared to exec entry | 0.258 |
+| Exec entry to publication | 1.613 |
+| Publication to exit service entry | 10.432 |
+| Exit service entry to successful parent wait return | 0.057 |
+| Parent work outside those boundaries | 0.070 |
+| Total measured spawn-and-wait | 13.869 |
+
+All 100 children joined, with no negative residual. Three matching untraced
+controls averaged 13.878, 13.599 and 13.700 ms. This does not establish a precise
+perturbation bound, but supports the broad phase ranking. All raw output and
+validated rows are under `wall-syscall*` and `wall-control*`.
+
+The `wall-true` and `wall-nosite` controls also validate 100/100. Respectively,
+clone-to-prepared is 0.278 / 1.230 ms, exec is 1.152 / 1.278 ms, and
+publication-to-exit-request is 0.565 / 8.878 ms. These separately timed runs
+are structural controls, not an additive subtraction proof.
+
+New hypothesis: the next clone's apparent preparation cost includes interference
+from the previous child's deferred retirement. Test: insert 5 ms sleep OUTSIDE
+each measured spawn, giving retirement time to settle. Prediction: clone cost
+falls while child startup remains similar; refutation: clone cost persists.
+`wall-spaced` supports the hypothesis: clone-to-prepared falls to 0.188 ms;
+publication-to-exit-request remains 10.093 ms, and total measured spawn becomes
+11.850 ms. Retirement still completes 1.357 ms after parent wait on average.
+This is one diagnostic experiment, not a performance optimization: the sleeps
+increase total workload time and are never an acceptance strategy. It suggests
+roughly 1.2 ms of removable interference, conditional on repeatability and exact
+attribution of the shared resource. Do not claim that asynchronous retirement
+is free merely because it lies after wait return.
+
+Greedy priorities now have stronger bounds: interpreter execution/startup is
+the dominant interval (about 10 ms), with COW/translation and syscall service
+the leading subdivisions to quantify; prior-child retirement interference is
+a smaller approximately 1.2 ms opportunity; exec reconstruction is approximately
+1.2-1.6 ms total, so cannot alone supply the remaining approximately 4.9 ms.
+The next experiment should attribute the largest startup subdivision on the
+current binary, while preserving the retirement-interference hypothesis for
+the next ranking. No new runtime optimization was made during this budget work.
+
+### Current-candidate CPU attribution and next COW hypothesis
+
+`current-cpu.raw` profiles 500 normal Python children on the signed current
+dirent candidate without USDT probes: 1,866 user and 2,342 kernel samples,
+target exit zero, no errors or bound hit. Exact return-site qualification found
+1,184/1,184 user and 404/404 kernel-user BL/BLR sites at load base
+`0x102714000`. `current-cpu-analysis.json` and `carrick-current-profile` retain
+artifact identity and classification. Each stack is assigned once, in the
+recorded precedence order, avoiding inclusive-frame double counting.
+
+| Classified path | User samples | Kernel samples | Approx sampled CPU ms/child |
+|---|---:|---:|---:|
+| COW resolution | 536 | 156 | 2.77 |
+| Syscall service | 289 | 209 | 2.00 |
+| Deferred retirement | 358 | 71 | 1.72 |
+| Translation fault resolution | 177 | 56 | 0.93 |
+| Ordinary guest run through HVF | 106 | 1,497 | 6.42 |
+| Other/unclassified | 400 | 353 | 3.02 |
+
+Conversion is samples / 499 Hz / 500 children, not measured exclusive wall
+time. Startup and overlapping retirement are both sampled; the guest-run bucket
+includes useful guest execution. The profile's mean spawn was 15.73 ms versus
+the preceding untraced controls around 13.7 ms, so sampling perturbed the run.
+Use this as a ranking, not an additive savings forecast or performance receipt.
+
+The next COW hypothesis targets transaction scope rather than another small
+collection scan: `resolve_frame_cow_fault` supplies the same full-ASID
+maintenance callback used for broader edits. Every successful private-page COW
+therefore runs `invalidate_asid_on_vcpu`, evicting translations outside the
+changed span. Hypothesis: this adds both direct maintenance cost and repeated
+translation refill work in the much larger guest-run bucket. It is not yet
+proved to be a major saving. Before an experiment, derive the complete changed
+descriptor range (including table splits/coalescing and rollback), establish
+the architectural invalidation requirements, and preserve inner-shareable
+publication plus exact owner/root/ASID generation proof. A VA-local invalidation
+must never be substituted merely from the fault address alone. Compare one
+bounded candidate against the same untraced base; reject if the end-to-end gain
+does not support pursuing the added complexity. No invalidation edit exists yet.
+
+Full workload acceptance also resumed: the conformance harness was rebuilt from
+current source. The first invocation rejected the obsolete `--results` option
+without running guests; the driver now uses the verified `--jsonl` flag. The
+serial two-suite ABBA run completed its first Carrick phase and entered the
+fresh pinned arm64 Docker phase. No full-workload verdict is claimed yet.
+
+### Full dirent workload comparison completed
+
+All four arms subsequently exited zero and both declared suites MATCH in every
+arm: multiprocessing has 39 passed; subprocess has 297 passed and 44 skipped,
+with no new or known differences. The fresh oracle is the pinned arm64 CPython
+manifest recorded in `cpython-image-pin.json`; later arms used its two cached
+rows. `cpython-exec-abba.json` records binary SHA-256 and exact commands;
+per-arm JSONL files retain assertion pairs and run IDs. Scoped inspection found
+no remaining Carrick processes or named Docker containers from these arms.
+
+| Full workload | Base A seconds | Candidate B seconds | Candidate B seconds | Base A seconds | Docker seconds |
+|---|---:|---:|---:|---:|---:|
+| multiprocessing_main_handling | 12.063 | 9.861 | 10.251 | 9.841 | 3.473 |
+| subprocess | 58.297 | 59.305 | 59.160 | 59.531 | 20.590 |
+
+Do not call the 8.18% multiprocessing mean reduction a repeatable gain: the
+first base arm is slower and the last base matches the candidates. Subprocess
+means differ by only 0.54% in the slower direction. This establishes full-suite
+correctness for the development candidate and no clear full-suite performance
+gain, alongside the separately measured microbenchmark improvement. Final
+integrated-artifact provenance/gates remain distinct. The exact final runtime
+unit suite is being rerun after the last sidecar test addition.
+
+### Bounded invalidation experiment contract
+
+Source inspection confirms COW can touch a clipped 4 KiB page or 16 KiB
+compound. `repoint_preserving_attributes` may split parent blocks while finding
+L3 leaves. Therefore the engine must not infer a safe invalidation range solely
+from the fault address. The existing undo journal records every descriptor
+preimage and arena allocation state under the COW transaction lock. A candidate
+can conservatively authorize a local range only when that journal proves all
+edits are existing, non-global L3 leaves inside the authenticated span, with no
+table topology or arena changes. Otherwise retain full-ASID maintenance.
+Rollback, kernel-only writes and losing-winner retries retain the existing full
+scope initially. The backend must supply the checked range to the flush callback
+before discarding the journal; engine-side inspection before acquiring the COW
+lock would race. Preserve barriers, inner-shareable invalidation, maintenance
+root validation, and vCPU register restoration. Red tests should reject parent
+splits, out-of-range edits, missing journals and global/invalid leaf transitions.
+
+Architectural reference: Arm's memory-management guide describes VA/ASID
+selection and inner-shareable invalidation; this is necessary background, not
+a proof that Carrick's particular edit is narrow:
+https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/LearnTheArchitecture-MemoryManagement-101811_0100_00_en.pdf
+No invalidation implementation has been changed yet.
+
+The final serial runtime suite completed with 2,577 passed, zero failures and
+two ignored (`dirent-runtime-final.log`). The dirent change is committed as
+`747876a48`; its last source adjustment only corrected the moved reader's
+pre-existing misleading dup/offset comments. The code and tests remain the
+validated implementation. Line-pinned inventories and final integrated artifact
+receipts remain pending; this commit is not <=2x acceptance.
