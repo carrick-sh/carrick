@@ -187,3 +187,42 @@ difference.** The change is kept because it removes work a disabled probe
 cannot use — the contract the two probes immediately upstream in the same
 fault arm (`vcpu_fault_regs_with`, `vcpu_fault_gprs_with`) already document —
 but it is recorded as a neutral result, not a win.
+
+## 8. Row receipts
+
+Binary `26b9db0c046aeb6d…`, harness `target/debug/carrick-conformance`,
+`--tier full --carrick-timeout-cap-s 0 --require-cached-oracle`.
+
+**Verdicts (every run, both binaries): MATCH.** `cpython-compile` 150/150,
+`cpython-itertools` 136/136, `cpython-mmap` 38/38. `go-build` smoke reducer
+(`gobuild-loop.sh optcf 65536 8`): `BUILDS=8 FAILS=0 fatal_lines=0 abort=0`
+at load 33-43.
+
+Ratios — **none of these is a citable quiet number.** The host carried three
+other lanes all evening; the best 1-minute window available was 4.96 rising to
+5.95 during the run, with the 5-minute average still at 15 (recovering from a
+peak of 63).
+
+| window (1-min load) | `--workers` | compile | itertools | mmap |
+|---|---:|---:|---:|---:|
+| 4.96 → 5.95 | 1 | 7.54x (20,193 ms) | 3.32x | 2.76x |
+| 11.75 → 10.93 | 1 | 16.16x (43,273 ms) | 4.57x | 3.85x |
+| 10.93 → 10.85 | 4 | 16.26x (43,523 ms) | 5.55x | 4.43x |
+
+For reference the campaign's recorded quiet receipt on `65b3c791c` was 6.41x
+at load 4.5-5.3. The 7.54x above is the same row one load band higher, not a
+regression: the controlled comparison is the interleaved one below, which
+holds the load window constant.
+
+**Interleaved control, `cpython-compile` at `--workers 1`, alternating
+binaries in one window (load 17-22):**
+
+| pair | before `251ab7b4f` | after |
+|---:|---:|---:|
+| 1 | 55,948 ms (20.90x) | 53,271 ms (19.90x) |
+| 2 | 43,409 ms (16.22x) | 49,272 ms (18.41x) |
+| 3 | 66,665 ms (24.90x) | 57,202 ms (21.37x) |
+
+Two of three favour the change, the spread is load-driven and larger than any
+effect: **no measurable difference**, matching the reducer A/B in section 7.
+The change neither helps nor harms this row.
