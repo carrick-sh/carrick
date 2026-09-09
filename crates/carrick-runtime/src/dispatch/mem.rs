@@ -1158,7 +1158,7 @@ pub(crate) struct MemState {
     shared_file_alias_maps: Vec<SharedFileAliasEntry>,
     /// File identity retained by private mmap, independent of descriptor lifetime
     /// and pathname replacement. Discard must return to this original source.
-    private_file_maps: Vec<PrivateFileMapEntry>,
+    pub(super) private_file_maps: Vec<PrivateFileMapEntry>,
     /// VA ranges of live MAP_SHARED mappings backed by a `memfd_secret(2)` fd.
     /// Secret memory is hidden from the kernel's own view of the process, so
     /// `/proc/<pid>/mem` reads that touch one of these ranges fail EIO
@@ -2163,50 +2163,68 @@ pub(super) fn semantic_vmas_from_boot_regions(
         let is_shared_aperture = region.path == "[shared]";
         let is_special =
             region.path == "[vdso]" || region.path == "[vvar]" || region.path == "[kernel]";
-        let file_mapping = file_mappings
-            .iter()
-            .find(|fm| fm.start <= start && fm.end >= end);
-        let file_page_offset = file_mapping.map(|fm| {
-            fm.file_page_offset + ((start - fm.start) / crate::core_dump::GUEST_PAGE as u64)
-        });
-        let provenance = if is_stack || is_heap {
-            VmaBackingProvenance::PrivateAnonymous
-        } else if is_special {
-            VmaBackingProvenance::SpecialKernelSynthetic
-        } else if file_mapping.is_some() {
-            if region.sharing == ProcMapSharing::Shared {
-                VmaBackingProvenance::SharedFile
-            } else {
-                VmaBackingProvenance::PrivateFile
+        // Physical boot regions can coalesce several PT_LOAD segments. File
+        // identity belongs to their page-rounded subranges, not to the whole
+        // physical allocation; full BSS pages retain anonymous provenance.
+        let mut boundaries = vec![start, end];
+        if !is_stack && !is_heap && !is_special {
+            for mapping in file_mappings {
+                if mapping.start < end && mapping.end > start {
+                    boundaries.push(mapping.start.max(start));
+                    boundaries.push(mapping.end.min(end));
+                }
             }
-        } else if is_shared_aperture {
-            VmaBackingProvenance::SharedAnonymous
-        } else if region.sharing == ProcMapSharing::Shared {
-            if !region.path.is_empty() && !region.path.starts_with('[') {
-                VmaBackingProvenance::SharedFile
-            } else {
-                VmaBackingProvenance::SharedAnonymous
-            }
-        } else {
-            if !region.path.is_empty() && !region.path.starts_with('[') {
-                VmaBackingProvenance::PrivateFile
-            } else {
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for window in boundaries.windows(2) {
+            let start = window[0];
+            let end = window[1];
+            let file_mapping = file_mappings
+                .iter()
+                .find(|fm| fm.start <= start && fm.end >= end);
+            let file_page_offset = file_mapping.map(|fm| {
+                fm.file_page_offset + ((start - fm.start) / crate::core_dump::GUEST_PAGE as u64)
+            });
+            let provenance = if is_stack || is_heap {
                 VmaBackingProvenance::PrivateAnonymous
-            }
-        };
-        semantic_vmas.push(SemanticVma {
-            start,
-            end,
-            read: region.read,
-            write: region.write,
-            execute: region.execute,
-            provenance,
-            fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
-            dump_policy: carrick_abi::VmaDumpPolicy::Include,
-            droppable: false,
-            path: region.path.clone(),
-            file_page_offset,
-        });
+            } else if is_special {
+                VmaBackingProvenance::SpecialKernelSynthetic
+            } else if file_mapping.is_some() {
+                if region.sharing == ProcMapSharing::Shared {
+                    VmaBackingProvenance::SharedFile
+                } else {
+                    VmaBackingProvenance::PrivateFile
+                }
+            } else if is_shared_aperture {
+                VmaBackingProvenance::SharedAnonymous
+            } else if region.sharing == ProcMapSharing::Shared {
+                if !region.path.is_empty() && !region.path.starts_with('[') {
+                    VmaBackingProvenance::SharedFile
+                } else {
+                    VmaBackingProvenance::SharedAnonymous
+                }
+            } else {
+                if !region.path.is_empty() && !region.path.starts_with('[') {
+                    VmaBackingProvenance::PrivateFile
+                } else {
+                    VmaBackingProvenance::PrivateAnonymous
+                }
+            };
+            semantic_vmas.push(SemanticVma {
+                start,
+                end,
+                read: region.read,
+                write: region.write,
+                execute: region.execute,
+                provenance,
+                fork_policy: carrick_abi::VmaForkPolicy::DEFAULT,
+                dump_policy: carrick_abi::VmaDumpPolicy::Include,
+                droppable: false,
+                path: region.path.clone(),
+                file_page_offset,
+            });
+        }
     }
     VmaMap::from_vec(semantic_vmas)
 }
@@ -2425,11 +2443,48 @@ pub(crate) struct HostAliasMmapCommit {
 }
 
 #[derive(Clone)]
-pub(super) struct PrivateFileMapEntry {
+pub(crate) struct PrivateFileMapEntry {
     start: u64,
     end: u64,
     offset: u64,
-    description: Arc<crate::kernel::objects::MappedFileReference>,
+    backing: PrivateFileBacking,
+}
+
+#[derive(Clone)]
+enum PrivateFileBacking {
+    Description(Arc<crate::kernel::objects::MappedFileReference>),
+    LoadedImage {
+        initialized_offset: u64,
+        bytes: Arc<Vec<u8>>,
+    },
+}
+
+pub(crate) fn boot_private_file_backings(
+    image: &crate::memory::AddressSpace,
+) -> Vec<PrivateFileMapEntry> {
+    let mut sources = Vec::new();
+    for mapping in image.file_mappings().iter().filter(|m| !m.path.is_empty()) {
+        for region in image.regions() {
+            let start = mapping.start.max(region.start);
+            let end = mapping.end.min(region.end);
+            if start >= end {
+                continue;
+            }
+            // Retain canonical loaded bytes, including backend patches, with
+            // no eager copy. Guest stores cannot mutate this image payload.
+            let (initialized_offset, bytes) = region.shared_initialized_bytes();
+            sources.push(PrivateFileMapEntry {
+                start,
+                end,
+                offset: start - region.start,
+                backing: PrivateFileBacking::LoadedImage {
+                    initialized_offset,
+                    bytes,
+                },
+            });
+        }
+    }
+    sources
 }
 
 impl std::fmt::Debug for PrivateFileMapEntry {
@@ -2453,7 +2508,7 @@ impl PrivateFileMapEntry {
             start,
             end: start.checked_add(len)?,
             offset,
-            description: Arc::clone(description.as_ref()?),
+            backing: PrivateFileBacking::Description(Arc::clone(description.as_ref()?)),
         })
     }
 
@@ -2467,7 +2522,7 @@ impl PrivateFileMapEntry {
             start,
             end,
             offset: self.offset.checked_add(start - self.start)?,
-            description: Arc::clone(&self.description),
+            backing: self.backing.clone(),
         })
     }
 }
@@ -3224,8 +3279,38 @@ impl SyscallDispatcher {
         }
         for source in sources {
             let len = usize::try_from(source.end - source.start).map_err(|_| LINUX_ENOMEM)?;
+            let description = match &source.backing {
+                PrivateFileBacking::Description(description) => description,
+                PrivateFileBacking::LoadedImage {
+                    initialized_offset,
+                    bytes,
+                } => {
+                    let mut restored = vec![0; len];
+                    let initialized_end = initialized_offset
+                        .checked_add(bytes.len() as u64)
+                        .ok_or(LINUX_ENOMEM)?;
+                    let start = source.offset.max(*initialized_offset);
+                    let end = source
+                        .offset
+                        .checked_add(len as u64)
+                        .ok_or(LINUX_ENOMEM)?
+                        .min(initialized_end);
+                    if start < end {
+                        let dst =
+                            usize::try_from(start - source.offset).map_err(|_| LINUX_ENOMEM)?;
+                        let src = usize::try_from(start - initialized_offset)
+                            .map_err(|_| LINUX_ENOMEM)?;
+                        let count = usize::try_from(end - start).map_err(|_| LINUX_ENOMEM)?;
+                        restored[dst..dst + count].copy_from_slice(&bytes[src..src + count]);
+                    }
+                    memory
+                        .write_bytes_unchecked(source.start, &restored)
+                        .map_err(|_| LINUX_ENOMEM)?;
+                    continue;
+                }
+            };
             let snapshot = self.snapshot_private_mmap_description(
-                source.description.description(),
+                description.description(),
                 source.offset,
                 len,
             )?;
@@ -3233,7 +3318,7 @@ impl SyscallDispatcher {
                 .map_err(|_| LINUX_ENOMEM)?;
             if valid_len != 0 {
                 let direct = {
-                    let open = source.description.description().read().ok_or(LINUX_EBADF)?;
+                    let open = description.description().read().ok_or(LINUX_EBADF)?;
                     if let Some(fd) = open.shared_alias_host_fd() {
                         let provenance = match &*open {
                             OpenDescription::HostFile { host_fd, .. } => {
@@ -3765,13 +3850,11 @@ impl SyscallDispatcher {
             },
         );
         if let Some(source) = &source.private_file
-            && let Some(entry) = PrivateFileMapEntry::for_mapping(
-                &Some(Arc::clone(&source.description)),
-                start,
-                len,
-                source.offset,
-            )
+            && let Some(end) = start.checked_add(len)
         {
+            let mut entry = source.clone();
+            entry.start = start;
+            entry.end = end;
             self.mem().lock().private_file_maps.push(entry);
         }
     }

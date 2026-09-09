@@ -3015,6 +3015,7 @@ mod tests {
             }],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(
             parent
@@ -3087,6 +3088,7 @@ mod tests {
             }],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         prepared.commit();
 
@@ -3155,6 +3157,7 @@ mod tests {
                 sharing: crate::vfs::ProcMapSharing::Private,
                 path: "committed-replacement".to_owned(),
             }],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -3234,6 +3237,7 @@ mod tests {
                 sharing: crate::vfs::ProcMapSharing::Private,
                 path: "committed-replacement".to_owned(),
             }],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );

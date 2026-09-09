@@ -588,6 +588,7 @@ where
     // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style). argv is
     // already opaque bytes (Linux ABI).
     let mut needs_at_base = false;
+    let mut main_image_path = Some(path);
     let (bytes, argv): (Vec<u8>, Vec<Vec<u8>>) =
         match maybe_redirect_to_rosetta(path, &bytes, &argv) {
             None => (bytes, argv),
@@ -597,6 +598,7 @@ where
                 // Flag the guest (uname → x86_64) and record the stack argv so
                 // /proc/self/cmdline survives Rosetta's argv-skip.
                 needs_at_base = redirect.target_is_dynamic;
+                main_image_path = None;
                 dispatcher.enter_binfmt(&redirect.argv);
                 (redirect.interpreter_bytes, redirect.argv)
             }
@@ -616,7 +618,12 @@ where
         )
     });
     drop(launch_context);
-    let image = built?;
+    let mut image = built?;
+    if let Some(path) = main_image_path {
+        // Byte-based boot loading leaves the main PT_LOAD paths empty. Bind
+        // the resolved ELF identity before dispatcher VMA/backing publication.
+        image = image.with_main_file_path(path);
+    }
     crate::hvpatch::finish_hvpatch_image_on(
         image,
         dispatcher,

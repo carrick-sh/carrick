@@ -4,6 +4,53 @@ use crate::memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE};
 use std::cell::{Cell, RefCell};
 
 #[test]
+fn boot_vma_preserves_file_subranges_and_anonymous_bss() {
+    let regions = vec![ProcMapsEntry {
+        start: 0x1000,
+        end: 0x5000,
+        read: true,
+        write: true,
+        execute: true,
+        sharing: ProcMapSharing::Private,
+        path: String::new(),
+    }];
+    let files = vec![
+        crate::core_dump::FileMapping {
+            start: 0x1000,
+            end: 0x2000,
+            file_page_offset: 0,
+            path: "/fixture".to_owned(),
+        },
+        crate::core_dump::FileMapping {
+            start: 0x3000,
+            end: 0x4000,
+            file_page_offset: 2,
+            path: "/fixture".to_owned(),
+        },
+    ];
+    let vmas = semantic_vmas_from_boot_regions(
+        &regions,
+        &files,
+        MemoryLayout::hvf_default(),
+        LINUX_HEAP_BASE,
+    )
+    .into_vec();
+    let actual: Vec<_> = vmas
+        .iter()
+        .map(|vma| (vma.start, vma.end, vma.provenance, vma.file_page_offset))
+        .collect();
+    assert_eq!(
+        actual,
+        vec![
+            (0x1000, 0x2000, VmaBackingProvenance::PrivateFile, Some(0)),
+            (0x2000, 0x3000, VmaBackingProvenance::PrivateAnonymous, None),
+            (0x3000, 0x4000, VmaBackingProvenance::PrivateFile, Some(2)),
+            (0x4000, 0x5000, VmaBackingProvenance::PrivateAnonymous, None),
+        ]
+    );
+}
+
+#[test]
 fn vma_snapshot_projects_permissions_and_splits_kernel_hidden_coverage() {
     let mut mem = MemState::new_with_layout(MemoryLayout::hvf_default());
     mem.address_space_regions = Some(vec![ProcMapsEntry {

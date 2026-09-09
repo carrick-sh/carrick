@@ -759,6 +759,7 @@ mod keys;
 pub(crate) use fs::{LegacyAioContextId, MountRetirement, SplicePushback};
 #[macro_use]
 mod mem;
+pub(crate) use mem::boot_private_file_backings;
 #[macro_use]
 pub(crate) mod net;
 #[macro_use]
@@ -6699,12 +6700,14 @@ impl SyscallDispatcher {
         regions: Vec<ProcMapsEntry>,
         auxv: Vec<u8>,
         file_mappings: Vec<crate::core_dump::FileMapping>,
+        private_file_backings: Vec<mem::PrivateFileMapEntry>,
     ) -> Result<(), DispatchError> {
         self.with_mm_executor_mutation(|dispatcher, mutation| {
             let permit = mutation.host_alias_permit();
             let _vma_dispatch = dispatcher.begin_vma_dispatch(&permit);
             dispatcher.replace_address_space_regions(regions);
             dispatcher.replace_address_space_file_mappings(file_mappings);
+            dispatcher.mem().lock().private_file_maps = private_file_backings;
             dispatcher.set_auxv_image(auxv);
         })
     }
@@ -6718,6 +6721,7 @@ impl SyscallDispatcher {
         regions: Vec<ProcMapsEntry>,
         auxv: Vec<u8>,
         file_mappings: Vec<crate::core_dump::FileMapping>,
+        private_file_backings: Vec<mem::PrivateFileMapEntry>,
     ) -> PreparedDispatchMmExec {
         // Always stage the replacement privately. This avoids asking a
         // racy owner-count question while another CLONE_VM dispatcher can be
@@ -6734,6 +6738,7 @@ impl SyscallDispatcher {
         mem.address_space_regions = Some(regions);
         mem.linux_auxv_image = auxv;
         mem.core_file_mappings = file_mappings;
+        mem.private_file_maps = private_file_backings;
         drop(mem);
         prepared
     }
