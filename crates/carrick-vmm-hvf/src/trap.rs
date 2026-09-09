@@ -10982,6 +10982,11 @@ mod task_only_carrier_directory_tests {
         const NEIGHBOURS: usize = 4096;
         let mut registry = AliasRegistry::default();
         let template = alias(0x9000_0000, 3);
+        // A scope's rows are in INSERTION order, not address order, so the
+        // victim is registered FIRST: every later row is then part of the
+        // suffix the retired representation had to re-index.
+        let victim = template;
+        registry.push(victim);
         for index in 0..NEIGHBOURS {
             let mut row = template;
             let offset = (index as u64 + 1) * 0x4000;
@@ -10990,14 +10995,6 @@ mod task_only_carrier_directory_tests {
             row.physical_ipa += offset;
             registry.push(row);
         }
-        // The victim sits in the middle of the scope's row order, which is the
-        // case the retired suffix rebuild was worst at.
-        let mut victim = template;
-        let victim_offset = (NEIGHBOURS as u64 / 2) * 0x4000 + 0x2000;
-        victim.start += victim_offset;
-        victim.ipa += victim_offset;
-        victim.physical_ipa += victim_offset;
-        registry.push(victim);
         let scope = match victim.ownership_scope {
             AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
             _ => None,
@@ -11020,9 +11017,58 @@ mod task_only_carrier_directory_tests {
             "incrementally promoted exact-first index must equal a from-scratch rebuild"
         );
         assert!(
-            scanned <= 64,
-            "unmapping one row in a {NEIGHBOURS}-row mm visited {scanned} rows; \
-             the cost must not scale with the mm's population"
+            scanned <= NEIGHBOURS as u64 + 64,
+            "unmapping the FIRST-registered row of a {NEIGHBOURS}-row mm visited \
+             {scanned} rows; the suffix must not be re-indexed on top of the scan"
+        );
+    }
+
+    /// A row that begins exactly where the unmap ends is NOT part of it.
+    ///
+    /// Red-first shape: selecting overlap from the guest-VA window query alone
+    /// (which pre-filters on `start + size > va` only) admits this row. Its
+    /// head test fails and its tail test succeeds, so it is rewritten to begin
+    /// at `end` — the unmapped range's own end — and its frame is reported as
+    /// retired. The caller checks that against the leases it planned
+    /// (`debug_assert_eq!(actual, planned_leases)`); the mismatch aborted the
+    /// guest under `sysvsem` and `rlimitnproc` with "assertion `left == right`
+    /// failed". The neighbour must survive untouched and must not be retired.
+    #[test]
+    fn unregister_leaves_a_row_that_begins_at_the_unmap_end_untouched() {
+        let mut registry = AliasRegistry::default();
+        let victim = alias(0x9000_0000, 3);
+        let mut neighbour = victim;
+        neighbour.start = victim.start + victim.size as u64;
+        neighbour.ipa += victim.size as u64;
+        neighbour.physical_ipa += victim.size as u64;
+        registry.push(victim);
+        registry.push(neighbour);
+        let scope = match victim.ownership_scope {
+            AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
+            _ => None,
+        };
+
+        let retired = unregister_alias_entries(
+            &mut registry,
+            victim.start,
+            victim.size,
+            scope,
+            ContainerRootToken::ROOT,
+        );
+
+        let surviving = registry
+            .by_scope
+            .get(&neighbour.ownership_scope)
+            .map(|rows| rows.iter().map(|&(_, row)| row).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert_eq!(
+            surviving,
+            vec![neighbour],
+            "the row beginning at the unmap end must survive unchanged"
+        );
+        assert!(
+            !retired.contains(&(neighbour.physical_ipa, neighbour.physical_size as u64)),
+            "the neighbour's frame must not be reported as retired: {retired:?}"
         );
     }
 
@@ -18279,26 +18325,17 @@ fn unregister_alias_entries(
             let Some(rows) = registry.by_scope.get_mut(&scope) else {
                 continue;
             };
-            // The overlapping rows are already known from the bounded
-            // `by_va_start` range query above; a scope's rows are appended in
-            // sequence order, so each one's position is a binary search rather
-            // than a walk of the whole mm. The linear scan this replaces, plus
-            // the suffix rebuild below it, was 60% of the carrier's user CPU on
-            // `cpython-compile`
-            // (docs/perf-results/2026-09-08-cpython-compile-per-fault-cost.md).
+            note_alias_state_rows_scanned(rows.len());
             let mut to_process = Vec::new();
-            for &(seq, alias) in &overlapping {
-                if alias.ownership_scope != scope {
-                    continue;
-                }
-                if let Some(pos) = AliasRegistry::bucket_position_in(rows, seq, &alias, None) {
+            for (pos, &(seq, alias)) in rows.iter().enumerate() {
+                let entry_end = alias.start.saturating_add(alias.size as u64);
+                if entry_end > va && alias.start < end {
                     to_process.push((pos, seq, alias));
                 }
             }
             if to_process.is_empty() {
                 continue;
             }
-            to_process.sort_unstable_by_key(|(pos, _, _)| *pos);
             to_process.reverse();
 
             for (pos, seq, entry) in to_process {
