@@ -141,18 +141,15 @@ pub(super) fn with_captured_resources<R>(
         // charge again.
         return operation();
     }
-    // The outermost dispatch scope is exactly one guest syscall's service
-    // window, and it runs on the guest thread — so it is where that thread's
-    // SYSTEM time comes from. Measured on the host thread's own CPU clock, not
-    // the wall clock, so a syscall that BLOCKS (`wait4`, `epoll_wait`,
-    // `futex`) contributes nothing, matching Linux: a blocked task accrues no
-    // kernel CPU. See `Thread::system_ns`.
-    let started_ns = carrick_host::guest_cpu::this_thread_cpu_ns();
-    let result = with_resource_scope(CapturedResources::from_context(context), context, operation);
-    context
-        .thread()
-        .charge_system_ns(carrick_host::guest_cpu::this_thread_cpu_ns().saturating_sub(started_ns));
-    result
+    // The outermost dispatch scope runs on the guest thread, so it is where
+    // that thread's SYSTEM time is claimed. Claiming is not measuring: this
+    // opens (or, far more often, simply confirms) the host thread's charge
+    // window for this logical thread and costs no host syscall while the
+    // executor keeps servicing the same thread. The clock is read when the
+    // charged identity changes, when the guest reads its own accounting, and
+    // when the executor closes the residency. See `Thread::system_ns`.
+    context.thread().open_system_charge_window();
+    with_resource_scope(CapturedResources::from_context(context), context, operation)
 }
 
 /// Run `operation` against the kernel context whose dispatch scope is active

@@ -776,9 +776,95 @@ pub(crate) struct LogicalRecordLocks {
     state: parking_lot::Mutex<LogicalRecordLockState>,
     changed: parking_lot::Condvar,
     next_wait_id: std::sync::atomic::AtomicU64,
+    /// How many entries the table holds right now — locks, flocks and
+    /// published wait edges together — republished by
+    /// [`LockedRecordLockState`] every time the mutex is released.
+    ///
+    /// It exists so a close can ask "could this table have anything to release?"
+    /// BEFORE computing the file's identity. Identity for a `--fs host`
+    /// description is `fstat(2)` on the backing descriptor, so asking the table
+    /// first cost one host syscall on every guest `close` — measured
+    /// 20,000/20,000 on the `openclose` reducer — for a table that is empty in
+    /// every process that never calls `fcntl(F_SETLK)`/`flock`.
+    ///
+    /// The count is a property of the GUARD, not of any call site: the state is
+    /// unreachable except through [`LogicalRecordLocks::state`], whose guard
+    /// republishes on `Drop` and across a condvar wait, so a mutation path
+    /// added later cannot forget to maintain it.
+    occupancy: std::sync::atomic::AtomicUsize,
+}
+
+/// Exclusive access to [`LogicalRecordLockState`] that keeps
+/// [`LogicalRecordLocks::occupancy`] true. Never hand out the inner
+/// `MutexGuard`: releasing the mutex without republishing is exactly the drift
+/// this type exists to make unrepresentable.
+struct LockedRecordLockState<'a> {
+    state: parking_lot::MutexGuard<'a, LogicalRecordLockState>,
+    occupancy: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl LockedRecordLockState<'_> {
+    fn publish(&self) {
+        let total = self
+            .state
+            .locks
+            .len()
+            .saturating_add(self.state.flocks.len())
+            .saturating_add(self.state.waiting_on.len());
+        self.occupancy
+            .store(total, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Wait on `changed`, releasing the mutex for the duration.
+    ///
+    /// The occupancy is republished BEFORE the mutex is released — a waiter
+    /// that has already mutated the table must not leave it advertising itself
+    /// as emptier than it is — and again once the wait re-acquires.
+    fn wait_for(&mut self, changed: &parking_lot::Condvar, timeout: std::time::Duration) {
+        self.publish();
+        changed.wait_for(&mut self.state, timeout);
+        self.publish();
+    }
+}
+
+impl std::ops::Deref for LockedRecordLockState<'_> {
+    type Target = LogicalRecordLockState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for LockedRecordLockState<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for LockedRecordLockState<'_> {
+    fn drop(&mut self) {
+        self.publish();
+    }
 }
 
 impl LogicalRecordLocks {
+    /// The one way to reach the lock set. See [`LockedRecordLockState`].
+    fn state(&self) -> LockedRecordLockState<'_> {
+        LockedRecordLockState {
+            state: self.state.lock(),
+            occupancy: &self.occupancy,
+        }
+    }
+
+    /// True iff the table holds no lock, no flock and no published wait edge,
+    /// so nothing any owner could release lives in it and nobody can be parked
+    /// on `changed` (both wait loops only park while a conflicting entry is
+    /// present). Answering from the published count takes no mutex and, at a
+    /// close, no file identity.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.occupancy.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
     fn conflict_locked(
         locks: &[LogicalRecordLock],
         request: &LogicalRecordLockRequest,
@@ -822,7 +908,7 @@ impl LogicalRecordLocks {
     }
 
     fn try_set(&self, request: LogicalRecordLockRequest) -> Result<(), LinuxErrno> {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         if Self::conflict_locked(&state.locks, &request).is_some() {
             return Err(LINUX_EAGAIN);
         }
@@ -848,17 +934,17 @@ impl LogicalRecordLocks {
         owner: LogicalRecordLockOwner,
         range: LogicalRecordLockRange,
     ) {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         Self::replace_owner_range(&mut state.locks, file, owner, range);
         self.changed.notify_all();
     }
 
     fn conflict(&self, request: &LogicalRecordLockRequest) -> Option<LogicalRecordLock> {
-        Self::conflict_locked(&self.state.lock().locks, request)
+        Self::conflict_locked(&self.state().locks, request)
     }
 
     fn release_file_owner(&self, file: &LeaseFileId, owner: LogicalRecordLockOwner) {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         state
             .locks
             .retain(|lock| lock.file != *file || lock.owner != owner);
@@ -867,7 +953,7 @@ impl LogicalRecordLocks {
 
     pub(crate) fn release_owner(&self, owner: crate::kernel::TaskKey) {
         let owner = LogicalRecordLockOwner::from(owner);
-        let mut state = self.state.lock();
+        let mut state = self.state();
         state.locks.retain(|lock| lock.owner != owner);
         self.changed.notify_all();
     }
@@ -878,7 +964,7 @@ impl LogicalRecordLocks {
         owner: usize,
         write: bool,
     ) -> Result<(), LinuxErrno> {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         let conflict = state
             .flocks
             .iter()
@@ -895,7 +981,7 @@ impl LogicalRecordLocks {
     }
 
     pub(crate) fn unlock_flock(&self, file: &LeaseFileId, owner: usize) {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         state
             .flocks
             .retain(|lock| lock.file != *file || lock.owner != owner);
@@ -909,7 +995,7 @@ impl LogicalRecordLocks {
         write: bool,
         tid: crate::thread::ThreadId,
     ) -> Result<(), LinuxErrno> {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         loop {
             let conflict = state
                 .flocks
@@ -933,13 +1019,12 @@ impl LogicalRecordLocks {
             ) {
                 return Err(LINUX_EINTR);
             }
-            self.changed
-                .wait_for(&mut state, std::time::Duration::from_millis(10));
+            state.wait_for(&self.changed, std::time::Duration::from_millis(10));
         }
     }
 
     pub(crate) fn release_ofd(&self, file: &LeaseFileId, owner: usize) {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         state
             .locks
             .retain(|lock| lock.file != *file || lock.owner != LogicalRecordLockOwner::Ofd(owner));
@@ -998,7 +1083,7 @@ impl LogicalRecordLocks {
     }
 
     fn retract_wait(&self, wait: RecordLockWaitId) {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         self.retract_wait_locked(&mut state, wait);
     }
 
@@ -1054,7 +1139,7 @@ impl LogicalRecordLocks {
         tid: crate::thread::ThreadId,
     ) -> Result<(), LinuxErrno> {
         let wait = self.mint_wait_id();
-        let mut state = self.state.lock();
+        let mut state = self.state();
         loop {
             match self.poll_set_locked(&mut state, request, wait) {
                 Err(errno) if errno == LINUX_EAGAIN => {}
@@ -1067,8 +1152,7 @@ impl LogicalRecordLocks {
                 self.retract_wait_locked(&mut state, wait);
                 break Err(LINUX_EINTR);
             }
-            self.changed
-                .wait_for(&mut state, std::time::Duration::from_millis(10));
+            state.wait_for(&self.changed, std::time::Duration::from_millis(10));
         }
     }
 }
@@ -1793,6 +1877,18 @@ impl SyscallDispatcher {
         owner: crate::kernel::TaskKey,
         open_file: &OpenFile,
     ) {
+        // Ask the TABLE before asking the FILE. Keying the release needs the
+        // description's identity, and for a `--fs host` description that is
+        // `fstat(2)` on the backing descriptor — a host syscall this path used
+        // to pay on every guest `close` (`hvpatch-syscall-host-tax.d` on the
+        // `openclose` reducer: 20,000 host `fstat64` for 20,000 closes) purely
+        // to look up a table that is empty in every process which never took a
+        // record lock. An empty table has nothing to release and, because both
+        // wait loops only park while a conflicting entry is present, no waiter
+        // to notify either.
+        if self.fs.classic_record_locks.is_empty() {
+            return;
+        }
         let file = {
             open_file
                 .description

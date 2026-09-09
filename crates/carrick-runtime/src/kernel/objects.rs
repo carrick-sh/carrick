@@ -6235,12 +6235,25 @@ pub struct Thread {
     /// Guest SYSTEM time for this thread, in nanoseconds: the CPU carrick has
     /// burned servicing THIS thread's syscalls.
     ///
-    /// Service time happens on the host thread outside guest execution.
-    /// Accumulated at the one
-    /// dispatch boundary that reliably runs on the guest thread
-    /// (`dispatch::resources::with_captured_resources`), from
-    /// `CLOCK_THREAD_CPUTIME_ID` so a BLOCKED syscall — `wait4`, `epoll_wait` —
-    /// contributes nothing, exactly as on Linux.
+    /// Service time happens on the host thread outside guest execution, and is
+    /// measured on that host thread's own `CLOCK_THREAD_CPUTIME_ID`, so a
+    /// BLOCKED syscall — `wait4`, `epoll_wait` — contributes nothing, exactly
+    /// as on Linux.
+    ///
+    /// The measurement window is one EXECUTOR RESIDENCY, not one syscall: it
+    /// opens at the first dispatch boundary after the executor loads this
+    /// thread (`Thread::open_system_charge_window`), closes when the executor
+    /// stops running it (`close_system_charge_window`), and is flushed by every
+    /// read so the thread's own `getrusage` sees the residency it is inside.
+    /// Reading the clock IS a host syscall on Darwin (`thread_selfusage`), so a
+    /// per-syscall bracket spent exactly two host syscalls on every guest
+    /// syscall of every kind. A residency covers many syscalls and the host
+    /// thread runs nothing but this logical thread's service for its whole
+    /// length, so the wider window is both cheaper and more complete: it also
+    /// charges the trap-decode and vCPU-loop CPU that the per-syscall bracket
+    /// excluded and that Linux charges to system time. Guest EXECUTION is IN
+    /// the raw window — `hv_vcpu_run` accrues to the host thread's own CPU
+    /// clock — and is subtracted from it; see [`SystemChargeWindow`].
     /// This thread's answer to one task-local crash-capture generation: exact
     /// architectural state read at a safe point, or an explicit withdrawal
     /// from a park it cannot publish from. The generation prevents a delayed
@@ -6280,6 +6293,123 @@ struct ThreadCpuAccounting {
     /// burning RIGHT NOW (the `RLIMIT_CPU` watchdog, a CPU itimer) adds the
     /// open interval instead of waiting for a trap that will not come.
     active_since_ns: AtomicU64,
+}
+
+/// One host thread's open claim on one logical guest thread's SYSTEM CPU.
+///
+/// The window is opened by [`Thread::open_system_charge_window`] at the
+/// dispatch boundary and closed by [`close_system_charge_window`] when the
+/// executor stops running that logical thread, so it spans a whole executor
+/// residency rather than one syscall. That is the point: reading
+/// `CLOCK_THREAD_CPUTIME_ID` costs a host `thread_selfusage` syscall on Darwin,
+/// so bracketing every guest syscall spent exactly two host syscalls on every
+/// guest syscall of every kind — to measure windows only microseconds long.
+///
+/// What the window contains has to be corrected for one measured fact: on
+/// Apple's `Hypervisor.framework`, the time a vCPU thread spends inside
+/// `hv_vcpu_run` DOES accrue to that host thread's `CLOCK_THREAD_CPUTIME_ID`.
+/// (Measured 2026-09-08 with `scripts/dtrace/syscall-tax-reducer.rs` in `spin`
+/// mode — a guest that only computes: charging the raw window put 11,673 µs of
+/// system time on a thread that had issued no syscall at all, against 11,358 µs
+/// of user time. The `guest_cpu` module's note that HVF guest execution does not
+/// accrue is true of `proc_pid_rusage`, NOT of the per-thread clock.) Guest
+/// execution is USER time, so it has to come back out of the window.
+///
+/// It cannot be subtracted directly, because the only free measure of guest
+/// execution is the engine's run receipt, which is a WALL clock: on a loaded
+/// host the guest-run wall exceeds the host-CPU delta and the subtraction
+/// floors at zero, reporting a syscall-bound guest as having spent no system
+/// time at all (observed at 1-minute load 23). The window therefore splits the
+/// residency's REAL cpu — measured on the thread's own clock, so host
+/// preemption is already excluded — in the ratio of the two wall spans it can
+/// see for free: how much of the residency was inside guest runs, and how much
+/// was carrick servicing them.
+struct SystemChargeWindow {
+    /// The logical thread being charged. Identity, never a slot: `execve` can
+    /// replace the thread object mid-residency.
+    ///
+    /// WEAK on purpose. A window is an observation about a thread, not an owner
+    /// of one, and a strong reference here outlives every boundary the runtime
+    /// audits: it kept retired `Thread`s alive past their sweep and shifted the
+    /// id the next fork was handed (caught by
+    /// `copied_file_table_owner_exit_purges_registration_despite_parent_description_ref`).
+    /// Every use upgrades first, so a freed-and-recycled allocation can never be
+    /// mistaken for the thread the window was opened on.
+    thread: std::sync::Weak<Thread>,
+    /// Host thread CPU clock (`CLOCK_THREAD_CPUTIME_ID`) when the window
+    /// opened. The one reading that costs a host syscall.
+    opened_at_host_cpu_ns: u64,
+    /// Monotonic wall clock when the window opened.
+    opened_at_wall_ns: u64,
+    /// The thread's accumulated guest-run wall time when the window opened;
+    /// its growth is the part of the residency that was guest execution.
+    opened_at_user_ns: u64,
+    /// How much of this window has already been committed. Cumulative rather
+    /// than per-flush, so a flush can never charge an interval twice and a
+    /// shrinking estimate cannot claw back time already reported to a guest.
+    charged_ns: u64,
+}
+
+impl SystemChargeWindow {
+    /// The live thread this window charges, or `None` once it has been
+    /// dropped — at which point nothing can report the time anyway.
+    fn live(&self) -> Option<ThreadRef> {
+        self.thread.upgrade()
+    }
+
+    /// The service CPU this window has accrued but not yet committed, and the
+    /// new cumulative total. Costs exactly one host syscall (the clock read);
+    /// the wall and guest-run readings are free.
+    fn pending(&self, thread: &Thread) -> (u64, u64) {
+        let residency_cpu_ns = carrick_host::guest_cpu::this_thread_cpu_ns()
+            .saturating_sub(self.opened_at_host_cpu_ns);
+        let residency_wall_ns = guest_run_clock_ns().saturating_sub(self.opened_at_wall_ns);
+        let guest_wall_ns = thread
+            .cpu_ns_including_active()
+            .saturating_sub(self.opened_at_user_ns);
+        let service_wall_ns = residency_wall_ns.saturating_sub(guest_wall_ns);
+        let accrued_ns = if residency_wall_ns == 0 {
+            0
+        } else {
+            u64::try_from(
+                u128::from(residency_cpu_ns) * u128::from(service_wall_ns)
+                    / u128::from(residency_wall_ns),
+            )
+            .unwrap_or(u64::MAX)
+        };
+        let uncommitted_ns = accrued_ns.saturating_sub(self.charged_ns);
+        (uncommitted_ns, accrued_ns.max(self.charged_ns))
+    }
+}
+
+thread_local! {
+    /// This host thread's open charge window, if it is running a logical guest
+    /// thread right now. See [`SystemChargeWindow`].
+    static SYSTEM_CHARGE_WINDOW: std::cell::RefCell<Option<SystemChargeWindow>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Commit what this host thread has burned servicing the logical thread it was
+/// running, and close the window.
+///
+/// The executor calls this when it stops running the loaded logical thread —
+/// at a residency boundary, and again in the boundary audit so no error path
+/// can leave a window open for a different logical thread to inherit.
+pub(crate) fn close_system_charge_window() {
+    let closed = SYSTEM_CHARGE_WINDOW.with(|window| window.borrow_mut().take());
+    if let Some(window) = closed
+        && let Some(thread) = window.live()
+    {
+        let (uncommitted_ns, _) = window.pending(&thread);
+        thread.charge_system_ns(uncommitted_ns);
+    }
+}
+
+/// Is this host thread free of any logical thread's charge window? Part of the
+/// executor boundary audit: an executor about to load a different logical task
+/// must not still be charging the previous one.
+pub(crate) fn system_charge_window_is_closed() -> bool {
+    SYSTEM_CHARGE_WINDOW.with(|window| window.borrow().is_none())
 }
 
 /// One thread's guest user CPU at an instant: see
@@ -7710,12 +7840,76 @@ impl Thread {
     /// Guest SYSTEM CPU (µs) this thread has accumulated — carrick's own CPU
     /// spent servicing this thread's syscalls. See `system_ns`.
     pub fn system_cpu_us(&self) -> u64 {
+        self.flush_open_system_charge();
         self.cpu_accounting.system_ns.load(Ordering::Acquire) / 1000
     }
 
     /// Guest SYSTEM CPU (ns) this thread has accumulated.
     pub fn system_cpu_ns(&self) -> u64 {
+        self.flush_open_system_charge();
         self.cpu_accounting.system_ns.load(Ordering::Acquire)
+    }
+
+    /// Open — or keep open — this host thread's system-CPU charge window for
+    /// this logical thread.
+    ///
+    /// Called at the outermost dispatch scope of every guest syscall. When the
+    /// window already belongs to this exact thread (the overwhelmingly common
+    /// case: an executor residency services many syscalls for one logical
+    /// thread) this is a pointer comparison and costs NO host syscall. It
+    /// samples the host CPU clock only when the charged identity changes,
+    /// committing the departing thread's accrual first — an `execve` that
+    /// replaces the thread object mid-residency lands on that path.
+    pub fn open_system_charge_window(self: &ThreadRef) {
+        let already_current = SYSTEM_CHARGE_WINDOW.with(|window| {
+            window
+                .borrow()
+                .as_ref()
+                .and_then(SystemChargeWindow::live)
+                .is_some_and(|live| Arc::ptr_eq(&live, self))
+        });
+        if already_current {
+            return;
+        }
+        // The charged identity is changing, so the departing window has to be
+        // settled before the clock reading is reused as the new baseline.
+        close_system_charge_window();
+        let opened = SystemChargeWindow {
+            thread: Arc::downgrade(self),
+            opened_at_host_cpu_ns: carrick_host::guest_cpu::this_thread_cpu_ns(),
+            opened_at_wall_ns: guest_run_clock_ns(),
+            opened_at_user_ns: self.cpu_ns_including_active(),
+            charged_ns: 0,
+        };
+        SYSTEM_CHARGE_WINDOW.with(|window| *window.borrow_mut() = Some(opened));
+    }
+
+    /// Commit what this host thread has burned so far in an open charge window
+    /// that belongs to THIS logical thread, and restart the window from now.
+    ///
+    /// Every read of the counter goes through here, so a guest asking for its
+    /// own `getrusage`/`times`/`CLOCK_THREAD_CPUTIME_ID` sees the service time
+    /// of the residency it is inside rather than only what earlier residencies
+    /// committed. A read from any OTHER host thread cannot sample this thread's
+    /// CPU clock and so still reports the committed total — the same lag a
+    /// peer read has always had while a syscall is in flight.
+    fn flush_open_system_charge(&self) {
+        let delta_ns = SYSTEM_CHARGE_WINDOW.with(|window| {
+            let mut window = window.borrow_mut();
+            let Some(open) = window.as_mut() else {
+                return 0;
+            };
+            let Some(live) = open.live() else {
+                return 0;
+            };
+            if !std::ptr::eq(Arc::as_ptr(&live), self as *const Self) {
+                return 0;
+            }
+            let (uncommitted_ns, accrued_ns) = open.pending(&live);
+            open.charged_ns = accrued_ns;
+            uncommitted_ns
+        });
+        self.charge_system_ns(delta_ns);
     }
 
     /// Guest USER + SYSTEM CPU (ns) including any active guest run.
@@ -7724,9 +7918,13 @@ impl Thread {
             .saturating_add(self.system_cpu_ns())
     }
 
-    /// Charge `delta_ns` of syscall-service CPU to this thread. Called once per
-    /// guest syscall from the dispatch boundary, with the delta measured on the
-    /// host thread's own CPU clock so blocked time is excluded.
+    /// Commit `delta_ns` of syscall-service CPU to this thread.
+    ///
+    /// The delta is measured on the host thread's own CPU clock, so time a
+    /// syscall spends BLOCKED contributes nothing, exactly as on Linux. The
+    /// callers are the charge window (`open_system_charge_window`,
+    /// `flush_open_system_charge`, `close_system_charge_window`) and any
+    /// backend whose executor returns a non-zero `ExecutorCpuReceipt`.
     pub fn charge_system_ns(&self, delta_ns: u64) {
         if delta_ns != 0 {
             self.cpu_accounting
