@@ -11038,6 +11038,9 @@ mod task_only_carrier_directory_tests {
     #[test]
     fn unregister_one_alias_costs_the_same_at_any_mm_size() {
         const NEIGHBOURS: usize = 4096;
+        // Room for the binary search's comparisons (log2 4097 ~ 12) and the
+        // per-key promotion, and nothing that scales with NEIGHBOURS.
+        const BUDGET: u64 = 64;
         let mut registry = AliasRegistry::default();
         let template = alias(0x9000_0000, 3);
         // A scope's rows are in INSERTION order, not address order, so the
@@ -11075,9 +11078,9 @@ mod task_only_carrier_directory_tests {
             "incrementally promoted exact-first index must equal a from-scratch rebuild"
         );
         assert!(
-            scanned <= NEIGHBOURS as u64 + 64,
+            scanned <= BUDGET,
             "unmapping the FIRST-registered row of a {NEIGHBOURS}-row mm visited \
-             {scanned} rows; the suffix must not be re-indexed on top of the scan"
+             {scanned} rows; the cost must not scale with the mm's population"
         );
     }
 
@@ -13669,12 +13672,28 @@ impl AliasRegistry {
         candidates
     }
 
+    /// Place one row in its scope bucket, keeping the bucket ordered by
+    /// sequence. The ONLY way a row enters a bucket.
+    ///
+    /// The order is not cosmetic. `bucket_position_in` locates a row by binary
+    /// search on the sequence, so an unsorted bucket does not answer "slower",
+    /// it answers "this row is not here". `push` always supplies the next
+    /// sequence and so always lands at the end; the unmap planner
+    /// (`staged_unmap_registry`) replays EXISTING rows in the order its two
+    /// source indices yield them, and only this placement makes the staged
+    /// bucket agree with the live one. Ties keep insertion order, so a split
+    /// row's head still precedes its tail.
+    fn place_in_scope_bucket(&mut self, seq: u64, alias: AliasBacking) {
+        let rows = self.by_scope.entry(alias.ownership_scope).or_default();
+        let at = rows.partition_point(|&(row_seq, _)| row_seq <= seq);
+        rows.insert(at, (seq, alias));
+    }
+
     fn push(&mut self, alias: AliasBacking) {
         self.bump_revision();
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        let rows = self.by_scope.entry(alias.ownership_scope).or_default();
-        rows.push((seq, alias));
+        self.place_in_scope_bucket(seq, alias);
         self.exact_first_by_scope
             .entry(alias.ownership_scope)
             .or_default()
@@ -14391,9 +14410,12 @@ impl AliasRegistry {
 
     /// Insert a single row into buckets and indices with an explicit sequence.
     /// Used when staging a planned mutation subset without cloning or reindexing the whole registry.
+    ///
+    /// The sequence is an EXISTING row's, so it may be lower than one already
+    /// staged; `place_in_scope_bucket` is what keeps the staged bucket in the
+    /// same sequence order the live one is in.
     fn insert_indexed_row(&mut self, seq: u64, alias: AliasBacking) {
-        let rows = self.by_scope.entry(alias.ownership_scope).or_default();
-        rows.push((seq, alias));
+        self.place_in_scope_bucket(seq, alias);
         self.exact_first_by_scope
             .entry(alias.ownership_scope)
             .or_default()
@@ -14420,10 +14442,33 @@ impl AliasRegistry {
         if overlapping.is_empty() {
             return (std::collections::BTreeSet::new(), registry_before);
         }
+        let mut planned = self.staged_unmap_registry(&overlapping, mm_root_slot, container_root);
+        let planned_leases =
+            unregister_alias_entries(&mut planned, va, len, mm_root_slot, container_root);
+        (planned_leases, registry_before)
+    }
+
+    /// The miniature registry the unmap planner runs `unregister_alias_entries`
+    /// over: the rows that overlap the unmap, plus every row of a
+    /// process-visible scope that co-holds one of their physical extents.
+    ///
+    /// It is a REGISTRY, not a row list, and that is load-bearing:
+    /// `unregister_alias_entries` selects the rows to split through this
+    /// object's own scope buckets and window index, so every invariant those
+    /// carry in the live registry has to hold here too or the plan and the
+    /// live unmap disagree about which frames retire. `insert_indexed_row` is
+    /// where that is enforced — these rows arrive in two index orders, not in
+    /// sequence order.
+    fn staged_unmap_registry(
+        &self,
+        overlapping: &[(u64, AliasBacking)],
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> Self {
         let scopes = Self::process_visible_scopes(mm_root_slot, container_root);
         let mut co_holders = Vec::new();
         let mut seen_extents = std::collections::BTreeSet::new();
-        for (_, entry) in &overlapping {
+        for (_, entry) in overlapping {
             if seen_extents.insert((entry.physical_ipa, entry.physical_size as u64)) {
                 for &scope in &scopes {
                     if let Some(rows) = self
@@ -14446,7 +14491,7 @@ impl AliasRegistry {
         // middle-page unmap followed by the head's).
         let mut planned = Self::default();
         let mut seen_rows = std::collections::BTreeSet::new();
-        for (seq, alias) in overlapping {
+        for &(seq, alias) in overlapping {
             seen_rows.insert((seq, alias.start));
             planned.insert_indexed_row(seq, alias);
         }
@@ -14455,9 +14500,7 @@ impl AliasRegistry {
                 planned.insert_indexed_row(seq, alias);
             }
         }
-        let planned_leases =
-            unregister_alias_entries(&mut planned, va, len, mm_root_slot, container_root);
-        (planned_leases, registry_before)
+        planned
     }
 
     /// The two scopes a process can see, per `alias_matches_process_scope`:
@@ -18383,17 +18426,41 @@ fn unregister_alias_entries(
             let Some(rows) = registry.by_scope.get_mut(&scope) else {
                 continue;
             };
-            note_alias_state_rows_scanned(rows.len());
+            // The rows this unmap splits are already known: `overlapping` is
+            // the bounded guest-VA window query above, and it is exact for
+            // this predicate (`va_window_rows` visits, per live size class,
+            // every start in `[va - (class radius - 1), end)`, and a row of
+            // that class beginning below that bound ends at or before `va`).
+            // Walking the scope's whole row vector to rediscover them made
+            // every `munmap` cost O(rows in the mm); with the retired suffix
+            // rebuild it was 60% of the carrier's user CPU on
+            // `cpython-compile`
+            // (docs/perf-results/2026-09-08-cpython-compile-per-fault-cost.md).
+            //
+            // A row's position is a binary search on its sequence, because a
+            // scope bucket is ordered by sequence — `place_in_scope_bucket` is
+            // what makes that true of the planner's staged registry as well as
+            // this one, and `unmap_row_selection_agrees_between_the_scope_scan_
+            // and_the_window_query` is the differential test that holds the two
+            // selections equal. `claimed` keeps two rows that are equal in
+            // every field from resolving to one position.
             let mut to_process = Vec::new();
-            for (pos, &(seq, alias)) in rows.iter().enumerate() {
-                let entry_end = alias.start.saturating_add(alias.size as u64);
-                if entry_end > va && alias.start < end {
+            let mut claimed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for &(seq, alias) in &overlapping {
+                if alias.ownership_scope != scope {
+                    continue;
+                }
+                if let Some(pos) =
+                    AliasRegistry::bucket_position_in(rows, seq, &alias, Some(&claimed))
+                {
+                    claimed.insert(pos);
                     to_process.push((pos, seq, alias));
                 }
             }
             if to_process.is_empty() {
                 continue;
             }
+            to_process.sort_unstable_by_key(|&(pos, _, _)| pos);
             to_process.reverse();
 
             for (pos, seq, entry) in to_process {
@@ -59685,6 +59752,264 @@ mod tag_strip_tests {
                 reg_new.ordered(),
                 reg_oracle.ordered(),
                 "resulting registry ordered rows mismatch for case: {desc}"
+            );
+        }
+    }
+
+    /// A seeded generator. Shapes must be identical on every run and on every
+    /// machine, so this is a fixed SplitMix64 rather than `rand`.
+    struct ShapeRng(u64);
+
+    impl ShapeRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    type SelectedRows = Vec<(usize, u64, AliasBacking)>;
+
+    /// The two ways of answering "which rows does this unmap split", per
+    /// touched scope: `(scope, scan, window)`.
+    ///
+    /// `scan` is the full walk of the scope's row vector that
+    /// `unregister_alias_entries` performs; `window` is the same question
+    /// answered from the bounded `overlapping` window query, each row located
+    /// in the bucket by binary search on its sequence. They must be equal in
+    /// EVERY registry the routine runs over — the live one and the planner's
+    /// staged one — or the frames a `munmap` retires stop matching the ones
+    /// its caller planned.
+    fn unmap_row_selections(
+        registry: &AliasRegistry,
+        va: u64,
+        len: usize,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+    ) -> Vec<(AliasOwnershipScope, SelectedRows, SelectedRows)> {
+        let Some(end) = va.checked_add(len as u64) else {
+            return Vec::new();
+        };
+        if len == 0 || end <= va {
+            return Vec::new();
+        }
+        let overlapping =
+            registry.overlapping_process_aliases(va, len, mm_root_slot, container_root);
+        let touched: std::collections::BTreeSet<AliasOwnershipScope> = overlapping
+            .iter()
+            .map(|(_, entry)| entry.ownership_scope)
+            .collect();
+        let mut out = Vec::new();
+        for scope in touched {
+            let Some(rows) = registry.by_scope.get(&scope) else {
+                continue;
+            };
+            let mut scan = Vec::new();
+            for (pos, &(seq, alias)) in rows.iter().enumerate() {
+                let entry_end = alias.start.saturating_add(alias.size as u64);
+                if entry_end > va && alias.start < end {
+                    scan.push((pos, seq, alias));
+                }
+            }
+            let mut window = Vec::new();
+            for &(seq, alias) in &overlapping {
+                if alias.ownership_scope != scope {
+                    continue;
+                }
+                if let Some(pos) = AliasRegistry::bucket_position_in(rows, seq, &alias, None) {
+                    window.push((pos, seq, alias));
+                }
+            }
+            window.sort_unstable_by_key(|&(pos, _, _)| pos);
+            out.push((scope, scan, window));
+        }
+        out
+    }
+
+    fn describe_registry(registry: &AliasRegistry) -> String {
+        let mut out = String::new();
+        for (scope, rows) in &registry.by_scope {
+            out.push_str(&format!("  scope {scope:?}\n"));
+            for (pos, (seq, alias)) in rows.iter().enumerate() {
+                out.push_str(&format!(
+                    "    [{pos}] seq={seq} va={:#x}..{:#x} phys={:#x}+{:#x}\n",
+                    alias.start,
+                    alias.start + alias.size as u64,
+                    alias.physical_ipa,
+                    alias.physical_size,
+                ));
+            }
+        }
+        out
+    }
+
+    /// Selecting an unmap's rows from the guest-VA window query must give the
+    /// same rows as walking the scope, in the LIVE registry and in the
+    /// planner's staged one alike.
+    ///
+    /// Red-first shape: this is the property `e123216a4` assumed and
+    /// `da0270d43` reverted for lack of evidence. The staged registry replays
+    /// existing rows out of sequence order — the overlapping rows sorted by
+    /// sequence, then their physical co-holders in physical-index order — while
+    /// `bucket_position_in` binary-searches the bucket BY sequence. On an
+    /// unsorted bucket that search reports "not present", the planner splits
+    /// fewer rows than the live unmap does, and
+    /// `debug_assert_eq!(actual, planned_leases)` aborts the guest (it did, as
+    /// "left: {8 entries} right: {6 entries}", under `sysvsem` and
+    /// `rlimitnproc`).
+    #[test]
+    fn unmap_row_selection_agrees_between_the_scope_scan_and_the_window_query() {
+        const PAGE: u64 = 0x1000;
+        let root_slot = Some((0x5000_0000, 0x4000));
+        let owned = AliasOwnershipScope::MmRootSlot {
+            base: 0x5000_0000,
+            size: 0x4000,
+        };
+        let global = AliasOwnershipScope::Global;
+        let foreign = AliasOwnershipScope::MmRootSlot {
+            base: 0x6000_0000,
+            size: 0x4000,
+        };
+        // Weighted so most rows land in the process's own scope, with a
+        // Global co-tenant and an invisible foreign owner in every shape.
+        let scope_pool = [owned, owned, owned, global, foreign];
+
+        let mut failures: Vec<(usize, String)> = Vec::new();
+        let mut shapes = 0usize;
+        let mut staged_shapes = 0usize;
+
+        for seed in 0..768u64 {
+            let mut rng = ShapeRng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0x00C0_FFEE);
+            let mut registry = AliasRegistry::default();
+            let row_count = 4 + rng.below(12) as usize;
+            for _ in 0..row_count {
+                let scope = scope_pool[rng.below(scope_pool.len() as u64) as usize];
+                // Four VA size classes, so `va_window_rows` has to visit more
+                // than one class bucket.
+                let size = (1u64 << rng.below(4)) * PAGE;
+                let start = 0x1000_0000 + rng.below(24) * PAGE;
+                // A three-extent physical pool: rows at distant VAs co-hold one
+                // extent, which is what puts co-holders in the staged registry.
+                let physical_ipa = 0x8000_0000 + rng.below(3) * 0x1_0000;
+                registry.push(make_test_alias(
+                    start,
+                    size as usize,
+                    physical_ipa,
+                    0x1_0000,
+                    scope,
+                ));
+            }
+
+            // Each step first CHECKS the property, then applies the unmap, so
+            // later steps see rows already split into head+tail fragments that
+            // share their parent's sequence.
+            let steps = 1 + rng.below(4);
+            for _ in 0..steps {
+                let va = 0x1000_0000 + rng.below(24) * PAGE;
+                let len = ((1 + rng.below(4)) * PAGE) as usize;
+                shapes += 1;
+
+                let overlapping = registry.overlapping_process_aliases(
+                    va,
+                    len,
+                    root_slot,
+                    ContainerRootToken::ROOT,
+                );
+                let staged = (!overlapping.is_empty()).then(|| {
+                    staged_shapes += 1;
+                    registry.staged_unmap_registry(
+                        &overlapping,
+                        root_slot,
+                        ContainerRootToken::ROOT,
+                    )
+                });
+
+                for (which, subject) in [
+                    Some(("live", &registry)),
+                    staged.as_ref().map(|s| ("staged", s)),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    // The invariant the binary search rests on, named
+                    // directly: an unsorted bucket does not make
+                    // `bucket_position_in` slower, it makes it answer "absent"
+                    // for a row that is present.
+                    for (scope, rows) in &subject.by_scope {
+                        if !rows.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
+                            failures.push((
+                                rows.len(),
+                                format!(
+                                    "seed {seed}: {which} registry scope {scope:?} bucket is not \
+                                     ordered by sequence: {:?}",
+                                    rows.iter().map(|&(seq, _)| seq).collect::<Vec<_>>()
+                                ),
+                            ));
+                        }
+                    }
+                    for (scope, scan, window) in
+                        unmap_row_selections(subject, va, len, root_slot, ContainerRootToken::ROOT)
+                    {
+                        if scan != window {
+                            failures.push((
+                                subject.len(),
+                                format!(
+                                    "seed {seed}: {which} registry, unmap {va:#x}..{:#x}, \
+                                     scope {scope:?}\n  scan   selected {} row(s): {scan:?}\n  \
+                                     window selected {} row(s): {window:?}\nregistry:\n{}",
+                                    va + len as u64,
+                                    scan.len(),
+                                    window.len(),
+                                    describe_registry(subject),
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                // The end-to-end invariant the guest actually depends on.
+                let (planned, _) = registry.plan_unregister_process_alias(
+                    va,
+                    len,
+                    root_slot,
+                    ContainerRootToken::ROOT,
+                );
+                let actual = unregister_alias_entries(
+                    &mut registry,
+                    va,
+                    len,
+                    root_slot,
+                    ContainerRootToken::ROOT,
+                );
+                if planned != actual {
+                    failures.push((
+                        registry.len(),
+                        format!(
+                            "seed {seed}: planned leases {planned:?} != actual {actual:?} \
+                             for unmap {va:#x}..{:#x}",
+                            va + len as u64
+                        ),
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            shapes >= 700 && staged_shapes >= 100,
+            "generator produced too few shapes: {shapes} unmaps, {staged_shapes} with a staged registry"
+        );
+        if !failures.is_empty() {
+            failures.sort_by_key(|(rows, _)| *rows);
+            let total = failures.len();
+            panic!(
+                "{total} diverging case(s) out of {shapes} unmaps; smallest ({} rows):\n{}",
+                failures[0].0, failures[0].1
             );
         }
     }
