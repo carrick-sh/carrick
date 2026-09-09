@@ -10961,6 +10961,71 @@ mod task_only_carrier_directory_tests {
         );
     }
 
+    /// Unmapping ONE row must cost the same whatever else the mm holds.
+    ///
+    /// Red-first shape: this fails on the representation this replaced. That
+    /// one scanned the scope's whole row vector to locate the overlap, then
+    /// collected `rows[first_changed..]` into a fresh `Vec` and re-indexed the
+    /// whole suffix through `refresh_exact_scope_suffix`, because
+    /// `exact_first_by_scope` was a first-occurrence index over positions. A
+    /// mid-scope unmap therefore visited ~1.5x the population; with 4,096
+    /// neighbours that is >6,000 rows against the 64 asserted here. Measured
+    /// on `cpython-compile`, `unregister_process_alias` held 60% of the
+    /// carrier's user CPU and its `Vec::from_iter` alone held 36%
+    /// (`docs/perf-results/2026-09-08-cpython-compile-per-fault-cost.md`).
+    ///
+    /// The exactness half is asserted too: the incrementally promoted index
+    /// must equal a from-scratch rebuild, which is what makes dropping the
+    /// suffix pass legitimate rather than merely cheaper.
+    #[test]
+    fn unregister_one_alias_costs_the_same_at_any_mm_size() {
+        const NEIGHBOURS: usize = 4096;
+        let mut registry = AliasRegistry::default();
+        let template = alias(0x9000_0000, 3);
+        for index in 0..NEIGHBOURS {
+            let mut row = template;
+            let offset = (index as u64 + 1) * 0x4000;
+            row.start += offset;
+            row.ipa += offset;
+            row.physical_ipa += offset;
+            registry.push(row);
+        }
+        // The victim sits in the middle of the scope's row order, which is the
+        // case the retired suffix rebuild was worst at.
+        let mut victim = template;
+        let victim_offset = (NEIGHBOURS as u64 / 2) * 0x4000 + 0x2000;
+        victim.start += victim_offset;
+        victim.ipa += victim_offset;
+        victim.physical_ipa += victim_offset;
+        registry.push(victim);
+        let scope = match victim.ownership_scope {
+            AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
+            _ => None,
+        };
+
+        let before = alias_state_rows_scanned();
+        unregister_alias_entries(
+            &mut registry,
+            victim.start,
+            victim.size,
+            scope,
+            ContainerRootToken::ROOT,
+        );
+        let scanned = alias_state_rows_scanned() - before;
+
+        let mut expected = registry.clone();
+        expected.rebuild_exact_scope(victim.ownership_scope);
+        assert_eq!(
+            registry.exact_first_by_scope, expected.exact_first_by_scope,
+            "incrementally promoted exact-first index must equal a from-scratch rebuild"
+        );
+        assert!(
+            scanned <= 64,
+            "unmapping one row in a {NEIGHBOURS}-row mm visited {scanned} rows; \
+             the cost must not scale with the mm's population"
+        );
+    }
+
     #[test]
     fn unregister_alias_matches_full_snapshot_invalidation() {
         let directory = HvpatchCarrierTaskStateDirectory::default();
@@ -13165,40 +13230,45 @@ impl AliasRegistry {
     /// Refresh only positions affected by a scope-bucket edit. Earlier first
     /// occurrences still mask duplicate keys in the suffix. Tail unmaps leave
     /// the existing prefix tree intact instead of allocating it again.
-    fn refresh_exact_scope_suffix(
+    /// Re-establish `exact_first_by_scope` for exactly the keys a mutation
+    /// disturbed, by asking `by_va_start` for the surviving row with the
+    /// lowest sequence — the same promotion the batch-remove path already
+    /// performs, and the reason this scope's row order no longer has to be
+    /// rescanned. Cost is O(touched keys * rows sharing that guest VA), never
+    /// O(rows in the mm).
+    fn promote_exact_first_keys(
         &mut self,
         scope: AliasOwnershipScope,
-        first_changed: usize,
-        old_keys: &[(u64, u64)],
+        keys: &std::collections::BTreeSet<(u64, u64)>,
     ) {
-        let Some(rows) = self.by_scope.get(&scope) else {
-            self.exact_first_by_scope.remove(&scope);
-            return;
-        };
-        let mut to_remove = Vec::new();
-        if let Some(exact) = self.exact_first_by_scope.get(&scope) {
-            note_alias_state_rows_scanned(old_keys.len());
-            let prefix_rows = &rows[..first_changed.min(rows.len())];
-            for key in old_keys {
-                if let Some(&(seq, alias)) = exact.get(key) {
-                    if Self::bucket_position_in(prefix_rows, seq, &alias, None).is_none() {
-                        to_remove.push(*key);
+        for &(start, ipa) in keys {
+            let next_remaining = self.by_va_start.get(&start).and_then(|va_rows| {
+                note_alias_state_rows_scanned(va_rows.len());
+                va_rows
+                    .iter()
+                    .filter(|r| r.1.ownership_scope == scope && r.1.ipa == ipa)
+                    .min_by_key(|r| r.0)
+                    .copied()
+            });
+            match next_remaining {
+                Some((next_seq, next_alias)) => {
+                    self.exact_first_by_scope
+                        .entry(scope)
+                        .or_default()
+                        .insert((start, ipa), (next_seq, next_alias));
+                }
+                None => {
+                    if let Some(exact) = self.exact_first_by_scope.get_mut(&scope) {
+                        exact.remove(&(start, ipa));
                     }
                 }
             }
         }
-        let exact = self.exact_first_by_scope.entry(scope).or_default();
-        for key in to_remove {
-            exact.remove(&key);
-        }
-        let rows = &self.by_scope[&scope];
-        note_alias_state_rows_scanned(rows.len().saturating_sub(first_changed));
-        for &(seq, alias) in rows.iter().skip(first_changed) {
-            exact
-                .entry((alias.start, alias.ipa))
-                .or_insert((seq, alias));
-        }
-        if exact.is_empty() {
+        if self
+            .exact_first_by_scope
+            .get(&scope)
+            .is_some_and(|e| e.is_empty())
+        {
             self.exact_first_by_scope.remove(&scope);
         }
     }
@@ -18203,28 +18273,32 @@ fn unregister_alias_entries(
         let mut mutations = Vec::new();
         let mut removed_count = 0usize;
         let mut inserted_count = 0usize;
-        let first_changed;
-        let old_suffix_keys;
+        let mut touched_keys: std::collections::BTreeSet<(u64, u64)> =
+            std::collections::BTreeSet::new();
         {
             let Some(rows) = registry.by_scope.get_mut(&scope) else {
                 continue;
             };
-            note_alias_state_rows_scanned(rows.len());
+            // The overlapping rows are already known from the bounded
+            // `by_va_start` range query above; a scope's rows are appended in
+            // sequence order, so each one's position is a binary search rather
+            // than a walk of the whole mm. The linear scan this replaces, plus
+            // the suffix rebuild below it, was 60% of the carrier's user CPU on
+            // `cpython-compile`
+            // (docs/perf-results/2026-09-08-cpython-compile-per-fault-cost.md).
             let mut to_process = Vec::new();
-            for (pos, &(seq, alias)) in rows.iter().enumerate() {
-                let entry_end = alias.start.saturating_add(alias.size as u64);
-                if entry_end > va && alias.start < end {
+            for &(seq, alias) in &overlapping {
+                if alias.ownership_scope != scope {
+                    continue;
+                }
+                if let Some(pos) = AliasRegistry::bucket_position_in(rows, seq, &alias, None) {
                     to_process.push((pos, seq, alias));
                 }
             }
-            let Some(&(first, _, _)) = to_process.first() else {
+            if to_process.is_empty() {
                 continue;
-            };
-            first_changed = first;
-            old_suffix_keys = rows[first..]
-                .iter()
-                .map(|(_, row)| (row.start, row.ipa))
-                .collect::<Vec<_>>();
+            }
+            to_process.sort_unstable_by_key(|(pos, _, _)| *pos);
             to_process.reverse();
 
             for (pos, seq, entry) in to_process {
@@ -18268,8 +18342,15 @@ fn unregister_alias_entries(
             }
         }
         for (seq, entry, fragments) in mutations {
+            // Every exact key this mutation can disturb: the row's own key, and
+            // each fragment's. `refresh_exact_scope_suffix` used to answer this
+            // by rebuilding the whole `rows[first_changed..]` suffix — the
+            // `Vec::from_iter` that held 36% of the carrier's user CPU on
+            // `cpython-compile` (docs/perf-results/2026-09-08-cpython-compile-per-fault-cost.md).
+            touched_keys.insert((entry.start, entry.ipa));
             registry.index_remove(seq, entry);
             for (frag_seq, frag_entry) in fragments {
+                touched_keys.insert((frag_entry.start, frag_entry.ipa));
                 registry.index_insert(frag_seq, frag_entry);
             }
         }
@@ -18278,7 +18359,7 @@ fn unregister_alias_entries(
             .saturating_sub(removed_count)
             .saturating_add(inserted_count);
         registry.bump_revision();
-        registry.refresh_exact_scope_suffix(scope, first_changed, &old_suffix_keys);
+        registry.promote_exact_first_keys(scope, &touched_keys);
         registry.drop_empty_scope(scope);
     }
 
