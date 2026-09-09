@@ -49,3 +49,25 @@ Candidate SHA-256: `ad86e454304484b579ce23ca6c2ddb9adad26ea4e191fefb05e07963ccba
 The whole-workload startup service trace (`scan-service.raw`) completed with status=ok and zero errors. It ranks `newfstatat`, `getdents64`, `brk` and `mmap` as leads; its high-perturbation durations are not CPU savings estimates. Follow up with low-perturbation phase/operation attribution and preserve the two ecosystem workload checks in the active objective.
 
 Checkpoint validation: `just test` and `just clippy` exited zero. The serial runtime suite reports 2,574 passed / 2 existing ignored; HVF reports 471 passed / 3 existing ignored. `just conformance-probes` exited zero, including 873 generic execution announcements, the signed negative controls, 24 case tests, CLI contract and the retained lane (46 tests passed / 1 existing ignored). Full log: `probes.log`; the generic and case artifact manifests were copied separately before the shared receipt path could be overwritten. No `carrick:execdiag` process remained after the gate. There are no line-pinned inventory entries naming `crates/carrick-mem/src/page_table.rs`; this edit does not move other source files. Full ecosystem comparisons and final goal acceptance remain outstanding.
+
+## Next diagnostic checkpoint: mmap faults dominate the event population
+
+The first implementation is committed as `e1ce4909c`.
+
+A same-binary ABBA of the existing `CARRICK_FAULT_WINDOW_BYTES` control (64 KiB vs 256 KiB) found no improvement. Ordinary Python averaged 13.563 ms at 64 KiB and 13.710 ms at 256 KiB; Python -S was 12.159 vs 12.499 ms. No default was changed. Evidence: `window-abba.json` and `measure-window.py`.
+
+New durable instrument: `scripts/dtrace/hvpatch-exec-startup-census.d`. This samples logical host CPU placement and counts EL0 fault classes plus exec/COW lifecycle populations, with natural-exit and error checks. It does not mistake a repeated VA in another MM for a repeated page. These are diagnostic counts, not traced performance timings.
+
+The first capture (`startup-census.raw`, 300 child spawns) records 301 balanced execs, 1,032 CPU samples, 167,082 faults, zero errors and no bound hit. The saved `host-cpu-topology.txt` identifies logical CPUs 0–5 as E and 6–9 as P; 1,014/1,032 samples (98.3%) are on P cores. E-core placement is therefore not the main explanation. Every fault is in the mmap VA region. The amortized fault population is approximately 557 per child spawn, including the parent's fixed startup.
+
+The expanded capture (`startup-cow-census.raw`, 100 child spawns) records 101 balanced execs, 56,479 faults, natural success and zero errors:
+
+- 23,944 translation faults (23,336 writes, 608 reads).
+- 32,535 write permission faults.
+- Exactly 32,535 permission-triggered COW transactions, each with stage-2, stage-1 and commit records. They are real COW transactions, not merely stale fault retries.
+
+`startup-provenance.json` binds the final instrument and signed binary hashes. The corresponding `.out`/`.err` files retain the successful trace invocations. Scoped cleanup was verified.
+
+Source fences for the next change: `FirstTouchArming` and `resident_fault_plan` in runtime `dispatch/mem.rs` deliberately observe anonymous page residency one Linux page at a time. `ensure_sparse_mmap_backing_censused` in HVF `trap.rs` can materialize a wider physical window but limits its pending publication receipt to the requested range. Separately, `materialize_private_file_backing` arms file views for page-granular COW so still-clean neighbouring Linux pages keep tracking file writes. A Darwin MAP_PRIVATE snapshot is explicitly not a substitute for that contract. Attribute file-page versus fork COW and per-fault cost next; do not equate a wider physical allocation with permission to mark neighbouring pages dirty/resident.
+
+The <=2x performance objective remains active. The two full ecosystem workload comparisons and final integrated-artifact acceptance are still pending.
