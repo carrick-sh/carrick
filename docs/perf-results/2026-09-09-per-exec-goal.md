@@ -71,3 +71,59 @@ The expanded capture (`startup-cow-census.raw`, 100 child spawns) records 101 ba
 Source fences for the next change: `FirstTouchArming` and `resident_fault_plan` in runtime `dispatch/mem.rs` deliberately observe anonymous page residency one Linux page at a time. `ensure_sparse_mmap_backing_censused` in HVF `trap.rs` can materialize a wider physical window but limits its pending publication receipt to the requested range. Separately, `materialize_private_file_backing` arms file views for page-granular COW so still-clean neighbouring Linux pages keep tracking file writes. A Darwin MAP_PRIVATE snapshot is explicitly not a substitute for that contract. Attribute file-page versus fork COW and per-fault cost next; do not equate a wider physical allocation with permission to mark neighbouring pages dirty/resident.
 
 The <=2x performance objective remains active. The two full ecosystem workload comparisons and final integrated-artifact acceptance are still pending.
+
+## COW attribution and instrument correction
+
+The census now verifies the target's `syscall::exit` status, in addition to
+natural process exit. The original script could accept a guest that exited
+nonzero. `cow-maps.raw` is explicitly invalid (a guest Python quoting error),
+and `cow-profile.raw` is invalid (zero sampled COW windows). Earlier successful
+census populations are diagnostic observations, not a qualified target-status
+gate. Final negative controls `sampling-negative.raw` and
+`census-negative-final.raw` both record guest exit 23 and make the trace command
+fail. The final positive captures below require and record exit zero.
+
+`cow-maps-valid.raw` records two successful execs. The child's maps place the
+large writable libpython mapping at `6000500000-600065e000`; most of the child's
+322 committed COWs fall there. The parent's 335 COWs are reported separately.
+This identifies interpreter startup writes to private file pages as a large
+population, rather than assuming these are parent-after-fork copies.
+
+The expanded census uses `[pid, tid]` for interrupted-thread COW windows;
+`self->` state yielded zero profile joins on this host. `cow-kernel.raw` records
+301 balanced execs, 167,082 faults and 96,935 balanced COW windows, zero errors,
+no bound hit and target exit zero. Its sampled kernel stacks mostly return to
+armed fault/COW probe functions: the four leading resolved probe return sites
+alone account for 330 samples. They are instrument overhead, **not evidence of
+an expensive HVF operation**. Installed KDKs do not match host build 26A5425a;
+no kernel symbol names are inferred from those mismatched images.
+
+The complementary `scripts/dtrace/hvpatch-exec-cpu-sampling.d` uses only 499 Hz
+user/kernel stacks and target/error checks, without high-rate USDT probes.
+`sampling-final.raw` completes 500 child spawns with target exit zero, zero
+errors and no bound hit: 2,043 user and 2,493 kernel samples. Counts use DTrace
+aggregations rather than a racy shared increment. Offline PIE load-base
+qualification matches all 1,309 unique Carrick return sites to BL/BLR
+instructions (load base `0x1027a0000`), using the identical code in the preserved
+`carrick-scan` artifact. Inclusive user-stack counts include:
+
+- `perform_frame_cow`: 471/2,043 (23.1%).
+- Detached address-space retirement: 307/2,043 (15.0%).
+- `resolve_mutating_fault`: 169/2,043 (8.3%).
+- Within those paths, `retire_process_aliases` has 108 samples,
+  `commit_cow_inventory_split` 52, `physical_cow_source_in` 51 and
+  `cow_inventory_split_shape` 41. These nested counts must not be added to
+  their parents.
+
+This is a ranking, not a promise of recoverable wall time; unresolved kernel
+stacks remain unattributed. Source inspection finds full extent iteration in
+`cow_inventory_split_shape` and a scope-wide alias scan in
+`physical_cow_source_in`, but neither should be rewritten without preserving
+all overlapping/retained mapping and owner-generation cases and measuring a
+paired untraced improvement. Physical 16 KiB copy size alone does not authorize
+marking neighbouring Linux 4 KiB pages dirty.
+
+`cow-sampling-provenance.json` binds the scripts and signed runtime artifact;
+`sampling-final.symbols.json` retains every resolved user stack. No production
+code changed in this diagnostic checkpoint. The performance goal, full ecosystem
+comparisons and final integrated-artifact gates remain open.
