@@ -6,7 +6,7 @@
     "slot_description_mutation": 21,
     "read_attempt": 13,
     "write_attempt": 21,
-    "lifecycle": 38,
+    "lifecycle": 37,
     "stream_transfer": 11,
     "mapping_ring": 12,
     "epoll_wait": 33
@@ -1838,17 +1838,6 @@
       "text": ".concrete_backing::<IoUringBacking>()",
       "scope_kind": "test_or_definition",
       "enclosing_function": "exec_survivor_keeps_description_but_new_mm_has_no_attachments",
-      "migration_family": "lifecycle"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3060,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "snapshot_private_mmap_file",
       "migration_family": "lifecycle"
     },
     {

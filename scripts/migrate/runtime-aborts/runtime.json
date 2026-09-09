@@ -1691,6 +1691,24 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "<MappedFileReference as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "08114e6865c622dffcf2ec85d7fdcfeb1ee632ce15c31b28daf986a9edaeba73",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_description_refs",
+      "rationale": "Mapped backing reference count underflow after the final Arc lease drops; indicates double release or corrupted lifetime accounting and cannot safely release the backing."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "function": "FileDescription::retain_mapping",
+      "ordinal_in_function": 1,
+      "fingerprint": "357c66f7b821dcd17aeb8d1da10eddf61e2df0f84fd1887c3ed88861dc1a2ed8",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_description_refs",
+      "rationale": "Mapped backing reference count overflow while retaining an internal allocated lease; a representable live lease population cannot reach this count, so wrapping would indicate corrupted lifetime accounting."
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
       "function": "FileTable::mutation_lease",
       "ordinal_in_function": 1,
       "fingerprint": "21f4fa35faade52a8c778eed4a20173d72d9601da29b9e326fcc8039cc056405",

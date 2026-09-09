@@ -990,8 +990,8 @@ impl DirListing {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(super) enum OpenDescription {
-    /// Observable identity shell retained after the last functional fd slot
-    /// closes. All host descriptors and subsystem resources have already been
+    /// Observable identity shell retained after the last fd slot and mapping
+    /// reference close. All host descriptors and subsystem resources have already been
     /// dropped; only immutable snapshot classification remains.
     Closed { was_epoll: bool },
     File {
@@ -2084,7 +2084,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
     }
 
     fn on_last_fd_ref(&self) {
-        let mut description = self.write();
+        let description = self.read();
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
                 let mut state = pipe.state.lock();
@@ -2102,6 +2102,10 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             }
             _ => {}
         }
+    }
+
+    fn on_last_resource_ref(&self) {
+        let mut description = self.write();
         let was_epoll = matches!(&*description, OpenDescription::Epoll { .. });
         *description = OpenDescription::Closed { was_epoll };
     }
@@ -2683,6 +2687,57 @@ mod tests {
 
     const SYS_READ: u64 = 63;
     const SYS_FTRUNCATE: u64 = 46;
+
+    #[test]
+    fn mapped_file_reference_survives_last_fd_and_releases_last_fragment() {
+        let backing = Arc::new(RwLock::new(OpenDescription::InMemoryFile {
+            base: OpenDescriptionBase::new(0),
+            path: "/mapped".into(),
+            contents: Arc::new(RwLock::new(vec![42])),
+            offset: 0,
+            writable: true,
+            max_size: 4096,
+        }));
+        let description = kernel_file_description(Arc::clone(&backing), 0);
+        description.retain_fd_ref();
+        let mapping = description.retain_mapping().unwrap();
+        let fragment = Arc::clone(&mapping);
+        description.release_fd_ref();
+        assert_eq!(description.fd_ref_count(), 0);
+        assert!(description.retain_mapping().is_none());
+        assert!(matches!(
+            &*backing.read(),
+            OpenDescription::InMemoryFile { .. }
+        ));
+        drop(mapping);
+        assert!(matches!(
+            &*backing.read(),
+            OpenDescription::InMemoryFile { .. }
+        ));
+        drop(fragment);
+        assert!(matches!(&*backing.read(), OpenDescription::Closed { .. }));
+    }
+
+    #[test]
+    fn mapped_file_reference_release_does_not_close_a_live_fd() {
+        let backing = Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+            base: OpenDescriptionBase::new(0),
+            path: "/mapped".into(),
+            contents: vec![42],
+            offset: 0,
+        }));
+        let description = kernel_file_description(Arc::clone(&backing), 0);
+        description.retain_fd_ref();
+        let mapping = description.retain_mapping().unwrap();
+        drop(mapping);
+        assert_eq!(description.fd_ref_count(), 1);
+        assert!(matches!(
+            &*backing.read(),
+            OpenDescription::SyntheticFile { .. }
+        ));
+        description.release_fd_ref();
+        assert!(matches!(&*backing.read(), OpenDescription::Closed { .. }));
+    }
 
     #[test]
     fn fd_table_host_backed_pread_failure_surfaces_errno_in_read() {

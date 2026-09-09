@@ -855,6 +855,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                 read_only_shared_file: false,
                 secretmem: false,
                 writable_memfd: None,
+                private_file: None,
                 shared_file_alias: None,
                 }));
             });

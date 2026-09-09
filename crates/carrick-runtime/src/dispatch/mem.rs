@@ -1156,6 +1156,9 @@ pub(crate) struct MemState {
     /// tail past EOF is SIGBUS, not zeroes). Same shape and lifetime rules as
     /// `writable_memfd_maps`: trimmed by range whenever a mapping goes away.
     shared_file_alias_maps: Vec<SharedFileAliasEntry>,
+    /// File identity retained by private mmap, independent of descriptor lifetime
+    /// and pathname replacement. Discard must return to this original source.
+    private_file_maps: Vec<PrivateFileMapEntry>,
     /// VA ranges of live MAP_SHARED mappings backed by a `memfd_secret(2)` fd.
     /// Secret memory is hidden from the kernel's own view of the process, so
     /// `/proc/<pid>/mem` reads that touch one of these ranges fail EIO
@@ -1219,6 +1222,7 @@ impl MemState {
             write_sealed_shared_maps: Vec::new(),
             writable_memfd_maps: Vec::new(),
             shared_file_alias_maps: Vec::new(),
+            private_file_maps: Vec::new(),
             secretmem_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
             core_file_mappings: Vec::new(),
@@ -2354,6 +2358,7 @@ struct MremapMappingMetadata {
     file_page_offset: Option<u64>,
     droppable: bool,
     fork_semantics: MremapForkSemantics,
+    private_file: Option<PrivateFileMapEntry>,
 }
 
 struct DynamicMappingSemantics {
@@ -2386,6 +2391,7 @@ fn proc_maps_entry_mremap_metadata(
         file_page_offset,
         droppable: fork_semantics.any_droppable(),
         fork_semantics,
+        private_file: None,
     }
 }
 
@@ -2415,6 +2421,69 @@ pub(crate) struct HostAliasMmapCommit {
     /// `mremap` can still find the file after the guest closes its own fd,
     /// paired with the extent base IPA and file offset.
     pub(super) shared_file_alias: Option<SharedFileAliasCommit>,
+    pub(super) private_file: Option<PrivateFileMapEntry>,
+}
+
+#[derive(Clone)]
+pub(super) struct PrivateFileMapEntry {
+    start: u64,
+    end: u64,
+    offset: u64,
+    description: Arc<crate::kernel::objects::MappedFileReference>,
+}
+
+impl std::fmt::Debug for PrivateFileMapEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateFileMapEntry")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("offset", &self.offset)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PrivateFileMapEntry {
+    fn for_mapping(
+        description: &Option<Arc<crate::kernel::objects::MappedFileReference>>,
+        start: u64,
+        len: u64,
+        offset: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            start,
+            end: start.checked_add(len)?,
+            offset,
+            description: Arc::clone(description.as_ref()?),
+        })
+    }
+
+    fn clip(&self, start: u64, end: u64) -> Option<Self> {
+        let start = self.start.max(start);
+        let end = self.end.min(end);
+        if start >= end {
+            return None;
+        }
+        Some(Self {
+            start,
+            end,
+            offset: self.offset.checked_add(start - self.start)?,
+            description: Arc::clone(&self.description),
+        })
+    }
+}
+
+fn trim_private_file_maps(maps: &mut Vec<PrivateFileMapEntry>, start: u64, len: u64) {
+    let end = start.saturating_add(len);
+    let mut retained = Vec::with_capacity(maps.len() + 1);
+    for entry in maps.drain(..) {
+        if entry.end <= start || entry.start >= end {
+            retained.push(entry);
+        } else {
+            retained.extend(entry.clip(entry.start, start));
+            retained.extend(entry.clip(end, entry.end));
+        }
+    }
+    *maps = retained;
 }
 
 #[derive(Clone)]
@@ -2678,6 +2747,7 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     trim_ranges_for_range(&mut mem.bus_fault_ranges, start, len);
     trim_writable_memfd_maps_for_range(&mut mem.writable_memfd_maps, start, len);
     trim_shared_file_alias_maps_for_range(&mut mem.shared_file_alias_maps, start, len);
+    trim_private_file_maps(&mut mem.private_file_maps, start, len);
     trim_remap_snapshots_for_range(&mut mem.remap_snapshots, start, len);
     let Some(remove) =
         crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
@@ -2870,6 +2940,7 @@ struct MadviseCoveredSegment {
     start: u64,
     end: u64,
     prot: LinuxProtFlags,
+    provenance: VmaBackingProvenance,
 }
 
 /// Owns alias exclusion from grow-down fault lookup through backend protection
@@ -2995,6 +3066,9 @@ impl SyscallDispatcher {
                 row_file_offset: shared_alias.row_file_offset,
             });
         }
+        if let Some(source) = commit.private_file {
+            mem.private_file_maps.push(source);
+        }
         if let Some(file_page_offset) = commit.file_page_offset
             && !commit.path.is_empty()
         {
@@ -3051,13 +3125,22 @@ impl SyscallDispatcher {
         offset: u64,
         length: usize,
     ) -> Result<PrivateMmapSnapshot, LinuxErrno> {
-        let mut bytes = vec![0; length];
-        let length_u64 = u64::try_from(length).map_err(|_| linux_errno::EOVERFLOW)?;
-        let page_size = self.linux_page_size();
         let Some(open_file) = self.open_file(fd.0) else {
             return Err(LINUX_EBADF);
         };
-        let Some(open) = open_file.description.read() else {
+        self.snapshot_private_mmap_description(&open_file.description, offset, length)
+    }
+
+    fn snapshot_private_mmap_description(
+        &self,
+        description: &crate::kernel::FileDescription,
+        offset: u64,
+        length: usize,
+    ) -> Result<PrivateMmapSnapshot, LinuxErrno> {
+        let mut bytes = vec![0; length];
+        let length_u64 = u64::try_from(length).map_err(|_| linux_errno::EOVERFLOW)?;
+        let page_size = self.linux_page_size();
+        let Some(open) = description.read() else {
             return Err(LINUX_EBADF);
         };
         let offset_usize = usize::try_from(offset).map_err(|_| linux_errno::EOVERFLOW)?;
@@ -3113,6 +3196,113 @@ impl SyscallDispatcher {
         })
     }
 
+    /// Restore mapped file identity, including after fd close or pathname
+    /// replacement. A direct view returns mutable pages to clean-page tracking;
+    /// byte-backed engines use the existing snapshot lowering.
+    fn discard_private_file_segment(
+        &self,
+        memory: &mut impl CurrentMmMemory,
+        segment: &MadviseCoveredSegment,
+    ) -> Result<(), LinuxErrno> {
+        let mut sources: Vec<_> = self
+            .mem()
+            .lock()
+            .private_file_maps
+            .iter()
+            .filter_map(|source| source.clip(segment.start, segment.end))
+            .collect();
+        sources.sort_by_key(|source| source.start);
+        let mut cursor = segment.start;
+        for source in &sources {
+            if source.start != cursor {
+                return Err(LINUX_ENOMEM);
+            }
+            cursor = source.end;
+        }
+        if cursor != segment.end {
+            return Err(LINUX_ENOMEM);
+        }
+        for source in sources {
+            let len = usize::try_from(source.end - source.start).map_err(|_| LINUX_ENOMEM)?;
+            let snapshot = self.snapshot_private_mmap_description(
+                source.description.description(),
+                source.offset,
+                len,
+            )?;
+            let valid_len = usize::try_from(snapshot.bus_fault_offset.unwrap_or(len as u64))
+                .map_err(|_| LINUX_ENOMEM)?;
+            if valid_len != 0 {
+                let direct = {
+                    let open = source.description.description().read().ok_or(LINUX_EBADF)?;
+                    if let Some(fd) = open.shared_alias_host_fd() {
+                        let provenance = match &*open {
+                            OpenDescription::HostFile { host_fd, .. } => {
+                                host_fd.private_file_source()
+                            }
+                            _ => carrick_guest_mem::PrivateFileSource::Mutable,
+                        };
+                        // SAFETY: the description guard retains the owning fd
+                        // throughout this synchronous mapping operation.
+                        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+                        memory
+                            .map_private_file_backed(
+                                source.start,
+                                valid_len,
+                                fd,
+                                source.offset,
+                                provenance,
+                            )
+                            .map_err(|error| {
+                                carrick_observability::probes::mmap_lowering_error(
+                                    source.start,
+                                    valid_len as u64,
+                                    source.offset,
+                                    &error,
+                                );
+                                LINUX_ENOMEM
+                            })?
+                    } else {
+                        false
+                    }
+                };
+                if !direct {
+                    memory
+                        .write_bytes_unchecked(source.start, &snapshot.bytes[..valid_len])
+                        .map_err(|_| LINUX_ENOMEM)?;
+                }
+                memory
+                    .protect_range(source.start, valid_len, segment.prot.bits())
+                    .map_err(|_| LINUX_ENOMEM)?;
+                memory.set_mapping_protection(
+                    source.start,
+                    valid_len,
+                    segment.prot.is_empty(),
+                    !segment.prot.contains(LinuxProtFlags::WRITE),
+                );
+                if let Some(protections) = memory.protections() {
+                    protections.set_bus_fault(source.start, valid_len, false);
+                }
+            }
+            if valid_len < len {
+                let bus_start = source.start + valid_len as u64;
+                memory
+                    .protect_range(bus_start, len - valid_len, 0)
+                    .map_err(|_| LINUX_ENOMEM)?;
+                if let Some(protections) = memory.protections() {
+                    protections.set_bus_fault(bus_start, len - valid_len, true);
+                }
+            }
+            let authority = self.mem();
+            let mut mem = authority.lock();
+            trim_ranges_for_range(&mut mem.bus_fault_ranges, source.start, len as u64);
+            if valid_len < len {
+                mem.bus_fault_ranges
+                    .push((source.start + valid_len as u64, (len - valid_len) as u64));
+            }
+        }
+        Ok(())
+    }
+
     /// Derive `madvise` range validity + properties from carrick's mapping
     /// metadata (`semantic_vmas`), never by probing a page.
     fn madvise_range_meta(&self, start: u64, end: u64) -> MadviseRangeMeta {
@@ -3142,13 +3332,18 @@ impl SyscallDispatcher {
                         | (u64::from(vma.execute) * carrick_abi::LINUX_PROT_EXEC),
                 );
                 match covered.last_mut() {
-                    Some(last) if last.end == covered_to && last.prot == prot => {
+                    Some(last)
+                        if last.end == covered_to
+                            && last.prot == prot
+                            && last.provenance == vma.provenance =>
+                    {
                         last.end = segment_end;
                     }
                     _ => covered.push(MadviseCoveredSegment {
                         start: covered_to,
                         end: segment_end,
                         prot,
+                        provenance: vma.provenance,
                     }),
                 }
                 if !vma.write {
@@ -3569,6 +3764,16 @@ impl SyscallDispatcher {
                 semantic_vmas: Some(semantic_vmas),
             },
         );
+        if let Some(source) = &source.private_file
+            && let Some(entry) = PrivateFileMapEntry::for_mapping(
+                &Some(Arc::clone(&source.description)),
+                start,
+                len,
+                source.offset,
+            )
+        {
+            self.mem().lock().private_file_maps.push(entry);
+        }
     }
 
     /// Whether one committed host-alias extent fully backs this guest-VA range.
@@ -3623,13 +3828,47 @@ impl SyscallDispatcher {
         let mem = mem_authority_5.lock();
         let fork_semantics =
             MremapForkSemantics::capture(&mem.semantic_vmas, start, len).ok_or(LINUX_EFAULT)?;
+        let private_file = mem
+            .private_file_maps
+            .iter()
+            .find(|source| source.start <= start && end <= source.end)
+            .and_then(|source| source.clip(start, end));
         let mut overlapping_dynamic = mem
             .dynamic_maps
             .iter()
             .filter(|map| map.start < end && map.end > start);
         if let Some(first) = overlapping_dynamic.next() {
+            let mut mapping = first.clone();
             if first.start > start || first.end < end || overlapping_dynamic.next().is_some() {
-                return Err(LINUX_EFAULT);
+                // mprotect may split the proc-map projection and later restore
+                // one canonical VMA. Join only fragments of the same retained
+                // private-file source with identical permissions and no holes.
+                // Independent mappings or mixed semantic VMAs remain refused.
+                if private_file.is_none() || fork_semantics.vmas.len() != 1 {
+                    return Err(LINUX_EFAULT);
+                }
+                let mut cursor = start;
+                for row in mem
+                    .dynamic_maps
+                    .iter()
+                    .filter(|row| row.start < end && row.end > start)
+                {
+                    if row.start > cursor
+                        || row.read != first.read
+                        || row.write != first.write
+                        || row.execute != first.execute
+                        || row.sharing != first.sharing
+                        || row.path != first.path
+                    {
+                        return Err(LINUX_EFAULT);
+                    }
+                    cursor = row.end.min(end);
+                }
+                if cursor != end {
+                    return Err(LINUX_EFAULT);
+                }
+                mapping.start = start;
+                mapping.end = end;
             }
             let file_page_offset = mem
                 .core_file_mappings
@@ -3640,11 +3879,10 @@ impl SyscallDispatcher {
                         + (start - mapping.start) / crate::core_dump::GUEST_PAGE as u64
                 })
                 .or_else(|| fork_semantics.vmas.first().and_then(|v| v.file_page_offset));
-            return Ok(proc_maps_entry_mremap_metadata(
-                first,
-                file_page_offset,
-                fork_semantics,
-            ));
+            let mut metadata =
+                proc_maps_entry_mremap_metadata(&mapping, file_page_offset, fork_semantics);
+            metadata.private_file = private_file;
+            return Ok(metadata);
         }
 
         // Complete mapping metadata is authoritative over the retained boot
@@ -4507,6 +4745,13 @@ impl SyscallDispatcher {
                     LINUX_EINVAL,
                 ));
             };
+            let private_file_description = if map_sharing == MmapSharing::Private
+                && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+            {
+                this.open_file(fd.0).and_then(|open| open.description.retain_mapping())
+            } else {
+                None
+            };
             let length = match align_up_u64(length, page_size) {
                 Some(length) => length,
                 None => {
@@ -4636,6 +4881,7 @@ impl SyscallDispatcher {
                         read_only_shared_file: false,
                         secretmem: false,
                         writable_memfd: None,
+                        private_file: None,
                         shared_file_alias: None,
                     },
                     mapping,
@@ -4981,6 +5227,9 @@ impl SyscallDispatcher {
                     read_only_shared_file: false,
                     secretmem: false,
                     writable_memfd: None,
+                    private_file: PrivateFileMapEntry::for_mapping(
+                        &private_file_description, requested.0, length, offset,
+                    ),
                     shared_file_alias: None,
                 });
                 return Ok(DispatchOutcome::Returned {
@@ -5197,6 +5446,7 @@ impl SyscallDispatcher {
                             read_only_shared_file: mmap_read_only_shared_file,
                             secretmem: false,
                             writable_memfd: alias_writable_memfd,
+                            private_file: None,
                             shared_file_alias: alias_description.map(|description| {
                                 SharedFileAliasCommit {
                                     description,
@@ -5974,6 +6224,9 @@ impl SyscallDispatcher {
                         read_only_shared_file: mmap_read_only_shared_file,
                         secretmem: secretmem_backed,
                         writable_memfd: writable_memfd_desc,
+                        private_file: PrivateFileMapEntry::for_mapping(
+                            &private_file_description, address, length, offset,
+                        ),
                         shared_file_alias: None,
                     },
                 ));
@@ -6254,6 +6507,11 @@ impl SyscallDispatcher {
                     semantic_vmas: None,
                 },
             );
+            if let Some(source) = PrivateFileMapEntry::for_mapping(
+                &private_file_description, address, length, offset,
+            ) {
+                this.mem().lock().private_file_maps.push(source);
+            }
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned {
                 value: address as i64,
@@ -6828,6 +7086,7 @@ impl SyscallDispatcher {
                             read_only_shared_file,
                             secretmem: false,
                             writable_memfd: None,
+                            private_file: None,
                             shared_file_alias: Some(SharedFileAliasCommit {
                                 description,
                                 extent_base: Gpa(ipa.saturating_sub(file_offset)),
@@ -8128,6 +8387,7 @@ impl SyscallDispatcher {
                             read_only_shared_file: false,
                             secretmem: false,
                             writable_memfd: None,
+                            private_file: None,
                             shared_file_alias: None,
                         }));
                     return Ok(DispatchOutcome::MapHostAlias {
@@ -8414,6 +8674,13 @@ impl SyscallDispatcher {
                         let Ok(segment_len) = usize::try_from(segment.end - segment.start) else {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                         };
+                        if segment.provenance == VmaBackingProvenance::PrivateFile {
+                            this.mark_vma_dispatch(&mut host_alias_dispatch);
+                            if let Err(errno) = this.discard_private_file_segment(cx.memory, segment) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            continue;
+                        }
                         if meta.writable && !meta.shared {
                             if cx.memory.zero_backing(segment.start, segment_len).is_err() {
                                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));

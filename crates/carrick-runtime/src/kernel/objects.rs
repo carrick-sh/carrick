@@ -709,6 +709,9 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
 
     fn on_last_fd_ref(&self) {}
 
+    /// Release backing resources after both fd slots and mappings are gone.
+    fn on_last_resource_ref(&self) {}
+
     fn set_pipe_capacity_from_authority(
         &self,
         capacity: i64,
@@ -1187,12 +1190,46 @@ impl DescriptionCommon {
     }
 }
 
+#[derive(Debug, Default)]
+struct DescriptionLifecycle {
+    mapping_refs: usize,
+}
+
+/// Keeps a mapped file's backing alive without retaining a logical fd slot.
+/// Fragments and forked mappings may share this reference through an Arc.
+#[derive(Debug)]
+pub(crate) struct MappedFileReference {
+    description: Arc<FileDescription>,
+}
+
+impl MappedFileReference {
+    pub(crate) fn description(&self) -> &FileDescription {
+        &self.description
+    }
+}
+
+impl Drop for MappedFileReference {
+    fn drop(&mut self) {
+        let mut lifecycle = self.description.lifecycle_transition.lock();
+        lifecycle.mapping_refs = lifecycle.mapping_refs.checked_sub(1).unwrap_or_else(|| {
+            tracing::error!("mapped file reference count underflow");
+            std::process::abort();
+        });
+        if lifecycle.mapping_refs == 0 && self.description.common.fd_refs() == 0 {
+            if let FileDescriptionKind::Concrete(backing) = &self.description.kind {
+                backing.0.on_last_resource_ref();
+            }
+        }
+        self.description.revision.publish();
+    }
+}
+
 #[derive(Debug)]
 pub struct FileDescription {
     id: FileDescriptionId,
     kind: FileDescriptionKind,
     common: Arc<DescriptionCommon>,
-    lifecycle_transition: Mutex<()>,
+    lifecycle_transition: Mutex<DescriptionLifecycle>,
     epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
 }
@@ -1213,7 +1250,7 @@ impl FileDescription {
             id: super::ids::allocate_file_description_id()?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
             common,
-            lifecycle_transition: Mutex::new(()),
+            lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         })
@@ -1243,7 +1280,7 @@ impl FileDescription {
             id: super::ids::restore_file_description_id(stable_id)?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
             common,
-            lifecycle_transition: Mutex::new(()),
+            lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         })
@@ -1270,7 +1307,7 @@ impl FileDescription {
             id,
             kind: FileDescriptionKind::Regular,
             common: Arc::new(DescriptionCommon::new(0)),
-            lifecycle_transition: Mutex::new(()),
+            lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
@@ -1281,7 +1318,7 @@ impl FileDescription {
             id,
             kind: FileDescriptionKind::Epoll(Mutex::new(BTreeMap::new())),
             common: Arc::new(DescriptionCommon::new(0)),
-            lifecycle_transition: Mutex::new(()),
+            lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
         }
@@ -1437,14 +1474,33 @@ impl FileDescription {
     }
 
     pub(crate) fn release_fd_ref(&self) {
-        let _guard = self.lifecycle_transition.lock();
+        let lifecycle = self.lifecycle_transition.lock();
         let count = self.common.release_fd_ref();
         if count == 0 {
             if let FileDescriptionKind::Concrete(backing) = &self.kind {
                 backing.0.on_last_fd_ref();
+                if lifecycle.mapping_refs == 0 {
+                    backing.0.on_last_resource_ref();
+                }
             }
         }
         self.revision.publish();
+    }
+
+    /// Acquire while an fd still owns the backing, serialized with final close.
+    pub(crate) fn retain_mapping(self: &Arc<Self>) -> Option<Arc<MappedFileReference>> {
+        let mut lifecycle = self.lifecycle_transition.lock();
+        if self.common.fd_refs() == 0 {
+            return None;
+        }
+        lifecycle.mapping_refs = lifecycle.mapping_refs.checked_add(1).unwrap_or_else(|| {
+            tracing::error!("mapped file reference count overflow");
+            std::process::abort();
+        });
+        self.revision.publish();
+        Some(Arc::new(MappedFileReference {
+            description: Arc::clone(self),
+        }))
     }
 
     pub(crate) fn fd_ref_count(&self) -> usize {
