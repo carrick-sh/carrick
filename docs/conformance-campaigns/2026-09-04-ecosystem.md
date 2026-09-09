@@ -3403,3 +3403,50 @@ follow-up and needs a Docker phase with no carrick guest alive.
 **A brief defect worth recording:** the exec-cost lane died waiting on a
 "host is quiet" gate that its four sibling lanes made unreachable. A quiet
 gate belongs to the director's measurement, never to a worker's inner loop.
+
+### 2026-09-08 22:20 — full-matrix state, and the receipt bug it found
+
+Pushed `b82dd2b7c..cf3995bb2` to `origin/main` (273 + 2 commits) behind a
+green gate: probes 876/876 with 0 DIFF, clippy/build/test/lint 0, gobuild
+reducer 8/8 with no fatal lines.
+
+**Full tier, 2,127 rows, committed oracle, 8 workers (`state-raw.log`):
+2,067 MATCH (97.2%)**, 28 TIMEOUT, 13 REGRESSION, 11 DIFF, 7 NEW, 1
+CARRICK_CRASH. Two readings that matter before anyone quotes those numbers:
+- **Most TIMEOUTs are the budget, not a hang.** The harness gives a row
+  `2x oracle + 2s`, so every row slower than ~2x times out by construction.
+  The timeout list is therefore mostly a readout of the goal's own gap
+  (compile, tarfile, subprocess, importlib, go_types, net_http) — all of
+  which MATCHed at `--workers 1` twenty minutes earlier.
+- **Several REGRESSIONs are the ORACLE failing**, the documented inversion:
+  `semctl06` carrick 1/1 vs oracle 0/7, `select02` 14/14 vs 6/14,
+  `syslog12` Success vs 1/6.
+
+**A first attempt at this run was NOT a bless and was discarded.** `just
+conformance full --refresh-oracle` screens with `fast-timeout=5s` at 8
+workers; every long row hit that budget, and the fresh Docker pass rewrote
+`oracle-cache.jsonl` with a starved oracle (the inversions above, at 8
+concurrent containers). The rewrite was reverted with `git checkout` —
+committing it would have poisoned every future gate. Kept as
+`target/perf/bless-screening-5s.log`. A second attempt with
+`--carrick-fast-timeout-s 900 --workers 4` was worse and was killed: with
+`--refresh-oracle` there are no cached oracle times, so the adaptive
+`2x oracle + 2s` budget is unavailable and EVERY row falls back to that flat
+900 s. **Rule: refreshing the oracle disables the adaptive per-row budget.**
+
+**The crash was a real bug, fixed in `8fa02b214`.** `go-net` died with
+"fatal error: runtime: cannot allocate memory" from
+`runtime.persistentalloc1`. Not host exhaustion: carrick refused the mapping
+— `deferred COW protection authentication failed at VA 0x6047c96000:
+leaf=0x0 translated=None ... receipt=0x6047c96000+0x1000`. A deferred-COW
+receipt had outlived the leaves it described. `supersede_cow_receipts` states
+that every stage-1 repointer voids the promises naming its range first;
+`unregister_process_alias` repoints leaves and publishes nothing, and was the
+one repointer that never called it. Same shape its own comment records from
+CPython's thread stacks, through a different door. Red-first at the contract
+level (`an_unmap_supersedes_the_cow_receipts_naming_its_range_first`, which
+took two corrections before it was honest: it first searched past the end of
+the function, then matched its own string literal — `rsplit_once`, as the
+neighbouring source-shape test already knew). **The crash itself did not
+reproduce in 3 interleaved runs per binary**, so it is committed as the
+contract repair it is, not as a demonstrated fix for that crash.
