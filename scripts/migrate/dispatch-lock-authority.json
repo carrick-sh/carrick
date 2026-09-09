@@ -103,7 +103,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4410,
+      "line": 4493,
       "item": "T::membarrier",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -112,7 +112,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#2",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4414,
+      "line": 4497,
       "item": "T::membarrier",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -121,7 +121,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#3",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4420,
+      "line": 4503,
       "item": "T::membarrier",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -130,7 +130,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mem.rs::SyscallDispatcher::mmap::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5030,
+      "line": 5113,
       "item": "SyscallDispatcher::mmap",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -139,7 +139,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::DispatchOutcome::bind_hvpatch_process_exact::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5223,
+      "line": 5224,
       "item": "DispatchOutcome::bind_hvpatch_process_exact",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -148,7 +148,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::R::hvpatch_process::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5454,
+      "line": 5455,
       "item": "R::hvpatch_process",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -157,7 +157,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::SnapshotError::fork_clone_with_prepared_mm_authorized_observed::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5715,
+      "line": 5716,
       "item": "SnapshotError::fork_clone_with_prepared_mm_authorized_observed",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -166,7 +166,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::SnapshotError::event_ring_guest_pid::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5832,
+      "line": 5833,
       "item": "SnapshotError::event_ring_guest_pid",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -175,7 +175,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::String::core_process_snapshot::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6787,
+      "line": 6792,
       "item": "String::core_process_snapshot",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -184,7 +184,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::String::set_executable_path::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7249,
+      "line": 7254,
       "item": "String::set_executable_path",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -193,7 +193,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::String::enter_binfmt::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7264,
+      "line": 7269,
       "item": "String::enter_binfmt",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -202,7 +202,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::String::set_native_x86_64::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7361,
+      "line": 7366,
       "item": "String::set_native_x86_64",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -211,7 +211,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::u8::set_executable_identity::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7385,
+      "line": 7390,
       "item": "u8::set_executable_identity",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -220,7 +220,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::u8::current_exec_env::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7399,
+      "line": 7404,
       "item": "u8::current_exec_env",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -229,7 +229,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::E::close_open_file_and_free_pty::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7787,
+      "line": 7792,
       "item": "E::close_open_file_and_free_pty",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -238,7 +238,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::E::register_controlling_pty::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7985,
+      "line": 7990,
       "item": "E::register_controlling_pty",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -247,7 +247,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::E::initialize_controlling_tty_for::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7990,
+      "line": 7995,
       "item": "E::initialize_controlling_tty_for",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -256,7 +256,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::SyntheticProcContext::synthetic_proc_context_observed::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 10983,
+      "line": 10988,
       "item": "SyntheticProcContext::synthetic_proc_context_observed",
       "category": "proc",
       "expression": ".proc.lock()",
