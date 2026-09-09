@@ -313,7 +313,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 3,
-      "fingerprint": "fd8b9f349cea114fc193920096aa29bea2a93db8d7b18f2c813682a830eb55e7",
+      "fingerprint": "f21a5460c3fdfbcf0c78737446fccd155a79cf8ac62a697fecf5db1ae6c51985",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Stage-1 TLB invalidation failed during frame COW rollback, leaving hardware TLBs with inconsistent stage-1 translations. Re-reviewed 2026-08-31: unchanged abort, re-attributed from HvfVmState to HvfTaskState (the enclosing impl the discovery walks) and re-fingerprinted after the per-fault armed-range clone was removed."
