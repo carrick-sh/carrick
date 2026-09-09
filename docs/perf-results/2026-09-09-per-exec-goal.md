@@ -487,3 +487,96 @@ two ignored (`dirent-runtime-final.log`). The dirent change is committed as
 pre-existing misleading dup/offset comments. The code and tests remain the
 validated implementation. Line-pinned inventories and final integrated artifact
 receipts remain pending; this commit is not <=2x acceptance.
+
+### COW invalidation experiment in implementation
+
+Inventory positions were reconciled and reviewed in `dc089daab`; the following
+`just lint-domains` passed (`dirent-lint-domains.log`). That closes the dirent
+inventory follow-up, not the final goal's future integrated-artifact gate.
+
+The invalidation candidate is now implemented but unmeasured. A private-field
+`LeafInvalidationRange` is minted only from the open page-table undo journal:
+all edited words must be existing non-global L3 leaves inside a <=16 KiB
+aligned-page span, with only PA/AP changes, no contiguous hint in either old or
+new descriptor, and unchanged arena/allocation state. Empty or missing journals,
+outside edits, parent splits, global/invalid transitions and overflow refuse the
+proof. The backend computes it under the COW locks before journal discard and
+passes it through the fault-specific callback. Rollback, winner retries,
+kernel-only and non-fault COW retain full-ASID maintenance.
+
+The EL1 loop uses DSB, VAE1IS per page, DSB, ISB and HVC completion, retaining the
+existing carrier-root checks and restoring the additional X1 scratch register.
+`leaf-maint.s` / `.o` independently qualify all eight opcode words with clang;
+the branch returns to the TLBI instruction. Proof tests were red first (two
+positive assertions failed with the conservative None stub after correcting a
+test's unmapped block setup). Then all 196 memory tests, 49 AArch64 tests, and
+471 serial HVF host tests passed (three HVF tests ignored). A signed CLI build
+is in progress. No guest correctness or performance result is claimed yet.
+
+Pre-measurement prediction: retaining unrelated translations should improve
+normal Python spawn materially, targeting at least 5% (~0.7 ms) to justify this
+additional mechanism. Refutation: repeated untraced pairs fail to show that
+benefit, controls regress, or exact guest/probe checks fail. In that case revert
+the candidate rather than retain complexity solely for its narrower semantics.
+Use `carrick-current-profile` as the exact saved pre-invalidation code artifact;
+the dirent source changes since it was linked were comment-only. Final oracle
+and all broader final acceptance requirements remain active.
+
+### COW invalidation hypothesis tested and candidate discarded
+
+Two untraced ABBA comparisons did not meet the predeclared benefit threshold:
+
+| Experiment | Command | Base mean ms | Candidate mean ms |
+|---|---|---:|---:|
+| Initial | true | 2.0772 | 2.1160 |
+| Initial | Python -S | 12.4938 | 12.5154 |
+| Initial | Python | 13.8482 | 13.9149 |
+| Explicit scope probe present but unarmed | true | 1.9934 | 1.9857 |
+| Explicit scope probe present but unarmed | Python -S | 12.0954 | 12.3925 |
+| Explicit scope probe present but unarmed | Python | 13.5798 | 13.6497 |
+
+Normal Python worsened about 0.5% in both comparisons; -S worsened 2.46% in
+the second. A private pid-provider entry capture yielded zero events even
+though lifecycle events proved host == target, so it was rejected. An explicit
+USDT scope probe then qualified the mechanism on the second exact artifact:
+`cow-scope-usdt.raw` completed ten children, eleven execs, and 5,185 invalidations
+with target exit zero/errors zero/bound zero: 3,557 single-page invalidations and
+1,628 full-ASID invalidations. Narrowing really was active; this was not merely
+a benchmark of universal fallback. That rejects this implementation as useful
+progress toward the spawn target, not a proof that ASID maintenance costs zero
+or that COW itself is cheap.
+
+The range proof, narrow callback, EL1 loop, and their tests were reverted. The
+complete experimental diff is retained as `cow-invalidation-rejected.patch`.
+`invalidation-abba.json` / `invalidation-scope-abba.json` and their provenance
+files bind the two development artifacts. The first artifact SHA-256 is
+`30fc3d5a7bc2bf7ca01945199be5e222439366053a10623a7fca40e45cea52b6`.
+Only the general scalar `hvpatch-tlb-invalidation` diagnostic remains, reporting
+zero pages for the restored full-ASID routine; its D script fails closed on
+missing events or unsuccessful targets. The unqualified private-ABI attempt is
+recorded in the script header instead of being mistaken for zero usage.
+
+A signed CLI rebuild of the restored runtime plus diagnostic is in progress.
+Until it finishes, `target/release/carrick` is still the rejected candidate;
+saved `carrick-current-profile` remains the pre-experiment runtime. No source
+change from this experiment improves the accepted ratio. Next ranking must
+address COW transaction work or retirement interference, not assume that
+narrowing an architectural invalidation is an end-to-end optimization.
+
+The restored signed build has now completed (`post-invalidation-rebuild.log`).
+`post-invalidation-provenance.json` binds its SHA-256, UUID and source diff.
+`cow-scope-restored.raw` completed five children with 2,942 full-ASID selections
+and no local selections; target exit/errors/bound were all zero. The negative
+control (`cow-scope-negative.raw`) observed target exit 23 and the trace command
+failed as required. After restoration, all 49 AArch64 and 82 observability unit
+tests passed (`post-invalidation-unit.log`). No candidate proof/type/trampoline
+or narrow callback remains in source; the diagnostic call is disabled unless
+armed. Later final artifact and inventory gates still belong to the eventual
+accepted optimization checkpoint.
+
+Next evidence question: how many neighboring private-file 4 KiB COWs each create
+separate 16 KiB physical owners, and how much ownership/retirement work that
+amplifies. Count exact task/mm and source-physical groups before proposing reuse.
+Any reuse must preserve fresh-file visibility of untouched 4 KiB pages, avoid
+overwriting a compound shared with a fork peer, and authenticate current owner
+generations. A smaller physical allocation count alone is not performance proof.

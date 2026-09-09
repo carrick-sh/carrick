@@ -4950,6 +4950,8 @@ mod real {
         /// 4=first-vcpu-run, 5=vm-destroy-begin, 6=vm-destroy-end. (guest-exit has
         /// its own probe between 4 and 5.) Cheap: fires a handful of times per run.
         fn lifecycle(_: u32) {}
+        /// Selected stage-1 invalidation: ASID, start VA, page count (0=full ASID).
+        fn hvpatch__tlb__invalidation(_: u32, _: u64, _: u32) {}
         /// Every Hypervisor.framework VM ownership transition. `operation`:
         /// 0=create-attempt, 1=create-success, 2=destroy-attempt,
         /// 3=destroy-success. `admission` is the backend's admission class for
@@ -6161,6 +6163,10 @@ mod real {
 
     pub fn lifecycle(phase: u32) {
         carrick_usdt::lifecycle!(|| phase);
+    }
+
+    pub fn hvpatch_tlb_invalidation(asid: u32, va: u64, pages: u32) {
+        carrick_usdt::hvpatch__tlb__invalidation!(|| (asid, va, pages));
     }
 
     #[inline(never)]
@@ -8281,6 +8287,7 @@ mod stub {
         result: super::HvpatchCloneTidWriteResult
     ));
     stub!(lifecycle(phase: u32));
+    stub!(hvpatch_tlb_invalidation(asid: u32, va: u64, pages: u32));
     stub!(mmap_lowering_verdict(va: u64, len: u64, offset: u64, outcome: super::MmapLoweringOutcome));
     stub!(mmap_lowering_error(va: u64, len: u64, offset: u64, error: &dyn std::fmt::Display));
     stub!(hvpatch_guest_lifecycle(event: super::HvpatchGuestLifecycle));
