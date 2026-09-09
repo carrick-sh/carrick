@@ -646,3 +646,54 @@ The current accepted measurement remains 13.725 ms versus Docker 4.404 ms
 (3.12x). About 4.92 ms must still be removed to reach 2x on that pair. The
 goal remains active; these diagnostics do not improve that ratio or satisfy
 the eventual final artifact and broad gates.
+
+### Retained source mapping churn tested and discarded
+
+Before attempting destination packing, source inspection found that a retained
+COW source was unmapped and republished even when all its physical coverage
+remained live. The experiment preserved the old MappingId and reference counts
+when fragment coverage equalled the original extent, and avoided fragmenting
+a larger fully retained extent. Reservations then needed only two replacement
+mapping events rather than unmap plus source prepare/publish plus replacement.
+Both local and foreign COW paths used the same change. An explicit exact
+`mapping_is_live` check replaced the old unmap event's source authentication
+before any physical mutation; source and destination ownership remained intact.
+
+The old-mapping identity assertion and the wider retained-extent assertion were
+red first (`retain-source-red.log`, `retain-source-wide-red.log`). With the
+candidate, all 471 HVF host tests passed, three ignored
+(`retain-source-qualified-unit.log`). Two ptrace test doubles initially refused
+the new check because they knew only newly published mappings; their exact
+initial mapping inventories were added. A test incorrectly treated the
+mapping-count-error double as a mapping-liveness-error double and was corrected.
+These were test fixture corrections, not a weakening of runtime authentication.
+
+Two repeated untraced ABBA comparisons failed to show meaningful benefit:
+
+| Comparison | Command | Base ms | Candidate ms | Candidate change |
+|---|---|---:|---:|---:|
+| First | true | 2.13175 | 2.17319 | +1.94% |
+| First | Python -S | 12.67558 | 12.77322 | +0.77% |
+| First | Python | 14.10526 | 14.11727 | +0.09% |
+| Repeat | true | 2.05937 | 2.09706 | +1.83% |
+| Repeat | Python -S | 12.69070 | 12.55742 | -1.05% |
+| Repeat | Python | 14.09106 | 14.07015 | -0.15% |
+
+The candidate was discarded. It does not establish that source bookkeeping
+costs zero, but it does not justify a standalone optimization and does not
+refute destination packing. All runtime and test changes were reverted; the
+experiment is saved as `retain-source-rejected.patch`. The two ABBA JSON files
+and `retain-source-provenance.json` bind candidate SHA-256
+`9b1490c6673f605da8f4cc6912d94061ce1afd3f97a55a29ee3c83721a008d48`.
+The saved signed base was restored byte-for-byte to `target/release/carrick`
+(SHA-256 `e33490c116541179fbf30c02d7253144ab0c54bc6bb692b0ff5c6eb9e951af24`),
+codesign verification passed, and five Python child spawns completed with exit
+zero (`retain-source-restored.json`). The first restoration smoke command had
+bad shell quoting and produced a Python SyntaxError; its rejected receipt is
+retained separately and the corrected command uses `shlex.quote`.
+
+Destination owner registration, inventory growth and retirement remain the
+larger COW hypothesis. Reusing lanes needs an authenticated, MM-local occupancy
+record and an exclusivity check that remains valid across fork; the preserved
+source path may be useful inside that transaction but has no accepted benefit
+on its own. No new performance improvement or final gate is claimed here.
