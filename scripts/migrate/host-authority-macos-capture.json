@@ -1,10 +1,10 @@
 {
   "catalog_sha256": "aa230c66221233fd4f87b931261e33b4975eedfb45efa04d6929a502a7d392ad",
   "diagnostic_counts": {
-    "macos-cli-default": 631,
+    "macos-cli-default": 632,
     "macos-hvf-default": 93,
-    "macos-runtime-default": 456,
-    "merged": 631
+    "macos-runtime-default": 457,
+    "merged": 632
   },
   "executed_profiles": [
     "macos-cli-default",
@@ -10519,6 +10519,26 @@
         "macos-runtime-default"
       ],
       "source": {
+        "byte_end": 35902,
+        "byte_start": 35886,
+        "column": 48,
+        "column_end": 64,
+        "column_start": 48,
+        "file": "crates/carrick-runtime/src/kernel/frame_inventory.rs",
+        "line": 985,
+        "line_end": 985,
+        "line_start": 985
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-ID",
+      "expansion": null,
+      "operation": "std::process::id",
+      "profiles": [
+        "macos-cli-default",
+        "macos-runtime-default"
+      ],
+      "source": {
         "byte_end": 10078,
         "byte_start": 10062,
         "column": 9,
@@ -12618,9 +12638,9 @@
       }
     }
   ],
-  "rows_sha256": "828558cfdf6a6821a0c4df1b10b3f26497e11961da761361cb0f18cddd622b93",
+  "rows_sha256": "fd89261db83f061b00119461bae5b703f921647baf917ba1c0977ef828c2e392",
   "schema": 1,
-  "source_head": "486a4305ffaf54c2e4a931ea3369be5addc00f02",
+  "source_head": "9c400287128de314a8c680ef820905bfb07f477e",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
