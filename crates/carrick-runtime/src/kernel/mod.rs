@@ -95,7 +95,8 @@ pub use objects::{
 #[allow(unused_imports)]
 pub(crate) use objects::{
     DescriptionCommon, FileDescriptionBacking, JobControlStopInvalidationGeneration,
-    NO_READINESS_CONTEXT, NoReadinessContext, ReadinessContext,
+    NO_READINESS_CONTEXT, NoReadinessContext, ReadinessContext, close_system_charge_window,
+    system_charge_window_is_closed,
 };
 pub use operations::{
     ChildStartOutcome, ChildStartWait, ChildWaitPrecheck, ForkReservation, KernelFailpoint,

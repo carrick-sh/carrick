@@ -1417,10 +1417,24 @@ mod rlimit_tests {
     fn thread_cpu_surfaces_read_exact_logical_thread_accounting() {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("task context");
-        context.thread().charge_user_ns(17_000);
-        context.thread().charge_system_ns(19_000);
         super::super::resources::with_captured_resources(&context, || {
-            assert_eq!(task_thread_cpu_us(), (17, 19));
+            // Entering the dispatch scope opens this host thread's system-CPU
+            // charge window, and reading the surfaces flushes it — so close it
+            // first, exactly as the executor does at a residency boundary, and
+            // the assertion then reads only what this test charged rather than
+            // the microseconds the test process happens to have burned. See
+            // `Thread::system_ns`.
+            crate::kernel::close_system_charge_window();
+            let (user_before_us, system_before_us) = task_thread_cpu_us();
+            context.thread().charge_user_ns(17_000);
+            context.thread().charge_system_ns(19_000);
+            // Whole microseconds, so the truncation of whatever the closed
+            // window already committed is unchanged by the addition and the
+            // assertion stays exact rather than approximate.
+            assert_eq!(
+                task_thread_cpu_us(),
+                (user_before_us + 17, system_before_us + 19)
+            );
         });
     }
     #[test]

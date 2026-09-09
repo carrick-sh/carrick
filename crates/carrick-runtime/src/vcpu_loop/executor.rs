@@ -2244,6 +2244,16 @@ impl WorkerBoundaryAudit {
     }
 
     pub(crate) fn audit_runtime_owned(&self) -> Result<(), TrapError> {
+        // A boundary ends this host thread's authority over whatever logical
+        // thread it was running, and the system-CPU charge window is exactly
+        // that authority: commit and close it here, BEFORE the audit, so no
+        // path out of a residency — including the error paths that skip the
+        // ordinary close — can leave the window open for a different logical
+        // thread to inherit. Idempotent: a closed window costs nothing.
+        crate::kernel::close_system_charge_window();
+        if !crate::kernel::system_charge_window_is_closed() {
+            return Err(boundary_error("system-charge-window"));
+        }
         if !carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary() {
             return Err(boundary_error("topology-depth"));
         }
@@ -4192,6 +4202,12 @@ where
             }
             break exit;
         };
+        // The residency is over: commit the system CPU this host thread burned
+        // servicing the loaded logical thread before anything downstream can
+        // observe that thread's accounting. A thread that exited here is about
+        // to be retired and folded into its task's ledger, and its parent's
+        // `wait4` rusage must not miss the residency that ran it.
+        crate::kernel::close_system_charge_window();
         let post_run_event_identity = running.thread().task().as_ref().and_then(|task| {
             process_leader_event_identity(task.key().id.raw(), running.thread_key().tid.raw())
         });
