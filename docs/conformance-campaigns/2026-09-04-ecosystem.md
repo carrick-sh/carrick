@@ -3360,3 +3360,46 @@ the volume to 13 GiB free and main's `just build` failed the 20 GiB disk
 guard mid-landing — which reads as a code failure in a chain log and is not.
 `just worktree-gc 1 apply` reclaimed 296 GiB. Sweep before dispatching a
 parallel round.
+
+### 2026-09-08 19:00 — converging to one workstream
+
+Owner direction: finish the running lanes and continue as a single stream.
+No further parallel dispatch; the remaining two lanes (per-fault cost,
+per-syscall tax) run to completion and everything after that is serial.
+
+**Go rows (lane `opus-go-rows-sep08`, landing).** Attribution first: on
+`go-go_types` the guest issues **1,148,501 syscalls** (fcntl 221k,
+newfstatat 120k, rt_sigaction 115k, read 105k, nanosleep 93k, openat 77k);
+`go-net_http` is wait-dominated (epoll_pwait at 737 µs/call, nanosleep,
+futex = 41.8 s of 96.5 s service). Wall split with kernel PCs symbolised
+against the KDK dSYM: guest execution plus VM entry/exit ≈ 55%, carrick user
+code 28%, other host kernel 17%. The top *named* carrick symbol was
+`BTreeMap::Values::next` under the carrier wait reactor at 9.1% of user
+samples: every reactor cycle walked the whole registration map three times
+(poll set, deadlines, record locks) although the pollable set is a handful.
+Fix: a `ReactorWorkSet` maintained by the three mutators, with a shape test
+refusing bare map access. In vivo the map holds 1,024–2,048 registrations
+per cycle, so the retired scans were **180,275,525 row visits over 135,101
+cycles against 192,289 now — 937x fewer**; host `poll` width is 1–4 every
+cycle, so the scans produced almost nothing. Red-first: ablating the index
+makes the new test report 257 visits for 257 registrations. Interleaved A/B
+against the pinned control: net_http faster in 5 of 5 (mean 0.92), go_types
+a wash. This is AGENTS.md's open "reactor's O(live blocked tasks) cost".
+Left open by the same lane: `publish_signal_for_thread` still scans all
+registrations per signal publication.
+
+**A director error, and its fix.** My denominator landing claimed the two
+newly registered probes "sit in the uncached population the shards do not
+gate". They do not: `regen-next-shards.py` derives the cached lane as every
+generic probe outside `LIVE_ORACLE_PROBES`/`OUT_OF_PROCESS_PROBES`, so the
+probe gate on main went red after 416 rows with "missing cached probe oracle
+for ppollwaitset" and the same for `forkexecstorm`. Fixed in `50aac60eb` by
+quarantining all three on the live-oracle lane, where `tlbibroadcast`,
+`windowcoherence` and `sigprofvdso` already sit for the same reason.
+`ppollwaitset` belongs there on its own merits: it asserts sub-5 ms wake
+latencies and runs a 70-second infinite-wait case. Blessing the three is the
+follow-up and needs a Docker phase with no carrick guest alive.
+
+**A brief defect worth recording:** the exec-cost lane died waiting on a
+"host is quiet" gate that its four sibling lanes made unreachable. A quiet
+gate belongs to the director's measurement, never to a worker's inner loop.
