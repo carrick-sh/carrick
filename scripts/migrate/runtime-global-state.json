@@ -1218,6 +1218,14 @@
       "rationale": "Process-wide monotonic identity allocator; values are never interpreted as the current container and are not reused."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "symbol": "SYSTEM_CHARGE_WINDOW",
+      "fingerprint": "761f744a623027ad2ff9fefe442521860f8fcfae43bd03d5dd2c8dbd9b920fee",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell SYSTEM_CHARGE_WINDOW in crates/carrick-runtime/src/kernel/objects.rs holding this HOST thread's open system-CPU charge window for the logical guest thread its executor is currently running. It is per-host-thread by construction \u2014 the CLOCK_THREAD_CPUTIME_ID reading it brackets describes this host thread and no other \u2014 and it selects no container state: the logical thread it charges is named by a WEAK reference that every use upgrades, so it neither keeps a retired Thread alive nor can be aliased by a recycled allocation, and the executor closes it at every boundary audit."
+    },
+    {
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
       "symbol": "post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG",
