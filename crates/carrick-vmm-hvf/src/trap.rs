@@ -12679,9 +12679,18 @@ impl GuestMappingPlan {
                     })?,
                     HVF_PAGE_SIZE,
                 );
-                let payload_offset_usize = usize::try_from(payload_offset)
-                    .map_err(|_| TrapError::MappingTooLarge(payload_offset))?;
-                let payload = region.bytes().get(payload_offset_usize..).ok_or_else(|| {
+                let (initialized_offset, initialized) = region.shared_initialized_bytes();
+                let within_payload =
+                    payload_offset
+                        .checked_sub(initialized_offset)
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "initial stack payload precedes initialized window".to_owned(),
+                            )
+                        })?;
+                let payload_offset_usize = usize::try_from(within_payload)
+                    .map_err(|_| TrapError::MappingTooLarge(within_payload))?;
+                let payload = initialized.get(payload_offset_usize..).ok_or_else(|| {
                     TrapError::Hypervisor("initial stack payload offset exceeds backing".to_owned())
                 })?;
                 offset_in_mapping = offset_in_mapping.checked_add(payload_offset).ok_or(
@@ -12690,7 +12699,11 @@ impl GuestMappingPlan {
                         mapped_size,
                     },
                 )?;
-                std::sync::Arc::new(payload.to_vec())
+                if share_payload && within_payload == 0 {
+                    initialized
+                } else {
+                    std::sync::Arc::new(payload.to_vec())
+                }
             } else if share_payload {
                 region.shared_bytes()
             } else {

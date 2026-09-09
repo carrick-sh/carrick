@@ -798,6 +798,64 @@ enum LoadRegionShape {
     PageAligned { page_size: u64 },
 }
 
+/// Immutable initialized window plus a lazily materialized compatibility prefix.
+/// The cache is not part of the value: reading through the legacy slice API
+/// must not change equality or detach a clone's initialized image.
+#[derive(Debug, Clone)]
+struct RegionPayload {
+    offset: usize,
+    initialized: std::sync::Arc<Vec<u8>>,
+    prefix: std::sync::OnceLock<std::sync::Arc<Vec<u8>>>,
+}
+
+impl From<Vec<u8>> for RegionPayload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            offset: 0,
+            initialized: bytes.into(),
+            prefix: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for RegionPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.offset == other.offset && self.initialized == other.initialized
+    }
+}
+
+impl Eq for RegionPayload {}
+
+impl RegionPayload {
+    fn initialized_at(offset: usize, bytes: Vec<u8>) -> Self {
+        Self {
+            offset,
+            ..bytes.into()
+        }
+    }
+
+    fn prefix(&self) -> &std::sync::Arc<Vec<u8>> {
+        if self.offset == 0 {
+            &self.initialized
+        } else {
+            self.prefix.get_or_init(|| {
+                let mut bytes = vec![0; self.offset + self.initialized.len()];
+                bytes[self.offset..].copy_from_slice(&self.initialized);
+                bytes.into()
+            })
+        }
+    }
+
+    fn make_mut(&mut self) -> &mut Vec<u8> {
+        if self.offset != 0 {
+            self.initialized = std::sync::Arc::clone(self.prefix());
+            self.offset = 0;
+        }
+        self.prefix.take();
+        std::sync::Arc::make_mut(&mut self.initialized)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoryRegion {
     pub start: u64,
@@ -808,7 +866,7 @@ pub struct MemoryRegion {
     /// aperture. All other regions are private.
     pub shared: bool,
     #[serde(skip)]
-    bytes: std::sync::Arc<Vec<u8>>,
+    bytes: RegionPayload,
 }
 
 impl MemoryRegion {
@@ -831,7 +889,7 @@ impl MemoryRegion {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        self.bytes.as_slice()
+        self.bytes.prefix().as_slice()
     }
 
     /// Share this region's immutable payload without copying it.
@@ -839,7 +897,15 @@ impl MemoryRegion {
     /// A later write through [`GuestMemory`] or [`AddressSpace::region_bytes_mut`]
     /// detaches the writer with copy-on-write semantics.
     pub fn shared_bytes(&self) -> std::sync::Arc<Vec<u8>> {
-        std::sync::Arc::clone(&self.bytes)
+        std::sync::Arc::clone(self.bytes.prefix())
+    }
+
+    /// Initialized image window relative to the semantic region start.
+    pub fn shared_initialized_bytes(&self) -> (u64, std::sync::Arc<Vec<u8>>) {
+        (
+            self.bytes.offset as u64,
+            std::sync::Arc::clone(&self.bytes.initialized),
+        )
     }
 
     /// Mutable access to a region's already-sized host backing.
@@ -847,7 +913,7 @@ impl MemoryRegion {
     /// Callers may rewrite bytes but cannot resize the region, preserving the
     /// `start..end`/backing-length invariant enforced by `AddressSpace`.
     fn bytes_mut(&mut self) -> &mut [u8] {
-        std::sync::Arc::make_mut(&mut self.bytes).as_mut_slice()
+        self.bytes.make_mut().as_mut_slice()
     }
 }
 
@@ -2062,7 +2128,7 @@ impl AddressSpace {
 
         self.regions.iter().find_map(|region| {
             region
-                .bytes
+                .bytes()
                 .windows(needle.len())
                 .position(|window| window == needle)
                 .map(|offset| region.start + offset as u64)
@@ -2098,11 +2164,44 @@ pub fn build_linux_initial_stack(
             })?;
     let stack_len =
         usize::try_from(stack_size).map_err(|_| AddressSpaceError::RegionTooLarge(stack_size))?;
-    let mut bytes = vec![0; stack_len];
-    let mut cursor = stack_len;
+    // Bound the initialized tail before allocating. The two 16-byte alignment
+    // steps need at most 30 padding bytes; reserve 32. Keep the omitted prefix
+    // aligned so all existing stack-relative alignment decisions remain exact.
+    let too_large = || AddressSpaceError::InitialStackTooLarge { stack_size };
+    let strings_len = argv.iter().chain(&env).try_fold(0usize, |len, value| {
+        len.checked_add(value.len())
+            .and_then(|len| len.checked_add(1))
+            .ok_or_else(too_large)
+    })?;
+    let execfn_len = execfn
+        .or_else(|| argv.first().map(Vec::as_slice))
+        .map_or(Some(0), |value| value.len().checked_add(1))
+        .ok_or_else(too_large)?;
+    let words_len = argv
+        .len()
+        .checked_add(env.len())
+        .and_then(|len| len.checked_add(3))
+        .and_then(|len| len.checked_mul(8))
+        .ok_or_else(too_large)?;
+    let aux_bytes = auxv
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(core::mem::size_of::<LinuxAuxvEntry>()))
+        .ok_or_else(too_large)?;
+    let required = strings_len
+        .checked_add(execfn_len)
+        .and_then(|len| len.checked_add(words_len))
+        .and_then(|len| len.checked_add(aux_bytes))
+        .and_then(|len| len.checked_add(8 + 16 + 32))
+        .ok_or_else(too_large)?;
+    let payload_offset = align_down_usize(stack_len.saturating_sub(required), 16 * 1024);
+    let payload_start = stack_start + payload_offset as u64;
+    let mut bytes = vec![0; stack_len - payload_offset];
+    let mut cursor = bytes.len();
 
-    let argv_addrs = write_stack_strings(&mut bytes, stack_start, &mut cursor, &argv, stack_size)?;
-    let env_addrs = write_stack_strings(&mut bytes, stack_start, &mut cursor, &env, stack_size)?;
+    let argv_addrs =
+        write_stack_strings(&mut bytes, payload_start, &mut cursor, &argv, stack_size)?;
+    let env_addrs = write_stack_strings(&mut bytes, payload_start, &mut cursor, &env, stack_size)?;
 
     // AT_EXECFN, AT_PLATFORM bytes (NUL-terminated strings on the stack).
     let execfn_addr = if let Some(s) = execfn.or_else(|| argv.first().map(Vec::as_slice)) {
@@ -2112,7 +2211,7 @@ pub fn build_linux_initial_stack(
         cursor -= s.len() + 1;
         bytes[cursor..cursor + s.len()].copy_from_slice(s);
         bytes[cursor + s.len()] = 0;
-        Some(stack_start + cursor as u64)
+        Some(payload_start + cursor as u64)
     } else {
         None
     };
@@ -2123,7 +2222,7 @@ pub fn build_linux_initial_stack(
     cursor -= platform.len() + 1;
     bytes[cursor..cursor + platform.len()].copy_from_slice(platform);
     bytes[cursor + platform.len()] = 0;
-    let platform_addr = stack_start + cursor as u64;
+    let platform_addr = payload_start + cursor as u64;
 
     // AT_RANDOM — 16 bytes glibc copies into __stack_chk_guard, pointer_guard,
     // and dl_random. Source from the host's CSPRNG via libc::getentropy so
@@ -2137,7 +2236,7 @@ pub fn build_linux_initial_stack(
     let mut random_bytes = [0u8; 16];
     fill_random_bytes(&mut random_bytes)?;
     bytes[cursor..cursor + 16].copy_from_slice(&random_bytes);
-    let random_addr = stack_start + cursor as u64;
+    let random_addr = payload_start + cursor as u64;
 
     cursor = align_down_usize(cursor, 16);
 
@@ -2203,9 +2302,9 @@ pub fn build_linux_initial_stack(
                 execute: false,
             },
             shared: false,
-            bytes: bytes.into(),
+            bytes: RegionPayload::initialized_at(payload_offset, bytes),
         },
-        stack_start + stack_pointer_offset as u64,
+        payload_start + stack_pointer_offset as u64,
         auxv_image,
     ))
 }
@@ -3796,15 +3895,17 @@ impl GuestMemory for AddressSpace {
         let end = offset
             .checked_add(length)
             .ok_or(MemoryError::OutOfBounds { address, length })?;
-        // `region.bytes` is only the initialised prefix of the region; every
-        // byte past it reads as zero (heap / mmap-arena pages are lazily
-        // zero-filled and never materialise a backing Vec). Copy the part
-        // that overlaps the prefix and leave the rest as the zeroes the
-        // freshly-allocated buffer already holds.
+        // Only the initialized window has stored bytes. Untouched heap/mmap
+        // tails and the unused initial-stack prefix read as zero. Copy the
+        // intersection and leave the rest of the result zero-filled.
         let mut out = vec![0_u8; length];
-        let init_end = end.min(region.bytes.len());
-        if init_end > offset {
-            out[..init_end - offset].copy_from_slice(&region.bytes[offset..init_end]);
+        let init_start = offset.max(region.bytes.offset);
+        let init_end = end.min(region.bytes.offset + region.bytes.initialized.len());
+        if init_end > init_start {
+            out[init_start - offset..init_end - offset].copy_from_slice(
+                &region.bytes.initialized
+                    [init_start - region.bytes.offset..init_end - region.bytes.offset],
+            );
         }
         Ok(out)
     }
@@ -3824,7 +3925,7 @@ impl GuestMemory for AddressSpace {
         // Grow the initialised prefix with zeroes so a write into the
         // lazily-zeroed tail of a region (heap / mmap arena) materialises the
         // bytes it lands in rather than slicing past the end of the Vec.
-        let region_bytes = std::sync::Arc::make_mut(&mut region.bytes);
+        let region_bytes = region.bytes.make_mut();
         if end > region_bytes.len() {
             region_bytes.resize(end, 0);
         }
@@ -3863,6 +3964,123 @@ mod tests {
     use super::*;
     use crate::elf::RoSpan;
     use carrick_guest_mem::GuestVa;
+
+    #[test]
+    fn initial_stack_preserves_arguments_across_payload_page_boundaries() {
+        for length in [0, 15, 16_200, 16_384, 32_768, 131_072] {
+            let argument = vec![b'x'; length];
+            let (region, sp, auxv) = build_linux_initial_stack(
+                vec![b"tool".to_vec(), argument.clone()],
+                vec![b"KEY=value".to_vec()],
+                &[
+                    LinuxAuxvEntry::new(LINUX_AT_RANDOM, 0),
+                    LinuxAuxvEntry::new(LINUX_AT_PLATFORM, 0),
+                    LinuxAuxvEntry::new(LINUX_AT_EXECFN, 0),
+                ],
+                Some(b"/bin/tool"),
+                LINUX_STACK_TOP,
+                LINUX_STACK_SIZE,
+            )
+            .expect("large initial stack");
+            let image = AddressSpace::from_regions(0, vec![region]).unwrap();
+            let word = |address| {
+                u64::from_le_bytes(
+                    image
+                        .read_bytes_raw(address, 8)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                )
+            };
+            assert_eq!(sp % 16, 0);
+            assert_eq!(word(sp), 2);
+            assert_eq!(image.read_bytes_raw(word(sp + 8), 5).unwrap(), b"tool\0");
+            let mut expected_argument = argument;
+            expected_argument.push(0);
+            assert_eq!(
+                image.read_bytes_raw(word(sp + 16), length + 1).unwrap(),
+                expected_argument
+            );
+            assert_eq!(word(sp + 24), 0);
+            assert_eq!(
+                image.read_bytes_raw(word(sp + 32), 10).unwrap(),
+                b"KEY=value\0"
+            );
+            assert_eq!(word(sp + 40), 0);
+            assert_eq!(image.read_bytes_raw(sp + 48, auxv.len()).unwrap(), auxv);
+            let auxv_value = |auxv: &[u8], key: u64| {
+                auxv.chunks_exact(16).find_map(|entry| {
+                    (u64::from_le_bytes(entry[..8].try_into().unwrap()) == key)
+                        .then(|| u64::from_le_bytes(entry[8..].try_into().unwrap()))
+                })
+            };
+            let random = auxv_value(&auxv, LINUX_AT_RANDOM).unwrap();
+            assert_eq!(image.read_bytes_raw(random, 16).unwrap().len(), 16);
+            let platform = auxv_value(&auxv, LINUX_AT_PLATFORM).unwrap();
+            assert_eq!(image.read_bytes_raw(platform, 8).unwrap(), b"aarch64\0");
+            let execfn = auxv_value(&auxv, LINUX_AT_EXECFN).unwrap();
+            assert_eq!(image.read_bytes_raw(execfn, 10).unwrap(), b"/bin/tool\0");
+        }
+        assert!(matches!(
+            build_linux_initial_stack(
+                vec![vec![b'x'; 128]],
+                Vec::new(),
+                &[],
+                None,
+                LINUX_STACK_TOP,
+                128
+            ),
+            Err(AddressSpaceError::InitialStackTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn initial_stack_keeps_a_compact_tail_and_full_zero_extent() {
+        let (region, sp, _) = build_linux_initial_stack(
+            vec![b"python3".to_vec(), b"-c".to_vec(), b"pass".to_vec()],
+            vec![b"PATH=/usr/local/bin:/usr/bin:/bin".to_vec()],
+            &[LinuxAuxvEntry::new(LINUX_AT_PAGESZ, 4096)],
+            None,
+            LINUX_STACK_TOP,
+            LINUX_STACK_SIZE,
+        )
+        .expect("initial stack");
+        let (offset, payload) = region.shared_initialized_bytes();
+        assert_eq!(region.len(), LINUX_STACK_SIZE);
+        assert!(offset > 0, "unused stack prefix stays implicit");
+        assert!(payload.len() <= 16 * 1024);
+        assert_eq!(offset + payload.len() as u64, region.len());
+        assert!(region.start + offset <= sp);
+        assert_eq!(sp % 16, 0);
+        let mut image = AddressSpace::from_regions(0, vec![region]).unwrap();
+        let original = image.clone();
+        assert_eq!(
+            image
+                .read_bytes_raw(LINUX_STACK_TOP - LINUX_STACK_SIZE, 64)
+                .unwrap(),
+            vec![0; 64]
+        );
+        let boundary = LINUX_STACK_TOP - LINUX_STACK_SIZE + offset;
+        assert_eq!(
+            image.read_bytes_raw(boundary - 16, 32).unwrap(),
+            vec![0; 32]
+        );
+        image.write_bytes_raw(boundary - 1, &[7, 8]).unwrap();
+        assert_eq!(image.read_bytes_raw(boundary - 1, 2).unwrap(), vec![7, 8]);
+        assert_eq!(
+            original.read_bytes_raw(boundary - 1, 2).unwrap(),
+            vec![0, 0]
+        );
+        let before = original.clone();
+        assert_eq!(
+            original.regions()[0].bytes().len(),
+            LINUX_STACK_SIZE as usize
+        );
+        assert_eq!(
+            original, before,
+            "compatibility materialization changes no value"
+        );
+    }
 
     #[test]
     fn address_space_clone_shares_payload_until_first_write() {
