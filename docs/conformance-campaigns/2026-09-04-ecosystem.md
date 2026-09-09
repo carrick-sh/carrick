@@ -3301,3 +3301,62 @@ symlink caching + `getpid`-free `dir_fd_for` behind subprocess / tarfile /
 importlib (the fs path term is 60 host syscalls per spawn at 20–70 µs);
 the Go rows' top syscall term; the per-exec fixed cost behind
 multiprocessing (16.6 ms vs 4.5 ms per `python3 -c pass`).
+
+### 2026-09-08 evening — the perf round: two briefs overturned by their own measurements
+
+**compile fault count (lane `opus-compile-faults-sep08`, landed `3538e22f7`).**
+The brief's premise was wrong and the lane proved it. The recorded "8x depth
+= 22.8x faults" reproduces (4,812 → 110,258 EL0 aborts) but is **linear
+growth with a large negative offset**, not a super-linear mechanism: 99.6%
+of the row's faults are anonymous mmap-arena write translation faults, 100%
+serviced by `resident_fault_plan`, re-fault term 1%. Docker oracle with one
+fresh process per depth: Linux minflt 19,108 → 146,848, i.e. 7.68x for 8x
+depth — also linear. Carrick takes **fewer** faults than Linux (0.25x at
+100k, 0.84x at 800k) because the 128 MiB brk heap is mapped eagerly at zero
+faults; a linear function minus a large constant grows super-linearly *in
+ratio* near the offset. New durable instrument
+`scripts/dtrace/hvpatch-fault-class-census.d` (VMA class × ESR fault kind ×
+repeat granule × service arm). **The row's cost is per-fault COST — 19.5 µs
+vs Linux's sub-µs** — of which `ensure_sparse_mmap_backing` is ≤12%; the
+remaining ~17 µs (trap round trip, dispatcher, `protect_range` publication)
+is the next attribution and is dispatched. Qualified live and worth keeping:
+**FEAT_HAFDBS = 0** on this M4 (`ID_AA64MMFR1_EL1 = 0x0000_1000_1131_2000`),
+so the hardware access-flag route is closed; the ~16 aborts per 64 KiB
+window are the documented price of page-granular `mincore` and
+`CARRICK_MINCORE_EXACT=0` does not remove them; 64 KiB is the window knee
+(4 KiB costs 30x). Also a measurement rule: the earlier "`trace_fault` =
+30.1% of CPU" was profiled **under `carrick trace`**, which enables those
+probes — an instrument artifact. The lane's own change (lazy probe arguments
+and a hoisted kernel-context capture) measured **neutral** and is kept only
+because it removes work a disabled probe cannot use.
+
+**dentry cache (lane `opus-dcache-sep08`, landing).** Negative dentries,
+symlink caching and the `getpid`-free `dir_fd_for` were already on main
+(steady-state `newfstatat` = 0.05 host `fstatat64` per call). The term the
+brief missed is **`getdents64`: 59% of all fs wall in a Python spawn**, 113
+host `fstatat64` per call — one `os.listdir` of the 201-entry
+`/usr/local/lib/python3.12` issued 384. Split by caller: 52%
+`FsBackend::shadows` (a full upper path lookup per lower entry) and 47%
+`RootFs::directory_entries` re-`real_stat`ing every child of the immutable
+lower. Fix: the upper's contribution is read once and membership in its
+child-name set **is** `shadows()`, byte-exact; the lower goes through its
+never-stale memo; `getdents64` streams off a trusted ImmutableLower dirfd.
+Host `fstatat64` **73,848 → 13,359**, host `openat` **11,981 → 0**,
+`os.listdir` ~6x faster (992/1113/1115 → 172/164/288 µs), subprocess row
+**3.62 → 3.14** quiet and −12.9% again under load. Exactness: a new unit
+test drives empty-shell, addition, type-flipping shadow and tombstone, red
+first twice; the `dentrycache` probe gained a readdir-coherence section,
+re-blessed line-exact on both libcs.
+
+**Two flat taxes found in passing, now their own lane
+(`opus-syscall-tax-sep08`):** `thread_selfusage` costs **2 host syscalls on
+every guest syscall** (exactly 2.00 across every kind), and every guest
+`close` pays one host `fstat` from `lease_file_identity` to key a
+record-lock table that is almost always empty. Neither is fs-specific, so
+both are paid by every open row.
+
+**Director note:** four parallel lanes at ~12 GiB of build output each drove
+the volume to 13 GiB free and main's `just build` failed the 20 GiB disk
+guard mid-landing — which reads as a code failure in a chain log and is not.
+`just worktree-gc 1 apply` reclaimed 296 GiB. Sweep before dispatching a
+parallel round.
