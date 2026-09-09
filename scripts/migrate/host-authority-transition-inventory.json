@@ -16953,5 +16953,32 @@
       "line_end": 665,
       "line_start": 665
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-ID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current host process identity used to invalidate inherited frame-provenance entropy tokens"
+    },
+    "expansion": null,
+    "operation": "std::process::id",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/kernel/frame_inventory.rs:985 in `prepare_reservation`, `std::process::id` identifies only the calling host process so the authority discards cached entropy after a host fork; it neither supplies a guest identity nor selects a host target.",
+    "review_id": "HA-000649",
+    "source": {
+      "byte_end": 35902,
+      "byte_start": 35886,
+      "column": 48,
+      "column_end": 64,
+      "column_start": 48,
+      "file": "crates/carrick-runtime/src/kernel/frame_inventory.rs",
+      "line": 985,
+      "line_end": 985,
+      "line_start": 985
+    }
   }
 ]
