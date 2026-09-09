@@ -3494,3 +3494,53 @@ remaining term is the ordered-`Vec` + first-occurrence-index representation
 itself); the multiprocessing row is per-exec fixed cost (`python3 -c pass`
 16.6 ms vs Docker 4.5 ms). Those two are the whole load-coupling residue and
 most of the ratio residue.
+
+### 2026-09-09 03:33 — the alias ordering invariant, and a measurement caveat that matters
+
+**Landed `901121ea0`.** The scope scan is gone from `munmap`: 4,098 row
+visits for a 4,096-row mm become 15. The earlier failed attempt
+(`e123216a4`) is now explained, and it was NOT the window query — **a scope
+bucket must be ordered by sequence for `bucket_position_in`'s binary search,
+and the unmap planner's staged registry was not ordered**, because it builds
+from two index orders and `insert_indexed_row` pushed. On an unsorted bucket
+the search answers "this row is not here" for a row that IS there, so the
+planner split fewer rows and planned fewer leases than the live unmap
+performed — the `debug_assert_eq!(actual, planned_leases)` that aborted
+`sysvsem`/`rlimitnproc`. The rule existed only in a doc comment;
+`place_in_scope_bucket` is now the only way a row enters a bucket, and it
+inserts in order. Exactly the class AGENTS.md names: a rule that lives in a
+comment is a bug that has not happened yet. Differential test
+`unmap_row_selection_agrees_between_the_scope_scan_and_the_window_query`
+(seeded generator, 1,903 unmaps) was **RED at 903/1,903 before the fix**;
+smallest diverging case is a two-row staged bucket in order `[seq=6, seq=4]`.
+
+**Goal on `62c63d979` (binary `afccec0cc339993c`), quiet before every phase:**
+
+| row | w1 | w4 | move | prev w4 |
+|---|---|---|---|---|
+| asyncio | 1.01 | 1.06 | 1.05 | 1.03 **MET** |
+| threading | 1.16 | 1.16 | 1.00 | 1.14 **MET** |
+| runtime_pprof | 1.39 | 1.55 | 1.12 | 1.50 **MET** |
+| itertools | 1.88 | 2.66 | 1.41 | 2.43 |
+| go_types | 2.97 | 2.69 | 0.91 | 2.70 |
+| subprocess | 2.90 | 3.09 | 1.07 | 3.03 |
+| net_http | 3.54 | 3.56 | 1.01 | 3.45 |
+| importlib | 2.49 | 4.26 | **1.71** | 3.16 |
+| tarfile | 4.77 | 5.39 | 1.13 | 5.10 |
+| multiprocessing_main_handling | 3.53 | 5.63 | **1.59** | 5.34 |
+| compile | 5.16 | 8.55 | **1.66** | 7.83 |
+
+11/11 MATCH, still **3/11 at ≤2x**.
+
+**The caveat, and it changes how this campaign must measure.** The lane's own
+PAIRED interleaved A/B on the same host read `importlib` **−18.4%** and
+`itertools` −8.6%; this UNPAIRED comparison against the previous run's w4
+column reads importlib **+35%** (3.16 → 4.26) and compile +9% (7.83 → 8.55).
+Both cannot be true. The w1 column moved the other way (importlib 2.80 →
+2.49), which is what a real improvement looks like. **Conclusion:
+cross-RUN w4 ratios are not comparable at this spread; only interleaved
+paired runs on one host are.** Every w4 delta quoted in this campaign from
+separate runs — including the three "MET" rows, which are far enough from
+2.0 to be safe — should be re-read with that in mind, and the next
+measurement round must interleave base and candidate rather than compare to
+a stored column.
