@@ -858,3 +858,41 @@ getdents/openat/mmap from generic dispatch: the current inclusive service
 samples include 99 getdents, 91 openat, and 60 mmap descendants. Neither set of
 samples yet proves which removable operation can recover the remaining 4.06 ms.
 No new speculative runtime edit is present at this checkpoint.
+
+
+### Remaining reservation cost: host entropy requests
+
+Static inspection of `kernel/frame_inventory.rs::prepare_reservation` found a
+32-byte `getrandom::fill` per transaction. The pinned getrandom 0.3.4 Darwin
+backend issues `getentropy` calls in at most 256-byte chunks. The current COW
+reservation profile has 79 kernel-user samples in one host syscall, compared
+with only a few samples in allocations and reservation-map insertion. Thus
+host entropy is a better bounded reservation hypothesis than another map edit.
+
+The new durable `hvpatch-host-entropy-cost.d` qualified the host entry provider
+and SDK `(buffer, size)` ABI, then captured 500 normal Python children. It does
+not read or emit entropy bytes. `pack-entropy.raw` records 212,115 balanced
+entry/return pairs, all result zero, successful target, no errors or bound:
+210,608 calls requested 32 bytes (421.216 per child), taking 359.443 ms total
+under tracing, or 0.719 ms/child. Other sizes were 8, 16 and 24 bytes, about
+500 calls each. Static source plus CPU stacks support inventory provenance as
+the dominant 32-byte caller; the syscall count itself is not a caller census.
+Mean spawn under this instrument was 13.594 ms. Trace duration is perturbed and
+cannot be cited as fully recoverable untraced time.
+
+A separate untraced host-only ctypes control alternated 32/256/256/32-byte OS
+requests, five batches of 20,000 each. Median call costs were 889/934/939/925 ns
+(`entropy-host-batch-control.json`); that includes Python/FFI overhead. Larger
+requests do not cost eight times as much, supporting a bounded batch-of-eight
+experiment, but the instrumented 0.719 ms is an overestimate of likely savings.
+No key bytes were logged, and the temporary buffer was cleared.
+
+Next candidate contract: retain fresh OS entropy for each provenance token,
+batch at most eight 32-byte tokens, consume each once, erase consumed slots,
+discard inherited cached bytes after a host PID change, and fail closed on any
+refill error without exposing partially filled or previously consumed bytes.
+Keep reservation/commit authentication and transaction IDs unchanged. Red-first
+host tests should inject an entropy source to verify refill count, exhaustion,
+PID invalidation, and failed-refill recovery. Compare untraced paired binaries
+before accepting the added state; reject the candidate if the expected small
+saving is not repeatable. No runtime entropy change exists at this checkpoint.
