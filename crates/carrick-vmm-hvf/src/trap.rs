@@ -20502,7 +20502,7 @@ impl InventoryStage2OwnerIdentity {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InventoryExtent {
     frame: carrick_hal::FrameId,
     mapping: carrick_hal::MappingId,
@@ -20516,6 +20516,59 @@ struct InventoryExtent {
     /// Retirement consumes this identity instead of reconstructing authority
     /// from historical per-executor mapping rows.
     stage2_owner: InventoryStage2OwnerIdentity,
+}
+
+/// Metadata half of lane reuse eligibility. Callers must additionally hold
+/// quiescence/topology, authenticate the owner and kernel mapping, and prove
+/// exclusive frame/stage-2 references before writing any byte.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn cow_lane_is_unpublished(
+    key: (u64, u64),
+    extent: InventoryExtent,
+    scope: AliasOwnershipScope,
+    offset: u64,
+    aliases: &[AliasBacking],
+) -> bool {
+    const PAGE: u64 = 0x1000;
+    if key.1 != 4 * PAGE
+        || key.0 % (4 * PAGE) != 0
+        || extent.stage2_base != key.0
+        || extent.stage2_length != key.1
+        || !matches!(extent.backing, InventoryBackingIdentity::Private(_))
+        || extent.stage2_owner.generation == 0
+        || offset >= key.1
+        || offset % PAGE != 0
+        || aliases.is_empty()
+    {
+        return false;
+    }
+    let Some(lane) = key.0.checked_add(offset) else {
+        return false;
+    };
+    let Some(lane_end) = lane.checked_add(PAGE) else {
+        return false;
+    };
+    aliases.iter().all(|alias| {
+        let Some(start) = alias.ipa.checked_sub(key.0) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(alias.size as u64) else {
+            return false;
+        };
+        alias.sharing == GuestMappingSharing::Private
+            && alias.ownership_scope == scope
+            && alias.inventory_backing == extent.backing
+            && alias.physical_ipa == key.0
+            && alias.physical_size as u64 == key.1
+            && alias.physical_host_addr == extent.stage2_owner.host_addr
+            && alias.owner_generation == extent.stage2_owner.generation
+            && extent.stage2_owner.host_addr.checked_add(start as usize) == Some(alias.host_addr)
+            && start % PAGE == 0
+            && alias.size > 0
+            && alias.size as u64 % PAGE == 0
+            && end <= key.1
+            && (alias.ipa >= lane_end || end <= offset)
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -20533,6 +20586,7 @@ struct CowInventoryReplacementStage {
     gpa: u64,
     backing: InventoryBackingIdentity,
     stage2_owner: InventoryStage2OwnerIdentity,
+    existing: Option<InventoryExtent>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -20565,6 +20619,7 @@ struct CowInventoryFragment {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 struct CowInventorySplit {
+    replacement_is_existing: bool,
     old_key: (u64, u64),
     old: InventoryExtent,
     fragments: Vec<CowInventoryFragment>,
@@ -27048,6 +27103,7 @@ fn perform_foreign_cow_transaction(
         &fragments,
         retirement,
         CowInventoryReplacementStage {
+            existing: None,
             gpa: new_physical_ipa,
             backing,
             stage2_owner: InventoryStage2OwnerIdentity {
@@ -37820,14 +37876,29 @@ impl HvfVmState {
                 mapping,
             });
         }
-        let new_frame = reservation.claim_frame().map_err(Self::reservation_error)?;
-        let new_mapping = Self::push_exact_mapping_events(
-            reservation,
-            new_frame,
-            replacement.gpa,
-            CowArmedRanges::COMPOUND_SIZE,
-            permissions,
-        )?;
+        let (new_frame, new_mapping) = if let Some(existing) = replacement.existing {
+            if existing.frame == old.frame
+                || existing.stage2_base != replacement.gpa
+                || existing.stage2_length != CowArmedRanges::COMPOUND_SIZE
+                || existing.stage2_owner != replacement.stage2_owner
+                || existing.backing != replacement.backing
+            {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch COW reuse identity mismatch".to_owned(),
+                ));
+            }
+            (existing.frame, existing.mapping)
+        } else {
+            let frame = reservation.claim_frame().map_err(Self::reservation_error)?;
+            let mapping = Self::push_exact_mapping_events(
+                reservation,
+                frame,
+                replacement.gpa,
+                CowArmedRanges::COMPOUND_SIZE,
+                permissions,
+            )?;
+            (frame, mapping)
+        };
         if retirement.retire_old_frame {
             reservation
                 .push(carrick_hal::FrameInventoryEvent::RetireFrame {
@@ -37838,6 +37909,7 @@ impl HvfVmState {
                 .map_err(Self::reservation_error)?;
         }
         Ok(CowInventorySplit {
+            replacement_is_existing: replacement.existing.is_some(),
             old_key,
             old,
             fragments,
@@ -37859,7 +37931,15 @@ impl HvfVmState {
         split: &CowInventorySplit,
         retire_stage2: impl FnOnce() -> Result<(), TrapError>,
     ) -> Result<bool, TrapError> {
-        if let Some(existing) = inventory.extents.get(&split.new_key) {
+        if split.replacement_is_existing {
+            if split.new_extent.frame == split.old.frame
+                || inventory.extents.get(&split.new_key) != Some(&split.new_extent)
+            {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch COW reuse destination drifted".to_owned(),
+                ));
+            }
+        } else if let Some(existing) = inventory.extents.get(&split.new_key) {
             let stage2_references = inventory
                 .frames
                 .lock()
@@ -37913,15 +37993,17 @@ impl HvfVmState {
                 },
             );
         }
-        increment_inventory_reference(&mut frames.references, split.new_extent.frame)?;
-        increment_inventory_reference(
-            &mut frames.extent_references,
-            (split.new_extent.frame, split.new_key.0, split.new_key.1),
-        )?;
-        increment_inventory_reference(
-            &mut frames.stage2_references,
-            (split.new_extent.stage2_base, split.new_extent.stage2_length),
-        )?;
+        if !split.replacement_is_existing {
+            increment_inventory_reference(&mut frames.references, split.new_extent.frame)?;
+            increment_inventory_reference(
+                &mut frames.extent_references,
+                (split.new_extent.frame, split.new_key.0, split.new_key.1),
+            )?;
+            increment_inventory_reference(
+                &mut frames.stage2_references,
+                (split.new_extent.stage2_base, split.new_extent.stage2_length),
+            )?;
+        }
         if split.retirement.retire_old_frame && frames.references.contains_key(&split.old.frame) {
             return Err(TrapError::Hypervisor(
                 "HVPatch COW retired old frame retains backend mappings".to_owned(),
@@ -37944,10 +38026,11 @@ impl HvfVmState {
             retire_stage2()?;
         }
         drop(frames);
-        if inventory
-            .extents
-            .insert(split.new_key, split.new_extent)
-            .is_some()
+        if !split.replacement_is_existing
+            && inventory
+                .extents
+                .insert(split.new_key, split.new_extent)
+                .is_some()
         {
             return Err(TrapError::Hypervisor(
                 "HVPatch COW new inventory extent collided".to_owned(),
@@ -41522,6 +41605,91 @@ impl HvfTaskState {
             })?
     }
 
+    /// Called only under the COW quiesce and topology guards. Use the complete
+    /// physical alias bucket, not only live leaves: even a retained invalid
+    /// projection or a foreign/stale alias conservatively prevents reuse.
+    fn private_cow_lane_candidate(
+        &self,
+        custody: &CarrierVmCustody,
+        authority: &dyn carrick_hal::FrameCowAuthority,
+        span: CowArmedSpan,
+        source_ipa: u64,
+        offset: u64,
+    ) -> Option<(PhysicalCowSource, InventoryExtent)> {
+        if span.len != 0x1000 || span.kernel_only || span.va % 0x1000 != 0 {
+            return None;
+        }
+        let scope = AliasRegistry::owned_scope(self.mm_root_slot, self.container_root);
+        let base = align_down(span.va, CowArmedRanges::COMPOUND_SIZE);
+        for lane in 0..4 {
+            let neighbor = base + lane * 0x1000;
+            if neighbor == span.va {
+                continue;
+            }
+            let Some(ipa) = self.translate_va_for_cow(neighbor) else {
+                continue;
+            };
+            let key = (
+                align_down(ipa, CowArmedRanges::COMPOUND_SIZE),
+                CowArmedRanges::COMPOUND_SIZE,
+            );
+            if key.0 == source_ipa {
+                continue;
+            }
+            let extent = {
+                let inventory = self.frame_inventory.lock();
+                let Some(extent) = inventory.extents.get(&key).copied() else {
+                    continue;
+                };
+                let frames = inventory.frames.lock();
+                if frames.references.get(&extent.frame) != Some(&1)
+                    || frames.extent_references.get(&(extent.frame, key.0, key.1)) != Some(&1)
+                    || frames.stage2_references.get(&key) != Some(&1)
+                {
+                    continue;
+                }
+                extent
+            };
+            let aliases: Vec<_> = alias_registry()
+                .lock()
+                .by_physical_start
+                .get(&key.0)
+                .into_iter()
+                .flatten()
+                .map(|(_, alias)| *alias)
+                .collect();
+            if !cow_lane_is_unpublished(key, extent, scope, offset, &aliases) {
+                continue;
+            }
+            let length =
+                carrick_hal::FrameLength::from_mapping_extent(std::num::NonZeroU64::new(key.1)?);
+            if authority.frame_mapping_count(extent.frame).ok() != Some(Some(1))
+                || authority
+                    .mapping_is_live(
+                        extent.mapping,
+                        extent.frame,
+                        carrick_guest_mem::Gpa(key.0),
+                        length,
+                    )
+                    .ok()
+                    != Some(true)
+            {
+                continue;
+            }
+            let Some(pin) = pin_exact_live_global_frame_owner_in(
+                custody,
+                key.0,
+                key.1,
+                extent.stage2_owner.host_addr,
+                extent.stage2_owner.generation,
+            ) else {
+                continue;
+            };
+            return Some((PhysicalCowSource::pinned(pin, 0, key.0), extent));
+        }
+        None
+    }
+
     fn perform_frame_cow(
         &mut self,
         custody: &std::sync::Arc<CarrierVmCustody>,
@@ -41775,122 +41943,178 @@ impl HvfTaskState {
         });
         crate::probes::hvpatch_frame_cow_trigger(trigger_event);
 
+        let reused_destination = if matches!(
+            old_inventory_extent.backing,
+            InventoryBackingIdentity::PrivateFileView(_)
+        ) && intent
+            == carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
+        {
+            self.private_cow_lane_candidate(
+                custody,
+                authority.as_ref(),
+                span,
+                old_physical_ipa,
+                old_offset,
+            )
+        } else {
+            None
+        };
+        let reused_extent = reused_destination.as_ref().map(|(_, extent)| *extent);
+        let fresh_destination = reused_extent.is_none();
         // Reserve every kernel identity/event slot before physical mutation.
-        let mapping_candidates = fragment_shapes.len().saturating_add(1);
+        let mapping_candidates = fragment_shapes
+            .len()
+            .saturating_add(usize::from(fresh_destination));
         let event_count = 1usize
             .saturating_add(mapping_candidates.saturating_mul(2))
             .saturating_add(usize::from(retirement.retire_old_frame));
         let mut reservation = authority
-            .reserve(1, mapping_candidates, event_count)
+            .reserve(
+                usize::from(fresh_destination),
+                mapping_candidates,
+                event_count,
+            )
             .map_err(|error| {
                 TrapError::Hypervisor(format!("reserve frame COW inventory: {error}"))
             })?;
         let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
-        let pooled = custody.frame_pool().and_then(|p| p.allocate_compound());
-        let (new_host_ptr, new_physical_ipa, owner_generation) = if let Some(handle) = pooled {
-            let host_ptr = handle.as_mut_ptr();
-            let physical_ipa = handle.ipa();
-            carrick_observability::probes::hvpatch_frame_pool_hit(0, physical_ipa);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    old_host,
-                    host_ptr,
-                    CowArmedRanges::COMPOUND_SIZE as usize,
-                );
-            }
-            let source = unsafe {
-                std::slice::from_raw_parts(
-                    old_host.cast_const(),
-                    CowArmedRanges::COMPOUND_SIZE as usize,
-                )
-            };
-            let destination = unsafe {
-                std::slice::from_raw_parts(
-                    host_ptr.cast_const(),
-                    CowArmedRanges::COMPOUND_SIZE as usize,
-                )
-            };
-            crate::probes::hvpatch_frame_cow_copy(
-                old_frame.raw(),
-                old_physical_ipa,
-                source,
-                destination,
-            );
-            drop(old_source);
-            let owner_generation = register_pooled_global_frame_host_owner_in(
-                custody,
-                handle,
-                u64::from(stage2_perms),
-            )?;
-            (host_ptr, physical_ipa, owner_generation)
+        let pooled = if fresh_destination {
+            custody.frame_pool().and_then(|p| p.allocate_compound())
         } else {
-            carrick_observability::probes::hvpatch_frame_pool_miss(0, 0);
-            let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-                CowArmedRanges::COMPOUND_SIZE as usize,
-                crate::host_mapping::HostMappingKind::FrameCow,
-            )
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("allocate frame COW backing: {error}"))
-            })?;
-            let new_host_ptr = new_host.as_ptr();
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    old_host,
-                    new_host_ptr,
-                    CowArmedRanges::COMPOUND_SIZE as usize,
-                );
-            }
-            let source = unsafe {
-                std::slice::from_raw_parts(
-                    old_host.cast_const(),
-                    CowArmedRanges::COMPOUND_SIZE as usize,
-                )
-            };
-            let destination = unsafe {
-                std::slice::from_raw_parts(
-                    new_host_ptr.cast_const(),
-                    CowArmedRanges::COMPOUND_SIZE as usize,
-                )
-            };
-            crate::probes::hvpatch_frame_cow_copy(
-                old_frame.raw(),
-                old_physical_ipa,
-                source,
-                destination,
-            );
-            drop(old_source);
-            let mut new_lease = GlobalFrameStage2Lease::reserve(
-                CowArmedRanges::COMPOUND_SIZE,
-                CowArmedRanges::COMPOUND_SIZE,
-            )?;
-            let new_physical_ipa = new_lease.base;
-            let map_result = unsafe {
-                inventory_hv_vm_map(
-                    new_host_ptr.cast(),
-                    new_physical_ipa,
-                    CowArmedRanges::COMPOUND_SIZE as usize,
-                    u64::from(stage2_perms),
-                )
-            };
-            if map_result != 0 {
-                return Err(TrapError::Hypervisor(format!(
-                    "map frame COW IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
-                )));
-            }
-            new_lease.mark_mapped();
-            let owner_generation = register_global_frame_host_owner_in(
-                custody,
-                new_lease,
-                new_host,
-                u64::from(stage2_perms),
-            )?;
-            (new_host_ptr, new_physical_ipa, owner_generation)
+            None
         };
+        let (new_host_ptr, new_physical_ipa, owner_generation) =
+            if let Some((destination, extent)) = &reused_destination {
+                // No published alias names this lane. Only the newly touched Linux
+                // page is refreshed; previously written neighbors are never copied.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        old_host.add(old_offset as usize),
+                        destination.host_addr().add(old_offset as usize),
+                        span.len,
+                    );
+                    crate::probes::hvpatch_frame_cow_copy(
+                        old_frame.raw(),
+                        old_ipa,
+                        std::slice::from_raw_parts(old_host.add(old_offset as usize), span.len),
+                        std::slice::from_raw_parts(
+                            destination.host_addr().add(old_offset as usize),
+                            span.len,
+                        ),
+                    );
+                }
+                drop(old_source);
+                (
+                    destination.host_addr(),
+                    destination.physical_ipa(),
+                    extent.stage2_owner.generation,
+                )
+            } else if let Some(handle) = pooled {
+                let host_ptr = handle.as_mut_ptr();
+                let physical_ipa = handle.ipa();
+                carrick_observability::probes::hvpatch_frame_pool_hit(0, physical_ipa);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        old_host,
+                        host_ptr,
+                        CowArmedRanges::COMPOUND_SIZE as usize,
+                    );
+                }
+                let source = unsafe {
+                    std::slice::from_raw_parts(
+                        old_host.cast_const(),
+                        CowArmedRanges::COMPOUND_SIZE as usize,
+                    )
+                };
+                let destination = unsafe {
+                    std::slice::from_raw_parts(
+                        host_ptr.cast_const(),
+                        CowArmedRanges::COMPOUND_SIZE as usize,
+                    )
+                };
+                crate::probes::hvpatch_frame_cow_copy(
+                    old_frame.raw(),
+                    old_physical_ipa,
+                    source,
+                    destination,
+                );
+                drop(old_source);
+                let owner_generation = register_pooled_global_frame_host_owner_in(
+                    custody,
+                    handle,
+                    u64::from(stage2_perms),
+                )?;
+                (host_ptr, physical_ipa, owner_generation)
+            } else {
+                carrick_observability::probes::hvpatch_frame_pool_miss(0, 0);
+                let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    CowArmedRanges::COMPOUND_SIZE as usize,
+                    crate::host_mapping::HostMappingKind::FrameCow,
+                )
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("allocate frame COW backing: {error}"))
+                })?;
+                let new_host_ptr = new_host.as_ptr();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        old_host,
+                        new_host_ptr,
+                        CowArmedRanges::COMPOUND_SIZE as usize,
+                    );
+                }
+                let source = unsafe {
+                    std::slice::from_raw_parts(
+                        old_host.cast_const(),
+                        CowArmedRanges::COMPOUND_SIZE as usize,
+                    )
+                };
+                let destination = unsafe {
+                    std::slice::from_raw_parts(
+                        new_host_ptr.cast_const(),
+                        CowArmedRanges::COMPOUND_SIZE as usize,
+                    )
+                };
+                crate::probes::hvpatch_frame_cow_copy(
+                    old_frame.raw(),
+                    old_physical_ipa,
+                    source,
+                    destination,
+                );
+                drop(old_source);
+                let mut new_lease = GlobalFrameStage2Lease::reserve(
+                    CowArmedRanges::COMPOUND_SIZE,
+                    CowArmedRanges::COMPOUND_SIZE,
+                )?;
+                let new_physical_ipa = new_lease.base;
+                let map_result = unsafe {
+                    inventory_hv_vm_map(
+                        new_host_ptr.cast(),
+                        new_physical_ipa,
+                        CowArmedRanges::COMPOUND_SIZE as usize,
+                        u64::from(stage2_perms),
+                    )
+                };
+                if map_result != 0 {
+                    return Err(TrapError::Hypervisor(format!(
+                        "map frame COW IPA 0x{new_physical_ipa:x}: 0x{map_result:x}"
+                    )));
+                }
+                new_lease.mark_mapped();
+                let owner_generation = register_global_frame_host_owner_in(
+                    custody,
+                    new_lease,
+                    new_host,
+                    u64::from(stage2_perms),
+                )?;
+                (new_host_ptr, new_physical_ipa, owner_generation)
+            };
         let new_ipa = new_physical_ipa
             .checked_add(old_offset)
             .ok_or_else(|| TrapError::Hypervisor("HVPatch COW semantic IPA overflow".to_owned()))?;
 
-        let backing = HvfVmState::private_backing_identity();
+        let backing = reused_extent.map_or_else(HvfVmState::private_backing_identity, |extent| {
+            extent.backing
+        });
         let split = match HvfVmState::stage_cow_inventory_split(
             &mut reservation,
             old_inventory_key,
@@ -41898,6 +42122,7 @@ impl HvfTaskState {
             &fragment_shapes,
             retirement,
             CowInventoryReplacementStage {
+                existing: reused_extent,
                 gpa: new_physical_ipa,
                 backing,
                 stage2_owner: InventoryStage2OwnerIdentity {
@@ -41908,11 +42133,13 @@ impl HvfTaskState {
         ) {
             Ok(split) => split,
             Err(error) => {
-                let _ = retire_global_frame_host_owner_in(
-                    custody,
-                    new_physical_ipa,
-                    CowArmedRanges::COMPOUND_SIZE,
-                );
+                if fresh_destination {
+                    let _ = retire_global_frame_host_owner_in(
+                        custody,
+                        new_physical_ipa,
+                        CowArmedRanges::COMPOUND_SIZE,
+                    );
+                }
                 return Err(error);
             }
         };
@@ -42126,11 +42353,13 @@ impl HvfTaskState {
                 );
                 std::process::abort();
             }
-            let _ = retire_global_frame_host_owner_in(
-                custody,
-                new_physical_ipa,
-                CowArmedRanges::COMPOUND_SIZE,
-            );
+            if fresh_destination {
+                let _ = retire_global_frame_host_owner_in(
+                    custody,
+                    new_physical_ipa,
+                    CowArmedRanges::COMPOUND_SIZE,
+                );
+            }
             return Err(error);
         }
         // Publication succeeded: the journalled pre-images are no longer needed.
@@ -42198,17 +42427,19 @@ impl HvfTaskState {
                 },
             );
         }
-        record_cow_inventory_lifecycle(
-            CowDiagnosticLifecycleKind::InventoryPublished,
-            CowDiagnosticLifecycleSite::CowCommit,
-            custody,
-            self.cow_identity,
-            self.mm_root_slot,
-            span.va,
-            span.len as u64,
-            split.new_key,
-            split.new_extent,
-        );
+        if fresh_destination {
+            record_cow_inventory_lifecycle(
+                CowDiagnosticLifecycleKind::InventoryPublished,
+                CowDiagnosticLifecycleSite::CowCommit,
+                custody,
+                self.cow_identity,
+                self.mm_root_slot,
+                span.va,
+                span.len as u64,
+                split.new_key,
+                split.new_extent,
+            );
+        }
         if retired_old_stage2 {
             {
                 // Exact physical-owner selection plus a single rebuild of
@@ -54526,6 +54757,7 @@ mod frame_inventory_backend_tests {
             "the planner must carry the backend/authority mismatch into commit",
         );
         let split = CowInventorySplit {
+            replacement_is_existing: false,
             old_key,
             old,
             fragments: Vec::new(),
@@ -55021,6 +55253,7 @@ mod frame_inventory_backend_tests {
             frames.stage2_references.insert(new_key, 1);
         }
         let split = CowInventorySplit {
+            replacement_is_existing: false,
             old_key,
             old,
             fragments: Vec::new(),
@@ -55107,6 +55340,7 @@ mod frame_inventory_backend_tests {
             },
         ];
         let split = CowInventorySplit {
+            replacement_is_existing: false,
             old_key,
             old,
             fragments,
@@ -55177,6 +55411,7 @@ mod frame_inventory_backend_tests {
             frames.stage2_references.insert(old_key, 1);
         }
         let split = CowInventorySplit {
+            replacement_is_existing: false,
             old_key,
             old,
             fragments: Vec::new(),
@@ -55281,6 +55516,199 @@ mod frame_inventory_backend_tests {
         let shape =
             HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &last_owner).unwrap();
         assert_eq!(shape.frames, std::collections::BTreeSet::from([frame]));
+    }
+
+    #[test]
+    fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
+        let old_key = (0x9b00_000000, 0x4000);
+        let new_key = (old_key.0 + 0x4000, 0x4000);
+        let old = InventoryExtent {
+            frame: carrick_hal::FrameId::from_kernel_allocation(id(91)),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(id(92)),
+            backing: InventoryBackingIdentity::Private(93),
+            stage2_base: old_key.0,
+            stage2_length: old_key.1,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
+        };
+        let new = InventoryExtent {
+            frame: carrick_hal::FrameId::from_kernel_allocation(id(94)),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(id(95)),
+            stage2_base: new_key.0,
+            ..old
+        };
+        let mut inventory = HvpatchFrameInventory::default();
+        for (key, extent) in [(old_key, old), (new_key, new)] {
+            inventory.extents.insert(key, extent);
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(extent.frame, 1);
+            frames
+                .extent_references
+                .insert((extent.frame, key.0, key.1), 1);
+            frames.stage2_references.insert(key, 1);
+        }
+        let mut reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([96; 32]),
+            carrick_hal::FrameInventoryBatch::prepare(
+                carrick_hal::KernelTransactionId::from_kernel_allocation(id(96)),
+                carrick_hal::FrameEventCapacity::for_event_count(2).unwrap(),
+            )
+            .unwrap(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut split = HvfVmState::stage_cow_inventory_split(
+            &mut reservation,
+            old_key,
+            old,
+            &[],
+            CowInventoryRetirementDecision {
+                retire_old_frame: true,
+                backend_frame_references_complete: true,
+            },
+            CowInventoryReplacementStage {
+                gpa: new_key.0,
+                backing: new.backing,
+                stage2_owner: new.stage2_owner,
+                existing: Some(new),
+            },
+        )
+        .unwrap();
+        assert_eq!(reservation.commit(()).batch().events().len(), 2);
+        split.new_extent.stage2_owner.generation += 1;
+        assert!(
+            HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || panic!(
+                "stale destination must fail before retirement"
+            ))
+            .is_err()
+        );
+        assert_eq!(inventory.extents[&old_key], old);
+        assert_eq!(inventory.extents[&new_key], new);
+        split.new_extent = new;
+        assert!(HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap());
+        assert_eq!(inventory.extents.len(), 1);
+        assert_eq!(inventory.extents[&new_key].mapping, new.mapping);
+        let frames = inventory.frames.lock();
+        assert_eq!(frames.references[&new.frame], 1);
+        assert_eq!(
+            frames.extent_references[&(new.frame, new_key.0, new_key.1)],
+            1
+        );
+        assert_eq!(frames.stage2_references[&new_key], 1);
+        assert!(!frames.references.contains_key(&old.frame));
+    }
+
+    #[test]
+    fn cow_lane_reuse_requires_an_unpublished_exact_owner_lane() {
+        let key = (0x9b00_000000, 0x4000);
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x3100_0000,
+            size: 0x4000,
+        };
+        let extent = InventoryExtent {
+            frame: carrick_hal::FrameId::from_kernel_allocation(id(81)),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(id(82)),
+            backing: InventoryBackingIdentity::Private(83),
+            stage2_base: key.0,
+            stage2_length: key.1,
+            stage2_owner: InventoryStage2OwnerIdentity {
+                host_addr: 0x7200_0000,
+                generation: 9,
+            },
+        };
+        let alias = AliasBacking {
+            start: 0x6000_040000,
+            ipa: key.0,
+            host_addr: extent.stage2_owner.host_addr,
+            size: 0x1000,
+            physical_ipa: key.0,
+            physical_host_addr: extent.stage2_owner.host_addr,
+            physical_size: key.1 as usize,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: scope,
+            inventory_backing: extent.backing,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: extent.stage2_owner.generation,
+        };
+        assert!(cow_lane_is_unpublished(
+            key,
+            extent,
+            scope,
+            0x1000,
+            &[alias]
+        ));
+        assert!(
+            !cow_lane_is_unpublished(key, extent, scope, 0, &[alias]),
+            "published lane"
+        );
+        assert!(
+            !cow_lane_is_unpublished(key, extent, scope, 0x4000, &[alias]),
+            "outside owner"
+        );
+        assert!(
+            !cow_lane_is_unpublished(key, extent, scope, 1, &[alias]),
+            "partial page"
+        );
+        assert!(
+            !cow_lane_is_unpublished(key, extent, scope, 0x1000, &[]),
+            "missing alias census"
+        );
+        for changed in [
+            AliasBacking {
+                owner_generation: 8,
+                ..alias
+            },
+            AliasBacking {
+                ownership_scope: AliasOwnershipScope::MmRootSlot {
+                    base: 0x3200_0000,
+                    size: 0x4000,
+                },
+                ..alias
+            },
+            AliasBacking {
+                size: 0x2000,
+                ..alias
+            },
+            AliasBacking {
+                host_addr: alias.host_addr + 0x1000,
+                ..alias
+            },
+            AliasBacking {
+                physical_size: 0x8000,
+                ..alias
+            },
+            AliasBacking {
+                ipa: u64::MAX - 0x100,
+                ..alias
+            },
+        ] {
+            assert!(
+                !cow_lane_is_unpublished(key, extent, scope, 0x1000, &[alias, changed]),
+                "every registered alias participates, including foreign/stale/malformed rows"
+            );
+        }
+        let second = AliasBacking {
+            start: alias.start + 0x2000,
+            ipa: key.0 + 0x2000,
+            host_addr: alias.host_addr + 0x2000,
+            ..alias
+        };
+        assert!(cow_lane_is_unpublished(
+            key,
+            extent,
+            scope,
+            0x1000,
+            &[alias, second]
+        ));
+        assert!(!cow_lane_is_unpublished(
+            key,
+            extent,
+            scope,
+            0x2000,
+            &[alias, second]
+        ));
     }
 
     #[test]
@@ -55521,6 +55949,7 @@ mod frame_inventory_backend_tests {
         .expect("plan COW with distant live projection");
         assert_eq!(shape.fragments, vec![old_key]);
         let split = CowInventorySplit {
+            replacement_is_existing: false,
             old_key: shape.old_key,
             old: shape.old,
             fragments: vec![CowInventoryFragment {
