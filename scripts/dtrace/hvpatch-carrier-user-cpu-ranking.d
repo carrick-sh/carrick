@@ -33,6 +33,33 @@
  * (c) Perturbation: moderate — one 24-frame user unwind at 1997 Hz per CPU
  * while the target is on CPU. Sample RANK and relative shares are citable;
  * absolute wall/CPU time under this script is not.
+ *
+ * (d) UNDER `carrick trace` THE STACKS COME OUT AS BARE ADDRESSES, and they
+ * are still fully recoverable — do not throw the capture away or re-run it
+ * under an external consumer (learned 2026-09-08, cpython-compile fault-cost
+ * attribution). `carrick trace` runs libdtrace IN-PROCESS inside the CLI,
+ * which is not the VM carrier, so the lazy `ustack()` symbol resolution has no
+ * process to grab and prints raw runtime addresses. Recover them offline:
+ *
+ *   1. The carrick binary is PIE with `__TEXT` at vmaddr `0x100000000` and
+ *      fileoff 0, so a runtime address maps to file offset `addr - load_base`
+ *      and the only unknown is `load_base`.
+ *   2. Every frame ABOVE the leaf is a RETURN address, so for the true
+ *      `load_base` the 4 bytes at `addr - 4 - load_base` decode as `BL`
+ *      (`insn >> 26 == 0b100101`) or `BLR` (`insn & 0xFFFFFC1F == 0xD63F0000`)
+ *      for essentially every sampled frame. Sweep `load_base` over the 16 KiB-
+ *      aligned candidates allowed by the observed address span and the
+ *      `__TEXT` vmsize (`otool -l`): the correct one scores ~100 %, every
+ *      other one ~12 %. Measured on the compile row: 248/248 vs 30/248, one
+ *      unambiguous winner (`0x102fe4000`).
+ *      Do NOT score by "does the offset land inside some symbol" — symbols are
+ *      contiguous, so every candidate scores 100 % and nothing is learned.
+ *   3. Then `atos -o <the exact binary> -l <load_base> <addr>...`.
+ *
+ * Attribute each SAMPLE to the highest-level owner in its stack (the first
+ * `munmap`/`resolve_mutating_fault`/`hv_vcpu_run` frame walking leaf→root),
+ * not to its leaf: the hot leaves are shared runtime helpers (`Vec::from_iter`,
+ * `memmove`) that say nothing on their own.
  */
 
 #pragma D option quiet

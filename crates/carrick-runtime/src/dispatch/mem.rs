@@ -1124,7 +1124,7 @@ pub(crate) struct MemState {
     pub resident_tracked_ranges: Vec<crate::vfs::GuestMemoryRange>,
     /// Shared-anon ranges that should fault once per guest page to become
     /// resident, with the protection to restore after that first touch.
-    resident_fault_ranges: Vec<ResidentFaultRange>,
+    resident_fault_ranges: FirstTouchArming,
     /// MAP_GROWSDOWN VMAs that may expand downward on a stack fault:
     /// `(low_bound, current_start, end)`.
     pub growdown_ranges: Vec<(u64, u64, u64)>,
@@ -1210,7 +1210,7 @@ impl MemState {
             locked_ranges: Vec::new(),
             resident_ranges: Vec::new(),
             resident_tracked_ranges: Vec::new(),
-            resident_fault_ranges: Vec::new(),
+            resident_fault_ranges: FirstTouchArming::default(),
             deferred_anonymous: std::sync::Arc::new(
                 carrick_guest_mem::DeferredAnonymousState::new(),
             ),
@@ -1570,38 +1570,160 @@ fn locked_ranges_total(ranges: &[crate::vfs::GuestMemoryRange]) -> u64 {
     ranges.iter().map(|range| range.len() as u64).sum()
 }
 
+/// Does a SORTED, MERGED, non-overlapping range set (the shape
+/// [`locked_ranges_insert`] and [`locked_ranges_remove`] maintain) contain
+/// `page`?
+///
+/// Binary search, not a scan: `fault_requires_mm_mutation` asks this of
+/// `resident_tracked_ranges` on EVERY guest fault, and a memory-hungry guest
+/// holds thousands of live anonymous extents.
 fn ranges_contain_page(ranges: &[crate::vfs::GuestMemoryRange], page: u64) -> bool {
+    let index = ranges.partition_point(|range| range.end().raw() <= page);
     ranges
-        .iter()
-        .any(|range| page >= range.start().raw() && page < range.end().raw())
+        .get(index)
+        .is_some_and(|range| range.start().raw() <= page)
 }
 
-fn remove_fault_range(ranges: &mut Vec<ResidentFaultRange>, remove: crate::vfs::GuestMemoryRange) {
-    let mut out = Vec::with_capacity(ranges.len());
-    for fault in ranges.drain(..) {
-        let range = fault.range;
-        if remove.end() <= range.start() || remove.start() >= range.end() {
-            out.push(fault);
-            continue;
-        }
-        if remove.start() > range.start()
-            && let Some(left) = crate::vfs::GuestMemoryRange::new(range.start(), remove.start())
+/// The first-touch ARMING set: the extents whose stage-1 leaves are
+/// deliberately invalid so the guest's first touch of each page traps, with
+/// the protection to publish when it does.
+///
+/// Every anonymous first touch consults and edits this set, so its
+/// representation IS a term of the per-fault cost. It used to be an unsorted
+/// `Vec<ResidentFaultRange>` that `resident_fault_plan` scanned linearly and
+/// that committing a single 4 KiB page REBUILT WHOLE — a fresh
+/// `Vec::with_capacity(n)` plus an n-element copy per fault — so the cost of
+/// one first touch grew with the number of live anonymous mappings in the mm.
+/// Measured on `target/conformance/eco-load/fault-population-reducer.sh`
+/// (one process, one 8,192-page batch per step): **12.0 µs per fault with an
+/// empty population, 36.5 µs with 8,000 untouched anonymous mappings held**.
+///
+/// A `BTreeMap` keyed by each extent's START gives the three operations the
+/// fault path needs in O(log n) with no whole-set rewrite: a page's arming is
+/// the last entry at or below it, and committing a page splits at most one
+/// entry. The set is non-overlapping by construction — [`Self::arm`] disarms
+/// what it covers before inserting — which is also what makes the "last entry
+/// at or below" lookup exact.
+#[derive(Clone, Default)]
+struct FirstTouchArming {
+    /// `start -> (end, prot)`, non-overlapping, ordered by `start`.
+    extents: std::collections::BTreeMap<u64, FirstTouchArm>,
+}
+
+#[derive(Clone, Copy)]
+struct FirstTouchArm {
+    end: u64,
+    prot: LinuxProtFlags,
+}
+
+impl FirstTouchArming {
+    /// Arm `range` for first-touch observation at `prot`, replacing whatever
+    /// armed the pages it covers.
+    fn arm(&mut self, range: crate::vfs::GuestMemoryRange, prot: LinuxProtFlags) {
+        self.disarm(range);
+        self.extents.insert(
+            range.start().raw(),
+            FirstTouchArm {
+                end: range.end().raw(),
+                prot,
+            },
+        );
+    }
+
+    /// The protection to publish for a first touch of `page`, or `None` when
+    /// no pending edit names it.
+    fn prot_for_page(&self, page: u64) -> Option<LinuxProtFlags> {
+        self.extents
+            .range(..=page)
+            .next_back()
+            .filter(|(_, arm)| page < arm.end)
+            .map(|(_, arm)| arm.prot)
+    }
+
+    /// Drop `range` from the set, keeping the parts of any extent that lie
+    /// outside it. This is the commit path for one page, so it must not touch
+    /// entries the range does not overlap.
+    fn disarm(&mut self, range: crate::vfs::GuestMemoryRange) {
+        let (start, end) = (range.start().raw(), range.end().raw());
+        // The one entry that may begin BEFORE `range` and still cover it.
+        if let Some((&head_start, &head)) = self.extents.range(..start).next_back()
+            && head.end > start
         {
-            out.push(ResidentFaultRange {
-                range: left,
-                prot: fault.prot,
-            });
+            self.extents.remove(&head_start);
+            self.insert_nonempty(head_start, start, head.prot);
+            if head.end > end {
+                self.insert_nonempty(end, head.end, head.prot);
+            }
         }
-        if remove.end() < range.end()
-            && let Some(right) = crate::vfs::GuestMemoryRange::new(remove.end(), range.end())
-        {
-            out.push(ResidentFaultRange {
-                range: right,
-                prot: fault.prot,
-            });
+        // Every entry that BEGINS inside `range`.
+        while let Some((&covered_start, &covered)) = self.extents.range(start..end).next() {
+            self.extents.remove(&covered_start);
+            if covered.end > end {
+                self.insert_nonempty(end, covered.end, covered.prot);
+            }
         }
     }
-    *ranges = out;
+
+    fn insert_nonempty(&mut self, start: u64, end: u64, prot: LinuxProtFlags) {
+        if end > start {
+            self.extents.insert(start, FirstTouchArm { end, prot });
+        }
+    }
+
+    /// The armed sub-ranges inside `range`, clipped to it — the pages an
+    /// explicit populate has to publish itself because their first touch will
+    /// never happen.
+    fn intersections(&self, range: crate::vfs::GuestMemoryRange) -> Vec<ResidentFaultRange> {
+        let (start, end) = (range.start().raw(), range.end().raw());
+        let head = self
+            .extents
+            .range(..start)
+            .next_back()
+            .filter(|(_, arm)| arm.end > start)
+            .map(|(&arm_start, arm)| (arm_start, *arm));
+        head.into_iter()
+            .chain(
+                self.extents
+                    .range(start..end)
+                    .map(|(&arm_start, arm)| (arm_start, *arm)),
+            )
+            .filter_map(|(arm_start, arm)| {
+                crate::vfs::GuestMemoryRange::new(
+                    GuestVa(arm_start.max(start)),
+                    GuestVa(arm.end.min(end)),
+                )
+                .map(|clipped| ResidentFaultRange {
+                    range: clipped,
+                    prot: arm.prot,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.extents
+            .range(..end)
+            .next_back()
+            .is_some_and(|(&arm_start, arm)| arm_start < end && arm.end > start)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.extents.len()
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = ResidentFaultRange> + '_ {
+        self.extents.iter().filter_map(|(&start, arm)| {
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(arm.end)).map(|range| {
+                ResidentFaultRange {
+                    range,
+                    prot: arm.prot,
+                }
+            })
+        })
+    }
 }
 
 /// The pages of `range` that lie inside a first-touch tracked extent and have
@@ -1624,25 +1746,6 @@ fn tracked_nonresident_subranges(
     }
     out.sort_by_key(|sub| sub.start().raw());
     out
-}
-
-fn fault_range_intersections(
-    ranges: &[ResidentFaultRange],
-    populate: crate::vfs::GuestMemoryRange,
-) -> Vec<ResidentFaultRange> {
-    ranges
-        .iter()
-        .filter_map(|fault| {
-            let start = fault.range.start().raw().max(populate.start().raw());
-            let end = fault.range.end().raw().min(populate.end().raw());
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).map(|range| {
-                ResidentFaultRange {
-                    range,
-                    prot: fault.prot,
-                }
-            })
-        })
-        .collect()
 }
 
 fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_end: u64) -> bool {
@@ -2584,7 +2687,7 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     locked_ranges_remove(&mut mem.locked_ranges, remove);
     locked_ranges_remove(&mut mem.resident_ranges, remove);
     locked_ranges_remove(&mut mem.resident_tracked_ranges, remove);
-    remove_fault_range(&mut mem.resident_fault_ranges, remove);
+    mem.resident_fault_ranges.disarm(remove);
     locked_ranges_remove(&mut mem.write_sealed_shared_maps, remove);
     locked_ranges_remove(&mut mem.secretmem_maps, remove);
     locked_ranges_remove(&mut mem.read_only_shared_file_maps, remove);
@@ -3626,10 +3729,11 @@ impl SyscallDispatcher {
         let page = page_floor(addr, self.linux_page_size());
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        let tracked = mem
-            .resident_tracked_ranges
-            .iter()
-            .any(|range| page >= range.start().raw() && page < range.end().raw())
+        // Binary search, not a scan: this classifier runs on EVERY guest
+        // fault and `resident_tracked_ranges` is one entry per live anonymous
+        // extent. `growdown_ranges` stays a scan — there is one entry per
+        // MAP_GROWSDOWN VMA and a process has a handful.
+        let tracked = ranges_contain_page(&mem.resident_tracked_ranges, page)
             || mem
                 .growdown_ranges
                 .iter()
@@ -8496,8 +8600,7 @@ impl SyscallDispatcher {
         let mem_authority_29 = self.mem();
         let mut mem = mem_authority_29.lock();
         locked_ranges_insert(&mut mem.resident_tracked_ranges, range);
-        mem.resident_fault_ranges
-            .push(ResidentFaultRange { range, prot });
+        mem.resident_fault_ranges.arm(range, prot);
     }
 
     /// Keep first-touch residency arming coherent across an arena `mprotect`.
@@ -8540,11 +8643,10 @@ impl SyscallDispatcher {
         }
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
-        remove_fault_range(&mut mem.resident_fault_ranges, range);
+        mem.resident_fault_ranges.disarm(range);
         if !prot.is_empty() {
             for sub in untouched {
-                mem.resident_fault_ranges
-                    .push(ResidentFaultRange { range: sub, prot });
+                mem.resident_fault_ranges.arm(sub, prot);
             }
         }
         Ok(())
@@ -8631,10 +8733,7 @@ impl SyscallDispatcher {
             || mem.locked_ranges.iter().any(overlaps)
             || mem.resident_ranges.iter().any(overlaps)
             || mem.resident_tracked_ranges.iter().any(overlaps)
-            || mem
-                .resident_fault_ranges
-                .iter()
-                .any(|fault| overlaps(&fault.range))
+            || mem.resident_fault_ranges.overlaps(start, end)
             || mem.write_sealed_shared_maps.iter().any(overlaps)
             || mem
                 .writable_memfd_maps
@@ -8675,12 +8774,7 @@ impl SyscallDispatcher {
         let page = page_floor(address, self.linux_page_size());
         let mem_authority_32 = self.mem();
         let mem = mem_authority_32.lock();
-        let prot = mem
-            .resident_fault_ranges
-            .iter()
-            .find(|fault| page >= fault.range.start().raw() && page < fault.range.end().raw())?
-            .prot
-            .bits();
+        let prot = mem.resident_fault_ranges.prot_for_page(page)?.bits();
         Some(ResidentFaultPlan {
             page,
             prot,
@@ -8722,7 +8816,7 @@ impl SyscallDispatcher {
         let mem_authority_33 = self.mem();
         let mut mem = mem_authority_33.lock();
         locked_ranges_insert(&mut mem.resident_ranges, range);
-        remove_fault_range(&mut mem.resident_fault_ranges, range);
+        mem.resident_fault_ranges.disarm(range);
     }
 
     fn populate_resident_range(
@@ -8733,7 +8827,7 @@ impl SyscallDispatcher {
         let faults = {
             let mem_authority_34 = self.mem();
             let mem = mem_authority_34.lock();
-            fault_range_intersections(&mem.resident_fault_ranges, range)
+            mem.resident_fault_ranges.intersections(range)
         };
         for fault in &faults {
             let len = range_len_usize(fault.range)?;
@@ -8744,7 +8838,7 @@ impl SyscallDispatcher {
         let mem_authority_35 = self.mem();
         let mut mem = mem_authority_35.lock();
         locked_ranges_insert(&mut mem.resident_ranges, range);
-        remove_fault_range(&mut mem.resident_fault_ranges, range);
+        mem.resident_fault_ranges.disarm(range);
         Ok(())
     }
 
@@ -8937,7 +9031,7 @@ impl SyscallDispatcher {
         locked_ranges_remove(&mut mem.locked_ranges, range);
         locked_ranges_remove(&mut mem.resident_ranges, range);
         locked_ranges_remove(&mut mem.resident_tracked_ranges, range);
-        remove_fault_range(&mut mem.resident_fault_ranges, range);
+        mem.resident_fault_ranges.disarm(range);
         Ok(())
     }
 

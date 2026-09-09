@@ -6978,10 +6978,7 @@ fn range_owned_metadata_removal_clears_every_mmap_classification() {
         locked_ranges_insert(&mut mem.locked_ranges, range);
         locked_ranges_insert(&mut mem.resident_ranges, range);
         locked_ranges_insert(&mut mem.resident_tracked_ranges, range);
-        mem.resident_fault_ranges.push(ResidentFaultRange {
-            range,
-            prot: LinuxProtFlags::READ,
-        });
+        mem.resident_fault_ranges.arm(range, LinuxProtFlags::READ);
         locked_ranges_insert(&mut mem.write_sealed_shared_maps, range);
         mem.writable_memfd_maps.push((range, writable_memfd));
     }
@@ -7028,10 +7025,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         locked_ranges_insert(&mut mem.locked_ranges, whole);
         locked_ranges_insert(&mut mem.resident_ranges, whole);
         locked_ranges_insert(&mut mem.resident_tracked_ranges, whole);
-        mem.resident_fault_ranges.push(ResidentFaultRange {
-            range: whole,
-            prot: LinuxProtFlags::READ,
-        });
+        mem.resident_fault_ranges.arm(whole, LinuxProtFlags::READ);
         locked_ranges_insert(&mut mem.write_sealed_shared_maps, whole);
         mem.writable_memfd_maps
             .push((whole, std::sync::Arc::clone(&writable_memfd)));
@@ -7085,8 +7079,13 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
     assert_eq!(mem.resident_tracked_ranges, expected_ranges);
     assert_eq!(mem.write_sealed_shared_maps, expected_ranges);
     assert_eq!(mem.resident_fault_ranges.len(), 2);
-    assert_eq!(mem.resident_fault_ranges[0].range, expected_ranges[0]);
-    assert_eq!(mem.resident_fault_ranges[1].range, expected_ranges[1]);
+    assert_eq!(
+        mem.resident_fault_ranges
+            .iter()
+            .map(|fault| fault.range)
+            .collect::<Vec<_>>(),
+        expected_ranges
+    );
     assert!(
         mem.resident_fault_ranges
             .iter()
@@ -9399,4 +9398,111 @@ fn vma_map_mutation_complexity_is_logarithmic_plus_affected() {
         remove_visits <= MAX_VISITS_BOUND,
         "remove visited {remove_visits} entries; expected <= {MAX_VISITS_BOUND} (O(log N + affected))"
     );
+}
+
+/// The first-touch arming set is what `resident_fault_plan` asks and what
+/// `commit_resident_fault` edits on every anonymous first touch. It replaced an
+/// unsorted `Vec` that was scanned linearly and rebuilt whole per committed
+/// page; these cases pin the answers that migration must not change — the
+/// boundary conditions of the "last extent at or below the page" lookup and the
+/// prefix/suffix split a one-page commit leaves behind.
+#[test]
+fn first_touch_arming_answers_and_splits_exactly_like_a_scan() {
+    let page = LINUX_PAGE_SIZE;
+    let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+    let range = |start: u64, end: u64| {
+        crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("range")
+    };
+    let mut arming = FirstTouchArming::default();
+    arming.arm(range(base, base + 4 * page), LinuxProtFlags::READ);
+    arming.arm(
+        range(base + 8 * page, base + 10 * page),
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+    );
+
+    // Lookup is exact at both edges of both extents, and the gap between them
+    // is unarmed — the case a "last entry at or below" search gets wrong if it
+    // forgets to check the end.
+    assert_eq!(arming.prot_for_page(base), Some(LinuxProtFlags::READ));
+    assert_eq!(
+        arming.prot_for_page(base + 3 * page),
+        Some(LinuxProtFlags::READ)
+    );
+    assert_eq!(arming.prot_for_page(base + 4 * page), None);
+    assert_eq!(arming.prot_for_page(base + 7 * page), None);
+    assert_eq!(
+        arming.prot_for_page(base + 9 * page),
+        Some(LinuxProtFlags::READ | LinuxProtFlags::WRITE)
+    );
+    assert_eq!(arming.prot_for_page(base - page), None);
+
+    // Committing one page in the middle leaves the prefix and the suffix armed
+    // at the same protection, and disarms exactly that page.
+    arming.disarm(range(base + 2 * page, base + 3 * page));
+    assert_eq!(
+        arming.prot_for_page(base + page),
+        Some(LinuxProtFlags::READ)
+    );
+    assert_eq!(arming.prot_for_page(base + 2 * page), None);
+    assert_eq!(
+        arming.prot_for_page(base + 3 * page),
+        Some(LinuxProtFlags::READ)
+    );
+    assert_eq!(
+        arming
+            .iter()
+            .map(|fault| (fault.range.start().raw(), fault.range.end().raw()))
+            .collect::<Vec<_>>(),
+        vec![
+            (base, base + 2 * page),
+            (base + 3 * page, base + 4 * page),
+            (base + 8 * page, base + 10 * page),
+        ]
+    );
+
+    // `intersections` clips to the populated range and reports an extent that
+    // merely OVERLAPS its start, not only extents that begin inside it.
+    let populate = range(base + 3 * page + 8, base + 9 * page);
+    assert_eq!(
+        arming
+            .intersections(populate)
+            .into_iter()
+            .map(|fault| (
+                fault.range.start().raw(),
+                fault.range.end().raw(),
+                fault.prot
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (base + 3 * page + 8, base + 4 * page, LinuxProtFlags::READ),
+            (
+                base + 8 * page,
+                base + 9 * page,
+                LinuxProtFlags::READ | LinuxProtFlags::WRITE
+            ),
+        ]
+    );
+
+    // A disarm spanning several extents removes every covered one and keeps
+    // only the uncovered tail.
+    arming.disarm(range(base + page, base + 9 * page));
+    assert_eq!(
+        arming
+            .iter()
+            .map(|fault| (fault.range.start().raw(), fault.range.end().raw()))
+            .collect::<Vec<_>>(),
+        vec![(base, base + page), (base + 9 * page, base + 10 * page)]
+    );
+
+    // Re-arming a range replaces what covered it rather than shadowing it, so
+    // the newest VMA over those pages owns their protection.
+    arming.arm(range(base, base + 2 * page), LinuxProtFlags::WRITE);
+    assert_eq!(arming.prot_for_page(base), Some(LinuxProtFlags::WRITE));
+    assert_eq!(
+        arming.prot_for_page(base + page),
+        Some(LinuxProtFlags::WRITE)
+    );
+    assert_eq!(arming.len(), 2);
+    assert!(arming.overlaps(base, base + page));
+    assert!(!arming.overlaps(base + 2 * page, base + 9 * page));
 }
