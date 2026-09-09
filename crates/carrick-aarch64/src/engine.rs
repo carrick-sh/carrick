@@ -1245,6 +1245,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                  ttbr0={entry_ttbr0:#x}/{maint_ttbr0:#x}"
             )));
         }
+        carrick_observability::probes::hvpatch_tlb_invalidation(u32::from(asid), 0, 0);
         let result = loop {
             match vcpu.run() {
                 Ok(Aarch64Exit::MaintenanceDone) => break Ok(()),
