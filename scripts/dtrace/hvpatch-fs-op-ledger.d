@@ -4,7 +4,7 @@
  *
  * (a) WHAT IT MEASURES. For every guest syscall whose name is in the fs set
  *     below (openat, close, unlinkat, newfstatat, mkdirat, renameat,
- *     fstat, faccessat, readlinkat, getdents64, statx), keyed by name:
+ *     fstat, faccessat, readlinkat, getdents64, statx, mmap, munmap), keyed by name:
  *       @wall        quantize of the service window (syscall-entry -> -return)
  *       @wall_sum    total window ns
  *       @host_n      quantize of host syscalls issued inside ONE window
@@ -37,6 +37,12 @@
  *     shares) are citable. Bounded: exits at $1 seconds (default 120) with an
  *     explicit `section=truncated` marker.
  *
+ * 2026-09-09: natural target completion is now fail-closed: require paired
+ * FS windows, a successful target exit, nonzero windows and zero DTrace
+ * errors. mmap/munmap are included for exec startup attribution. Host/guest
+ * counters and the target-exit ABI are requalified by each retained capture;
+ * nanoseconds remain perturbed diagnostic values, never acceptance timing.
+ *
  * Usage:
  *   carrick trace -s scripts/dtrace/hvpatch-fs-op-ledger.d -- run ... (auto-sudo)
  *   sudo dtrace -q -s scripts/dtrace/hvpatch-fs-op-ledger.d 60 -c "<command>"
@@ -50,20 +56,24 @@
 
 dtrace:::BEGIN
 {
-	secs = 0;
+	self->fs = 0;
+	secs = 0; fs_entries = 0; fs_returns = 0; errors = 0; seen = 0; code = -1; bounded = 0;
 	limit = $1 != 0 ? $1 : 120;
 }
 
 carrick*:::syscall-entry
 /pid == $target || progenyof($target)/
 {
+	errors += self->fs != 0;
 	this->name = copyinstr(arg1);
 	self->fs = (this->name == "openat" || this->name == "close" ||
 	    this->name == "unlinkat" || this->name == "newfstatat" ||
 	    this->name == "mkdirat" || this->name == "renameat" ||
 	    this->name == "fstat" || this->name == "faccessat" ||
 	    this->name == "readlinkat" || this->name == "getdents64" ||
-	    this->name == "statx") ? 1 : 0;
+	    this->name == "statx" || this->name == "mmap" ||
+	    this->name == "munmap") ? 1 : 0;
+	fs_entries += self->fs;
 	/* arg2 is the ADDRESS of the guest's SyscallArgs ([u64; 6]); a creating
 	 * openat (Linux O_CREAT = 0x40 in args[2]) is a different operation
 	 * from an open of an existing entry and is ledgered under its own key. */
@@ -78,6 +88,7 @@ carrick*:::syscall-entry
 carrick*:::syscall-return
 /(pid == $target || progenyof($target)) && self->fs/
 {
+	fs_returns++;
 	this->w = timestamp - self->t0;
 	@wall[self->guest] = quantize(this->w);
 	@wall_sum[self->guest] = sum(this->w);
@@ -115,6 +126,17 @@ syscall:::entry
 	@outside_fn[probefunc] = count();
 }
 
+syscall::exit:entry
+/pid == $target/
+{ seen = 1; code = (int)arg0; }
+
+proc:::exit
+/pid == $target/
+{ exit(seen && code == 0 && fs_entries > 0 && fs_entries == fs_returns && errors == 0 ? 0 : 2); }
+
+dtrace:::ERROR
+{ errors++; exit(3); }
+
 tick-1s
 {
 	secs++;
@@ -123,12 +145,14 @@ tick-1s
 tick-1s
 /secs >= limit/
 {
+	bounded = 1;
 	printf("section=truncated after %d s\n", secs);
 	exit(2);
 }
 
 dtrace:::END
 {
+	printf("FSLEDGER|summary|entries=%d|returns=%d|errors=%d|seen=%d|code=%d|bounded=%d\n", fs_entries, fs_returns, errors, seen, code, bounded);
 	printf("section=calls\n");
 	printa("guest=%s calls=%@d\n", @calls);
 	printf("section=wall-vs-kernel-ns\n");

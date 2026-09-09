@@ -981,3 +981,59 @@ benefit; the paired base/candidate comparison supplies that number.
 code is accepted as a small measured improvement. The required new host-PID
 inventory review and position reconciliation follow the code commit; domain
 closure is not claimed until that check passes. No push is authorized or made.
+
+
+### Entropy inventory closure and next attribution
+
+The entropy code is committed as `9c4002871`. Host PID use is explicitly
+reviewed as `HA-000649`: current-host identity invalidates inherited entropy
+only. The first domain retry caught noncanonical ordering of the appended
+review row; the next caught shifted K1 inventory positions with unchanged
+operation counts. The review was reordered without content changes, then 215
+K1 line numbers were reconciled with identical operation contents and taxonomy.
+The complete `just lint-domains` now passes
+(`entropy-batch-lint-domains-reconciled.log`). The host-authority receipt remains
+a macOS subset and does not qualify the pending non-macOS profiles.
+
+`hvpatch-fs-op-ledger.d` now includes mmap/munmap and fails closed on missing
+windows, unpaired windows, DTrace errors, or an unsuccessful target exit. The
+first compile exposed an undeclared TLS type in the new overlap check, before
+any guest execution; an explicit BEGIN initialization fixed it. A zero-window
+`--version` negative control now rejects an otherwise successful target.
+`entropy-fs-ledger.raw` completes 50 Python children with 8,327 balanced FS
+windows, zero errors, successful target and no bound. Its 19.99 ms mean is
+heavily perturbed; counts and syscall shapes, not time, are the evidence.
+The census includes parent Python startup as well as the children.
+
+| Guest operation | Calls | Host calls / guest call |
+|---|---:|---:|
+| mmap | 1,198 | 1.53 |
+| openat (non-create) | 1,290 | 2.14 |
+| getdents64 | 518 | 6.46 |
+| fstat | 1,265 | 2.02 |
+
+The directory path uses getdirentries64 plus descriptor setup/teardown; source
+inspection confirms its listing is already cached after the first read, so
+repeated full directory enumeration per getdents call is refuted. mmap/openat
+remain comparable attribution targets; counts alone do not prove removable
+work. `entropy-fs-ledger-analysis.json` retains the full breakdown.
+
+A same-boot host shared-cache `dladdr` lookup resolves previously anonymous
+user-library frames in the existing exact-binary packing CPU sample
+(`pack-cpu-host-symbols.json`, boot receipt alongside it). This independently
+identifies the reservation syscall as getentropy and exposes a stronger copy
+lead: 87 samples show bzero under `build_linux_initial_stack`, while 37 show
+memmove under `prepare_exec_region_raw_in` and 28 under `execve_rebuild_inner`.
+These are old, perturbed samples, not a new measured saving. Source confirms
+`LINUX_STACK_SIZE` is 8 MiB and `build_linux_initial_stack` allocates and zeros
+that entire buffer before writing argv/env/auxv near its top. Exact copy sizes
+and the minimal initialized tail still need qualification.
+
+The next greedy experiment should quantify that initial-stack payload versus
+full-size zero/copy work before changing representation. Preserve the complete
+semantic stack extent, zero-filled untouched memory, page alignment, argument
+limits, auxv/AT_RANDOM/AT_EXECFN addresses, rollback and fork isolation. Compare
+this measurable copy hypothesis against the remaining filesystem cost before
+committing to smaller descriptor-wrapper savings. No stack/runtime change is
+present at this checkpoint. Current accepted normal spawn remains 12.310 ms /
+4.449 ms = 2.77x; the <=2x goal remains active.
