@@ -697,3 +697,118 @@ larger COW hypothesis. Reusing lanes needs an authenticated, MM-local occupancy
 record and an exclusivity check that remains valid across fork; the preserved
 source path may be useful inside that transaction but has no accepted benefit
 on its own. No new performance improvement or final gate is claimed here.
+
+### Destination lane reuse candidate: mechanism and first paired evidence
+
+An uncommitted candidate now reuses an unpublished 4 KiB lane of a neighboring
+private compound. Selection occurs under COW quiescence/topology. It requires
+one backend frame reference, one exact extent reference, one stage-2 reference,
+one authoritative kernel mapping, an exact live MappingId/FrameId/extent, and
+an exact pinned host-owner generation. Every alias in the physical-start bucket
+must name that owner and this MM, and none may cover the lane. Stale, foreign,
+malformed or overlapping aliases decline reuse. No occupancy cache is retained
+across fork or remapping. Eligibility is restricted to guest-visible, 4 KiB,
+non-kernel private-file COW; other paths retain fresh-owner allocation.
+
+The copy refreshes only the touched page. The inventory transaction keeps the
+existing destination identity/reference counts and still splits/retires source
+coverage. Failed publication does not retire the reused owner: the written lane
+was unpublished and will be refreshed again before a later publication attempt.
+The source-mapping optimization rejected above is not included. Foreign COW
+continues to allocate fresh destinations.
+
+Red-first checks: `pack-lane-red.log` refused the valid free-lane case with a
+conservative stub; `pack-inventory-red.log` rejected an existing destination as
+a collision. The implemented checks also reject occupied/foreign/stale aliases,
+and the commit test verifies unchanged destination counts plus stale-owner
+rejection before source mutation. `pack-integrated-unit.log`: 473 HVF host
+tests passed, three ignored. `pack-runtime-unit.log`: 2,577 runtime host tests
+passed, two ignored.
+
+`private_file_cow_lanes.rs` runs an in-process regression with the exact Python
+fixture under `tests/workloads/`: fresh file bytes on a second COW, preservation
+of dirty neighbors, clean-page visibility, and independent parent/child writes
+to both previously dirty and still-clean pages. Native arm64 Docker passed on
+the pinned image (`pack-lanes-oracle.json`), then the signed embed runner passed
+with its unentitled negative control and zero remaining scoped guests
+(`pack-lanes-embed.log`). The initial runner command incorrectly supplied cargo's
+`--test` flag; it was rejected before execution and rerun with the supported
+exact libtest filter. These semantic assertions are regression coverage; the
+pre-change runtime is not claimed semantically wrong by this optimization.
+
+The first signed development artifact, SHA-256
+`fe5ff30b9038ec84934555abef89ecdf9b7ba3d93ede26f2eb09cfe4e0c7f426`,
+completed ten children with 322 COW transactions but only 87 destination owners
+each (`pack-candidate-analysis.json`). All phase triples balanced. The census
+parser now keys transactions by semantic page/source/destination, since a
+destination FrameId is intentionally reusable across pages. Original captures
+and a synthetic repeated-destination parser control still validate.
+
+Two untraced ABBA comparisons show a useful relative gain:
+
+| Artifact | Command | Base mean ms | Candidate mean ms |
+|---|---|---:|---:|
+| Initial | true | 2.07522 | 2.06531 |
+| Initial | Python -S | 12.47446 | 11.46547 |
+| Initial | Python | 13.98807 | 12.88705 |
+| Copy diagnostic restored, unarmed | true | 2.24059 | 2.26558 |
+| Copy diagnostic restored, unarmed | Python -S | 13.12178 | 11.86317 |
+| Copy diagnostic restored, unarmed | Python | 14.47563 | 13.31865 |
+
+Normal spawn improves about 8% in both pairs. True changes -0.48% then +1.12%,
+so its control result is inconclusive, not a demonstrated improvement. This is
+not yet a fresh oracle ratio or final acceptance.
+
+The rebuilt candidate emits copy hashes for the exact refreshed 4 KiB range.
+`hvpatch-cow-copy-census.d` is a separate, deliberately perturbing content/count
+instrument: `pack-copy.raw` records 3,557 copies, 2,588 at 4 KiB and 969 at
+16 KiB, 26,476,544 total bytes, equal source/destination hashes, successful
+target and no errors/bound termination. `pack-copy-provenance.json` binds the
+new artifact and source diff; `pack-copy-abba.json` measures it with probes
+unarmed. The existing whole-compound fork-fixture validator remains unchanged
+and cannot qualify the page-reuse path; the new census does not claim its
+stronger fork-ordering proof.
+
+The public full probe gate completed successfully (`pack-full-probes.log`, run
+ID `execdiag-sep09-pack-probes`): 876 unique generic announcements (438 musl,
+438 gnu), 25 case tests including the new regression, both unentitled negative
+controls, the CLI contract, and the retained harness (46 passed, one ignored).
+The amd64 musl lane has 30 report-only DIFFs and the gnu binaries are absent;
+this is not x86 acceptance. The exact gated CLI is saved as `carrick-pack-gated`,
+SHA-256 `b9b8195edccf6f56b4fde053af709aa409be96fe37e93742f19b4597d7030bf3`;
+`pack-gated-provenance.json` records signature, UUID, entitlement and DOF.
+Full CPython ABBA, clippy/inventory reconciliation, a fresh same-image oracle
+and final artifact acceptance remain pending. Runtime/test changes are intentionally uncommitted
+until those results are reviewed. The <=2x objective remains active.
+
+
+### Destination lane reuse validation completed
+
+The full pinned CPython ABBA completed with MATCH in all eight suite results
+(`cpython-pack-abba.json`, `cpython-pack-summary.json`). Each arm has 39 passing
+multiprocessing cases and 297 passing subprocess cases. The fresh oracle took
+3.053 s and 20.603 s respectively. Baseline/candidate means were 9.9575/9.665 s
+for multiprocessing and 59.3895/59.120 s for subprocess. Subprocess is effectively
+unchanged; multiprocessing varies enough that its apparent 2.9% improvement is
+tentative. Neither suite meets 2x. No full-suite 8% gain is claimed.
+
+A subsequent serial Docker/base/candidate/candidate/base/Docker microbenchmark
+on the exact gated binary refreshed the pinned arm64 oracle (`pack-refresh.json`,
+`pack-refresh-summary.json`, `pack-refresh-image.json`):
+
+| Command | Docker ms | Base ms | Candidate ms | Candidate / Docker |
+|---|---:|---:|---:|---:|
+| true | 0.15832 | 2.16704 | 2.12612 | 13.43x |
+| Python -S | 3.73900 | 12.92697 | 11.76346 | 3.15x |
+| Python | 4.59645 | 14.36835 | 13.25350 | 2.88x |
+
+Normal spawn saves 1.11485 ms (7.76%), consistent with both earlier pairs.
+Another 4.06061 ms must be removed to reach 2x this contemporaneous oracle.
+True remains a much larger ratio because its useful execution is very short;
+its small relative change is not the basis for accepting this optimization.
+`just clippy` passed (`pack-clippy.log`), as did `git diff --check`. The candidate
+is accepted as a scoped reduction in COW allocation amplification. Inventory
+position reconciliation remains to be completed after the code commit. The
+next greedy step is to refresh CPU attribution on this exact artifact, since
+its reduced allocation and retirement work can change the prior ranking.
+The full <=2x goal remains active.

@@ -45,7 +45,11 @@ def analyze(trace, stdout, stderr, expected):
     require(len(events) == summary["events"] > 0, "event count mismatch")
     transactions = collections.defaultdict(list)
     for row in events:
-        transactions[row["guest"], row["mm"], row["new_frame"]].append(row)
+        # Packed COW may reuse a destination FrameId for different semantic
+        # pages. Authenticate each source/page/destination triple separately;
+        # repeated indistinguishable transactions still fail phase balance.
+        transactions[row["guest"], row["mm"], row["va"], row["old_frame"],
+                     row["old_ipa"], row["new_frame"]].append(row)
     committed = []
     for identity, phases in transactions.items():
         require(sorted(p["phase"] for p in phases) == [0, 1, 2],
