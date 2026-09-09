@@ -1811,3 +1811,26 @@ Receipts: private-file-replacement-reviewed-{hvf,clippy,signed}.log and copied
 signed manifest. The earlier 1.969x screen predates this eligibility recheck;
 it is not final timing for the reviewed source. Preparing narrow local-main
 commits now; inventories, full public gate and final timings remain outstanding.
+
+### Committed-source inventory review
+
+Main is now 600c5abcd after separate boot-discard (557f1c4c0), replacement
+transaction (c97335657), diagnostics (b143ec66e), and evidence commits. Verified
+clean tracked tree and linear ancestry from 49e28af35, with no push.
+
+The inventory reconciler captured this committed source and rebound 28 host
+authority rows, 18 dispatch lock rows and 24 K1 taxonomy positions. It correctly
+refused semantic changes. Reviewed 14 abort-function moves (three retirement,
+eleven publication) preserving their classifications/rationales, plus one new
+carrier-fault abort after committed replacement retirement fails. Reviewed
+seven added K1 mapping lexical entries: four boot-VMA boundary metadata accesses
+and three retained loaded-image range accesses; no new file authority operation.
+Other inventory changes are positions and capture metadata; rationale changes
+only update source-line prefixes. Preserve prior abort row order to avoid churn.
+
+The initial just lint-domains passed strategy/shard, semgrep, runtime global
+state, abort, task-participant and MM-authority checks, then stopped because
+the host-authority check requires a clean tracked snapshot (inventory edits
+were uncommitted). This is not a green full gate. Commit reviewed inventories
+and rerun the complete gate before final public signing/timing qualification.
+Receipt: replacement-inventory-reconcile.log and replacement-lint-domains.log.

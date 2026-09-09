@@ -716,7 +716,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::unregister_process_alias",
+      "function": "HvfVmState::commit_process_alias_retirement",
       "ordinal_in_function": 1,
       "fingerprint": "fdb990d1eb6a2f8114f40765e88e43771a6dafee9d9e62f3052c1a6da3c56f94",
       "verdict": "carrier_fault",
@@ -725,7 +725,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::unregister_process_alias",
+      "function": "HvfVmState::commit_process_alias_retirement",
       "ordinal_in_function": 2,
       "fingerprint": "213b9edc67b2824b934b39d2b6436f93a87d47911713dec5cda6076c5231df41",
       "verdict": "carrier_fault",
@@ -734,7 +734,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "function": "HvfVmState::unregister_process_alias",
+      "function": "HvfVmState::commit_process_alias_retirement",
       "ordinal_in_function": 3,
       "fingerprint": "8c2c7890e7ddbcfc1fdcb2ee0a74b2e2cd78d9c4dd9d6ecd0c94af222be26d46",
       "verdict": "carrier_fault",
@@ -1166,7 +1166,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 1,
       "fingerprint": "35af18808756199586eb3cabfb12ec2681f3b6bcc1acbea2711a16217bdcc5ee",
       "verdict": "carrier_fault",
@@ -1175,7 +1175,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 2,
       "fingerprint": "6915e0db907a2a25f76504bc62d96ba50e2a6f2920a0bbf0cca0e819d5b7ea62",
       "verdict": "carrier_fault",
@@ -1184,7 +1184,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 3,
       "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
       "verdict": "carrier_fault",
@@ -1193,7 +1193,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 4,
       "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
       "verdict": "carrier_fault",
@@ -1202,7 +1202,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 5,
       "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
       "verdict": "carrier_fault",
@@ -1211,7 +1211,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 6,
       "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
       "verdict": "carrier_fault",
@@ -1220,7 +1220,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 7,
       "fingerprint": "4f61180e15c7366278e6cb2bfa172cf2b067d1d8da563b5084a4abca1aaf4398",
       "verdict": "carrier_fault",
@@ -1229,7 +1229,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 8,
       "fingerprint": "7df09cebf797bab16616bd4deafc3f358025ebbe51f53a36c610689ce15e3c75",
       "verdict": "carrier_fault",
@@ -1238,7 +1238,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 9,
       "fingerprint": "c7d8981e7f7bb0ed08916f05ab40779c0149cdfe3ace82828721c0f2d2ed0873",
       "verdict": "carrier_fault",
@@ -1247,7 +1247,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 10,
       "fingerprint": "c7d8981e7f7bb0ed08916f05ab40779c0149cdfe3ace82828721c0f2d2ed0873",
       "verdict": "carrier_fault",
@@ -1256,7 +1256,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish",
+      "function": "publish_replacing",
       "ordinal_in_function": 11,
       "fingerprint": "c7d8981e7f7bb0ed08916f05ab40779c0149cdfe3ace82828721c0f2d2ed0873",
       "verdict": "carrier_fault",
@@ -1424,6 +1424,15 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Replay epoch exhaustion after an external alias mutation prevents distinct versioning of changed physical replay state, allowing stale replay authentication."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "function": "HvfVmState::materialize_sparse_mmap_extent_inner",
+      "ordinal_in_function": 1,
+      "fingerprint": "3acfde78992b0f53a8c8dd528ce6c5da29e6e4346f359596370ff8e92fccff65",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::host_alias",
+      "rationale": "Retirement failed after replacement descriptors and inventory committed. Preparation has already reserved retirement events; returning an ordinary guest error here would expose divergent alias and frame ownership. Stop the carrier rather than continue with an invalid lifetime graph."
     }
   ]
 }
