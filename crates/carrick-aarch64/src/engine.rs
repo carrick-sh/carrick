@@ -1862,14 +1862,15 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         offset: u64,
         source: carrick_guest_mem::PrivateFileSource,
     ) -> Result<bool, MemoryError> {
-        let in_sparse_arena = self.process_asid.is_some()
+        let eligible_range = self.process_asid.is_some()
             && self.vm.sparse_mmap_arena_enabled()
-            && va >= carrick_mem::memory::LINUX_MMAP_BASE
-            && va.checked_add(len as u64).is_some_and(|end| {
-                end <= carrick_mem::memory::LINUX_MMAP_BASE
-                    .saturating_add(carrick_mem::memory::mmap_arena_size())
-            });
-        if !in_sparse_arena || len == 0 {
+            && ((va >= carrick_mem::memory::LINUX_MMAP_BASE
+                && va.checked_add(len as u64).is_some_and(|end| {
+                    end <= carrick_mem::memory::LINUX_MMAP_BASE
+                        .saturating_add(carrick_mem::memory::mmap_arena_size())
+                }))
+                || carrick_mem::memory::va_in_shared_aperture(va, len as u64));
+        if !eligible_range || len == 0 {
             return Ok(false);
         }
         // Same editor precondition as `ensure_sparse_mmap_backing`: a fresh

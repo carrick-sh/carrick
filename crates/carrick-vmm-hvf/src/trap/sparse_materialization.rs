@@ -263,13 +263,14 @@ fn file_view_allocation_layout(
         || !start.is_multiple_of(4096)
         || !end.is_multiple_of(4096)
         || !offset.is_multiple_of(4096)
-        || start & (HVF_PAGE_SIZE - 1) != offset & (HVF_PAGE_SIZE - 1)
     {
         return Err(TrapError::Hypervisor(
             "invalid sparse private-file view range".to_owned(),
         ));
     }
-    let delta = start & (HVF_PAGE_SIZE - 1);
+    // The host view is aligned around the file offset, not the semantic VA.
+    // Stage-1 maps the guest's 4 KiB VA to this independently aligned IPA.
+    let delta = offset & (HVF_PAGE_SIZE - 1);
     let length = align_up(
         delta
             .checked_add(end - start)
@@ -317,13 +318,16 @@ mod tests {
             (4096, 4096, 4096, HVF_PAGE_SIZE),
             (3 * 4096, 3 * 4096, 8192, 2 * HVF_PAGE_SIZE),
             (HVF_PAGE_SIZE, 0, 5 * 4096, 2 * HVF_PAGE_SIZE),
+            (0, 4096, 4096, HVF_PAGE_SIZE),
+            (4096, 0, 4096, HVF_PAGE_SIZE),
+            (8192, 12288, 8192, 2 * HVF_PAGE_SIZE),
         ] {
             let layout = file_view_allocation_layout(start, start + semantic_len, offset).unwrap();
-            assert_eq!(layout.offset, start & (HVF_PAGE_SIZE - 1));
+            assert_eq!(layout.offset, offset & (HVF_PAGE_SIZE - 1));
             assert_eq!(layout.length, expected_len);
             assert_eq!(layout.alignment, HVF_PAGE_SIZE);
         }
-        assert!(file_view_allocation_layout(0, 4096, 4096).is_err());
+        assert!(file_view_allocation_layout(0, 4096, 1).is_err());
     }
 
     #[test]

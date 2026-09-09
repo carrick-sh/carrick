@@ -40553,12 +40553,15 @@ impl HvfVmState {
         let end = va
             .checked_add(len as u64)
             .ok_or_else(|| TrapError::Hypervisor("private file view range overflow".to_owned()))?;
-        if va < arena_start
-            || end > arena_end
+        // A private mapping may be moved into the shared aperture. Its VA
+        // does not decide ownership: the live alias/mapping checks below still
+        // refuse shared or non-dynamic backing before any retirement.
+        let eligible_range = (va >= arena_start && end <= arena_end)
+            || crate::memory::va_in_shared_aperture(va, len as u64);
+        if !eligible_range
             || !va.is_multiple_of(PAGE_SIZE)
             || !end.is_multiple_of(PAGE_SIZE)
             || !offset.is_multiple_of(PAGE_SIZE)
-            || va & (HVF_PAGE_SIZE - 1) != offset & (HVF_PAGE_SIZE - 1)
         {
             return Ok(false);
         }
@@ -40624,7 +40627,10 @@ impl HvfVmState {
 
         let mut current = va;
         while current < end {
-            if self.mapping_for_range(current, 1).is_some() {
+            if self.mapping_for_range(current, 1).is_some_and(|mapping| {
+                !crate::memory::va_in_shared_aperture(current, 1)
+                    || !mapping.is_shared_aperture_identity()
+            }) {
                 // The hole check / retirement above ran outside the topology lock;
                 // a mapping appearing here means a sibling publication raced this
                 // mmap. Fail closed: the dispatcher's snapshot fallback rewrites
@@ -40693,7 +40699,16 @@ impl HvfVmState {
             identity.linux_tid,
         );
         if let Some(mapping) = self.mapping_for_range(start, 1) {
-            return Ok(mapping.end.min(end));
+            // An aperture identity row is a boot lookup fallback, not proof
+            // that a private file view raced this publication. The caller has
+            // already refused live shared aliases; process-scoped frame owners
+            // below remain authoritative even after an old overlay is retired.
+            let replaces_boot_identity = matches!(backing, SparseExtentBacking::FileView { .. })
+                && crate::memory::va_in_shared_aperture(start, end - start)
+                && mapping.is_shared_aperture_identity();
+            if !replaces_boot_identity {
+                return Ok(mapping.end.min(end));
+            }
         }
 
         // Another vCPU in this mm can publish the physical alias while its
@@ -49423,6 +49438,13 @@ impl HvfMappedRegion {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl MappingView {
+    fn is_shared_aperture_identity(&self) -> bool {
+        self.ipa == self.start
+            && self.sharing == GuestMappingSharing::GlobalShared
+            && self.end > self.start
+            && crate::memory::va_in_shared_aperture(self.start, self.end - self.start)
+    }
+
     /// Synthesize a view from a process-shared `alias_registry` entry (the
     /// cross-thread fallback). The alias is a contiguous VA→IPA→host window, so
     /// the VA base + backing base reproduce the same `host_addr + (addr - start)`

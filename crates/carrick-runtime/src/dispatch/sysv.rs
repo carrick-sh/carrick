@@ -2654,6 +2654,7 @@ impl SyscallDispatcher {
                     read_only_shared_file: false,
                     secretmem: false,
                     writable_memfd: None,
+                    private_file: None,
                     shared_file_alias: None,
                 },
                 HostAliasShmatCommit {
@@ -5385,6 +5386,7 @@ mod ipc_set_tests {
             read_only_shared_file: false,
             secretmem: false,
             writable_memfd: Some(writable_memfd),
+            private_file: None,
             shared_file_alias: None,
         });
         assert!(dispatcher.range_has_mapping_metadata_for_test(addr, len));
@@ -5437,6 +5439,7 @@ mod ipc_set_tests {
             read_only_shared_file: false,
             secretmem: false,
             writable_memfd: None,
+            private_file: None,
             shared_file_alias: None,
         });
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
@@ -5536,6 +5539,7 @@ mod ipc_set_tests {
                     read_only_shared_file: false,
                     secretmem: false,
                     writable_memfd: None,
+                    private_file: None,
                     shared_file_alias: None,
                 },
                 HostAliasShmatCommit {

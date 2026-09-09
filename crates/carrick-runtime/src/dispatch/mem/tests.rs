@@ -797,6 +797,7 @@ where
             read_only_shared_file: false,
             secretmem: false,
             writable_memfd: None,
+            private_file: None,
             shared_file_alias: None,
         }))
     });
@@ -4352,6 +4353,7 @@ fn native16k_rejects_write_exec_alias_mprotect() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: None,
     });
     let registry =
@@ -4404,6 +4406,7 @@ fn committed_high_alias_mprotect_readonly_edits_guest_page_tables() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: None,
     });
     let registry =
@@ -4453,6 +4456,7 @@ fn committed_high_alias_mprotect_reports_backend_edit_failure() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: None,
     });
     let registry =
@@ -4653,6 +4657,7 @@ fn native16k_allows_private_alias_write_exec_for_translation_backend() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: None,
     });
     let registry =
@@ -7047,6 +7052,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: None,
     });
 
@@ -7129,6 +7135,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: None,
     });
     dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
@@ -7147,6 +7154,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: None,
     });
 
@@ -7184,6 +7192,7 @@ fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
             read_only_shared_file: false,
             secretmem: false,
             writable_memfd: None,
+            private_file: None,
             shared_file_alias: None,
         }))
     });
@@ -7280,6 +7289,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
             read_only_shared_file: false,
             secretmem: false,
             writable_memfd: None,
+            private_file: None,
             shared_file_alias: None,
         }))
     });
@@ -7349,6 +7359,7 @@ fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
             read_only_shared_file: false,
             secretmem: false,
             writable_memfd: None,
+            private_file: None,
             shared_file_alias: None,
         }))
     });
@@ -7400,6 +7411,7 @@ fn proc_mem_snapshot_waits_for_install_and_returns_one_coherent_generation() {
             read_only_shared_file: false,
             secretmem: false,
             writable_memfd: None,
+            private_file: None,
             shared_file_alias: None,
         }))
     });
@@ -7451,6 +7463,7 @@ fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
             read_only_shared_file: false,
             secretmem: false,
             writable_memfd: None,
+            private_file: None,
             shared_file_alias: None,
         }))
     });
@@ -7506,6 +7519,7 @@ fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
             read_only_shared_file: false,
             secretmem: false,
             writable_memfd: None,
+            private_file: None,
             shared_file_alias: None,
         }))
     });
@@ -8214,6 +8228,7 @@ fn host_alias_map_droppable_reaches_keeponfork_rejection_metadata() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: None,
     });
 
@@ -8555,6 +8570,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
             extent_base: carrick_guest_mem::Gpa(base),
@@ -8744,6 +8760,7 @@ fn shared_file_fixed_mremap_repoint_failure_lowers_to_enomem() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
             extent_base: carrick_guest_mem::Gpa(base),
@@ -8821,6 +8838,7 @@ fn shared_file_fixed_mremap_rejects_missing_maymove_or_overlapping_ranges() {
         read_only_shared_file: false,
         secretmem: false,
         writable_memfd: None,
+        private_file: None,
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
             extent_base: carrick_guest_mem::Gpa(base),
