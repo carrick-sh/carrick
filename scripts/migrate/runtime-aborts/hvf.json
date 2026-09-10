@@ -972,7 +972,7 @@
       "domain": "hvpatch::task_backend_lifecycle"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "function": "HvpatchFrameInventoryState::cancel_alias_inventory",
       "ordinal_in_function": 1,
       "fingerprint": "c7861f9592a449f597bf4942e873e344c408f4a662f2995cb51f48e1be33eeca",
