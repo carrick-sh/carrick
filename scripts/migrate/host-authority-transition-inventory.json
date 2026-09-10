@@ -414,18 +414,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/main.rs:322 in `install_guest_abort_banner`, `libc::getpid` acts only on the current carrier panic diagnostic used by `install_guest_abort_banner`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/main.rs:286 in `install_guest_abort_banner`, `libc::getpid` acts only on the current carrier panic diagnostic used by `install_guest_abort_banner`; no guest identity selects its host target.",
     "review_id": "HA-000017",
     "source": {
-      "byte_end": 15994,
-      "byte_start": 15982,
+      "byte_end": 14065,
+      "byte_start": 14053,
       "column": 28,
       "column_end": 40,
       "column_start": 28,
       "file": "crates/carrick-cli/src/main.rs",
-      "line": 322,
-      "line_end": 322,
-      "line_start": 322
+      "line": 286,
+      "line_end": 286,
+      "line_start": 286
     }
   },
   {
@@ -6490,18 +6490,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/lib.rs:326 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
+    "rationale": "At crates/carrick-runtime/src/lib.rs:327 in `rosetta_interpreter_path`, `std::fs::read_to_string` accesses only the fixed binfmt_misc Rosetta registration object at /proc/sys/fs/binfmt_misc/rosetta.",
     "review_id": "HA-000294",
     "source": {
-      "byte_end": 16694,
-      "byte_start": 16671,
+      "byte_end": 16716,
+      "byte_start": 16693,
       "column": 22,
       "column_end": 45,
       "column_start": 22,
       "file": "crates/carrick-runtime/src/lib.rs",
-      "line": 326,
-      "line_end": 326,
-      "line_start": 326
+      "line": 327,
+      "line_end": 327,
+      "line_start": 327
     }
   },
   {
