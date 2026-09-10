@@ -70,16 +70,6 @@
       "domain": "aarch64::process_materialize"
     },
     {
-      "file": "crates/carrick-fatal/src/lib.rs",
-      "function": "fatal",
-      "ordinal_in_function": 1,
-      "fingerprint": "522ae26cbe285c90172bbb736e78928f228d65810bb5be9af38cf797a33aca48",
-      "verdict": "carrier_fault",
-      "failure_domain": "fatal::sink",
-      "rationale": "Terminal abort after formatting fatal record into stderr and recording invariant violation state into CARRICK_LAST_FATAL.",
-      "sink": "raw"
-    },
-    {
       "file": "crates/carrick-guest-mem/src/deferred_anonymous.rs",
       "function": "DeferredPrivateFileTransition<'_>::len",
       "ordinal_in_function": 1,
