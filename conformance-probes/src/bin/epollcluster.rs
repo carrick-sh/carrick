@@ -11,19 +11,11 @@ const F_SETPIPE_SZ: libc::c_int = 1031;
 static RODATA_EVENTS: [u8; 16] = [0; 16];
 
 fn syscall_errno(rc: libc::c_int) -> i32 {
-    if rc < 0 {
-        errno()
-    } else {
-        0
-    }
+    if rc < 0 { errno() } else { 0 }
 }
 
 fn syscall_errno_long(rc: libc::c_long) -> i32 {
-    if rc < 0 {
-        errno()
-    } else {
-        0
-    }
+    if rc < 0 { errno() } else { 0 }
 }
 
 fn close_fd(fd: libc::c_int) {
@@ -137,6 +129,67 @@ fn epoll_fd_readiness() {
         epollfd_drained_child_mask = drained_child_mask,
     );
     close_fd(outer);
+    close_fd(child);
+    close_fd(fd);
+}
+
+/// Polling an epoll descriptor must wake when an observed eventfd is written
+/// by another thread, including after an empty epoll_wait clears control wakes.
+/// The writer owns a duplicate descriptor and every synchronization wait is bounded.
+fn epoll_fd_thread_wake() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::Duration;
+    let child = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    let add_errno = add_epoll_interest(child, fd, libc::EPOLLIN as u32);
+    let (initial_child, _) = epoll_wait_one(child);
+    let mut pfd = libc::pollfd {
+        fd: child,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let initial_poll = unsafe { libc::poll(&mut pfd, 1, 0) };
+    let writer_fd = unsafe { libc::dup(fd) };
+    let mut spawn_errno = if writer_fd < 0 { errno() } else { 0 };
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    if writer_fd >= 0 {
+        let writer = unsafe { OwnedFd::from_raw_fd(writer_fd) };
+        if let Err(error) = std::thread::Builder::new().spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let value = 1u64;
+            let written =
+                unsafe { libc::write(writer.as_raw_fd(), (&value as *const u64).cast(), 8) };
+            drop(writer);
+            let _ = tx.send(written);
+        }) {
+            spawn_errno = error.raw_os_error().unwrap_or(-1);
+        }
+    }
+    pfd.revents = 0;
+    let wake_poll = unsafe { libc::poll(&mut pfd, 1, 5000) };
+    let wake_mask = pfd.revents;
+    let written = rx.recv_timeout(Duration::from_secs(5)).unwrap_or(-1);
+    let (child_ready, child_mask) = epoll_wait_one(child);
+    let mut value = 0u64;
+    let read_rc = unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
+    let (drained_child, _) = epoll_wait_one(child);
+    pfd.revents = 0;
+    let drained_poll = unsafe { libc::poll(&mut pfd, 1, 0) };
+    report!(
+        epollfd_thread_add_errno = add_errno,
+        epollfd_thread_initial_child = initial_child,
+        epollfd_thread_initial_poll = initial_poll,
+        epollfd_thread_spawn_errno = spawn_errno,
+        epollfd_thread_poll = wake_poll,
+        epollfd_thread_poll_mask = wake_mask,
+        epollfd_thread_write = written,
+        epollfd_thread_child = child_ready,
+        epollfd_thread_child_mask = child_mask,
+        epollfd_thread_read = read_rc,
+        epollfd_thread_value = value,
+        epollfd_thread_drained_child = drained_child,
+        epollfd_thread_drained_poll = drained_poll,
+    );
     close_fd(child);
     close_fd(fd);
 }
@@ -310,4 +363,5 @@ fn main() {
         et_after_refill_events = et_after_refill_events,
     );
     epoll_fd_readiness();
+    epoll_fd_thread_wake();
 }

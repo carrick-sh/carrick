@@ -1,4 +1,4 @@
-049b9af6d423b247
+6bb1d9485abc968e
 epollpri_pipe_add_errno=0
 nested_epoll_add_errno=0
 nested_epoll_cycle_errno=40
@@ -41,3 +41,16 @@ epollfd_drained_outer=0
 epollfd_drained_outer_mask=0
 epollfd_drained_child=0
 epollfd_drained_child_mask=0
+epollfd_thread_add_errno=0
+epollfd_thread_initial_child=0
+epollfd_thread_initial_poll=0
+epollfd_thread_spawn_errno=0
+epollfd_thread_poll=1
+epollfd_thread_poll_mask=1
+epollfd_thread_write=8
+epollfd_thread_child=1
+epollfd_thread_child_mask=1
+epollfd_thread_read=8
+epollfd_thread_value=1
+epollfd_thread_drained_child=0
+epollfd_thread_drained_poll=0
