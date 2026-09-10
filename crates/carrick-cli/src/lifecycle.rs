@@ -733,6 +733,7 @@ fn rebuild_request_from_state(state: &ContainerState) -> LaunchRequest {
     LaunchRequest {
         run: carrick_engine::RunRequest {
             image_ref: state.image.clone(),
+            image_source: carrick_spec::ImageSource::Oci(state.image.clone()),
             // Restart/exec reuses the already-resolved image; no re-pull.
             pull: carrick_image::PullPolicy::Missing,
             platform: c.platform.clone(),

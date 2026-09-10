@@ -100,13 +100,14 @@ impl NativeShapeTarget {
             Cli::from_arg_matches(&matches).with_context(|| format!("decode {label} target"))?;
         let Commands::Run {
             image,
-            exec_backend,
+            run_args,
             command: target_command,
             ..
         } = parsed.command
         else {
             bail!("{label} target must be a run subcommand");
         };
+        let exec_backend = run_args.exec_backend;
         if !allowed.contains(&exec_backend) {
             bail!(
                 "{label} target requires an explicit command-line --exec-backend ({})",

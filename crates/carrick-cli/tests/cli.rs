@@ -831,6 +831,64 @@ fn help_output_snapshots() {
     }
 }
 
+#[test]
+fn shared_run_args_accepted_across_verbs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let elf = tmp.path().join("dummy.elf");
+    std::fs::write(&elf, minimal_aarch64_elf_with_load_segment()).unwrap();
+
+    let check_parse_flags = |subcmd: &str, extra: &[&str]| {
+        let mut args = vec![
+            subcmd,
+            "--fs",
+            "host",
+            "--volume",
+            "/tmp:/tmp:ro",
+            "--workdir",
+            "/tmp",
+            "--exec-backend",
+            "hvpatch",
+            "--security-opt",
+            "seccomp=unconfined",
+            "--env",
+            "FOO=bar",
+            "--user",
+            "0:0",
+        ];
+        args.extend_from_slice(extra);
+        let output = command().args(&args).output().expect("run carrick");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("unexpected argument") && !stderr.contains("error: unexpected"),
+            "{subcmd} rejected shared run args: {stderr}"
+        );
+    };
+
+    check_parse_flags(
+        "run",
+        &[
+            "--max-traps",
+            "100",
+            "--forward-env",
+            "A=B",
+            "nonexistent-image",
+        ],
+    );
+    check_parse_flags("create", &["nonexistent-image"]);
+    if cfg!(target_os = "macos") {
+        check_parse_flags(
+            "run-elf",
+            &[
+                "--max-traps",
+                "100",
+                "--forward-env",
+                "A=B",
+                elf.to_str().unwrap(),
+            ],
+        );
+    }
+}
+
 fn minimal_aarch64_elf() -> Vec<u8> {
     let mut elf = vec![0_u8; 64];
     elf[0..4].copy_from_slice(b"\x7fELF");

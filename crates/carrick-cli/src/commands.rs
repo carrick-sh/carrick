@@ -15,22 +15,14 @@
 //!    backend, pty relay — with zero duplication; the `Shell` arm in the match
 //!    is therefore unreachable and only exists to satisfy exhaustiveness.
 //!
-//! 2. **The two run pipelines.** There are deliberately two entry points to a
-//!    guest, and they share almost nothing:
-//!    - `Run`/`Create` lower their flags into a `lifecycle::LaunchRequest` (the
-//!      engine's [`carrick_engine::RunRequest`] plus lifecycle fields) and go
-//!      through `carrick_engine::Engine::resolve` — i.e. resolve+pull an OCI
-//!      image and compose its rootfs — then call `Runtime::execute` separately,
-//!      once the async pull is torn down (no tokio runtime live across the
-//!      possible interactive-session fork). This is the docker path.
-//!    - `RunElf`/`DispatchSyscall` bypass the engine and the image store
-//!      entirely, loading a *host* ELF (or a single synthetic syscall) straight
-//!      through `carrick-runtime`. This is the fixture path used by Go/CPython/
-//!      libuv conformance and unit tests, where there is no container image —
-//!      hence the manual rootfs-layer composition, `--fs` install,
-//!      `-v`/`--volume` bind-mounts, and the read-only self-bind of the host ELF
-//!      at its own `/proc/self/exe` path (so `os.Executable()` + re-exec
-//!      resolve), all of which the engine would otherwise do from the image.
+//! 2. **The run pipelines.** `Run`, `Create`, and `RunElf` lower their
+//!    arguments into a `lifecycle::LaunchRequest` and resolve through
+//!    `carrick_engine::Engine::resolve`. `Run`/`Create` resolve an OCI image
+//!    (`ImageSource::Oci`), while `RunElf` resolves a freestanding host ELF
+//!    (`ImageSource::HostElf`). Both paths share rootfs layer composition,
+//!    mounts, environment resolution, and seccomp policy mapping before
+//!    executing synchronously on the carrier runtime. `DispatchSyscall` remains
+//!    a direct diagnostic fixture for single synthetic syscalls.
 //!
 //! 3. **Exit-code parity with docker.** The CLI, not the runtime, owns the
 //!    *process* exit code. Docker's convention is encoded explicitly here: `125`
@@ -65,21 +57,19 @@ use carrick_runtime::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest}
 use carrick_runtime::elf::{inspect_elf, plan_elf_load};
 use carrick_runtime::memory::AddressSpace;
 use carrick_runtime::rootfs::RootFs;
-use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
 // HVF-only diagnostics — the `run-elf`, `trap-capabilities`, and full
 // `syscalls`-table subcommands are macOS-only for now (Linux uses `carrick run
 // <oci>` / `carrick-kvm run-elf`; per-number `syscalls <n>` works on both).
-#[cfg(feature = "platform-macos")]
-use carrick_runtime::runtime::{
-    RunStaticElfBackendOptions, run_static_elf_with_backend_args_and_dispatcher_debug,
-};
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::syscall::aarch64_table;
 use carrick_runtime::syscall::lookup_aarch64;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::trap::hvf_capabilities;
 
-use crate::args::{Cli, Commands, NetworkCommand, RootfsCommand, SystemCommand, VolumeCommand};
+use crate::args::{
+    Cli, Commands, ExecutionArgs, NetworkCommand, RootfsCommand, RunArgs, SystemCommand,
+    VolumeCommand,
+};
 // Only the non-HVF `Commands::Debug` arm below matches on `DebugCommand`
 // variants directly; the macOS arm just forwards `command` into `run_debug`.
 #[cfg(any(
@@ -90,9 +80,6 @@ use crate::args::{Cli, Commands, NetworkCommand, RootfsCommand, SystemCommand, V
 use crate::args::DebugCommand;
 #[cfg(feature = "platform-macos")]
 use crate::debug::run_debug;
-// Used only by the macOS-only `run-elf` arm.
-#[cfg(feature = "platform-macos")]
-use crate::fs_setup::install_fs_backend;
 #[cfg(target_os = "macos")]
 use crate::hvpatch_core_profile::HvpatchCoreSummary;
 #[cfg(target_os = "macos")]
@@ -135,42 +122,15 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // SAFETY: isatty on fd 0 is a simple syscall returning 0/1.
             let interactive = unsafe { libc::isatty(0) } == 1;
             Commands::Run {
+                run_args: RunArgs {
+                    tty: interactive,
+                    interactive,
+                    ..RunArgs::default()
+                },
+                exec_args: ExecutionArgs::default(),
                 image,
-                platform: None,
-                max_traps: DEFAULT_MAX_TRAPS,
-                debug_state_path: None,
-                post_mortem_dir: None,
                 json: false,
-                pull: crate::args::PullArg::Missing,
-                tty: interactive,
-                interactive,
-                fs: None,
-                network: "host".to_string(),
-                network_alias: vec![],
-                ip: None,
-                add_host: vec![],
-                dns: vec![],
-                dns_search: vec![],
-                dns_option: vec![],
-                env: vec![],
-                env_file: vec![],
-                workdir: None,
-                user: None,
-                entrypoint: None,
-                volume: vec![],
-                volumes_from: vec![],
-                mount: vec![],
-                name: None,
-                rm: false,
-                stop_signal: None,
-                stop_timeout: None,
-                publish: vec![],
-                security_opt: vec![],
-                cap_add: vec![],
-                pid: carrick_spec::PidMode::Private,
                 detach: false,
-                forward_env: vec![],
-                exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
                 command: vec!["/bin/sh".to_owned()],
             }
         }
@@ -245,125 +205,89 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::RunElf {
             path,
             rootfs_layers,
-            max_traps,
-            debug_state_path,
             raw,
-            fs,
-            volume,
-            workdir,
-            forward_env,
-            exec_backend,
-            security_opt,
             args,
+            run_args,
+            exec_args,
         } => {
             // Apply forwarded env BEFORE anything reads it (host_facts caches the
             // CPU count on first query). CLI args survive sudo's env_reset where
             // a bare `sudo VAR=val` is rejected without SETENV in sudoers.
-            for kv in &forward_env {
+            for kv in &exec_args.forward_env {
                 if let Some((k, v)) = kv.split_once('=') {
                     // SAFETY: single-threaded at this point (pre-runtime).
                     unsafe { std::env::set_var(k, v) };
                 }
             }
-            let mut dispatcher = if rootfs_layers.is_empty() {
-                SyscallDispatcher::new()
-            } else {
-                SyscallDispatcher::with_rootfs(
-                    RootFs::from_layer_paths(&rootfs_layers)
-                        .context("failed to compose rootfs layers")?,
-                )
+            if let Some(dir) = &exec_args.post_mortem_dir {
+                carrick_runtime::kernel::debug::PostMortem::install_dir(dir.clone());
+            }
+
+            let utf8_path = camino::Utf8PathBuf::from_path_buf(path.clone())
+                .map_err(|p| anyhow::anyhow!("invalid non-UTF-8 ELF path: {}", p.display()))?;
+            let mut utf8_layers = Vec::new();
+            for layer in &rootfs_layers {
+                let utf8_layer =
+                    camino::Utf8PathBuf::from_path_buf(layer.clone()).map_err(|p| {
+                        anyhow::anyhow!("invalid non-UTF-8 rootfs layer path: {}", p.display())
+                    })?;
+                utf8_layers.push(utf8_layer);
+            }
+
+            let image_source = carrick_spec::ImageSource::HostElf {
+                path: utf8_path,
+                rootfs_layers: utf8_layers,
             };
-            // run-elf drives a bare host ELF: UNCONFINED by default (handlers
-            // stay honest). `--security-opt seccomp=default` opts into the
-            // container policy model `carrick run` applies by default.
-            let seccomp_policy = carrick_engine::resolve_seccomp_policy(
-                carrick_spec::SeccompPolicy::Unconfined,
-                &security_opt,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let container = carrick_runtime::kernel::Container::for_reference_model();
-            dispatcher.apply_launch_privileges(seccomp_policy, &container);
-            install_fs_backend(&mut dispatcher, fs)?;
-            // Bind-mount host paths into the guest. `--fs host` is a sandboxed
-            // scratch (NOT the real host FS), so this is the only way to expose a
-            // host directory — e.g. a conformance test's `testdata/`. `HOST:GUEST[:ro]`.
-            for v in &volume {
-                let parts: Vec<&str> = v.splitn(3, ':').collect();
-                if parts.len() < 2 {
-                    anyhow::bail!("invalid -v/--volume {v:?}: expected HOST:GUEST[:ro]");
+
+            let stdio = if raw {
+                carrick_spec::StdioMode::Inherit
+            } else {
+                carrick_spec::StdioMode::Captured
+            };
+
+            let mut req = build_launch_request(image_source, &run_args, &exec_args, args)?;
+            req.run.stdio = stdio;
+
+            let engine = carrick_engine::Engine::new(store.clone());
+            let resolved = match block_on_oci(engine.resolve(req.run.clone())) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    eprintln!("carrick: {e:#}");
+                    carrick_runtime::carrier::exit_carrier(125);
                 }
-                let (host_src, guest_dst) = (parts[0], parts[1]);
-                let readonly = parts.get(2).is_some_and(|m| *m == "ro");
-                let bind = carrick_runtime::vfs::BindVfs::new(
-                    guest_dst,
-                    std::path::PathBuf::from(host_src),
-                    readonly,
-                );
-                dispatcher.register_mount(std::path::PathBuf::from(guest_dst), Box::new(bind));
-            }
-            // Set the guest's initial CWD from -w (so a test's relative
-            // `testdata/...`/`../testdata/...` resolves against a bind-mounted dir).
-            if let Some(dir) = &workdir {
-                dispatcher.set_cwd(dir);
-            }
-            if raw {
-                dispatcher.set_stdio_sink(carrick_runtime::dispatch::StdioSink::Inherit);
-            }
-            let executable_path = path
-                .canonicalize()
-                .unwrap_or_else(|_| path.clone())
-                .to_string_lossy()
-                .into_owned();
-            // Make the guest's own executable openable at its /proc/self/exe path.
-            // run-elf loads the ELF directly from a host path, so the guest fs (the
-            // --fs host scratch / rootfs) doesn't contain it; without this a guest
-            // that does os.Executable()+open, or re-execs /proc/self/exe (Go os
-            // TestOpenFileNonBlocking, TestPidfdLeak; glibc's _dl_get_origin), hits
-            // ENOENT on its own binary. Bind the host ELF read-only at the
-            // executable path so the readlink target resolves to real, openable
-            // bytes — matching `carrick run <image>` and Docker, where the binary
-            // is a real file in the guest fs.
-            {
-                let exe_bind =
-                    carrick_runtime::vfs::BindVfs::new(executable_path.clone(), path.clone(), true);
-                dispatcher.register_mount(
-                    std::path::PathBuf::from(&executable_path),
-                    Box::new(exe_bind),
-                );
-            }
-            let mut argv = vec![executable_path];
-            argv.extend(args);
-            let mut elf_env: Vec<String> = Vec::new();
-            for key in [
-                "GODEBUG",
-                "GOMAXPROCS",
-                "GOTRACEBACK",
-                "GOGC",
-                "GODEBUGFLAGS",
-            ] {
-                if let Ok(val) = std::env::var(key) {
-                    elf_env.push(format!("{key}={val}"));
+            };
+            crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
+            let spec = resolved.spec;
+            let carrier = match carrick_runtime::CarrierRuntime::new_explicit() {
+                Ok(carrier) => carrier,
+                Err(e) => {
+                    eprintln!("carrick: {e:#}");
+                    std::process::exit(125);
                 }
-            }
-            let result = run_static_elf_with_backend_args_and_dispatcher_debug(
-                &path,
-                dispatcher,
-                argv,
-                elf_env,
-                RunStaticElfBackendOptions {
-                    max_traps,
-                    debug_state_path: debug_state_path.as_ref(),
-                    exec_backend,
-                },
-            )
-            .with_context(|| format!("failed to run static ELF {}", path.display()))?;
+            };
+            let launch = match carrick_runtime::kernel::LaunchContext::from_process_env() {
+                Ok(launch) => launch,
+                Err(e) => {
+                    eprintln!("carrick: {e:#}");
+                    carrick_runtime::carrier::exit_explicit_carrier(&carrier, 125);
+                }
+            };
+            let result = match carrick_runtime::Runtime::execute_on(&carrier, &spec, launch) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("carrick: {e:#}");
+                    carrick_runtime::carrier::exit_explicit_carrier(&carrier, 125);
+                }
+            };
+
             if raw {
                 emit_raw(&result);
-                std::process::exit(if result.trap_limit_hit {
+                let status = if result.trap_limit_hit {
                     1
                 } else {
                     result.exit_code
-                });
+                };
+                carrick_runtime::carrier::exit_explicit_carrier(&carrier, status);
             }
             println!(
                 "{}",
@@ -384,6 +308,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     result.traps
                 );
             }
+            carrick_runtime::carrier::exit_explicit_carrier(&carrier, result.exit_code);
         }
         Commands::Pull { image, platform } => {
             let image = ImageReference::parse(&image)?;
@@ -541,125 +466,32 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             )?;
         }
         Commands::Run {
+            run_args,
+            exec_args,
             image,
-            platform,
-            max_traps,
-            debug_state_path,
-            post_mortem_dir,
             json,
-            tty,
-            interactive,
-            fs,
-            exec_backend,
-            network,
-            network_alias,
-            ip,
-            add_host,
-            dns,
-            dns_search,
-            dns_option,
-            env,
-            env_file,
-            workdir,
-            user,
-            entrypoint,
-            volume,
-            volumes_from,
-            mount,
-            name,
-            rm,
-            stop_signal,
-            stop_timeout,
-            publish,
-            security_opt,
-            cap_add,
-            pid,
             detach,
-            forward_env,
-            pull,
             command,
         } => {
             // Apply forwarded env BEFORE anything reads it (e.g. host_facts'
             // CPU-count cache). CLI args survive sudo's env_reset where a bare
             // `sudo VAR=val` is rejected without SETENV in sudoers.
-            for kv in &forward_env {
+            for kv in &exec_args.forward_env {
                 if let Some((k, v)) = kv.split_once('=') {
                     // SAFETY: single-threaded at this point (pre-runtime).
                     unsafe { std::env::set_var(k, v) };
                 }
             }
-            if let Some(dir) = post_mortem_dir {
-                carrick_runtime::kernel::debug::PostMortem::install_dir(dir);
-            }
-            let parsed_network = parse_network_mode_arg(&network)?;
-            let published_ports = parse_publish_specs(parsed_network.mode, &publish)?;
-
-            let mut env_overrides = env.clone();
-            // `--env-file` may repeat (docker allows it); later files win.
-            for file_path in &env_file {
-                env_overrides.extend(parse_env_file(file_path)?);
+            if let Some(dir) = &exec_args.post_mortem_dir {
+                carrick_runtime::kernel::debug::PostMortem::install_dir(dir.clone());
             }
 
-            let mut mounts = Vec::new();
-            for v_str in &volume {
-                mounts.push(parse_volume_mount(v_str)?);
-            }
-            for m_str in &mount {
-                mounts.push(parse_mount_flag(m_str)?);
-            }
-            mounts.extend(resolve_volumes_from_specs(&volumes_from)?);
-
-            // `--entrypoint ""` clears the image ENTRYPOINT (run the command
-            // alone), like docker — an empty value maps to an empty vec, not a
-            // one-element [""] that would become an empty argv[0].
-            let entrypoint_override =
-                entrypoint.map(|ep| if ep.is_empty() { Vec::new() } else { vec![ep] });
-
-            let req = crate::lifecycle::LaunchRequest {
-                run: carrick_engine::RunRequest {
-                    image_ref: image,
-                    pull: pull.into(),
-                    platform,
-                    args: command,
-                    env_overrides,
-                    // docker `-e KEY`: import from the user's shell environment.
-                    host_env: Some(crate::runtime_util::host_env_snapshot()),
-                    mounts,
-                    workdir,
-                    user,
-                    hostname: None,
-                    entrypoint_override,
-                    tty,
-                    // docker-shaped: guest stdout/stderr stream to this terminal.
-                    stdio: carrick_spec::StdioMode::Inherit,
-                    name,
-                    max_traps,
-                    debug_state_path: debug_state_path.map(|p| p.to_string_lossy().into_owned()),
-                    fs,
-                    exec_backend,
-                    pid,
-                    network: parsed_network.mode,
-                    network_bridge: parsed_network.bridge,
-                    network_container: parsed_network.container,
-                    network_namespace_id: None,
-                    bridge_namespace_id: Some(crate::runtime_util::anon_bridge_namespace_id()),
-                    network_attachments: Vec::new(),
-                    network_ipv4: ip,
-                    network_aliases: network_alias,
-                    extra_hosts: add_host,
-                    dns_servers: dns,
-                    dns_search,
-                    dns_options: dns_option,
-                    published_ports,
-                    security_opts: security_opt,
-                    cap_add,
-                },
-                interactive,
-                rm,
-                stop_signal,
-                stop_timeout,
-                volumes_from,
-            };
+            let req = build_launch_request(
+                carrick_spec::ImageSource::Oci(image),
+                &run_args,
+                &exec_args,
+                command,
+            )?;
 
             // Detached (`carrick run -d`): fork one VM carrier into the
             // background, print the id, and return. Manage it with `carrick
@@ -762,7 +594,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
             // Interactive / tty: the guest's stdio already went straight to the
             // terminal; nothing to emit, just take the exit code.
-            if tty || interactive {
+            if req.run.tty || req.interactive {
                 carrick_runtime::carrier::exit_explicit_carrier(&carrier, status);
             }
 
@@ -824,96 +656,17 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Kill { signal, containers } => crate::lifecycle::kill(&signal, &containers)?,
         Commands::Rm { force, containers } => crate::lifecycle::rm(force, &containers)?,
         Commands::Create {
+            run_args,
             image,
-            platform,
-            fs,
-            exec_backend,
-            pid,
-            network,
-            network_alias,
-            ip,
-            add_host,
-            dns,
-            dns_search,
-            dns_option,
-            env,
-            env_file,
-            workdir,
-            user,
-            entrypoint,
-            volume,
-            volumes_from,
-            mount,
-            name,
-            rm,
-            tty,
-            interactive,
-            publish,
-            stop_signal,
-            stop_timeout,
-            security_opt,
-            cap_add,
-            pull,
             command,
         } => {
-            let mut env_overrides = env;
-            for file_path in &env_file {
-                env_overrides.extend(parse_env_file(file_path)?);
-            }
-            let mut mounts = Vec::new();
-            for v in &volume {
-                mounts.push(parse_volume_mount(v)?);
-            }
-            for m in &mount {
-                mounts.push(parse_mount_flag(m)?);
-            }
-            mounts.extend(resolve_volumes_from_specs(&volumes_from)?);
-            let entrypoint_override =
-                entrypoint.map(|ep| if ep.is_empty() { Vec::new() } else { vec![ep] });
-            let parsed_network = parse_network_mode_arg(&network)?;
-            let req = crate::lifecycle::LaunchRequest {
-                run: carrick_engine::RunRequest {
-                    image_ref: image,
-                    pull: pull.into(),
-                    platform,
-                    args: command,
-                    env_overrides,
-                    host_env: Some(crate::runtime_util::host_env_snapshot()),
-                    mounts,
-                    workdir,
-                    user,
-                    hostname: None,
-                    entrypoint_override,
-                    tty,
-                    stdio: carrick_spec::StdioMode::Inherit,
-                    name: None,
-                    max_traps: DEFAULT_MAX_TRAPS,
-                    debug_state_path: None,
-                    fs,
-                    exec_backend,
-                    pid,
-                    network: parsed_network.mode,
-                    network_bridge: parsed_network.bridge,
-                    network_container: parsed_network.container,
-                    network_namespace_id: None,
-                    bridge_namespace_id: Some(crate::runtime_util::anon_bridge_namespace_id()),
-                    network_attachments: Vec::new(),
-                    network_ipv4: ip,
-                    network_aliases: network_alias,
-                    extra_hosts: add_host,
-                    dns_servers: dns,
-                    dns_search,
-                    dns_options: dns_option,
-                    published_ports: parse_publish_specs(parsed_network.mode, &publish)?,
-                    security_opts: security_opt,
-                    cap_add,
-                },
-                interactive,
-                rm,
-                stop_signal,
-                stop_timeout,
-                volumes_from,
-            };
+            let req = build_launch_request(
+                carrick_spec::ImageSource::Oci(image),
+                &run_args,
+                &ExecutionArgs::default(),
+                command,
+            )?;
+            let name = run_args.name.clone();
             crate::lifecycle::create(req, store.clone(), name)?;
         }
         Commands::Start { attach, containers } => {
@@ -2917,5 +2670,90 @@ fn parse_container_network_mode(value: &str) -> anyhow::Result<ParsedNetworkMode
         mode: target_state.config.network,
         bridge,
         container: Some(target_id),
+    })
+}
+
+fn build_launch_request(
+    image_source: carrick_spec::ImageSource,
+    run_args: &RunArgs,
+    exec_args: &ExecutionArgs,
+    command: Vec<String>,
+) -> anyhow::Result<crate::lifecycle::LaunchRequest> {
+    let parsed_network = parse_network_mode_arg(&run_args.network)?;
+    let published_ports = parse_publish_specs(parsed_network.mode, &run_args.publish)?;
+
+    let mut env_overrides = run_args.env.clone();
+    for file_path in &run_args.env_file {
+        env_overrides.extend(parse_env_file(file_path)?);
+    }
+
+    let mut mounts = Vec::new();
+    for v_str in &run_args.volume {
+        mounts.push(parse_volume_mount(v_str)?);
+    }
+    for m_str in &run_args.mount {
+        mounts.push(parse_mount_flag(m_str)?);
+    }
+    mounts.extend(resolve_volumes_from_specs(&run_args.volumes_from)?);
+
+    let entrypoint_override = run_args.entrypoint.as_ref().map(|ep| {
+        if ep.is_empty() {
+            Vec::new()
+        } else {
+            vec![ep.clone()]
+        }
+    });
+
+    let image_ref = match &image_source {
+        carrick_spec::ImageSource::Oci(s) => s.clone(),
+        carrick_spec::ImageSource::HostElf { path, .. } => path.as_str().to_string(),
+    };
+
+    Ok(crate::lifecycle::LaunchRequest {
+        run: carrick_engine::RunRequest {
+            image_ref,
+            image_source,
+            pull: run_args.pull.into(),
+            platform: run_args.platform.clone(),
+            args: command,
+            env_overrides,
+            host_env: Some(crate::runtime_util::host_env_snapshot()),
+            mounts,
+            workdir: run_args.workdir.clone(),
+            user: run_args.user.clone(),
+            hostname: None,
+            entrypoint_override,
+            tty: run_args.tty,
+            stdio: carrick_spec::StdioMode::Inherit,
+            name: run_args.name.clone(),
+            max_traps: exec_args.max_traps,
+            debug_state_path: exec_args
+                .debug_state_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            fs: run_args.fs,
+            exec_backend: run_args.exec_backend,
+            pid: run_args.pid,
+            network: parsed_network.mode,
+            network_bridge: parsed_network.bridge,
+            network_container: parsed_network.container,
+            network_namespace_id: None,
+            bridge_namespace_id: Some(crate::runtime_util::anon_bridge_namespace_id()),
+            network_attachments: Vec::new(),
+            network_ipv4: run_args.ip.clone(),
+            network_aliases: run_args.network_alias.clone(),
+            extra_hosts: run_args.add_host.clone(),
+            dns_servers: run_args.dns.clone(),
+            dns_search: run_args.dns_search.clone(),
+            dns_options: run_args.dns_option.clone(),
+            published_ports,
+            security_opts: run_args.security_opt.clone(),
+            cap_add: run_args.cap_add.clone(),
+        },
+        interactive: run_args.interactive,
+        rm: run_args.rm,
+        stop_signal: run_args.stop_signal.clone(),
+        stop_timeout: run_args.stop_timeout,
+        volumes_from: run_args.volumes_from.clone(),
     })
 }
