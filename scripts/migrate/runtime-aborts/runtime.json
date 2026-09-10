@@ -1971,7 +1971,7 @@
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "RunQueue::close",
       "ordinal_in_function": 1,
-      "fingerprint": "6c24f5fd84c25791ba87ae636991f4745b6c4eb21ab46ee05f6ec861185ca6b1",
+      "fingerprint": "f78dc1bf9da83340126c0885f267ed13e24219800485a7833d8de4f6c2933622",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue close_epoch counter overflow in close; wrapping epoch numbers corrupts queue close synchronization."
@@ -2025,7 +2025,7 @@
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "RunQueue::take_row",
       "ordinal_in_function": 1,
-      "fingerprint": "c6f289037d5772e9debfc69eef63be975a1b8cf3d8e8f2380987995345172048",
+      "fingerprint": "397888ad8ce6f8deefe5c7978dc4266d51b946d659c4f952de4cd276e4efa0d0",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue claimed count overflow in take_row; corrupts run queue claim accounting."
@@ -2034,7 +2034,7 @@
       "file": "crates/carrick-runtime/src/kernel/scheduler.rs",
       "function": "RunQueue::take_row",
       "ordinal_in_function": 2,
-      "fingerprint": "c6f289037d5772e9debfc69eef63be975a1b8cf3d8e8f2380987995345172048",
+      "fingerprint": "397888ad8ce6f8deefe5c7978dc4266d51b946d659c4f952de4cd276e4efa0d0",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::run_queue",
       "rationale": "RunQueue closed_waiter_observations count overflow in take_row; corrupts queue close draining synchronization."
