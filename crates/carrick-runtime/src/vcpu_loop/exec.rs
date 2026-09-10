@@ -1260,7 +1260,8 @@ where
             None => kernel
                 .dispatcher
                 .prepare_one_task_kernel_exec(kernel_context)
-                .map(|prepared| (RuntimePreparedExec::Other(Box::new(prepared)), None)),
+                .map(|prepared| (RuntimePreparedExec::Other(Box::new(prepared)), None))
+                .map_err(|error| error.to_string()),
         };
         let (mut prepared_kernel_exec, refreshed_hvpatch_context) = match prepared_kernel_exec {
             Ok(prepared) => prepared,

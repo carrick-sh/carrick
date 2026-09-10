@@ -1,5 +1,9 @@
 use std::sync::Arc;
 
+use carrick_abi::{
+    LINUX_EACCES, LINUX_EAGAIN, LINUX_EBADF, LINUX_EINVAL, LINUX_EIO, LINUX_ENOENT, LINUX_ENOEXEC,
+    LINUX_ENOMEM, LINUX_ESRCH, LinuxErrno,
+};
 use carrick_hal::{KernelTransactionId, ThreadId};
 
 use super::address::MmBackend;
@@ -728,6 +732,133 @@ pub enum ExecError {
     Injected(KernelFailpoint),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ExecPrepareError {
+    #[error("I/O error during exec preparation: {0}")]
+    Io(#[source] std::io::Error),
+    #[error("Linux error during exec preparation: {0:?}")]
+    Linux(LinuxErrno),
+    #[error("Kernel error during exec preparation: {0}")]
+    Kernel(#[source] super::core::KernelError),
+    #[error("Kernel operation error during exec preparation: {0}")]
+    KernelOperation(#[source] super::operations::KernelOperationError),
+    #[error("exec transaction error: {0}")]
+    Exec(#[source] ExecError),
+    #[error("host PID does not fit Linux task identity: {0}")]
+    InvalidHostPid(#[source] std::num::TryFromIntError),
+}
+
+impl From<std::io::Error> for ExecPrepareError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<LinuxErrno> for ExecPrepareError {
+    fn from(errno: LinuxErrno) -> Self {
+        Self::Linux(errno)
+    }
+}
+
+impl From<super::core::KernelError> for ExecPrepareError {
+    fn from(error: super::core::KernelError) -> Self {
+        Self::Kernel(error)
+    }
+}
+
+impl From<super::operations::KernelOperationError> for ExecPrepareError {
+    fn from(error: super::operations::KernelOperationError) -> Self {
+        Self::KernelOperation(error)
+    }
+}
+
+impl From<ExecError> for ExecPrepareError {
+    fn from(error: ExecError) -> Self {
+        Self::Exec(error)
+    }
+}
+
+impl From<std::num::TryFromIntError> for ExecPrepareError {
+    fn from(error: std::num::TryFromIntError) -> Self {
+        Self::InvalidHostPid(error)
+    }
+}
+
+impl ExecPrepareError {
+    /// Map the exec preparation error to the guest-visible `LinuxErrno`.
+    pub fn to_errno(&self) -> LinuxErrno {
+        match self {
+            Self::Io(err) => match err.kind() {
+                std::io::ErrorKind::NotFound => LINUX_ENOENT,
+                std::io::ErrorKind::PermissionDenied => LINUX_EACCES,
+                std::io::ErrorKind::OutOfMemory => LINUX_ENOMEM,
+                _ => LINUX_ENOEXEC,
+            },
+            Self::Linux(errno) => *errno,
+            Self::Kernel(err) => match err {
+                super::core::KernelError::InvalidLinuxId(_) => LINUX_EINVAL,
+                super::core::KernelError::Id(_)
+                | super::core::KernelError::ObjectId(_)
+                | super::core::KernelError::ObjectGraph(_) => LINUX_ENOMEM,
+                super::core::KernelError::UnknownTask(_)
+                | super::core::KernelError::StaleTaskBinding(_)
+                | super::core::KernelError::UnknownThread(_) => LINUX_ESRCH,
+                super::core::KernelError::DuplicateContainer(_)
+                | super::core::KernelError::ContainerBusy(_)
+                | super::core::KernelError::ContainerRootAlreadyPublished(_) => LINUX_EAGAIN,
+                super::core::KernelError::InjectedContainerRootFailure(_) => LINUX_EIO,
+                super::core::KernelError::UnknownContainer(_)
+                | super::core::KernelError::PidNamespaceMembership(_)
+                | super::core::KernelError::PidNamespaceRetirement(_)
+                | super::core::KernelError::ContainerTopology(_) => LINUX_EINVAL,
+            },
+            Self::KernelOperation(err) => match err {
+                super::operations::KernelOperationError::ProcessLimitExceeded { .. }
+                | super::operations::KernelOperationError::TaskBusy(_)
+                | super::operations::KernelOperationError::StaleContext
+                | super::operations::KernelOperationError::StaleReservation => LINUX_EAGAIN,
+                super::operations::KernelOperationError::IdentityPermission => LINUX_EACCES,
+                super::operations::KernelOperationError::ParentExited
+                | super::operations::KernelOperationError::UnknownTask(_)
+                | super::operations::KernelOperationError::UnknownThread(_) => LINUX_ESRCH,
+                super::operations::KernelOperationError::RevisionExhausted
+                | super::operations::KernelOperationError::RetiredThreadCapacity(_) => LINUX_ENOMEM,
+                super::operations::KernelOperationError::FileTableDraining => LINUX_EBADF,
+                _ => LINUX_EINVAL,
+            },
+            Self::Exec(err) => match err {
+                ExecError::TaskBusy
+                | ExecError::ReservationLost
+                | ExecError::InvariantLostAfterDrain
+                | ExecError::StalePreparation
+                | ExecError::StalePublication => LINUX_EAGAIN,
+                ExecError::TaskExited | ExecError::CallerExited => LINUX_ESRCH,
+                ExecError::FileTableDraining => LINUX_EBADF,
+                ExecError::RevisionExhausted | ExecError::RetiredThreadCapacity(_) => LINUX_ENOMEM,
+                ExecError::ObjectId(_) | ExecError::ObjectGraph(_) => LINUX_ENOMEM,
+                ExecError::ForeignContext
+                | ExecError::ForeignPreparation
+                | ExecError::WrongTask
+                | ExecError::LeaderClaimMissing => LINUX_EINVAL,
+                ExecError::Injected(_) => LINUX_EIO,
+            },
+            Self::InvalidHostPid(_) => LINUX_EINVAL,
+        }
+    }
+}
+
+impl From<ExecPrepareError> for LinuxErrno {
+    fn from(err: ExecPrepareError) -> Self {
+        err.to_errno()
+    }
+}
+
+impl From<&ExecPrepareError> for LinuxErrno {
+    fn from(err: &ExecPrepareError) -> Self {
+        err.to_errno()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU16;
@@ -1251,5 +1382,84 @@ mod tests {
 
         quit.store(true, Ordering::Release);
         runner.join().expect("resumed runner exits normally");
+    }
+
+    #[test]
+    fn test_exec_prepare_error_io_variant_errno() {
+        let err_not_found = ExecPrepareError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "not found",
+        ));
+        assert_eq!(err_not_found.to_errno(), LINUX_ENOENT);
+
+        let err_perm = ExecPrepareError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        assert_eq!(err_perm.to_errno(), LINUX_EACCES);
+
+        let err_oom =
+            ExecPrepareError::Io(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "oom"));
+        assert_eq!(err_oom.to_errno(), LINUX_ENOMEM);
+
+        let err_exec = ExecPrepareError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid elf",
+        ));
+        assert_eq!(err_exec.to_errno(), LINUX_ENOEXEC);
+        assert_eq!(LinuxErrno::from(&err_exec), LINUX_ENOEXEC);
+    }
+
+    #[test]
+    fn test_exec_prepare_error_linux_variant_errno() {
+        let err = ExecPrepareError::Linux(LINUX_EACCES);
+        assert_eq!(err.to_errno(), LINUX_EACCES);
+        assert_eq!(LinuxErrno::from(err), LINUX_EACCES);
+    }
+
+    #[test]
+    fn test_exec_prepare_error_kernel_variant_errno() {
+        let err = ExecPrepareError::Kernel(crate::kernel::KernelError::Id(
+            crate::kernel::IdError::Exhausted,
+        ));
+        assert_eq!(err.to_errno(), LINUX_ENOMEM);
+
+        let tid = LinuxTid::from_abi_positive(99).expect("valid positive tid");
+        let err_srch = ExecPrepareError::Kernel(crate::kernel::KernelError::UnknownThread(tid));
+        assert_eq!(err_srch.to_errno(), LINUX_ESRCH);
+    }
+
+    #[test]
+    fn test_exec_prepare_error_kernel_operation_variant_errno() {
+        let task_id = TaskId::from_abi_positive(1).expect("valid positive task id");
+        let err_busy = ExecPrepareError::KernelOperation(
+            crate::kernel::KernelOperationError::TaskBusy(task_id),
+        );
+        assert_eq!(err_busy.to_errno(), LINUX_EAGAIN);
+
+        let err_perm = ExecPrepareError::KernelOperation(
+            crate::kernel::KernelOperationError::IdentityPermission,
+        );
+        assert_eq!(err_perm.to_errno(), LINUX_EACCES);
+    }
+
+    #[test]
+    fn test_exec_prepare_error_exec_variant_errno() {
+        let err_busy = ExecPrepareError::Exec(ExecError::TaskBusy);
+        assert_eq!(err_busy.to_errno(), LINUX_EAGAIN);
+
+        let err_nomem = ExecPrepareError::Exec(ExecError::RevisionExhausted);
+        assert_eq!(err_nomem.to_errno(), LINUX_ENOMEM);
+
+        let err_inval = ExecPrepareError::Exec(ExecError::ForeignContext);
+        assert_eq!(err_inval.to_errno(), LINUX_EINVAL);
+    }
+
+    #[test]
+    fn test_exec_prepare_error_invalid_host_pid_variant_errno() {
+        let e = i32::try_from(i64::MAX).expect_err("i32::try_from(i64::MAX) must fail");
+        let err = ExecPrepareError::InvalidHostPid(e);
+        assert_eq!(err.to_errno(), LINUX_EINVAL);
+        assert_eq!(LinuxErrno::from(err), LINUX_EINVAL);
     }
 }

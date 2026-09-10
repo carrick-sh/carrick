@@ -71,6 +71,8 @@ pub enum RuntimeError {
     /// refusal as an execution failure, and the label is the message.
     #[error("configuration refused: {0}")]
     Configuration(String),
+    #[error("configuration refused: {0}")]
+    Exec(#[from] crate::kernel::ExecPrepareError),
     /// The one fail-closed sink. A judge proved the run can never finish, the
     /// kernel was frozen and captured in process, and every unpublished job
     /// was completed with this. It is deliberately NOT a panic and NOT an

@@ -67,7 +67,7 @@ pub use debug::{
     ServerError as KernelDebugServerError, UnknownTable as UnknownKernelTable,
     abort as kernel_debug_abort, fetch as kernel_debug_fetch,
 };
-pub use exec::{ExecError, PreparedExec};
+pub use exec::{ExecError, ExecPrepareError, PreparedExec};
 pub use frame_inventory::{
     FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
     FrameInventorySnapshot, FrameRow, MappingRow,
@@ -116,8 +116,8 @@ pub use registry::{
 pub(crate) use scheduler::SubmissionAuthority;
 pub use scheduler::{
     ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, RunQueue,
-    RunQueueError, RunnableThread, Scheduler, SchedulerError, SettlementDisposition,
-    WakeDisposition,
+    RunQueueError, RunnableThread, Scheduler, SchedulerError, SchedulerRetargetError,
+    SettlementDisposition, WakeDisposition,
 };
 pub use snapshot::{
     CredentialsSnapshotRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,

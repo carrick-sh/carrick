@@ -13,7 +13,7 @@ use parking_lot::{Condvar, Mutex};
 
 pub use carrick_hal::{
     CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, PreemptOrContinue,
-    SchedulingPolicy, TaskKey, TaskPlacement,
+    SchedulingPolicy, TaskKey, TaskPlacement, TrapError,
 };
 
 use super::Kernel;
@@ -68,6 +68,18 @@ pub enum RunQueueError {
     QueueEmpty,
     #[error("executor was poked for owner-thread control work")]
     ControlPoked,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SchedulerRetargetError {
+    #[error(transparent)]
+    Exec(#[from] super::exec::ExecError),
+    #[error(transparent)]
+    Thread(#[from] ThreadExecutionError),
+    #[error(transparent)]
+    Queue(#[from] RunQueueError),
+    #[error("exec retarget publication failed: {0}")]
+    Publication(#[from] TrapError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3623,16 +3635,12 @@ impl Scheduler {
         running: &mut RunnableThread,
         committed: super::exec::CommittedExecTransition,
         lease: ThreadExecutionLease,
-        publish: impl FnOnce(&super::exec::CommittedExecSchedulerParts) -> Result<T, String>,
-    ) -> Result<T, String> {
+        publish: impl FnOnce(&super::exec::CommittedExecSchedulerParts) -> Result<T, TrapError>,
+    ) -> Result<T, SchedulerRetargetError> {
         let generation_transition = self.generation_transition.lock();
-        let committed = committed
-            .into_scheduler_parts()
-            .map_err(|error| error.to_string())?;
+        let committed = committed.into_scheduler_parts()?;
         let replacement = Arc::clone(committed.context.thread());
-        let lease_identity = lease
-            .task_state_authority()
-            .map_err(|error| error.to_string())?;
+        let lease_identity = lease.task_state_authority()?;
         if running.lease.is_some()
             || lease.executor() != running.binding.executor
             || lease.thread_key() != replacement.key()
@@ -3644,11 +3652,9 @@ impl Scheduler {
             || committed.predecessor_mm == committed.successor_mm
             || lease_identity != (committed.successor_mm, committed.successor_asid_generation)
         {
-            return Err(RunQueueError::AuthorityMismatch.to_string());
+            return Err(RunQueueError::AuthorityMismatch.into());
         }
-        replacement
-            .validate_running_execution_lease(&lease)
-            .map_err(|error| error.to_string())?;
+        replacement.validate_running_execution_lease(&lease)?;
         let successor = ExecutorBinding {
             executor: lease.executor(),
             executor_epoch: lease.executor_epoch(),
@@ -3679,7 +3685,7 @@ impl Scheduler {
             .rebind_exact_with(running.binding, successor, &mut publish_once)
         {
             if let Some(error) = publication_error {
-                return Err(error);
+                return Err(SchedulerRetargetError::Publication(error));
             }
             // The Kernel replacement and combined record are already visible;
             // continuing without the matching kick token would split worker
@@ -3704,8 +3710,7 @@ impl Scheduler {
         running.lease = Some(lease);
         drop(generation_transition);
         self.kernel
-            .release_vfork_after_exec_publication(committed.publication_receipt)
-            .map_err(|error| error.to_string())?;
+            .release_vfork_after_exec_publication(committed.publication_receipt)?;
         Ok(published)
     }
 
@@ -4223,7 +4228,7 @@ mod tests {
 
     use super::{
         CpuAffinity, ExecutorBinding, ExecutorKick, ExecutorKickToken, GuestCpuId, GuestCpuPolicy,
-        QueueKey, RunQueueError, Scheduler, WakeDisposition,
+        QueueKey, RunQueueError, Scheduler, TrapError, WakeDisposition,
     };
     use crate::compat::SyscallArgs;
     use crate::dispatch::SyscallRequest;
@@ -4977,7 +4982,7 @@ mod tests {
             .unwrap();
         scheduler
             .retarget_running_exec(&mut running, committed, replacement_lease, |_| {
-                Ok::<_, String>(())
+                Ok::<_, TrapError>(())
             })
             .unwrap();
         let successor = running.binding;
@@ -5042,7 +5047,7 @@ mod tests {
 
         scheduler
             .retarget_running_exec(&mut running, committed, replacement_lease, |_| {
-                Ok::<_, String>(())
+                Ok::<_, TrapError>(())
             })
             .unwrap();
 
@@ -5101,12 +5106,9 @@ mod tests {
 
         assert!(
             scheduler
-                .retarget_running_exec(&mut running, committed, replacement_lease, |_| Ok::<
-                    _,
-                    String,
-                >(
-                    ()
-                ),)
+                .retarget_running_exec(&mut running, committed, replacement_lease, |_| {
+                    Ok::<_, TrapError>(())
+                },)
                 .is_err(),
             "replacement lease MM/ASID/CPU identity must match the Kernel token"
         );
