@@ -33,6 +33,55 @@ fn mapping_perms(addr: usize) -> Option<String> {
     containing
 }
 
+/// Large Linux virtual mappings reserve address space without allocating their
+/// entire byte length. Touch only three pages, then release the whole extent.
+fn sparse_large_mapping(label: &str, length: usize) {
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let base = libc::mmap(
+            core::ptr::null_mut(),
+            length,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        let map_errno = if base == libc::MAP_FAILED { errno() } else { 0 };
+        let mut protect_ok = 0;
+        let mut initial_zero = 0;
+        let mut distinct = 0;
+        let mut unmap_rc = -1;
+        if base != libc::MAP_FAILED {
+            let offsets = [0, (length / 2 / page) * page, length - page];
+            let mut protected = [false; 3];
+            for (i, offset) in offsets.iter().enumerate() {
+                let address = (base as usize + offset) as *mut u8;
+                if libc::mprotect(address.cast(), page, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+                    protected[i] = true;
+                    protect_ok += 1;
+                    if address.read_volatile() == 0 {
+                        initial_zero += 1;
+                    }
+                    address.write_volatile((i + 1) as u8);
+                }
+            }
+            for (i, offset) in offsets.iter().enumerate() {
+                if protected[i]
+                    && ((base as usize + offset) as *const u8).read_volatile() == (i + 1) as u8
+                {
+                    distinct += 1;
+                }
+            }
+            unmap_rc = libc::munmap(base, length);
+        }
+        println!("{label}_map_errno={map_errno}");
+        println!("{label}_protected_pages={protect_ok}");
+        println!("{label}_initial_zero_pages={initial_zero}");
+        println!("{label}_distinct_pages={distinct}");
+        println!("{label}_unmap={unmap_rc}");
+    }
+}
+
 fn main() {
     unsafe {
         libc::mkdir(c"/tmp".as_ptr(), 0o777);
@@ -207,6 +256,8 @@ fn main() {
         close_if_valid(bus_fd);
         close_if_valid(fd);
     }
+    sparse_large_mapping("vma64g", 64usize << 30);
+    sparse_large_mapping("vma16t", 16usize << 40);
 }
 
 unsafe fn errno_reset() {
