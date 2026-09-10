@@ -14041,18 +14041,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9038 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9036 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 368063,
-      "byte_start": 368038,
+      "byte_end": 367999,
+      "byte_start": 367974,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9038,
-      "line_end": 9038,
-      "line_start": 9038
+      "line": 9036,
+      "line_end": 9036,
+      "line_start": 9036
     }
   },
   {
@@ -14708,18 +14708,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9951 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9949 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000614",
     "source": {
-      "byte_end": 406200,
-      "byte_start": 406182,
+      "byte_end": 406148,
+      "byte_start": 406130,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9951,
-      "line_end": 9951,
-      "line_start": 9951
+      "line": 9949,
+      "line_end": 9949,
+      "line_start": 9949
     }
   },
   {
@@ -15368,18 +15368,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9785 in `capture_core_for_publication`, `std::thread::yield_now` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:9783 in `capture_core_for_publication`, `std::thread::yield_now` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000639",
     "source": {
-      "byte_end": 397222,
-      "byte_start": 397200,
+      "byte_end": 397170,
+      "byte_start": 397148,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9785,
-      "line_end": 9785,
-      "line_start": 9785
+      "line": 9783,
+      "line_end": 9783,
+      "line_start": 9783
     }
   },
   {
