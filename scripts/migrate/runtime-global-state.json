@@ -467,11 +467,11 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/core_publication.rs",
       "symbol": "publish_core_atomic::CARRICK_CORE_FAILPOINT",
       "fingerprint": "33a4c376d77e54b0f5f77e36519780e96feea8fcce87baaf8b1ade4443192589",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in publish_core_atomic::CARRICK_CORE_FAILPOINT (crates/carrick-runtime/src/dispatch/mod.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_CORE_FAILPOINT read in publish_core_atomic::CARRICK_CORE_FAILPOINT (crates/carrick-runtime/src/dispatch/core_publication.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var",
