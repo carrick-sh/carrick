@@ -1554,9 +1554,9 @@ pub(crate) enum BlockingHostWriteStep {
 pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> BlockingHostWriteStep {
     loop {
         if write.offset >= write.bytes.len() {
-            return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
-                value: write.bytes.len() as i64,
-            });
+            return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                write.bytes.len(),
+            ));
         }
         // BLOCKING-IO-OK: BlockingHostWrite pins a dup of a host fd that was
         // adopted non-blocking before the handoff; EAGAIN returns Wait below.
@@ -1574,37 +1574,37 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
                     write.tid.raw(),
                     carrick_abi::SigBlockMask::NONE,
                 ) {
-                    return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
-                        value: write.offset as i64,
-                    });
+                    return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                        write.offset,
+                    ));
                 }
                 return BlockingHostWriteStep::Wait;
             }
             if write.offset > 0 {
-                return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
-                    value: write.offset as i64,
-                });
+                return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                    write.offset,
+                ));
             }
             return BlockingHostWriteStep::Done(DispatchOutcome::Errno { errno });
         }
         if n == 0 {
-            return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
-                value: write.offset as i64,
-            });
+            return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                write.offset,
+            ));
         }
         write.offset += n as usize;
         if write.offset >= write.bytes.len() {
-            return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
-                value: write.bytes.len() as i64,
-            });
+            return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                write.bytes.len(),
+            ));
         }
         if crate::host_signal::has_unblocked_pending_for(
             write.tid.raw(),
             carrick_abi::SigBlockMask::NONE,
         ) {
-            return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
-                value: write.offset as i64,
-            });
+            return BlockingHostWriteStep::Done(DispatchOutcome::returned_len_or_errno(
+                write.offset,
+            ));
         }
     }
 }
@@ -10105,9 +10105,7 @@ pub(super) fn dispatch_futex_waitv_args(
             let wait = futex.prepare_wait(entry.address);
             match read_futex_word(memory, entry.address) {
                 Ok(word) if word != entry.value => {
-                    return DispatchOutcome::Returned {
-                        value: index as i64,
-                    };
+                    return DispatchOutcome::returned_len_or_errno(index);
                 }
                 Ok(_) => {}
                 Err(errno) => return DispatchOutcome::Errno { errno },
@@ -10123,9 +10121,7 @@ pub(super) fn dispatch_futex_waitv_args(
     for (index, entry) in entries.iter().enumerate() {
         match read_futex_word(memory, entry.address) {
             Ok(word) if word != entry.value => {
-                return DispatchOutcome::Returned {
-                    value: index as i64,
-                };
+                return DispatchOutcome::returned_len_or_errno(index);
             }
             Ok(_) => {}
             Err(errno) => return DispatchOutcome::Errno { errno },
@@ -11484,9 +11480,7 @@ fn read_eventfd(
             (current - taken) as u32 as i32,
         );
         state.wait_queue.wake_all();
-        return DispatchOutcome::Returned {
-            value: core::mem::size_of::<LinuxEventfdValue>() as i64,
-        };
+        return DispatchOutcome::returned_len_or_errno(core::mem::size_of::<LinuxEventfdValue>());
     }
 }
 
@@ -11545,9 +11539,7 @@ fn write_eventfd(this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) -
             this.notify_inmem_epoll();
         }
         state.wait_queue.wake_all();
-        return DispatchOutcome::Returned {
-            value: core::mem::size_of::<LinuxEventfdValue>() as i64,
-        };
+        return DispatchOutcome::returned_len_or_errno(core::mem::size_of::<LinuxEventfdValue>());
     }
 }
 
@@ -11577,9 +11569,9 @@ fn read_timerfd(
                 };
             }
             timer.expirations = 0;
-            return DispatchOutcome::Returned {
-                value: core::mem::size_of::<LinuxTimerfdExpirations>() as i64,
-            };
+            return DispatchOutcome::returned_len_or_errno(core::mem::size_of::<
+                LinuxTimerfdExpirations,
+            >());
         }
 
         if nonblocking {
@@ -12584,7 +12576,7 @@ fn read_host_pipe_into(
             errno: LINUX_EFAULT,
         };
     }
-    DispatchOutcome::Returned { value: n as i64 }
+    DispatchOutcome::returned_isize_or_errno(n)
 }
 
 fn read_host_pipe(
@@ -12826,9 +12818,7 @@ fn write_host_pipe_payload(
                             tid.raw(),
                             carrick_abi::SigBlockMask::NONE,
                         ) {
-                            return DispatchOutcome::Returned {
-                                value: offset as i64,
-                            };
+                            return DispatchOutcome::returned_len_or_errno(offset);
                         }
                         return match BlockingHostWrite::from_vec(
                             host_fd,
@@ -12838,9 +12828,7 @@ fn write_host_pipe_payload(
                             sigpipe_on_epipe,
                         ) {
                             Ok(write) => DispatchOutcome::BlockingHostWrite(write),
-                            Err(_) => DispatchOutcome::Returned {
-                                value: offset as i64,
-                            },
+                            Err(_) => DispatchOutcome::returned_len_or_errno(offset),
                         };
                     }
                     return would_block_outcome(
@@ -12904,9 +12892,7 @@ fn write_host_pipe_payload(
                     && let Some(result) = try_small_nonblocking_write(host_fd, payload.as_slice())
                 {
                     return match result {
-                        Ok(written) => DispatchOutcome::Returned {
-                            value: written as i64,
-                        },
+                        Ok(written) => DispatchOutcome::returned_len_or_errno(written),
                         Err(errno) => DispatchOutcome::Errno { errno },
                     };
                 }
@@ -12915,9 +12901,7 @@ fn write_host_pipe_payload(
                         tid.raw(),
                         carrick_abi::SigBlockMask::NONE,
                     ) {
-                        return DispatchOutcome::Returned {
-                            value: offset as i64,
-                        };
+                        return DispatchOutcome::returned_len_or_errno(offset);
                     }
                     return match BlockingHostWrite::from_vec(
                         host_fd,
@@ -12927,9 +12911,7 @@ fn write_host_pipe_payload(
                         sigpipe_on_epipe,
                     ) {
                         Ok(write) => DispatchOutcome::BlockingHostWrite(write),
-                        Err(_) => DispatchOutcome::Returned {
-                            value: offset as i64,
-                        },
+                        Err(_) => DispatchOutcome::returned_len_or_errno(offset),
                     };
                 }
                 return would_block_outcome(
@@ -12962,22 +12944,16 @@ fn write_host_pipe_payload(
                             sigpipe_on_epipe,
                         ) {
                             Ok(write) => DispatchOutcome::BlockingHostWrite(write),
-                            Err(_) => DispatchOutcome::Returned {
-                                value: offset as i64,
-                            },
+                            Err(_) => DispatchOutcome::returned_len_or_errno(offset),
                         };
                     }
-                    return DispatchOutcome::Returned {
-                        value: offset as i64,
-                    };
+                    return DispatchOutcome::returned_len_or_errno(offset);
                 }
                 continue;
             }
-            return DispatchOutcome::Returned {
-                value: payload.as_slice().len() as i64,
-            };
+            return DispatchOutcome::returned_len_or_errno(payload.as_slice().len());
         }
-        return DispatchOutcome::Returned { value: n as i64 };
+        return DispatchOutcome::returned_isize_or_errno(n);
     }
 }
 
