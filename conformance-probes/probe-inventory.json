@@ -2354,6 +2354,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "syslogstate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "sysvmsg": {
     "class": "conformance",
     "excluded": false,

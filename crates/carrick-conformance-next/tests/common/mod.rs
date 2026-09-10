@@ -160,25 +160,25 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "stackgrowmain",
     "streamdestmatrix",
     "syncfilerange",
-    "sysvmsg",
-    "sysvsem",
-    "telemetrymap",
-    "tgsigqueue",
-    "threadrecycle",
-    "threadstatuscount",
-    "timersettimeabs",
-    "tlsswitch",
-    "traceexecstop",
-    "udplitesock",
-    "unicodenorm",
-    "usernsmap",
-    "vdsosymbols",
-    "vforkvmshare",
-    "waitexitstorm",
-    "waitidspec",
-    "waitsiblingsigchld",
-    "xprocsigign",
-    "zerolenio",
+    "syslogstate",
+    "sysvmsgwake",
+    "sysvshm",
+    "termiosflow",
+    "threadcommname",
+    "threadstatstate",
+    "timeextra",
+    "tlbibroadcast",
+    "tmpfilewrite",
+    "udpconnectunspec",
+    "uffdpolicy",
+    "usernsisolation",
+    "vdsogtod",
+    "vforkpid",
+    "vmsplicepipe",
+    "waitidsiuid",
+    "waitrestart",
+    "writevpartial",
+    "xthreadsig",
 ];
 
 /// Exact materialized Shard 1 probe list: index % 3 == 1 over generic conformance probes.
@@ -324,24 +324,25 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "statfdino",
     "symlinkfollow",
     "syscallregpreserve",
-    "sysvmsgselect",
-    "sysvsemstat",
-    "termiosbits",
-    "threadbarrier",
-    "threadspawn",
-    "timeclock",
-    "timeschildren",
-    "tmpfileatime",
-    "ttyencoding",
-    "udpreuseaddr",
-    "unlinkatbindmount",
-    "usernswrite",
-    "vforkexecthread",
-    "vfs_mount_rw",
-    "waitidcputime",
-    "waitpgid",
-    "windowcoherence",
-    "xsignal",
+    "sysvmsg",
+    "sysvsem",
+    "telemetrymap",
+    "tgsigqueue",
+    "threadrecycle",
+    "threadstatuscount",
+    "timersettimeabs",
+    "tlsswitch",
+    "traceexecstop",
+    "udplitesock",
+    "unicodenorm",
+    "usernsmap",
+    "vdsosymbols",
+    "vforkvmshare",
+    "waitexitstorm",
+    "waitidspec",
+    "waitsiblingsigchld",
+    "xprocsigign",
+    "zerolenio",
 ];
 
 /// Exact materialized list of generic conformance probes for shard 2 (index % 3 == 2).
@@ -488,24 +489,24 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "statfslifetime",
     "symlinkmknod",
     "sysinfo",
-    "sysvmsgwake",
-    "sysvshm",
-    "termiosflow",
-    "threadcommname",
-    "threadstatstate",
-    "timeextra",
-    "tlbibroadcast",
-    "tmpfilewrite",
-    "udpconnectunspec",
-    "uffdpolicy",
-    "usernsisolation",
-    "vdsogtod",
-    "vforkpid",
-    "vmsplicepipe",
-    "waitidsiuid",
-    "waitrestart",
-    "writevpartial",
-    "xthreadsig",
+    "sysvmsgselect",
+    "sysvsemstat",
+    "termiosbits",
+    "threadbarrier",
+    "threadspawn",
+    "timeclock",
+    "timeschildren",
+    "tmpfileatime",
+    "ttyencoding",
+    "udpreuseaddr",
+    "unlinkatbindmount",
+    "usernswrite",
+    "vforkexecthread",
+    "vfs_mount_rw",
+    "waitidcputime",
+    "waitpgid",
+    "windowcoherence",
+    "xsignal",
 ];
 
 /// Per-probe additions to the generic container launch request.
@@ -516,6 +517,13 @@ pub struct ProbeLaunchPolicy {
 }
 
 const SPECIAL_PROBE_LAUNCH_POLICIES: &[(&str, ProbeLaunchPolicy)] = &[
+    (
+        "syslogstate",
+        ProbeLaunchPolicy {
+            security_opt: None,
+            cap_add: Some("SYSLOG"),
+        },
+    ),
     (
         "adjtimexmodel",
         ProbeLaunchPolicy {
@@ -691,6 +699,7 @@ pub fn select_cached_probes<'a>(probes: &'a [&'a str], requested: Option<&str>) 
 #[test]
 fn special_probe_container_lowers_required_privileges() {
     let cases = [
+        ("syslogstate", &["SYSLOG"][..], &[][..]),
         ("clocksettimevdso", &["SYS_TIME"][..], &[][..]),
         ("adjtimexmodel", &["SYS_TIME"][..], &[][..]),
         ("pipeblockedge", &["SYS_ADMIN"][..], &[][..]),
@@ -734,7 +743,7 @@ fn special_policy_names_are_unique_in_the_generic_shard_union() {
         SHARD_0_PROBES.len() + SHARD_1_PROBES.len() + SHARD_2_PROBES.len(),
         "generic shard arrays must form a unique union"
     );
-    assert_eq!(union.len(), 478, "generic shard union must remain complete");
+    assert_eq!(union.len(), 479, "generic shard union must remain complete");
 
     for (special, _) in SPECIAL_PROBE_LAUNCH_POLICIES {
         let occurrences = shards

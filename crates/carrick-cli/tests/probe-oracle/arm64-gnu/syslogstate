@@ -1,0 +1,13 @@
+854dfa8ce5481e48
+syslog_cap_effective=true
+invalid_action_errno=22
+null_read_errno=22
+negative_length_errno=22
+negative_level_errno=22
+excessive_level_errno=22
+zero_read_errno=0
+buffer_size_errno=0
+buffer_size_positive=true
+drop_euid_errno=0
+nonroot_read_errno=1
+restore_euid_errno=0
