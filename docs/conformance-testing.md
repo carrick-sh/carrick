@@ -132,6 +132,17 @@ The retained subprocess runner surfaces per-case `PASS`/`FAIL`/`XFAIL` lines as
 it runs; the generic shards use signed in-process test executables and committed
 source-hash-validated Docker oracles.
 
+The `tty0state` cached probe qualifies Linux virtual-console admission and
+read-only ioctl behavior. To deliberately refresh its native-arm64 Docker
+oracle, expose the Linux VM device with `--device /dev/tty0:/dev/tty0:rw` on
+`ubuntu:24.04`, and run both musl and GNU helpers serially after Carrick guests
+have stopped. It opens with `O_NOCTTY | O_NONBLOCK`, reads `TCGETS`/`TCGETA`,
+checks error numbers and duplicate-descriptor lifetime, and never writes console
+data or changes terminal settings. Missing `/dev/tty0` is a fixture failure,
+not a skip or a replacement oracle. The routine signed embed gate uses the
+committed source-hash-validated output; Carrick must supply its own Linux device
+semantics. This probe does not yet cover the state-changing ioctl cases in LTP.
+
 ### What a case is
 
 The suite has three flavors of differential case, all sharing the same

@@ -2484,6 +2484,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "tty0state": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "ttyencoding": {
     "class": "conformance",
     "excluded": false,

@@ -169,16 +169,16 @@ pub const SHARD_0_PROBES: &[&str] = &[
     "timeextra",
     "tlbibroadcast",
     "tmpfilewrite",
-    "udpconnectunspec",
-    "uffdpolicy",
-    "usernsisolation",
-    "vdsogtod",
-    "vforkpid",
-    "vmsplicepipe",
-    "waitidsiuid",
-    "waitrestart",
-    "writevpartial",
-    "xthreadsig",
+    "ttyencoding",
+    "udpreuseaddr",
+    "unlinkatbindmount",
+    "usernswrite",
+    "vforkexecthread",
+    "vfs_mount_rw",
+    "waitidcputime",
+    "waitpgid",
+    "windowcoherence",
+    "xsignal",
 ];
 
 /// Exact materialized Shard 1 probe list: index % 3 == 1 over generic conformance probes.
@@ -333,20 +333,20 @@ pub const SHARD_1_PROBES: &[&str] = &[
     "timersettimeabs",
     "tlsswitch",
     "traceexecstop",
-    "udplitesock",
-    "unicodenorm",
-    "usernsmap",
-    "vdsosymbols",
-    "vforkvmshare",
-    "waitexitstorm",
-    "waitidspec",
-    "waitsiblingsigchld",
-    "xprocsigign",
-    "zerolenio",
+    "udpconnectunspec",
+    "uffdpolicy",
+    "usernsisolation",
+    "vdsogtod",
+    "vforkpid",
+    "vmsplicepipe",
+    "waitidsiuid",
+    "waitrestart",
+    "writevpartial",
+    "xthreadsig",
 ];
 
 /// Exact materialized list of generic conformance probes for shard 2 (index % 3 == 2).
-/// Hard-asserted to have exactly 159 sorted unique names.
+/// Hard-asserted to have exactly 160 sorted unique names.
 pub const SHARD_2_PROBES: &[&str] = &[
     "accessx",
     "adjtimexstate",
@@ -497,16 +497,17 @@ pub const SHARD_2_PROBES: &[&str] = &[
     "timeclock",
     "timeschildren",
     "tmpfileatime",
-    "ttyencoding",
-    "udpreuseaddr",
-    "unlinkatbindmount",
-    "usernswrite",
-    "vforkexecthread",
-    "vfs_mount_rw",
-    "waitidcputime",
-    "waitpgid",
-    "windowcoherence",
-    "xsignal",
+    "tty0state",
+    "udplitesock",
+    "unicodenorm",
+    "usernsmap",
+    "vdsosymbols",
+    "vforkvmshare",
+    "waitexitstorm",
+    "waitidspec",
+    "waitsiblingsigchld",
+    "xprocsigign",
+    "zerolenio",
 ];
 
 /// Per-probe additions to the generic container launch request.
@@ -742,7 +743,7 @@ fn special_policy_names_are_unique_in_the_generic_shard_union() {
         SHARD_0_PROBES.len() + SHARD_1_PROBES.len() + SHARD_2_PROBES.len(),
         "generic shard arrays must form a unique union"
     );
-    assert_eq!(union.len(), 479, "generic shard union must remain complete");
+    assert_eq!(union.len(), 480, "generic shard union must remain complete");
 
     for (special, _) in SPECIAL_PROBE_LAUNCH_POLICIES {
         let occurrences = shards
