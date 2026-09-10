@@ -1,0 +1,56 @@
+`run-elf` drives a freestanding ELF straight through the HVF run loop (`run_static_elf_with_hvf_…`), macOS-only. On Linux use `carrick run <oci>`, or the `carrick-kvm run-elf` dev driver for a bare ELF
+
+Usage: carrick run-elf [OPTIONS] <PATH> [-- <ARGS>...]
+
+Arguments:
+  <PATH>
+          
+
+  [ARGS]...
+          
+
+Options:
+      --rootfs-layer <ROOTFS_LAYERS>
+          
+
+      --store <STORE>
+          [env: CARRICK_HOME=]
+
+      --max-traps <MAX_TRAPS>
+          Opt-in debugging bound on guest traps (default: unlimited). Use it to stop a runaway guest while tracing; it is NOT a health check — exceeding a fixed count of successfully-serviced syscalls says nothing about whether the guest is stuck
+          
+          [default: 18446744073709551615]
+
+      --debug-state-path <DEBUG_STATE_PATH>
+          Write a JSON dump of the guest address-space layout (PIE base, interpreter base, HVF mappings, vector + trampoline pages) to this path BEFORE starting the vCPU. The dump is what the `carrick.lldb` Python plugin reads to translate guest addresses back to image / segment / file context
+
+      --raw
+          Suppress the JSON compat-report envelope. The guest's stdout goes to the carrick process's stdout, stderr to stderr, and the host exit code matches the guest's exit_group code. Makes carrick feel like a normal command runner
+
+      --fs <FS>
+          Which writable-layer backend to use. Defaults to `host`. The in-memory backend (`memory`) is opt-in: build with `--features fs-memory`. It is incoherent across guest `fork`
+
+          Possible values:
+          - host: Host-APFS passthrough via cap-std: the kernel is the single fork-coherent source of truth. The only backend in a default build
+
+  -v, --volume <HOST:GUEST[:ro]>
+          Bind-mount a host directory/file into the guest: `HOST:GUEST[:ro]`. Needed under `--fs host` (a sandboxed scratch, not the real host FS) to expose host paths — e.g. a test's `testdata/`
+
+  -w, --workdir <DIR>
+          The guest's initial working directory. Defaults (under `--fs host`) to carrick's launch directory
+
+      --forward-env <KEY=VAL>
+          `KEY=VAL` env vars to set in this process before the guest starts. Lets a `sudo`-launched run carry `CARRICK_*` tunables (e.g. `CARRICK_EXPOSED_CPUS`) across sudo's `env_reset` without needing SETENV in sudoers - CLI args survive sudo where env vars don't. Same idiom as `trace --forward-env`
+
+      --exec-backend <EXEC_BACKEND>
+          Execution backend policy. `native` is experimental and trusted-code-only
+          
+          [env: CARRICK_EXEC_BACKEND=]
+          [default: hvpatch]
+          [possible values: hvpatch]
+
+      --security-opt <OPTION>
+          Launch-time syscall policy. `run-elf` drives a bare host ELF and defaults to UNCONFINED (no policy); pass `seccomp=default` to opt into the container policy model `carrick run` applies by default (the shape the conformance Docker oracle runs under)
+
+  -h, --help
+          Print help (see a summary with '-h')

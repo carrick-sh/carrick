@@ -1,0 +1,120 @@
+Create a container without starting it (like `docker create`). Pulls the image and persists the config; launch it later with `carrick start`
+
+Usage: carrick create [OPTIONS] <IMAGE> [COMMAND]...
+
+Arguments:
+  <IMAGE>
+          
+
+  [COMMAND]...
+          
+
+Options:
+      --platform <OS/ARCH>
+          
+
+      --store <STORE>
+          [env: CARRICK_HOME=]
+
+      --fs <FS>
+          Which writable-layer backend to use. Defaults to `host`. The in-memory backend (`memory`) is opt-in (`--features fs-memory`)
+
+          Possible values:
+          - host: Host-APFS passthrough via cap-std: the kernel is the single fork-coherent source of truth. The only backend in a default build
+
+      --exec-backend <EXEC_BACKEND>
+          Execution backend policy. `native` is experimental and trusted-code-only
+          
+          [env: CARRICK_EXEC_BACKEND=]
+          [default: hvpatch]
+          [possible values: hvpatch]
+
+      --pid <PID>
+          Possible values:
+          - private: A fresh PID namespace (default; `docker run` default)
+          - host:    Share the host PID namespace (`docker run --pid=host`)
+          
+          [default: private]
+
+      --pull <PULL>
+          Docker `--pull` policy: `always` re-checks the registry and re-pulls a moved tag, `missing` (default) pulls only when the image is absent, `never` uses only the local cache
+          
+          [default: missing]
+          [possible values: always, missing, never]
+
+      --net <NETWORK>
+          Container network mode: host, bridge, none, or container:<id|name>
+          
+          [default: host]
+
+      --network-alias <ALIAS>
+          Add a service alias on the bridge network
+
+      --ip <IPv4>
+          Assign a static IPv4 address on the bridge network
+
+      --add-host <HOST:IP>
+          Add a custom host-to-IP mapping in the guest's /etc/hosts
+
+      --dns <IP>
+          Set a custom DNS nameserver
+
+      --dns-search <DOMAIN>
+          Set a custom DNS search domain
+
+      --dns-option <OPTION>
+          Set a custom DNS resolver option
+
+  -e, --env <KEY=VALUE>
+          
+
+      --env-file <FILE>
+          
+
+  -w, --workdir <DIR>
+          
+
+  -u, --user <USER>
+          
+
+      --entrypoint <COMMAND>
+          
+
+  -v, --volume <host-src:container-dest[:ro|rw]>
+          
+
+      --volumes-from <CONTAINER[:ro|:rw]>
+          Mount volumes from another container
+
+      --mount <type=bind,source=...,target=...>
+          
+
+      --name <NAME>
+          
+
+      --rm
+          Automatically remove the container when it exits
+
+  -t, --tty
+          
+
+  -i, --interactive
+          
+
+  -p, --publish <hostPort:containerPort>
+          Publish a container's port(s) to the host
+
+      --stop-signal <SIGNAL>
+          Signal to stop the container (overrides the image `STOPSIGNAL`)
+
+      --stop-timeout <SECONDS>
+          Seconds to wait before SIGKILL when stopping. Defaults to 10
+
+      --security-opt <OPTION>
+          Docker-compatible security options (see `run --security-opt`)
+
+      --cap-add <CAPABILITY>
+          Docker-compatible `--cap-add` (see `run --cap-add`)
+
+  -h, --help
+          Print help (see a summary with '-h')
