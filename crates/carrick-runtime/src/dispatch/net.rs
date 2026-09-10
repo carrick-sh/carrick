@@ -11712,7 +11712,7 @@ mod nested_epoll_readiness_tests {
         let pollfds_addr = 0x1100u64;
         let pfd = LinuxPollFd {
             fd: outer,
-            events: LINUX_POLLIN as i16,
+            events: LINUX_POLLIN,
             revents: 0,
         };
         guest_mem
@@ -11791,7 +11791,7 @@ mod nested_epoll_readiness_tests {
 
         assert_eq!(ppoll_ready, DispatchOutcome::Returned { value: 1 });
         let out_pfd: LinuxPollFd = read_kernel_struct(&guest_mem, pollfds_addr).unwrap();
-        assert_eq!(out_pfd.revents & (LINUX_POLLIN as i16), LINUX_POLLIN as i16);
+        assert_eq!(out_pfd.revents & LINUX_POLLIN, LINUX_POLLIN);
     }
 
     #[test]
