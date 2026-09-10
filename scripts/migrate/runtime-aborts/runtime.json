@@ -548,7 +548,7 @@
       "domain": "dispatch::mm_mutation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
       "function": "<HostAliasDispatchGuard<'_> as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "f49624eac3ea22e23576535dcc326d7ff4bd0c9222c5b1611df9d57bfab1b38b",
@@ -581,7 +581,7 @@
       "domain": "dispatch::mm_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
       "function": "HostAliasDispatchGuard<'_>::publish",
       "ordinal_in_function": 1,
       "fingerprint": "151fb0f88540693135133e77b970bb88c42c51bcf642d6bc9c730d7646845c4e",
@@ -593,7 +593,7 @@
       "domain": "dispatch::host_alias_transactions"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
       "function": "HostAliasDispatchGuard<'_>::publish",
       "ordinal_in_function": 2,
       "fingerprint": "f8bcea04aa49a5898808a9640ced88393e1339d743d9a6f65fbd9aaa2a7406ca",
@@ -604,7 +604,7 @@
       "domain": "dispatch::host_alias_transactions"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
       "function": "HostAliasDispatchGuard<'_>::with_authority",
       "ordinal_in_function": 1,
       "fingerprint": "2b7a9c4dbfeced482bf7f142f302c08b7d5d78f5d7602d5e4630ad95cd501b18",
@@ -725,7 +725,7 @@
       "domain": "dispatch::mm_authority"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
       "function": "SyscallDispatcher::commit_host_alias_install",
       "ordinal_in_function": 1,
       "fingerprint": "d1288d2a935f542b2e958737eebcd08d6ff7db0ddbe079f6f3f783ce4ce8a95b",
@@ -759,7 +759,7 @@
       "domain": "dispatch::mm_executor_admission"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
       "function": "SyscallDispatcher::mark_vma_dispatch",
       "ordinal_in_function": 1,
       "fingerprint": "97c09b9c7ace02a91e0135fa4bcb9f4a07603580f10e1ffd196e9d69bf72f42c",
