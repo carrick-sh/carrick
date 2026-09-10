@@ -1749,11 +1749,7 @@ impl SyscallDispatcher {
     }
 
     fn tty_ioctl_fd_kind(&self, fd: i32) -> Result<TtyFdKind, LinuxErrno> {
-        if is_stdio_fd(fd)
-            && !self.stdio_is_closed(fd)
-            && !self.fd_table_contains(fd)
-            && crate::host_tty::host_isatty(fd)
-        {
+        if is_stdio_fd(fd) && !self.stdio_is_closed(fd) && !self.fd_table_contains(fd) {
             Ok(TtyFdKind::Stdio)
         } else if self.fd_is_valid(fd) {
             Ok(TtyFdKind::Other)
@@ -1799,7 +1795,6 @@ impl SyscallDispatcher {
         } else if is_stdio_fd(fd)
             && !self.stdio_is_closed(fd)
             && !self.fd_table_contains(fd)
-            && crate::host_tty::host_isatty(fd)
             && controlling_index.is_some()
         {
             crate::kernel::tty::session(crate::kernel::tty::TtyKey::Launch) == Some(session)
@@ -6417,7 +6412,7 @@ impl SyscallDispatcher {
             changed = true;
         }
         if changed {
-            let _ = self.fs.rootfs_vfs.overlay.set_mode(path, mode);
+            let _ = self.fs.rootfs_vfs.set_mode(path, mode);
         }
     }
 
@@ -6508,16 +6503,10 @@ impl SyscallDispatcher {
         // Create the target from the captured bytes, then apply the creation
         // mode (set_file_contents creates with the host umask; set_mode forces
         // the O_TMPFILE create mode the test stats).
-        if self
-            .fs
-            .rootfs_vfs
-            .overlay
-            .set_file_contents(target, bytes)
-            .is_err()
-        {
+        if self.fs.rootfs_vfs.set_file_contents(target, bytes).is_err() {
             return Some(Err(LINUX_EROFS));
         }
-        let _ = self.fs.rootfs_vfs.overlay.set_mode(target, mode);
+        let _ = self.fs.rootfs_vfs.set_mode(target, mode);
         Some(Ok(()))
     }
 
@@ -7519,14 +7508,13 @@ impl SyscallDispatcher {
             {
                 owner_gid = pgid;
                 inherited_gid = true;
-                let _ = self.fs.rootfs_vfs.overlay.set_mode(path, node_mode);
+                let _ = self.fs.rootfs_vfs.set_mode(path, node_mode);
             }
         }
         if !creds.euid.is_root() || !owner_gid.is_root() || inherited_gid {
             let _ = self
                 .fs
                 .rootfs_vfs
-                .overlay
                 .set_owner(path, Some(creds.euid), Some(owner_gid));
         }
     }
