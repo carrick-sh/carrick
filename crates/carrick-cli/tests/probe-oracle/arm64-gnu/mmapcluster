@@ -1,4 +1,4 @@
-56fadfa1b59c0238
+2152d2cca9194d19
 private_perms=r--p
 shared_perms=rw-s
 write_only_errno=13
@@ -16,3 +16,17 @@ vma16t_protected_pages=3
 vma16t_initial_zero_pages=3
 vma16t_distinct_pages=3
 vma16t_unmap=0
+vma64g_rw_map_errno=0
+vma64g_rw_pipe_errno=0
+vma64g_rw_initial_zero_pages=3
+vma64g_rw_distinct_groups=3
+vma64g_rw_kernel_first_copyin=3
+vma64g_rw_kernel_first_copyout=3
+vma64g_rw_unmap=0
+vma16t_rw_map_errno=0
+vma16t_rw_pipe_errno=0
+vma16t_rw_initial_zero_pages=3
+vma16t_rw_distinct_groups=3
+vma16t_rw_kernel_first_copyin=3
+vma16t_rw_kernel_first_copyout=3
+vma16t_rw_unmap=0
