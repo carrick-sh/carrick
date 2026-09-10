@@ -149,9 +149,10 @@ lint-domains:
 # `git diff` (positions only), then commit it as
 # `chore: reconcile the line-pinned inventories for <change>`.
 #
-# Rebind the line-pinned lint-domains inventories after a pure code move.
-reconcile-inventories:
-    python3 scripts/migrate/reconcile-line-pinned-inventories.py
+# Rebind the line-pinned lint-domains inventories after a pure code move. Pass
+# `--rehome` to allow reviewed rows to follow functions that move files.
+reconcile-inventories *args:
+    python3 scripts/migrate/reconcile-line-pinned-inventories.py {{args}}
 
 
 # Dependency license / bans / sources gate (matches CI). Enforces the deny.toml
