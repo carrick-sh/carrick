@@ -2068,9 +2068,7 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(linux_errno::EMFILE);
             }
         };
-        DispatchOutcome::Returned {
-            value: linux_fd as i64,
-        }
+        DispatchOutcome::returned_i32(linux_fd)
     }
 
     /// Add GUEST fd `guest_fd` to an `SCM_RIGHTS` send. A host-backed
@@ -2605,9 +2603,7 @@ impl SyscallDispatcher {
                 }
             }
         }
-        DispatchOutcome::Returned {
-            value: request.len() as i64,
-        }
+        DispatchOutcome::returned_len_or_errno(request.len())
     }
 
     /// recvfrom path for netlink: drain queued reply bytes into guest memory,
@@ -2630,9 +2626,7 @@ impl SyscallDispatcher {
         if !chunk.is_empty() && memory.write_bytes(buf_addr, &chunk).is_err() {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
-        DispatchOutcome::Returned {
-            value: chunk.len() as i64,
-        }
+        DispatchOutcome::returned_len_or_errno(chunk.len())
     }
 
     /// Pop up to `max` bytes from the netlink recv queue. Our synthetic
@@ -3041,9 +3035,7 @@ impl SyscallDispatcher {
                 protocol,
             );
         }
-        DispatchOutcome::Returned {
-            value: linux_fd as i64,
-        }
+        DispatchOutcome::returned_i32(linux_fd)
     }
 
     /// connect(2) core with always-wait-on-block semantics, for the io_uring
@@ -3161,14 +3153,14 @@ impl SyscallDispatcher {
                         // At least one message went out — Linux returns
                         // the count of successful sends, and the errno
                         // surfaces on the next call.
-                        return DispatchOutcome::Returned { value: sent as i64 };
+                        return DispatchOutcome::returned_i32(sent);
                     }
                     return DispatchOutcome::errno(errno);
                 }
                 other => return other,
             }
         }
-        DispatchOutcome::Returned { value: sent as i64 }
+        DispatchOutcome::returned_i32(sent)
     }
 
     /// `recvmmsg(sockfd, msgvec, vlen, flags, timeout)` — Linux's
@@ -3259,18 +3251,14 @@ impl SyscallDispatcher {
                 }
                 DispatchOutcome::Errno { errno } => {
                     if received > 0 {
-                        return DispatchOutcome::Returned {
-                            value: received as i64,
-                        };
+                        return DispatchOutcome::returned_i32(received);
                     }
                     return DispatchOutcome::errno(errno);
                 }
                 other => return other,
             }
         }
-        DispatchOutcome::Returned {
-            value: received as i64,
-        }
+        DispatchOutcome::returned_i32(received)
     }
 }
 
@@ -8606,9 +8594,7 @@ impl SyscallDispatcher {
                     match socket.send_stream(&bytes, Vec::new()) {
                         Ok(written) => {
                             this.notify_inmem_epoll();
-                            return Ok(DispatchOutcome::Returned {
-                                value: written as i64,
-                            });
+                            return Ok(DispatchOutcome::returned_len(written)?);
                         }
                         Err(LINUX_EPIPE) => {
                             let outcome = DispatchOutcome::errno(LINUX_EPIPE);
@@ -8708,14 +8694,14 @@ impl SyscallDispatcher {
                 if let Ok(bytes) = memory.read_bytes(buf_addr, len)
                     && this.maybe_queue_icmp_echo_reply(fd, &bytes, requested)
                 {
-                    return Ok(DispatchOutcome::Returned { value: len as i64 });
+                    return Ok(DispatchOutcome::returned_len(len)?);
                 }
                 if protocol == PortProtocol::Udp
                     && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
                     && let Ok(bytes) = memory.read_bytes(buf_addr, len)
                     && this.maybe_queue_dns_response(fd, &bytes, requested)
                 {
-                    return Ok(DispatchOutcome::Returned { value: len as i64 });
+                    return Ok(DispatchOutcome::returned_len(len)?);
                 }
                 match this.network.provider.resolve_connect(
                     this.network.spec.namespace_id.as_ref(),
@@ -8743,7 +8729,7 @@ impl SyscallDispatcher {
                         if dest_addr == 0 {
                             this.queue_socket_error_after_send(fd);
                         }
-                        return Ok(DispatchOutcome::Returned { value: len as i64 });
+                        return Ok(DispatchOutcome::returned_len(len)?);
                     }
                     Ok(ConnectTarget::Intercept(_)) => {
                         return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED))
@@ -8777,7 +8763,7 @@ impl SyscallDispatcher {
                         .cork()
                         .stage(data, host_addr.as_deref());
                 }
-                return Ok(DispatchOutcome::Returned { value: len as i64 });
+                return Ok(DispatchOutcome::returned_len(len)?);
             }
 
             let pending_cork_data = if has_pending_cork {
@@ -8946,9 +8932,7 @@ impl SyscallDispatcher {
                                 }
                             }
                         }
-                        return Ok(DispatchOutcome::Returned {
-                            value: read_len as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_len(read_len)?);
                     }
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
@@ -8978,7 +8962,7 @@ impl SyscallDispatcher {
                 {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
-                return Ok(DispatchOutcome::Returned { value: take as i64 });
+                return Ok(DispatchOutcome::returned_len(take)?);
             }
             // An error-queue socket's ICMP error goes ONLY to the queue — that
             // is what `IP_RECVERR` is FOR. The ordinary read must still answer
@@ -9992,9 +9976,7 @@ impl SyscallDispatcher {
             match socket.send_stream(&data, Vec::new()) {
                 Ok(written) => {
                     self.notify_inmem_epoll();
-                    return Ok(DispatchOutcome::Returned {
-                        value: written as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_len(written)?);
                 }
                 Err(LINUX_EPIPE) => {
                     return Ok(DispatchOutcome::errno(LINUX_EPIPE));
@@ -10060,9 +10042,7 @@ impl SyscallDispatcher {
                     .cork()
                     .stage(&data, host_addr.as_deref());
             }
-            return Ok(DispatchOutcome::Returned {
-                value: data_len as i64,
-            });
+            return Ok(DispatchOutcome::returned_len(data_len)?);
         }
 
         let pending_cork_data = if has_pending_cork {
@@ -10091,9 +10071,7 @@ impl SyscallDispatcher {
                 || self.socket_port_protocol(fd) == Some(PortProtocol::Udp)
                     && self.maybe_queue_dns_response(fd, &data, requested)
             {
-                return Ok(DispatchOutcome::Returned {
-                    value: data.len() as i64,
-                });
+                return Ok(DispatchOutcome::returned_len(data.len())?);
             }
         }
         // SCM_RIGHTS ancillary data (passing fds over AF_UNIX). Read the guest's
@@ -10273,9 +10251,7 @@ impl SyscallDispatcher {
         if payload_sent == 0 && nonblocking {
             return DispatchOutcome::errno(LINUX_EAGAIN);
         }
-        DispatchOutcome::Returned {
-            value: payload_sent as i64,
-        }
+        DispatchOutcome::returned_len_or_errno(payload_sent)
     }
 
     /// Put not-yet-accepted corked bytes back ahead of anything corked since.
@@ -10419,9 +10395,7 @@ impl SyscallDispatcher {
                             }
                         }
                     }
-                    return Ok(DispatchOutcome::Returned {
-                        value: read_len as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_len(read_len)?);
                 }
                 Err(LINUX_EAGAIN) => return Ok(DispatchOutcome::errno(LINUX_EAGAIN)),
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -10508,7 +10482,7 @@ impl SyscallDispatcher {
                 msg_addr + core::mem::offset_of!(LinuxMsghdr, flags) as u64,
                 &0i32.to_ne_bytes(),
             );
-            return Ok(DispatchOutcome::Returned { value: n as i64 });
+            return Ok(DispatchOutcome::returned_len(n)?);
         }
         let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
         if let Some((payload, source)) = self.synthetic_datagram_drain(fd) {
@@ -10553,7 +10527,7 @@ impl SyscallDispatcher {
                 msg_addr + core::mem::offset_of!(LinuxMsghdr, flags) as u64,
                 &0i32.to_ne_bytes(),
             );
-            return Ok(DispatchOutcome::Returned { value: n as i64 });
+            return Ok(DispatchOutcome::returned_len(n)?);
         }
         let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;

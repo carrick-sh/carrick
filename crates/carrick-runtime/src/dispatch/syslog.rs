@@ -93,7 +93,7 @@ impl SyscallDispatcher {
                             cx.memory.write_bytes(buf.0, &data)?;
                         }
                         crate::event_ring::rec_syslog(owner_id, action, len, data.len() as i32);
-                        return Ok(DispatchOutcome::Returned { value: data.len() as i64 });
+                        return Ok(DispatchOutcome::returned_len(data.len())?);
                     }
 
                     // Buffer is empty relative to this reader: park interruptibly using WaitOnFds.
@@ -127,7 +127,7 @@ impl SyscallDispatcher {
                         cx.memory.write_bytes(buf.0, &data)?;
                     }
                     crate::event_ring::rec_syslog(owner_id, action, len, data.len() as i32);
-                    Ok(DispatchOutcome::Returned { value: data.len() as i64 })
+                    Ok(DispatchOutcome::returned_len(data.len())?)
                 }
                 SYSLOG_ACTION_READ_CLEAR => {
                     if buf.0 == 0 || len < 0 {
@@ -143,7 +143,7 @@ impl SyscallDispatcher {
                         cx.memory.write_bytes(buf.0, &data)?;
                     }
                     crate::event_ring::rec_syslog(owner_id, action, len, data.len() as i32);
-                    Ok(DispatchOutcome::Returned { value: data.len() as i64 })
+                    Ok(DispatchOutcome::returned_len(data.len())?)
                 }
                 SYSLOG_ACTION_CLEAR => {
                     syslog.clear();
@@ -172,12 +172,12 @@ impl SyscallDispatcher {
                 SYSLOG_ACTION_SIZE_UNREAD => {
                     let unread = syslog.size_unread();
                     crate::event_ring::rec_syslog(owner_id, action, len, unread as i32);
-                    Ok(DispatchOutcome::Returned { value: unread as i64 })
+                    Ok(DispatchOutcome::returned_len(unread)?)
                 }
                 SYSLOG_ACTION_SIZE_BUFFER => {
                     let size = syslog.size_buffer();
                     crate::event_ring::rec_syslog(owner_id, action, len, size as i32);
-                    Ok(DispatchOutcome::Returned { value: size as i64 })
+                    Ok(DispatchOutcome::returned_len(size)?)
                 }
                 _ => {
                     crate::event_ring::rec_syslog(owner_id, action, len, -LINUX_EINVAL.get());

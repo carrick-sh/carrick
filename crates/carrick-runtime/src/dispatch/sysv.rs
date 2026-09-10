@@ -2518,7 +2518,7 @@ impl SyscallDispatcher {
             let creator = this.identity_pid() as i32;
             this.sysv.with_state_mut(|state| {
                 match shmget_open(state, &creds, key, size, flags, creator) {
-                    Ok(shmid) => Ok(DispatchOutcome::Returned { value: shmid as i64 }),
+                    Ok(shmid) => Ok(DispatchOutcome::returned_i32(shmid)),
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
             })
@@ -2571,7 +2571,7 @@ impl SyscallDispatcher {
                 if process.first_remapped_attachment().is_some() {
                     let va = process.commit_remapped_shmat(shmid, lpid, reservation);
                     unsafe { libc::close(host_fd) };
-                    return Ok(DispatchOutcome::Returned { value: va as i64 });
+                    return Ok(DispatchOutcome::returned_u64(va)?);
                 }
             }
             if addr != 0
@@ -2850,7 +2850,7 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         }
                     }
-                    Ok(DispatchOutcome::Returned { value: target_id as i64 })
+                    Ok(DispatchOutcome::returned_i32(target_id))
                 }
                 LINUX_IPC_INFO | LINUX_SHM_INFO => {
                     // Aggregate info. Linux fills `struct shminfo`
@@ -3023,7 +3023,7 @@ impl SyscallDispatcher {
             loop {
                 match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator) {
                     Ok(Some(received)) => {
-                        return Ok(DispatchOutcome::Returned { value: received as i64 });
+                        return Ok(DispatchOutcome::returned_len(received)?);
                     }
                     Ok(None) => {
                         saw_would_block = true;
@@ -3037,9 +3037,7 @@ impl SyscallDispatcher {
                             match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator)
                             {
                                 Ok(Some(received)) => {
-                                    return Ok(DispatchOutcome::Returned {
-                                        value: received as i64,
-                                    });
+                                    return Ok(DispatchOutcome::returned_len(received)?);
                                 }
                                 Ok(None) => {
                                     if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
@@ -3565,9 +3563,7 @@ fn sysv_msgctl<M: CurrentMmMemory>(
         LINUX_IPC_INFO | LINUX_MSG_INFO => {
             let metrics = msg_queue_metrics();
             write_msginfo(cx, buf, metrics, cmd)?;
-            return Ok(DispatchOutcome::Returned {
-                value: (metrics.queues as i64 - 1).max(0),
-            });
+            return DispatchOutcome::returned_len(metrics.queues.saturating_sub(1));
         }
         LINUX_MSG_STAT | LINUX_MSG_STAT_ANY => {
             return msg_stat_by_index(cx, msqid, buf, &creds, cmd == LINUX_MSG_STAT);
@@ -4152,7 +4148,7 @@ impl SyscallDispatcher {
                     Ok(meta.values.lock()[idx])
                 });
                 match val_res {
-                    Ok(val) => Ok(DispatchOutcome::Returned { value: val as i64 }),
+                    Ok(val) => Ok(DispatchOutcome::returned_u16(val)),
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
             }

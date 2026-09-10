@@ -504,9 +504,7 @@ impl SyscallDispatcher {
                     Some(d) => d.disarm_itimer(idx),
                     None => crate::itimer::disarm(idx),
                 }
-                return Ok(DispatchOutcome::Returned {
-                    value: previous.min(i64::MAX as u64) as i64,
-                });
+                return Ok(DispatchOutcome::returned_u64(previous)?);
             }
 
             let value = Duration::from_secs(seconds);
@@ -533,9 +531,7 @@ impl SyscallDispatcher {
                 crate::itimer::spawn_fallback_timer(idx, generation, spec_ns);
             }
 
-            Ok(DispatchOutcome::Returned {
-                value: previous.min(i64::MAX as u64) as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(previous)?)
         }
 
         /// `timer_create(clock_id, sevp, &id)`: allocate a per-process timer.
@@ -794,7 +790,7 @@ impl SyscallDispatcher {
         fn timer_getoverrun(this, cx, timer_id: u64) {
             let id = timer_id as i64 as i32;
             match crate::posix_timer::getoverrun(id) {
-                Some(n) => Ok(DispatchOutcome::Returned { value: n as i64 }),
+                Some(n) => Ok(DispatchOutcome::returned_u32(n)),
                 None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
         }

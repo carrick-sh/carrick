@@ -769,6 +769,7 @@ mod proc;
 pub(crate) use proc::build_hvpatch_waitid_siginfo;
 mod proctitle;
 pub(crate) mod resources;
+mod retval;
 #[macro_use]
 mod signal;
 mod bpf;
