@@ -104,3 +104,9 @@ from sibling branches.
   forward in eec00f45f); validate every inventory JSON parses before commit;
   `git rerere` is enabled in this clone — its cache was cleared so a recorded
   "take main" resolution can never be replayed onto a newer inventory.
+- 2026-09-10 live verification: `just conformance-probes` on main at
+  ce62ddb26 (signed, carrick-only against the cached oracle) — every probe
+  MATCH except four DIFFs already recorded as open reds by earlier sessions
+  the same day (`seekholemap` 9bf699d88, `statfslifetime` 9bf699d88,
+  `tty0state` 4392584d0, `packetv3state` 1655fd6dd). No campaign regression
+  on the probe gate. Log: `target/perf/probes-wave2b-sep10.log`.
