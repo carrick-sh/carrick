@@ -649,15 +649,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 777248,
-        "byte_start": 777236,
+        "byte_end": 798513,
+        "byte_start": 798501,
         "column": 22,
         "column_end": 34,
         "column_start": 22,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19115,
-        "line_end": 19115,
-        "line_start": 19115
+        "line": 19615,
+        "line_end": 19615,
+        "line_start": 19615
       }
     },
     {
@@ -670,57 +670,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 777677,
-        "byte_start": 777665,
-        "column": 22,
-        "column_end": 34,
-        "column_start": 22,
-        "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19130,
-        "line_end": 19130,
-        "line_start": 19130
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-PROCESS-GETPID",
-      "expansion": null,
-      "operation": "libc::getpid",
-      "profiles": [
-        "macos-cli-default",
-        "macos-hvf-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 799686,
-        "byte_start": 799674,
-        "column": 22,
-        "column_end": 34,
-        "column_start": 22,
-        "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19649,
-        "line_end": 19649,
-        "line_start": 19649
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-PROCESS-GETPID",
-      "expansion": null,
-      "operation": "libc::getpid",
-      "profiles": [
-        "macos-cli-default",
-        "macos-hvf-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 813189,
-        "byte_start": 813177,
+        "byte_end": 812049,
+        "byte_start": 812037,
         "column": 34,
         "column_end": 46,
         "column_start": 34,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19969,
-        "line_end": 19969,
-        "line_start": 19969
+        "line": 19935,
+        "line_end": 19935,
+        "line_start": 19935
       }
     },
     {
@@ -733,15 +691,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 813671,
-        "byte_start": 813659,
+        "byte_end": 812531,
+        "byte_start": 812519,
         "column": 34,
         "column_end": 46,
         "column_start": 34,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19980,
-        "line_end": 19980,
-        "line_start": 19980
+        "line": 19946,
+        "line_end": 19946,
+        "line_start": 19946
       }
     },
     {
@@ -754,15 +712,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 814139,
-        "byte_start": 814127,
+        "byte_end": 812999,
+        "byte_start": 812987,
         "column": 34,
         "column_end": 46,
         "column_start": 34,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19990,
-        "line_end": 19990,
-        "line_start": 19990
+        "line": 19956,
+        "line_end": 19956,
+        "line_start": 19956
       }
     },
     {
@@ -775,15 +733,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2084368,
-        "byte_start": 2084356,
+        "byte_end": 2083228,
+        "byte_start": 2083216,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 49748,
-        "line_end": 49748,
-        "line_start": 49748
+        "line": 49714,
+        "line_end": 49714,
+        "line_start": 49714
       }
     },
     {
@@ -796,15 +754,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2086999,
-        "byte_start": 2086987,
+        "byte_end": 2085859,
+        "byte_start": 2085847,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 49794,
-        "line_end": 49794,
-        "line_start": 49794
+        "line": 49760,
+        "line_end": 49760,
+        "line_start": 49760
       }
     },
     {
@@ -817,15 +775,57 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 2089316,
-        "byte_start": 2089304,
+        "byte_end": 2088176,
+        "byte_start": 2088164,
         "column": 25,
         "column_end": 37,
         "column_start": 25,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 49835,
-        "line_end": 49835,
-        "line_start": 49835
+        "line": 49801,
+        "line_end": 49801,
+        "line_start": 49801
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETPID",
+      "expansion": null,
+      "operation": "libc::getpid",
+      "profiles": [
+        "macos-cli-default",
+        "macos-hvf-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 5391,
+        "byte_start": 5379,
+        "column": 22,
+        "column_end": 34,
+        "column_start": 22,
+        "file": "crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs",
+        "line": 118,
+        "line_end": 118,
+        "line_start": 118
+      }
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETPID",
+      "expansion": null,
+      "operation": "libc::getpid",
+      "profiles": [
+        "macos-cli-default",
+        "macos-hvf-default",
+        "macos-runtime-default"
+      ],
+      "source": {
+        "byte_end": 5845,
+        "byte_start": 5833,
+        "column": 22,
+        "column_end": 34,
+        "column_start": 22,
+        "file": "crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs",
+        "line": 133,
+        "line_end": 133,
+        "line_start": 133
       }
     },
     {
@@ -10110,15 +10110,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 799437,
-        "byte_start": 799421,
+        "byte_end": 798264,
+        "byte_start": 798248,
         "column": 57,
         "column_end": 73,
         "column_start": 57,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19645,
-        "line_end": 19645,
-        "line_start": 19645
+        "line": 19611,
+        "line_end": 19611,
+        "line_start": 19611
       }
     },
     {
@@ -10131,15 +10131,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 806272,
-        "byte_start": 806256,
+        "byte_end": 805099,
+        "byte_start": 805083,
         "column": 15,
         "column_end": 31,
         "column_start": 15,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19799,
-        "line_end": 19799,
-        "line_start": 19799
+        "line": 19765,
+        "line_end": 19765,
+        "line_start": 19765
       }
     },
     {
@@ -11109,15 +11109,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 779478,
-        "byte_start": 779460,
+        "byte_end": 778305,
+        "byte_start": 778287,
         "column": 9,
         "column_end": 27,
         "column_start": 9,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19175,
-        "line_end": 19175,
-        "line_start": 19175
+        "line": 19141,
+        "line_end": 19141,
+        "line_start": 19141
       }
     },
     {
@@ -11130,15 +11130,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 806889,
-        "byte_start": 806871,
+        "byte_end": 805738,
+        "byte_start": 805720,
         "column": 9,
         "column_end": 27,
         "column_start": 9,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 19817,
-        "line_end": 19817,
-        "line_start": 19817
+        "line": 19783,
+        "line_end": 19783,
+        "line_start": 19783
       }
     },
     {
@@ -11506,9 +11506,9 @@
       }
     }
   ],
-  "rows_sha256": "6cbc304fc4700b296967075004e8fdef88b5d3c8b45c1c41de99b329eaae1fec",
+  "rows_sha256": "96c9a003601775fd84a6cfedab1c0ab2c52c94b269346d7cd9a239289c3b7bee",
   "schema": 1,
-  "source_head": "19aaf7a5bed7ac5794b25c7048d993d75bd8a61e",
+  "source_head": "27c93d9296ca080d75c55db478240c7c36e286c4",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
