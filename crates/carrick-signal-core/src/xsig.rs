@@ -28,19 +28,34 @@ use std::sync::atomic::{
 const XSIG_SLOTS: usize = 256;
 const XSIG_OCCUPANCY_WORDS: usize = XSIG_SLOTS / 64;
 
+const XSIG_PHASE_MASK: u64 = 0b11;
+const XSIG_PHASE_FREE: u64 = 0b00;
+const XSIG_PHASE_CLAIMING: u64 = 0b01;
+const XSIG_PHASE_READY: u64 = 0b10;
+const XSIG_PHASE_DRAINING: u64 = 0b11;
+
 #[cfg(test)]
 static SLOT_LOAD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[inline]
-fn slot_used_load(slot: &XSigSlot, ordering: Ordering) -> u32 {
+fn slot_state_load(slot: &XSigSlot, ordering: Ordering) -> u64 {
     #[cfg(test)]
     SLOT_LOAD_COUNT.fetch_add(1, Ordering::Relaxed);
-    slot.used.load(ordering)
+    slot.state.load(ordering)
 }
 
 #[repr(C)]
 struct XSigSlot {
-    used: AtomicU32, // 0 = free, 1 = claiming (payload not yet valid), 2 = ready, 3 = draining (one consumer claimed it)
+    /// Incarnation-stamped lifecycle state:
+    /// - Lower 2 bits: Phase (00 = FREE, 01 = CLAIMING, 10 = READY, 11 = DRAINING).
+    /// - Upper 62 bits: Monotonic generation counter.
+    ///
+    /// State transitions:
+    /// - FREE -> CLAIMING: `gen | FREE -> gen | CLAIMING` (CAS by producer)
+    /// - CLAIMING -> READY: `gen | CLAIMING -> gen | READY` (Release store by producer after writing payload and setting published bitmap)
+    /// - READY -> DRAINING: `gen | READY -> gen | DRAINING` (CAS by consumer matching exact `gen` incarnation)
+    /// - DRAINING -> FREE: `gen | DRAINING -> (gen + 1) | FREE` (Release store by consumer after clearing published bitmap)
+    state: AtomicU64,
     target_host_pid: AtomicI32,
     /// Guest ns tid of a THREAD-DIRECTED cross-process send (tkill/tgkill/
     /// rt_tgsigqueueinfo); 0 = process-directed (kill/rt_sigqueueinfo/pidfd).
@@ -60,7 +75,7 @@ struct XSigSlot {
 #[repr(C)]
 struct XSigRing {
     /// Authoritative publication index: bit `i` is set (1) if and only if slot `i`
-    /// is published and ready for delivery/checking. 256 slots = 4 AtomicU64 words.
+    /// is in-flight or published. 256 slots = 4 AtomicU64 words.
     ///
     /// Checkers and drainers inspect these 4 words (which fit in a single 32-byte
     /// slice within the ring's first cache line) to determine occupancy in O(1)
@@ -217,12 +232,17 @@ pub fn xsig_enqueue(
         return false;
     };
     for (slot_idx, slot) in ring.slots.iter().enumerate() {
-        // Phase 1 — CLAIM the slot (0 -> 1). `used == 1` means "claimed but the
-        // payload is NOT yet valid", so a concurrent cross-process consumer
-        // gating on `== 2` will skip it until we publish below.
+        let current = slot.state.load(Ordering::Acquire);
+        if (current & XSIG_PHASE_MASK) != XSIG_PHASE_FREE {
+            continue;
+        }
+        let claiming_state = (current & !XSIG_PHASE_MASK) | XSIG_PHASE_CLAIMING;
+        // Phase 1 — CLAIM the slot for this generation. `phase == CLAIMING` means
+        // "claimed but the payload is NOT yet valid", so any concurrent cross-process
+        // consumer gating on `READY` will skip it until we publish below.
         if slot
-            .used
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .state
+            .compare_exchange(current, claiming_state, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             slot.target_host_pid
@@ -234,20 +254,21 @@ pub fn xsig_enqueue(
             slot.sender_uid.store(sender_uid, Ordering::Relaxed);
             slot.value.store(value, Ordering::Relaxed);
 
-            // Phase 2 — PUBLISH (1 -> 2). This single Release store is the
-            // payload publish point: it carries all the Relaxed payload stores above.
-            slot.used.store(2, Ordering::Release);
-
-            // Phase 3 — AUTHORITATIVE PUBLICATION INDEX UPDATE.
-            // Mark the slot as published in the shared publication bitmap.
-            // The Release ordering ensures that any reader observing this bit with
-            // Acquire ordering is guaranteed to observe `used == 2` and the full
-            // payload. Because this store completes before `xsig_enqueue` returns,
-            // no published signal can be hidden from any subsequent recheck.
+            // Phase 2 — INDEX PUBLICATION in the shared authoritative bitmap.
+            // Marking the publication index bit BEFORE transitioning to READY
+            // guarantees that no drainer can consume/retire the slot before its
+            // bit is set, preventing stale phantom bits on fast drain.
             let word_idx = slot_idx / 64;
             let bit_idx = slot_idx % 64;
             let bit_mask = 1u64 << bit_idx;
             ring.published[word_idx].fetch_or(bit_mask, Ordering::Release);
+
+            // Phase 3 — PUBLISH (CLAIMING -> READY).
+            // This Release store is the publication barrier: it carries all payload
+            // stores and the publication index bit above, so any consumer observing
+            // READY with an Acquire load sees the fully-written slot and index.
+            let ready_state = (current & !XSIG_PHASE_MASK) | XSIG_PHASE_READY;
+            slot.state.store(ready_state, Ordering::Release);
 
             return true;
         }
@@ -289,7 +310,8 @@ pub fn xsig_has_unblocked_for_self(block_mask: carrick_abi::SigBlockMask) -> boo
             mask &= mask - 1; // clear lowest set bit
 
             let slot = &ring.slots[slot_idx];
-            if slot_used_load(slot, Ordering::Acquire) == 2
+            let state = slot_state_load(slot, Ordering::Acquire);
+            if (state & XSIG_PHASE_MASK) == XSIG_PHASE_READY
                 && slot.target_host_pid.load(Ordering::Acquire) == me
                 && signal_unblocked_by_mask(slot.signum.load(Ordering::Acquire), block_mask)
             {
@@ -319,30 +341,28 @@ pub fn xsig_drain_for_self() -> Vec<(i32, i32, i32, u32, i64, i32)> {
             mask &= mask - 1; // advance to next occupied slot
 
             let slot = &ring.slots[slot_idx];
-            // Only consider published entries (`== 2`) targeting THIS process. The
-            // target check happens BEFORE the claim so a thread never claims a slot
-            // destined for another process; a `== 2` slot's target is immutable until
-            // it is freed (a producer can only re-claim from state 0), so this read is
-            // stable across the compare_exchange below.
-            if slot_used_load(slot, Ordering::Acquire) != 2 {
+            let state = slot_state_load(slot, Ordering::Acquire);
+            if (state & XSIG_PHASE_MASK) != XSIG_PHASE_READY {
                 continue;
             }
             if slot.target_host_pid.load(Ordering::Acquire) != me {
                 continue;
             }
-            // CLAIM the slot for draining (2 -> 3), mirroring the producer's
-            // 0 -> 1 claim. Exactly one of several concurrent sibling-thread drainers
-            // wins the compare_exchange; the losers see it fail and skip the slot, so
-            // a process-directed signal is delivered EXACTLY ONCE rather than once per
-            // racing drainer. State 3 is disjoint from the producer (which only ever
-            // touches 0/1/2), so claim and publish never collide.
+
+            // ATOMIC INCARNATION CLAIM:
+            // Claim from READY to DRAINING for THIS EXACT GENERATION `state`.
+            // If another thread drains this slot, it frees to gen+1.
+            // If a new occupant is subsequently published (even targeting another PID),
+            // this CAS fails because `state` has advanced to a new generation.
+            let draining_state = (state & !XSIG_PHASE_MASK) | XSIG_PHASE_DRAINING;
             if slot
-                .used
-                .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+                .state
+                .compare_exchange(state, draining_state, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
                 continue;
             }
+
             let signum = slot.signum.load(Ordering::Relaxed);
             let code = slot.code.load(Ordering::Relaxed);
             let sp = slot.sender_ns_pid.load(Ordering::Relaxed);
@@ -351,14 +371,16 @@ pub fn xsig_drain_for_self() -> Vec<(i32, i32, i32, u32, i64, i32)> {
             let tt = slot.target_ns_tid.load(Ordering::Relaxed);
 
             // RETIREMENT PROTOCOL:
-            // 1. Clear the publication index bit while slot is STILL in state 3 (DRAINING).
-            //    Because the slot is in state 3, no producer can claim it (producers require state 0).
+            // 1. Clear the publication index bit while slot is STILL in DRAINING phase.
+            //    Because the slot is in DRAINING phase, no producer can claim it (producers require FREE).
             //    This guarantees that clearing the bit strictly precedes any future occupant's
             //    bit setting on slot reuse, preventing the clear from ever erasing a later occupant.
             word_atomic.fetch_and(!bit_mask, Ordering::AcqRel);
 
-            // 2. Free the slot back to state 0 for reuse.
-            slot.used.store(0, Ordering::Release);
+            // 2. Advance generation and free the slot back to FREE phase for reuse.
+            let next_gen = (state >> 2).wrapping_add(1);
+            let free_state = (next_gen << 2) | XSIG_PHASE_FREE;
+            slot.state.store(free_state, Ordering::Release);
 
             out.push((signum, code, sp, su, v, tt));
         }
@@ -385,7 +407,7 @@ mod tests {
         // the publication bitmap words.
         if let Some(ring) = xsig_ring() {
             for slot in ring.slots.iter() {
-                slot.used.store(0, Ordering::Release);
+                slot.state.store(0, Ordering::Release);
             }
             for word in ring.published.iter() {
                 word.store(0, Ordering::Release);
@@ -437,7 +459,7 @@ mod tests {
         let remapped_ring = unsafe { &*remapped.cast::<XSigRing>() };
         assert_ne!(remapped_ring.published[0].load(Ordering::Acquire), 0);
         assert!(remapped_ring.slots.iter().any(|slot| {
-            slot.used.load(Ordering::Acquire) == 2
+            (slot.state.load(Ordering::Acquire) & XSIG_PHASE_MASK) == XSIG_PHASE_READY
                 && slot.target_host_pid.load(Ordering::Acquire) == me
                 && slot.signum.load(Ordering::Acquire) == 15
         }));
@@ -672,7 +694,7 @@ mod tests {
         let mut found = false;
         if let Some(ring) = xsig_ring() {
             for slot in ring.slots.iter() {
-                if slot.used.load(Ordering::Acquire) == 2
+                if (slot.state.load(Ordering::Acquire) & XSIG_PHASE_MASK) == XSIG_PHASE_READY
                     && slot.target_host_pid.load(Ordering::Acquire) == other
                 {
                     found = true;
@@ -689,10 +711,10 @@ mod tests {
         reset_ring();
         let me = std::process::id() as i32;
 
-        // A successful enqueue must drive the slot all the way to the `used == 2`
-        // (ready) state — the drain gate is `== 2`, so a slot stuck at `1`
-        // (claimed-but-unpublished) would NOT be returned. Getting the entry back
-        // proves the publish store landed and the consumer gate matches.
+        // A successful enqueue must drive the slot all the way to the READY
+        // phase — the drain gate checks READY, so a slot stuck in CLAIMING
+        // would NOT be returned. Getting the entry back proves the publish
+        // store landed and the consumer gate matches.
         assert!(xsig_enqueue(
             me,
             13,
@@ -700,13 +722,12 @@ mod tests {
             7777,
             1234,
             0x1234_5678_9abc_def0_u64 as i64,
-            0
+            0,
         ));
 
         // The entire payload tuple survives the MAP_SHARED round-trip intact,
-        // reinforcing that the single `used = 2` Release publishes ALL the
-        // preceding payload fields (target/signum/sender_ns/sender_uid/value),
-        // not just `value` — a torn read would corrupt one of these.
+        // reinforcing that the Release publish publishes ALL the preceding
+        // payload fields (target/signum/sender_ns/sender_uid/value).
         let drained = xsig_drain_for_self();
         assert_eq!(
             drained,
@@ -714,8 +735,7 @@ mod tests {
             "published payload must round-trip byte-for-byte"
         );
 
-        // The slot was freed back to 0 by the drain, so a second drain is empty
-        // (no stale ready slot lingers at `used == 2`).
+        // The slot was freed back to FREE phase by the drain, so a second drain is empty.
         assert!(xsig_drain_for_self().is_empty());
         reset_ring();
     }
@@ -731,9 +751,8 @@ mod tests {
         // Sibling vCPU threads of one guest process all reach their signal
         // safe-point and call xsig_drain_for_self concurrently (the nudge handler
         // broadcasts a wake to every parked thread). A process-directed entry must
-        // be delivered to EXACTLY ONE of them. With an unguarded load(==2)+store(0)
-        // drain, two threads can both observe the single ready slot, both read the
-        // payload, and both return it — a duplicate (extra) delivery.
+        // be delivered to EXACTLY ONE of them. Exactly one thread wins the
+        // incarnation compare_exchange; losers skip it.
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -920,5 +939,152 @@ mod tests {
             );
             reset_ring();
         }
+    }
+
+    #[test]
+    fn incarnation_claim_prevents_cross_destination_delivery_on_slot_reuse() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+        let me = std::process::id() as i32;
+        let other = me + 1;
+
+        // Step 1: Enqueue signal for `me` in slot 0.
+        assert!(xsig_enqueue(me, 10, 0, 100, 0, 1000, 0));
+
+        // Step 2: Thread A inspects slot 0, sees target is `me` and records current state.
+        let ring = xsig_ring().unwrap();
+        let slot = &ring.slots[0];
+        let observed_state = slot.state.load(Ordering::Acquire);
+        assert_eq!(observed_state & XSIG_PHASE_MASK, XSIG_PHASE_READY);
+        assert_eq!(slot.target_host_pid.load(Ordering::Acquire), me);
+
+        // Step 3: Thread A pauses before CAS. Another thread of `me` cleanly drains slot 0:
+        let drained = xsig_drain_for_self();
+        assert_eq!(drained, vec![(10, 0, 100, 0, 1000, 0)]);
+
+        // Step 4: Producer enqueues a NEW signal for `other` into slot 0 (reusing it).
+        assert!(xsig_enqueue(other, 12, 0, 200, 0, 2000, 0));
+
+        // Step 5: Thread A resumes and attempts CAS with its stale observed state (generation 0).
+        // Because generation advanced to 1 during drain/re-enqueue, this CAS fails!
+        let draining_state = (observed_state & !XSIG_PHASE_MASK) | XSIG_PHASE_DRAINING;
+        let cas_result = slot.state.compare_exchange(
+            observed_state,
+            draining_state,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        assert!(
+            cas_result.is_err(),
+            "stale claim with old generation must fail and not steal other process's signal"
+        );
+
+        // Step 6: Verify `other`'s signal is undamaged and deliverable to `other`.
+        XSIG_SELF_HOST_PID.store(other, Ordering::Release);
+        assert!(xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE));
+        let drained_other = xsig_drain_for_self();
+        assert_eq!(
+            drained_other,
+            vec![(12, 0, 200, 0, 2000, 0)],
+            "other process must receive its signal undamaged"
+        );
+
+        XSIG_SELF_HOST_PID.store(me, Ordering::Release);
+        reset_ring();
+    }
+
+    #[test]
+    fn publication_before_ready_prevents_stale_phantom_index_bits() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+        let me = std::process::id() as i32;
+
+        for round in 0..100 {
+            assert!(xsig_enqueue(me, 10, 0, round, 0, round as i64, 0));
+            let ring = xsig_ring().unwrap();
+            let word = ring.published[0].load(Ordering::Acquire);
+            assert_eq!(word & 1, 1, "published bit must be set");
+
+            let drained = xsig_drain_for_self();
+            assert_eq!(drained.len(), 1);
+
+            let word_after = ring.published[0].load(Ordering::Acquire);
+            assert_eq!(
+                word_after, 0,
+                "published bitmap must be completely zeroed after drain"
+            );
+
+            SLOT_LOAD_COUNT.store(0, Ordering::Relaxed);
+            assert!(!xsig_has_unblocked_for_self(
+                carrick_abi::SigBlockMask::NONE
+            ));
+            assert_eq!(
+                SLOT_LOAD_COUNT.load(Ordering::Relaxed),
+                0,
+                "empty check must load 0 payload slots after drain"
+            );
+        }
+
+        reset_ring();
+    }
+
+    #[test]
+    fn deterministic_interleaved_producer_drainer_barrier_coordination() {
+        use std::sync::{Arc, Barrier};
+
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+        let me = std::process::id() as i32;
+        let other = me + 10;
+
+        let barrier_start = Arc::new(Barrier::new(3));
+        let barrier_step = Arc::new(Barrier::new(3));
+
+        std::thread::scope(|s| {
+            // Producer 1 (for `me`)
+            let b1 = Arc::clone(&barrier_start);
+            let bs1 = Arc::clone(&barrier_step);
+            s.spawn(move || {
+                b1.wait();
+                assert!(xsig_enqueue(me, 10, 0, 1, 0, 100, 0));
+                bs1.wait();
+            });
+
+            // Producer 2 (for `other`)
+            let b2 = Arc::clone(&barrier_start);
+            let bs2 = Arc::clone(&barrier_step);
+            s.spawn(move || {
+                b2.wait();
+                assert!(xsig_enqueue(other, 12, 0, 2, 0, 200, 0));
+                bs2.wait();
+            });
+
+            // Coordinator thread
+            barrier_start.wait();
+            barrier_step.wait();
+
+            // Both signals are published. Drain `me`
+            let drained_me = xsig_drain_for_self();
+            assert_eq!(drained_me, vec![(10, 0, 1, 0, 100, 0)]);
+
+            // `other` signal is still intact
+            XSIG_SELF_HOST_PID.store(other, Ordering::Release);
+            assert!(xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE));
+            let drained_other = xsig_drain_for_self();
+            assert_eq!(drained_other, vec![(12, 0, 2, 0, 200, 0)]);
+
+            XSIG_SELF_HOST_PID.store(me, Ordering::Release);
+            assert!(!xsig_has_unblocked_for_self(
+                carrick_abi::SigBlockMask::NONE
+            ));
+
+            SLOT_LOAD_COUNT.store(0, Ordering::Relaxed);
+            assert!(!xsig_has_unblocked_for_self(
+                carrick_abi::SigBlockMask::NONE
+            ));
+            assert_eq!(SLOT_LOAD_COUNT.load(Ordering::Relaxed), 0);
+        });
+
+        reset_ring();
     }
 }
