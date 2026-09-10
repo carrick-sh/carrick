@@ -31,3 +31,7 @@ carrick-spec = { path = "../carrick-spec" }
 carrick-image = { path = "../carrick-image" }
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+carrick-test-support = { path = "../carrick-test-support" }
+tempfile = { workspace = true }
