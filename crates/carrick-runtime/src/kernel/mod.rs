@@ -129,4 +129,4 @@ pub use snapshot::{
     ThreadSignalSnapshotRow, ThreadSnapshotClass, ThreadSnapshotRow, VmaSnapshotRow,
     ZombieSnapshotRow,
 };
-pub use wait_set::{WaitEnrollment, WaitQueue, WaitSet, WaitSetOutcome};
+pub use wait_set::{WaitCallbackEnrollment, WaitEnrollment, WaitQueue, WaitSet, WaitSetOutcome};

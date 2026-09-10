@@ -1292,6 +1292,12 @@ impl SyscallDispatcher {
                                 let before = slot.last_ready;
                                 let before_read_avail = slot.last_read_avail;
                                 slot.io_gen = slot.io_gen.wrapping_add(1);
+                                crate::event_ring::rec(
+                                    crate::event_ring::EPCMSUM,
+                                    matching_fd,
+                                    slot.io_gen as i32,
+                                    *clear as i32,
+                                );
                                 if clear & READ_CLEAR != 0 {
                                     if let Some(bytes) = read_progress_bytes {
                                         slot.last_read_avail =
@@ -1480,6 +1486,7 @@ impl SyscallDispatcher {
                 OpenDescription::EventFd { state, .. } => {
                     state.read_fd.as_ref().and_then(|fd| readiness(fd.raw()))
                 }
+                OpenDescription::Epoll { kqueue, .. } => readiness(kqueue.poll_fd()),
                 OpenDescription::Pidfd { kqueue, .. } => direct(kqueue.poll_fd()),
                 OpenDescription::Inotify { state, .. } => direct(state.poll_fd()),
                 OpenDescription::Fanotify { group, .. } => match group.poll_fd() {
@@ -1523,7 +1530,9 @@ impl SyscallDispatcher {
                 OpenDescription::PipeWriter { pipe, .. } => {
                     pipe.write_poll_fd().map(|fd| fd.view())
                 }
-                // eventfd is host-backed by a readiness pipe (read end readable
+                OpenDescription::EventFd { state, .. } => {
+                    state.read_fd.as_ref().map(|fd| fd.view())
+                }
                 // A pidfd is read-ready when its process exits; the backing
                 // multiplexer's poll fd (the kqueue fd on macOS, the
                 // pidfd-bearing epoll fd on Linux) is what poll/epoll watch.
@@ -1632,6 +1641,16 @@ impl SyscallDispatcher {
                 });
             }
             kqueue.wake_parked();
+            drop(guard);
+            if let Some(wq) = owner.wait_queue() {
+                wq.wake_all();
+            }
+            crate::event_ring::rec(
+                crate::event_ring::EPRETIRE,
+                owner.id().raw() as i32,
+                target.id().raw() as i32,
+                0,
+            );
         }
     }
 
@@ -1949,6 +1968,7 @@ impl SyscallDispatcher {
                 pid: 0,
                 groups: 0,
                 recv_queue: VecDeque::new(),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
                 base: OpenDescriptionBase::new(status_flags),
             },
             fd_flags,
@@ -2568,11 +2588,18 @@ impl SyscallDispatcher {
             build_netlink_reply_for_snapshot(request, dest_pid, &net_ns.view())
         };
         if let Some(mut open) = open_file.description.write() {
-            if let OpenDescription::Netlink { recv_queue, .. } = &mut *open {
+            if let OpenDescription::Netlink {
+                recv_queue,
+                wait_queue,
+                ..
+            } = &mut *open
+            {
                 let was_empty = recv_queue.is_empty();
                 recv_queue.extend(reply);
                 if was_empty && !recv_queue.is_empty() {
+                    let wq = Arc::clone(wait_queue);
                     drop(open);
+                    wq.wake_all();
                     self.notify_inmem_epoll();
                     crate::host_signal::wake_all_waiters();
                 }
@@ -2657,11 +2684,18 @@ impl SyscallDispatcher {
         let Some(mut open) = open_file.description.write() else {
             return Err(LINUX_EBADF);
         };
-        let OpenDescription::Netlink { recv_queue, .. } = &mut *open else {
+        let OpenDescription::Netlink {
+            recv_queue,
+            wait_queue,
+            ..
+        } = &mut *open
+        else {
             return Err(LINUX_EBADF);
         };
+        let wq = Arc::clone(wait_queue);
         recv_queue.extend(bytes);
         drop(open);
+        wq.wake_all();
         self.notify_inmem_epoll();
         // A thread may be blocked in recvfrom() directly rather than through
         // an epoll instance. The queue mutation above is durable; wake the
@@ -3778,6 +3812,7 @@ mod netlink_readiness_tests {
                 pid: 0,
                 groups: 0,
                 recv_queue: VecDeque::from(vec![0xAAu8; 32]),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             })),
             0,
             0,
@@ -3879,6 +3914,7 @@ mod netlink_readiness_tests {
                 pid: 0,
                 groups: 0,
                 recv_queue: VecDeque::from(vec![0xAAu8; 32]),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             })),
             0,
             0,
@@ -3904,6 +3940,7 @@ mod netlink_readiness_tests {
                 write_backpressured: false,
                 io_gen: 0,
                 reg_gen: 0,
+                _callback_enrollment: None,
             },
         );
         let mut mux = crate::event_mux::make_event_multiplexer().expect("event multiplexer");
@@ -3918,6 +3955,7 @@ mod netlink_readiness_tests {
                     mux,
                     crate::dispatch::new_epoll_wake_registry(),
                 )),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             })),
             0,
             0,
@@ -3994,6 +4032,7 @@ mod netlink_readiness_tests {
                     mux,
                     crate::dispatch::new_epoll_wake_registry(),
                 )),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             })),
             0,
             0,
@@ -4047,6 +4086,7 @@ mod netlink_readiness_tests {
                         mux,
                         crate::dispatch::new_epoll_wake_registry(),
                     )),
+                    wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
                 })),
                 0,
                 0,
@@ -4115,6 +4155,7 @@ mod netlink_readiness_tests {
                 pid: 0,
                 groups: 0,
                 recv_queue: VecDeque::new(),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             })),
             0,
             0,
@@ -4156,6 +4197,7 @@ mod netlink_readiness_tests {
                 write_backpressured: false,
                 io_gen: 0,
                 reg_gen: 0,
+                _callback_enrollment: None,
             },
         );
         let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
@@ -4170,6 +4212,7 @@ mod netlink_readiness_tests {
                     mux,
                     crate::dispatch::new_epoll_wake_registry(),
                 )),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             })),
             0,
             0,
@@ -4281,6 +4324,7 @@ mod netlink_readiness_tests {
                 pid: 0,
                 groups: 0,
                 recv_queue: VecDeque::new(),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             })),
             0,
             0,
@@ -4306,6 +4350,7 @@ mod netlink_readiness_tests {
                 write_backpressured: false,
                 io_gen: 0,
                 reg_gen: 0,
+                _callback_enrollment: None,
             },
         );
         let epoll_kqueue = Arc::new(epoll_kqueue_for_wake_test(&dispatcher));
@@ -4316,6 +4361,7 @@ mod netlink_readiness_tests {
                 synthetic_interest_count: 1,
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::clone(&epoll_kqueue),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             })),
             0,
             0,
@@ -4406,6 +4452,7 @@ mod netlink_readiness_tests {
                 write_backpressured: false,
                 io_gen: 0,
                 reg_gen: 0,
+                _callback_enrollment: None,
             },
         );
         let mut mux = crate::event_mux::make_event_multiplexer().expect("mux");
@@ -4419,6 +4466,7 @@ mod netlink_readiness_tests {
                 mux,
                 crate::dispatch::new_epoll_wake_registry(),
             )),
+            wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
         }));
         let epoll_open_file =
             OpenFile::from_open_description_with_status_flags(Arc::clone(&epoll_backing), 0, 0);
@@ -4477,6 +4525,7 @@ mod netlink_readiness_tests {
                 mux,
                 crate::dispatch::new_epoll_wake_registry(),
             )),
+            wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
         }));
         let epoll_open_file =
             OpenFile::from_open_description_with_status_flags(Arc::clone(&epoll_backing), 0, 0);
@@ -4494,6 +4543,7 @@ mod netlink_readiness_tests {
                         pid: 0,
                         groups: 0,
                         recv_queue: VecDeque::new(),
+                        wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
                     })),
                     0,
                     0,
@@ -4675,6 +4725,7 @@ mod netlink_readiness_tests {
                         mux,
                         crate::dispatch::new_epoll_wake_registry(),
                     )),
+                    wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
                 })),
                 0,
                 0,
@@ -4848,6 +4899,7 @@ mod netlink_readiness_tests {
                 pid: 0,
                 groups: 0,
                 recv_queue: VecDeque::new(),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             })),
             0,
             0,
@@ -6151,6 +6203,7 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(0),
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::new(epoll_kqueue),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             };
             Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
 
@@ -6181,6 +6234,7 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(0),
                 pending_ready: VecDeque::new(),
                 kqueue: Arc::new(epoll_kqueue),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
             };
             Ok(this.install_fd(description, linux_fd_flags_from_open_flags(0)))
 
@@ -6240,6 +6294,7 @@ impl SyscallDispatcher {
                 synthetic_interest_count,
                 pending_ready,
                 kqueue,
+                wait_queue,
                 ..
             } = &mut *open
             else {
@@ -6314,8 +6369,38 @@ impl SyscallDispatcher {
                             ev_events as i32,
                         );
                     }
+                    let kqueue_weak = Arc::downgrade(kqueue);
+                    let owner_wq_weak = Arc::downgrade(wait_queue);
+                    let owner_id = epoll_description.id();
+                    let callback_enrollment = if let Some(target) = &target_description
+                        && let Some(target_wq) = target.wait_queue()
+                    {
+                        let target_id = target.id();
+                        Some(Arc::new(target_wq.enroll_callback(move |depth: usize| {
+                            if let Some(kqueue) = kqueue_weak.upgrade() {
+                                kqueue.wake_parked();
+                            }
+                            if let Some(owner_wq) = owner_wq_weak.upgrade() {
+                                owner_wq.wake_all_with_depth(depth);
+                            }
+                            crate::event_ring::rec(
+                                crate::event_ring::EPWAKE,
+                                owner_id.raw() as i32,
+                                target_id.raw() as i32,
+                                depth as i32,
+                            );
+                        })))
+                    } else {
+                        None
+                    };
                     if let Some(target) = &target_description {
                         target.register_epoll_owner(&epoll_description, fd);
+                        crate::event_ring::rec(
+                            crate::event_ring::EPOWNER,
+                            epoll_description.id().raw() as i32,
+                            target.id().raw() as i32,
+                            fd,
+                        );
                     }
                     interest.insert(
                         fd,
@@ -6328,6 +6413,7 @@ impl SyscallDispatcher {
                             write_backpressured: false,
                             io_gen: 0,
                             reg_gen,
+                            _callback_enrollment: callback_enrollment,
                         },
                     );
                     if host_fd.is_none() {
@@ -6336,6 +6422,10 @@ impl SyscallDispatcher {
                     // A waiter parked on this instance's ppoll snapshot does
                     // not watch the just-added fd; pop it so it rebuilds.
                     kqueue.wake_parked();
+                    drop(open);
+                    if let Some(wq) = open_file.description.wait_queue() {
+                        wq.wake_all();
+                    }
                     crate::probes::epoll_ctl(epfd, operation, fd, event.events, event.data, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -6382,9 +6472,14 @@ impl SyscallDispatcher {
                         write_backpressured: false,
                         io_gen: 0,
                         reg_gen,
+                        _callback_enrollment: slot._callback_enrollment.clone(),
                     };
                     // Re-arm visible to a parked waiter: rebuild its park set.
                     kqueue.wake_parked();
+                    drop(open);
+                    if let Some(wq) = open_file.description.wait_queue() {
+                        wq.wake_all();
+                    }
                     crate::probes::epoll_ctl(epfd, operation, fd, event.events, event.data, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -6394,8 +6489,15 @@ impl SyscallDispatcher {
                     else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOENT));
                     };
-                    if let Some(target) = removed.target {
+                    let removed_reg_gen = removed.reg_gen;
+                    if let Some(target) = &removed.target {
                         target.unregister_epoll_owner(&epoll_description, fd);
+                        crate::event_ring::rec(
+                            crate::event_ring::EPRETIRE,
+                            epoll_description.id().raw() as i32,
+                            fd,
+                            removed_reg_gen as i32,
+                        );
                     }
                     if let Some(host_fd) = host_fd {
                         // Other guest fds in THIS epoll instance can be dups of the
@@ -6465,6 +6567,10 @@ impl SyscallDispatcher {
                     // A parked waiter still ppolls the removed fd's host fd;
                     // pop it so it rebuilds without the dead entry.
                     kqueue.wake_parked();
+                    drop(open);
+                    if let Some(wq) = open_file.description.wait_queue() {
+                        wq.wake_all();
+                    }
                     crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -6971,93 +7077,65 @@ impl SyscallDispatcher {
                     };
                 }
             } else {
-                // Mixed / synthetic fds: kernel WaitSet.
-                let wait_set = crate::kernel::WaitSet::for_current_executor();
-                let _task_sub = wait_set.enroll_task(cx.kernel.task());
-                let mut _enrollments = Vec::new();
-                let mut host_fds: Vec<(i32, i16)> = Vec::new();
-
+                // Mixed / synthetic fds: evaluate current readiness without holding the wait loop synchronously.
+                let mut any = false;
                 for (i, (fd, _)) in owners.iter().enumerate() {
-                    if *fd < 0 {
-                        continue;
-                    }
-                    if let Some(open_file) = this.open_file(*fd) {
-                        if let Some(wq) = open_file.wait_queue() {
-                            _enrollments.push(wait_set.enroll(&wq));
-                        }
-                        if let Some(target) = this.host_poll_target(*fd, events_list[i]) {
-                            host_fds.push((target.host_fd, target.host_events));
-                        }
-                    } else if is_stdio_fd(*fd) {
-                        host_fds.push((*fd, events_list[i]));
+                    let rev = this.poll_ready_events(*fd, events_list[i]);
+                    revents[i] = rev;
+                    if rev != 0 {
+                        any = true;
                     }
                 }
-
-                let start_instant = std::time::Instant::now();
-                let base_timeout = if timeout_ms < 0 {
-                    None
-                } else {
-                    Some(std::time::Duration::from_millis(timeout_ms as u64))
-                };
-
-                loop {
-                    let mut any = false;
-                    for (i, (fd, _)) in owners.iter().enumerate() {
-                        let rev = this.poll_ready_events(*fd, events_list[i]);
-                        revents[i] = rev;
-                        if rev != 0 {
-                            any = true;
-                        }
-                    }
-                    if any || timeout_ms == 0 {
-                        break;
-                    }
-
-                    let mut remaining_timeout = match base_timeout {
-                        None => None,
-                        Some(dur) => {
-                            let elapsed = start_instant.elapsed();
-                            if elapsed >= dur {
-                                break;
-                            }
-                            Some(dur - elapsed)
-                        }
+                if !any && timeout_ms != 0 {
+                    let mut timeout = if timeout_ms < 0 {
+                        None
+                    } else {
+                        Some(std::time::Duration::from_millis(timeout_ms as u64))
                     };
-
                     for (fd, _) in &owners {
-                        if *fd < 0 {
-                            continue;
-                        }
-                        if let Some(open_file) = this.open_file(*fd) {
-                            if let Some(rem) = open_file.timerfd_remaining_timeout() {
-                                remaining_timeout = match remaining_timeout {
-                                    None => Some(rem),
-                                    Some(prev) => Some(prev.min(rem)),
-                                };
-                            }
-                        }
-                    }
-
-                    let outcome = wait_set.wait(&host_fds, remaining_timeout, || {
-                        this.has_deliverable_dispatch_pending_for_wait(kernel, tid, sig_mask)
-                    });
-
-                    match outcome {
-                        crate::kernel::WaitSetOutcome::Woken => {}
-                        crate::kernel::WaitSetOutcome::Timeout => {
-                            if let Some(dur) = base_timeout {
-                                if start_instant.elapsed() >= dur {
-                                    break;
+                        if *fd >= 0 {
+                            if let Some(open_file) = this.open_file(*fd) {
+                                if let Some(rem) = open_file.timerfd_remaining_timeout() {
+                                    timeout = match timeout {
+                                        None => Some(rem),
+                                        Some(prev) => Some(prev.min(rem)),
+                                    };
                                 }
                             }
                         }
-                        crate::kernel::WaitSetOutcome::Interrupted => {
-                            if let carrick_abi::WaitSigMask::Replace(mask) = sig_mask {
-                                this.begin_sigsuspend(kernel, tid, mask);
-                            }
-                            return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                    }
+                    let mut wait_targets = Vec::new();
+                    for (i, (fd, _)) in owners.iter().enumerate() {
+                        if *fd < 0 {
+                            continue;
+                        }
+                        if let Some(target) = this.host_poll_target(*fd, events_list[i]) {
+                            wait_targets.push((target.host_fd, target.host_events));
                         }
                     }
+                    let mut clear_on_timeout: Vec<(u64, usize)> = Vec::new();
+                    if let Some(s) = &read_set {
+                        clear_on_timeout.push((readfds_addr, s.len()));
+                    }
+                    if let Some(s) = &write_set {
+                        clear_on_timeout.push((writefds_addr, s.len()));
+                    }
+                    if let Some(s) = &except_set {
+                        clear_on_timeout.push((exceptfds_addr, s.len()));
+                    }
+                    let files = this.captured_file_table();
+                    let wait_fds = match WaitFds::raw(wait_targets)
+                        .with_guest_slots(&files, owners.iter().map(|(fd, _)| *fd))
+                    {
+                        Ok(wait_fds) => wait_fds,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
+                    return Ok(DispatchOutcome::WaitOnFdsSelect {
+                        fds: wait_fds,
+                        timeout,
+                        sig_mask,
+                        clear_on_timeout,
+                    });
                 }
             }
 
@@ -7387,100 +7465,60 @@ impl SyscallDispatcher {
                 });
             }
 
-            // Mixed / synthetic fds: kernel WaitSet.
-            let wait_set = crate::kernel::WaitSet::for_current_executor();
-            let _task_sub = wait_set.enroll_task(cx.kernel.task());
-            let mut _enrollments = Vec::new();
-            let mut host_fds: Vec<(i32, i16)> = Vec::new();
-
-            for pollfd in &fds {
-                if pollfd.fd < 0 {
-                    continue;
+            // Mixed / synthetic fds: evaluate current readiness and yield cancellable continuation if not ready.
+            let mut ready = 0i64;
+            for (index, pollfd) in fds.iter_mut().enumerate() {
+                pollfd.revents = this.poll_ready_events(pollfd.fd, pollfd.events);
+                if pollfd.revents != 0 {
+                    ready += 1;
                 }
-                if let Some(open_file) = this.open_file(pollfd.fd) {
-                    if let Some(wq) = open_file.wait_queue() {
-                        _enrollments.push(wait_set.enroll(&wq));
-                    }
-                    if let Some(target) = this.host_poll_target(pollfd.fd, pollfd.events) {
-                        host_fds.push((target.host_fd, target.host_events));
-                    }
-                } else if is_stdio_fd(pollfd.fd) {
-                    host_fds.push((pollfd.fd, pollfd.events));
+                if write_kernel_struct_raw(memory, addresses[index], pollfd).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
+            if ready > 0 || timeout_ms == 0 {
+                return Ok(DispatchOutcome::Returned { value: ready });
+            }
 
-            let start_instant = std::time::Instant::now();
-            let base_timeout = if timeout_ms < 0 {
+            let mut timeout = if timeout_ms < 0 {
                 None
             } else {
                 Some(std::time::Duration::from_millis(timeout_ms as u64))
             };
-
-            let mut ready: i64;
-            loop {
-                ready = 0;
-                for (index, pollfd) in fds.iter_mut().enumerate() {
-                    pollfd.revents = this.poll_ready_events(pollfd.fd, pollfd.events);
-                    if pollfd.revents != 0 {
-                        ready += 1;
-                    }
-                    if write_kernel_struct_raw(memory, addresses[index], pollfd).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                }
-                if ready > 0 || timeout_ms == 0 {
-                    break;
-                }
-
-                let mut remaining_timeout = match base_timeout {
-                    None => None,
-                    Some(dur) => {
-                        let elapsed = start_instant.elapsed();
-                        if elapsed >= dur {
-                            break;
-                        }
-                        Some(dur - elapsed)
-                    }
-                };
-
-                for pollfd in &fds {
-                    if pollfd.fd < 0 {
-                        continue;
-                    }
+            for pollfd in &fds {
+                if pollfd.fd >= 0 {
                     if let Some(open_file) = this.open_file(pollfd.fd) {
                         if let Some(rem) = open_file.timerfd_remaining_timeout() {
-                            remaining_timeout = match remaining_timeout {
+                            timeout = match timeout {
                                 None => Some(rem),
                                 Some(prev) => Some(prev.min(rem)),
                             };
                         }
                     }
                 }
-
-                let outcome = wait_set.wait(&host_fds, remaining_timeout, || {
-                    this.has_deliverable_dispatch_pending_for_wait(kernel, tid, sig_mask)
-                });
-
-                match outcome {
-                    crate::kernel::WaitSetOutcome::Woken => {}
-                    crate::kernel::WaitSetOutcome::Timeout => {
-                        if let Some(dur) = base_timeout {
-                            if start_instant.elapsed() >= dur {
-                                break;
-                            }
-                        }
-                    }
-                    crate::kernel::WaitSetOutcome::Interrupted => {
-                        if let carrick_abi::WaitSigMask::Replace(mask) = sig_mask {
-                            this.begin_sigsuspend(kernel, tid, mask);
-                        }
-                        return Ok(DispatchOutcome::errno(LINUX_EINTR));
-                    }
+            }
+            let mut wait_targets = Vec::new();
+            for pollfd in &fds {
+                if pollfd.fd < 0 {
+                    continue;
+                }
+                if let Some(target) = this.host_poll_target(pollfd.fd, pollfd.events) {
+                    wait_targets.push((target.host_fd, target.host_events));
                 }
             }
-
-            Ok(DispatchOutcome::Returned { value: ready })
-
+            let files = this.captured_file_table();
+            let wait_fds = match WaitFds::raw(wait_targets)
+                .with_guest_slots(&files, fds.iter().filter(|p| p.fd >= 0).map(|pollfd| pollfd.fd))
+            {
+                Ok(wait_fds) => wait_fds,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            return Ok(DispatchOutcome::WaitOnPollFds {
+                fds: wait_fds,
+                timeout,
+                on_timeout: 0,
+                sig_mask,
+            });
         }
 
         fn socket(this, cx, domain: u64, socket_type: u64, protocol: u64) {
@@ -10827,5 +10865,992 @@ impl SyscallDispatcher {
             }
         }
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod nested_epoll_readiness_tests {
+    use super::*;
+    use crate::dispatch::LinearMemory;
+
+    fn create_epoll(
+        dispatcher: &mut SyscallDispatcher,
+        kernel: &crate::kernel::KernelContext,
+        mem: &mut LinearMemory,
+        reporter: &CompatReporter,
+    ) -> i32 {
+        let req = SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
+        match dispatcher.dispatch(kernel, req, mem, reporter).unwrap() {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("epoll_create1 failed: {other:?}"),
+        }
+    }
+
+    fn create_eventfd(
+        dispatcher: &mut SyscallDispatcher,
+        kernel: &crate::kernel::KernelContext,
+        mem: &mut LinearMemory,
+        reporter: &CompatReporter,
+        init_val: u64,
+    ) -> i32 {
+        let req = SyscallRequest::new(19, SyscallArgs::from([init_val, 0, 0, 0, 0, 0]));
+        match dispatcher.dispatch(kernel, req, mem, reporter).unwrap() {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("eventfd2 failed: {other:?}"),
+        }
+    }
+
+    fn close_guest_fd(
+        dispatcher: &mut SyscallDispatcher,
+        kernel: &crate::kernel::KernelContext,
+        mem: &mut LinearMemory,
+        reporter: &CompatReporter,
+        fd: i32,
+    ) -> bool {
+        let req = SyscallRequest::new(57, SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]));
+        matches!(
+            dispatcher.dispatch(kernel, req, mem, reporter),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        )
+    }
+
+    fn write_guest_epoll_event(mem: &mut LinearMemory, address: u64, events: u32, data: u64) {
+        let ev = LinuxEpollEvent {
+            events,
+            _pad: 0,
+            data,
+        };
+        mem.write_bytes(address, zerocopy::IntoBytes::as_bytes(&ev))
+            .unwrap();
+    }
+
+    fn read_guest_epoll_event(mem: &LinearMemory, address: u64) -> LinuxEpollEvent {
+        read_kernel_struct(mem, address).unwrap()
+    }
+
+    #[test]
+    fn empty_inner_epoll_has_no_false_in_on_poll_or_outer_epoll() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        // Create empty inner epoll
+        let inner_epfd = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        // Create outer epoll
+        let outer_epfd = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        // Register inner in outer
+        let event_ptr = 0x1000u64;
+        write_guest_epoll_event(&mut guest_mem, event_ptr, LINUX_EPOLLIN, 42);
+
+        let add_req = SyscallRequest::new(
+            21,
+            SyscallArgs::from([
+                outer_epfd as u64,
+                LINUX_EPOLL_CTL_ADD,
+                inner_epfd as u64,
+                event_ptr,
+                0,
+                0,
+            ]),
+        );
+        assert!(matches!(
+            dispatcher.dispatch(&kernel, add_req, &mut guest_mem, &reporter),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        // Authoritative readiness must NOT return POLLIN/EPOLLIN because inner epoll has no deliverable events!
+        assert_eq!(
+            dispatcher.poll_ready_events(inner_epfd, LINUX_POLLIN),
+            0,
+            "empty inner epoll must not report POLLIN under poll(2)"
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(inner_epfd, LINUX_EPOLLIN),
+            0,
+            "empty inner epoll must not report EPOLLIN under epoll"
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer_epfd, LINUX_EPOLLIN),
+            0,
+            "outer epoll monitoring empty inner epoll must not report EPOLLIN"
+        );
+        assert_eq!(
+            dispatcher.poll_ready_events(outer_epfd, LINUX_POLLIN),
+            0,
+            "outer epoll monitoring empty inner epoll must not report POLLIN"
+        );
+    }
+
+    #[test]
+    fn threaded_eventfd_nested_epoll_wake() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        // Create eventfd (initially 0)
+        let efd = create_eventfd(&mut dispatcher, &kernel, &mut guest_mem, &reporter, 0);
+
+        // Create inner epoll
+        let inner_epfd = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        // Create outer epoll
+        let outer_epfd = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        // Add efd to inner_epfd
+        let event_ptr1 = 0x1000u64;
+        write_guest_epoll_event(&mut guest_mem, event_ptr1, LINUX_EPOLLIN, 101);
+        let add_efd = SyscallRequest::new(
+            21,
+            SyscallArgs::from([
+                inner_epfd as u64,
+                LINUX_EPOLL_CTL_ADD,
+                efd as u64,
+                event_ptr1,
+                0,
+                0,
+            ]),
+        );
+        assert!(matches!(
+            dispatcher.dispatch(&kernel, add_efd, &mut guest_mem, &reporter),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        // Add inner_epfd to outer_epfd
+        let event_ptr2 = 0x1020u64;
+        write_guest_epoll_event(&mut guest_mem, event_ptr2, LINUX_EPOLLIN, 202);
+        let add_inner = SyscallRequest::new(
+            21,
+            SyscallArgs::from([
+                outer_epfd as u64,
+                LINUX_EPOLL_CTL_ADD,
+                inner_epfd as u64,
+                event_ptr2,
+                0,
+                0,
+            ]),
+        );
+        assert!(matches!(
+            dispatcher.dispatch(&kernel, add_inner, &mut guest_mem, &reporter),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        // Initially neither is ready
+        assert_eq!(dispatcher.epoll_ready_events(inner_epfd, LINUX_EPOLLIN), 0);
+        assert_eq!(dispatcher.epoll_ready_events(outer_epfd, LINUX_EPOLLIN), 0);
+
+        // Get outer epoll's wait_queue
+        let outer_file = dispatcher.open_file(outer_epfd).unwrap();
+        let outer_wq = outer_file.wait_queue().unwrap();
+        let outer_kqueue_poll_fd = dispatcher
+            .host_fd_for_poll(outer_epfd)
+            .map(|h| h.get())
+            .unwrap_or(-1);
+
+        // Spawn a background waiter that waits for outer epoll wake_queue or kqueue poll_fd
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outer_wq_clone = Arc::clone(&outer_wq);
+        let waiter = std::thread::spawn(move || {
+            let wait_set = crate::kernel::WaitSet::for_current_executor();
+            let _enrollment = wait_set.enroll(&outer_wq_clone);
+            let mut pfd = libc::pollfd {
+                fd: outer_kqueue_poll_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            tx.send(()).unwrap();
+            let outcome = wait_set.wait(&[], Some(std::time::Duration::from_secs(5)), || false);
+            let kq_ready = if outer_kqueue_poll_fd >= 0 {
+                unsafe { libc::poll(&mut pfd, 1, 0) }
+            } else {
+                0
+            };
+            (
+                outcome == crate::kernel::WaitSetOutcome::Woken,
+                kq_ready > 0 && pfd.revents & libc::POLLIN != 0,
+            )
+        });
+
+        // Wait until waiter has enrolled
+        rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Write to eventfd (0 -> 1)
+        let write_buf = 0x1040u64;
+        guest_mem
+            .write_bytes(write_buf, &1u64.to_le_bytes())
+            .unwrap();
+        let write_req =
+            SyscallRequest::new(64, SyscallArgs::from([efd as u64, write_buf, 8, 0, 0, 0]));
+        let write_outcome = dispatcher.dispatch(&kernel, write_req, &mut guest_mem, &reporter);
+        assert!(matches!(
+            write_outcome,
+            Ok(DispatchOutcome::Returned { value: 8 })
+        ));
+
+        let (wq_woken, kq_woken) = waiter.join().expect("waiter thread joined");
+        assert!(
+            wq_woken,
+            "registered wait queue must wake before deadline; late kqueue readiness={kq_woken}"
+        );
+
+        // After write, outer and inner are both ready
+        assert_eq!(
+            dispatcher.epoll_ready_events(inner_epfd, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer_epfd, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN
+        );
+    }
+
+    #[test]
+    fn nested_epoll_dup_close_reuse() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        // Create eventfd (initially 0)
+        let efd = create_eventfd(&mut dispatcher, &kernel, &mut guest_mem, &reporter, 0);
+
+        // Create inner epoll
+        let inner_epfd = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        // Add efd to inner_epfd
+        let event_ptr1 = 0x1000u64;
+        write_guest_epoll_event(&mut guest_mem, event_ptr1, LINUX_EPOLLIN, 101);
+        let add_efd = SyscallRequest::new(
+            21,
+            SyscallArgs::from([
+                inner_epfd as u64,
+                LINUX_EPOLL_CTL_ADD,
+                efd as u64,
+                event_ptr1,
+                0,
+                0,
+            ]),
+        );
+        assert!(matches!(
+            dispatcher.dispatch(&kernel, add_efd, &mut guest_mem, &reporter),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        // Dup inner_epfd to alias_inner_fd
+        let inner_open_file = dispatcher.open_file(inner_epfd).unwrap();
+        let alias_inner_fd = dispatcher
+            .install_fd_at_or_above(30, inner_open_file)
+            .unwrap();
+
+        // Create outer epoll
+        let outer_epfd = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        // Add inner_epfd to outer_epfd
+        let event_ptr2 = 0x1020u64;
+        write_guest_epoll_event(&mut guest_mem, event_ptr2, LINUX_EPOLLIN, 202);
+        let add_inner = SyscallRequest::new(
+            21,
+            SyscallArgs::from([
+                outer_epfd as u64,
+                LINUX_EPOLL_CTL_ADD,
+                inner_epfd as u64,
+                event_ptr2,
+                0,
+                0,
+            ]),
+        );
+        assert!(matches!(
+            dispatcher.dispatch(&kernel, add_inner, &mut guest_mem, &reporter),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        // Close original inner_epfd
+        assert!(close_guest_fd(
+            &mut dispatcher,
+            &kernel,
+            &mut guest_mem,
+            &reporter,
+            inner_epfd
+        ));
+
+        // Install a new Netlink socket (empty) into the exact slot inner_epfd
+        let netlink_open_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::Netlink {
+                base: OpenDescriptionBase::new(0),
+                protocol: 0,
+                sock_type: LINUX_SOCK_DGRAM,
+                pid: 0,
+                groups: 0,
+                recv_queue: VecDeque::new(),
+                wait_queue: Arc::new(crate::kernel::WaitQueue::new()),
+            })),
+            0,
+            0,
+        );
+        let reused_fd = dispatcher
+            .install_fd_at_or_above(inner_epfd, netlink_open_file)
+            .unwrap();
+        assert_eq!(reused_fd, inner_epfd);
+
+        // Write to eventfd (0 -> 1)
+        let write_buf = 0x1040u64;
+        guest_mem
+            .write_bytes(write_buf, &1u64.to_le_bytes())
+            .unwrap();
+        let write_req =
+            SyscallRequest::new(64, SyscallArgs::from([efd as u64, write_buf, 8, 0, 0, 0]));
+        assert!(matches!(
+            dispatcher.dispatch(&kernel, write_req, &mut guest_mem, &reporter),
+            Ok(DispatchOutcome::Returned { value: 8 })
+        ));
+
+        // Outer epoll must report ready because it tracks the underlying Epoll description identity (referenced by alias_inner_fd)
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer_epfd, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            "outer epoll must track stored description identity, not newly installed netlink at reused fd"
+        );
+
+        // Now close alias_inner_fd (the last handle to the inner epoll description)
+        assert!(close_guest_fd(
+            &mut dispatcher,
+            &kernel,
+            &mut guest_mem,
+            &reporter,
+            alias_inner_fd
+        ));
+
+        // Outer epoll must now evaluate to not ready because the target description is closed
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer_epfd, LINUX_EPOLLIN),
+            0,
+            "outer epoll must not report ready after inner epoll description is closed"
+        );
+    }
+
+    #[test]
+    fn nested_epoll_et_and_oneshot() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x2000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        // EventFd 1 (for ET test)
+        let efd1 = create_eventfd(&mut dispatcher, &kernel, &mut guest_mem, &reporter, 0);
+        let inner1 = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+        let outer1 = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        // Add efd1 to inner1
+        let ep1 = 0x1000u64;
+        write_guest_epoll_event(&mut guest_mem, ep1, LINUX_EPOLLIN, 1);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([inner1 as u64, LINUX_EPOLL_CTL_ADD, efd1 as u64, ep1, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Add inner1 to outer1 with EPOLLET | EPOLLIN
+        let ep2 = 0x1020u64;
+        write_guest_epoll_event(&mut guest_mem, ep2, LINUX_EPOLLET | LINUX_EPOLLIN, 2);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([outer1 as u64, LINUX_EPOLL_CTL_ADD, inner1 as u64, ep2, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Write to efd1 (0 -> 1)
+        let write_buf = 0x1040u64;
+        guest_mem
+            .write_bytes(write_buf, &1u64.to_le_bytes())
+            .unwrap();
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(64, SyscallArgs::from([efd1 as u64, write_buf, 8, 0, 0, 0])),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Outer1 is ready
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer1, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN
+        );
+
+        // Consume outer1 readiness via epoll_pwait (syscall 22 on aarch64)
+        let events_out = 0x1100u64;
+        let wait_outcome = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                22,
+                SyscallArgs::from([outer1 as u64, events_out, 10, 0, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+        assert!(
+            matches!(&wait_outcome, Ok(DispatchOutcome::Returned { value: 1 })),
+            "outer ET epoll first delivery: {wait_outcome:?}"
+        );
+
+        // Verify delivered 16-byte event struct and user data payload
+        let delivered_event = read_guest_epoll_event(&guest_mem, events_out);
+        assert_eq!(
+            { delivered_event.events } & LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            "delivered event mask must include EPOLLIN"
+        );
+        assert_eq!(
+            { delivered_event.data },
+            2,
+            "delivered event data must match registered payload"
+        );
+
+        // Outer1 is now latched (ET suppresses repeat report without new readiness change)
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer1, LINUX_EPOLLIN),
+            0,
+            "ET registration must be suppressed once latched"
+        );
+
+        // Test ONESHOT:
+        let outer2 = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+        let ep3 = 0x1060u64;
+        write_guest_epoll_event(&mut guest_mem, ep3, LINUX_EPOLLONESHOT | LINUX_EPOLLIN, 3);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([outer2 as u64, LINUX_EPOLL_CTL_ADD, inner1 as u64, ep3, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Outer2 is ready
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer2, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN
+        );
+
+        // Consume outer2 readiness via epoll_pwait (disarms ONESHOT)
+        let wait_outcome2 = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                22,
+                SyscallArgs::from([outer2 as u64, events_out, 10, 0, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+        assert!(matches!(
+            wait_outcome2,
+            Ok(DispatchOutcome::Returned { value: 1 })
+        ));
+
+        let delivered_event2 = read_guest_epoll_event(&guest_mem, events_out);
+        assert_eq!({ delivered_event2.data }, 3);
+
+        // Outer2 is now not ready (disarmed by delivery)
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer2, LINUX_EPOLLIN),
+            0,
+            "disarmed ONESHOT registration must not report ready"
+        );
+
+        // Re-arm via MOD
+        write_guest_epoll_event(&mut guest_mem, ep3, LINUX_EPOLLONESHOT | LINUX_EPOLLIN, 33);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([outer2 as u64, LINUX_EPOLL_CTL_MOD, inner1 as u64, ep3, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Outer2 is ready again
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer2, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN,
+            "re-armed ONESHOT registration must report ready"
+        );
+    }
+
+    #[test]
+    fn nested_epoll_drain_and_rearm() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        let efd = create_eventfd(&mut dispatcher, &kernel, &mut guest_mem, &reporter, 0);
+        let inner = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+        let outer = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        let ep1 = 0x1000u64;
+        write_guest_epoll_event(&mut guest_mem, ep1, LINUX_EPOLLIN, 10);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([inner as u64, LINUX_EPOLL_CTL_ADD, efd as u64, ep1, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        let ep2 = 0x1020u64;
+        write_guest_epoll_event(&mut guest_mem, ep2, LINUX_EPOLLIN, 20);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([outer as u64, LINUX_EPOLL_CTL_ADD, inner as u64, ep2, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Initial: 0
+        assert_eq!(dispatcher.epoll_ready_events(inner, LINUX_EPOLLIN), 0);
+        assert_eq!(dispatcher.epoll_ready_events(outer, LINUX_EPOLLIN), 0);
+
+        // Write 5 to eventfd
+        let write_buf = 0x1040u64;
+        guest_mem
+            .write_bytes(write_buf, &5u64.to_le_bytes())
+            .unwrap();
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(64, SyscallArgs::from([efd as u64, write_buf, 8, 0, 0, 0])),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Both ready
+        assert_eq!(
+            dispatcher.epoll_ready_events(inner, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN
+        );
+
+        // Drain eventfd (read 8 bytes)
+        let read_buf_addr = 0x1060u64;
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                63,
+                SyscallArgs::from([efd as u64, read_buf_addr, 8, 0, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // After drain: both not ready
+        assert_eq!(dispatcher.epoll_ready_events(inner, LINUX_EPOLLIN), 0);
+        assert_eq!(dispatcher.epoll_ready_events(outer, LINUX_EPOLLIN), 0);
+
+        // Write 1 to eventfd again
+        guest_mem
+            .write_bytes(write_buf, &1u64.to_le_bytes())
+            .unwrap();
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(64, SyscallArgs::from([efd as u64, write_buf, 8, 0, 0, 0])),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Both ready again
+        assert_eq!(
+            dispatcher.epoll_ready_events(inner, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(outer, LINUX_EPOLLIN) & LINUX_EPOLLIN,
+            LINUX_EPOLLIN
+        );
+    }
+
+    #[test]
+    fn nested_epoll_active_wait_cancel_and_retirement() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        let inner = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+        let outer = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        let ep1 = 0x1000u64;
+        write_guest_epoll_event(&mut guest_mem, ep1, LINUX_EPOLLIN, 99);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([outer as u64, LINUX_EPOLL_CTL_ADD, inner as u64, ep1, 0, 0]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        let outer_file = dispatcher.open_file(outer).unwrap();
+        let outer_wq = outer_file.wait_queue().unwrap();
+
+        // Spawn a waiter on outer's wait queue
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outer_wq_clone = Arc::clone(&outer_wq);
+        let waiter = std::thread::spawn(move || {
+            let wait_set = crate::kernel::WaitSet::for_current_executor();
+            let _enrollment = wait_set.enroll(&outer_wq_clone);
+            tx.send(()).unwrap();
+            wait_set.wait(&[], Some(std::time::Duration::from_secs(5)), || false)
+        });
+
+        rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Delete inner from outer
+        let del_req = SyscallRequest::new(
+            21,
+            SyscallArgs::from([outer as u64, LINUX_EPOLL_CTL_DEL, inner as u64, 0, 0, 0]),
+        );
+        assert!(matches!(
+            dispatcher.dispatch(&kernel, del_req, &mut guest_mem, &reporter),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        // Waiter must be woken!
+        let outcome = waiter.join().expect("waiter thread joined");
+        assert_eq!(
+            outcome,
+            crate::kernel::WaitSetOutcome::Woken,
+            "waiter must be woken when registration is deleted"
+        );
+
+        // Readiness on outer is 0
+        assert_eq!(dispatcher.epoll_ready_events(outer, LINUX_EPOLLIN), 0);
+    }
+
+    #[test]
+    fn nested_epoll_3_levels_deep_wake() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        let efd = create_eventfd(&mut dispatcher, &kernel, &mut guest_mem, &reporter, 0);
+        let ep1 = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+        let ep2 = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+        let ep3 = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        // ep1 watches efd
+        let ev1 = 0x1000u64;
+        write_guest_epoll_event(&mut guest_mem, ev1, LINUX_EPOLLIN, 1);
+        assert!(matches!(
+            dispatcher.dispatch(
+                &kernel,
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([ep1 as u64, LINUX_EPOLL_CTL_ADD, efd as u64, ev1, 0, 0]),
+                ),
+                &mut guest_mem,
+                &reporter,
+            ),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        // ep2 watches ep1
+        let ev2 = 0x1020u64;
+        write_guest_epoll_event(&mut guest_mem, ev2, LINUX_EPOLLIN, 2);
+        assert!(matches!(
+            dispatcher.dispatch(
+                &kernel,
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([ep2 as u64, LINUX_EPOLL_CTL_ADD, ep1 as u64, ev2, 0, 0]),
+                ),
+                &mut guest_mem,
+                &reporter,
+            ),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        // ep3 watches ep2
+        let ev3 = 0x1040u64;
+        write_guest_epoll_event(&mut guest_mem, ev3, LINUX_EPOLLIN, 3);
+        assert!(matches!(
+            dispatcher.dispatch(
+                &kernel,
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([ep3 as u64, LINUX_EPOLL_CTL_ADD, ep2 as u64, ev3, 0, 0]),
+                ),
+                &mut guest_mem,
+                &reporter,
+            ),
+            Ok(DispatchOutcome::Returned { value: 0 })
+        ));
+
+        // Background waiter on ep3
+        let ep3_file = dispatcher.open_file(ep3).unwrap();
+        let ep3_wq = ep3_file.wait_queue().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let wait_set = crate::kernel::WaitSet::for_current_executor();
+            let _enrollment = wait_set.enroll(&ep3_wq);
+            tx.send(()).unwrap();
+            wait_set.wait(&[], Some(std::time::Duration::from_secs(5)), || false)
+        });
+
+        rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Write to eventfd (0 -> 1)
+        let write_buf = 0x1060u64;
+        guest_mem
+            .write_bytes(write_buf, &1u64.to_le_bytes())
+            .unwrap();
+        assert!(matches!(
+            dispatcher.dispatch(
+                &kernel,
+                SyscallRequest::new(64, SyscallArgs::from([efd as u64, write_buf, 8, 0, 0, 0])),
+                &mut guest_mem,
+                &reporter,
+            ),
+            Ok(DispatchOutcome::Returned { value: 8 })
+        ));
+
+        let outcome = waiter.join().expect("waiter thread joined");
+        assert_eq!(
+            outcome,
+            crate::kernel::WaitSetOutcome::Woken,
+            "waiter on 3-level deep epoll must wake on leaf write"
+        );
+
+        // All 3 levels must report ready
+        assert_eq!(
+            dispatcher.epoll_ready_events(ep1, LINUX_EPOLLIN),
+            LINUX_EPOLLIN
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(ep2, LINUX_EPOLLIN),
+            LINUX_EPOLLIN
+        );
+        assert_eq!(
+            dispatcher.epoll_ready_events(ep3, LINUX_EPOLLIN),
+            LINUX_EPOLLIN
+        );
+    }
+
+    #[test]
+    fn nested_epoll_ppoll_continuation_yield_and_wake() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x2000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        let efd = create_eventfd(&mut dispatcher, &kernel, &mut guest_mem, &reporter, 0);
+        let inner = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+        let outer = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        let ev1_addr = 0x1000u64;
+        write_guest_epoll_event(&mut guest_mem, ev1_addr, LINUX_EPOLLIN, 111);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([
+                    inner as u64,
+                    LINUX_EPOLL_CTL_ADD,
+                    efd as u64,
+                    ev1_addr,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        let ev2_addr = 0x1020u64;
+        write_guest_epoll_event(&mut guest_mem, ev2_addr, LINUX_EPOLLIN, 222);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([
+                    outer as u64,
+                    LINUX_EPOLL_CTL_ADD,
+                    inner as u64,
+                    ev2_addr,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Call ppoll on outer with timeout = 500ms
+        let pollfds_addr = 0x1100u64;
+        let pfd = LinuxPollFd {
+            fd: outer,
+            events: LINUX_POLLIN as i16,
+            revents: 0,
+        };
+        guest_mem
+            .write_bytes(pollfds_addr, zerocopy::IntoBytes::as_bytes(&pfd))
+            .unwrap();
+
+        let timeout_addr = 0x1120u64;
+        let timespec = LinuxTimespec {
+            tv_sec: 0,
+            tv_nsec: 500_000_000,
+        };
+        guest_mem
+            .write_bytes(timeout_addr, zerocopy::IntoBytes::as_bytes(&timespec))
+            .unwrap();
+
+        // ppoll must return WaitOnPollFds continuation rather than blocking synchronously
+        let ppoll_outcome = dispatcher
+            .dispatch(
+                &kernel,
+                SyscallRequest::new(
+                    73,
+                    SyscallArgs::from([pollfds_addr, 1, timeout_addr, 0, 0, 0]),
+                ),
+                &mut guest_mem,
+                &reporter,
+            )
+            .unwrap();
+
+        match &ppoll_outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                on_timeout,
+                ..
+            }
+            | DispatchOutcome::WaitOnPollFds {
+                fds,
+                timeout,
+                on_timeout,
+                ..
+            } => {
+                assert_eq!(*timeout, Some(std::time::Duration::from_millis(500)));
+                assert_eq!(*on_timeout, 0);
+                assert!(!fds.is_empty(), "WaitFds must contain host poll target");
+            }
+            other => panic!("expected WaitOnFds / WaitOnPollFds outcome, got {other:?}"),
+        }
+
+        // Write to eventfd (0 -> 1)
+        let write_buf = 0x1140u64;
+        guest_mem
+            .write_bytes(write_buf, &1u64.to_le_bytes())
+            .unwrap();
+        assert!(matches!(
+            dispatcher.dispatch(
+                &kernel,
+                SyscallRequest::new(64, SyscallArgs::from([efd as u64, write_buf, 8, 0, 0, 0])),
+                &mut guest_mem,
+                &reporter
+            ),
+            Ok(DispatchOutcome::Returned { value: 8 })
+        ));
+
+        // Re-dispatch ppoll -> now returns ready value = 1
+        let ppoll_ready = dispatcher
+            .dispatch(
+                &kernel,
+                SyscallRequest::new(
+                    73,
+                    SyscallArgs::from([pollfds_addr, 1, timeout_addr, 0, 0, 0]),
+                ),
+                &mut guest_mem,
+                &reporter,
+            )
+            .unwrap();
+
+        assert_eq!(ppoll_ready, DispatchOutcome::Returned { value: 1 });
+        let out_pfd: LinuxPollFd = read_kernel_struct(&guest_mem, pollfds_addr).unwrap();
+        assert_eq!(out_pfd.revents & (LINUX_POLLIN as i16), LINUX_POLLIN as i16);
+    }
+
+    #[test]
+    fn nested_epoll_negative_control_control_wake_no_false_readiness() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut guest_mem = LinearMemory::new(0x1000, vec![0; 0x2000]);
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+
+        let inner = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+        let outer = create_epoll(&mut dispatcher, &kernel, &mut guest_mem, &reporter);
+
+        let ev_addr = 0x1000u64;
+        write_guest_epoll_event(&mut guest_mem, ev_addr, LINUX_EPOLLIN, 555);
+        let _ = dispatcher.dispatch(
+            &kernel,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([
+                    outer as u64,
+                    LINUX_EPOLL_CTL_ADD,
+                    inner as u64,
+                    ev_addr,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut guest_mem,
+            &reporter,
+        );
+
+        // Control wake pulse on inner and outer
+        let inner_file = dispatcher.open_file(inner).unwrap();
+        if let Some(wq) = inner_file.wait_queue() {
+            wq.wake_all();
+        }
+        let outer_file = dispatcher.open_file(outer).unwrap();
+        if let Some(wq) = outer_file.wait_queue() {
+            wq.wake_all();
+        }
+
+        // Logical readiness MUST remain 0!
+        assert_eq!(dispatcher.epoll_ready_events(inner, LINUX_EPOLLIN), 0);
+        assert_eq!(dispatcher.epoll_ready_events(outer, LINUX_EPOLLIN), 0);
+        assert_eq!(dispatcher.poll_ready_events(outer, LINUX_POLLIN), 0);
+
+        // epoll_pwait with timeout 0 returns 0 (no false events delivered)
+        let events_out = 0x1100u64;
+        let wait_outcome = dispatcher
+            .dispatch(
+                &kernel,
+                SyscallRequest::new(
+                    22,
+                    SyscallArgs::from([outer as u64, events_out, 10, 0, 0, 0]),
+                ),
+                &mut guest_mem,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(wait_outcome, DispatchOutcome::Returned { value: 0 });
     }
 }

@@ -38,10 +38,48 @@ impl Drop for WaitEnrollment {
     }
 }
 
-#[derive(Debug, Default)]
+/// An enrolled callback's reference in a [`WaitQueue`].
+///
+/// When dropped, this automatically unregisters the callback from the target queue.
+#[derive(Debug)]
+pub struct WaitCallbackEnrollment {
+    token: u64,
+    queue: Weak<WaitQueueInner>,
+}
+
+impl WaitCallbackEnrollment {
+    /// Disarm / unregister immediately rather than waiting for drop.
+    pub fn unregister(self) {
+        drop(self);
+    }
+}
+
+impl Drop for WaitCallbackEnrollment {
+    fn drop(&mut self) {
+        if let Some(queue) = self.queue.upgrade() {
+            let mut callbacks = queue.callbacks.lock();
+            callbacks.remove(&self.token);
+        }
+    }
+}
+
+pub type WaitCallback = Arc<dyn Fn(usize) + Send + Sync + 'static>;
+
+#[derive(Default)]
 struct WaitQueueInner {
     waiters: Mutex<BTreeMap<u64, Weak<WaitSetInner>>>,
+    callbacks: Mutex<BTreeMap<u64, WaitCallback>>,
     next_token: AtomicU64,
+}
+
+impl std::fmt::Debug for WaitQueueInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitQueueInner")
+            .field("waiters", &self.waiters)
+            .field("callbacks_count", &self.callbacks.lock().len())
+            .field("next_token", &self.next_token)
+            .finish()
+    }
 }
 
 /// A wait queue embedded in any Carrick-owned kernel object (pipe, eventfd, timerfd, etc.).
@@ -64,6 +102,7 @@ impl WaitQueue {
         Self {
             inner: Arc::new(WaitQueueInner {
                 waiters: Mutex::new(BTreeMap::new()),
+                callbacks: Mutex::new(BTreeMap::new()),
                 next_token: AtomicU64::new(1),
             }),
         }
@@ -81,17 +120,54 @@ impl WaitQueue {
         }
     }
 
-    /// Wake all active waiters enrolled in this queue.
+    /// Enroll a callback to be invoked when this wait queue is woken.
+    /// Returns an RAII [`WaitCallbackEnrollment`]. Dropping the enrollment unregisters the callback.
+    pub fn enroll_callback(
+        &self,
+        callback: impl Fn(usize) + Send + Sync + 'static,
+    ) -> WaitCallbackEnrollment {
+        let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
+        let mut callbacks = self.inner.callbacks.lock();
+        callbacks.insert(token, Arc::new(callback));
+        WaitCallbackEnrollment {
+            token,
+            queue: Arc::downgrade(&self.inner),
+        }
+    }
+
+    /// Wake all active waiters enrolled in this queue and invoke registered callbacks.
     pub fn wake_all(&self) {
-        let mut waiters = self.inner.waiters.lock();
-        waiters.retain(|_, weak| {
-            if let Some(waiter) = weak.upgrade() {
-                waiter.wake();
-                true
-            } else {
-                false // prune dead weak references
-            }
-        });
+        self.wake_all_with_depth(0);
+    }
+
+    pub const MAX_WAKE_PROPAGATION_DEPTH: usize = 16;
+
+    /// Wake all active waiters with an explicit propagation depth.
+    pub fn wake_all_with_depth(&self, depth: usize) {
+        {
+            let mut waiters = self.inner.waiters.lock();
+            waiters.retain(|_, weak| {
+                if let Some(waiter) = weak.upgrade() {
+                    waiter.wake();
+                    true
+                } else {
+                    false // prune dead weak references
+                }
+            });
+        }
+
+        if depth >= Self::MAX_WAKE_PROPAGATION_DEPTH {
+            return;
+        }
+
+        let callbacks: Vec<Arc<dyn Fn(usize) + Send + Sync + 'static>> = {
+            let callbacks = self.inner.callbacks.lock();
+            callbacks.values().cloned().collect()
+        };
+
+        for cb in callbacks {
+            cb(depth + 1);
+        }
     }
 
     /// Return the count of active waiters (primarily for unit tests).
@@ -99,6 +175,16 @@ impl WaitQueue {
         let mut waiters = self.inner.waiters.lock();
         waiters.retain(|_, weak| weak.strong_count() > 0);
         waiters.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controller_callback_snapshot(&self) -> Vec<WaitCallback> {
+        self.inner.callbacks.lock().values().cloned().collect()
+    }
+
+    /// Return the count of enrolled callbacks (primarily for unit tests and census).
+    pub fn callback_count(&self) -> usize {
+        self.inner.callbacks.lock().len()
     }
 }
 

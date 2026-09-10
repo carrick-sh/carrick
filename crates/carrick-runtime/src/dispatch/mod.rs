@@ -992,7 +992,7 @@ impl WaitFds {
         if slot_authorities.is_empty() && !self.fds.is_empty() {
             return Err(LINUX_EBADF);
         }
-        if self.fds.is_empty() {
+        if slot_authorities.is_empty() {
             self.authority = WaitFdAuthority::Empty;
         } else {
             self.authority = WaitFdAuthority::Logical {
