@@ -228,6 +228,8 @@ pub struct RealStat {
     pub uid: NsUid,
     pub gid: NsGid,
     pub size: u64,
+    /// Allocated 512-byte blocks from the host inode (`st_blocks`), if available.
+    pub blocks: Option<u64>,
     /// Last-access time `(sec, nsec)` from the real on-disk inode.
     pub atime: (i64, i64),
     /// Last-modification time `(sec, nsec)` from the real on-disk inode.
@@ -4323,6 +4325,7 @@ impl HostFsBackend {
             uid: uid.unwrap_or(NsUid::ROOT),
             gid: gid.unwrap_or(NsGid::ROOT),
             size: st.st_size as u64,
+            blocks: Some(st.st_blocks.max(0) as u64),
             atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
             mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
             ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
@@ -4465,6 +4468,7 @@ impl HostFsBackend {
                         on_disk_mode
                     }),
                     size: st.st_size as u64,
+                    blocks: Some(st.st_blocks.max(0) as u64),
                     atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
                     mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
                     ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
@@ -4554,6 +4558,7 @@ impl HostFsBackend {
             uid: uid.unwrap_or(NsUid::ROOT),
             gid: gid.unwrap_or(NsGid::ROOT),
             size: st.st_size as u64,
+            blocks: Some(st.st_blocks.max(0) as u64),
             atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
             mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
             ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
@@ -7837,6 +7842,7 @@ impl FsBackend for HostFsBackend {
             uid: owner.0.unwrap_or(NsUid::ROOT),
             gid: owner.1.unwrap_or(NsGid::ROOT),
             size: st.st_size as u64,
+            blocks: Some(st.st_blocks.max(0) as u64),
             atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
             mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
             ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),

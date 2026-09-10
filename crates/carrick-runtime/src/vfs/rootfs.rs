@@ -253,6 +253,7 @@ impl RootFsVfs {
             uid,
             gid,
             size: st.st_size as u64,
+            blocks: Some(st.st_blocks.max(0) as u64),
             atime: (st.st_atime, carrick_portable::stat_atime_nsec(st)),
             mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
             ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),

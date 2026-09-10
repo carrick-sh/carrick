@@ -2261,6 +2261,7 @@ pub(super) struct StatRecord {
     /// `FsBackend::create_device`). Zero for every ordinary file/dir/etc.
     pub(super) rdev: u64,
     pub(super) size: u64,
+    pub(super) blocks: Option<u64>,
     pub(super) atime: (i64, i64),
     pub(super) mtime: (i64, i64),
     pub(super) ctime: (i64, i64),
@@ -2280,6 +2281,7 @@ impl StatRecord {
             gid: carrick_abi::NsGid::ROOT,
             rdev: 0,
             size: metadata.size as u64,
+            blocks: None,
             atime: (0, 0),
             mtime: (0, 0),
             ctime: (0, 0),
@@ -2302,6 +2304,7 @@ impl StatRecord {
             gid: real.gid,
             rdev: 0,
             size: real.size,
+            blocks: real.blocks,
             atime: real.atime,
             mtime: real.mtime,
             ctime: real.ctime,
@@ -2318,6 +2321,7 @@ impl StatRecord {
             gid: carrick_abi::NsGid::ROOT,
             rdev: 0,
             size: size as u64,
+            blocks: None,
             atime: (0, 0),
             mtime: (0, 0),
             ctime: (0, 0),
@@ -2443,8 +2447,12 @@ impl OpenDescription {
                 OpenStatSource::Record(record)
             }
             OpenDescription::InMemoryFile { path, contents, .. } => {
-                let len = contents.read().len();
-                OpenStatSource::Record(StatRecord::synthetic(path, len, LINUX_S_IFREG | 0o644))
+                let guard = contents.read();
+                let len = guard.len();
+                let allocated = guard.allocated_bytes();
+                let mut record = StatRecord::synthetic(path, len, LINUX_S_IFREG | 0o644);
+                record.blocks = Some(super::blocks_512(allocated) as u64);
+                OpenStatSource::Record(record)
             }
             OpenDescription::SyntheticDevice { kind, .. } => {
                 let mut record = StatRecord::synthetic(kind.as_str(), 0, LINUX_S_IFCHR | 0o666);

@@ -320,4 +320,50 @@ mod tests {
         mismatched[0] = 1; // non-zero in hole
         assert_ne!(buf, mismatched.as_slice());
     }
+
+    #[test]
+    fn bounded_traversal_and_sparse_chunk_accounting() {
+        let mut buf = SparseBuffer::new();
+        const N: usize = 5000;
+        const PAGE: usize = 4096;
+        let data = [0x7f_u8; PAGE];
+
+        // Insert N non-contiguous pages
+        for i in 0..N {
+            buf.write_range(i * 2 * PAGE, &data);
+        }
+
+        assert_eq!(buf.len(), (2 * N - 1) * PAGE);
+        assert_eq!(buf.allocated_bytes(), N * PAGE);
+
+        // Subrange read deep in the buffer (chunk index 4500)
+        let offset = 4500 * 2 * PAGE;
+        let read = buf.read_range(offset, PAGE);
+        assert_eq!(read, data);
+
+        // Read across a hole between chunk 4500 and 4501
+        let hole_offset = offset + PAGE;
+        let hole_read = buf.read_range(hole_offset, PAGE);
+        assert_eq!(hole_read, vec![0_u8; PAGE]);
+
+        // Straddled read across chunk 4500, hole, and chunk 4501
+        let straddle_read = buf.read_range(offset + PAGE - 2, PAGE + 4);
+        let mut expected = vec![0x7f_u8; 2];
+        expected.resize(PAGE + 2, 0);
+        expected.extend_from_slice(&[0x7f, 0x7f]);
+        assert_eq!(straddle_read, expected);
+
+        // Overwrite middle of chunk 4500 with split
+        let overwrite = [0x33_u8; 100];
+        buf.write_range(offset + 100, &overwrite);
+        // Original chunk is split into prefix (100 bytes) + new chunk (100 bytes) + suffix (PAGE - 200 bytes)
+        // Total allocated bytes remains identical
+        assert_eq!(buf.allocated_bytes(), N * PAGE);
+        assert_eq!(buf.read_range(offset + 100, 100), overwrite);
+        assert_eq!(buf.read_range(offset, 100), vec![0x7f_u8; 100]);
+        assert_eq!(
+            buf.read_range(offset + 200, PAGE - 200),
+            vec![0x7f_u8; PAGE - 200]
+        );
+    }
 }

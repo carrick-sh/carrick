@@ -358,6 +358,7 @@ fn real_stat_from_host(
         uid: uid.unwrap_or_else(|| carrick_abi::NsUid::new(st.st_uid)),
         gid: gid.unwrap_or_else(|| carrick_abi::NsGid::new(st.st_gid)),
         size: st.st_size.max(0) as u64,
+        blocks: Some(st.st_blocks.max(0) as u64),
         atime: (st.st_atime, carrick_portable::stat_atime_nsec(st)),
         mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
         ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
