@@ -2,6 +2,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use carrick_fatal::carrick_fatal;
+
 use carrick_aarch64::mailbox::{
     AARCH64_SYSCALL_MAILBOX_MAGIC, AARCH64_SYSCALL_MAILBOX_SIZE, AARCH64_SYSCALL_MAILBOX_VERSION,
     Aarch64SyscallMailbox, MailboxProtocolError, MailboxRequestMetadata, MailboxResponseAction,
@@ -260,7 +262,12 @@ impl MailboxBinding {
 
     pub fn slot(&self) -> MailboxSlotId {
         let Some(lease) = self.lease.as_ref() else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::mailbox_authority",
+                "mailbox slot identifier accessed without lease on binding: generation={} transport={:?}",
+                self.generation,
+                self.transport
+            );
         };
         lease.id()
     }

@@ -3,6 +3,8 @@
 //! and stage-1 successfully. No guest permission is granted by preparation.
 use super::*;
 
+use carrick_fatal::carrick_fatal;
+
 pub(super) struct PreparedSparseBacking {
     pub(super) physical_host: *mut u8,
     pub(super) semantic_host: *mut u8,
@@ -803,8 +805,10 @@ pub(super) fn publish_replacing(
             },
         );
         if let Err(rollback_error) = rollback {
-            eprintln!("carrick: FATAL: sparse HVPatch mmap rollback failed: {rollback_error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::sparse_materialization_rollback",
+                "sparse page-table rollback failed after publication failure: start=0x{start:x} end=0x{end:x} error={rollback_error}"
+            );
         }
         HvfVmState::rollback_unpublished_mappings(
             &mut context.state.frame_inventory.ledger.lock(),
@@ -821,8 +825,10 @@ pub(super) fn publish_replacing(
         },
     );
     if let Err(error) = flush_stage1() {
-        eprintln!("carrick: FATAL: sparse HVPatch mmap TLBI failed: {error}");
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::sparse_materialization_tlbi",
+            "sparse page-table stage-1 TLBI failed after publication: start=0x{start:x} end=0x{end:x} error={error}"
+        );
     }
     let commit = reservation.commit(());
     let foreign_receipt = if let Some(requested) = &context.foreign {
@@ -846,25 +852,49 @@ pub(super) fn publish_replacing(
             .apply_foreign_cow(
                 commit,
                 carrick_guest_mem::GuestVa(start),
-                std::num::NonZeroUsize::new(semantic_len).unwrap_or_else(|| std::process::abort()),
+                std::num::NonZeroUsize::new(semantic_len).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::sparse_materialization_inventory",
+                        "sparse publication produced zero semantic length: start=0x{start:x} end=0x{end:x}"
+                    );
+                }),
                 inventory_mapping.mapping,
                 inventory_mapping.frame,
                 carrick_guest_mem::Gpa(physical_ipa),
                 carrick_hal::FrameLength::from_mapping_extent(
-                    std::num::NonZeroU64::new(physical_len)
-                        .unwrap_or_else(|| std::process::abort()),
+                    std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::sparse_materialization_inventory",
+                            "prepared sparse backing produced zero physical extent: physical_ipa=0x{physical_ipa:x}"
+                        );
+                    }),
                 ),
             )
-            .unwrap_or_else(|_| std::process::abort());
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::sparse_materialization_inventory",
+                    "kernel foreign-MM inventory application failed: start=0x{start:x} end=0x{end:x} error={error}"
+                );
+            });
         if generation.raw_for_probe() != owner_generation
             || !challenge.authenticate_apply(
                 &receipt,
-                std::num::NonZeroU64::new(requested.mm.raw_for_probe())
-                    .unwrap_or_else(|| std::process::abort()),
+                std::num::NonZeroU64::new(requested.mm.raw_for_probe()).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::sparse_materialization_mm_authority",
+                        "foreign-MM snapshot supplied zero MM identity after sparse commit: start=0x{start:x}"
+                    );
+                }),
             )
             || !receipt.authorizes(inventory_mapping.mapping, inventory_mapping.frame)
         {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::sparse_materialization_inventory",
+                "foreign-MM inventory receipt failed verification: generation={} owner_generation={owner_generation} mapping={:?} frame={:?}",
+                generation.raw_for_probe(),
+                inventory_mapping.mapping,
+                inventory_mapping.frame
+            );
         }
         let mut snapshot = requested.clone();
         snapshot.mapping_ids = mapping_ids;
@@ -883,8 +913,10 @@ pub(super) fn publish_replacing(
         })
     } else {
         if let Err(error) = context.authority.apply(commit) {
-            eprintln!("carrick: FATAL: sparse HVPatch mmap inventory commit failed: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::sparse_materialization_inventory",
+                "local kernel frame-inventory application failed after sparse publication: start=0x{start:x} end=0x{end:x} error={error}"
+            );
         }
         None
     };
@@ -895,17 +927,30 @@ pub(super) fn publish_replacing(
         inventory_mapping.frame,
         carrick_guest_mem::Gpa(physical_ipa),
         carrick_hal::FrameLength::from_mapping_extent(
-            std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| std::process::abort()),
+            std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::sparse_materialization_inventory",
+                    "post-commit authentication observed zero physical extent: physical_ipa=0x{physical_ipa:x}"
+                );
+            }),
         ),
     ) {
         Ok(true) => {}
         Ok(false) => {
-            eprintln!("carrick: FATAL: sparse HVPatch mmap absent after commit");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::sparse_materialization_inventory",
+                "post-commit kernel authentication reported published sparse mapping absent: mapping={:?} frame={:?} physical_ipa=0x{physical_ipa:x}",
+                inventory_mapping.mapping,
+                inventory_mapping.frame
+            );
         }
         Err(error) => {
-            eprintln!("carrick: FATAL: authenticate sparse HVPatch mmap: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::sparse_materialization_inventory",
+                "post-commit kernel authentication errored for published sparse mapping: mapping={:?} frame={:?} physical_ipa=0x{physical_ipa:x} error={error}",
+                inventory_mapping.mapping,
+                inventory_mapping.frame
+            );
         }
     }
 

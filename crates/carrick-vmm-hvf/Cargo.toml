@@ -38,6 +38,7 @@ carrick-observability = { path = "../carrick-observability" }
 carrick-signal-core = { path = "../carrick-signal-core" }
 carrick-timer-core = { path = "../carrick-timer-core" }
 carrick-thread = { path = "../carrick-thread" }
+carrick-fatal.workspace = true
 clap.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
