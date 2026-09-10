@@ -2721,8 +2721,8 @@ impl SyscallDispatcher {
                             token,
                         ),
                         timeout: None,
-                        on_timeout: 0,
                         sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
+                        completion: FdWaitCompletion::Fd { on_timeout: 0 },
                     });
                 }
             } else if !is_nonblock && access_idx == 1 && host_fd_opt.is_none() {
@@ -2737,8 +2737,8 @@ impl SyscallDispatcher {
                         token,
                     ),
                     timeout: None,
-                    on_timeout: 0,
                     sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
+                    completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 });
             }
 
@@ -12545,8 +12545,10 @@ impl SyscallDispatcher {
                                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                                 },
                                 timeout: None,
-                                on_timeout: LINUX_EAGAIN.guest_retval(),
                                 sig_mask: carrick_abi::WaitSigMask::NONE,
+                                completion: FdWaitCompletion::Fd {
+                                    on_timeout: LINUX_EAGAIN.guest_retval(),
+                                },
                             }
                         });
                     }

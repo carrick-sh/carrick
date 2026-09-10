@@ -109,8 +109,8 @@ impl SyscallDispatcher {
                                 InternalWaitKind::CarrierControl,
                             )),
                         timeout: None,
-                        on_timeout: 0,
                         sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::EMPTY),
+                        completion: FdWaitCompletion::Fd { on_timeout: 0 },
                     })
                 }
                 SYSLOG_ACTION_READ_ALL => {

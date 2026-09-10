@@ -7885,12 +7885,9 @@ where
                 // the resume address.
                 executor::ExecutorExit::Syscall
             }
-            DispatchOutcome::SharedFutexWake {
-                location,
-                waiter_key,
-                count,
-            } => {
-                let value = shared_futex_wake(location.wait_addr().raw(), waiter_key, count);
+            DispatchOutcome::SharedFutexWake { target, count } => {
+                let value =
+                    shared_futex_wake(target.location.wait_addr().raw(), target.waiter_key, count);
                 self.state
                     .complete_returned(engine, &self.kernel.reporter, value)?;
                 self.state.trace_syscall_return(self.traps, Some(value));
@@ -7921,31 +7918,37 @@ where
             }
             DispatchOutcome::SharedFutexRequeue {
                 from,
-                from_key,
                 to,
-                to_key,
                 wake,
                 requeue,
             } => {
-                trace_shared_futex_requeue(0, from_key, to_key, wake, requeue, 0, 0);
+                trace_shared_futex_requeue(0, from.waiter_key, to.waiter_key, wake, requeue, 0, 0);
                 let (carrier_woken, carrier_requeued) =
                     carrick_thread::platform_futex::carrier_shared_futex_table().requeue(
-                        from_key as u64,
-                        to_key as u64,
+                        from.waiter_key as u64,
+                        to.waiter_key as u64,
                         wake,
                         requeue,
                     );
                 let (ulock_woken, ulock_requeued) = crate::ulock::requeue_counted(
-                    from.wait_addr().raw(),
-                    from_key,
-                    to.wait_addr().raw(),
-                    to_key,
+                    from.location.wait_addr().raw(),
+                    from.waiter_key,
+                    to.location.wait_addr().raw(),
+                    to.waiter_key,
                     wake,
                     requeue,
                 );
                 let woken = carrier_woken.max(ulock_woken);
                 let requeued = carrier_requeued.max(ulock_requeued);
-                trace_shared_futex_requeue(1, from_key, to_key, wake, requeue, woken, requeued);
+                trace_shared_futex_requeue(
+                    1,
+                    from.waiter_key,
+                    to.waiter_key,
+                    wake,
+                    requeue,
+                    woken,
+                    requeued,
+                );
                 let value = i64::from(woken + requeued);
                 self.state
                     .complete_returned(engine, &self.kernel.reporter, value)?;
@@ -10816,8 +10819,6 @@ where
                 blocking @ (DispatchOutcome::BlockingHostWrite(_)
                 | DispatchOutcome::BlockingRecordLock(_)
                 | DispatchOutcome::WaitOnFds { .. }
-                | DispatchOutcome::WaitOnFdsSelect { .. }
-                | DispatchOutcome::WaitOnPollFds { .. }
                 | DispatchOutcome::WaitOnProcExit { .. }
                 | DispatchOutcome::WaitOnProcState { .. }
                 | DispatchOutcome::WaitOnHvpatchChild { .. }

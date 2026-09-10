@@ -947,7 +947,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let out = h.reserve(16);
         let outcome = h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]);
         let authority = match outcome {
-            DispatchOutcome::WaitOnPollFds { fds, .. } => {
+            DispatchOutcome::WaitOnFds { fds, .. } => {
                 assert_eq!(
                     fds.first().map(|(_, events)| events),
                     Some(libc::POLLIN),
@@ -988,7 +988,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as i32;
         let out = h.reserve(16);
         let kqueue_fd = match h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]) {
-            DispatchOutcome::WaitOnPollFds { fds, .. } => {
+            DispatchOutcome::WaitOnFds { fds, .. } => {
                 fds.first().expect("epoll mutation source").0
             }
             other => panic!("expected shared epoll source, got {other:?}"),
@@ -1052,8 +1052,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         let out = h.reserve(16);
         let blocked = h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]);
         let fds = match blocked {
-            DispatchOutcome::WaitOnFds { fds, .. }
-            | DispatchOutcome::WaitOnPollFds { fds, .. } => fds,
+            DispatchOutcome::WaitOnFds { fds, .. } => fds,
             other => panic!("expected blocked epoll, got {other:?}"),
         };
         assert_eq!(fds.logical_authorities_for_test().len(), 1);
@@ -2126,7 +2125,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                             }
                         }
                         DispatchOutcome::Returned { .. } => {}
-                        DispatchOutcome::WaitOnPollFds { fds, timeout, .. } => {
+                        DispatchOutcome::WaitOnFds { fds, timeout, .. } => {
                             if let Some((fd, events)) = fds.first() {
                                 let mut pfd = libc::pollfd {
                                     fd,
@@ -2139,11 +2138,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                                 unsafe {
                                     libc::poll(&mut pfd, 1, ms);
                                 }
+                            } else {
+                                let ms = timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
+                                std::thread::sleep(Duration::from_millis(ms));
                             }
-                        }
-                        DispatchOutcome::WaitOnFds { timeout, .. } => {
-                            let ms = timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
-                            std::thread::sleep(Duration::from_millis(ms));
                         }
                         _ => {}
                     }
@@ -2328,7 +2326,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                             }
                         }
                         DispatchOutcome::Returned { .. } => {}
-                        DispatchOutcome::WaitOnPollFds { fds, timeout, .. } => {
+                        DispatchOutcome::WaitOnFds { fds, timeout, .. } => {
                             if let Some((fd, events)) = fds.first() {
                                 let mut pfd = libc::pollfd {
                                     fd,
@@ -2341,11 +2339,10 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                                 unsafe {
                                     libc::poll(&mut pfd, 1, ms);
                                 }
+                            } else {
+                                let ms = timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
+                                std::thread::sleep(Duration::from_millis(ms));
                             }
-                        }
-                        DispatchOutcome::WaitOnFds { timeout, .. } => {
-                            let ms = timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
-                            std::thread::sleep(Duration::from_millis(ms));
                         }
                         _ => {}
                     }
@@ -3037,8 +3034,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         assert_eq!(
             outcome,
             DispatchOutcome::SharedFutexWake {
-                location,
-                waiter_key: location.waiter_key(),
+                target: SharedFutexTarget::new(location, location.waiter_key()),
                 count: 3,
             },
             "a shared FUTEX_WAKE must defer to the PlatformFutex::shared_wake seam"
@@ -7367,4 +7363,135 @@ mod scm_rights_tests {
             "the in-flight writer must be collected once nothing can receive it"
         );
     }
+
+    #[test]
+    fn fd_wait_outcomes_pin_poll_select_and_plain_wait_for_same_fd_set() {
+        const SYS_PSELECT6: u64 = 72;
+        const SYS_PPOLL: u64 = 73;
+
+        let mut g = Guest::new();
+        assert_eq!(g.ok(SYS_PIPE2, [PIPEFD, 0, 0, 0, 0, 0]), 0);
+        let (pipe_r, pipe_w) = (g.u32_at(PIPEFD), g.u32_at(PIPEFD + 4));
+
+        let timeout_addr = MEM_BASE + 0x500;
+        let timespec: [u64; 2] = [0, 50_000_000]; // 50ms
+        g.mem
+            .write_bytes(timeout_addr, zerocopy::IntoBytes::as_bytes(&timespec))
+            .unwrap();
+
+        // 1. Plain fd wait: read from empty blocking pipe
+        let read_outcome = g.call(SYS_READ, [pipe_r as u64, DATA, 16, 0, 0, 0]);
+        match &read_outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                completion,
+                ..
+            } => {
+                assert!(!fds.is_empty(), "plain wait must contain host poll target");
+                assert_eq!(*timeout, None);
+                assert_eq!(
+                    *completion,
+                    FdWaitCompletion::Fd {
+                        on_timeout: carrick_abi::LINUX_EAGAIN.guest_retval()
+                    }
+                );
+            }
+            other => panic!("expected WaitOnFds for empty pipe read, got {other:?}"),
+        }
+
+        // 2. Poll: ppoll on the same pipe_r for POLLIN (host pipe -> WaitOnFds with Fd completion on_timeout: 0)
+        let pollfd_addr = MEM_BASE + 0x520;
+        let mut pfd = [0u8; 8];
+        pfd[0..4].copy_from_slice(&pipe_r.to_ne_bytes());
+        pfd[4..6].copy_from_slice(&libc::POLLIN.to_ne_bytes());
+        g.mem.write_bytes(pollfd_addr, &pfd).unwrap();
+
+        let poll_outcome = g.call(SYS_PPOLL, [pollfd_addr, 1, timeout_addr, 0, 0, 0]);
+        match &poll_outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                completion,
+                ..
+            } => {
+                assert!(!fds.is_empty(), "ppoll must contain host poll target");
+                assert_eq!(*timeout, Some(Duration::from_millis(50)));
+                assert_eq!(*completion, FdWaitCompletion::Fd { on_timeout: 0 });
+            }
+            other => panic!("expected WaitOnFds for host ppoll, got {other:?}"),
+        }
+
+        // 3. Select: pselect6 on the same pipe_r in readfds
+        let readfds_addr = MEM_BASE + 0x540;
+        let mut fdset = [0u8; 128];
+        fdset[(pipe_r / 8) as usize] |= 1 << (pipe_r % 8);
+        g.mem.write_bytes(readfds_addr, &fdset).unwrap();
+
+        let select_outcome = g.call(
+            SYS_PSELECT6,
+            [pipe_r as u64 + 1, readfds_addr, 0, 0, timeout_addr, 0],
+        );
+        match &select_outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                completion: FdWaitCompletion::Select { clear_on_timeout },
+                ..
+            } => {
+                assert!(!fds.is_empty(), "pselect6 must contain host poll target");
+                assert_eq!(*timeout, Some(Duration::from_millis(50)));
+                assert_eq!(clear_on_timeout.len(), 1);
+                assert_eq!(clear_on_timeout[0].0, readfds_addr);
+                // On timeout, select zeroes the fd_set:
+                for (addr, len) in clear_on_timeout {
+                    g.mem.write_bytes(*addr, &vec![0u8; *len]).unwrap();
+                }
+                assert_eq!(g.mem.read_bytes(readfds_addr, 128).unwrap(), vec![0u8; 128]);
+            }
+            other => panic!("expected WaitOnFds for pselect6, got {other:?}"),
+        }
+
+        // 4. Polling wait: epoll_pwait on epfd watching pipe_r yields WaitOnFds with Poll completion
+        const SYS_EPOLL_CREATE1: u64 = 20;
+        const SYS_EPOLL_CTL: u64 = 21;
+        const SYS_EPOLL_PWAIT: u64 = 22;
+        let epfd = g.ok(SYS_EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]) as i32;
+        let event_addr = MEM_BASE + 0x600;
+        let mut epoll_ev = [0u8; 16];
+        epoll_ev[0..4].copy_from_slice(&(carrick_abi::LINUX_EPOLLIN as u32).to_le_bytes());
+        g.mem.write_bytes(event_addr, &epoll_ev).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_EPOLL_CTL,
+                [epfd as u64, carrick_abi::LINUX_EPOLL_CTL_ADD, pipe_r as u64, event_addr, 0, 0]
+            ),
+            0
+        );
+
+        let events_out = MEM_BASE + 0x620;
+        let epoll_outcome = g.call(
+            SYS_EPOLL_PWAIT,
+            [epfd as u64, events_out, 1, 50, 0, 0],
+        );
+        match &epoll_outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                completion: FdWaitCompletion::Poll { on_timeout },
+                ..
+            } => {
+                assert!(!fds.is_empty(), "poll wait must contain poll target");
+                assert_eq!(*timeout, Some(Duration::from_millis(50)));
+                assert_eq!(*on_timeout, 0);
+            }
+            other => panic!("expected WaitOnFds for epoll_pwait, got {other:?}"),
+        }
+
+        assert_eq!(g.ok(SYS_CLOSE, [epfd as u64, 0, 0, 0, 0, 0]), 0);
+
+        assert_eq!(g.ok(SYS_CLOSE, [pipe_r as u64, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(g.ok(SYS_CLOSE, [pipe_w as u64, 0, 0, 0, 0, 0]), 0);
+    }
 }
+

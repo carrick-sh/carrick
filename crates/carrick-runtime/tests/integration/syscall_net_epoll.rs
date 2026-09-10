@@ -11,7 +11,7 @@
 mod support;
 
 #[cfg(target_os = "macos")]
-use carrick_runtime::dispatch::WaitFds;
+use carrick_runtime::dispatch::{FdWaitCompletion, WaitFds};
 #[cfg(target_os = "macos")]
 use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
 use carrick_runtime::linux_abi::{
@@ -1552,11 +1552,11 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
         )
         .unwrap();
     match outcome {
-        DispatchOutcome::WaitOnPollFds {
+        DispatchOutcome::WaitOnFds {
             fds,
             timeout,
-            on_timeout,
             sig_mask,
+            completion: FdWaitCompletion::Poll { on_timeout },
         } => {
             assert_eq!(fds.len(), 1);
             assert!(fds[0].fd() >= 0);
@@ -1633,11 +1633,11 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
             &reporter,
         )
         .unwrap();
-    let DispatchOutcome::WaitOnPollFds {
+    let DispatchOutcome::WaitOnFds {
         fds,
         timeout,
-        on_timeout,
         sig_mask,
+        completion: FdWaitCompletion::Poll { on_timeout },
     } = outcome
     else {
         panic!("expected epoll wait handoff, got {outcome:?}");
@@ -1757,11 +1757,11 @@ fn epoll_latched_host_edge_parks_on_kqueue_edge_not_timeout_backstop() {
             &reporter,
         )
         .unwrap();
-    let DispatchOutcome::WaitOnPollFds {
+    let DispatchOutcome::WaitOnFds {
         fds,
         timeout,
-        on_timeout,
         sig_mask,
+        completion: FdWaitCompletion::Poll { on_timeout },
     } = outcome
     else {
         panic!("expected latch-masked edge to park on kqueue edge, got {outcome:?}");
@@ -1899,11 +1899,11 @@ fn epoll_et_read_growth_does_not_rearm_latched_read_level() {
             &reporter,
         )
         .unwrap();
-    let DispatchOutcome::WaitOnPollFds {
+    let DispatchOutcome::WaitOnFds {
         fds,
         timeout,
-        on_timeout,
         sig_mask,
+        completion: FdWaitCompletion::Poll { on_timeout },
     } = outcome
     else {
         panic!("expected latched growth edge to park on future kqueue edge, got {outcome:?}");
@@ -2120,11 +2120,11 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
         )
         .unwrap();
     match outcome {
-        DispatchOutcome::WaitOnPollFds {
+        DispatchOutcome::WaitOnFds {
             fds,
             timeout,
-            on_timeout,
             sig_mask,
+            completion: FdWaitCompletion::Poll { on_timeout },
         } => {
             assert_eq!(fds.len(), 1);
             assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
@@ -2146,8 +2146,8 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
         DispatchOutcome::WaitOnFds {
             fds,
             timeout,
-            on_timeout,
             sig_mask,
+            completion: FdWaitCompletion::Fd { on_timeout },
         } => {
             assert!(fds.is_empty());
             assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
@@ -2208,11 +2208,11 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
         )
         .unwrap();
     match outcome {
-        DispatchOutcome::WaitOnPollFds {
+        DispatchOutcome::WaitOnFds {
             fds,
             timeout,
-            on_timeout,
             sig_mask,
+            completion: FdWaitCompletion::Poll { on_timeout },
         } => {
             assert_eq!(fds.len(), 1);
             assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
@@ -2234,8 +2234,8 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
         DispatchOutcome::WaitOnFds {
             fds,
             timeout,
-            on_timeout,
             sig_mask,
+            completion: FdWaitCompletion::Fd { on_timeout },
         } => {
             assert!(fds.is_empty());
             assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
@@ -2351,11 +2351,11 @@ fn epoll_latched_eof_hup_disarms_kqueue_and_leaves_fd_not_readable() {
             &reporter,
         )
         .unwrap();
-    let DispatchOutcome::WaitOnPollFds {
+    let DispatchOutcome::WaitOnFds {
         fds,
         timeout,
-        on_timeout,
         sig_mask,
+        completion: FdWaitCompletion::Poll { on_timeout },
     } = outcome
     else {
         panic!("expected timed epoll wait handoff after latched EOF, got {outcome:?}");
@@ -2671,41 +2671,42 @@ fn dispatch_with_wait(
             DispatchOutcome::WaitOnFds {
                 fds,
                 timeout,
-                on_timeout,
                 sig_mask,
+                completion,
             } => {
                 let waiter = ThreadWaiter::new(ThreadId::main_from_host_pid_value(unsafe {
                     libc::getpid()
                 }));
-                match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
-                    WaitResult::Ready => {}
-                    WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
-                    WaitResult::Interrupted => {
-                        return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                match completion {
+                    FdWaitCompletion::Fd { on_timeout } => {
+                        match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+                            WaitResult::Ready => {}
+                            WaitResult::TimedOut => {
+                                return DispatchOutcome::Returned { value: on_timeout };
+                            }
+                            WaitResult::Interrupted => {
+                                return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                            }
+                            WaitResult::Errno(errno) => {
+                                return DispatchOutcome::Errno { errno };
+                            }
+                        }
                     }
-                    WaitResult::Errno(errno) => {
-                        return DispatchOutcome::Errno { errno };
+                    FdWaitCompletion::Poll { on_timeout } => {
+                        match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
+                            WaitResult::Ready => {}
+                            WaitResult::TimedOut => {
+                                return DispatchOutcome::Returned { value: on_timeout };
+                            }
+                            WaitResult::Interrupted => {
+                                return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                            }
+                            WaitResult::Errno(errno) => {
+                                return DispatchOutcome::Errno { errno };
+                            }
+                        }
                     }
-                }
-            }
-            DispatchOutcome::WaitOnPollFds {
-                fds,
-                timeout,
-                on_timeout,
-                sig_mask,
-            } => {
-                let waiter = ThreadWaiter::new(ThreadId::main_from_host_pid_value(unsafe {
-                    libc::getpid()
-                }));
-                match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
-                    WaitResult::Ready => {}
-                    WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
-                    WaitResult::Interrupted => {
-                        return DispatchOutcome::Errno { errno: LINUX_EINTR };
-                    }
-                    WaitResult::Errno(errno) => {
-                        return DispatchOutcome::Errno { errno };
-                    }
+                    FdWaitCompletion::Select { .. } => unreachable!(),
                 }
             }
             other => return other,
@@ -2844,43 +2845,43 @@ fn dispatch_threaded_with_wait_notify(
             DispatchOutcome::WaitOnFds {
                 fds,
                 timeout,
-                on_timeout,
                 sig_mask,
+                completion,
             } => {
                 if let Some(sender) = wait_notify.take() {
                     sender.send(fds.clone()).unwrap();
                 }
                 let waiter = ThreadWaiter::new(tid);
-                match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
-                    WaitResult::Ready => {}
-                    WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
-                    WaitResult::Interrupted => {
-                        return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                match completion {
+                    FdWaitCompletion::Fd { on_timeout } => {
+                        match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+                            WaitResult::Ready => {}
+                            WaitResult::TimedOut => {
+                                return DispatchOutcome::Returned { value: on_timeout };
+                            }
+                            WaitResult::Interrupted => {
+                                return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                            }
+                            WaitResult::Errno(errno) => {
+                                return DispatchOutcome::Errno { errno };
+                            }
+                        }
                     }
-                    WaitResult::Errno(errno) => {
-                        return DispatchOutcome::Errno { errno };
+                    FdWaitCompletion::Poll { on_timeout } => {
+                        match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
+                            WaitResult::Ready => {}
+                            WaitResult::TimedOut => {
+                                return DispatchOutcome::Returned { value: on_timeout };
+                            }
+                            WaitResult::Interrupted => {
+                                return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                            }
+                            WaitResult::Errno(errno) => {
+                                return DispatchOutcome::Errno { errno };
+                            }
+                        }
                     }
-                }
-            }
-            DispatchOutcome::WaitOnPollFds {
-                fds,
-                timeout,
-                on_timeout,
-                sig_mask,
-            } => {
-                if let Some(sender) = wait_notify.take() {
-                    sender.send(fds.clone()).unwrap();
-                }
-                let waiter = ThreadWaiter::new(tid);
-                match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
-                    WaitResult::Ready => {}
-                    WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
-                    WaitResult::Interrupted => {
-                        return DispatchOutcome::Errno { errno: LINUX_EINTR };
-                    }
-                    WaitResult::Errno(errno) => {
-                        return DispatchOutcome::Errno { errno };
-                    }
+                    FdWaitCompletion::Select { .. } => unreachable!(),
                 }
             }
             other => return other,

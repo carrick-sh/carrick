@@ -1762,6 +1762,51 @@ impl Drop for HostAliasInstallGuard<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SharedFutexTarget {
+    pub location: carrick_guest_mem::SharedFutexLocation,
+    pub waiter_key: usize,
+}
+
+impl SharedFutexTarget {
+    #[inline]
+    pub const fn new(location: carrick_guest_mem::SharedFutexLocation, waiter_key: usize) -> Self {
+        Self {
+            location,
+            waiter_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FdWaitCompletion {
+    /// Plain fd wait completion semantics.
+    Fd { on_timeout: i64 },
+    /// Serviced by `poll(2)` instead of the runtime's per-thread kqueue.
+    /// This is for epoll's backing kqueue fd:
+    /// polling a kqueue fd observes pending epoll events without consuming
+    /// them, so the runtime can re-dispatch `epoll_pwait` and let that call
+    /// drain the epoll instance kqueue normally.
+    Poll { on_timeout: i64 },
+    /// Like [`DispatchOutcome::WaitOnFds`] but for `select`/`pselect6`, whose fd-set bitmaps are
+    /// BOTH input and output (unlike `poll`'s separate `events`/`revents`).
+    /// The handler therefore leaves the guest fd-sets UNMODIFIED across the
+    /// wait, so:
+    ///
+    /// - a `Ready` re-dispatch re-reads the original input sets and reports
+    ///   the now-ready fds (a fd that becomes ready *during* the block — the
+    ///   primary use of select — is found correctly), and
+    /// - an `Interrupted` (EINTR) return leaves the sets unmodified, exactly
+    ///   as Linux specifies on signal interruption.
+    ///
+    /// Only `TimedOut` must present zeroed sets (select returns 0 with empty
+    /// sets), which the runtime does by zeroing each `clear_on_timeout`
+    /// `(guest_addr, byte_len)` range before completing the syscall with 0.
+    /// `on_timeout` is implicitly 0 (a select timeout means "no fds ready").
+    Select { clear_on_timeout: Vec<(u64, usize)> },
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
@@ -1957,15 +2002,13 @@ pub enum DispatchOutcome {
     /// dispatcher lock; the runtime waits interruptibly and completes the
     /// syscall. `value` is the expected futex word (the kernel re-compares).
     SharedFutexWait {
-        location: carrick_guest_mem::SharedFutexLocation,
-        waiter_key: usize,
+        target: SharedFutexTarget,
         generation: crate::thread::FutexWait,
         value: u32,
         timeout: Option<Duration>,
     },
     SharedFutexWaitv {
-        location: carrick_guest_mem::SharedFutexLocation,
-        waiter_key: usize,
+        target: SharedFutexTarget,
         generation: crate::thread::FutexWait,
         value: u32,
         timeout: Option<Duration>,
@@ -1982,15 +2025,12 @@ pub enum DispatchOutcome {
     /// requested wake count (`FUTEX_WAKE`'s `val`); the loop completes the syscall
     /// with the number actually woken.
     SharedFutexWake {
-        location: carrick_guest_mem::SharedFutexLocation,
-        waiter_key: usize,
+        target: SharedFutexTarget,
         count: u32,
     },
     SharedFutexRequeue {
-        from: carrick_guest_mem::SharedFutexLocation,
-        from_key: usize,
-        to: carrick_guest_mem::SharedFutexLocation,
-        to_key: usize,
+        from: SharedFutexTarget,
+        to: SharedFutexTarget,
         wake: u32,
         requeue: u32,
     },
@@ -2026,11 +2066,6 @@ pub enum DispatchOutcome {
         fds: WaitFds,
         /// `None` = wait forever (signal-interruptible).
         timeout: Option<Duration>,
-        /// Value to complete the syscall with if the wait times out: `0` for
-        /// poll/select (a timeout means "no fds ready"), `-EAGAIN` for a
-        /// blocking recv/accept with a finite SO_RCVTIMEO (a timeout means
-        /// "would have blocked"). Only consulted when `timeout` is `Some`.
-        on_timeout: i64,
         /// The wait's signal-masking policy. `Replace(set)` carries a POSIX
         /// sigmask that REPLACES the thread's persistent mask for the wait
         /// (`ppoll`/`pselect6`/`epoll_pwait`): a signal blocked by the set does
@@ -2042,6 +2077,8 @@ pub enum DispatchOutcome {
         /// thread's persistent mask plus the set. (probe `ppollunblock` vs
         /// `maskfork`.)
         sig_mask: carrick_abi::WaitSigMask,
+        /// Completion behavior distinguishing fd, poll, and select wait semantics.
+        completion: FdWaitCompletion,
     },
     /// A blocking `write(2)` to a host FIFO made partial progress and then hit
     /// host EAGAIN. Re-dispatching the original syscall would duplicate the
@@ -2055,50 +2092,6 @@ pub enum DispatchOutcome {
     /// sleep until a sibling thread releases a conflicting lock. Execute it in
     /// the run loop after dispatcher state locks have been released.
     BlockingRecordLock(BlockingRecordLock),
-    /// Like [`DispatchOutcome::WaitOnFds`] but for `select`/`pselect6`, whose fd-set bitmaps are
-    /// BOTH input and output (unlike `poll`'s separate `events`/`revents`).
-    /// The handler therefore leaves the guest fd-sets UNMODIFIED across the
-    /// wait, so:
-    ///
-    /// - a `Ready` re-dispatch re-reads the original input sets and reports
-    ///   the now-ready fds (a fd that becomes ready *during* the block — the
-    ///   primary use of select — is found correctly), and
-    /// - an `Interrupted` (EINTR) return leaves the sets unmodified, exactly
-    ///   as Linux specifies on signal interruption.
-    ///
-    /// Only `TimedOut` must present zeroed sets (select returns 0 with empty
-    /// sets), which the runtime does by zeroing each `clear_on_timeout`
-    /// `(guest_addr, byte_len)` range before completing the syscall with 0.
-    /// `on_timeout` is implicitly 0 (a select timeout means "no fds ready").
-    WaitOnFdsSelect {
-        /// (host_fd, poll events) pairs to wait on.
-        fds: WaitFds,
-        /// `None` = wait forever (signal-interruptible).
-        timeout: Option<Duration>,
-        /// The wait's signal-masking policy (`Replace` when pselect6 supplies a
-        /// sigmask). See [`DispatchOutcome::WaitOnFds::sig_mask`].
-        sig_mask: carrick_abi::WaitSigMask,
-        /// Guest `(address, byte length)` of each present fd-set to zero if the
-        /// wait times out. Empty when no fd-set was supplied.
-        clear_on_timeout: Vec<(u64, usize)>,
-    },
-    /// Same contract as [`DispatchOutcome::WaitOnFds`], but serviced by `poll(2)` instead of
-    /// the runtime's per-thread kqueue. This is for epoll's backing kqueue fd:
-    /// polling a kqueue fd observes pending epoll events without consuming
-    /// them, so the runtime can re-dispatch `epoll_pwait` and let that call
-    /// drain the epoll instance kqueue normally.
-    WaitOnPollFds {
-        /// (host_fd, poll events) pairs to wait on.
-        fds: WaitFds,
-        /// `None` = wait forever (signal-interruptible).
-        timeout: Option<Duration>,
-        /// Value to complete the syscall with if the wait times out.
-        on_timeout: i64,
-        /// The wait's signal-masking policy (`Replace` when `ppoll`/
-        /// `epoll_pwait` supplies a sigmask). See
-        /// [`DispatchOutcome::WaitOnFds::sig_mask`].
-        sig_mask: carrick_abi::WaitSigMask,
-    },
     /// A blocking `waitid(P_PID, pid, …)` whose target child hasn't changed
     /// state yet. The runtime parks the vCPU thread on the child's exit via the
     /// per-thread kqueue's `EVFILT_PROC`/`NOTE_EXIT` (interruptible by a signal
@@ -5335,42 +5328,14 @@ impl SyscallDispatcher {
             DispatchOutcome::WaitOnFds {
                 fds,
                 timeout,
-                on_timeout,
                 sig_mask,
+                completion,
             } => match authorize(fds) {
                 Ok(fds) => DispatchOutcome::WaitOnFds {
                     fds,
                     timeout,
-                    on_timeout,
                     sig_mask,
-                },
-                Err(errno) => DispatchOutcome::errno(errno),
-            },
-            DispatchOutcome::WaitOnPollFds {
-                fds,
-                timeout,
-                on_timeout,
-                sig_mask,
-            } => match authorize(fds) {
-                Ok(fds) => DispatchOutcome::WaitOnPollFds {
-                    fds,
-                    timeout,
-                    on_timeout,
-                    sig_mask,
-                },
-                Err(errno) => DispatchOutcome::errno(errno),
-            },
-            DispatchOutcome::WaitOnFdsSelect {
-                fds,
-                timeout,
-                sig_mask,
-                clear_on_timeout,
-            } => match authorize(fds) {
-                Ok(fds) => DispatchOutcome::WaitOnFdsSelect {
-                    fds,
-                    timeout,
-                    sig_mask,
-                    clear_on_timeout,
+                    completion,
                 },
                 Err(errno) => DispatchOutcome::errno(errno),
             },
@@ -9839,8 +9804,7 @@ fn dispatch_threaded_futex(
                 // success cure) or KVM's host `SYS_futex(FUTEX_WAKE)`. The loop
                 // completes the syscall with the count woken.
                 return DispatchOutcome::SharedFutexWake {
-                    location,
-                    waiter_key: location.waiter_key(),
+                    target: SharedFutexTarget::new(location, location.waiter_key()),
                     count: value,
                 };
             }
@@ -9922,8 +9886,7 @@ fn dispatch_threaded_futex(
                 // (__ulock UL_COMPARE_AND_WAIT re-checks the word), so no
                 // generation snapshot is needed here.
                 return DispatchOutcome::SharedFutexWait {
-                    location,
-                    waiter_key: location.waiter_key(),
+                    target: SharedFutexTarget::new(location, location.waiter_key()),
                     generation: carrick_thread::platform_futex::carrier_shared_futex_table()
                         .prepare_wait(location.waiter_key() as u64),
                     value,
@@ -9987,10 +9950,8 @@ fn dispatch_threaded_futex(
                     };
                 };
                 return DispatchOutcome::SharedFutexRequeue {
-                    from: location,
-                    from_key: location.waiter_key(),
-                    to: to_location,
-                    to_key: to_location.waiter_key(),
+                    from: SharedFutexTarget::new(location, location.waiter_key()),
+                    to: SharedFutexTarget::new(to_location, to_location.waiter_key()),
                     wake: nr_wake,
                     requeue: nr_requeue,
                 };
@@ -10132,8 +10093,7 @@ pub(super) fn dispatch_futex_waitv_args(
             && let Some(location) = memory.shared_futex_location(entry.address)
         {
             return DispatchOutcome::SharedFutexWaitv {
-                location,
-                waiter_key: location.waiter_key(),
+                target: SharedFutexTarget::new(location, location.waiter_key()),
                 generation: carrick_thread::platform_futex::carrier_shared_futex_table()
                     .prepare_wait(location.waiter_key() as u64),
                 value: entry.value,
@@ -13064,8 +13024,10 @@ fn would_block_outcome(
         DispatchOutcome::WaitOnFds {
             fds: WaitFds::anchored_one(host_fd, events, host_fd_owner).with_authority(authority),
             timeout: None,
-            on_timeout: LINUX_EAGAIN.guest_retval(),
             sig_mask: carrick_abi::WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd {
+                on_timeout: LINUX_EAGAIN.guest_retval(),
+            },
         }
     }
 }
