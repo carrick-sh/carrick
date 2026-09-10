@@ -7,9 +7,6 @@ use crate::domains::{HostPid, ProcessGeneration};
 
 pub const PROCESS_RECORDS: usize = 4096;
 
-/// Claim-sentinel: `host_pid == REGISTERING` while a record is being filled.
-pub const REGISTERING: u32 = u32::MAX;
-
 bitflags! {
     /// Process lifecycle flags stored in [`ProcessRecord.flags`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,9 +26,6 @@ bitflags! {
         /// `carrick exec`; every arena reader must honor the carrier's owner
         /// domain rather than infer it from its own process-local state.
         const OWNER_GUEST_TASK = 1 << 4;
-        /// One lifecycle authority is changing record ownership or releasing
-        /// the slot. This bit is an internal lock, not guest-visible state.
-        const RECORD_TRANSITION = 1 << 31;
     }
 }
 
@@ -40,7 +34,285 @@ pub const FLAG_ORPHANED: u32 = ProcessFlags::ORPHANED.bits();
 pub const FLAG_DEAD: u32 = ProcessFlags::DEAD.bits();
 pub const FLAG_ADOPTED: u32 = ProcessFlags::ADOPTED.bits();
 pub const FLAG_OWNER_GUEST_TASK: u32 = ProcessFlags::OWNER_GUEST_TASK.bits();
-pub const FLAG_RECORD_TRANSITION: u32 = ProcessFlags::RECORD_TRANSITION.bits();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Busy;
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "process record transition busy")
+    }
+}
+
+impl std::error::Error for Busy {}
+
+impl From<Busy> for ProcessRecordTransitionError {
+    fn from(_: Busy) -> Self {
+        Self::Busy
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordState {
+    Free,
+    Registering,
+    Live { host_pid: HostPid },
+    Transitioning { host_pid: HostPid },
+    Retiring,
+}
+
+impl RecordState {
+    pub const fn host_pid(self) -> Option<HostPid> {
+        match self {
+            Self::Live { host_pid } | Self::Transitioning { host_pid } => Some(host_pid),
+            Self::Free | Self::Registering | Self::Retiring => None,
+        }
+    }
+
+    pub const fn is_free(self) -> bool {
+        matches!(self, Self::Free)
+    }
+
+    pub const fn is_registering(self) -> bool {
+        matches!(self, Self::Registering)
+    }
+
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Live { .. })
+    }
+
+    pub const fn is_transitioning(self) -> bool {
+        matches!(self, Self::Transitioning { .. })
+    }
+
+    pub const fn is_retiring(self) -> bool {
+        matches!(self, Self::Retiring)
+    }
+}
+
+#[derive(Debug)]
+pub struct RegisteringToken<'a> {
+    cell: &'a RecordStateCell,
+    disarmed: bool,
+}
+
+impl<'a> RegisteringToken<'a> {
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl<'a> Drop for RegisteringToken<'a> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            let _ = self.cell.raw.compare_exchange(
+                RecordStateCell::pack(RecordState::Registering),
+                RecordStateCell::pack(RecordState::Free),
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TransitionGuard<'a> {
+    cell: &'a RecordStateCell,
+    host_pid: HostPid,
+    disarmed: bool,
+}
+
+impl<'a> TransitionGuard<'a> {
+    pub fn host_pid(&self) -> HostPid {
+        self.host_pid
+    }
+
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
+    pub fn retire(mut self) {
+        self.disarmed = true;
+        self.cell.raw.store(
+            RecordStateCell::pack(RecordState::Retiring),
+            Ordering::Release,
+        );
+    }
+}
+
+impl<'a> Drop for TransitionGuard<'a> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            let _ = self.cell.raw.compare_exchange(
+                RecordStateCell::pack(RecordState::Transitioning {
+                    host_pid: self.host_pid,
+                }),
+                RecordStateCell::pack(RecordState::Live {
+                    host_pid: self.host_pid,
+                }),
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct RecordStateCell {
+    raw: AtomicU64,
+}
+
+impl Default for RecordStateCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RecordStateCell {
+    const TAG_FREE: u32 = 0;
+    const TAG_REGISTERING: u32 = 1;
+    const TAG_LIVE: u32 = 2;
+    const TAG_TRANSITIONING: u32 = 3;
+    const TAG_RETIRING: u32 = 4;
+
+    pub const fn new() -> Self {
+        Self {
+            raw: AtomicU64::new(0),
+        }
+    }
+
+    pub fn state(&self) -> RecordState {
+        Self::unpack(self.raw.load(Ordering::Acquire))
+    }
+
+    pub fn claim(&self) -> Result<RegisteringToken<'_>, Busy> {
+        match self.raw.compare_exchange(
+            Self::pack(RecordState::Free),
+            Self::pack(RecordState::Registering),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(RegisteringToken {
+                cell: self,
+                disarmed: false,
+            }),
+            Err(_) => Err(Busy),
+        }
+    }
+
+    pub fn publish(&self, mut token: RegisteringToken<'_>, host_pid: HostPid) {
+        token.disarm();
+        let old = self.raw.swap(
+            Self::pack(RecordState::Live { host_pid }),
+            Ordering::Release,
+        );
+        debug_assert_eq!(
+            (old >> 32) as u32,
+            Self::TAG_REGISTERING,
+            "publish must transition from Registering"
+        );
+    }
+
+    pub fn publish_deferred(&self, host_pid: HostPid) -> bool {
+        let expected = Self::pack(RecordState::Registering);
+        let desired = Self::pack(RecordState::Live { host_pid });
+        match self
+            .raw
+            .compare_exchange(expected, desired, Ordering::Release, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(actual) => actual == desired,
+        }
+    }
+
+    pub fn begin_transition(&self) -> Option<TransitionGuard<'_>> {
+        let mut current = self.raw.load(Ordering::Acquire);
+        loop {
+            let state = Self::unpack(current);
+            let RecordState::Live { host_pid } = state else {
+                return None;
+            };
+            let desired = Self::pack(RecordState::Transitioning { host_pid });
+            match self.raw.compare_exchange_weak(
+                current,
+                desired,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(TransitionGuard {
+                        cell: self,
+                        host_pid,
+                        disarmed: false,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn release_transition(&self) {
+        let current = self.raw.load(Ordering::Acquire);
+        let RecordState::Transitioning { host_pid } = Self::unpack(current) else {
+            return;
+        };
+        let _ = self.raw.compare_exchange(
+            current,
+            Self::pack(RecordState::Live { host_pid }),
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn finish_retire(&self) {
+        self.raw
+            .store(Self::pack(RecordState::Free), Ordering::Release);
+    }
+
+    const fn pack(state: RecordState) -> u64 {
+        match state {
+            RecordState::Free => 0,
+            RecordState::Registering => (Self::TAG_REGISTERING as u64) << 32,
+            RecordState::Live { host_pid } => {
+                ((Self::TAG_LIVE as u64) << 32) | (host_pid.raw() as u64)
+            }
+            RecordState::Transitioning { host_pid } => {
+                ((Self::TAG_TRANSITIONING as u64) << 32) | (host_pid.raw() as u64)
+            }
+            RecordState::Retiring => (Self::TAG_RETIRING as u64) << 32,
+        }
+    }
+
+    const fn unpack(raw: u64) -> RecordState {
+        let tag = (raw >> 32) as u32;
+        let pid = raw as u32;
+        match tag {
+            Self::TAG_FREE => RecordState::Free,
+            Self::TAG_REGISTERING => RecordState::Registering,
+            Self::TAG_LIVE => {
+                if pid == 0 {
+                    RecordState::Free
+                } else {
+                    RecordState::Live {
+                        host_pid: HostPid::new(pid),
+                    }
+                }
+            }
+            Self::TAG_TRANSITIONING => {
+                if pid == 0 {
+                    RecordState::Free
+                } else {
+                    RecordState::Transitioning {
+                        host_pid: HostPid::new(pid),
+                    }
+                }
+            }
+            Self::TAG_RETIRING => RecordState::Retiring,
+            _ => RecordState::Free,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -163,6 +435,7 @@ pub struct ProcessSection {
 
 #[repr(C)]
 pub struct ProcessRecord {
+    pub state_cell: RecordStateCell,
     pub host_pid: AtomicU32,
     pub generation: AtomicU32,
     pub ns_pid: AtomicU32,
@@ -180,9 +453,6 @@ pub struct ProcessRecord {
     pub exit_ready: AtomicU32,
     /// The PID namespace this record is a member of (`PidNamespaceRef::ns_id`),
     /// or 0 while it carries no namespace identity (run-state/guest-CPU only).
-    /// Placed in the padding after `exit_ready`, so the `#[repr(C)]` record
-    /// stays 88 bytes (10×u32 + 4×u64 = 72, `exit_ready` at 72, this at 76,
-    /// `guest_ns` at 80).
     pub pid_ns: AtomicU32,
     pub guest_ns: AtomicU64,
 }
@@ -216,19 +486,18 @@ impl ProcessSection {
         fill: impl FnOnce(&ProcessRecord),
     ) -> Result<ProcessRecordRef, ArenaError> {
         for (index, record) in self.records.iter().enumerate() {
-            if record
-                .host_pid
-                .compare_exchange(0, REGISTERING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
+            let Ok(mut token) = record.state_cell.claim() else {
                 continue;
-            }
+            };
 
             record.clear_body_for_claim();
             record.generation.store(generation.raw(), Ordering::Release);
             fill(record);
             if let Some(pid) = host_pid {
+                record.state_cell.publish(token, pid);
                 record.host_pid.store(pid.raw(), Ordering::Release);
+            } else {
+                token.disarm();
             }
             return Ok(ProcessRecordRef { index, generation });
         }
@@ -240,13 +509,15 @@ impl ProcessSection {
 
     pub fn find(&self, host_pid: HostPid) -> Option<ProcessRecordRef> {
         let wanted = host_pid.raw();
-        if wanted == 0 || wanted == REGISTERING {
+        if wanted == 0 {
             return None;
         }
 
         for (index, record) in self.records.iter().enumerate() {
-            if record.host_pid.load(Ordering::Acquire) != wanted {
-                continue;
+            match record.state() {
+                RecordState::Live { host_pid: p } | RecordState::Transitioning { host_pid: p }
+                    if p == host_pid => {}
+                _ => continue,
             }
             let generation = record.generation.load(Ordering::Acquire);
             if generation != 0 {
@@ -261,6 +532,7 @@ impl ProcessSection {
 
     pub fn publish_host_pid(&self, r: ProcessRecordRef, pid: HostPid) {
         if let Some(record) = self.record_for_ref(r) {
+            record.state_cell.publish_deferred(pid);
             record.host_pid.store(pid.raw(), Ordering::Release);
         }
     }
@@ -269,14 +541,13 @@ impl ProcessSection {
         let Some(record) = self.record_for_ref(r) else {
             return false;
         };
-        if !record.try_claim_transition() {
+        let Some(guard) = record.begin_transition() else {
             return false;
-        }
+        };
         if record.generation.load(Ordering::Acquire) != r.generation.raw() {
-            record.release_transition();
             return false;
         }
-        self.release_claimed(r, record);
+        self.release_claimed(r, record, guard);
         true
     }
 
@@ -294,17 +565,16 @@ impl ProcessSection {
         let Some(record) = self.record_for_ref(r) else {
             return false;
         };
-        if !record.try_claim_transition() {
+        let Some(guard) = record.begin_transition() else {
             return false;
-        }
+        };
         let owns_record = record.generation.load(Ordering::Acquire) == r.generation.raw()
-            && record.host_pid.load(Ordering::Acquire) == expected_host_pid.raw()
+            && record.state().host_pid() == Some(expected_host_pid)
             && record.ns_pid.load(Ordering::Acquire) == 0;
         if !owns_record {
-            record.release_transition();
             return false;
         }
-        self.release_claimed(r, record);
+        self.release_claimed(r, record, guard);
         true
     }
 
@@ -324,13 +594,12 @@ impl ProcessSection {
         let Some(record) = self.record_for_ref(r) else {
             return Err(ProcessRecordTransitionError::Stale);
         };
-        if !record.try_claim_transition() {
+        let Some(guard) = record.begin_transition() else {
             return Err(ProcessRecordTransitionError::Busy);
-        }
+        };
         let owns_record = record.generation.load(Ordering::Acquire) == r.generation.raw()
-            && record.host_pid.load(Ordering::Acquire) == expected_host_pid.raw();
+            && record.state().host_pid() == Some(expected_host_pid);
         if !owns_record {
-            record.release_transition();
             return Err(ProcessRecordTransitionError::Stale);
         }
 
@@ -339,19 +608,22 @@ impl ProcessSection {
             || (action == ProcessRecordTransitionAction::RetireIfNamespaceUnowned
                 && record.ns_pid.load(Ordering::Acquire) == 0);
         if released {
-            self.release_claimed(r, record);
-        } else {
-            record.release_transition();
+            self.release_claimed(r, record, guard);
         }
         Ok((value, released))
     }
 
-    fn release_claimed(&self, r: ProcessRecordRef, record: &ProcessRecord) {
+    fn release_claimed(
+        &self,
+        r: ProcessRecordRef,
+        record: &ProcessRecord,
+        guard: TransitionGuard<'_>,
+    ) {
         if std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
             eprintln!(
-                "[RUNSTATE] release idx={} host_pid={} gen={}\n{}",
+                "[RUNSTATE] release idx={} host_pid={:?} gen={}\n{}",
                 r.index,
-                record.host_pid.load(Ordering::Acquire),
+                record.state().host_pid(),
                 record.generation.load(Ordering::Acquire),
                 std::backtrace::Backtrace::force_capture(),
             );
@@ -359,10 +631,11 @@ impl ProcessSection {
         // Unpublish the lookup key before clearing either namespace identity or
         // generation. A registrar that did not win the transition claim cannot
         // attach to a half-released record.
-        record.host_pid.store(REGISTERING, Ordering::Release);
+        guard.retire();
+        record.host_pid.store(0, Ordering::Release);
         record.generation.store(0, Ordering::Release);
         record.clear_body_for_claim();
-        record.host_pid.store(0, Ordering::Release);
+        record.state_cell.finish_retire();
     }
 
     fn record_for_ref(&self, r: ProcessRecordRef) -> Option<&ProcessRecord> {
@@ -377,36 +650,39 @@ impl ProcessSection {
 }
 
 impl ProcessRecord {
+    pub fn state(&self) -> RecordState {
+        self.state_cell.state()
+    }
+
+    pub fn host_pid(&self) -> Option<HostPid> {
+        self.state_cell.state().host_pid()
+    }
+
+    pub fn begin_transition(&self) -> Option<TransitionGuard<'_>> {
+        self.state_cell.begin_transition()
+    }
+
     /// Try to become the sole lifecycle authority for this record.
     pub fn try_claim_transition(&self) -> bool {
-        let mut flags = self.flags.load(Ordering::Acquire);
-        loop {
-            if flags & FLAG_RECORD_TRANSITION != 0 {
-                return false;
-            }
-            match self.flags.compare_exchange_weak(
-                flags,
-                flags | FLAG_RECORD_TRANSITION,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => flags = actual,
-            }
+        if let Some(mut guard) = self.state_cell.begin_transition() {
+            guard.disarm();
+            true
+        } else {
+            false
         }
     }
 
     /// Relinquish a lifecycle transition without releasing the record.
     pub fn release_transition(&self) {
-        self.flags
-            .fetch_and(!FLAG_RECORD_TRANSITION, Ordering::Release);
+        self.state_cell.release_transition();
     }
 
     pub fn transition_claimed(&self) -> bool {
-        self.flags.load(Ordering::Acquire) & FLAG_RECORD_TRANSITION != 0
+        self.state_cell.state().is_transitioning()
     }
 
     fn clear_body_for_claim(&self) {
+        self.host_pid.store(0, Ordering::Relaxed);
         self.ns_pid.store(0, Ordering::Relaxed);
         self.parent_host_pid.store(0, Ordering::Relaxed);
         self.subreaper_pid.store(0, Ordering::Relaxed);
@@ -496,9 +772,87 @@ mod tests {
         let s = &arena.layout().processes;
         let generation = arena.allocate_generation();
         let r = s.claim(None, generation, |_| {}).unwrap();
-        assert!(s.find(HostPid::new(REGISTERING)).is_none());
+        assert_eq!(s.records[r.index].state(), RecordState::Registering);
+        assert!(s.find(HostPid::new(600)).is_none());
         s.publish_host_pid(r, HostPid::new(600));
+        assert_eq!(
+            s.records[r.index].state(),
+            RecordState::Live {
+                host_pid: HostPid::new(600)
+            }
+        );
         assert!(s.find(HostPid::new(600)).is_some());
+    }
+
+    #[test]
+    fn record_state_cell_transitions_and_refusals() {
+        let cell = RecordStateCell::new();
+        assert_eq!(cell.state(), RecordState::Free);
+        assert!(cell.state().is_free());
+        assert_eq!(cell.state().host_pid(), None);
+
+        // Refusal: begin_transition / publish_deferred on Free
+        assert!(cell.begin_transition().is_none());
+        assert!(!cell.publish_deferred(HostPid::new(100)));
+
+        // Transition: Free -> Registering
+        let token = cell.claim().expect("claim on Free");
+        assert_eq!(cell.state(), RecordState::Registering);
+        assert!(cell.state().is_registering());
+        assert_eq!(cell.state().host_pid(), None);
+
+        // Refusal: claim / begin_transition on Registering
+        assert!(matches!(cell.claim(), Err(Busy)));
+        assert!(cell.begin_transition().is_none());
+
+        // Drop token -> reverts to Free
+        drop(token);
+        assert_eq!(cell.state(), RecordState::Free);
+
+        // Claim again and publish
+        let token = cell.claim().expect("claim again");
+        let pid = HostPid::new(555);
+        cell.publish(token, pid);
+        assert_eq!(cell.state(), RecordState::Live { host_pid: pid });
+        assert!(cell.state().is_live());
+        assert_eq!(cell.state().host_pid(), Some(pid));
+
+        // Refusal: claim on Live
+        assert!(matches!(cell.claim(), Err(Busy)));
+        // Idempotent publish with same pid
+        assert!(cell.publish_deferred(pid));
+        // Refusal: publish with different pid
+        assert!(!cell.publish_deferred(HostPid::new(999)));
+
+        // Transition: Live -> Transitioning
+        let guard = cell.begin_transition().expect("begin transition");
+        assert_eq!(cell.state(), RecordState::Transitioning { host_pid: pid });
+        assert!(cell.state().is_transitioning());
+
+        // Refusal: concurrent begin_transition / claim
+        assert!(cell.begin_transition().is_none());
+        assert!(matches!(cell.claim(), Err(Busy)));
+        assert!(!cell.publish_deferred(pid));
+
+        // Drop guard -> reverts to Live
+        drop(guard);
+        assert_eq!(cell.state(), RecordState::Live { host_pid: pid });
+
+        // Transition again and retire
+        let guard = cell.begin_transition().expect("begin transition");
+        guard.retire();
+        assert_eq!(cell.state(), RecordState::Retiring);
+        assert!(cell.state().is_retiring());
+        assert_eq!(cell.state().host_pid(), None);
+
+        // Refusal: operations on Retiring
+        assert!(matches!(cell.claim(), Err(Busy)));
+        assert!(cell.begin_transition().is_none());
+        assert!(!cell.publish_deferred(pid));
+
+        // Finish retire -> Free
+        cell.finish_retire();
+        assert_eq!(cell.state(), RecordState::Free);
     }
 
     #[test]

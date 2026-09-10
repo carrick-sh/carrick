@@ -45,8 +45,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use carrick_fatal::carrick_fatal;
 use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
-#[cfg(test)]
-use carrick_kernel::process::REGISTERING;
 use carrick_kernel::process::{
     ProcessRecord, ProcessRecordRef, ProcessRecordTransitionAction, ProcessRecordTransitionError,
     ProcessSection,
@@ -847,11 +845,12 @@ mod tests {
             })
             .expect("claim process record awaiting namespace adoption");
         let record = &processes().records[record_ref.index];
-        assert!(
-            record.try_claim_transition(),
-            "namespace adoption owns the record transition"
-        );
-        record.ns_pid.store(REGISTERING, Ordering::Release);
+        let guard = record
+            .begin_transition()
+            .expect("namespace adoption owns the record transition");
+        record
+            .ns_pid
+            .store(crate::namespace::pid::NS_PID_REGISTERING, Ordering::Release);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let join = std::thread::spawn(move || {
@@ -866,11 +865,14 @@ mod tests {
 
         assert_eq!(record.host_pid.load(Ordering::Acquire), pid);
         assert_eq!(record.generation.load(Ordering::Acquire), generation.raw());
-        assert_eq!(record.ns_pid.load(Ordering::Acquire), REGISTERING);
+        assert_eq!(
+            record.ns_pid.load(Ordering::Acquire),
+            crate::namespace::pid::NS_PID_REGISTERING
+        );
         assert_ne!(record.run_state.load(Ordering::Acquire), 0);
 
         record.ns_pid.store(42, Ordering::Release);
-        record.release_transition();
+        drop(guard);
         rx.recv_timeout(std::time::Duration::from_secs(1))
             .expect("retirement completes after namespace publication");
         join.join().unwrap();

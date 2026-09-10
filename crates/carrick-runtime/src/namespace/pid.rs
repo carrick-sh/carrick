@@ -24,7 +24,7 @@ use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::pidns::{PID_NAMESPACE_SLOTS, PidNamespaceRef, PidNamespaceSlot};
 use carrick_kernel::process::{
     FLAG_ALIVE, FLAG_DEAD, FLAG_ORPHANED, PROCESS_RECORDS, ProcessRecord, ProcessRecordRef,
-    ProcessRecordTransitionAction, ProcessRecordTransitionError, ProcessSection, REGISTERING,
+    ProcessRecordTransitionAction, ProcessRecordTransitionError, ProcessSection,
 };
 #[cfg(test)]
 use carrick_kernel::process::{VirtualPtraceControl, VirtualPtraceState};
@@ -47,13 +47,9 @@ pub const MEMBER_SLOTS: usize = PROCESS_RECORDS;
 /// ns-pid 1 — the namespace init (`pid_namespaces(7)`).
 pub const NS_INIT_PID: u32 = 1;
 
-/// Sentinel used while a process is filling a slot. Readers must treat it as
-/// unpublished; the real host pid is release-stored only after the rest of the
-/// slot is initialized.
-pub const HOST_PID_REGISTERING: u32 = REGISTERING;
 /// Sentinel used while namespace adoption or process retirement owns the
 /// transition of a shared process record. Readers must treat it as unpublished.
-pub(crate) const NS_PID_REGISTERING: u32 = REGISTERING;
+pub(crate) const NS_PID_REGISTERING: u32 = u32::MAX;
 const RUN_STATE_KIND_TID: u64 = 1 << 40;
 
 pub type MemberSlot = ProcessRecord;
@@ -1063,7 +1059,7 @@ impl NsSharedRegion {
         if !self.claim_is_live() {
             return None;
         }
-        if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
+        if host_pid == 0 {
             return None;
         }
         for record in self.member_records() {
@@ -1105,7 +1101,7 @@ impl NsSharedRegion {
         if !self.claim_is_live() {
             return None;
         }
-        if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
+        if host_pid == 0 {
             return None;
         }
         let ns_id = self.ns_id();
@@ -1248,7 +1244,6 @@ impl NsSharedRegion {
         for slot in self.member_records() {
             let host_pid = slot.host_pid.load(Ordering::Acquire);
             if host_pid != 0
-                && host_pid != HOST_PID_REGISTERING
                 && slot.parent_host_pid.load(Ordering::Acquire) == dead_host_pid
                 && slot.flags.load(Ordering::Acquire) & MEMBER_DEAD == 0
             {
@@ -1368,7 +1363,7 @@ impl NsSharedRegion {
         let mut released = 0;
         for (index, record) in self.section.records.iter().enumerate() {
             let host_pid = record.host_pid.load(Ordering::Acquire);
-            if host_pid == 0 || host_pid == HOST_PID_REGISTERING || host_pid == init {
+            if host_pid == 0 || host_pid == init {
                 continue;
             }
             let ns_pid = record.ns_pid.load(Ordering::Acquire);
@@ -1469,7 +1464,6 @@ impl NsSharedRegion {
             let host_pid = record.host_pid.load(Ordering::Acquire);
             let ns_pid = record.ns_pid.load(Ordering::Acquire);
             host_pid != 0
-                && host_pid != HOST_PID_REGISTERING
                 && ns_pid != 0
                 && ns_pid != NS_PID_REGISTERING
                 && record.pid_ns.load(Ordering::Acquire) == ns_id
@@ -1477,7 +1471,7 @@ impl NsSharedRegion {
     }
 
     fn reusable_record_for(&self, host_pid: u32) -> Option<(usize, &ProcessRecord)> {
-        if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
+        if host_pid == 0 {
             return None;
         }
         self.section
@@ -1661,7 +1655,7 @@ mod tests {
             .expect("first namespace adoption must claim the reusable record");
         assert_eq!(
             record.ns_pid.load(Ordering::Acquire),
-            REGISTERING,
+            NS_PID_REGISTERING,
             "the winning adopter must exclude a concurrent adopter or retirement"
         );
         assert!(
@@ -1876,11 +1870,7 @@ mod tests {
     fn in_progress_registration_slot_is_not_visible() {
         let region = test_region();
         let slot = &region.section.records[0];
-        assert!(
-            slot.host_pid
-                .compare_exchange(0, HOST_PID_REGISTERING, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        );
+        let token = slot.state_cell.claim().expect("slot must be claimable");
         slot.pid_ns.store(region.ns_id(), Ordering::Relaxed);
         slot.ns_pid.store(2, Ordering::Relaxed);
         slot.parent_host_pid.store(100, Ordering::Relaxed);
@@ -1888,11 +1878,13 @@ mod tests {
 
         assert_eq!(region.host_to_ns(200), None);
         assert_eq!(region.ns_to_host(2), None);
-        assert_eq!(region.slot_of(HOST_PID_REGISTERING), None);
+        assert_eq!(region.slot_of(200), None);
 
+        slot.state_cell.publish(token, HostPid::new(200));
         slot.host_pid.store(200, Ordering::Release);
         assert_eq!(region.host_to_ns(200), Some(2));
         assert_eq!(region.ns_to_host(2), Some(200));
+        assert_eq!(region.slot_of(200), Some(0));
     }
 
     #[test]
