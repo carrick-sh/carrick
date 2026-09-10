@@ -2937,13 +2937,18 @@ struct OperationClaimGuard {
 
 impl Drop for OperationClaimGuard {
     fn drop(&mut self) {
-        let mut state = self.gate.state.lock();
-        state.in_flight = state.in_flight.saturating_sub(1);
-        if state.in_flight == 0 {
-            self.gate.drain_condvar.notify_all();
-            if let Some(waker) = state.drain_waker.take() {
-                waker.wake();
+        let waker = {
+            let mut state = self.gate.state.lock();
+            state.in_flight = state.in_flight.saturating_sub(1);
+            if state.in_flight == 0 {
+                self.gate.drain_condvar.notify_all();
+                state.drain_waker.take()
+            } else {
+                None
             }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -3364,7 +3369,7 @@ impl CarrierWaitServiceInner {
         &self,
         token: ContinuationWakeToken,
     ) -> Result<(), ContinuationResumeError> {
-        let gate = {
+        let (gate, task_waker) = {
             let mut state = self.state.lock();
             let mut entry = state
                 .registration_mut(token.continuation)
@@ -3376,12 +3381,17 @@ impl CarrierWaitServiceInner {
             entry.operation_gate.close_admission_consumed();
             entry.state = RegistrationState::Consumed;
             let gate = Arc::clone(&entry.operation_gate);
+            let task_waker = entry.task_waker.take();
             drop(entry);
-            gate
+            (gate, task_waker)
         };
         gate.drain();
-        let mut state = self.state.lock();
-        state.remove_registration(token.continuation);
+        let removed = {
+            let mut state = self.state.lock();
+            state.remove_registration(token.continuation)
+        };
+        drop(removed);
+        drop(task_waker);
         Ok(())
     }
 
@@ -4015,12 +4025,6 @@ impl CarrierWaitService {
                 entry.state,
                 RegistrationState::Enrolled | RegistrationState::Prepared
             ) {
-                if matches!(
-                    entry.state,
-                    RegistrationState::Cancelled(_) | RegistrationState::Consumed
-                ) {
-                    return Ok(None);
-                }
                 return Ok(entry.event.clone());
             }
             (
@@ -4042,12 +4046,6 @@ impl CarrierWaitService {
                 .get(&registration.token.continuation)
                 .filter(|entry| entry.token == registration.token)
             {
-                if matches!(
-                    entry.state,
-                    RegistrationState::Cancelled(_) | RegistrationState::Consumed
-                ) {
-                    return Ok(None);
-                }
                 return Ok(entry.event.clone());
             }
             return Err(WaitServiceError::StaleRegistration);
@@ -4061,27 +4059,11 @@ impl CarrierWaitService {
         let mut probe = probe;
         let event = signal_readiness.event().or_else(|| probe.poll());
         drop(claim);
-
         if let Some(event) = event {
             let receipt = self.inner.publish_event(registration.token, event.clone());
             if receipt.accepted() {
                 return Ok(Some(event));
             }
-            let state = self.inner.state.lock();
-            if let Some(entry) = state
-                .entries
-                .get(&registration.token.continuation)
-                .filter(|entry| entry.token == registration.token)
-            {
-                if matches!(
-                    entry.state,
-                    RegistrationState::Cancelled(_) | RegistrationState::Consumed
-                ) {
-                    return Ok(None);
-                }
-                return Ok(entry.event.clone());
-            }
-            return Ok(None);
         }
         Ok(None)
     }
@@ -4217,40 +4199,62 @@ impl Future for ContinuationEventFuture {
     type Output = Result<ContinuationEvent, WaitServiceError>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.service.state.lock();
-        let Some(mut entry) = state
-            .registration_mut(self.token.continuation)
-            .filter(|entry| entry.token == self.token)
-        else {
-            return Poll::Ready(Err(WaitServiceError::StaleRegistration));
-        };
-        match entry.state {
-            RegistrationState::Ready => Poll::Ready(
-                entry
-                    .event
-                    .clone()
-                    .ok_or(WaitServiceError::StaleRegistration),
-            ),
-            RegistrationState::Cancelled(cause) => {
-                let gate = Arc::clone(&entry.operation_gate);
-                let mut gate_state = gate.state.lock();
-                gate_state.cancelled = true;
-                if gate_state.in_flight > 0 {
-                    gate_state.drain_waker = Some(context.waker().clone());
-                    entry.task_waker = Some(context.waker().clone());
-                    return Poll::Pending;
+        let incoming_waker = context.waker().clone();
+        let mut old_drain_waker = None;
+        let mut old_task_waker = None;
+        let mut removed_entry = None;
+
+        let result = {
+            let mut state = self.service.state.lock();
+            let Some(mut entry) = state
+                .registration_mut(self.token.continuation)
+                .filter(|entry| entry.token == self.token)
+            else {
+                return Poll::Ready(Err(WaitServiceError::StaleRegistration));
+            };
+            match entry.state {
+                RegistrationState::Ready => Poll::Ready(
+                    entry
+                        .event
+                        .clone()
+                        .ok_or(WaitServiceError::StaleRegistration),
+                ),
+                RegistrationState::Cancelled(cause) => {
+                    let gate = Arc::clone(&entry.operation_gate);
+                    let (is_in_flight, drain_waker_displaced) = {
+                        let mut gate_state = gate.state.lock();
+                        gate_state.cancelled = true;
+                        if gate_state.in_flight > 0 {
+                            let displaced = gate_state.drain_waker.replace(incoming_waker.clone());
+                            (true, displaced)
+                        } else {
+                            (false, None)
+                        }
+                    };
+                    old_drain_waker = drain_waker_displaced;
+                    if is_in_flight {
+                        old_task_waker = entry.task_waker.replace(incoming_waker);
+                        Poll::Pending
+                    } else {
+                        old_task_waker = entry.task_waker.take();
+                        drop(entry);
+                        removed_entry = state.remove_registration(self.token.continuation);
+                        Poll::Ready(Err(WaitServiceError::Cancelled(cause)))
+                    }
                 }
-                drop(gate_state);
-                drop(entry);
-                state.remove_registration(self.token.continuation);
-                Poll::Ready(Err(WaitServiceError::Cancelled(cause)))
+                RegistrationState::Consumed => {
+                    Poll::Ready(Err(WaitServiceError::StaleRegistration))
+                }
+                RegistrationState::Prepared | RegistrationState::Enrolled => {
+                    old_task_waker = entry.task_waker.replace(incoming_waker);
+                    Poll::Pending
+                }
             }
-            RegistrationState::Consumed => Poll::Ready(Err(WaitServiceError::StaleRegistration)),
-            RegistrationState::Prepared | RegistrationState::Enrolled => {
-                entry.task_waker = Some(context.waker().clone());
-                Poll::Pending
-            }
-        }
+        };
+        drop(old_drain_waker);
+        drop(old_task_waker);
+        drop(removed_entry);
+        result
     }
 }
 
@@ -5131,9 +5135,12 @@ impl ProcessDrain {
                 if previous == 0 {
                     std::process::abort();
                 }
-                if previous == 1
-                    && let Some(waker) = callback_state.waker.lock().take()
-                {
+                let waker = if previous == 1 {
+                    callback_state.waker.lock().take()
+                } else {
+                    None
+                };
+                if let Some(waker) = waker {
                     waker.wake();
                 }
                 if previous == 1
@@ -5217,7 +5224,12 @@ impl Future for ProcessDrain {
         if self.state.remaining.load(Ordering::Acquire) == 0 {
             return Poll::Ready(());
         }
-        *self.state.waker.lock() = Some(context.waker().clone());
+        let incoming_waker = context.waker().clone();
+        let displaced_waker = {
+            let mut waker = self.state.waker.lock();
+            waker.replace(incoming_waker)
+        };
+        drop(displaced_waker);
         if self.state.remaining.load(Ordering::Acquire) == 0 {
             Poll::Ready(())
         } else {
@@ -5241,6 +5253,16 @@ mod tests {
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 
     use super::*;
+
+    fn spawn_contained_test_child(test_name: &str, marker: &str) -> std::process::Child {
+        let spawn_cmd = std::process::Command::new;
+        spawn_cmd(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(marker, "1")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn contained test child")
+    }
 
     /// Drive one future to completion on the calling test thread.
     ///
@@ -9795,7 +9817,268 @@ mod tests {
     }
 
     #[test]
+    fn drain_waker_runs_outside_operation_gate_lock() {
+        struct GateCheckingWake {
+            gate: Arc<RegistrationOperationGate>,
+            observed: Arc<AtomicBool>,
+            unlocked: Arc<AtomicBool>,
+        }
+        impl std::task::Wake for GateCheckingWake {
+            fn wake(self: Arc<Self>) {
+                self.unlocked
+                    .store(self.gate.state.try_lock().is_some(), Ordering::Release);
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+        let (kernel, context) = bootstrap(15_389);
+        let generation = publish(&context, 0x729);
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(60),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("sleep continuation");
+        let registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        let gate = Arc::clone(
+            &service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token.continuation)
+                .expect("prepared registration")
+                .operation_gate,
+        );
+        let claim = gate.try_claim(token).expect("admitted operation");
+        let _ = service
+            .inner
+            .state
+            .lock()
+            .cancel_all_active(CancellationCause::ProcessExit);
+        let observed = Arc::new(AtomicBool::new(false));
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(GateCheckingWake {
+            gate,
+            observed: Arc::clone(&observed),
+            unlocked: Arc::clone(&unlocked),
+        }));
+        let mut future = service.event(token);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(claim);
+        assert!(
+            observed.load(Ordering::Acquire),
+            "actual cancelled future must receive drain wake"
+        );
+        assert!(
+            unlocked.load(Ordering::Acquire),
+            "drain callback must run after releasing gate.state; callbacks may reenter service -> gate"
+        );
+    }
+
+    #[test]
+    fn replaced_drain_waker_drops_outside_registration_locks() {
+        struct DropCheckingWake {
+            gate: Arc<RegistrationOperationGate>,
+            service: Arc<CarrierWaitServiceInner>,
+            observed: Arc<AtomicBool>,
+            gate_unlocked: Arc<AtomicBool>,
+            service_unlocked: Arc<AtomicBool>,
+        }
+        impl std::task::Wake for DropCheckingWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        impl Drop for DropCheckingWake {
+            fn drop(&mut self) {
+                self.gate_unlocked.store(
+                    self.gate
+                        .state
+                        .try_lock_for(Duration::from_millis(50))
+                        .is_some(),
+                    Ordering::Release,
+                );
+                self.service_unlocked.store(
+                    self.service
+                        .state
+                        .try_lock_for(Duration::from_millis(50))
+                        .is_some(),
+                    Ordering::Release,
+                );
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+        let (kernel, context) = bootstrap(15_390);
+        let generation = publish(&context, 0x730);
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(60),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("sleep continuation");
+        let registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        let gate = Arc::clone(
+            &service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token.continuation)
+                .expect("prepared registration")
+                .operation_gate,
+        );
+        let claim = gate.try_claim(token).expect("admitted operation");
+        let _ = service
+            .inner
+            .state
+            .lock()
+            .cancel_all_active(CancellationCause::ProcessExit);
+        let observed = Arc::new(AtomicBool::new(false));
+        let gate_unlocked = Arc::new(AtomicBool::new(false));
+        let service_unlocked = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(DropCheckingWake {
+            gate,
+            service: Arc::clone(&service.inner),
+            observed: Arc::clone(&observed),
+            gate_unlocked: Arc::clone(&gate_unlocked),
+            service_unlocked: Arc::clone(&service_unlocked),
+        }));
+        let mut future = service.event(token);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        // Only the registration owns this waker now. Repolling with a
+        // replacement must release its final references outside both locks.
+        drop(waker);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(claim);
+        assert!(
+            observed.load(Ordering::Acquire),
+            "replacing the registered waker must release its old owner"
+        );
+        assert!(
+            gate_unlocked.load(Ordering::Acquire),
+            "replaced waker destructor must run after releasing gate.state; destructors may reenter service -> gate"
+        );
+        assert!(
+            service_unlocked.load(Ordering::Acquire),
+            "replaced waker destructor must run after releasing service.state; destructors may reenter service -> gate"
+        );
+    }
+
+    #[test]
+    fn replaced_task_waker_drops_outside_registration_locks() {
+        struct DropCheckingWake {
+            service: Arc<CarrierWaitServiceInner>,
+            observed: Arc<AtomicBool>,
+            service_unlocked: Arc<AtomicBool>,
+        }
+        impl std::task::Wake for DropCheckingWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        impl Drop for DropCheckingWake {
+            fn drop(&mut self) {
+                self.service_unlocked.store(
+                    self.service
+                        .state
+                        .try_lock_for(Duration::from_millis(50))
+                        .is_some(),
+                    Ordering::Release,
+                );
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+        let (kernel, context) = bootstrap(15_391);
+        let generation = publish(&context, 0x731);
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(60),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("sleep continuation");
+        let registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        let observed = Arc::new(AtomicBool::new(false));
+        let service_unlocked = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(DropCheckingWake {
+            service: Arc::clone(&service.inner),
+            observed: Arc::clone(&observed),
+            service_unlocked: Arc::clone(&service_unlocked),
+        }));
+        let mut future = service.event(token);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(
+            observed.load(Ordering::Acquire),
+            "replacing the registered task waker must release its old owner"
+        );
+        assert!(
+            service_unlocked.load(Ordering::Acquire),
+            "replaced task waker destructor must run after releasing service.state"
+        );
+    }
+
+    #[test]
     fn event_future_cancelled_observation_drains_inflight_operation_safely() {
+        // A broken production lock order can deadlock irrecoverably. Contain
+        // that interleaving in an owned child so the regression itself fails
+        // with an assertion and leaves no live blocked test threads.
+        const CHILD_MARKER: &str = "CARRICK_WAIT_TERMINAL_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = spawn_contained_test_child(
+                "vcpu_loop::continuation::tests::event_future_cancelled_observation_drains_inflight_operation_safely",
+                CHILD_MARKER,
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("read child status") {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    child.kill().expect("reap deadlocked child");
+                    let status = child.wait().expect("wait for killed child");
+                    eprintln!(
+                        "contained terminal-retirement child {} reaped with {status}",
+                        child.id()
+                    );
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert!(
+                status.is_some_and(|status| status.success()),
+                "production terminal-retirement child must complete successfully within its bound; child was reaped"
+            );
+            return;
+        }
         let (kernel, context) = bootstrap(15_382);
         let generation = publish(&context, 0x722);
         let scheduler = Arc::new(Scheduler::new(kernel));
@@ -9852,27 +10135,28 @@ mod tests {
             cancel_done_tx.send(receipt).expect("send receipt");
         });
 
-        // 1. Verify cancel thread blocks while in-flight claim is held
+        // 1. Wait for bounded acknowledgment of the cancellation transition in service.state
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let gate = loop {
+            let state = service.inner.state.lock();
+            if let Some(entry) = state.entries.get(&token.continuation) {
+                if entry.state == RegistrationState::Cancelled(CancellationCause::ProcessExit) {
+                    break Arc::clone(&entry.operation_gate);
+                }
+            }
+            if Instant::now() > deadline {
+                panic!("timed out waiting for cancellation to linearize in service.state");
+            }
+            std::thread::yield_now();
+        };
+
+        // 2. Cancellation has linearized, but cancel thread is STILL blocked on drain because reactor holds claim
         assert!(
-            cancel_done_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
+            cancel_done_rx.try_recv().is_err(),
             "cancel must block on drain while in-flight operation is active"
         );
 
-        // 2. Verify cancellation linearization point: admission is closed, no new claims admitted
-        let (gate, is_cancelled) = {
-            let state = service.inner.state.lock();
-            let entry = state
-                .entries
-                .get(&token.continuation)
-                .expect("entry must NOT be removed from map while operation is in-flight");
-            (
-                Arc::clone(&entry.operation_gate),
-                entry.state == RegistrationState::Cancelled(CancellationCause::ProcessExit),
-            )
-        };
-        assert!(is_cancelled, "cancellation state must be linearized");
+        // 3. Verify cancellation linearization point: admission is closed, no new claims admitted
         assert!(
             gate.try_claim(token).is_none(),
             "no fresh claim admitted after cancellation linearization point"
@@ -10348,6 +10632,37 @@ mod tests {
 
     #[test]
     fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
+        // A broken production lock order can deadlock irrecoverably. Contain
+        // that interleaving in an owned child so the regression itself fails
+        // with an assertion and leaves no live blocked test threads.
+        const CHILD_MARKER: &str = "CARRICK_WAIT_LOCK_ORDER_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let mut child = spawn_contained_test_child(
+                "vcpu_loop::continuation::tests::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock",
+                CHILD_MARKER,
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("read child status") {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    child.kill().expect("reap deadlocked child");
+                    let status = child.wait().expect("wait for killed child");
+                    eprintln!(
+                        "contained lock-order child {} reaped with {status}",
+                        child.id()
+                    );
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert!(
+                status.is_some_and(|status| status.success()),
+                "production lock-order child must complete successfully within its bound; child was reaped"
+            );
+            return;
+        }
         let (kernel, context) = bootstrap(15_388);
         let generation = publish(&context, 0x728);
         let scheduler = Arc::new(Scheduler::new(kernel));
