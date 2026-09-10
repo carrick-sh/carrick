@@ -1801,20 +1801,29 @@ fn mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success() {
     let dead = unsafe { libc::dup(0) };
     assert!(dead >= 0);
     assert_eq!(unsafe { libc::close(dead) }, 0);
+    // Handing an already-closed fd to an owner is an I/O-safety violation by
+    // construction (production never does it; `OwnedFd`'s drop asserts
+    // liveness under debug UB checks). This test wants exactly that
+    // impossible state, so it keeps a clone of the description alive for the
+    // life of the test binary: the owner is never dropped, the dead fd is
+    // never closed twice, and the lie stays confined to this test.
+    let dead_description =
+        std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+            host_fd: HostFdRef::new(dead),
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/host-private-map-dead"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 0,
+            },
+            writable: false,
+        }));
+    std::mem::forget(std::sync::Arc::clone(&dead_description));
     dispatcher.captured_file_table().write_open_files().insert(
         34,
         OpenFile::from_open_description_with_status_flags(
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
-                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
-                host_fd: HostFdRef::new(dead),
-                metadata: RootFsMetadata {
-                    path: std::path::PathBuf::from("/host-private-map-dead"),
-                    kind: RootFsEntryKind::File,
-                    mode: 0o644,
-                    size: 0,
-                },
-                writable: false,
-            })),
+            dead_description,
             crate::linux_abi::LINUX_O_RDONLY,
             0,
         ),

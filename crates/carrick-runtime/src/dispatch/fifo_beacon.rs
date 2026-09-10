@@ -32,20 +32,21 @@
 //! `openat` from scratch.
 
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{LazyLock, Mutex};
 
 use super::fd_table::HostFdRef;
 
 struct PresencePipe {
-    read_fd: i32,
-    write_fd: i32,
+    read_fd: Option<OwnedFd>,
+    write_fd: Option<OwnedFd>,
     asserted: bool,
 }
 
 impl PresencePipe {
     fn new() -> Self {
         let mut fds = [-1i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+        let (read_fd, write_fd) = if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
             unsafe {
                 libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
                 libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
@@ -57,17 +58,27 @@ impl PresencePipe {
                 if fl1 >= 0 {
                     libc::fcntl(fds[1], libc::F_SETFL, fl1 | libc::O_NONBLOCK);
                 }
+                (
+                    Some(OwnedFd::from_raw_fd(fds[0])),
+                    Some(OwnedFd::from_raw_fd(fds[1])),
+                )
             }
-        }
+        } else {
+            (None, None)
+        };
         Self {
-            read_fd: fds[0],
-            write_fd: fds[1],
+            read_fd,
+            write_fd,
             asserted: false,
         }
     }
 
     fn is_valid(&self) -> bool {
-        self.read_fd >= 0 && self.write_fd >= 0
+        self.read_fd.is_some() && self.write_fd.is_some()
+    }
+
+    fn read_fd(&self) -> Option<i32> {
+        self.read_fd.as_ref().map(|fd| fd.as_raw_fd())
     }
 
     fn set_asserted(&mut self, present: bool) {
@@ -76,39 +87,32 @@ impl PresencePipe {
         }
         if present && !self.asserted {
             let b = 1u8;
-            unsafe {
-                libc::write(self.write_fd, &b as *const _ as *const libc::c_void, 1);
+            if let Some(write_fd) = &self.write_fd {
+                unsafe {
+                    libc::write(
+                        write_fd.as_raw_fd(),
+                        &b as *const _ as *const libc::c_void,
+                        1,
+                    );
+                }
+                self.asserted = true;
             }
-            self.asserted = true;
         } else if !present && self.asserted {
             let mut buf = [0u8; 16];
-            loop {
-                let n = unsafe {
-                    libc::read(
-                        self.read_fd,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                    )
-                };
-                if n <= 0 {
-                    break;
+            if let Some(read_fd) = &self.read_fd {
+                loop {
+                    let n = unsafe {
+                        libc::read(
+                            read_fd.as_raw_fd(),
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                        )
+                    };
+                    if n <= 0 {
+                        break;
+                    }
                 }
-            }
-            self.asserted = false;
-        }
-    }
-}
-
-impl Drop for PresencePipe {
-    fn drop(&mut self) {
-        if self.read_fd >= 0 {
-            unsafe {
-                libc::close(self.read_fd);
-            }
-        }
-        if self.write_fd >= 0 {
-            unsafe {
-                libc::close(self.write_fd);
+                self.asserted = false;
             }
         }
     }
@@ -117,10 +121,10 @@ impl Drop for PresencePipe {
 struct Beacon {
     /// Read end of the EOF beacon pipe (carrick-held). `poll`ing it reports POLLHUP
     /// once every writer's beacon-write fd has closed.
-    eof_read_fd: i32,
+    eof_read_fd: Option<OwnedFd>,
     /// guest writer host-fd → that writer's beacon write fd (closed when the
     /// guest writer closes). The kernel refcounts these.
-    writer_bw: HashMap<i32, i32>,
+    writer_bw: HashMap<i32, OwnedFd>,
     /// Presence pipe asserted while reader count > 0 (including parked readers).
     readers_present: PresencePipe,
     /// Presence pipe asserted while writer count > 0 (including parked writers).
@@ -132,26 +136,11 @@ struct Beacon {
 impl Beacon {
     fn new_for_identity() -> Self {
         Self {
-            eof_read_fd: -1,
+            eof_read_fd: None,
             writer_bw: HashMap::new(),
             readers_present: PresencePipe::new(),
             writers_present: PresencePipe::new(),
             parked_writers: HashMap::new(),
-        }
-    }
-}
-
-impl Drop for Beacon {
-    fn drop(&mut self) {
-        if self.eof_read_fd >= 0 {
-            unsafe {
-                libc::close(self.eof_read_fd);
-            }
-        }
-        for (_, bw) in self.writer_bw.drain() {
-            unsafe {
-                libc::close(bw);
-            }
         }
     }
 }
@@ -198,8 +187,7 @@ pub(crate) fn readers_present_read_fd(id: (u64, u64)) -> Option<i32> {
         .beacons
         .entry(id)
         .or_insert_with(Beacon::new_for_identity);
-    let fd = beacon.readers_present.read_fd;
-    if fd >= 0 { Some(fd) } else { None }
+    beacon.readers_present.read_fd()
 }
 
 pub(crate) fn writers_present_read_fd(id: (u64, u64)) -> Option<i32> {
@@ -208,8 +196,7 @@ pub(crate) fn writers_present_read_fd(id: (u64, u64)) -> Option<i32> {
         .beacons
         .entry(id)
         .or_insert_with(Beacon::new_for_identity);
-    let fd = beacon.writers_present.read_fd;
-    if fd >= 0 { Some(fd) } else { None }
+    beacon.writers_present.read_fd()
 }
 
 /// An owned token representing a parked FIFO opener (reader or writer) blocking in `openat`.
@@ -263,10 +250,7 @@ impl ParkedOpenerToken {
         let token_id = *next_parked_writer_token;
         *next_parked_writer_token += 1;
         let beacon = beacons.entry(id).or_insert_with(Beacon::new_for_identity);
-        let readers_present_read_fd = beacon.readers_present.read_fd;
-        if readers_present_read_fd < 0 {
-            return None;
-        }
+        let readers_present_read_fd = beacon.readers_present.read_fd()?;
         parked_writers.insert(token_id, id);
         beacon.parked_writers.insert(token_id, ());
         beacon.writers_present.set_asserted(true);
@@ -349,29 +333,35 @@ pub(crate) fn register_open(host_fd: i32, access_idx: u32) {
         // writer; otherwise dup an existing write end so the kernel refcount
         // tracks every concurrent writer. carrick keeps NO standalone write
         // anchor, so the read end hits POLLHUP exactly when all writers close.
-        let existing_writer = beacon.writer_bw.values().next().copied();
+        let existing_writer = beacon.writer_bw.values().next().map(|fd| fd.as_raw_fd());
         let bw = if let Some(existing) = existing_writer {
-            unsafe { libc::dup(existing) }
+            let duped = unsafe { libc::dup(existing) };
+            if duped >= 0 {
+                // SAFETY: `duped` is an owned dup of an existing descriptor.
+                Some(unsafe { OwnedFd::from_raw_fd(duped) })
+            } else {
+                None
+            }
         } else {
             let mut fds = [0i32; 2];
             if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-                -1
+                None
             } else {
                 unsafe {
                     libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
                     libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
                 }
-                if beacon.eof_read_fd >= 0 {
+                if beacon.eof_read_fd.is_some() {
                     debug_assert!(beacon.writer_bw.is_empty());
-                    unsafe { libc::close(beacon.eof_read_fd) };
                 }
-                beacon.eof_read_fd = fds[0];
-                fds[1]
+                // SAFETY: `fds` are fresh pipe descriptors.
+                beacon.eof_read_fd = Some(unsafe { OwnedFd::from_raw_fd(fds[0]) });
+                Some(unsafe { OwnedFd::from_raw_fd(fds[1]) })
             }
         };
-        if bw >= 0 {
+        if let Some(bw) = bw {
             unsafe {
-                libc::fcntl(bw, libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(bw.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
             }
             beacon.writer_bw.insert(host_fd, bw);
         }
@@ -394,8 +384,7 @@ pub(crate) fn register_close(host_fd: &HostFdRef) -> bool {
     let read_id = st.read_ends.remove(&host_fd);
     let mut writer_of = None;
     for (id, b) in st.beacons.iter_mut() {
-        if let Some(bw) = b.writer_bw.remove(&host_fd) {
-            unsafe { libc::close(bw) };
+        if b.writer_bw.remove(&host_fd).is_some() {
             writer_of = Some(*id);
             break;
         }
@@ -461,11 +450,11 @@ pub(crate) fn read_end_at_eof(host_fd: i32) -> bool {
     let Some(b) = st.beacons.get(id) else {
         return false;
     };
-    if b.eof_read_fd < 0 {
+    let Some(eof_read_fd) = b.eof_read_fd.as_ref() else {
         return false;
-    }
+    };
     let mut pfd = libc::pollfd {
-        fd: b.eof_read_fd,
+        fd: eof_read_fd.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
