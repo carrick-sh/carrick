@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 31-crate Cargo workspace. The product path is:
+Carrick is a 27-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
@@ -65,15 +65,6 @@ lifecycle semantics.
 | `carrick-vmm-nvmm` | NetBSD/NVMM backend; x86_64 lane through the shared x86 engine plus NVMM-specific host/VMM glue. |
 | `carrick-x86` | Shared x86_64 engine: long-mode bring-up, register/snapshot model, fault tables, VDSO helpers, generic `X86EngineCore<V>`. |
 | `carrick-aarch64` | Shared AArch64 engine (`Aarch64EngineCore`) used by the HVF AArch64 path (and shared with the KVM AArch64 lane). |
-
-## Binary Patching & Translation Core (DSR)
-
-| Crate | Role |
-| --- | --- |
-| `carrick-dsr` | Platform-neutral DSR core: the `NativeLane`/`GuestIsa`/`NativeHost` seam traits, translation cache + publication behind the `NativeHostJit` seam, `prepared_image`, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. |
-| `carrick-dsr-aarch64` | AArch64 guest-ISA lane: bad64/dynasmrt decode + emit, block planner + exclusive fusion, gateway (`gateway_aarch64.S`), counter virtualization, artifact store, mapped memory + translator. |
-| `carrick-dsr-x86` | x86_64 guest-ISA lane: `iced-x86` decode/classify, block planning + control-flow lowering, a hand-rolled byte-level block emitter (no dynasmrt dependency), gateway (`gateway_x86_64.S`) + x87/SSE/AVX state transfer. |
-| `carrick-native-darwin` | **Preserved for future OS-level optimisation.** Darwin host primitives: Apple Silicon `MAP_JIT` W^X JIT backend (`DarwinHostJit`, implementing `NativeHostJit`), Tier-D binary patching (svc island generation, x18/TLS virtualisation), persistent AOT cache. Not actively wired into the HVPatch execution path. |
 
 ## Test and Harness Support
 

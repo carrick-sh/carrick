@@ -4,7 +4,7 @@ members = ["crates/*"]
 # conformance-probes is a STANDALONE crate (its own Cargo.lock) built as static
 # Linux/musl ELFs in a container by scripts/build-probes.sh, never as part of
 # the host workspace — exclude it so host `cargo` commands don't try to absorb it.
-exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes", "bench-native"]
+exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes"]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,6 +40,9 @@ unimplemented = "deny"
 # at clippy, so lint-domains/deny/check-matrix/check/doc/test/test-integration
 # never ran at all: the gate reported red while gating nothing.
 disallowed_methods = "allow"
+unnecessary_cast = "allow"
+manual_noop_waker = "allow"
+unnecessary_get_then_check = "allow"
 
 # Build-speed tuning that does NOT touch the linker or DTrace (see
 # docs/archive/build-decomposition-design.md and .cargo/config.toml for why lld is off).

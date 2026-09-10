@@ -5,15 +5,11 @@
 # via env so a quick smoke and a full baseline share one code path.
 #
 # Usage: scripts/measure-perf.sh [quick|full]          (default: quick)
-#        scripts/measure-perf.sh backends [quick|full]
 #        scripts/measure-perf.sh hvf-mailbox [quick|full]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mode="perf"
-if [[ "${1:-}" == "backends" ]]; then
-  mode="backends"
-  shift
-elif [[ "${1:-}" == "hvf-mailbox" ]]; then
+if [[ "${1:-}" == "hvf-mailbox" ]]; then
   mode="hvf-mailbox"
   shift
 fi
@@ -42,18 +38,8 @@ fi
 echo "==> building signed carrick"
 ./scripts/build-signed.sh
 echo "==> building probes"
-if [[ "$mode" == "backends" ]]; then
-  ./scripts/build-probes.sh --native-pie >/dev/null
-elif [[ "$mode" == "hvf-mailbox" ]]; then
+if [[ "$mode" == "hvf-mailbox" ]]; then
   ./scripts/build-probes.sh --native-pie-musl >/dev/null
-fi
-if [[ "$mode" == "backends" ]]; then
-  export CARRICK_BACKEND_REPORT="${CARRICK_BACKEND_REPORT:-docs/perf-results/$(date +%F)-native16k-hvf.jsonl}"
-  echo "==> running backend_pair_report (profile=$profile cycles=$CARRICK_PERF_REPS)"
-  cargo test -p carrick-cli --test perf_runner backend_pair_report -- --nocapture --ignored
-  echo "==> backend report: $CARRICK_BACKEND_REPORT"
-  tail -n 4 "$CARRICK_BACKEND_REPORT"
-  exit 0
 fi
 if [[ "$mode" == "hvf-mailbox" ]]; then
   if ps -axo command= | grep -E 'carrick:[^:]+:|(^|[ /])target/release/carrick (run|run-elf|trace)( |$)' | grep -v grep >/dev/null; then
@@ -84,8 +70,6 @@ if [[ "$mode" == "hvf-mailbox" ]]; then
   exit 0
 fi
 ./scripts/build-probes.sh >/dev/null
-echo "==> building native (macos) probes"
-( cd bench-native && cargo build --release ) >/dev/null
 echo "==> running perf_gate (profile=$profile reps=$CARRICK_PERF_REPS)"
 cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
 

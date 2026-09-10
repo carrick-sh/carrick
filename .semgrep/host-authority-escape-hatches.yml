@@ -38,12 +38,6 @@ rules:
     severity: ERROR
     paths:
       exclude:
-        - /crates/carrick-dsr-aarch64/src/counter.rs
-        - /crates/carrick-dsr-aarch64/src/emit.rs
-        - /crates/carrick-dsr-x86/src/gateway.rs
-        - /crates/carrick-dsr-x86/tests/fixtures/computeloop.rs
-        - /crates/carrick-dsr-x86/tests/fixtures/tinyguest.rs
-        - /crates/carrick-native-darwin/src/direct.rs
         - /crates/carrick-runtime/tools/vdso_getrandom_blob.rs
         - /crates/carrick-vmm-bhyve/fixtures/bhyve-fpsignal/src/main.rs
         - /crates/carrick-vmm-bhyve/fixtures/bhyve-sigfpe/src/main.rs

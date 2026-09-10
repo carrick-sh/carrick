@@ -456,12 +456,12 @@ pub fn mmap_arena_size() -> u64 {
 }
 
 /// Guest heap + mmap-arena placement: the four knobs the syscall dispatcher's
-/// `mem` subsystem (brk/mmap accounting) and the native (DSR) backend's
+/// `mem` subsystem (brk/mmap accounting) and the native backend's
 /// address-layout selection share. Moved here from the runtime's
 /// `dispatch::mem` as part of the staged native-backend extraction
-/// (docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md)
-/// so `carrick-dsr` can consume it without a runtime dependency; the runtime
-/// re-exports it under the old `crate::dispatch::MemoryLayout` path.
+/// so that multiple crates can consume it without a runtime dependency;
+/// the runtime re-exports it under the old
+/// `crate::dispatch::MemoryLayout` path.
 #[derive(Clone, Copy)]
 pub struct MemoryLayout {
     pub heap_base: u64,

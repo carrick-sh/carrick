@@ -86,26 +86,6 @@ pub enum RuntimeError {
     },
 }
 
-/// The runtime-side edge of the native memory error seam: the native
-/// mapping machinery (mapped_memory.rs, migrating into `carrick-dsr`)
-/// produces `NativeMemoryError`, and only its public boundary functions
-/// surface `RuntimeError` — through this conversion. It preserves the
-/// historical messages exactly: `Unsupported` maps variant-to-variant, and
-/// `Io` reproduces the `"{context}: {os error}"` string the old inline
-/// `last_io_error` built for `RuntimeError::FsBackend`.
-impl From<carrick_dsr::native_error::NativeMemoryError> for RuntimeError {
-    fn from(error: carrick_dsr::native_error::NativeMemoryError) -> Self {
-        match error {
-            carrick_dsr::native_error::NativeMemoryError::Unsupported(message) => {
-                RuntimeError::Unsupported(message)
-            }
-            carrick_dsr::native_error::NativeMemoryError::Io { operation, source } => {
-                RuntimeError::FsBackend(anyhow::anyhow!("{operation}: {source}"))
-            }
-        }
-    }
-}
-
 /// What a finished guest run produced. `stdout`/`stderr` hold the guest's fd
 /// 1/2 bytes ONLY for a `StdioSink::Captured` run; under `Inherit` they went
 /// to the carrier's own fds and under `Piped` to the caller's writers, so both

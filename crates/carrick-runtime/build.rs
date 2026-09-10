@@ -23,8 +23,5 @@ fn main() {
         }
         _ => {}
     }
-    // gateway_aarch64.S moved to carrick-dsr-aarch64 (whose build.rs
-    // assembles it under this same target gate); the C trap shim
-    // (csrc/native_darwin.c) moved to carrick-native-darwin (M0.6 of the
-    // seams design) — this crate no longer compiles any C/asm of its own.
+    // This crate no longer compiles any C/asm of its own.
 }

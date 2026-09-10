@@ -79,10 +79,7 @@ use carrick_runtime::syscall::lookup_aarch64;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::trap::hvf_capabilities;
 
-use crate::args::{
-    Cli, Commands, NativeProfileTerminalMode, NetworkCommand, RootfsCommand, SystemCommand,
-    VolumeCommand,
-};
+use crate::args::{Cli, Commands, NetworkCommand, RootfsCommand, SystemCommand, VolumeCommand};
 // Only the non-HVF `Commands::Debug` arm below matches on `DebugCommand`
 // variants directly; the macOS arm just forwards `command` into `run_debug`.
 #[cfg(any(
@@ -93,12 +90,6 @@ use crate::args::{
 use crate::args::DebugCommand;
 #[cfg(feature = "platform-macos")]
 use crate::debug::run_debug;
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
-use crate::debug_layout::native_x86_layout_json;
 // Used only by the macOS-only `run-elf` arm.
 #[cfg(feature = "platform-macos")]
 use crate::fs_setup::install_fs_backend;
@@ -110,19 +101,6 @@ use crate::hvpatch_exec_runtime_profile::HvpatchExecRuntimeSummary;
 use crate::hvpatch_identity_host_safety_profile::HvpatchIdentityHostSafetySummary;
 #[cfg(target_os = "macos")]
 use crate::hvpatch_k1_profile::HvpatchK1LifecycleSummary;
-#[cfg(target_os = "macos")]
-use crate::native_fault_profile::NativeFaultSummary;
-#[cfg(target_os = "macos")]
-use crate::native_profile_qualification::run_native_profile_qualifications;
-use crate::native_profile_qualification::validate_qualification_paths;
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-use crate::native_shape_profile::validate_native_shape_trace_arguments;
-#[cfg(target_os = "macos")]
-use crate::native_shape_profile::{
-    CaptureIdentity, NativeShapeAuthority, NativeShapeTarget,
-    claim_native_shape_snapshot_directory, establish_native_shape_run_id,
-    require_native_shape_snapshot_absent, run_native_shape_capture, validate_native_shape_host,
-};
 use crate::runtime_util::{
     block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
     parse_publish_specs, parse_volume_mount, resolve_volumes_from_specs, truncate_str,
@@ -132,251 +110,6 @@ use crate::trace_cli::{
     TraceSudoInvocation, current_supplementary_groups, exec_trace_under_sudo,
     trace_drop_credentials, trace_sudo_argv,
 };
-use crate::trace_profile::validate_v2_path;
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-use crate::trace_profile::{ProfileSummary, capture_provenance, write_summary_atomic};
-#[cfg(target_os = "macos")]
-use crate::trace_profile::{kernel_sample_addresses_from_path, path_has_v2_header};
-
-#[cfg(target_os = "macos")]
-fn uses_live_kernel_symbols(profile: crate::trace_profile::TraceProfileKind) -> bool {
-    profile == crate::trace_profile::TraceProfileKind::NativeWall
-}
-
-#[cfg(target_os = "macos")]
-fn uses_native_launch_qualification(profile: crate::trace_profile::TraceProfileKind) -> bool {
-    matches!(
-        profile,
-        crate::trace_profile::TraceProfileKind::NativeAmplification
-            | crate::trace_profile::TraceProfileKind::NativeFault
-            | crate::trace_profile::TraceProfileKind::NativeShape
-            | crate::trace_profile::TraceProfileKind::NativeWall
-    )
-}
-
-const BIRTH_FIXTURE_MARKER: &[u8] = b"BIRTH_FIXTURE_OK\n\0";
-const TERMINAL_THREAD_ARMED_MARKER: &[u8] = b"TERMINAL_THREAD_ARMED\n\0";
-const TERMINAL_THREAD_OK_MARKER: &[u8] = b"TERMINAL_THREAD_OK\n\0";
-const TERMINAL_PROCESS_ARMED_MARKER: &[u8] = b"TERMINAL_PROCESS_ARMED\n\0";
-
-fn nul_terminated_marker_bytes(marker: &'static [u8]) -> anyhow::Result<&'static [u8]> {
-    marker
-        .strip_suffix(&[0])
-        .ok_or_else(|| anyhow::anyhow!("native-profile marker lacks its NUL terminator"))
-}
-
-fn raw_write_all(fd: libc::c_int, mut bytes: &[u8]) -> bool {
-    while !bytes.is_empty() {
-        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if written > 0 {
-            let Ok(written) = usize::try_from(written) else {
-                return false;
-            };
-            bytes = &bytes[written..];
-            continue;
-        }
-        if written < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-        {
-            continue;
-        }
-        return false;
-    }
-    true
-}
-
-fn raw_read_byte(fd: libc::c_int) -> Option<u8> {
-    let mut byte = 0_u8;
-    loop {
-        let read = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
-        if read == 1 {
-            return Some(byte);
-        }
-        if read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return None;
-    }
-}
-
-fn close_raw_fd(fd: libc::c_int) {
-    let _ = unsafe { libc::close(fd) };
-}
-
-fn create_native_profile_pipe() -> anyhow::Result<[libc::c_int; 2]> {
-    let mut fds = [-1; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("create native-profile fixture pipe");
-    }
-    Ok(fds)
-}
-
-#[cfg(target_os = "macos")]
-fn publish_current_host_process_birth() -> anyhow::Result<()> {
-    let birth = carrick_runtime::probes::HostProcessBirth::query(std::process::id())
-        .context("query Darwin process birth identity")?;
-    carrick_runtime::probes::host_process_birth(birth);
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn publish_current_host_process_birth() -> anyhow::Result<()> {
-    bail!("native-profile process-birth qualification requires Darwin")
-}
-
-fn wait_fixture_child(pid: libc::pid_t) -> anyhow::Result<libc::c_int> {
-    let mut status = 0;
-    loop {
-        let waited = unsafe { libc::waitpid(pid, &raw mut status, 0) };
-        if waited == pid {
-            return Ok(status);
-        }
-        if waited < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(std::io::Error::last_os_error()).context("wait for native-profile child");
-    }
-}
-
-fn silence_native_profile_fixture_stdout() -> anyhow::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let sink = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/null")
-        .context("open native-profile fixture output sink")?;
-    if unsafe { libc::dup2(sink.as_raw_fd(), libc::STDOUT_FILENO) } != libc::STDOUT_FILENO {
-        return Err(std::io::Error::last_os_error())
-            .context("redirect native-profile fixture stdout");
-    }
-    Ok(())
-}
-
-fn run_native_profile_birth_fixture(hold_ms: u64, quiet: bool) -> anyhow::Result<()> {
-    if !(1..=10_000).contains(&hold_ms) {
-        bail!("--hold-ms must be in 1..=10000");
-    }
-    if quiet {
-        silence_native_profile_fixture_stdout()?;
-    }
-    publish_current_host_process_birth()?;
-    publish_current_host_process_birth()?;
-    let ready = create_native_profile_pipe()?;
-    let release = match create_native_profile_pipe() {
-        Ok(release) => release,
-        Err(error) => {
-            close_raw_fd(ready[0]);
-            close_raw_fd(ready[1]);
-            return Err(error);
-        }
-    };
-    let child = unsafe { libc::fork() };
-    if child < 0 {
-        for fd in [ready[0], ready[1], release[0], release[1]] {
-            close_raw_fd(fd);
-        }
-        return Err(std::io::Error::last_os_error()).context("fork native-profile birth fixture");
-    }
-    if child == 0 {
-        close_raw_fd(ready[0]);
-        close_raw_fd(release[1]);
-        let birth_ok = publish_current_host_process_birth().is_ok()
-            && publish_current_host_process_birth().is_ok();
-        let ready_ok = birth_ok && raw_write_all(ready[1], &[0x42]);
-        close_raw_fd(ready[1]);
-        let released = raw_read_byte(release[0]) == Some(0x52);
-        close_raw_fd(release[0]);
-        unsafe { libc::_exit(i32::from(!(ready_ok && released))) };
-    }
-
-    close_raw_fd(ready[1]);
-    close_raw_fd(release[0]);
-    let child_ready = raw_read_byte(ready[0]) == Some(0x42);
-    close_raw_fd(ready[0]);
-    if child_ready {
-        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
-    }
-    let child_released = raw_write_all(release[1], &[0x52]);
-    close_raw_fd(release[1]);
-    let status = wait_fixture_child(child)?;
-    if !child_ready || !child_released {
-        bail!("native-profile birth fixture handshake failed");
-    }
-    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-        bail!("native-profile birth child did not exit cleanly: status={status}");
-    }
-    if !raw_write_all(
-        libc::STDOUT_FILENO,
-        nul_terminated_marker_bytes(BIRTH_FIXTURE_MARKER)?,
-    ) {
-        return Err(std::io::Error::last_os_error()).context("write birth fixture marker");
-    }
-    Ok(())
-}
-
-extern "C" fn native_profile_terminal_thread_main(_: *mut libc::c_void) -> *mut libc::c_void {
-    if TERMINAL_THREAD_ARMED_MARKER.last() == Some(&0)
-        && raw_write_all(
-            libc::STDOUT_FILENO,
-            &TERMINAL_THREAD_ARMED_MARKER[..TERMINAL_THREAD_ARMED_MARKER.len() - 1],
-        )
-    {
-        std::ptr::null_mut()
-    } else {
-        std::ptr::dangling_mut::<libc::c_void>()
-    }
-}
-
-fn run_native_profile_terminal_fixture(
-    mode: NativeProfileTerminalMode,
-    quiet: bool,
-) -> anyhow::Result<()> {
-    if quiet {
-        silence_native_profile_fixture_stdout()?;
-    }
-    match mode {
-        NativeProfileTerminalMode::Thread => {
-            let mut thread = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
-            let created = unsafe {
-                libc::pthread_create(
-                    thread.as_mut_ptr(),
-                    std::ptr::null(),
-                    native_profile_terminal_thread_main,
-                    std::ptr::null_mut(),
-                )
-            };
-            if created != 0 {
-                bail!("pthread_create native-profile terminal fixture failed: {created}");
-            }
-            let thread = unsafe { thread.assume_init() };
-            let mut result = std::ptr::null_mut();
-            let joined = unsafe { libc::pthread_join(thread, &raw mut result) };
-            if joined != 0 {
-                bail!("pthread_join native-profile terminal fixture failed: {joined}");
-            }
-            if !result.is_null() {
-                bail!("native-profile terminal thread marker write failed");
-            }
-            if !raw_write_all(
-                libc::STDOUT_FILENO,
-                nul_terminated_marker_bytes(TERMINAL_THREAD_OK_MARKER)?,
-            ) {
-                return Err(std::io::Error::last_os_error())
-                    .context("write terminal thread fixture marker");
-            }
-            Ok(())
-        }
-        NativeProfileTerminalMode::Process => {
-            if !raw_write_all(
-                libc::STDOUT_FILENO,
-                nul_terminated_marker_bytes(TERMINAL_PROCESS_ARMED_MARKER)?,
-            ) {
-                return Err(std::io::Error::last_os_error())
-                    .context("write terminal process fixture marker");
-            }
-            unsafe { libc::_exit(0) };
-        }
-    }
-}
 
 pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     // The `proc` provider exposes zeroed `pr_start` on current Darwin. Query
@@ -451,20 +184,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::CarrierEntry { id, grant_fd } => {
             crate::lifecycle::carrier_entry(store, &id, grant_fd)
         }
-        Commands::NativeProfileBirthFixture { hold_ms, quiet } => {
-            run_native_profile_birth_fixture(hold_ms, quiet)?;
-        }
-        Commands::NativeProfileTerminalFixture { mode, quiet } => {
-            run_native_profile_terminal_fixture(mode, quiet)?;
-        }
-        Commands::NativeProfileValidateQualification {
-            birth,
-            thread,
-            process,
-        } => {
-            let qualification = validate_qualification_paths(&birth, &thread, &process)?;
-            println!("{}", qualification.render_json()?);
-        }
         Commands::NativeProfileValidate {
             input,
             principal_drops,
@@ -484,9 +203,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 other_drops,
                 interrupted,
             };
-            // One harness, dispatched on the stream's own protocol. A stream
-            // that names neither protocol falls through to the DSRPROF2 reader
-            // and is refused there by name.
             let contents = std::fs::read_to_string(&input)
                 .with_context(|| format!("read profile stream {}", input.display()))?;
             if crate::amplification_profile::is_amp1_stream(&contents) {
@@ -496,8 +212,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 )?;
                 println!("AMP1_VALID");
             } else {
-                validate_v2_path(&input, capture_status)?;
-                println!("DSRPROF2_VALID");
+                bail!("unknown profile stream in {}", input.display());
             }
         }
         Commands::InspectElf { path } => {
@@ -1327,35 +1042,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Debug { command } => match command {
             // Parses a file only, so it is available wherever the binary is.
             DebugCommand::Core { core } => crate::debug_core::run_debug_core(&core)?,
-            DebugCommand::NativeX86Layout => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&native_x86_layout_json())?
-                );
-            }
-            // Parses text files only, so it is available wherever the binary is.
-            DebugCommand::XlatCensus {
-                dir,
-                top,
-                processes_observed,
-            } => crate::debug_census::run_xlat_census(&dir, top, processes_observed)?,
-            DebugCommand::AllocOwnerCensus {
-                dir,
-                native_perf,
-                expected_process_epochs,
-                expected_pids,
-                normal_host_allocation_opportunity_share,
-                qualification_share_of_total,
-            } => crate::debug_alloc_owner::run_alloc_owner_census(
-                &crate::debug_alloc_owner::AllocOwnerCensusRequest {
-                    dir,
-                    native_perf,
-                    expected_process_epochs,
-                    expected_pids,
-                    normal_host_allocation_opportunity_share,
-                    qualification_share_of_total,
-                },
-            )?,
             // Parses one authenticated text stream, so it is available wherever
             // the binary is even though only a Darwin/AArch64 host can capture
             // one.
@@ -1365,25 +1051,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             DebugCommand::AmplificationCompare { a, b, output } => {
                 crate::debug_amplification::run_amplification_compare(&a, &b, output.as_deref())?
             }
-            DebugCommand::NativeFaultPartition { raw, output } => {
-                crate::native_fault_profile::run_native_fault_partition(&raw, output.as_deref())?
-            }
             DebugCommand::ExecStampCensus { input, workload_ns } => {
                 crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?
-            }
-            DebugCommand::JitShapeCensus {
-                trace,
-                capture,
-                snapshots,
-                output,
-            } => crate::debug_jit_shape::run_jit_shape_census(
-                &trace,
-                &capture,
-                &snapshots,
-                output.as_deref(),
-            )?,
-            DebugCommand::JitShapeCompare { a, b, output } => {
-                crate::debug_jit_shape::run_jit_shape_compare(&a, &b, output.as_deref())?
             }
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
@@ -1417,7 +1086,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             summary_jsonl,
             core_artifact,
             profile_bound_seconds,
-            native_shape_snapshots,
             preflight_quiet_host,
             trace_out,
             command,
@@ -1435,8 +1103,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         unsafe { std::env::set_var(k, v) };
                     }
                 }
-                let current_directory =
-                    std::env::current_dir().context("resolve trace current directory")?;
                 match (profile, core_artifact.as_deref()) {
                     (Some(crate::trace_profile::TraceProfileKind::HvpatchCoreLifecycle), None) => {
                         bail!(
@@ -1452,14 +1118,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         bail!("--core-artifact is valid only with --profile hvpatch-core-lifecycle")
                     }
                 }
-                validate_native_shape_trace_arguments(
-                    profile,
-                    script.as_deref(),
-                    trace_out.as_deref(),
-                    summary_jsonl.as_deref(),
-                    native_shape_snapshots.as_deref(),
-                    &current_directory,
-                )?;
                 // A receipt with nowhere to live would be a silent no-op, and
                 // this whole flag exists so that a quiet host is a RECORDED
                 // fact rather than an operator's memory of one.
@@ -1470,29 +1128,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         "--preflight-quiet-host is carried in the `native-amplification` stream header; no other profile header has a field for the receipt"
                     );
                 }
-                #[cfg(target_os = "macos")]
-                let (native_shape_target, native_shape_run_id) =
-                    if profile == Some(crate::trace_profile::TraceProfileKind::NativeShape) {
-                        validate_native_shape_host(std::env::consts::OS, std::env::consts::ARCH)?;
-                        let target = NativeShapeTarget::parse("native-shape", &command)?;
-                        let run_id = establish_native_shape_run_id()?;
-                        let snapshot_directory =
-                            native_shape_snapshots.as_deref().ok_or_else(|| {
-                                anyhow::anyhow!("native-shape snapshot directory disappeared")
-                            })?;
-                        require_native_shape_snapshot_absent(snapshot_directory)?;
-                        (Some(target), Some(run_id))
-                    } else {
-                        (None, None)
-                    };
                 #[cfg(target_os = "freebsd")]
                 {
-                    if profile == Some(crate::trace_profile::TraceProfileKind::NativeShape) {
-                        crate::native_shape_profile::validate_native_shape_host(
-                            std::env::consts::OS,
-                            std::env::consts::ARCH,
-                        )?;
-                    }
                     if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchK1Lifecycle) {
                         bail!("hvpatch-k1-lifecycle requires a Darwin/HVF host");
                     }
@@ -1514,25 +1151,18 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         bail!("hvpatch-identity-host-safety requires a Darwin/HVF host");
                     }
                 }
-                if profile.is_some_and(|kind| kind.requires_runtime_profile()) {
-                    // The broad profile's prepare/run probes are const-specialized
-                    // out unless this is present before both sudo reconstruction
-                    // and traced-child creation. This branch is still
-                    // single-threaded and precedes the runtime.
-                    unsafe { std::env::set_var("CARRICK_DSR_PROFILE", "1") };
-                }
                 if command.is_empty() {
                     bail!(
                         "trace needs a carrick subcommand to forward (e.g. `carrick trace run alpine:latest /bin/busybox echo hi`)"
                     );
                 }
-                let me = std::env::current_exe()
-                    .context("failed to resolve current carrick binary path")?;
                 if let (Some(raw), Some(summary)) = (&trace_out, &summary_jsonl)
                     && raw == summary
                 {
                     bail!("--trace-out and --summary-jsonl must name different files");
                 }
+                let me = std::env::current_exe()
+                    .context("failed to resolve current carrick binary path")?;
                 if unsafe { libc::geteuid() } != 0 {
                     // libdtrace needs root to open /dev/dtrace. Re-exec the
                     // whole `carrick trace ...` invocation under sudo so the
@@ -1567,7 +1197,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         core_artifact: core_artifact.as_deref(),
                         profile_bound_seconds,
                         trace_out: trace_out.as_deref(),
-                        native_shape_snapshots: native_shape_snapshots.as_deref(),
                         preflight_quiet_host,
                         uid: unsafe { libc::getuid() },
                         gid: unsafe { libc::getgid() },
@@ -1578,30 +1207,18 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     let err = exec_trace_under_sudo(&forwarded);
                     bail!("carrick trace: failed to re-exec under sudo: {}", err);
                 }
-                let drop_credentials = trace_drop_credentials(trace_uid, trace_gid, &trace_groups);
                 #[cfg(target_os = "macos")]
-                let native_shape_identity = if profile
-                    == Some(crate::trace_profile::TraceProfileKind::NativeShape)
-                {
-                    let identity = CaptureIdentity::capture(&me)?;
-                    let snapshot_directory =
-                        native_shape_snapshots.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("native-shape snapshot directory disappeared")
-                        })?;
-                    let owner = drop_credentials
-                        .as_ref()
-                        .map(|value| (value.uid, value.gid))
-                        .unwrap_or_else(|| unsafe { (libc::getuid(), libc::getgid()) });
-                    claim_native_shape_snapshot_directory(snapshot_directory, owner.0, owner.1)?;
-                    // SAFETY: this root-side preflight is still
-                    // single-threaded and precedes qualification/trace work.
-                    unsafe {
-                        std::env::set_var("CARRICK_DSR_CODE_SNAPSHOT_DIR", snapshot_directory)
-                    };
-                    Some(identity)
+                let _quiet_host_receipt = if preflight_quiet_host {
+                    let receipt = crate::quiet_host::preflight_quiet_host()?;
+                    eprintln!(
+                        "carrick trace: quiet-host preflight accepted (settled in {}s, one-minute load {} milli)",
+                        receipt.settle_s, receipt.loadavg1_milli
+                    );
+                    Some(receipt)
                 } else {
                     None
                 };
+                let drop_credentials = trace_drop_credentials(trace_uid, trace_gid, &trace_groups);
                 let script_template = match (&script, profile) {
                     (Some(path), None) => {
                         Some(std::fs::read_to_string(path).with_context(|| {
@@ -1622,121 +1239,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let output_path = trace_out
                     .as_deref()
                     .or_else(|| internal_trace.as_ref().map(tempfile::NamedTempFile::path));
-                // The amplification ledger's fixture identity, parsed at
-                // LAUNCH. Two silent failures become fast ones: a VMM-backend
-                // target, whose `native-syscall-service-*` probes never fire
-                // and would surface as a wrong-backend refusal only after a
-                // whole build, and a tag-pinned image, which no comparison can
-                // hold fixed.
-                #[cfg(target_os = "macos")]
-                let amplification_target = if profile
-                    == Some(crate::trace_profile::TraceProfileKind::NativeAmplification)
-                {
-                    Some(NativeShapeTarget::parse_for_backends(
-                        "native-amplification",
-                        &command,
-                        &[carrick_spec::ExecBackendRequest::HvPatch],
-                    )?)
-                } else {
-                    None
-                };
-                // Settle and refuse BEFORE the launch qualification, which is
-                // itself a timed run: a dirty host must abort rather than
-                // produce a number.
-                #[cfg(target_os = "macos")]
-                let quiet_host_receipt = if preflight_quiet_host {
-                    let receipt = crate::quiet_host::preflight_quiet_host()?;
-                    eprintln!(
-                        "carrick trace: quiet-host preflight accepted (settled in {}s, one-minute load {} milli)",
-                        receipt.settle_s, receipt.loadavg1_milli
-                    );
-                    Some(receipt)
-                } else {
-                    None
-                };
-                #[cfg(target_os = "macos")]
-                let native_profile_qualification =
-                    if profile.is_some_and(uses_native_launch_qualification) {
-                        Some(run_native_profile_qualifications(
-                            &me,
-                            drop_credentials.clone(),
-                        )?)
-                    } else {
-                        None
-                    };
-                #[cfg(target_os = "macos")]
-                let (script_src, native_profile_authority, native_shape_authority) =
-                    if let Some(qualification) = native_profile_qualification.as_ref() {
-                        let profile_template = script_template
-                            .as_deref()
-                            .ok_or_else(|| anyhow::anyhow!("native profile has no D program"))?;
-                        let requested = profile.ok_or_else(|| {
-                            anyhow::anyhow!("native launch qualification has no profile")
-                        })?;
-                        match requested {
-                            crate::trace_profile::TraceProfileKind::NativeAmplification => {
-                                let target = amplification_target.clone().ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "native-amplification target identity is absent"
-                                    )
-                                })?;
-                                let rendered = qualification
-                                    .render_native_amplification_profile_program(
-                                        profile_template,
-                                        target,
-                                        quiet_host_receipt.clone(),
-                                    )?;
-                                (Some(rendered.program), Some(rendered.authority), None)
-                            }
-                            crate::trace_profile::TraceProfileKind::NativeFault => {
-                                let rendered = qualification
-                                    .render_native_fault_profile_program(profile_template)?;
-                                (Some(rendered.program), Some(rendered.authority), None)
-                            }
-                            crate::trace_profile::TraceProfileKind::NativeWall => {
-                                let rendered =
-                                    qualification.render_v2_profile_program(profile_template)?;
-                                (Some(rendered.program), Some(rendered.authority), None)
-                            }
-                            crate::trace_profile::TraceProfileKind::NativeShape => {
-                                let identity = native_shape_identity.as_ref().ok_or_else(|| {
-                                    anyhow::anyhow!("native-shape capture identity is absent")
-                                })?;
-                                let target = native_shape_target.as_ref().ok_or_else(|| {
-                                    anyhow::anyhow!("native-shape target identity is absent")
-                                })?;
-                                let run_id = native_shape_run_id.as_deref().ok_or_else(|| {
-                                    anyhow::anyhow!("native-shape run ID is absent")
-                                })?;
-                                let authority = NativeShapeAuthority::new(
-                                    identity,
-                                    target,
-                                    run_id,
-                                    profile_template,
-                                    qualification.birth_receipt_sha256(),
-                                    qualification.terminal_receipt_sha256(),
-                                )?;
-                                let rendered = qualification.render_native_shape_profile_program(
-                                    profile_template,
-                                    authority,
-                                )?;
-                                (Some(rendered.program), None, Some(rendered.authority))
-                            }
-                            crate::trace_profile::TraceProfileKind::Dsr
-                            | crate::trace_profile::TraceProfileKind::DsrFork
-                            | crate::trace_profile::TraceProfileKind::DsrIndirect
-                            | crate::trace_profile::TraceProfileKind::HvpatchFrameCow
-                            | crate::trace_profile::TraceProfileKind::HvpatchExecRuntimeStages
-                            | crate::trace_profile::TraceProfileKind::HvpatchCoreLifecycle
-                            | crate::trace_profile::TraceProfileKind::HvpatchIdentityHostSafety
-                            | crate::trace_profile::TraceProfileKind::HvpatchK1Lifecycle => {
-                                unreachable!("non-native profile requested native qualification")
-                            }
-                        }
-                    } else {
-                        (script_template, None, None)
-                    };
-                #[cfg(target_os = "freebsd")]
                 let script_src = script_template;
                 // Applied AFTER the launch-qualification rendering on purpose:
                 // the authority names the immutable bundled TEMPLATE's digest,
@@ -1759,14 +1261,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     }
                     None => script_src,
                 };
-                #[cfg(target_os = "macos")]
-                if let Some(qualification) = native_profile_qualification.as_ref() {
-                    eprintln!(
-                        "carrick trace: native launch qualification accepted (birth={}, terminal={})",
-                        qualification.birth_receipt_sha256(),
-                        qualification.terminal_receipt_sha256()
-                    );
-                }
                 let opts = carrick_runtime::dtrace_consumer::TraceOptions {
                     flowindent,
                     script: script_src,
@@ -1777,77 +1271,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     ),
                 };
                 #[cfg(target_os = "macos")]
-                if profile == Some(crate::trace_profile::TraceProfileKind::NativeShape) {
-                    let raw_path = output_path
-                        .ok_or_else(|| anyhow::anyhow!("native-shape trace has no raw output"))?;
-                    let receipt_path = summary_jsonl.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("native-shape trace has no capture receipt output")
-                    })?;
-                    let snapshot_directory =
-                        native_shape_snapshots.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("native-shape trace has no snapshot directory")
-                        })?;
-                    let authority = native_shape_authority.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("NSHAPE2 stream has no capture authority")
-                    })?;
-                    let owner = drop_credentials
-                        .as_ref()
-                        .map(|value| (value.uid, value.gid));
-                    run_native_shape_capture(
-                        authority,
-                        raw_path,
-                        snapshot_directory,
-                        receipt_path,
-                        owner,
-                        || {
-                            carrick_runtime::dtrace_consumer::run_child_under_dtrace_observed(
-                                &me, &command, &opts,
-                            )
-                        },
-                        || CaptureIdentity::capture(&me),
-                    )?;
-                    return Ok(());
-                }
-                #[cfg(target_os = "macos")]
-                let (report, sampled_kernel_overlay) = if profile
-                    .is_some_and(uses_live_kernel_symbols)
-                {
-                    let raw_path = output_path
-                        .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
-                    let (report, overlay) =
-                            carrick_runtime::dtrace_consumer::run_child_under_dtrace_with_post_stop(
-                                &me,
-                                &command,
-                                &opts,
-                                |mut symbolizer, capture_report| -> anyhow::Result<_> {
-                                    let addresses = kernel_sample_addresses_from_path(
-                                        raw_path,
-                                        native_profile_authority.as_ref(),
-                                        capture_report.into(),
-                                    )?;
-                                    if addresses.weighted_leaves.iter().any(|address| {
-                                        addresses.requested.binary_search(address).is_err()
-                                    }) {
-                                        bail!(
-                                            "native-wall weighted kernel leaves escaped the requested address set"
-                                        );
-                                    }
-                                    symbolizer
-                                        .sampled_overlay(addresses.requested)
-                                        .map_err(anyhow::Error::from)
-                                },
-                            )
-                            .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?;
-                    (report, Some(overlay))
-                } else {
-                    (
-                        carrick_runtime::dtrace_consumer::run_child_under_dtrace(
-                            &me, &command, &opts,
-                        )
-                        .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?,
-                        None,
-                    )
-                };
+                let report =
+                    carrick_runtime::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
+                        .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?;
                 #[cfg(target_os = "freebsd")]
                 let report =
                     carrick_runtime::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
@@ -1989,87 +1415,21 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 capture_status,
                             )?;
                             eprintln!("{}", summary.render_human());
-                        } else if requested_profile
-                            == crate::trace_profile::TraceProfileKind::NativeFault
-                        {
-                            let authority = native_profile_authority.clone().ok_or_else(|| {
-                                anyhow::anyhow!("NFAULT2 stream has no launch authority")
-                            })?;
-                            let mut summary =
-                                NativeFaultSummary::from_path(raw_path, capture_status, authority)?;
-                            summary.set_provenance(capture_provenance(&me, &command)?);
-                            eprintln!("{}", summary.render_human());
-                            if let Some(summary_path) = summary_jsonl.as_deref() {
-                                let owner = drop_credentials
-                                    .as_ref()
-                                    .map(|value| (value.uid, value.gid));
-                                summary.write_atomic(summary_path, owner)?;
-                            }
                         } else {
-                            let mut summary = if requested_profile
-                                == crate::trace_profile::TraceProfileKind::NativeWall
-                                && path_has_v2_header(raw_path)?
-                            {
-                                let authority =
-                                    native_profile_authority.clone().ok_or_else(|| {
-                                        anyhow::anyhow!("DSRPROF2 stream has no launch authority")
-                                    })?;
-                                ProfileSummary::from_v2_path_with_authority(
-                                    raw_path,
-                                    capture_status,
-                                    authority,
-                                )?
-                            } else {
-                                ProfileSummary::from_path(raw_path, capture_status)?
-                            };
-                            summary.require_profile(requested_profile)?;
-                            // A capture that silently ran to a different
-                            // ceiling than requested is not evidence about the
-                            // window the operator asked for.
-                            if let Some(expected) = profile_bound_seconds {
-                                summary.require_capture_bound(expected)?;
-                            }
-                            if let Some(overlay) = sampled_kernel_overlay {
-                                summary.attach_sampled_kernel_overlay(overlay)?;
-                            }
-                            summary.set_provenance(capture_provenance(&me, &command)?);
-                            eprintln!("{}", summary.render_human());
-                            if let Some(summary_path) = summary_jsonl.as_deref() {
-                                let owner = drop_credentials
-                                    .as_ref()
-                                    .map(|value| (value.uid, value.gid));
-                                write_summary_atomic(summary_path, &summary, owner)?;
-                            }
+                            bail!("unsupported trace profile {:?}", requested_profile);
                         }
                     }
                     #[cfg(target_os = "freebsd")]
                     {
-                        if requested_profile == crate::trace_profile::TraceProfileKind::NativeShape
-                        {
-                            bail!("native-shape requires a Darwin/AArch64 host");
-                        }
-                        if requested_profile
-                            == crate::trace_profile::TraceProfileKind::NativeAmplification
-                        {
-                            // The AMP1 header is substituted from the Darwin
-                            // launch-qualification receipts, which is a macOS
-                            // path; an unauthenticated stream would be refused
-                            // by the reader anyway, so refuse it up front.
-                            bail!("native-amplification requires a Darwin/AArch64 host");
-                        }
-                        let mut summary = ProfileSummary::from_path(raw_path, capture_status)?;
-                        summary.require_profile(requested_profile)?;
-                        if let Some(expected) = profile_bound_seconds {
-                            summary.require_capture_bound(expected)?;
-                        }
-                        summary.set_provenance(capture_provenance(&me, &command)?);
-                        eprintln!("{}", summary.render_human());
-                        if let Some(summary_path) = summary_jsonl.as_deref() {
-                            let owner = drop_credentials
-                                .as_ref()
-                                .map(|value| (value.uid, value.gid));
-                            write_summary_atomic(summary_path, &summary, owner)?;
-                        }
+                        let _ = (
+                            raw_path,
+                            capture_status,
+                            requested_profile,
+                            profile_bound_seconds,
+                            summary_jsonl,
+                            drop_credentials,
+                        );
+                        bail!("trace profiles require macOS / HVF");
                     }
                 }
             }
@@ -2080,7 +1440,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     script,
                     profile,
                     summary_jsonl,
-                    native_shape_snapshots,
                     preflight_quiet_host,
                     trace_out,
                     command,
@@ -3074,8 +2433,6 @@ fn kaniko_run_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
-    use crate::trace_profile::TraceProfileKind;
 
     #[test]
     fn build_source_marker_is_always_explicit_and_versioned() {
@@ -3134,31 +2491,6 @@ mod tests {
             },
             true,
         ));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn live_kernel_symbols_only_use_the_native_wall_callback() {
-        assert!(uses_live_kernel_symbols(TraceProfileKind::NativeWall));
-        assert!(uses_native_launch_qualification(
-            TraceProfileKind::NativeWall
-        ));
-        assert!(!uses_live_kernel_symbols(TraceProfileKind::NativeFault));
-        assert!(uses_native_launch_qualification(
-            TraceProfileKind::NativeFault
-        ));
-        assert!(!uses_live_kernel_symbols(TraceProfileKind::NativeShape));
-        assert!(uses_native_launch_qualification(
-            TraceProfileKind::NativeShape
-        ));
-        for profile in [
-            TraceProfileKind::Dsr,
-            TraceProfileKind::DsrIndirect,
-            TraceProfileKind::DsrFork,
-        ] {
-            assert!(!uses_live_kernel_symbols(profile));
-            assert!(!uses_native_launch_qualification(profile));
-        }
     }
 
     #[test]

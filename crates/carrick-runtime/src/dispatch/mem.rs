@@ -1180,10 +1180,10 @@ pub(crate) struct MemState {
 }
 
 // Moved to `carrick_mem::memory::MemoryLayout` as part of the staged
-// native-backend extraction (docs/superpowers/specs/
-// 2026-07-17-native-backend-portability-seams-design.md) so `carrick-dsr` can
-// share it; re-exported so every `crate::dispatch::MemoryLayout` call site is
-// unchanged.
+// backend extraction (docs/superpowers/specs/
+// 2026-07-17-native-backend-portability-seams-design.md) so multiple crates
+// can share it; re-exported so every `crate::dispatch::MemoryLayout` call site
+// is unchanged.
 pub(crate) use carrick_mem::memory::MemoryLayout;
 
 impl MemState {

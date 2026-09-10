@@ -2565,7 +2565,7 @@ mod tests {
         }
         // hvf (the shared ground truth) and any unknown lane have NO overlay —
         // including the retired local spellings, which are no longer lanes.
-        for lane in ["hvf", "bogus", "hvpatch", "macos-hvpatch", "native-dsr"] {
+        for lane in ["hvf", "bogus", "hvpatch", "macos-hvpatch"] {
             assert_eq!(lane_overlay_path(baseline, lane), None, "lane {lane}");
         }
     }
@@ -2607,7 +2607,7 @@ mod tests {
         // write) — including the retired local lane spellings. `hvf` is the ONE
         // local macOS lane, so blessing the shared baseline has to be spelled
         // that way and cannot be reached under an old name.
-        for lane in ["rosetta", "hvpatch", "macos-hvpatch", "native-dsr"] {
+        for lane in ["rosetta", "hvpatch", "macos-hvpatch"] {
             assert!(bless_target(lane).is_err(), "lane {lane}");
         }
     }

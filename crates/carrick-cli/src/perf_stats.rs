@@ -40,6 +40,7 @@ fn nearest_rank(sorted: &[f64], p: f64) -> f64 {
     sorted[idx]
 }
 
+#[allow(dead_code)]
 pub fn summarize(values: &[f64]) -> Option<Summary> {
     if values.is_empty() {
         return None;

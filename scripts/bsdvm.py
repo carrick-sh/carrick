@@ -666,7 +666,7 @@ def provision_commands(vm: VmConfig, pubkey: str) -> list[tuple[str, float]]:
              "service sshd restart", 120),
             ("env ASSUME_ALWAYS_YES=yes pkg bootstrap -f", 600),
             # `llvm19` is NOT optional tooling, it is a BUILD dependency of the
-            # aarch64 acceptance path: carrick-dsr-aarch64 -> bad64 -> bad64-sys
+            # aarch64 acceptance path: bad64 -> bad64-sys
             # runs `bindgen` in its build script, and bindgen dlopens libclang.
             # FreeBSD base ships none (no /usr/lib/libclang*, no
             # /usr/local/lib/libclang*), so without this the stage1 gate dies
@@ -733,7 +733,7 @@ def provision_commands(vm: VmConfig, pubkey: str) -> list[tuple[str, float]]:
         # to carry git-2.53.0 and rust-1.91.1nb1 as of 2026-07-22).
         #
         # `clang` is NOT optional tooling here, it is a BUILD dependency of the
-        # aarch64 acceptance path: carrick-dsr-aarch64 -> bad64 -> bad64-sys runs
+        # aarch64 acceptance path: bad64 -> bad64-sys runs
         # `bindgen` in its build script, and bindgen dlopens libclang. NetBSD
         # base ships no libclang, so without this the stage1 gate dies with
         # `Unable to find libclang: "couldn't find any valid shared libraries

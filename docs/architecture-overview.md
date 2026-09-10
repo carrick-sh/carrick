@@ -269,18 +269,6 @@ they do not remove the Carrick-side VMM requirement. A skip-capable developer
 test is convenience, not runtime proof. See
 [conformance-testing.md](conformance-testing.md) for commands and CI boundaries.
 
-## 9. Preserved Optimization Primitives
-
-`carrick-dsr`, `carrick-dsr-aarch64`, `carrick-dsr-x86`, and
-`carrick-native-darwin` retain translation caches, ISA-specific rewriting,
-`MAP_JIT` W^X support, and direct binary-patching machinery. These components
-are preserved as possible future optimizations beneath or alongside Carrick's
-kernel architecture.
-
-They are not selectable shipped execution backends. Correctness belongs to the
-HVPatch unified kernel model; an optimization may be wired in only if it
-preserves that model's identity, memory, lifecycle, and evidence contracts.
-
 ## See also
 
 - [hal.md](hal.md) — platform and VMM boundaries

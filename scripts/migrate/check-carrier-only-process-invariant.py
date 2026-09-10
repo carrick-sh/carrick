@@ -102,28 +102,12 @@ def _is_product_source(path: PurePosixPath) -> bool:
 
 REVIEWED_OPERATOR_LIMITS = {
     (PurePosixPath("crates/carrick-cli/src/apfs_operator.rs"), "run_diskutil", "process_command"): 1,
-    (PurePosixPath("crates/carrick-cli/src/commands.rs"), "wait_fixture_child", "waitpid"): 1,
-    (
-        PurePosixPath("crates/carrick-cli/src/commands.rs"),
-        "run_native_profile_birth_fixture",
-        "fork",
-    ): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "run_lldb_deadline", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "run_lldb_attach", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "collect_scoped_processes", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "terminate_scoped_run", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "dump_lldb", "kill"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "terminate_scoped_run", "kill"): 3,
-    (
-        PurePosixPath("crates/carrick-cli/src/native_profile_qualification.rs"),
-        "command_output",
-        "process_command",
-    ): 1,
-    (
-        PurePosixPath("crates/carrick-cli/src/native_shape_profile.rs"),
-        "command_stdout",
-        "process_command",
-    ): 1,
     (PurePosixPath("crates/carrick-cli/src/quiet_host.rs"), "count_named_processes", "process_command"): 1,
     (
         PurePosixPath("crates/carrick-cli/src/quiet_host.rs"),
@@ -219,11 +203,6 @@ CARRIER_BIRTH_LIMITS = {
 # containment/lifecycle substrates; none accept a guest PID. All other direct
 # process-control calls in product code are rejected.
 CARRIER_SUBSTRATE_LIMITS = {
-    (
-        PurePosixPath("crates/carrick-native-darwin/src/aot_cache.rs"),
-        "claim_recording",
-        "kill_probe",
-    ): 1,
     (
         PurePosixPath("crates/carrick-portable/src/lib.rs"),
         "ptrace",

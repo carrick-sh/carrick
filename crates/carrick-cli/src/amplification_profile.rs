@@ -34,16 +34,167 @@
 //! module answers "is this stream admissible", not "what does it say".
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use carrick_image::ImageReference;
 use carrick_runtime::linux_abi::CanonicalNr;
+use carrick_spec::ExecBackendRequest;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches};
 use sha2::{Digest, Sha256};
 
+use crate::args::{Cli, Commands};
 use crate::quiet_host::QuietHostReceipt;
 use crate::trace_profile::{AMPLIFICATION_RAW_SCHEMA, ProfileCaptureStatus};
+
+/// A digest-pinned `run` target, parsed from a profile's own trailing argv.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeShapeTarget {
+    pub(crate) image: String,
+    pub(crate) image_digest: String,
+    pub(crate) argv: Vec<String>,
+    pub(crate) argv_sha256: String,
+}
+
+#[allow(dead_code)]
+impl NativeShapeTarget {
+    pub(crate) fn parse(label: &str, command: &[String]) -> Result<Self> {
+        Self::parse_for_backends(label, command, &[ExecBackendRequest::HvPatch])
+    }
+
+    pub(crate) fn parse_for_backends(
+        label: &str,
+        command: &[String],
+        allowed: &[ExecBackendRequest],
+    ) -> Result<Self> {
+        debug_assert!(!allowed.is_empty(), "a target must permit some backend");
+        if command.is_empty() {
+            bail!("{label} target command is empty");
+        }
+
+        let mut argv = Vec::<OsString>::with_capacity(command.len() + 1);
+        argv.push(OsString::from("carrick"));
+        argv.extend(command.iter().map(OsString::from));
+        let matches = Cli::command()
+            .try_get_matches_from(argv)
+            .with_context(|| format!("parse {label} target command"))?;
+        let Some((subcommand, run_matches)) = matches.subcommand() else {
+            bail!("{label} target must be a run subcommand");
+        };
+        if subcommand != "run" {
+            bail!("{label} target must be a run subcommand");
+        }
+        if run_matches.value_source("exec_backend") != Some(ValueSource::CommandLine) {
+            bail!(
+                "{label} target requires an explicit command-line --exec-backend ({})",
+                backend_list(allowed)
+            );
+        }
+
+        let parsed =
+            Cli::from_arg_matches(&matches).with_context(|| format!("decode {label} target"))?;
+        let Commands::Run {
+            image,
+            exec_backend,
+            command: target_command,
+            ..
+        } = parsed.command
+        else {
+            bail!("{label} target must be a run subcommand");
+        };
+        if !allowed.contains(&exec_backend) {
+            bail!(
+                "{label} target requires an explicit command-line --exec-backend ({})",
+                backend_list(allowed)
+            );
+        }
+        if target_command.is_empty() {
+            bail!("{label} run target command is empty");
+        }
+
+        if let Some((_, digest)) = image.rsplit_once('@') {
+            validate_image_digest(digest)
+                .with_context(|| format!("validate {label} image digest"))?;
+        }
+        let reference =
+            ImageReference::parse(&image).with_context(|| format!("parse {label} image"))?;
+        let image_digest = reference
+            .digest()
+            .with_context(|| format!("{label} image must be digest-pinned"))?
+            .to_owned();
+        validate_image_digest(&image_digest)?;
+        let target = Self {
+            image: reference.canonical(),
+            image_digest,
+            argv: command.to_vec(),
+            argv_sha256: argv_sha256(command)?,
+        };
+        target.validate()?;
+        Ok(target)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_image_digest(&self.image_digest)?;
+        let image = ImageReference::parse(&self.image).context("validate run image")?;
+        if image.canonical() != self.image || image.digest() != Some(self.image_digest.as_str()) {
+            bail!("run image identity is not canonical and digest-consistent");
+        }
+        if self.argv.is_empty() || self.argv_sha256 != argv_sha256(&self.argv)? {
+            bail!("run target argv identity is inconsistent");
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+fn backend_list(allowed: &[ExecBackendRequest]) -> String {
+    allowed
+        .iter()
+        .map(|backend| match backend {
+            ExecBackendRequest::HvPatch => "hvpatch",
+        })
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+#[allow(dead_code)]
+fn validate_image_digest(digest: &str) -> Result<()> {
+    let hexadecimal = digest
+        .strip_prefix("sha256:")
+        .context("image digest must use sha256")?;
+    validate_lower_hex(hexadecimal, 64, "image digest")
+}
+
+#[allow(dead_code)]
+fn validate_lower_hex(value: &str, length: usize, field: &str) -> Result<()> {
+    if value.len() != length
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        bail!("{field} is not lower-case hex of length {length}");
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn argv_sha256(argv: &[String]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let count = u64::try_from(argv.len()).context("target argv count exceeds u64")?;
+    hasher.update(count.to_be_bytes());
+    for argument in argv {
+        let bytes = argument.as_bytes();
+        let length = u64::try_from(bytes.len()).context("target argv byte length exceeds u64")?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(bytes);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
 
 const AMP1_PREFIX: &str = "AMP1";
 const AMP1_PROFILE: &str = "native-amplification";
@@ -972,8 +1123,8 @@ fn require_no_consumer_drops(status: ProfileCaptureStatus) -> Result<()> {
 /// are COMPUTED rather than asserted — a literal would let the fixture drift
 /// away from what a capture actually renders without any test noticing.
 #[cfg(test)]
-pub(crate) fn fixture_target() -> crate::native_shape_profile::NativeShapeTarget {
-    crate::native_shape_profile::NativeShapeTarget::parse(
+pub(crate) fn fixture_target() -> NativeShapeTarget {
+    NativeShapeTarget::parse(
         "native-amplification",
         &[
             "run".to_owned(),

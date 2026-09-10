@@ -155,30 +155,6 @@ pub use carrick_abi as linux_abi;
 // `crate::memory::…` / `crate::elf::…` / `crate::page_table::…` / `crate::vdso::…`
 // site (and the `carrick_runtime::*` ones) is unchanged.
 pub use carrick_mem::{elf, memory, page_table, vdso};
-// Versioned native-x86 context layout consumed by the live profiler. The
-// matching carrick binary is the authority; scripts must never duplicate the
-// offset because gateway state (notably XSAVE) changes its size.
-pub use carrick_dsr_x86::{X86DsrProfilerLayout, x86_dsr_profiler_layout};
-// The translation-redundancy census file model. The WRITER lives beside the
-// translator that produces the records; `carrick debug xlat-census` aggregates
-// them and must parse them with the SAME definition, so the format is exported
-// here rather than re-implemented in the CLI (which cannot depend on
-// carrick-dsr-aarch64 directly). Unconditional: carrick-dsr-aarch64 compiles on
-// every host, and reading a census captured on a Darwin/aarch64 rig is a
-// perfectly reasonable thing to do elsewhere.
-pub use carrick_dsr_aarch64::translator::xlat_census;
-// Allocation-owner census records are rendered by the AArch64 translator-side
-// diagnostic and parsed by the portable CLI. Re-export the single typed wire
-// authority so the CLI does not acquire a direct guest-ISA dependency.
-#[cfg(feature = "alloc-owner-census")]
-pub use carrick_dsr_aarch64::alloc_owner_census;
-pub use carrick_dsr_aarch64::alloc_owner_wire;
-// The biased-lowering host-bias candidate set. The native-fault partition in
-// the CLI classifies fault pages against `guest_va + bias`, and the bias is
-// selected per process at boot from exactly this list — re-exported (the
-// `xlat_census` precedent) so the parser reads the runtime's authority instead
-// of duplicating four load-bearing constants.
-pub use carrick_dsr::address::BIAS_CANDIDATES as NATIVE_HOST_BIAS_CANDIDATES;
 // The guest-virtual address domain the census records are keyed on. Exported
 // beside `xlat_census` so an out-of-crate aggregator keys its sets on the typed
 // address instead of degrading them to `u64` at the crate boundary.

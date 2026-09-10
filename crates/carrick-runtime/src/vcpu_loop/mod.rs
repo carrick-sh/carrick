@@ -962,7 +962,7 @@ pub(crate) use signal::{
     reset_signal_progress_for_executor_boundary, signal_progress_is_zero_for_executor_boundary,
 };
 // Test-only consumer since the DSR translator (the lib-side caller) moved to
-// the arch crate; the ESR decode itself lives in carrick_dsr_aarch64::esr and
+// the arch crate; the ESR decode itself lives in carrick_aarch64::esr and
 // signal.rs re-exports it.
 #[cfg(test)]
 use signal::el0_debug_signal;

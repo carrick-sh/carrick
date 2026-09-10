@@ -3,8 +3,8 @@
 use crate::runtime::RuntimeError;
 use carrick_spec::{BackendCapabilities, ExecBackendRequest, HostOs, Platform, RunSpec};
 
-pub(crate) use carrick_dsr::page_geometry::DEFAULT_LINUX_PAGE_SIZE;
-pub use carrick_dsr::page_geometry::{
+pub(crate) use carrick_mem::page_geometry::DEFAULT_LINUX_PAGE_SIZE;
+pub use carrick_mem::page_geometry::{
     HostPageState, MappingPolicyDecision, MixedPageReason, PageBacking, PageGeometry, PagePerms,
     SubpageState, classify_host_page_state, decide_linux4k_on_16k_mapping,
 };
@@ -103,7 +103,7 @@ pub(crate) fn host_page_size() -> u64 {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
-    use carrick_dsr::page_geometry::DARWIN_NATIVE_PAGE_SIZE;
+    use carrick_mem::page_geometry::DARWIN_NATIVE_PAGE_SIZE;
     use carrick_spec::Platform;
 
     fn spec_with_platform(

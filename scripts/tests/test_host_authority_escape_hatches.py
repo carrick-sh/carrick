@@ -314,7 +314,7 @@ macro_rules! compiler_catalog_owned {
             "crates/nested/crates/carrick-portable/src/lib.rs": (
                 "pub unsafe fn call() { let _ = libc::syscall(1); }\n"
             ),
-            "crates/nested/crates/carrick-dsr-aarch64/src/emit.rs": (
+            "crates/nested/crates/carrick-vmm-hvf/src/trap/sysreg.rs": (
                 'pub unsafe fn emit() { core::arch::asm!("nop"); }\n'
             ),
         }
@@ -344,12 +344,12 @@ macro_rules! compiler_catalog_owned {
                 1,
             ),
             (
-                "crates/carrick-dsr-aarch64/src/emit.rs",
+                "crates/carrick-vmm-hvf/src/trap/sysreg.rs",
                 'pub unsafe fn emit() { core::arch::asm!("nop"); }\n',
                 0,
             ),
             (
-                "crates/nested/crates/carrick-dsr-aarch64/src/emit.rs",
+                "crates/nested/crates/carrick-vmm-hvf/src/trap/sysreg.rs",
                 'pub unsafe fn emit() { core::arch::asm!("nop"); }\n',
                 1,
             ),
@@ -369,7 +369,7 @@ macro_rules! compiler_catalog_owned {
                 "crates/carrick-portable/src/lib.rs": (
                     "pub unsafe fn call() { let _ = libc::syscall(1); }\n"
                 ),
-                "crates/carrick-dsr-aarch64/src/emit.rs": (
+                "crates/carrick-vmm-hvf/src/trap/sysreg.rs": (
                     'pub unsafe fn emit() { core::arch::asm!("nop"); }\n'
                 ),
                 "crates/carrick-host/src/host_proc.rs": (
