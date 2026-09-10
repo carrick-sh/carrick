@@ -1390,11 +1390,15 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     fn ensure_sparse_mmap_backing(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
         let in_sparse_arena = self.process_asid.is_some()
             && self.vm.sparse_mmap_arena_enabled()
-            && va >= carrick_mem::memory::LINUX_MMAP_BASE
-            && va.checked_add(len as u64).is_some_and(|end| {
-                end <= carrick_mem::memory::LINUX_MMAP_BASE
-                    .saturating_add(carrick_mem::memory::mmap_arena_size())
-            });
+            && ((va >= carrick_mem::memory::LINUX_MMAP_BASE
+                && va.checked_add(len as u64).is_some_and(|end| {
+                    end <= carrick_mem::memory::LINUX_MMAP_BASE
+                        .saturating_add(carrick_mem::memory::mmap_arena_size())
+                }))
+                || (carrick_mem::memory::is_high_va(va)
+                    && va
+                        .checked_add(len as u64)
+                        .is_some_and(|end| end <= (1u64 << 48))));
         if !in_sparse_arena || len == 0 {
             return Ok(());
         }
@@ -1777,10 +1781,15 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     ) -> Result<(), MemoryError> {
         if sharing == MappingSharing::Private
             && self.vm.sparse_mmap_arena_enabled()
-            && address >= carrick_mem::memory::LINUX_MMAP_BASE
-            && address.checked_add(len as u64).is_some_and(|end| {
-                end <= carrick_mem::memory::LINUX_MMAP_BASE + carrick_mem::memory::mmap_arena_size()
-            })
+            && ((address >= carrick_mem::memory::LINUX_MMAP_BASE
+                && address.checked_add(len as u64).is_some_and(|end| {
+                    end <= carrick_mem::memory::LINUX_MMAP_BASE
+                        + carrick_mem::memory::mmap_arena_size()
+                }))
+                || (carrick_mem::memory::is_high_va(address)
+                    && address
+                        .checked_add(len as u64)
+                        .is_some_and(|end| end <= (1u64 << 48))))
         {
             // HVPatch sparse arena retires private frames at munmap and allocates
             // pristine zeroed compounds on demand on first touch/fault.
@@ -1971,11 +1980,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // table/TLBI operation fails, the alias registry remains an exact owner
         // of the still-published backing instead of becoming a dangling absence.
         if self.vm.sparse_mmap_arena_enabled()
-            && address >= carrick_mem::memory::LINUX_MMAP_BASE
-            && address.checked_add(len as u64).is_some_and(|end| {
-                end <= carrick_mem::memory::LINUX_MMAP_BASE
-                    .saturating_add(carrick_mem::memory::mmap_arena_size())
-            })
+            && ((address >= carrick_mem::memory::LINUX_MMAP_BASE
+                && address.checked_add(len as u64).is_some_and(|end| {
+                    end <= carrick_mem::memory::LINUX_MMAP_BASE
+                        .saturating_add(carrick_mem::memory::mmap_arena_size())
+                }))
+                || carrick_mem::memory::is_high_va(address))
         {
             self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))?;
         } else {

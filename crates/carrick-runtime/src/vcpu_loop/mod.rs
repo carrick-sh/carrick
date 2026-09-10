@@ -9803,7 +9803,7 @@ where
                     "core capture missing authoritative VMA state".to_owned(),
                 ));
             }
-            let readable_bytes = process
+            let _readable_bytes = process
                 .maps
                 .iter()
                 .filter(|map| map.read)
@@ -9820,7 +9820,9 @@ where
             // RLIMIT_CORE at serialisation. Failing closed here published NO
             // core and therefore cleared WCOREDUMP for any process whose
             // readable regions merely exceeded the limit.
-            let _ = readable_bytes;
+            let deferred_anonymous = kernel
+                .dispatcher
+                .deferred_anonymous_state(context.shared().mm().id());
             let mut region_bytes = Vec::with_capacity(process.maps.len());
             for map in &process.maps {
                 if !map.read {
@@ -9870,6 +9872,12 @@ where
                         map.start
                     ))
                 })?;
+                if deferred_anonymous.as_ref().is_some_and(|deferred| {
+                    deferred.covers_pristine(carrick_guest_mem::GuestVa(map.start), length)
+                }) {
+                    region_bytes.push(Vec::new());
+                    continue;
+                }
                 region_bytes.push(engine.read_core_bytes(map.start, length).map_err(|error| {
                     RuntimeError::Trap(TrapError::Hypervisor(format!(
                         "read core region {:#x}..{:#x}: {error}",
