@@ -7,7 +7,7 @@
     "description_backing": 17,
     "epoll": 380,
     "stream": 174,
-    "mapping": 1102,
+    "mapping": 1101,
     "lifecycle": 23
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 6,
     "epoll": 158,
     "stream": 121,
-    "mapping": 723,
+    "mapping": 722,
     "lifecycle": 6
   },
   "files": {
@@ -25,7 +25,7 @@
     "description_backing": 7,
     "epoll": 30,
     "stream": 14,
-    "mapping": 64,
+    "mapping": 63,
     "lifecycle": 5
   },
   "entries": [
@@ -16599,7 +16599,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/lib.rs",
-      "line": 774,
+      "line": 750,
       "categories": [
         "mapping"
       ],
@@ -16608,7 +16608,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/lib.rs",
-      "line": 979,
+      "line": 955,
       "categories": [
         "epoll"
       ],
@@ -16617,7 +16617,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/lib.rs",
-      "line": 980,
+      "line": 956,
       "categories": [
         "epoll"
       ],
@@ -16626,7 +16626,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/lib.rs",
-      "line": 1751,
+      "line": 1727,
       "categories": [
         "mapping"
       ],
@@ -17252,15 +17252,6 @@
         "mapping"
       ],
       "text": "/// every host mapping, mount, lease and registry publication made so far",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/run_result.rs",
-      "line": 90,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// mapping machinery (mapped_memory.rs, migrating into `carrick-dsr`)",
       "scope_kind": "production_callsite"
     },
     {
@@ -18075,7 +18066,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 126,
+      "line": 125,
       "categories": [
         "mapping"
       ],
@@ -18084,7 +18075,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 129,
+      "line": 128,
       "categories": [
         "mapping"
       ],
@@ -18093,7 +18084,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 162,
+      "line": 161,
       "categories": [
         "mapping"
       ],

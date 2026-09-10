@@ -71,6 +71,7 @@ pub use carrick_abi as linux_abi;
 pub mod arch_sysregs;
 pub mod elf;
 pub mod memory;
+pub mod page_geometry;
 pub mod page_table;
 pub mod pml4;
 pub mod protections;

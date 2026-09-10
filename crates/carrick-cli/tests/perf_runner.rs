@@ -10,9 +10,7 @@
 mod perf_support;
 
 use perf_support::backend_pair::{
-    ArtifactIdentity, BACKEND_PAIR_ORDER, BackendEvidenceRow, BackendMeasurement, BackendRun,
-    CarrickBackend, collect_backend_pair, comparison_row, v8_artifact_identity,
-    validate_same_artifact, write_backend_rows_atomic,
+    ArtifactIdentity, CarrickBackend, v8_artifact_identity, validate_same_artifact,
 };
 use perf_support::cases::{BackendPairSupport, CASES, PerfArtifact, PerfCase};
 use perf_support::hvf_mailbox_pair::{
@@ -26,12 +24,10 @@ use perf_support::invoke::{self, CPU_PIN, IMAGE};
 use perf_support::metric::Metrics;
 use perf_support::provenance::{self, HostFacts, ResultRow};
 use perf_support::stats::{self, Summary};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::time::Duration;
 
 static PERF_LOCK: Mutex<()> = Mutex::new(());
 
@@ -39,7 +35,6 @@ const V8_IMAGE: &str = "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0
 const V8_ENTRYPOINT: &str = "/opt/nodejs-conformance/bin/node24";
 const V8_SCRIPT: &str = "/opt/nodejs-conformance/fixtures/v8-smoke.js";
 const V8_MAX_TRAPS: &str = "18446744073709551615";
-const V8_SAMPLE_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The in-memory fs backend is opt-in (`--features fs-memory`); skip perf cases
 /// that require it on a default build so the harness never invokes `--fs memory`.
@@ -148,12 +143,6 @@ fn immutable_v8_artifact(repo_digest: &str) -> Result<(String, ArtifactIdentity)
     Ok((repo_digest.to_owned(), identity))
 }
 
-fn resolve_v8_artifact() -> Result<(String, ArtifactIdentity), String> {
-    let repo_digest = provenance::image_digest(V8_IMAGE)
-        .ok_or_else(|| format!("local image {V8_IMAGE} has no immutable RepoDigest"))?;
-    immutable_v8_artifact(&repo_digest)
-}
-
 #[cfg(test)]
 fn backend_neutral_v8_args(arguments: &[String]) -> Vec<String> {
     let mut neutral = Vec::with_capacity(arguments.len());
@@ -174,107 +163,6 @@ fn v8_wall_millis(output: &str, elapsed: Duration) -> Result<f64, String> {
         return Err("V8 sample did not print `v8-smoke ok`".to_owned());
     }
     Ok(elapsed.as_secs_f64() * 1_000.0)
-}
-
-fn cleanup_v8_sample(root: &Path, run_id: &str) {
-    let _ = Command::new("sudo")
-        .arg("-n")
-        .arg(root.join("scripts/sudo/kill.sh"))
-        .arg(run_id)
-        .output();
-}
-
-fn run_v8_backend(
-    bin: &Path,
-    root: &Path,
-    backend: CarrickBackend,
-    immutable_image: &str,
-) -> Result<f64, String> {
-    let run_id = invoke::perf_run_id();
-    let started = Instant::now();
-    let child = Command::new(bin)
-        .args(v8_backend_args(backend, immutable_image))
-        .env("CARRICK_RUN_ID", &run_id)
-        .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| format!("spawn direct V8 {backend:?} sample: {error}"))?;
-    let pid = child.id() as i32;
-    let done = Arc::new(AtomicBool::new(false));
-    let watcher = {
-        let done = Arc::clone(&done);
-        let root = root.to_path_buf();
-        let run_id = run_id.clone();
-        std::thread::spawn(move || {
-            let deadline_started = Instant::now();
-            while !done.load(Ordering::Relaxed) {
-                if deadline_started.elapsed() > V8_SAMPLE_DEADLINE {
-                    unsafe { libc::kill(-pid, libc::SIGKILL) };
-                    cleanup_v8_sample(&root, &run_id);
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            false
-        })
-    };
-
-    let wait_result = child.wait_with_output();
-    if wait_result.is_err() {
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
-        cleanup_v8_sample(root, &run_id);
-    }
-    done.store(true, Ordering::Relaxed);
-    let timed_out = watcher
-        .join()
-        .map_err(|_| "direct V8 deadline watcher panicked".to_owned())?;
-    let output = wait_result.map_err(|error| format!("wait for direct V8 sample: {error}"))?;
-    let elapsed = started.elapsed();
-    cleanup_v8_sample(root, &run_id);
-
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
-    if timed_out {
-        return Err(format!(
-            "direct V8 {backend:?} sample timed out after {}s: {combined}",
-            V8_SAMPLE_DEADLINE.as_secs()
-        ));
-    }
-    if !output.status.success() {
-        return Err(format!(
-            "direct V8 {backend:?} sample exited with status {}: {combined}",
-            output.status
-        ));
-    }
-    v8_wall_millis(&combined, elapsed)
-}
-
-#[test]
-fn backend_pair_uses_native_pie_artifact() {
-    let case = CASES
-        .iter()
-        .find(|case| case.workload == "trap_floor")
-        .expect("trap floor case");
-    assert_eq!(
-        backend_pair_probe_path(Path::new("/repo"), case),
-        Path::new(
-            "/repo/conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/perf_trap_floor"
-        )
-    );
-}
-
-#[test]
-fn backend_pair_contains_required_process_cases() {
-    for workload in ["fork", "fork_exec", "fork_scale_0m", "fork_scale_256m"] {
-        let case = CASES
-            .iter()
-            .find(|case| case.workload == workload)
-            .unwrap_or_else(|| panic!("missing {workload}"));
-        assert_eq!(case.backend_pair_support, BackendPairSupport::DirectElf);
-    }
 }
 
 #[test]
@@ -340,18 +228,6 @@ fn v8_sample_requires_success_marker() {
         v8_wall_millis("startup noise\nv8-smoke ok", Duration::from_millis(12))
             .expect("successful V8 output"),
         12.0
-    );
-}
-
-#[test]
-fn backend_pair_report_path_is_root_relative() {
-    assert_eq!(
-        backend_pair_report_path(Path::new("/repo"), Path::new("docs/perf-results/run.jsonl")),
-        Path::new("/repo/docs/perf-results/run.jsonl")
-    );
-    assert_eq!(
-        backend_pair_report_path(Path::new("/repo"), Path::new("/tmp/run.jsonl")),
-        Path::new("/tmp/run.jsonl")
     );
 }
 
@@ -502,20 +378,6 @@ fn hvf_transport_uses_batched_trap_metric_to_avoid_counter_quantization() {
         hvf_transport_metric(case),
         ("trap_batch_trimmed_mean_us", "us")
     );
-}
-
-#[test]
-fn backend_pair_rejects_missing_metric() {
-    let error = parse_backend_pair_sample("nproc=4", "trap_p50_us")
-        .expect_err("a missing metric must invalidate the report");
-    assert!(error.contains("missing metric trap_p50_us"));
-}
-
-#[test]
-fn backend_pair_rejects_wrong_nproc() {
-    let error = parse_backend_pair_sample("trap_p50_us=1.25\nnproc=10", "trap_p50_us")
-        .expect_err("an unnormalized sample must invalidate the report");
-    assert!(error.contains("wrong nproc 10"));
 }
 
 #[test]
@@ -776,171 +638,6 @@ fn today_string() -> String {
         .unwrap_or_else(|| "unknown-date".into())
 }
 
-const BACKEND_BOOTSTRAP_SEED: u64 = 0x4e31_364b_2d48_5646;
-const BACKEND_BOOTSTRAP_RESAMPLES: usize = 10_000;
-
-fn run_backend_pair_report() -> Result<(), String> {
-    let _serial = PERF_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let root = repo_root();
-    let bin = carrick_bin(&root)
-        .ok_or_else(|| "target/release/carrick not built; run `just build`".to_owned())?;
-    ensure_signed(&root, &bin);
-    let requested_report = std::env::var_os("CARRICK_BACKEND_REPORT")
-        .map(PathBuf::from)
-        .ok_or_else(|| "CARRICK_BACKEND_REPORT is required".to_owned())?;
-    let report = backend_pair_report_path(&root, &requested_report);
-    if let Some(parent) = report.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("create backend report directory: {error}"))?;
-    }
-
-    let filter = std::env::var("CARRICK_PERF_FILTER").ok();
-    let mut rows = vec![BackendEvidenceRow::Run(BackendRun {
-        schema: 1,
-        epoch_secs: provenance::epoch_secs(),
-        schedule: BACKEND_PAIR_ORDER,
-        bootstrap_seed: BACKEND_BOOTSTRAP_SEED,
-        bootstrap_resamples: BACKEND_BOOTSTRAP_RESAMPLES,
-        git_sha: provenance::git_sha(),
-        host: HostFacts::capture(),
-    })];
-    let v8_artifact = match filter.as_deref() {
-        None => Some(resolve_v8_artifact()?),
-        Some(value) if "direct_v8".contains(value) => Some(resolve_v8_artifact()?),
-        Some(_) => None,
-    };
-
-    for case in CASES {
-        if filter
-            .as_ref()
-            .is_some_and(|value| !case.workload.contains(value))
-        {
-            continue;
-        }
-        if let BackendPairSupport::Unsupported(reason) = case.backend_pair_support {
-            rows.push(BackendEvidenceRow::Skip(
-                perf_support::backend_pair::BackendSkip {
-                    workload: case.workload.to_owned(),
-                    reason: reason.to_owned(),
-                },
-            ));
-            continue;
-        }
-
-        let probe = backend_pair_probe_path(&root, case);
-        if !probe.exists() {
-            return Err(format!(
-                "backend pair probe {} is missing; run scripts/build-probes.sh",
-                probe.display()
-            ));
-        }
-        let artifact_before = ArtifactIdentity::from_file(case.probe, &probe)
-            .map_err(|error| format!("identify probe {}: {error}", probe.display()))?;
-        let mut run_sample = |backend| {
-            let output =
-                invoke::run_carrick_backend(&bin, &root, backend, &probe, case.guest_args)?;
-            parse_backend_pair_case_sample(&output, case)
-                .map_err(|error| format!("{} {backend:?}: {error}", case.workload))
-        };
-        let warmups = warmup_reps();
-        if warmups > 0 {
-            collect_backend_pair(warmups, cooldown(), &mut run_sample)
-                .map_err(|error| format!("{} warmup: {error}", case.workload))?;
-        }
-        let samples = collect_backend_pair(reps(), cooldown(), run_sample)?;
-        let artifact_after = ArtifactIdentity::from_file(case.probe, &probe)
-            .map_err(|error| format!("re-identify probe {}: {error}", probe.display()))?;
-        validate_same_artifact(&artifact_before, &artifact_after)?;
-        let native_summary = stats::summarize(&samples.native16k)
-            .ok_or_else(|| format!("{}: too few native16k samples", case.workload))?;
-        let hvf_summary = stats::summarize(&samples.hvf)
-            .ok_or_else(|| format!("{}: too few HVF samples", case.workload))?;
-        rows.push(BackendEvidenceRow::Measurement(BackendMeasurement {
-            workload: case.workload.to_owned(),
-            backend: CarrickBackend::Native16k,
-            artifact: artifact_before.clone(),
-            metric: case.metric_key.to_owned(),
-            unit: case.unit.to_owned(),
-            higher_is_better: case.higher_is_better,
-            samples: samples.native16k.clone(),
-            summary: native_summary,
-        }));
-        rows.push(BackendEvidenceRow::Measurement(BackendMeasurement {
-            workload: case.workload.to_owned(),
-            backend: CarrickBackend::Hvf,
-            artifact: artifact_before,
-            metric: case.metric_key.to_owned(),
-            unit: case.unit.to_owned(),
-            higher_is_better: case.higher_is_better,
-            samples: samples.hvf.clone(),
-            summary: hvf_summary,
-        }));
-        let mut comparison = comparison_row(
-            case.workload,
-            case.higher_is_better,
-            &samples.native16k,
-            &samples.hvf,
-            BACKEND_BOOTSTRAP_SEED,
-            BACKEND_BOOTSTRAP_RESAMPLES,
-        )
-        .ok_or_else(|| format!("{}: too few samples for comparison", case.workload))?;
-        comparison.metric = case.metric_key.to_owned();
-        comparison.unit = case.unit.to_owned();
-        rows.push(BackendEvidenceRow::Comparison(comparison));
-    }
-
-    if let Some((immutable_image, artifact)) = v8_artifact {
-        let mut run_sample = |backend| run_v8_backend(&bin, &root, backend, &immutable_image);
-        let warmups = warmup_reps();
-        if warmups > 0 {
-            collect_backend_pair(warmups, cooldown(), &mut run_sample)
-                .map_err(|error| format!("direct_v8 warmup: {error}"))?;
-        }
-        let samples = collect_backend_pair(reps(), cooldown(), run_sample)
-            .map_err(|error| format!("direct_v8: {error}"))?;
-        validate_same_artifact(&artifact, &artifact)?;
-        let native_summary = stats::summarize(&samples.native16k)
-            .ok_or_else(|| "direct_v8: too few native16k samples".to_owned())?;
-        let hvf_summary = stats::summarize(&samples.hvf)
-            .ok_or_else(|| "direct_v8: too few HVF samples".to_owned())?;
-        rows.push(BackendEvidenceRow::Measurement(BackendMeasurement {
-            workload: "direct_v8".to_owned(),
-            backend: CarrickBackend::Native16k,
-            artifact: artifact.clone(),
-            metric: "wall_ms".to_owned(),
-            unit: "ms".to_owned(),
-            higher_is_better: false,
-            samples: samples.native16k.clone(),
-            summary: native_summary,
-        }));
-        rows.push(BackendEvidenceRow::Measurement(BackendMeasurement {
-            workload: "direct_v8".to_owned(),
-            backend: CarrickBackend::Hvf,
-            artifact,
-            metric: "wall_ms".to_owned(),
-            unit: "ms".to_owned(),
-            higher_is_better: false,
-            samples: samples.hvf.clone(),
-            summary: hvf_summary,
-        }));
-        let mut comparison = comparison_row(
-            "direct_v8",
-            false,
-            &samples.native16k,
-            &samples.hvf,
-            BACKEND_BOOTSTRAP_SEED,
-            BACKEND_BOOTSTRAP_RESAMPLES,
-        )
-        .ok_or_else(|| "direct_v8: too few samples for comparison".to_owned())?;
-        comparison.metric = "wall_ms".to_owned();
-        comparison.unit = "ms".to_owned();
-        rows.push(BackendEvidenceRow::Comparison(comparison));
-    }
-
-    write_backend_rows_atomic(&report, &rows)
-        .map_err(|error| format!("write {}: {error}", report.display()))
-}
-
 fn run_hvf_mailbox_report() -> Result<(), String> {
     let _serial = PERF_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let root = repo_root();
@@ -1115,12 +812,6 @@ fn run_hvf_mailbox_report() -> Result<(), String> {
         return Err(reason);
     }
     Ok(())
-}
-
-#[test]
-#[ignore = "requires signed carrick and deliberate serial native16k/HVF sampling"]
-fn backend_pair_report() {
-    run_backend_pair_report().expect("backend-pair report");
 }
 
 #[test]

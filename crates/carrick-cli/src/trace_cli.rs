@@ -75,7 +75,6 @@ pub(crate) struct TraceSudoInvocation<'a> {
     pub(crate) core_artifact: Option<&'a Path>,
     pub(crate) profile_bound_seconds: Option<u64>,
     pub(crate) trace_out: Option<&'a Path>,
-    pub(crate) native_shape_snapshots: Option<&'a Path>,
     /// The quiet-host preflight. Same silent-drop class as the capture bound
     /// and the global `--store`: dropping it does not fail, it just measures a
     /// host nobody screened.
@@ -123,10 +122,6 @@ pub(crate) fn trace_sudo_argv(invocation: &TraceSudoInvocation<'_>) -> Vec<OsStr
     }
     if let Some(path) = invocation.trace_out {
         argv.push(OsString::from("--trace-out"));
-        argv.push(path.as_os_str().to_owned());
-    }
-    if let Some(path) = invocation.native_shape_snapshots {
-        argv.push(OsString::from("--native-shape-snapshots"));
         argv.push(path.as_os_str().to_owned());
     }
     if invocation.preflight_quiet_host {
@@ -294,7 +289,7 @@ mod tests {
 
     #[test]
     fn sudo_argv_preserves_profile_paths_identity_and_environment() {
-        let environment = [(OsString::from("CARRICK_DSR_PROFILE"), OsString::from("1"))];
+        let environment = [(OsString::from("CARRICK_TEST_ENV"), OsString::from("1"))];
         let command = ["run-elf".to_owned(), "/tmp/probe".to_owned()];
         let argv = trace_sudo_argv(&TraceSudoInvocation {
             executable: Path::new("/tmp/carrick"),
@@ -302,12 +297,11 @@ mod tests {
             flowindent: false,
             script: None,
             require_script_exit: false,
-            profile: Some(TraceProfileKind::DsrIndirect),
+            profile: Some(TraceProfileKind::HvpatchIdentityHostSafety),
             summary_jsonl: Some(Path::new("/tmp/summary.jsonl")),
             core_artifact: None,
             profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/raw.trace")),
-            native_shape_snapshots: None,
             preflight_quiet_host: false,
             uid: 501,
             gid: 20,
@@ -325,7 +319,7 @@ mod tests {
                 "/tmp/carrick",
                 "trace",
                 "--profile",
-                "dsr-indirect",
+                "hvpatch-identity-host-safety",
                 "--summary-jsonl",
                 "/tmp/summary.jsonl",
                 "--trace-out",
@@ -337,7 +331,7 @@ mod tests {
                 "--trace-groups",
                 "20,12",
                 "--forward-env",
-                "CARRICK_DSR_PROFILE=1",
+                "CARRICK_TEST_ENV=1",
                 "--",
                 "run-elf",
                 "/tmp/probe",
@@ -359,7 +353,6 @@ mod tests {
             core_artifact: None,
             profile_bound_seconds: None,
             trace_out: None,
-            native_shape_snapshots: None,
             preflight_quiet_host: false,
             uid: 501,
             gid: 20,
@@ -393,7 +386,6 @@ mod tests {
             core_artifact: Some(Path::new("/tmp/coredumpfile/core")),
             profile_bound_seconds: None,
             trace_out: Some(Path::new("/tmp/core.raw")),
-            native_shape_snapshots: None,
             preflight_quiet_host: false,
             uid: 501,
             gid: 20,
@@ -430,12 +422,11 @@ mod tests {
             flowindent: false,
             script: None,
             require_script_exit: false,
-            profile: Some(TraceProfileKind::NativeWall),
+            profile: Some(TraceProfileKind::NativeAmplification),
             summary_jsonl: None,
             core_artifact: None,
             profile_bound_seconds: Some(900),
             trace_out: Some(Path::new("/tmp/raw.trace")),
-            native_shape_snapshots: None,
             preflight_quiet_host: true,
             uid: 501,
             gid: 20,
@@ -453,7 +444,7 @@ mod tests {
                 "/tmp/carrick",
                 "trace",
                 "--profile",
-                "native-wall",
+                "native-amplification",
                 "--profile-bound-seconds",
                 "900",
                 "--trace-out",
@@ -483,12 +474,11 @@ mod tests {
             flowindent: false,
             script: None,
             require_script_exit: false,
-            profile: Some(TraceProfileKind::NativeWall),
+            profile: Some(TraceProfileKind::NativeAmplification),
             summary_jsonl: None,
             core_artifact: None,
             profile_bound_seconds: None,
             trace_out: None,
-            native_shape_snapshots: None,
             preflight_quiet_host: false,
             uid: 501,
             gid: 20,
@@ -515,108 +505,6 @@ mod tests {
         assert_eq!(
             trace_child_argv(None, &command),
             vec!["carrick", "run", "img"]
-        );
-    }
-
-    #[test]
-    fn native_fault_profile_survives_sudo_argv_reconstruction() {
-        let command = ["run-elf".to_owned(), "/tmp/fault-probe".to_owned()];
-        let argv = trace_sudo_argv(&TraceSudoInvocation {
-            executable: Path::new("/tmp/carrick"),
-            store: None,
-            flowindent: false,
-            script: None,
-            require_script_exit: false,
-            profile: Some(TraceProfileKind::NativeFault),
-            summary_jsonl: None,
-            core_artifact: None,
-            profile_bound_seconds: None,
-            trace_out: Some(Path::new("/tmp/native-fault.raw")),
-            native_shape_snapshots: None,
-            preflight_quiet_host: false,
-            uid: 501,
-            gid: 20,
-            groups: &[],
-            forwarded_env: &[],
-            command: &command,
-        });
-        let strings = argv
-            .iter()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            strings,
-            [
-                "/tmp/carrick",
-                "trace",
-                "--profile",
-                "native-fault",
-                "--trace-out",
-                "/tmp/native-fault.raw",
-                "--trace-uid",
-                "501",
-                "--trace-gid",
-                "20",
-                "--",
-                "run-elf",
-                "/tmp/fault-probe",
-            ]
-        );
-    }
-
-    #[test]
-    fn native_shape_sudo_argv_preserves_snapshots_before_identity_and_run_id() {
-        let environment = [(
-            OsString::from("CARRICK_RUN_ID"),
-            OsString::from("native-shape-test"),
-        )];
-        let command = ["run".to_owned(), "/bin/true".to_owned()];
-        let argv = trace_sudo_argv(&TraceSudoInvocation {
-            executable: Path::new("/tmp/carrick"),
-            store: None,
-            flowindent: false,
-            script: None,
-            require_script_exit: false,
-            profile: Some(TraceProfileKind::NativeShape),
-            summary_jsonl: Some(Path::new("/tmp/native-shape.jsonl")),
-            core_artifact: None,
-            profile_bound_seconds: None,
-            trace_out: Some(Path::new("/tmp/native-shape.raw")),
-            preflight_quiet_host: false,
-            native_shape_snapshots: Some(Path::new("/tmp/native-shape.snapshots")),
-            uid: 501,
-            gid: 20,
-            groups: &[],
-            forwarded_env: &environment,
-            command: &command,
-        });
-        let strings = argv
-            .iter()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            strings,
-            [
-                "/tmp/carrick",
-                "trace",
-                "--profile",
-                "native-shape",
-                "--summary-jsonl",
-                "/tmp/native-shape.jsonl",
-                "--trace-out",
-                "/tmp/native-shape.raw",
-                "--native-shape-snapshots",
-                "/tmp/native-shape.snapshots",
-                "--trace-uid",
-                "501",
-                "--trace-gid",
-                "20",
-                "--forward-env",
-                "CARRICK_RUN_ID=native-shape-test",
-                "--",
-                "run",
-                "/bin/true",
-            ]
         );
     }
 }

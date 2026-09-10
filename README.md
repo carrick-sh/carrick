@@ -127,11 +127,6 @@ Hardware-assisted execution is supplied per host:
   FreeBSD/bhyve, and NetBSD/NVMM.
 - **Guest ISAs:** AArch64 on the reference macOS/HVF path, plus active x86_64
   bring-up through KVM, bhyve, and NVMM.
-- **Preserved optimization primitives:** `carrick-native-darwin`,
-  `carrick-dsr`, `carrick-dsr-aarch64`, and `carrick-dsr-x86` provide JIT
-  translation, `MAP_JIT` W^X primitives, and Tier-D direct binary patching for
-  future OS-level optimizations. They are not selectable shipped execution
-  backends.
 
 ---
 

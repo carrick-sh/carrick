@@ -117,10 +117,9 @@ pub(crate) fn el0_fault_access(esr: u64) -> Option<carrick_mem::page_table::Leaf
 }
 
 // `el0_debug_signal` (a pure AArch64 ESR_EL1 architectural fact) moved to
-// `carrick_dsr_aarch64::esr` with the DSR translator extraction (its exit
-// dispatch is a second consumer); re-exported so the HVF lowering below and
+// `carrick_aarch64::esr`; re-exported so the HVF lowering below and
 // every `el0_debug_signal` call path resolve unchanged.
-pub(crate) use carrick_dsr_aarch64::esr::el0_debug_signal;
+pub(crate) use carrick_aarch64::esr::el0_debug_signal;
 
 /// Upgrade `SEGV_MAPERR` to `SEGV_ACCERR` when Carrick's protection metadata
 /// says the faulting VA belongs to a live mapping that denies the access.

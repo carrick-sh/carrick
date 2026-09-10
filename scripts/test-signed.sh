@@ -107,11 +107,6 @@ jq -nc \
     --argjson requested_filter "$requested_filter_json" \
     '{schema:$schema,record_type:"header",source_head:$source_head,package:$package,arguments:$arguments,requested_test_filter:$requested_filter,carrick_run_id:$run_id}' \
     >"$receipt_tmp"
-# Hermetic translation store, as `just test` does: fixture guests must never
-# warm (or be warmed by) the user's persistent store.
-CARRICK_DSR_STORE_DIR="$(mktemp -d -t carrick-test-store)"
-export CARRICK_DSR_STORE_DIR
-
 scratch=()
 cleanup() {
     status=$?
@@ -134,7 +129,6 @@ cleanup() {
         cat "$cleanup_log"
         rm -f "$cleanup_log"
     done
-    rm -rf "$CARRICK_DSR_STORE_DIR"
     if [ "${#scratch[@]}" -gt 0 ]; then
         rm -f "${scratch[@]}"
     fi

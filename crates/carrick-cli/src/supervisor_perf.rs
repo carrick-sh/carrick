@@ -2,7 +2,7 @@
 //!
 //! # Theory of operation
 //!
-//! NATIVEPERF v2 (`carrick_runtime::native_darwin::dsr::profile`) reconciles
+//! NATIVEPERF v2 reconciles
 //! CPU *inside* each guest process (thread/blocked/startup/helper CPU), but
 //! the top-level `carrick run` process itself — the one this crate's
 //! `Commands::Run` arm drives — is never a guest and never emits a
@@ -48,11 +48,7 @@
 //! [`TOP_LEVEL_PID`] before any dispatch, and only the process whose
 //! `getpid()` matches may emit.
 
-/// Wire prefix shared with the in-guest NATIVEPERF v2 protocol
-/// (`crate::native_darwin::dsr::profile::PROTOCOL_PREFIX` in carrick-runtime;
-/// duplicated here rather than imported because the DSR module is
-/// `pub(crate)` inside carrick-runtime and this is a one-line producer, not a
-/// consumer of the shared frame machinery).
+/// Wire prefix for the supervisor NATIVEPERF v2 protocol.
 const PROTOCOL_PREFIX: &str = "NATIVEPERF1";
 
 /// The pid of the ONE true top-level `carrick` process, recorded exactly once
@@ -114,9 +110,8 @@ fn format_supervisor_record(self_cpu_ns: u64, children_cpu_ns: u64) -> String {
 }
 
 /// Write `line` (plus a trailing newline) to `fd` as a single atomic `write(2)`,
-/// retrying only on `EINTR`. Mirrors the transport discipline of the in-guest
-/// NATIVEPERF frame writer (`native_darwin::dsr::profile::write_protocol_frames_to_fd`):
-/// one syscall, no buffered `std::io::Write` layer that could tear the write
+/// retrying only on `EINTR`.
+/// One syscall, no buffered `std::io::Write` layer that could tear the write
 /// across two syscalls, and a short write is a hard error rather than a
 /// silent partial line.
 fn write_line_atomically_to_fd(fd: libc::c_int, line: &str) -> std::io::Result<()> {

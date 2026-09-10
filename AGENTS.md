@@ -29,11 +29,6 @@ BKL-free (per-subsystem locks, not a global lock).
   reference lane; Linux/KVM, FreeBSD/bhyve, and NetBSD/NVMM bring the Carrick
   kernel to additional host platforms, with x86_64 guest bring-up through the
   shared `carrick-x86` engine.
-- **Binary Patching & Translation Primitives (Preserved for Optimization)**:
-  `carrick-native-darwin`, `carrick-dsr`, `carrick-dsr-aarch64`, and
-  `carrick-dsr-x86` provide JIT translation, Apple Silicon `MAP_JIT` W^X
-  primitives, and Tier-D direct binary patching, preserved as building blocks
-  for future OS-level performance optimizations.
 
 The legacy 1:1 host-process-per-guest-process execution backends (legacy `vmm`
 and `native`) have been retired in favor of the consolidated HVPatch kernel.
@@ -95,7 +90,7 @@ compile/lint/test only.
 | `just build-debug [ARGS]` 🔏 | Build + codesign with debug entitlements (`get-task-allow` for lldb attaching). |
 | `just run [ARGS]` 🔏 | `just build` then run `target/release/carrick ARGS`. |
 | `just check [ARGS]` | Fast **unsigned** `cargo build` — compile-check only, cannot run a guest. |
-| `just test` | Host lib tests (no HVF/Docker). **Use the recipe, never a bare `cargo test --workspace --lib`** — `carrick-runtime`, `carrick-host` and `carrick-native-darwin` all fork from the test harness and deadlock when run in parallel, so the recipe runs every OTHER crate in parallel and then those three alone under `RUST_TEST_THREADS=1`. A per-module `TEST_LOCK` does **not** substitute: child reaping is PROCESS-wide, so a fork test in a sibling module can consume a stop/exit another module is mid-handshake with, and the rightful parent blocks forever (seen 2026-08-16 as an 11-minute `just test` hang at 0% CPU). |
+| `just test` | Host lib tests (no HVF/Docker). **Use the recipe, never a bare `cargo test --workspace --lib`** — `carrick-runtime` and `carrick-host` both fork from the test harness and deadlock when run in parallel, so the recipe runs every OTHER crate in parallel and then those two alone under `RUST_TEST_THREADS=1`. A per-module `TEST_LOCK` does **not** substitute: child reaping is PROCESS-wide, so a fork test in a sibling module can consume a stop/exit another module is mid-handshake with, and the rightful parent blocks forever (seen 2026-08-16 as an 11-minute `just test` hang at 0% CPU). |
 | `just test-integration` | Host integration suites (`carrick-runtime`/`engine`/`image`; no HVF). |
 | `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` (no-panic gate). |
 | `just fmt` / `just fmt-check` | Apply / check formatting. |
@@ -133,11 +128,6 @@ Two conventions to keep in mind:
 
 - **Use the `carrick-vmm-*` names for VMM crates** (`carrick-vmm-hvf`, not the
   historical `carrick-hvf`).
-- **DSR translation & binary patching core**: `carrick-dsr` provides the
-  platform-neutral traits and translation cache; `carrick-dsr-aarch64` and
-  `carrick-dsr-x86` provide the ISA-specific decoder/emitter/translator engines;
-  and `carrick-native-darwin` provides Darwin `MAP_JIT` and Tier-D binary
-  patching primitives. These are preserved for future OS-level optimization.
 
 ### Where key subsystems live
 - **Trap loop / syscall dispatch** — mature macOS trap loop in `crates/carrick-vmm-hvf/src/trap.rs`; x86 loop in `crates/carrick-x86/src/engine.rs` with backend adapters; dispatch in `crates/carrick-runtime/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall metadata in `crates/carrick-abi/src/syscall.rs` and guest-arch tables under `carrick-hal`.
@@ -375,19 +365,10 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
     A capture that yields nothing must be an error, not an empty summary.
   - **`execname` scoping silently tracks nothing** the moment two arms are built
     under different binary names. Cross-binary screens must key on carrick's own
-    `carrick*:::dsr-cache-*` lifecycle probes under `dtrace -Z`.
+    USDT lifecycle probes under `dtrace -Z`.
   - **Provider ABIs differ per host/build and must be qualified live**, not
     assumed (`sched:::preempt` does not exist on macOS; `vminfo:::as_fault`
     arg2 IS the exact 16 KiB host-page base).
-  - **USDT/pid-provider tracing of a live native guest is ALLOWED** — carrick's
-    own `carrick*:::` probes are the most direct instrument the native lane
-    has, and refusing them left whole subsystems (the shared-translation store
-    among them) measurable only by inference. Use `dtrace -Z` so probes in
-    not-yet-started processes still arm. The one real hazard is **fasttrap
-    detach**: an aborted session once leaked `SIGTRAP` into a continuing
-    FreeBSD tracee and killed a live Kaniko build, so let a session end on its
-    own rather than killing the consumer, and prefer kernel providers when the
-    tracee is a long, unrepeatable run you cannot afford to lose.
   - **Declare perturbation.** A probe on a 2M-events/run path can double `sys`
     time; a script that perturbs must say so, and only same-instrument ratios
     are then citable.
@@ -426,23 +407,6 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
   values before changing code; treat memory notes and prior diagnoses as
   hypotheses, not facts. Also verify *how you read the result* — empty output may
   mean "ran but unreadable," not "didn't happen."
-
-### Debugging the FreeBSD/amd64 native (DSR) lane
-
-The x86_64 native lane (`carrick-runtime/src/native_freebsd.rs`, driver
-`runtime::run_elf_native_dispatch`) runs guest code from a JIT cache with the
-`carrick-dsr-x86` gateway. `carrick trace` targets the container/VMM run, not
-this bare in-process runner. USDT and pid-provider probes on a continuing
-native process are permitted; the hazard to respect is **fasttrap detach**,
-which once leaked `SIGTRAP` and killed a live Kaniko build, so prefer the
-kernel-provider profiler (`sudo scripts/native-x86-profile.py PID`) when the
-tracee is a long run you cannot afford to lose. **Never
-hardcode the context offset** (XSAVE expansion moved it from 720 to 33024), and
-**the native-x86 gateway is zero-copy by contract** — 16,384/16,576-byte
-`memcpy` samples that scale with gateway entries are a performance-correctness
-failure. The launch-time `native_run` driver, the USDT census recipe, the
-gcore-and-disassemble-the-JIT procedure, and the JIT-unwind TODO are in
-[`.agents/skills/carrick-native-debug`](.agents/skills/carrick-native-debug).
 
 ---
 

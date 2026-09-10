@@ -28,12 +28,6 @@ workspace = true
 
 [features]
 default = ["platform-macos"]
-alloc-owner-census = ["carrick-dsr-aarch64/alloc-owner-census"]
-# Ablation-ladder measurement builds: the rung-3 zeroing knob
-# forwarded to the aarch64 lane. Never a default; an ablated binary is
-# incorrect by construction. See carrick-dsr/Cargo.toml and
-# docs/superpowers/specs/2026-08-07-ablation-ladder-design.md.
-ablation = ["carrick-dsr/ablation", "carrick-dsr-aarch64/ablation"]
 # Guest-side syscall shim (docs/syscall-shim-design.md). NO default here on
 # purpose: the binary (carrick-cli) is the single control point. carrick-cli's
 # default enables it for normal builds; dependents that use carrick-runtime as a
@@ -52,14 +46,6 @@ trace-hvf = ["carrick-vmm-hvf/trace-hvf"]
 trace-syscalls = ["carrick-vmm-hvf?/trace-syscalls", "carrick-observability/trace-syscalls"]
 debug-stats = ["carrick-vmm-hvf/debug-stats"]
 trace-elf = ["carrick-mem/trace-elf"]
-# Native test failpoints/captures (carrick_dsr::test_hooks). Never enabled by
-# production builds. This crate's own unit tests get the hook STATE through
-# the [dev-dependencies] re-declaration of carrick-dsr/carrick-dsr-aarch64
-# below (cargo feature unification applies dev-dep features to every test
-# target's dependency graph); the check sites in native_darwin compile under
-# `cfg(any(test, feature = "test-hooks"))`, so an external consumer can also
-# opt in explicitly via this forwarding feature.
-test-hooks = ["carrick-dsr/test-hooks", "carrick-dsr-aarch64/test-hooks"]
 
 # Platform backend selection (exactly one active at a time). carrick-cli's
 # `default` enables `platform-macos`; a `platform-linux` build links NO HVF.
@@ -97,17 +83,7 @@ carrick-vmm-kvm = { path = "../carrick-vmm-kvm", optional = true }
 carrick-host-linux = { path = "../carrick-host-linux", optional = true }
 # carrick-vmm-bhyve / carrick-vmm-nvmm are NOT declared here: they are
 # x86_64-only and live in arch-scoped target tables below.
-carrick-dsr = { path = "../carrick-dsr" }
-# The AArch64 guest-ISA translator crate. UNCONDITIONAL: it compiles on every
-# host (bad64/dynasmrt are pure Rust); only its assembled gateway is
-# target-gated inside the crate itself.
-carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64" }
-# The x86_64 guest-ISA translator crate. Also UNCONDITIONAL, same rationale as
-# carrick-dsr-aarch64 above: its portable layout/decode surface (consumed
-# cross-host by `x86_dsr_profiler_layout` for diagnostic scripts) compiles
-# everywhere; only its assembled native gateway is target-gated inside the
-# crate itself.
-carrick-dsr-x86 = { path = "../carrick-dsr-x86" }
+carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-host = { path = "../carrick-host" }
 carrick-kernel = { path = "../carrick-kernel" }
 carrick-mem = { path = "../carrick-mem" }
@@ -172,25 +148,12 @@ applevisor-sys.workspace = true
 mach2.workspace = true
 
 [dev-dependencies]
-# bad64/dynasmrt dropped to DEV-dependencies with the extraction-completing
-# slice: the runtime LIB no longer references either (the emulation blobs,
-# translator, and memory model live in carrick-dsr-aarch64); the
-# still-runtime-resident DSR oracle, the dsr shim test suites, and the
-# emission microbenchmark are the remaining consumers. UNCONDITIONAL (both
-# are pure Rust) so `--all-targets` typechecks the test code on every host.
-bad64.workspace = true
-dynasmrt.workspace = true
 carrick-test-support = { path = "../carrick-test-support" }
 tempfile.workspace = true
 tokio.workspace = true
 carrick-image = { path = "../carrick-image" }
 proptest.workspace = true
 static_assertions = "1"
-# The dev-dep feature-unification trick for the native test hooks: test
-# builds of this crate compile carrick-dsr WITH the hook state; production
-# consumers (carrick-cli) never enable it. See `test-hooks` in [features].
-carrick-dsr = { path = "../carrick-dsr", features = ["test-hooks"] }
-carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64", features = ["test-hooks"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
 carrick-vmm-hvf = { path = "../carrick-vmm-hvf", features = ["foreign-cow-test-support"] }

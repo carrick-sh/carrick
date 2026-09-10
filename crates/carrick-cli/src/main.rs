@@ -114,17 +114,6 @@ compile_error!(
     "multiple platforms selected: enable exactly one platform-* feature \
      (each pulls a mutually-exclusive host VMM backend)"
 );
-#[cfg(all(feature = "alloc-census", feature = "alloc-owner-census"))]
-compile_error!(
-    "alloc-census and alloc-owner-census install different global allocators; \
-     enable exactly one diagnostic"
-);
-#[cfg(all(
-    feature = "alloc-owner-census",
-    not(all(target_os = "macos", target_arch = "aarch64"))
-))]
-compile_error!("alloc-owner-census is supported only on Darwin/AArch64 native builds");
-
 // The AMP1 reader only parses a text stream and hashes the bundled D program,
 // so — like the census modules below — it is declared on every platform even
 // though only a libdtrace host can produce the stream.
@@ -137,30 +126,16 @@ mod commands;
 // `runtime::DebugStateSnapshot`; HVF-only.
 #[cfg(feature = "platform-macos")]
 mod debug;
-// The census modules only parse text files the native lane wrote, so — like
-// `debug_layout` and unlike `debug` — they are declared on every platform.
-mod debug_alloc_owner;
 mod debug_amplification;
-mod debug_census;
 mod debug_core;
 mod debug_exec_stamps;
-mod debug_jit_shape;
-mod debug_layout;
 mod fs_setup;
 mod hvpatch_core_profile;
 // Strict text reader for the bundled one-VM HVPatch K1 lifecycle profile.
 mod hvpatch_exec_runtime_profile;
 mod hvpatch_identity_host_safety_profile;
 mod hvpatch_k1_profile;
-mod jit_shape_snapshot;
 mod lifecycle;
-#[cfg(target_os = "macos")]
-mod native_fault_profile;
-mod native_perf_epochs;
-mod native_profile_qualification;
-// The authenticated raw protocol is wired by follow-on trace CLI work.
-#[allow(dead_code)]
-mod native_shape_profile;
 // `perf_stats` + the bulk of `trace_profile` back the BSD libdtrace-based
 // `carrick trace --profile` pipeline. Other hosts retain only the shared
 // `TraceProfileKind` argument vocabulary.
@@ -199,14 +174,9 @@ use crate::runtime_util::register_dtrace_probes;
 /// plausible-but-false symbols; `fbt::mach_vm_allocate` never fires;
 /// `syscall::mmap` sees only MAP_NORESERVE reservations because libmalloc
 /// sub-allocates a few large regions).
-#[cfg(all(feature = "alloc-census", not(feature = "alloc-owner-census")))]
+#[cfg(feature = "alloc-census")]
 #[global_allocator]
 static ALLOC_CENSUS: dhat::Alloc = dhat::Alloc;
-
-#[cfg(feature = "alloc-owner-census")]
-#[global_allocator]
-static ALLOC_OWNER_CENSUS: carrick_runtime::alloc_owner_census::TaggedSystem =
-    carrick_runtime::alloc_owner_census::TaggedSystem;
 
 /// One output file per carrier process. The profiler must outlive all guest
 /// work, so `main` holds it to the end; the only host re-exec left is
@@ -247,14 +217,6 @@ fn start_alloc_census() {
     }
 }
 
-#[cfg(feature = "alloc-owner-census")]
-fn start_alloc_owner_census() -> anyhow::Result<()> {
-    if carrick_runtime::alloc_owner_census::init_main_from_environment()? {
-        let _ = carrick_runtime::alloc_owner_census::register_atexit_backstop()?;
-    }
-    Ok(())
-}
-
 fn seed_vm_lifecycle_command_identity()
 -> Result<(), carrick_runtime::vm_lifecycle::VmLifecycleArtifactError> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -275,8 +237,6 @@ fn main() -> anyhow::Result<()> {
     // before it (env-gated; one getenv when off).
     carrick_runtime::exec_stamps::stamp(carrick_runtime::exec_stamps::ExecStampPhase::MainEntry);
     seed_vm_lifecycle_command_identity()?;
-    #[cfg(feature = "alloc-owner-census")]
-    start_alloc_owner_census()?;
     #[cfg(feature = "alloc-census")]
     start_alloc_census();
     // FIRST, before any dispatch: record this process as the one true

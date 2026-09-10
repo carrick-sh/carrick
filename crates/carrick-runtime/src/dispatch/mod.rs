@@ -5207,7 +5207,7 @@ impl NormalizedDispatchRoute for MutationDispatchRoute<'_, '_, '_> {
 /// and must never be handed to a host call that takes one.
 ///
 /// A process-global flag, following the precedent of
-/// `guest_cpu::set_native_darwin_provider`: the free functions that need this
+/// `guest_cpu::set_native_host_provider`: the free functions that need this
 /// fact (the signal send path) hold no dispatcher, and threading one through
 /// every caller would be a larger change than the fact warrants.
 static HVPATCH_LANE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

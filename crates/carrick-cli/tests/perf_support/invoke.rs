@@ -191,6 +191,7 @@ fn isolate_backend_process(command: &mut Command) {
 /// Run one direct-ELF sample in its own process group with a scoped run id.
 /// The function returns only a clean, successful process output; timeout and
 /// nonzero status are hard errors and cleanup runs for both backends.
+#[allow(dead_code)]
 pub fn run_carrick_backend(
     bin: &Path,
     repo_root: &Path,

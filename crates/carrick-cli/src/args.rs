@@ -91,12 +91,6 @@ pub(crate) enum PullArg {
     Never,
 }
 
-#[derive(Copy, Clone, Debug, clap::ValueEnum)]
-pub(crate) enum NativeProfileTerminalMode {
-    Thread,
-    Process,
-}
-
 impl From<PullArg> for carrick_image::PullPolicy {
     fn from(p: PullArg) -> Self {
         match p {
@@ -118,33 +112,6 @@ pub(crate) enum Commands {
         id: String,
         grant_fd: i32,
     },
-    /// Internal process-birth qualification fixture for native profiling.
-    #[command(name = "__native-profile-birth-fixture", hide = true)]
-    NativeProfileBirthFixture {
-        #[arg(long, default_value_t = 500)]
-        hold_ms: u64,
-        #[arg(long)]
-        quiet: bool,
-    },
-    /// Internal terminal-call qualification fixture for native profiling.
-    #[command(name = "__native-profile-terminal-fixture", hide = true)]
-    NativeProfileTerminalFixture {
-        #[arg(long, value_enum)]
-        mode: NativeProfileTerminalMode,
-        #[arg(long)]
-        quiet: bool,
-    },
-    /// Internal receipt validator for native-profile launch qualification.
-    #[command(name = "__native-profile-validate-qualification", hide = true)]
-    NativeProfileValidateQualification {
-        #[arg(long)]
-        birth: PathBuf,
-        #[arg(long)]
-        thread: PathBuf,
-        #[arg(long)]
-        process: PathBuf,
-    },
-    /// Internal parser harness for fail-closed native-profile fixtures.
     #[command(name = "__native-profile-validate", hide = true)]
     NativeProfileValidate {
         #[arg(long)]
@@ -161,7 +128,7 @@ pub(crate) enum Commands {
         dynamic_dirty_drops: u64,
         #[arg(long, default_value_t = 0)]
         other_drops: u64,
-        #[arg(long, default_value_t = false)]
+        #[arg(long)]
         interrupted: bool,
     },
 
@@ -795,21 +762,12 @@ pub(crate) enum Commands {
         #[arg(long = "core-artifact", value_name = "FILE", requires = "profile")]
         core_artifact: Option<std::path::PathBuf>,
         /// Override the profile's capture bound, in seconds (multiple of 10).
-        /// The `native-wall` profile otherwise stops at its shipped 180 s
-        /// ceiling, which cannot hold a workload that runs for minutes.
         #[arg(
             long = "profile-bound-seconds",
             value_name = "SECONDS",
             requires = "profile"
         )]
         profile_bound_seconds: Option<u64>,
-        /// Fresh directory for native-shape retirement snapshots.
-        #[arg(
-            long = "native-shape-snapshots",
-            value_name = "DIR",
-            requires = "profile"
-        )]
-        native_shape_snapshots: Option<std::path::PathBuf>,
         /// Refuse to capture on a host that is not quiet, and record what it
         /// settled to in the stream header.
         ///
@@ -996,56 +954,6 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         run_id: String,
     },
-    /// Print the versioned native-x86 DSR context layout consumed by
-    /// `scripts/native-x86-profile.py`. The running process's matching Carrick
-    /// binary is authoritative; do not hardcode these offsets in D scripts.
-    NativeX86Layout,
-    /// Aggregate the per-process translation census a native run wrote under
-    /// `CARRICK_XLAT_CENSUS_DIR` and print the result as JSON: translation
-    /// redundancy, distinct unit keys and their per-key block counts, the share
-    /// of blocks that fall inside a configured segment, and what the flush
-    /// lineage says about processes the census missed.
-    XlatCensus {
-        /// Directory holding the run's `xlat-<pid>-<stamp>-<seq>.txt` files.
-        dir: PathBuf,
-        /// Per-key rows to print. The key COUNT is never truncated.
-        #[arg(long = "top", default_value_t = 20)]
-        top: usize,
-        /// Process INCARNATIONS the run actually started, counted by other
-        /// means (the census cannot know: a process that dies by a fatal signal
-        /// writes nothing). Supplying it turns `processes.coverage` on.
-        ///
-        /// The unit must match `processes.incarnations` or the ratio is
-        /// meaningless: one incarnation is one process-image lifetime, so a pid
-        /// that performs carrick's host self-re-exec holds TWO, while a pid that
-        /// `execve`s in process holds ONE. A bare pid count is the wrong
-        /// denominator in the first case and the right one in the second.
-        /// `CARRICK_DSR_PROFILE`'s main-thread eras are counted the same way.
-        #[arg(long = "processes-observed")]
-        processes_observed: Option<u64>,
-    },
-    /// Strictly join allocation-owner fragments to a complete NATIVEPERF
-    /// export and print the non-overlapping owner opportunity portfolio.
-    AllocOwnerCensus {
-        /// Directory holding `alloc-owner-*.txt` fragments from one run.
-        dir: PathBuf,
-        /// Complete NATIVEPERF export from the same run.
-        #[arg(long = "native-perf")]
-        native_perf: PathBuf,
-        /// Independently expected process-image epochs in the run.
-        #[arg(long = "expected-process-epochs")]
-        expected_process_epochs: u64,
-        /// Independently expected distinct host PIDs in the run.
-        #[arg(long = "expected-pids")]
-        expected_pids: u64,
-        /// Measured share of total workload CPU attributable to ordinary host
-        /// allocation work. Omit only for the strict coverage-only fallback.
-        #[arg(long = "normal-host-allocation-opportunity-share")]
-        normal_host_allocation_opportunity_share: Option<f64>,
-        /// Minimum projected share of total workload CPU worth pursuing.
-        #[arg(long = "qualification-share-of-total", default_value_t = 0.10)]
-        qualification_share_of_total: f64,
-    },
     /// Turn one authenticated `AMP1` capture into the typed Darwin kernel
     /// amplification ledger: host calls, host kernel CPU-ns, mach traps and
     /// faults per guest operation, with `carrick-only` kept out of every ratio
@@ -1079,22 +987,6 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Re-analyze an ARCHIVED `NFAULT2` native-fault capture offline: print
-    /// the bias-aware `memory_fault_partition` table and optionally publish
-    /// the full `carrick.native-fault-attribution.v4` summary record.
-    /// Corroborating a published partition is one command against the
-    /// archived raw. The raw's header `program_sha256` must name the bundled
-    /// `native-fault-attribution.d` or the command refuses by digest; the
-    /// capture command's own zero exit remains the drop authority (the
-    /// stream carries no in-band consumer-drop record).
-    NativeFaultPartition {
-        /// Complete `NFAULT2` stream from `carrick trace --profile
-        /// native-fault -o`.
-        raw: PathBuf,
-        /// Publish the full summary JSONL without overwriting an artifact.
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
     /// Parse a complete `CARRICK_EXEC_STAMPS` v2 export, validate every
     /// fork/exec/exit/reap relationship, and print CPU/wall attribution JSON.
     ExecStampCensus {
@@ -1105,34 +997,6 @@ pub(crate) enum DebugCommand {
         /// upper bound; CPU shares use the export's exact run-complete rusage.
         #[arg(long = "workload-ns")]
         workload_ns: u64,
-    },
-    /// Join a complete native AArch64 sampled-PC trace to authenticated JIT
-    /// retirement snapshots and report exact emitted context traffic.
-    JitShapeCensus {
-        /// Complete NSHAPE2 stream from the native-shape profile.
-        trace: PathBuf,
-        /// Accepted native-shape capture receipt authenticating this trace.
-        #[arg(long)]
-        capture: PathBuf,
-        /// Directory containing paired v4 JSON and binary JIT snapshots.
-        #[arg(long)]
-        snapshots: PathBuf,
-        /// Publish the deterministic census without overwriting an artifact.
-        /// Omit to write the same bytes to stdout.
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
-    /// Compare two independently authenticated native AArch64 JIT-shape
-    /// censuses under one determinant-locked exact-arithmetic contract.
-    JitShapeCompare {
-        /// First complete canonical v3 census.
-        a: PathBuf,
-        /// Second complete canonical v3 census.
-        b: PathBuf,
-        /// Publish the deterministic comparison without overwriting an
-        /// artifact. Omit to write the same bytes to stdout.
-        #[arg(long)]
-        output: Option<PathBuf>,
     },
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
@@ -1499,43 +1363,6 @@ mod tests {
         assert_eq!(profile, Some(TraceProfileKind::HvpatchIdentityHostSafety));
     }
 
-    #[test]
-    fn native_shape_profile_parses_with_all_dedicated_outputs() {
-        let cli = Cli::try_parse_from([
-            "carrick",
-            "trace",
-            "--profile",
-            "native-shape",
-            "--trace-out",
-            "/tmp/native-shape.raw",
-            "--summary-jsonl",
-            "/tmp/native-shape.capture.jsonl",
-            "--native-shape-snapshots",
-            "/tmp/native-shape.snapshots",
-            "--",
-            "run",
-            "--exec-backend",
-            "native",
-            "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "/bin/true",
-        ])
-        .expect("native-shape trace command should parse");
-
-        let Commands::Trace {
-            profile,
-            native_shape_snapshots,
-            ..
-        } = cli.command
-        else {
-            panic!("expected trace command");
-        };
-        assert_eq!(profile, Some(TraceProfileKind::NativeShape));
-        assert_eq!(
-            native_shape_snapshots.as_deref(),
-            Some(std::path::Path::new("/tmp/native-shape.snapshots"))
-        );
-    }
-
     /// The quiet-host preflight is the Rust-first half of the capture driver:
     /// its whole value is that a DIRTY host aborts before producing a number,
     /// so it has to be reachable from the command that takes the measurement,
@@ -1608,157 +1435,6 @@ mod tests {
     }
 
     #[test]
-    fn jit_shape_census_requires_capture_and_snapshots_but_not_output() {
-        let cli = Cli::try_parse_from([
-            "carrick",
-            "debug",
-            "jit-shape-census",
-            "/tmp/native-shape.raw",
-            "--capture",
-            "/tmp/native-shape.capture.jsonl",
-            "--snapshots",
-            "/tmp/native-shape.snapshots",
-        ])
-        .expect("authenticated census arguments should parse without --output");
-        let Commands::Debug {
-            command:
-                DebugCommand::JitShapeCensus {
-                    trace,
-                    capture,
-                    snapshots,
-                    output,
-                },
-        } = cli.command
-        else {
-            panic!("expected jit-shape-census command");
-        };
-        assert_eq!(trace, std::path::Path::new("/tmp/native-shape.raw"));
-        assert_eq!(
-            capture,
-            std::path::Path::new("/tmp/native-shape.capture.jsonl")
-        );
-        assert_eq!(
-            snapshots,
-            std::path::Path::new("/tmp/native-shape.snapshots")
-        );
-        assert_eq!(output, None);
-
-        for missing in [
-            vec![
-                "carrick",
-                "debug",
-                "jit-shape-census",
-                "/tmp/native-shape.raw",
-                "--snapshots",
-                "/tmp/native-shape.snapshots",
-            ],
-            vec![
-                "carrick",
-                "debug",
-                "jit-shape-census",
-                "/tmp/native-shape.raw",
-                "--capture",
-                "/tmp/native-shape.capture.jsonl",
-            ],
-        ] {
-            assert!(
-                Cli::try_parse_from(missing).is_err(),
-                "accepted command missing an authenticated input"
-            );
-        }
-    }
-
-    #[test]
-    fn jit_shape_census_accepts_output_and_rejects_removed_ratio() {
-        let with_output = Cli::try_parse_from([
-            "carrick",
-            "debug",
-            "jit-shape-census",
-            "/tmp/native-shape.raw",
-            "--capture",
-            "/tmp/native-shape.capture.jsonl",
-            "--snapshots",
-            "/tmp/native-shape.snapshots",
-            "--output",
-            "/tmp/native-shape.census.json",
-        ]);
-        assert!(
-            with_output.is_ok(),
-            "--output should be optional and accepted"
-        );
-
-        assert!(
-            Cli::try_parse_from([
-                "carrick",
-                "debug",
-                "jit-shape-census",
-                "/tmp/native-shape.raw",
-                "--capture",
-                "/tmp/native-shape.capture.jsonl",
-                "--snapshots",
-                "/tmp/native-shape.snapshots",
-                "--jit-share-of-total",
-                "0.45",
-            ])
-            .is_err(),
-            "the unauthenticated imported JIT ratio must be unknown"
-        );
-    }
-
-    #[test]
-    fn jit_shape_compare_requires_both_censuses_but_not_output() {
-        let cli = Cli::try_parse_from([
-            "carrick",
-            "debug",
-            "jit-shape-compare",
-            "/tmp/a.census.json",
-            "/tmp/b.census.json",
-        ])
-        .expect("paired comparison arguments should parse without --output");
-        let Commands::Debug {
-            command: DebugCommand::JitShapeCompare { a, b, output },
-        } = cli.command
-        else {
-            panic!("expected jit-shape-compare command");
-        };
-        assert_eq!(a, std::path::Path::new("/tmp/a.census.json"));
-        assert_eq!(b, std::path::Path::new("/tmp/b.census.json"));
-        assert_eq!(output, None);
-
-        assert!(
-            Cli::try_parse_from([
-                "carrick",
-                "debug",
-                "jit-shape-compare",
-                "/tmp/a.census.json",
-            ])
-            .is_err(),
-            "the second independently authenticated census is mandatory",
-        );
-
-        let with_output = Cli::try_parse_from([
-            "carrick",
-            "debug",
-            "jit-shape-compare",
-            "/tmp/a.census.json",
-            "/tmp/b.census.json",
-            "--output",
-            "/tmp/comparison.json",
-        ])
-        .expect("paired comparison should accept --output");
-        let Commands::Debug {
-            command: DebugCommand::JitShapeCompare { output, .. },
-        } = with_output.command
-        else {
-            panic!("expected jit-shape-compare command with output");
-        };
-        assert_eq!(
-            output.as_deref(),
-            Some(std::path::Path::new("/tmp/comparison.json")),
-        );
-    }
-
-    #[test]
     fn network_inspect_accepts_multiple_names_like_docker() {
         assert!(
             Cli::try_parse_from(["carrick", "network", "inspect", "net1", "net2"]).is_ok(),
@@ -1807,30 +1483,6 @@ mod tests {
             ])
             .is_ok(),
             "timeout diagnostics need a standalone snapshot command"
-        );
-    }
-
-    #[test]
-    fn alloc_owner_census_accepts_explicit_join_authority() {
-        assert!(
-            Cli::try_parse_from([
-                "carrick",
-                "debug",
-                "alloc-owner-census",
-                "/tmp/owners",
-                "--native-perf",
-                "/tmp/nativeperf.txt",
-                "--expected-process-epochs",
-                "140",
-                "--expected-pids",
-                "70",
-                "--normal-host-allocation-opportunity-share",
-                "0.30",
-                "--qualification-share-of-total",
-                "0.10",
-            ])
-            .is_ok(),
-            "allocation-owner aggregation needs explicit workload identity and opportunity authority"
         );
     }
 }

@@ -82,6 +82,7 @@ impl QuietHostReceipt {
     /// recording a number that can never appear. What varies, and therefore
     /// what is worth carrying, is how long the host took to settle and what it
     /// settled to.
+    #[allow(dead_code)]
     pub(crate) fn header_fields(&self) -> String {
         format!(
             "|preflight=quiet-host|preflight_settle_s={}|preflight_loadavg1_milli={}",

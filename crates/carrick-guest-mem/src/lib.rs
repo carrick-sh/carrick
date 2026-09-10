@@ -295,12 +295,11 @@ impl HostVa {
 }
 
 /// Resolved native page profile for a run — how Linux page semantics map
-/// onto the host's page size on the native (DSR) execution backend.
+/// onto the host's page size on the native execution backend.
 ///
 /// Relocated from `carrick-spec` (which re-exports it, so spec-side paths
-/// are unchanged) during the staged native-DSR extraction: the neutral
-/// page-geometry vocabulary in `carrick-dsr` embeds this leaf type, and
-/// carrick-dsr must stay off carrick-spec's heavyweight (oci-client/rustls)
+/// are unchanged): the neutral page-geometry vocabulary embeds this leaf type,
+/// and it must stay off carrick-spec's heavyweight (oci-client/rustls)
 /// dependency graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

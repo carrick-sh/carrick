@@ -33,7 +33,6 @@ use anyhow::{Context, bail};
 use carrick_runtime::runtime::DebugStateSnapshot;
 
 use crate::args::DebugCommand;
-use crate::debug_layout::native_x86_layout_json;
 
 pub(crate) fn run_debug(
     command: DebugCommand,
@@ -125,65 +124,14 @@ pub(crate) fn run_debug(
                 }))?
             );
         }
-        DebugCommand::NativeX86Layout => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&native_x86_layout_json())?
-            );
-        }
-        DebugCommand::XlatCensus {
-            dir,
-            top,
-            processes_observed,
-        } => {
-            crate::debug_census::run_xlat_census(&dir, top, processes_observed)?;
-        }
-        DebugCommand::AllocOwnerCensus {
-            dir,
-            native_perf,
-            expected_process_epochs,
-            expected_pids,
-            normal_host_allocation_opportunity_share,
-            qualification_share_of_total,
-        } => {
-            crate::debug_alloc_owner::run_alloc_owner_census(
-                &crate::debug_alloc_owner::AllocOwnerCensusRequest {
-                    dir,
-                    native_perf,
-                    expected_process_epochs,
-                    expected_pids,
-                    normal_host_allocation_opportunity_share,
-                    qualification_share_of_total,
-                },
-            )?;
-        }
         DebugCommand::AmplificationLedger { trace, output } => {
             crate::debug_amplification::run_amplification_ledger(&trace, output.as_deref())?;
         }
         DebugCommand::AmplificationCompare { a, b, output } => {
             crate::debug_amplification::run_amplification_compare(&a, &b, output.as_deref())?;
         }
-        DebugCommand::NativeFaultPartition { raw, output } => {
-            crate::native_fault_profile::run_native_fault_partition(&raw, output.as_deref())?;
-        }
         DebugCommand::ExecStampCensus { input, workload_ns } => {
             crate::debug_exec_stamps::run_exec_stamp_census(&input, workload_ns)?;
-        }
-        DebugCommand::JitShapeCensus {
-            trace,
-            capture,
-            snapshots,
-            output,
-        } => {
-            crate::debug_jit_shape::run_jit_shape_census(
-                &trace,
-                &capture,
-                &snapshots,
-                output.as_deref(),
-            )?;
-        }
-        DebugCommand::JitShapeCompare { a, b, output } => {
-            crate::debug_jit_shape::run_jit_shape_compare(&a, &b, output.as_deref())?;
         }
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();

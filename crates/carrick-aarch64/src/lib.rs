@@ -26,6 +26,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod engine;
+pub mod esr;
 pub mod mailbox;
 pub mod stage1_authority;
 pub mod vmm;

@@ -238,12 +238,6 @@ fmt:
 test *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Guest-running tests must never publish translation units into the
-    # user's real persistent store (fixture guests would warm — and be
-    # warmed by — production state). Point the store at a per-gate tempdir.
-    CARRICK_DSR_STORE_DIR="$(mktemp -d -t carrick-test-store)"
-    export CARRICK_DSR_STORE_DIR
-    trap 'rm -rf "$CARRICK_DSR_STORE_DIR"' EXIT
     if [ "{{os()}}" = "macos" ]; then
         # Runtime tests exercise process-wide signal dispositions, custom-x18
         # transitions, and fork from the test harness. Running those cases on
@@ -261,13 +255,12 @@ test *ARGS:
         # `fs_backend_flag.rs` drive the cargo-built binary via assert_cmd and
         # run no guest (adding `--test cli --test fs_backend_flag` here is a
         # follow-up; the recipe body is unchanged in this commit). The others
-        # (`conformance.rs`, `perf_runner.rs`, `dsr_trace_overhead.rs`,
-        # `trace_profile.rs`) shell out to the SIGNED `target/release/carrick`
-        # and run real guests or dtrace. This recipe is defined as the tests
-        # that do NOT need the HVF runtime or Docker; those belong to a
-        # guest-capable lane (`just conformance*`,
+        # (`conformance.rs`, `perf_runner.rs`, `trace_profile.rs`) shell out to the
+        # SIGNED `target/release/carrick` and run real guests or dtrace. This recipe
+        # is defined as the tests that do NOT need the HVF runtime or Docker;
+        # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
-        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-native-darwin --exclude carrick-host --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
+        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-host --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -275,7 +268,6 @@ test *ARGS:
         # scoped to the bin-only CLI test process rather than every workspace
         # crate (see `test(debug): bound the jit-shape publication test's stack`).
         env RUST_MIN_STACK=8388608 cargo test -p carrick-cli --bin carrick {{ARGS}}
-        env RUST_TEST_THREADS=1 cargo test -p carrick-native-darwin --lib {{ARGS}}
         # carrick-host needs the same serial treatment, for the same reason and
         # one more. Its `guest_cpu` tests `libc::fork()` from the harness and
         # drive a real SIGSTOP/waitpid handshake with the child; its
@@ -335,10 +327,6 @@ doc *ARGS:
 test-integration:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Hermetic translation store for guest-running suites; see `test`.
-    CARRICK_DSR_STORE_DIR="$(mktemp -d -t carrick-test-store)"
-    export CARRICK_DSR_STORE_DIR
-    trap 'rm -rf "$CARRICK_DSR_STORE_DIR"' EXIT
     if [ "{{os()}}" = "macos" ]; then
         cargo test -p carrick-runtime --test integration
         cargo test -p carrick-runtime --test syscall_process
@@ -543,10 +531,6 @@ sign:
 # `just bench` = quick profile; `just bench full` = full profile.
 bench PROFILE="quick":
     ./scripts/measure-perf.sh {{PROFILE}}
-
-# Report-only native16k/HVF comparison over identical direct-ELF artifacts.
-bench-backends PROFILE="quick":
-    ./scripts/measure-perf.sh backends {{PROFILE}}
 
 # Report-only legacy/mailbox HVF syscall-transport comparison over identical
 # signed VMM commands and native-PIE guest artifacts.
