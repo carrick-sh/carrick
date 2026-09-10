@@ -20,6 +20,7 @@ pauseeintr
 pidnsinitreap
 posixtimers
 ppollsig
+ppollwaitset
 pselecteintr
 selecttimeout
 sigchld
@@ -28,6 +29,8 @@ splicenetpoll
 timeclock
 timeextra
 timersettimeabs
+tlbibroadcast
 vforkexecthread
 waitexitstorm
 waitsiblingsigchld
+windowcoherence
