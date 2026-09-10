@@ -439,4 +439,30 @@ fn main() {
         println!("scm_magic_match=false");
         println!("scm_blocks_match=false");
     }
+
+    // Reopening a file selects a new access mode from inode permissions; it
+    // does not inherit the original descriptor's read-only restriction.
+    let access_path = CString::new("/tmp/statfs_reopen_access.txt").unwrap();
+    let access_fd = unsafe { libc::open(access_path.as_ptr(), libc::O_CREAT | libc::O_RDONLY, 0o600) };
+    println!("reopen_access_create_errno={}", if access_fd < 0 { errno() } else { 0 });
+    let access_proc = CString::new(format!("/proc/self/fd/{access_fd}")).unwrap();
+    for phase in ["linked", "unlinked"] {
+        let reopened = if access_fd >= 0 {
+            unsafe { libc::open(access_proc.as_ptr(), libc::O_WRONLY) }
+        } else { -1 };
+        let open_errno = if access_fd < 0 { -1 } else if reopened < 0 { errno() } else { 0 };
+        println!("reopen_access_{phase}_errno={open_errno}");
+        let written = if reopened >= 0 {
+            unsafe { libc::write(reopened, b"x".as_ptr().cast(), 1) }
+        } else { -1 };
+        let write_errno = if reopened < 0 { -1 } else if written < 0 { errno() } else { 0 };
+        println!("reopen_access_{phase}_written={written}");
+        println!("reopen_access_{phase}_write_errno={write_errno}");
+        if reopened >= 0 { unsafe { libc::close(reopened) }; }
+        if phase == "linked" {
+            let rc = unsafe { libc::unlink(access_path.as_ptr()) };
+            println!("reopen_access_unlink_errno={}", if rc < 0 { errno() } else { 0 });
+        }
+    }
+    if access_fd >= 0 { unsafe { libc::close(access_fd) }; }
 }
