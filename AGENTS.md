@@ -369,6 +369,13 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
   - **Provider ABIs differ per host/build and must be qualified live**, not
     assumed (`sched:::preempt` does not exist on macOS; `vminfo:::as_fault`
     arg2 IS the exact 16 KiB host-page base).
+  - **USDT/pid-provider tracing of a live guest is ALLOWED** — carrick's own
+    `carrick*:::` probes are the most direct instrument there is. Use
+    `dtrace -Z` so probes in not-yet-started processes still arm. The one real
+    hazard is **fasttrap detach**: an aborted session once leaked `SIGTRAP`
+    into a continuing tracee and killed a live build, so let a session end on
+    its own rather than killing the consumer, and prefer kernel providers when
+    the tracee is a long, unrepeatable run you cannot afford to lose.
   - **Declare perturbation.** A probe on a 2M-events/run path can double `sys`
     time; a script that perturbs must say so, and only same-instrument ratios
     are then citable.
