@@ -498,15 +498,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
-      "ordinal_in_function": 10,
-      "fingerprint": "5752fdeef66c44b5c3925b8ff33cb82feae5f93ff0dd12e645e7257c3a20fc52",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::deferred_anonymous_mmap",
-      "rationale": "A validated private anonymous mmap was published before its deferred pristine range was recorded; rejecting an invalid or unaligned range at this point would split guest VMA authority from zero-read provenance."
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "SyscallDispatcher::mprotect",
       "ordinal_in_function": 1,
       "fingerprint": "b90af5c066d5bddee4c68adac71e6ab6ec082a5eda649675c24cb0c819f07f48",
