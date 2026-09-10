@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 use parking_lot::Mutex;
 
 use carrick_abi::LinuxGuestAbi;
+use carrick_fatal::carrick_fatal;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use carrick_hal::ThreadedEngine as _;
 
@@ -536,7 +537,10 @@ fn restore_worker_vcpu_before_binding_publication<V, B>(
     publish: impl FnOnce(B, &Option<V>) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
     if worker_vcpu.replace(vcpu).is_some() {
-        std::process::abort();
+        carrick_fatal!(
+            "vcpu_loop::executor_lease",
+            "worker vCPU slot unexpectedly occupied prior to binding publication"
+        );
     }
     publish(backend, worker_vcpu)
 }
@@ -707,7 +711,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             binding: Some(
                 self.binding
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort()),
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "vcpu_loop::executor_lease",
+                            "HvpatchPersistentExecutor task binding disappeared between quantum setup and control construction: executor_id={:?}",
+                            self.executor_id
+                        );
+                    }),
             ),
             cow_invalidation_observer: self.cow_invalidation_observer.as_ref(),
         };
@@ -801,7 +811,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         if let Err(error) = engine.restore_persistent_executor_invariants() {
             return Err(ExecutorSaveError::new(error, lease));
         }
-        let engine = self.current.take().unwrap_or_else(|| std::process::abort());
+        let engine = self.current.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "vcpu_loop::executor_lease",
+                "HvpatchPersistentExecutor missing active engine during save transition: executor_id={:?}",
+                self.executor_id
+            );
+        });
         let Some(binding) = self.binding.take() else {
             return Err(ExecutorSaveError::new(
                 TrapError::Hypervisor("HVPatch save lost task binding".into()),
@@ -813,14 +829,24 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             let (lifecycle, vcpu) =
                 carrick_vmm_hvf::hvf_aarch64_engine::detach_task_only_engine(&task_only, engine);
             if self.lifecycle.replace(lifecycle).is_some() {
-                std::process::abort();
+                carrick_fatal!(
+                    "vcpu_loop::executor_lease",
+                    "HvpatchPersistentExecutor lifecycle slot unexpectedly occupied during engine detachment in save: executor_id={:?}",
+                    self.executor_id
+                );
             }
             (HvpatchTaskEngineBindingState::task_only(task_only), vcpu)
         } else {
             let lifecycle = self
                 .lifecycle
                 .as_mut()
-                .unwrap_or_else(|| std::process::abort());
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "vcpu_loop::executor_lease",
+                        "HvpatchPersistentExecutor missing lifecycle state during engine detachment in save: executor_id={:?}",
+                        self.executor_id
+                    );
+                });
             let (state, vcpu) =
                 carrick_vmm_hvf::hvf_aarch64_engine::detach_task_engine(engine, lifecycle);
             (HvpatchTaskEngineBindingState::initial(state), vcpu)
@@ -863,7 +889,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 "dirty HVPatch executor boundary".into(),
             ));
         }
-        let vcpu = self.vcpu.as_ref().unwrap_or_else(|| std::process::abort());
+        let vcpu = self.vcpu.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "vcpu_loop::executor_lease",
+                "HvpatchPersistentExecutor missing vCPU handle during boundary audit: executor_id={:?}",
+                self.executor_id
+            );
+        });
         if carrick_vmm_hvf::hvf_aarch64_engine::persistent_vcpu_identity(vcpu) != self.raw_vcpu_id
             || current_owner_thread_port() != self.owner_thread_port
         {
@@ -873,7 +905,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         }
         self.lifecycle
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "vcpu_loop::executor_lease",
+                    "HvpatchPersistentExecutor missing active engine during boundary audit: executor_id={:?}",
+                    self.executor_id
+                );
+            })
             .audit_persistent_executor_idle()?;
         Ok(())
     }
@@ -888,14 +926,24 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                         &task_only, engine,
                     );
                 if self.lifecycle.replace(lifecycle).is_some() {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "vcpu_loop::executor_lease",
+                        "HvpatchPersistentExecutor lifecycle slot unexpectedly occupied during engine detachment in destroy: executor_id={:?}",
+                        self.executor_id
+                    );
                 }
                 (HvpatchTaskEngineBindingState::task_only(task_only), vcpu)
             } else {
                 let lifecycle = self
                     .lifecycle
                     .as_mut()
-                    .unwrap_or_else(|| std::process::abort());
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "vcpu_loop::executor_lease",
+                            "HvpatchPersistentExecutor missing lifecycle state during engine detachment in destroy: executor_id={:?}",
+                            self.executor_id
+                        );
+                    });
                 let (state, vcpu) =
                     carrick_vmm_hvf::hvf_aarch64_engine::detach_task_engine(engine, lifecycle);
                 (HvpatchTaskEngineBindingState::initial(state), vcpu)
@@ -1707,8 +1755,12 @@ impl PreparedVforkChildActivation {
                     ExecutionFailure::SnapshotRestoreFailed,
                 )
                 .unwrap_or_else(|cleanup_error| {
-                    tracing::error!(%error, %cleanup_error, "vfork child activation rollback failed");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "kernel::scheduler_rollback",
+                        "scheduler fail_runnable_exact rollback failed during vfork child activation failure cleanup: child_key={:?}, gen={:?}, error={cleanup_error}",
+                        child_thread.key(),
+                        proof.generation
+                    );
                 });
             error
         };
@@ -2437,10 +2489,13 @@ struct ReceiptLog(Mutex<ReceiptState>);
 impl ReceiptLog {
     fn record(&self, executor: ExecutorId, event: ExecutorPoolEvent) {
         let mut state = self.0.lock();
-        state.next_sequence = state
-            .next_sequence
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        state.next_sequence = state.next_sequence.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal!(
+                "vcpu_loop::executor_receipt_log",
+                "executor receipt log sequence counter overflow: executor_id={:?}",
+                executor
+            );
+        });
         let sequence = state.next_sequence;
         match event {
             ExecutorPoolEvent::Created => state.created += 1,
@@ -2754,7 +2809,11 @@ impl PoolControl {
             .insert(executor, WorkerControlHandle { command, kick })
             .is_some()
         {
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::executor_control",
+                "duplicate worker registration in PoolControl: executor={:?}",
+                executor
+            );
         }
     }
 
@@ -3218,7 +3277,12 @@ impl DebugAuxProviderPublication {
     fn commit(mut self) -> crate::kernel::core::DebugAuxProviderRegistration {
         self.registration
             .take()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "vcpu_loop::debug_aux_publication",
+                    "committing a debug-provider publication after its exact registration was already consumed"
+                );
+            })
     }
 }
 
@@ -3420,13 +3484,23 @@ where
                         ));
                     } else {
                         control.register_worker(
-                            handle.executor.unwrap_or_else(|| std::process::abort()),
+                            handle.executor.unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "vcpu_loop::executor_pool",
+                                    "worker handle missing assigned ExecutorId during pool initialization: worker_index={index}"
+                                );
+                            }),
                             handle.command.clone(),
                             Arc::clone(
                                 handle
                                     .kick
                                     .as_ref()
-                                    .unwrap_or_else(|| std::process::abort()),
+                                    .unwrap_or_else(|| {
+                                        carrick_fatal!(
+                                            "vcpu_loop::executor_pool",
+                                            "worker handle missing kick synchronization handle during pool initialization: worker_index={index}"
+                                        );
+                                    }),
                             ),
                         );
                     }
@@ -3549,7 +3623,10 @@ where
             .cancel_dormant(&self.scheduler, ExecutionFailure::SnapshotRestoreFailed)
         {
             tracing::error!(%error, "post-join exact dormant cancellation failed");
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::executor_pool",
+                "post-join exact dormant cancellation failed: error={error}"
+            );
         }
         self.scheduler.wait_closed();
         let events = self.receipts.snapshot();
@@ -4125,7 +4202,11 @@ where
                             // The combined record now names the replacement;
                             // allowing the old Arc to receive saved state would
                             // split immutable MM/ASID identity.
-                            std::process::abort();
+                            carrick_fatal!(
+                                "vcpu_loop::executor_exec_transfer",
+                                "backend task retarget failed during exec transfer: executor_id={:?}",
+                                executor_id
+                            );
                         }
                         Ok(replacement_record)
                     });
@@ -4138,8 +4219,11 @@ where
                         // authority. This is a split-authority invariant loss,
                         // so fail-stop the carrier rather than resume either
                         // image.
-                        tracing::error!(%error, "worker-owned exec retarget failed after publication");
-                        std::process::abort();
+                        carrick_fatal!(
+                            "vcpu_loop::executor_exec_transfer",
+                            "worker-owned exec retarget failed after kernel published successor image: executor_id={:?}, error={error}",
+                            executor_id
+                        );
                     }
                 };
                 binding = replacement_record.binding;
@@ -4314,7 +4398,11 @@ where
         }
         let terminal_retirement = binding.take_address_space_retirement();
         if terminal_retirement.is_some() && pending_exec_cleanup {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::mm_retirement",
+                "conflicting address space retirement state encountered during exec cleanup: executor_id={:?}",
+                executor_id
+            );
         }
         let exec_cleanup_ran = pending_exec_retirement.is_some() || pending_exec_cleanup;
         if let Some(mut retirement) = pending_exec_retirement.take() {
@@ -4391,7 +4479,13 @@ where
         if pending_exec_cleanup {
             match binding.retire_detached_exec_predecessor(None) {
                 Ok(None) => {}
-                Ok(Some(_)) => std::process::abort(),
+                Ok(Some(_)) => {
+                    carrick_fatal!(
+                        "vcpu_loop::executor_boundary",
+                        "kick handle remains bound after settlement transaction: executor_id={:?}",
+                        executor_id
+                    );
+                }
                 Err(error) => {
                     let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                         resolver.as_ref(),
@@ -4720,7 +4814,11 @@ where
         // invariant violation after successor publication; fail-stop instead
         // of retrospectively failing a predecessor that no longer exists.
         if kick.current_binding().is_some() {
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::executor_boundary",
+                "executor kick remains bound after terminal settlement: executor_id={:?}",
+                executor_id
+            );
         }
         receipts.record(executor_id, ExecutorPoolEvent::AuditPassed);
         if yielded_or_preempted {
@@ -6157,7 +6255,7 @@ pub(crate) mod tests {
             .rfind("cancel_dormant")
             .expect("stable exact cancellation");
         let fail_stop = source[marker..]
-            .find("std::process::abort()")
+            .find("carrick_fatal!")
             .map(|offset| marker + offset)
             .expect("cancellation failure fail-stop");
         let wait = source[fail_stop..]

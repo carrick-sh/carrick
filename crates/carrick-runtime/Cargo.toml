@@ -83,6 +83,7 @@ platform-linux = ["dep:carrick-vmm-kvm", "dep:carrick-host-linux"]
 platform-freebsd = ["dep:carrick-vmm-bhyve", "dep:carrick-host-bsd"]
 platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd"]
 [dependencies]
+carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-portable = { path = "../carrick-portable" }

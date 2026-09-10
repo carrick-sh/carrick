@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use carrick_fatal::carrick_fatal;
 use parking_lot::{Condvar, Mutex};
 
 use carrick_hal::{PlatformFutex, SignalPumpControl, ThreadedEngine, VcpuRegistry};
@@ -483,8 +484,12 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .frame_inventory()
             .apply_with_receipt(self.mm, commit)
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
-        let expected_mm =
-            std::num::NonZeroU64::new(self.mm.raw()).unwrap_or_else(|| std::process::abort());
+        let expected_mm = std::num::NonZeroU64::new(self.mm.raw()).unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::mm_identity",
+                "KernelFrameCowAuthority target MmId is zero"
+            )
+        });
         if receipt.mm() != expected_mm
             || !receipt.authorizes(mapping, frame)
             || !self
@@ -500,7 +505,10 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
                 )
             || !owner.is_current()
         {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "Applied foreign COW frame inventory receipt failed authorization, revision, or owner generation verification"
+            );
         }
         let proof = KernelForeignCowProof::new(
             Arc::clone(&self.kernel),
@@ -1202,7 +1210,7 @@ impl ProcessPhysicalRetirement {
             publication
                 .completions
                 .as_ref()
-                .unwrap_or_else(|| std::process::abort())
+                .unwrap_or_else(|| carrick_fatal!("kernel::terminal_settlement", "A notified physical-retirement wait without its completion receipt is a torn terminal publication"))
                 .clone()
         };
         for completion in completions {
@@ -1291,13 +1299,13 @@ impl ContainerJobGroup {
             let group = state
                 .groups
                 .get_mut(&self.container_id)
-                .unwrap_or_else(|| std::process::abort());
+                .unwrap_or_else(|| carrick_fatal!("vcpu_loop::container_job_group", "A container job group disappeared after the closer claimed it and drained all reservations"));
             group.draining = true;
             let jobs = std::mem::take(&mut group.jobs);
             state.active_drains = state
                 .active_drains
                 .checked_add(1)
-                .unwrap_or_else(|| std::process::abort());
+                .unwrap_or_else(|| carrick_fatal!("vcpu_loop::container_job_group", "The carrier active-drain counter overflowed while establishing exclusive container job-group drainage"));
             self.directory.process_jobs_changed.notify_all();
             break jobs;
         };
@@ -1307,7 +1315,10 @@ impl ContainerJobGroup {
             group.closing && group.draining && group.reservations == 0 && group.jobs.is_empty()
         });
         if !exact || state.active_drains == 0 {
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::container_job_group",
+                "A drained container job group no longer has the exact closing, draining, reservation-free state, or the carrier lost its active-drain claim"
+            );
         }
         state.groups.remove(&self.container_id);
         state.closed_groups.insert(self.container_id);
@@ -1366,7 +1377,10 @@ impl Drop for ContainerJobReservation {
         let mut state = self.directory.process_jobs.lock();
         let remove = if let Some(group) = state.groups.get_mut(&self.container_id) {
             if group.reservations == 0 {
-                std::process::abort();
+                carrick_fatal!(
+                    "vcpu_loop::container_job_group",
+                    "Dropping an armed container-job reservation with a zero reservation count proves the exact admission token was already consumed"
+                );
             }
             group.reservations -= 1;
             !group.closing && group.reservations == 0 && group.jobs.is_empty()
@@ -1565,8 +1579,18 @@ impl HvpatchRuntimeDirectory {
                     std::sync::atomic::Ordering::Acquire,
                     |current| current.checked_add(1),
                 )
-                .unwrap_or_else(|_| std::process::abort());
-            let instance = std::num::NonZeroU64::new(raw).unwrap_or_else(|| std::process::abort());
+                .unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "hvpatch::process_identity",
+                        "Parsing hexadecimal HVPatch process instance ID string failed"
+                    )
+                });
+            let instance = std::num::NonZeroU64::new(raw).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::process_identity",
+                    "Parsed HVPatch process instance ID evaluated to zero"
+                )
+            });
             Arc::new(
                 carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskStateDirectory::new(
                     instance,
@@ -1660,7 +1684,7 @@ impl HvpatchRuntimeDirectory {
                 .lock()
                 .as_ref()
                 .map(Arc::clone)
-                .unwrap_or_else(|| std::process::abort());
+                .unwrap_or_else(|| carrick_fatal!("vcpu_loop::persistent_services", "A published carrier scheduler without its paired continuation wait service is a torn persistent-service transaction"));
             return PreparedPersistentServices {
                 scheduler,
                 wait_service,
@@ -1714,7 +1738,10 @@ impl HvpatchRuntimeDirectory {
             (Some(installed_scheduler), Some(installed_wait_service))
                 if Arc::ptr_eq(installed_scheduler, &services.scheduler)
                     && Arc::ptr_eq(installed_wait_service, &services.wait_service) => {}
-            _ => std::process::abort(),
+            _ => carrick_fatal!(
+                "vcpu_loop::persistent_services",
+                "Publishing prepared persistent services over a partial or identity-mismatched scheduler/wait-service pair would split carrier service authority"
+            ),
         }
         for endpoint in self.endpoints.lock().values_mut() {
             endpoint.scheduler = Some(Arc::clone(&services.scheduler));
@@ -2073,7 +2100,7 @@ impl CloneAdmissionGate {
         state.next_listener = state
             .next_listener
             .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| carrick_fatal!("vcpu_loop::vfork_wait", "Missing VforkParentWait barrier on thread context during clone admission status change subscription"));
         let id = state.next_listener;
         state.listeners.insert(id, (expected_epoch, callback));
         Some(CloneAdmissionChangeSubscription {
@@ -2317,7 +2344,10 @@ impl Drop for CloneAdmissionPermit {
         }
         let mut state = self.gate.state.lock();
         let Some(in_flight) = state.in_flight.checked_sub(1) else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::task_backend_lifecycle",
+                "HVPatch task backend destruction failed during permit teardown"
+            );
         };
         state.in_flight = in_flight;
         self.active = false;
@@ -2730,7 +2760,10 @@ impl KernelState {
         let leader = crate::kernel::LinuxTid::for_task_leader(binding.task_id());
         let signal_context = binding.capture(leader).unwrap_or_else(|error| {
             tracing::error!(%error, "cannot retain HVPatch runtime endpoint context");
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::runtime_binding",
+                "cannot retain HVPatch runtime endpoint context: {error}"
+            );
         });
         // The kernel wakes a task through this; cross-process signal delivery
         // reaches a PARKED guest only because of it.
@@ -2918,7 +2951,10 @@ pub(crate) fn dispatch_with_panic_backstop(
                 "carrick: FATAL — panic in syscall {syscall_nr} handler on vCPU tid {tid}; \
                  aborting guest (subsystem state may be torn, cannot safely resume)"
             );
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::panic_backstop",
+                "panic in syscall handler on vCPU: subsystem state may be torn"
+            );
         }
     }
 }
@@ -3278,7 +3314,10 @@ impl InjectedExecutionLeaseSlot {
             )
             .is_err()
         {
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::runtime_context",
+                "Duplicate installation of thread-local VcpuRuntimeContext"
+            );
         }
         InjectedExecutionLeasePublication { owner: self }
     }
@@ -3295,7 +3334,10 @@ impl Drop for InjectedExecutionLeasePublication<'_> {
             .slot
             .swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel);
         if previous.is_null() {
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::runtime_context",
+                "Thread-local VcpuRuntimeContext missing on teardown"
+            );
         }
     }
 }
@@ -3341,7 +3383,10 @@ impl ExecutionLeaseCell {
             Self::Injected(slot) => {
                 let pointer = slot.slot.load(std::sync::atomic::Ordering::Acquire);
                 if pointer.is_null() {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "vcpu_loop::runtime_context",
+                        "Thread-local VcpuRuntimeContext missing when entering direct dispatch lock"
+                    );
                 }
                 // SAFETY: the persistent worker installs the unique mutable
                 // lease slot for the duration of this poll and clears it before
@@ -3834,7 +3879,10 @@ impl HvpatchLoopResult {
     fn publish(&self, result: Result<VcpuLoopOutcome, RuntimeError>) {
         let mut slot = self.state.result.lock();
         if slot.is_some() {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::task_activation",
+                "TaskActivationProof was published more than once"
+            );
         }
         *slot = Some(result);
         self.state.ready.notify_all();
@@ -4829,7 +4877,10 @@ where
 
     fn fail_stop(&mut self, error: RuntimeError) -> RuntimeError {
         eprintln!("carrick: FATAL: HVPatch process publication failure: {error}");
-        std::process::abort();
+        carrick_fatal!(
+            "vcpu_loop::fail_stop",
+            "HVPatch process publication failure: {error}"
+        );
     }
 }
 
@@ -5155,7 +5206,7 @@ where
             .state
             .service_kernel_context
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during external exec failure transition"))
             .retain_exact();
         let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
             &self.kernel,
@@ -5485,7 +5536,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during persistent fork completion"))
                     .retain_exact();
                 let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
                     &self.kernel,
@@ -5554,16 +5605,17 @@ where
         terminal_context: crate::kernel::KernelContext,
         terminal: PersistentTerminal,
     ) -> executor::ExecutorExit {
-        let process = self
-            .kernel
-            .hvpatch_process
-            .as_ref()
-            .unwrap_or_else(|| std::process::abort());
+        let process = self.kernel.hvpatch_process.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::terminal_settlement",
+                "Terminal process missing execution context during terminal finalization"
+            )
+        });
         let wake_scheduler = || {
             self.kernel
                 .hvpatch_runtime
                 .as_ref()
-                .unwrap_or_else(|| std::process::abort())
+                .unwrap_or_else(|| carrick_fatal!("hvpatch::task_backend_lifecycle", "Missing HVPatch runtime reference when constructing the terminal-retire wake callback"))
                 .continuation_services(terminal_context.kernel())
                 .0
         };
@@ -5628,7 +5680,10 @@ where
                 }
                 Err(failure) => {
                     tracing::error!(%failure, "admit persistent terminal MM retirement");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::mm_reservation",
+                        "admit persistent terminal MM retirement failed: {failure}"
+                    );
                 }
             }
         };
@@ -5677,19 +5732,30 @@ where
             .owns_final_mm_edge(terminal_context.task().key())
             .unwrap_or_else(|failure| {
                 tracing::error!(%failure, "classify persistent terminal MM ownership");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "classify persistent terminal MM ownership failed: {failure}"
+                );
             });
         if owns_final_mm {
             let capacity = carrick_hal::FrameEventCapacity::for_event_count(
                 carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
             )
-            .unwrap_or_else(|_| std::process::abort());
+            .unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "Missing sibling execution context during terminal settlement"
+                )
+            });
             let reservation = terminal_context
                 .kernel()
                 .reserve_frame_inventory(0, 0, capacity)
                 .unwrap_or_else(|failure| {
                     tracing::error!(%failure, "reserve persistent failure inventory");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "kernel::terminal_settlement",
+                        "reserve persistent failure inventory failed: {failure}"
+                    );
                 });
             let transaction = reservation.transaction();
             engine
@@ -5700,7 +5766,10 @@ where
                         .frame_inventory()
                         .abandon(transaction);
                     tracing::error!(%failure, "arm persistent failure inventory");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "kernel::container_scope",
+                        "arm persistent failure inventory failed: {failure}"
+                    );
                 });
         }
         let prepared_core = match &terminal {
@@ -5774,7 +5843,10 @@ where
             PersistentTerminal::Outcome {
                 outcome: VcpuLoopOutcome::ThreadDone,
                 ..
-            } => std::process::abort(),
+            } => carrick_fatal!(
+                "kernel::terminal_settlement",
+                "Unexpected terminal settlement disposition encountered during process teardown"
+            ),
         };
         let process_exit_event = process.record_process_exit_begin(exit_code, self.state.this_tid);
         let child = process.is_child();
@@ -5800,7 +5872,10 @@ where
                 output_truncated: false,
             }) {
                 tracing::error!(%error, "publish logical exec terminal result failed");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "publish logical exec terminal result failed: {error}"
+                );
             }
         }
         let status = crate::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
@@ -5835,7 +5910,10 @@ where
                 );
             }
             tracing::error!(%failure, "publish persistent failure Kernel exit");
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::terminal_settlement",
+                "publish persistent failure Kernel exit failed: {failure}"
+            );
         }
         // The logical process is no longer runnable. Drop its carrier-wide
         // run-state publication now; run-state-only records are reclaimed here,
@@ -5860,7 +5938,10 @@ where
                 .replace((Arc::clone(terminal_context.kernel()), terminal_mm))
                 .is_some()
             {
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "Failed to claim persistent process terminal owner role"
+                );
             }
         }
         self.pending_terminal_retirement = Some(
@@ -5868,7 +5949,10 @@ where
                 .begin_address_space_retirement(exit_code, self.state.this_tid, process_exit_event)
                 .unwrap_or_else(|failure| {
                     tracing::error!(%failure, "retire persistent failure MM/ASID");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "kernel::terminal_settlement",
+                        "retire persistent failure MM/ASID failed: {failure}"
+                    );
                 }),
         );
         drop(owner_set_edit);
@@ -5905,7 +5989,10 @@ where
                 )
             }
             threads::PersistentThreadExitDisposition::Done(VcpuLoopOutcome::TrapLimit(_)) => {
-                std::process::abort()
+                carrick_fatal!(
+                    "kernel::thread_settlement",
+                    "Unhandled thread exit disposition during persistent thread settlement"
+                )
             }
             threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
                 if self.kernel.process_exiting()
@@ -5952,7 +6039,7 @@ where
             .kernel
             .hvpatch_runtime
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during thread exit retry park"))
             .continuation_services(context.kernel())
             .0;
         let thread = context.thread().key();
@@ -5989,7 +6076,10 @@ where
             .try_claim_persistent_process_exit(self.state.this_tid)
             .unwrap_or_else(|failure| {
                 tracing::error!(%failure, "claim persistent process terminal owner");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "claim persistent process terminal owner failed: {failure}"
+                );
             });
         self.begin_persistent_process_terminal_with_claim(engine, terminal, context, receipt)
     }
@@ -6010,7 +6100,10 @@ where
                     tracing::error!(%failure, "claim exec terminal handoff owner");
                 }
             }
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::exec_terminal",
+                "claim exec terminal handoff owner failed: {failure}"
+            );
         });
         self.state.service_kernel_context = Some(context.retain_exact());
         self.state.kernel_thread = Some(Arc::clone(context.thread()));
@@ -6050,7 +6143,7 @@ where
                     .kernel
                     .hvpatch_runtime
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("kernel::runtime_binding", "A pending terminal claim cannot subscribe its exact thread without the Kernel HVPatch runtime"))
                     .continuation_services(context.kernel())
                     .0;
                 let thread = context.thread().key();
@@ -6077,7 +6170,10 @@ where
                     .arm_process_owner()
                     .unwrap_or_else(|failure| {
                         tracing::error!(%failure, "arm persistent terminal result owner");
-                        std::process::abort();
+                        carrick_fatal!(
+                            "kernel::terminal_settlement",
+                            "arm persistent terminal result owner failed: {failure}"
+                        );
                     });
             }
         }
@@ -6128,7 +6224,10 @@ where
             .begin_persistent_exit_sibling_drain(&self.kernel, self.completion.id())
             .unwrap_or_else(|failure| {
                 tracing::error!(%failure, "begin persistent failure sibling drain");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "begin persistent failure sibling drain failed: {failure}"
+                );
             });
         if drain.is_ready() {
             let completions = self
@@ -6136,14 +6235,20 @@ where
                 .finish_persistent_sibling_drain(&self.completion)
                 .unwrap_or_else(|failure| {
                     tracing::error!(%failure, "finish persistent failure sibling drain");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "kernel::terminal_settlement",
+                        "finish persistent failure sibling drain failed: {failure}"
+                    );
                 });
             self.kernel
                 .process_physical_retirement
                 .publish(completions)
                 .unwrap_or_else(|failure| {
                     tracing::error!(%failure, "publish persistent process physical retirement");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "kernel::terminal_settlement",
+                        "publish persistent process physical retirement failed: {failure}"
+                    );
                 });
             return self.finalize_persistent_process_terminal(engine, context, terminal);
         }
@@ -6194,7 +6299,12 @@ where
             .kernel
             .hvpatch_runtime
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "vcpu_loop::quiesce_barrier",
+                    "Missing quiesce barrier reference when suspending for process quiesce"
+                )
+            })
             .continuation_services(context.kernel())
             .0;
         let thread = context.thread().key();
@@ -6269,7 +6379,7 @@ where
             .kernel
             .hvpatch_runtime
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during job control suspension"))
             .continuation_services(context.kernel())
             .0;
         let thread = context.thread().key();
@@ -6360,16 +6470,18 @@ where
         // registration. No scheduler or Kernel row can be retired while a live
         // backend still has authority to mutate the child MM.
         drop(logical);
-        let runtime = self
-            .kernel
-            .hvpatch_runtime
-            .as_ref()
-            .unwrap_or_else(|| std::process::abort());
-        let process = self
-            .kernel
-            .hvpatch_process
-            .as_ref()
-            .unwrap_or_else(|| std::process::abort());
+        let runtime = self.kernel.hvpatch_runtime.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::clone_rollback",
+                "Missing parent execution context during clone publication rollback"
+            )
+        });
+        let process = self.kernel.hvpatch_process.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::runtime_binding",
+                "Missing HVPatch runtime binding on KernelState during clone rollback"
+            )
+        });
         let scheduler = runtime.continuation_services(context.kernel()).0;
         executor::retire_failed_hvpatch_clone_authority(
             &scheduler,
@@ -6401,14 +6513,20 @@ where
         })
         .unwrap_or_else(|error| {
             eprintln!("carrick: FATAL: authoritative HVPatch clone rollback: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::clone_rollback",
+                "authoritative HVPatch clone rollback failed: {error}"
+            );
         });
         if registry_installed {
             self.state.registry.exit(tid);
         }
         tid_outputs.rollback(memory).unwrap_or_else(|error| {
             eprintln!("carrick: FATAL: restore published HVPatch clone TID outputs: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::clone_rollback",
+                "restore published HVPatch clone TID outputs failed: {error}"
+            );
         });
         if let Some(completion) = completion {
             let id = completion.id();
@@ -6457,7 +6575,7 @@ where
                     .kernel
                     .hvpatch_runtime
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("kernel::runtime_binding", "Missing HVPatch runtime reference when constructing the clone-admission deferral wake callback"))
                     .continuation_services(parent_context.kernel())
                     .0;
                 let thread = parent_context.thread().key();
@@ -6513,7 +6631,7 @@ where
                 .kernel
                 .hvpatch_runtime
                 .as_ref()
-                .unwrap_or_else(|| std::process::abort());
+                .unwrap_or_else(|| carrick_fatal!("hvpatch::task_backend_lifecycle", "Missing HVPatch runtime reference when constructing the reservation-change wake callback for a deferred thread clone"));
             let scheduler = runtime.continuation_services(parent_context.kernel()).0;
             let thread = parent_context.thread().key();
             let callback: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
@@ -6678,13 +6796,17 @@ where
             Ok(generation) => {
                 ops.abort(prepared_backend).unwrap_or_else(|error| {
                     eprintln!("carrick: FATAL: abort generation-drifted clone backend: {error}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::clone_lifecycle",
+                        "abort generation-drifted clone backend failed: {error}"
+                    );
                 });
-                let runtime = self
-                    .kernel
-                    .hvpatch_runtime
-                    .as_ref()
-                    .unwrap_or_else(|| std::process::abort());
+                let runtime = self.kernel.hvpatch_runtime.as_ref().unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "kernel::runtime_binding",
+                        "Missing HVPatch runtime binding during generation drift clone retirement"
+                    )
+                });
                 let scheduler = runtime.continuation_services(child_context.kernel()).0;
                 executor::retire_failed_hvpatch_clone_authority(
                     &scheduler,
@@ -6696,11 +6818,17 @@ where
                 .map(|_| ())
                 .unwrap_or_else(|error| {
                     eprintln!("carrick: FATAL: retire generation-drifted clone: {error}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::clone_lifecycle",
+                        "retire generation-drifted clone failed: {error}"
+                    );
                 });
                 tid_outputs.rollback(memory).unwrap_or_else(|error| {
                     eprintln!("carrick: FATAL: restore generation-drifted clone TIDs: {error}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::clone_lifecycle",
+                        "restore generation-drifted clone TIDs failed: {error}"
+                    );
                 });
                 return Err(RuntimeError::Configuration(
                     "persistent HVPatch child execution generation drifted".to_owned(),
@@ -6709,29 +6837,39 @@ where
             Err(error) => {
                 ops.abort(prepared_backend).unwrap_or_else(|abort| {
                     eprintln!("carrick: FATAL: abort unpublished clone backend: {abort}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::clone_lifecycle",
+                        "abort unpublished clone backend failed: {abort}"
+                    );
                 });
                 process
                     .kernel_graph()
                     .exit_thread(&child_context, None)
                     .unwrap_or_else(|retire| {
                         eprintln!("carrick: FATAL: retire unpublished clone: {retire}");
-                        std::process::abort();
+                        carrick_fatal!(
+                            "hvpatch::clone_lifecycle",
+                            "retire unpublished clone failed: {retire}"
+                        );
                     });
                 tid_outputs.rollback(memory).unwrap_or_else(|rollback| {
                     eprintln!("carrick: FATAL: restore published clone TIDs: {rollback}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::clone_lifecycle",
+                        "restore published clone TIDs failed: {rollback}"
+                    );
                 });
                 return Err(RuntimeError::Configuration(format!(
                     "publish persistent HVPatch child execution state: {error}"
                 )));
             }
         };
-        let runtime = self
-            .kernel
-            .hvpatch_runtime
-            .as_ref()
-            .unwrap_or_else(|| std::process::abort());
+        let runtime = self.kernel.hvpatch_runtime.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::runtime_binding",
+                "Missing HVPatch runtime binding when committing clone task backend"
+            )
+        });
         let mut task_backend = match ops.commit(
             prepared_backend,
             runtime.carrier_tasks(child_context.kernel()),
@@ -6749,11 +6887,17 @@ where
                 .map(|_| ())
                 .unwrap_or_else(|retire| {
                     eprintln!("carrick: FATAL: retire carrier-commit clone: {retire}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::clone_lifecycle",
+                        "retire carrier-commit clone failed: {retire}"
+                    );
                 });
                 tid_outputs.rollback(memory).unwrap_or_else(|rollback| {
                     eprintln!("carrick: FATAL: restore carrier-commit clone TIDs: {rollback}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::clone_lifecycle",
+                        "restore carrier-commit clone TIDs failed: {rollback}"
+                    );
                 });
                 return Err(error);
             }
@@ -7121,7 +7265,10 @@ where
     fn finish(&mut self, outcome: Result<VcpuLoopOutcome, RuntimeError>) -> executor::ExecutorExit {
         self.leave_executor();
         if self.terminal_result.replace(outcome).is_some() {
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::lifecycle",
+                "Duplicate terminal outcome recorded on completed thread run loop"
+            );
         }
         self.phase = HvpatchProductionPhase::Complete;
         executor::ExecutorExit::Exited
@@ -7268,7 +7415,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 if let Some(outcome) = service_signals_threaded(
                     &self.kernel,
@@ -7298,7 +7445,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 if let Some(outcome) = service_signals_threaded(
                     &self.kernel,
@@ -7334,7 +7481,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 if let Some(outcome) = service_signals_threaded(
                     &self.kernel,
@@ -7364,7 +7511,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 let disposition = self.state.handle_persistent_thread_exit(
                     &self.kernel,
@@ -7380,7 +7527,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
                     &self.kernel,
@@ -7626,7 +7773,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 if let Some(outcome) = service_signals_threaded(
                     &self.kernel,
@@ -7655,7 +7802,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 if let Some(outcome) = service_signals_threaded(
                     &self.kernel,
@@ -7751,7 +7898,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 if let Some(outcome) = service_signals_threaded(
                     &self.kernel,
@@ -7807,7 +7954,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 if let Some(outcome) = service_signals_threaded(
                     &self.kernel,
@@ -7834,7 +7981,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
                     .retain_exact();
                 self.kernel.record_fatal_signal(FatalSignalRecord {
                     image_generation: self.state.fatal_image_generation,
@@ -7878,7 +8025,12 @@ where
             .state
             .service_kernel_context
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "vcpu_loop::service_context",
+                    "ThreadRuntimeState missing service_kernel_context when entering terminal state"
+                )
+            })
             .retain_exact();
         self.begin_persistent_process_terminal(
             engine,
@@ -8349,7 +8501,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context on trap limit outcome assembly"))
                     .retain_exact();
                 let outcome = VcpuLoopOutcome::TrapLimit(Box::new(assemble_run_result(
                     &self.kernel,
@@ -8754,7 +8906,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .unwrap_or_else(|| std::process::abort())
+                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context on engine error terminal transition"))
                     .retain_exact();
                 self.begin_persistent_process_terminal(
                     engine,
@@ -8792,7 +8944,10 @@ where
             Some(PendingExecTerminal { context, handoff }) => {
                 let receipt = handoff.claim_process_exit().unwrap_or_else(|failure| {
                     tracing::error!(%failure, "claim unexpected executor-failure exec handoff");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::exec_terminal",
+                        "claim unexpected executor-failure exec handoff failed: {failure}"
+                    );
                 });
                 self.state.service_kernel_context = Some(context.retain_exact());
                 self.state.kernel_thread = Some(Arc::clone(context.thread()));
@@ -8806,7 +8961,10 @@ where
                 .try_claim_persistent_process_exit(self.state.this_tid)
                 .unwrap_or_else(|failure| {
                     tracing::error!(%failure, "claim unexpected executor-failure process exit");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "kernel::terminal_settlement",
+                        "claim unexpected executor-failure process exit failed: {failure}"
+                    );
                 }),
         };
         match receipt.claim {
@@ -8841,13 +8999,19 @@ where
             .persistent_sibling_stop_authority()
             .unwrap_or_else(|failure| {
                 tracing::error!(%failure, "retain unexpected executor-failure sibling stop");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "retain unexpected executor-failure sibling stop failed: {failure}"
+                );
             });
         sibling_stop
             .publish(&self.kernel)
             .unwrap_or_else(|failure| {
                 tracing::error!(%failure, "stop siblings after unexpected executor failure");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "stop siblings after unexpected executor failure failed: {failure}"
+                );
             });
 
         if receipt.claim == ProcessExitClaim::Owner {
@@ -8858,7 +9022,10 @@ where
             )
             .unwrap_or_else(|failure| {
                 tracing::error!(%failure, "publish unexpected executor-failure retirement");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "publish unexpected executor-failure retirement failed: {failure}"
+                );
             });
         } else {
             let kernel = Arc::clone(&self.kernel);
@@ -10560,7 +10727,10 @@ where
                             SyscallMmPhase::Mutation(authority) => authority,
                             SyscallMmPhase::Ordinary(_) => {
                                 tracing::error!("mutation dispatch lacks outer stage-1 authority");
-                                std::process::abort()
+                                carrick_fatal!(
+                                    "vcpu_loop::mm_stage1_authority",
+                                    "mutation dispatch lacks outer stage-1 authority"
+                                )
                             }
                         };
                         match stage1_authority {
@@ -10609,7 +10779,10 @@ where
                                 tracing::error!(
                                     "ordinary dispatch unexpectedly owns stage-1 authority"
                                 );
-                                std::process::abort()
+                                carrick_fatal!(
+                                    "vcpu_loop::mm_stage1_authority",
+                                    "ordinary dispatch unexpectedly owns stage-1 authority"
+                                )
                             }
                         };
                         kernel
@@ -10850,7 +11023,10 @@ where
                         SyscallMmPhase::Mutation(authority) => authority,
                         SyscallMmPhase::Ordinary(_) => {
                             tracing::error!("host-alias install lacks outer stage-1 authority");
-                            std::process::abort()
+                            carrick_fatal!(
+                                "vcpu_loop::mm_stage1_authority",
+                                "host-alias install lacks outer stage-1 authority"
+                            )
                         }
                     };
                     let installed = match stage1_authority {
@@ -11146,7 +11322,10 @@ fn enroll_persistent_process_member(
         .iter()
         .any(|handle| handle.completion().id() == terminal_settlement.completion().id())
     {
-        std::process::abort();
+        carrick_fatal!(
+            "vcpu_loop::process_membership",
+            "Duplicate terminal settlement registration in persistent process handle list"
+        );
     }
     handles.push(VcpuThreadHandle::Persistent {
         terminal_settlement: terminal_settlement.clone(),
@@ -11484,10 +11663,12 @@ where
             Ok(prepared) => prepared,
             Err(error) => return VcpuLoopLaunch::Direct(Err(error)),
         };
-        let prepared_task = prepared
-            .task
-            .take()
-            .unwrap_or_else(|| std::process::abort());
+        let prepared_task = prepared.task.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "vcpu_loop::job_launch",
+                "Prepared persistent job missing task context during job launch"
+            )
+        });
         let context = prepared_task.context;
         let exact_cpu = prepared_task.cpu;
         let start_gate = prepared_task.start_gate;
@@ -11573,10 +11754,12 @@ where
             prepared.fail_exact();
             return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
         }
-        let directory = kernel
-            .hvpatch_runtime
-            .as_ref()
-            .unwrap_or_else(|| std::process::abort());
+        let directory = kernel.hvpatch_runtime.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::runtime_binding",
+                "KernelState missing HVPatch runtime reference during persistent job launch"
+            )
+        });
         let dormant = match directory.persistent_bindings().prepare_submission(
             &prepared.scheduler,
             executor::HvpatchSubmissionShape::Root,

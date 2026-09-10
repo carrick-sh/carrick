@@ -730,6 +730,7 @@ dependencies = [
  "carrick-dsr",
  "carrick-dsr-aarch64",
  "carrick-dsr-x86",
+ "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
