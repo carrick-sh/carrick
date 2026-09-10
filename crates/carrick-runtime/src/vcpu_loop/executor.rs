@@ -9073,6 +9073,84 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn controller_close_failing_audit_worker_retires_across_census_race() {
+        let (kernel, context) = bootstrap(14_290);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        let binding = FakeBinding::new(90, [Step::Yield]);
+        binding.audit_fails.store(true, Ordering::SeqCst);
+        factory.install(&context, binding);
+
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+
+        // Wait until the worker has parked:
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.waiter_count() != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for executor to park"
+            );
+            thread::yield_now();
+        }
+
+        let (census_arrived_tx, census_arrived_rx) = std::sync::mpsc::channel();
+        let (census_resume_tx, census_resume_rx) = std::sync::mpsc::channel();
+        let (unpark_tx, unpark_rx) = std::sync::mpsc::channel();
+        scheduler.install_close_census_gate(census_arrived_tx, census_resume_rx);
+        scheduler.install_post_unpark_epoch_gate(unpark_tx);
+
+        let authority = scheduler
+            .admit_root(context.thread().key(), publish(&context, 90))
+            .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let shutdown_thread = thread::spawn(move || {
+            shutdown_tx
+                .send(pool.shutdown())
+                .expect("send shutdown result");
+        });
+
+        census_arrived_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("close reached census");
+
+        // Wake the parked executor during census pause:
+        authority
+            .publish(&scheduler, Arc::clone(context.thread()))
+            .unwrap();
+
+        // Wait for the worker to unpark and read the epoch:
+        unpark_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker unparked and read epoch");
+
+        // Release close census:
+        census_resume_tx.send(()).unwrap();
+
+        // Release authority so active_authorities reaches 0 and queue can drain:
+        drop(authority);
+
+        let report = shutdown_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown must return without deadlock")
+            .expect_err("worker audit failure must surface");
+
+        shutdown_thread.join().expect("shutdown thread join");
+
+        assert_eq!(report.retired_workers(), 1);
+        assert_eq!(report.report().created(), 1);
+        assert_eq!(report.report().destroyed(), 1);
+        assert!(matches!(
+            context.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+
+        let summary = scheduler.scheduler_summary();
+        assert_eq!(summary.lifecycle, "closed");
+        assert_eq!(scheduler.closed_waiter_observations(), 1);
+    }
+
+    #[test]
     fn last_worker_failure_fails_queued_exact_generation_and_shutdown_returns() {
         let (kernel, first) = bootstrap(14_240);
         let second = sibling(&kernel, &first, 24_240);

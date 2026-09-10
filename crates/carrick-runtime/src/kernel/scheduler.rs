@@ -607,6 +607,8 @@ struct GuestCpuLocalState {
     /// the ticket, or it did not, in which case the flag was stored after the
     /// publisher's load and this CPU's steal scan runs after the publication.
     wake_ticket: u64,
+    /// Close epoch published to this CPU during close census.
+    close_epoch: u64,
 }
 
 /// A guest CPU — `P` in Go's G/M/P. The unit of guest parallelism: it owns a
@@ -884,6 +886,10 @@ struct RunQueueInner {
     /// CPU, so an executor that retires never strands its queue.
     online: Vec<AtomicUsize>,
     policy: Arc<dyn SchedulingPolicy>,
+    #[cfg(test)]
+    close_census_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    post_unpark_epoch_gate: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     close_observation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
@@ -1936,6 +1942,10 @@ impl RunQueue {
                 cpus,
                 policy,
                 #[cfg(test)]
+                close_census_gate: Mutex::new(None),
+                #[cfg(test)]
+                post_unpark_epoch_gate: Mutex::new(None),
+                #[cfg(test)]
                 close_observation_gate: Mutex::new(None),
                 #[cfg(test)]
                 root_admission_gate: Mutex::new(None),
@@ -2104,7 +2114,7 @@ impl RunQueue {
                 .waiters
                 .checked_add(1)
                 .unwrap_or_else(|| std::process::abort());
-            let close_epoch = self.inner.close_epoch.load(Ordering::Acquire);
+            let park_epoch = local.close_epoch;
             // The executor is about to sleep with no row: report the park on
             // the REAL guest CPU it serves, so an auditor reading the pair
             // (claimed, parked) sees the same CPU identity the guest does.
@@ -2121,12 +2131,16 @@ impl RunQueue {
                 .waiters
                 .checked_sub(1)
                 .unwrap_or_else(|| std::process::abort());
-            drop(local);
-            let observed_close_epoch = self.inner.close_epoch.load(Ordering::Acquire);
-            if observed_close_epoch != close_epoch {
+            let observed_close_epoch = local.close_epoch;
+            if observed_close_epoch != park_epoch {
                 executor
                     .close_observation_epoch
                     .store(observed_close_epoch, Ordering::Release);
+            }
+            drop(local);
+            #[cfg(test)]
+            if let Some(gate) = self.inner.post_unpark_epoch_gate.lock().clone() {
+                let _ = gate.send(());
             }
         }
     }
@@ -2325,15 +2339,22 @@ impl RunQueue {
                 .close_epoch
                 .checked_add(1)
                 .unwrap_or_else(|| std::process::abort());
-            // Exactly the executors parked RIGHT NOW owe a close observation.
-            // Per-CPU waiters are counted under each CPU's own lock while this
-            // carrier lock is held, so an executor is either already parked
-            // (counted, and woken by the nudge below) or has not yet parked
-            // and will see the published lifecycle before it does.
-            state.close_waiters_expected = self.waiter_count_locked(&state);
-            self.inner
-                .close_epoch
-                .store(state.close_epoch, Ordering::Release);
+            let epoch = state.close_epoch;
+            self.inner.close_epoch.store(epoch, Ordering::Release);
+            let mut expected = state.spare_waiters;
+            for cpu in &self.inner.cpus {
+                let mut local = cpu.state.lock();
+                expected += local.waiters;
+                local.close_epoch = epoch;
+            }
+            #[cfg(test)]
+            let close_census_gate = self.inner.close_census_gate.lock().take();
+            #[cfg(test)]
+            if let Some((arrived, resume)) = close_census_gate {
+                let _ = arrived.send(());
+                let _ = resume.recv_timeout(std::time::Duration::from_secs(5));
+            }
+            state.close_waiters_expected = expected;
         }
         #[cfg(test)]
         let close_started_gate = self.inner.close_started_gate.lock().clone();
@@ -2382,6 +2403,7 @@ impl RunQueue {
     /// entering a non-reentrant `parking_lot::Mutex` and deadlocking its own
     /// thread while holding the lock the whole carrier drains through. Taking
     /// `&RunQueueState` makes that call unwritable.
+    #[cfg(test)]
     fn waiter_count_locked(&self, state: &RunQueueState) -> usize {
         let cpu_waiters: usize = self
             .inner
@@ -2447,6 +2469,20 @@ impl RunQueue {
     #[cfg(test)]
     fn install_root_admission_gate(&self, gate: Arc<std::sync::Barrier>) {
         *self.inner.root_admission_gate.lock() = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn install_close_census_gate(
+        &self,
+        arrived: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.inner.close_census_gate.lock() = Some((arrived, resume));
+    }
+
+    #[cfg(test)]
+    fn install_post_unpark_epoch_gate(&self, gate: std::sync::mpsc::Sender<()>) {
+        *self.inner.post_unpark_epoch_gate.lock() = Some(gate);
     }
 
     #[cfg(test)]
@@ -4006,6 +4042,20 @@ impl Scheduler {
     }
 
     #[cfg(test)]
+    pub(crate) fn install_close_census_gate(
+        &self,
+        arrived: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.queue.install_close_census_gate(arrived, resume);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_post_unpark_epoch_gate(&self, gate: std::sync::mpsc::Sender<()>) {
+        self.queue.install_post_unpark_epoch_gate(gate);
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_close_started_gate(&self, gate: Arc<std::sync::Barrier>) {
         self.queue.install_close_started_gate(gate);
     }
@@ -4025,13 +4075,13 @@ impl Scheduler {
     }
 
     #[cfg(test)]
-    fn waiter_count(&self) -> usize {
+    pub(crate) fn waiter_count(&self) -> usize {
         let state = self.queue.inner.state.lock();
         self.queue.waiter_count_locked(&state)
     }
 
     #[cfg(test)]
-    fn closed_waiter_observations(&self) -> usize {
+    pub(crate) fn closed_waiter_observations(&self) -> usize {
         self.queue.closed_waiter_observations()
     }
 
@@ -4087,6 +4137,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     use carrick_abi::LinuxCloneFlags;
     /// Pin every placement to guest CPU 0.
@@ -6894,5 +6945,428 @@ mod tests {
         );
         drop(held);
         worker.join().expect("summary probe thread");
+    }
+
+    #[test]
+    fn controller_close_parked_executor_wakes_runs_and_retires_across_census_race() {
+        let (kernel, root) = bootstrap(12_550);
+        publish(&root, 10);
+        let root_generation = root.thread().execution_state().generation().unwrap();
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let root_authority = scheduler
+            .admit_root(root.thread().key(), root_generation)
+            .unwrap();
+
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+            .unwrap();
+        let (worker_ready_tx, worker_ready_rx) = std::sync::mpsc::channel();
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+        let worker_scheduler = Arc::clone(&scheduler);
+        let worker_registration = registration.clone();
+        let worker = thread::spawn(move || {
+            worker_ready_tx.send(()).expect("worker ready");
+            let running = match worker_scheduler.take(&worker_registration) {
+                Ok(running) => running,
+                Err(error) => panic!("take row failed: {error:?}"),
+            };
+            worker_scheduler
+                .settle_exited(running)
+                .expect("settle exited");
+            worker_scheduler
+                .unregister_executor(&worker_registration)
+                .expect("unregister executor");
+            worker_tx.send(()).expect("worker finished");
+        });
+
+        worker_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker started");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while scheduler.waiter_count() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for executor to park"
+            );
+            thread::yield_now();
+        }
+
+        let (census_arrived_tx, census_arrived_rx) = std::sync::mpsc::channel();
+        let (census_resume_tx, census_resume_rx) = std::sync::mpsc::channel();
+        let (unpark_tx, unpark_rx) = std::sync::mpsc::channel();
+        scheduler.install_close_census_gate(census_arrived_tx, census_resume_rx);
+        scheduler.install_post_unpark_epoch_gate(unpark_tx);
+
+        let close_scheduler = Arc::clone(&scheduler);
+        let close_thread = thread::spawn(move || {
+            close_scheduler.close();
+        });
+
+        census_arrived_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("close reached census");
+
+        // While close is paused after census, wake the parked executor:
+        root_authority
+            .publish(&scheduler, Arc::clone(root.thread()))
+            .unwrap();
+
+        // Wait for the worker to unpark and read the epoch:
+        unpark_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker unparked and read epoch");
+
+        // Release close() so epoch publication and state unlock complete:
+        census_resume_tx.send(()).unwrap();
+        close_thread.join().expect("close thread joined");
+
+        // Wait for the worker to finish execution and unregister:
+        worker_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker must wake, run, and unregister");
+        worker.join().expect("join worker");
+
+        drop(root_authority);
+
+        // Snapshot state in one scope and drop lock before assert:
+        let (lifecycle, expected, observed) = {
+            let state = scheduler.queue.inner.state.lock();
+            (
+                state.lifecycle,
+                state.close_waiters_expected,
+                state.closed_waiter_observations,
+            )
+        };
+
+        assert_eq!(
+            observed, expected,
+            "close waiter observations must equal expected waiters (lifecycle={lifecycle:?})"
+        );
+        assert_eq!(
+            lifecycle,
+            super::QueueLifecycle::Closed,
+            "run queue must be closed after all waiters observe/retire"
+        );
+
+        scheduler.wait_closed();
+    }
+
+    #[test]
+    fn controller_close_normal_wake_and_exit() {
+        let (kernel, root) = bootstrap(12_551);
+        publish(&root, 11);
+        let root_generation = root.thread().execution_state().generation().unwrap();
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let root_authority = scheduler
+            .admit_root(root.thread().key(), root_generation)
+            .unwrap();
+
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+            .unwrap();
+        let (worker_ready_tx, worker_ready_rx) = std::sync::mpsc::channel();
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+        let worker_scheduler = Arc::clone(&scheduler);
+        let worker_registration = registration.clone();
+        let worker = thread::spawn(move || {
+            worker_ready_tx.send(()).expect("worker ready");
+            let running = match worker_scheduler.take(&worker_registration) {
+                Ok(running) => running,
+                Err(error) => panic!("take row failed: {error:?}"),
+            };
+            worker_scheduler
+                .settle_exited(running)
+                .expect("settle exited");
+            match worker_scheduler.take(&worker_registration) {
+                Err(RunQueueError::Closed) => {}
+                other => panic!("expected Closed on second take, got {other:?}"),
+            }
+            worker_scheduler
+                .unregister_executor(&worker_registration)
+                .expect("unregister executor");
+            worker_tx.send(()).expect("worker finished");
+        });
+
+        worker_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker started");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while scheduler.waiter_count() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for executor to park"
+            );
+            thread::yield_now();
+        }
+
+        scheduler.close();
+        root_authority
+            .publish(&scheduler, Arc::clone(root.thread()))
+            .unwrap();
+        drop(root_authority);
+
+        worker_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker must finish and unregister");
+        worker.join().expect("join worker");
+
+        let (lifecycle, expected, observed) = {
+            let state = scheduler.queue.inner.state.lock();
+            (
+                state.lifecycle,
+                state.close_waiters_expected,
+                state.closed_waiter_observations,
+            )
+        };
+        assert_eq!(observed, expected);
+        assert_eq!(lifecycle, super::QueueLifecycle::Closed);
+        scheduler.wait_closed();
+    }
+
+    #[test]
+    fn controller_close_spare_executor_parks_and_retires() {
+        let (kernel, _root) = bootstrap(12_552);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler
+            .register_executor_bound(Arc::clone(&kick) as Arc<dyn ExecutorKick>, None, true)
+            .unwrap();
+        assert!(registration.is_spare());
+
+        let (spare_ready_tx, spare_ready_rx) = std::sync::mpsc::channel();
+        let (spare_tx, spare_rx) = std::sync::mpsc::channel();
+        let spare_scheduler = Arc::clone(&scheduler);
+        let spare_registration = registration.clone();
+        let spare_worker = thread::spawn(move || {
+            spare_ready_tx.send(()).expect("spare ready");
+            match spare_scheduler.take(&spare_registration) {
+                Err(RunQueueError::Closed) => {}
+                other => panic!("expected Closed, got {other:?}"),
+            }
+            spare_scheduler
+                .unregister_executor(&spare_registration)
+                .expect("unregister spare");
+            spare_tx.send(()).expect("spare finished");
+        });
+
+        spare_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("spare started");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while scheduler.waiter_count() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for spare executor to park"
+            );
+            thread::yield_now();
+        }
+
+        scheduler.close();
+
+        spare_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("spare finished");
+        spare_worker.join().expect("join spare worker");
+
+        let (lifecycle, expected, observed) = {
+            let state = scheduler.queue.inner.state.lock();
+            (
+                state.lifecycle,
+                state.close_waiters_expected,
+                state.closed_waiter_observations,
+            )
+        };
+        assert_eq!(observed, expected);
+        assert_eq!(expected, 1);
+        assert_eq!(lifecycle, super::QueueLifecycle::Closed);
+        scheduler.wait_closed();
+    }
+
+    #[test]
+    fn controller_close_before_and_after_park() {
+        // Case A: Close before park
+        {
+            let (kernel, _root) = bootstrap(12_553);
+            let scheduler = Arc::new(Scheduler::new(kernel));
+            let kick = Arc::new(RecordingKick::default());
+            let registration = scheduler
+                .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+                .unwrap();
+
+            scheduler.close();
+
+            // When take is called after close:
+            match scheduler.take(&registration) {
+                Err(RunQueueError::Closed) => {}
+                other => panic!("expected Closed, got {other:?}"),
+            }
+            scheduler.unregister_executor(&registration).unwrap();
+
+            let (lifecycle, expected, observed) = {
+                let state = scheduler.queue.inner.state.lock();
+                (
+                    state.lifecycle,
+                    state.close_waiters_expected,
+                    state.closed_waiter_observations,
+                )
+            };
+            assert_eq!(expected, 0, "executor was not parked at close time");
+            assert_eq!(observed, 0, "no observation should be recorded");
+            assert_eq!(lifecycle, super::QueueLifecycle::Closed);
+            scheduler.wait_closed();
+        }
+
+        // Case B: Close after park
+        {
+            let (kernel, _root) = bootstrap(12_554);
+            let scheduler = Arc::new(Scheduler::new(kernel));
+            let kick = Arc::new(RecordingKick::default());
+            let registration = scheduler
+                .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+                .unwrap();
+
+            let (worker_ready_tx, worker_ready_rx) = std::sync::mpsc::channel();
+            let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+            let worker_scheduler = Arc::clone(&scheduler);
+            let worker_registration = registration.clone();
+            let worker = thread::spawn(move || {
+                worker_ready_tx.send(()).expect("worker ready");
+                match worker_scheduler.take(&worker_registration) {
+                    Err(RunQueueError::Closed) => {}
+                    other => panic!("expected Closed, got {other:?}"),
+                }
+                worker_scheduler
+                    .unregister_executor(&worker_registration)
+                    .expect("unregister");
+                worker_tx.send(()).expect("worker finished");
+            });
+
+            worker_ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker started");
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while scheduler.waiter_count() != 1 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for executor to park"
+                );
+                thread::yield_now();
+            }
+
+            scheduler.close();
+
+            worker_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker finished");
+            worker.join().expect("join worker");
+
+            let (lifecycle, expected, observed) = {
+                let state = scheduler.queue.inner.state.lock();
+                (
+                    state.lifecycle,
+                    state.close_waiters_expected,
+                    state.closed_waiter_observations,
+                )
+            };
+            assert_eq!(expected, 1, "executor was parked at close time");
+            assert_eq!(observed, 1, "executor observed close");
+            assert_eq!(lifecycle, super::QueueLifecycle::Closed);
+            scheduler.wait_closed();
+        }
+    }
+
+    #[test]
+    fn controller_close_duplicate_and_stale_retirement() {
+        let (kernel, _root) = bootstrap(12_555);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+            .unwrap();
+
+        let (worker_ready_tx, worker_ready_rx) = std::sync::mpsc::channel();
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+        let worker_scheduler = Arc::clone(&scheduler);
+        let worker_registration = registration.clone();
+        let worker = thread::spawn(move || {
+            worker_ready_tx.send(()).expect("worker ready");
+            match worker_scheduler.take(&worker_registration) {
+                Err(RunQueueError::Closed) => {}
+                other => panic!("expected Closed, got {other:?}"),
+            }
+            // First unregister discharges observation:
+            worker_scheduler
+                .unregister_executor(&worker_registration)
+                .expect("unregister first time");
+            // Second unregister should NOT double credit:
+            let _ = worker_scheduler.unregister_executor(&worker_registration);
+            worker_tx.send(()).expect("worker finished");
+        });
+
+        worker_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker ready");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while scheduler.waiter_count() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for executor to park"
+            );
+            thread::yield_now();
+        }
+
+        scheduler.close();
+
+        worker_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker finished");
+        worker.join().expect("join worker");
+
+        let (lifecycle, expected, observed) = {
+            let state = scheduler.queue.inner.state.lock();
+            (
+                state.lifecycle,
+                state.close_waiters_expected,
+                state.closed_waiter_observations,
+            )
+        };
+        assert_eq!(expected, 1);
+        assert_eq!(observed, 1, "duplicate unregister must not double credit");
+        assert_eq!(lifecycle, super::QueueLifecycle::Closed);
+        scheduler.wait_closed();
+    }
+
+    #[test]
+    fn controller_close_negative_control_uncounted_worker_does_not_manufacture_obligation() {
+        let (kernel, _root) = bootstrap(12_556);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        scheduler.close();
+
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+            .unwrap();
+
+        // Calling unregister on an executor registered after close:
+        scheduler.unregister_executor(&registration).unwrap();
+
+        let (lifecycle, expected, observed) = {
+            let state = scheduler.queue.inner.state.lock();
+            (
+                state.lifecycle,
+                state.close_waiters_expected,
+                state.closed_waiter_observations,
+            )
+        };
+        assert_eq!(expected, 0);
+        assert_eq!(observed, 0);
+        assert_eq!(lifecycle, super::QueueLifecycle::Closed);
     }
 }
