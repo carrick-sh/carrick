@@ -290,7 +290,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
       "function": "AliasRegistry::bump_revision",
       "ordinal_in_function": 1,
       "fingerprint": "1bb4726f1d308f37c481f3b8269749e775c8d81c3aab305a1276d7038c020173",
@@ -301,7 +301,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
       "function": "AliasRegistry::replace_exact_keys_in_batch",
       "ordinal_in_function": 1,
       "fingerprint": "c3f14235e907d5b8cef981d0e4f4cb933524ace89f8f6d9e701832e8d8b2291e",
@@ -312,7 +312,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
       "function": "AliasRegistry::upsert_by_key",
       "ordinal_in_function": 1,
       "fingerprint": "ad947e030e15f2a8add149949c6610c7476f2f541ef7a5637ddf8940eab1753e",
@@ -323,7 +323,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
       "function": "AliasRegistry::upsert_by_key",
       "ordinal_in_function": 2,
       "fingerprint": "ad947e030e15f2a8add149949c6610c7476f2f541ef7a5637ddf8940eab1753e",
@@ -334,7 +334,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
       "function": "AliasRegistry::upsert_by_key",
       "ordinal_in_function": 3,
       "fingerprint": "ad947e030e15f2a8add149949c6610c7476f2f541ef7a5637ddf8940eab1753e",
@@ -345,7 +345,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
       "function": "AliasRegistry::upsert_by_key",
       "ordinal_in_function": 4,
       "fingerprint": "ad947e030e15f2a8add149949c6610c7476f2f541ef7a5637ddf8940eab1753e",
@@ -1544,7 +1544,7 @@
       "domain": "hvpatch::sparse_materialization_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
       "function": "unregister_alias_in",
       "ordinal_in_function": 1,
       "fingerprint": "0261fb64dbc84ac91ea334eac6d636d3127b5c72ec503068947b690d1e55290c",
@@ -1555,7 +1555,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
       "function": "unregister_alias_in",
       "ordinal_in_function": 2,
       "fingerprint": "76dcc82dba47eae4267c3060e8baa2b5232db90e3ac639a7a5eb62e2d99fd94e",
