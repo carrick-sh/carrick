@@ -447,7 +447,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "function": "HvpatchRuntimeDirectory::carrier_tasks",
       "ordinal_in_function": 1,
       "fingerprint": "a77b7b3e01fbf256177361b2f241f29492798010e92bb6089a8f0ebaeb539494",
@@ -458,7 +458,7 @@
       "domain": "hvpatch::process_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "function": "HvpatchRuntimeDirectory::carrier_tasks",
       "ordinal_in_function": 2,
       "fingerprint": "a77b7b3e01fbf256177361b2f241f29492798010e92bb6089a8f0ebaeb539494",
@@ -1646,7 +1646,7 @@
       "domain": "vcpu_loop::debug_aux_publication"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "function": "ContainerJobGroup::join",
       "ordinal_in_function": 1,
       "fingerprint": "3ce12f73b70c10da1468e533ec27610c967111befd946ccf6de7ec67091cf63e",
@@ -1657,7 +1657,7 @@
       "domain": "vcpu_loop::container_job_group"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "function": "ContainerJobGroup::join",
       "ordinal_in_function": 2,
       "fingerprint": "3ce12f73b70c10da1468e533ec27610c967111befd946ccf6de7ec67091cf63e",
@@ -1668,7 +1668,7 @@
       "domain": "vcpu_loop::container_job_group"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "function": "ContainerJobGroup::join",
       "ordinal_in_function": 3,
       "fingerprint": "a61e8e4d9c56f1852b56bd54492e1f3ff88653e12fb4a3a4b1cc4fcf84f3aab9",
@@ -1679,7 +1679,7 @@
       "domain": "vcpu_loop::container_job_group"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "function": "<ContainerJobReservation as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "3911a368368bf0d3e290b68d0963c26f4838b79b1fe796e71c9630d3899b7cc3",
@@ -1690,7 +1690,7 @@
       "domain": "vcpu_loop::container_job_group"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "function": "HvpatchRuntimeDirectory::prepare_persistent_services",
       "ordinal_in_function": 1,
       "fingerprint": "56f95103ee1633938be41b1d51008231025e8056f4285cb8557a5f7f00d701a2",
@@ -1701,7 +1701,7 @@
       "domain": "vcpu_loop::persistent_services"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "function": "HvpatchRuntimeDirectory::publish_persistent_services",
       "ordinal_in_function": 1,
       "fingerprint": "397a6977a7db65200738531f9ac5ec182493488b71c62f3a2b78e6bcaaa9caab",
@@ -1734,7 +1734,7 @@
       "domain": "vcpu_loop::executor_boundary"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "function": "ProcessPhysicalRetirement::wait_with_publication_timeout",
       "ordinal_in_function": 1,
       "fingerprint": "47fadcb201fe171abec52a84a5e2ce9ced795af24cc63f305522e602a33dcc8d",

@@ -1636,11 +1636,11 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs",
       "symbol": "carrier_tasks::NEXT_DIRECTORY",
       "fingerprint": "494f245b479841fe513536cf0f826d5425e7dcdb8a5733690a7e39b0a3c7782e",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator carrier_tasks::NEXT_DIRECTORY in crates/carrick-runtime/src/vcpu_loop/mod.rs generating unique IDs across the host process."
+      "rationale": "Carrier-wide monotonic allocator carrier_tasks::NEXT_DIRECTORY in crates/carrick-runtime/src/vcpu_loop/wait_wake.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
