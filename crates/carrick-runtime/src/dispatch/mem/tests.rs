@@ -227,6 +227,7 @@ fn readonly_host_fd_cannot_carry_a_writable_shared_file_mapping() {
 
 struct CountingMmapMemory {
     defer_anon: bool,
+    fail_protect_non_zero: Cell<bool>,
     base: u64,
     bytes: Vec<u8>,
     write_calls: Cell<usize>,
@@ -300,6 +301,7 @@ impl CountingMmapMemory {
     fn new(base: u64, len: usize) -> Self {
         Self {
             defer_anon: false,
+            fail_protect_non_zero: Cell::new(false),
             base,
             bytes: vec![0u8; len],
             write_calls: Cell::new(0),
@@ -308,6 +310,15 @@ impl CountingMmapMemory {
             protect_calls: Cell::new(0),
             protect_log: RefCell::new(Vec::new()),
         }
+    }
+
+    fn with_defer_anon(mut self, defer: bool) -> Self {
+        self.defer_anon = defer;
+        self
+    }
+
+    fn set_fail_protect_non_zero(&self, fail: bool) {
+        self.fail_protect_non_zero.set(fail);
     }
 
     fn range_offset(&self, address: u64, length: usize) -> Result<usize, MemoryError> {
@@ -356,6 +367,11 @@ impl GuestMemory for CountingMmapMemory {
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         self.protect_calls.set(self.protect_calls.get() + 1);
         self.protect_log.borrow_mut().push((address, len, prot));
+        if prot != 0 && self.fail_protect_non_zero.get() {
+            return Err(MemoryError::HostMap(format!(
+                "injected protection failure at {address:#x}+{len:#x}"
+            )));
+        }
         Ok(())
     }
 }
@@ -9570,4 +9586,699 @@ fn first_touch_arming_answers_and_splits_exactly_like_a_scan() {
     assert_eq!(arming.len(), 2);
     assert!(arming.overlaps(base, base + page));
     assert!(!arming.overlaps(base + 2 * page, base + 9 * page));
+}
+
+#[test]
+fn next_mmap_address_allocates_large_vmas_in_canonical_high_va_space() {
+    let dispatcher = SyscallDispatcher::new();
+    let size_64g = 64u64 << 30;
+    let size_16t = 16u64 << 40;
+
+    let first = dispatcher
+        .next_mmap_address(0, size_64g, 0, 0, MmapGrantCongruence::Any)
+        .expect("64 GiB grant");
+    assert_eq!(first, (crate::memory::LINUX_HIGH_VA_THRESHOLD, false));
+
+    // Record the 64 GiB allocation so the next search sees it as occupied.
+    dispatcher.record_dynamic_mapping_with_file_offset(
+        first.0,
+        size_64g,
+        LinuxProtFlags::empty(),
+        ProcMapSharing::Private,
+        String::new(),
+        DynamicMappingSemantics {
+            file_page_offset: None,
+            droppable: false,
+            semantic_vmas: None,
+        },
+    );
+
+    let second = dispatcher
+        .next_mmap_address(0, size_16t, 0, 0, MmapGrantCongruence::Any)
+        .expect("16 TiB grant");
+    assert_eq!(
+        second,
+        (crate::memory::LINUX_HIGH_VA_THRESHOLD + size_64g, false)
+    );
+
+    // Request exceeding 48-bit address space returns None.
+    let oversized = dispatcher.next_mmap_address(
+        0,
+        (1u64 << 48) + LINUX_PAGE_SIZE,
+        0,
+        0,
+        MmapGrantCongruence::Any,
+    );
+    assert_eq!(oversized, None);
+}
+
+#[test]
+fn next_mmap_address_canonical_high_va_hint_and_gap_search() {
+    let dispatcher = SyscallDispatcher::new();
+    let hint_addr = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x2000_0000;
+    let size = 1u64 << 30; // 1 GiB
+
+    // Clean hint in canonical space succeeds at requested address.
+    let grant = dispatcher
+        .next_mmap_address(hint_addr, size, 0, 0, MmapGrantCongruence::Any)
+        .expect("hint grant");
+    assert_eq!(grant, (hint_addr, false));
+
+    // Record dynamic region at hint_addr.
+    dispatcher.record_dynamic_mapping_with_file_offset(
+        hint_addr,
+        size,
+        LinuxProtFlags::empty(),
+        ProcMapSharing::Private,
+        String::new(),
+        DynamicMappingSemantics {
+            file_page_offset: None,
+            droppable: false,
+            semantic_vmas: None,
+        },
+    );
+
+    // Request with same hint now collides, so it falls back to unhinted search (low arena).
+    let fallback = dispatcher
+        .next_mmap_address(hint_addr, size, 0, 0, MmapGrantCongruence::Any)
+        .expect("fallback grant");
+    assert_eq!(fallback, (LINUX_MMAP_BASE, false));
+
+    // Request with large 64 GiB size and colliding hint falls back to canonical high VA gap.
+    let size_64g = 64u64 << 30;
+    dispatcher.record_dynamic_mapping_with_file_offset(
+        crate::memory::LINUX_HIGH_VA_THRESHOLD,
+        size_64g,
+        LinuxProtFlags::empty(),
+        ProcMapSharing::Private,
+        String::new(),
+        DynamicMappingSemantics {
+            file_page_offset: None,
+            droppable: false,
+            semantic_vmas: None,
+        },
+    );
+    let fallback_large = dispatcher
+        .next_mmap_address(
+            crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            size_64g,
+            0,
+            0,
+            MmapGrantCongruence::Any,
+        )
+        .expect("fallback large grant");
+    assert_eq!(
+        fallback_large,
+        (crate::memory::LINUX_HIGH_VA_THRESHOLD + size_64g, false)
+    );
+}
+
+#[test]
+fn large_vma_mmap_prot_none_mprotect_subranges_and_munmap() {
+    const SYS_MMAP: u64 = 222;
+    const SYS_MPROTECT: u64 = 226;
+    const SYS_MUNMAP: u64 = 215;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 4 * LINUX_PAGE_SIZE as usize)
+        .with_defer_anon(true);
+    let reporter = CompatReporter::default();
+    let context = dispatcher.capture_one_task_context().expect("task context");
+
+    let size_16t = 16u64 << 40;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE;
+
+    // 1. Reserve 16 TiB PROT_NONE
+    let map_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(SYS_MMAP, SyscallArgs([0, size_16t, 0, flags, u64::MAX, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .expect("sys map dispatch");
+    let base = returned(map_outcome) as u64;
+    assert_eq!(base, crate::memory::LINUX_HIGH_VA_THRESHOLD);
+
+    // Verify deferred anonymous state has pristine interval and zero physical backing initially.
+    let pristine = dispatcher
+        .mem()
+        .lock()
+        .deferred_anonymous
+        .snapshot()
+        .pristine;
+    assert!(
+        pristine
+            .iter()
+            .any(|r| r.start.raw() <= base && r.end.raw() >= base + size_16t),
+        "16 TiB reservation must be registered in pristine deferred anonymous state"
+    );
+    assert!(
+        !dispatcher.range_has_host_alias_backing(base, size_16t),
+        "initial 16 TiB reservation must have zero physical alias backing"
+    );
+
+    // 2. mprotect 3 single pages: first, middle, last.
+    let offsets = [
+        0,
+        (size_16t / 2 / LINUX_PAGE_SIZE) * LINUX_PAGE_SIZE,
+        size_16t - LINUX_PAGE_SIZE,
+    ];
+    for offset in offsets {
+        let addr = base + offset;
+        let prot_outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_MPROTECT,
+                    SyscallArgs([
+                        addr,
+                        LINUX_PAGE_SIZE,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("mprotect dispatch");
+        match prot_outcome {
+            DispatchOutcome::MapHostAlias {
+                va,
+                len,
+                prot,
+                transaction,
+                ..
+            } => {
+                assert_eq!(va.raw(), addr);
+                assert_eq!(len, LINUX_PAGE_SIZE);
+                assert_eq!(prot, LINUX_PROT_READ | LINUX_PROT_WRITE);
+                assert!(
+                    !dispatcher.range_has_host_alias_backing(addr, LINUX_PAGE_SIZE),
+                    "backing must not be marked published before transaction commit"
+                );
+                // Apply actual host-alias publication commit.
+                transaction
+                    .with_claim_for_test(|install| {
+                        dispatcher
+                            .commit_host_alias_install(install)
+                            .expect("publish host alias install");
+                    })
+                    .expect("claim host alias install");
+                assert!(
+                    dispatcher.range_has_host_alias_backing(addr, LINUX_PAGE_SIZE),
+                    "materialized subrange must have published host-alias backing"
+                );
+                assert!(
+                    !dispatcher
+                        .range_has_host_alias_backing(addr + LINUX_PAGE_SIZE, LINUX_PAGE_SIZE),
+                    "unmaterialized span must remain without physical backing"
+                );
+            }
+            other => panic!("expected MapHostAlias for subrange mprotect, got {other:?}"),
+        }
+    }
+
+    // 3. munmap the entire 16 TiB reservation.
+    let unmap_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(SYS_MUNMAP, SyscallArgs([base, size_16t, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .expect("munmap dispatch");
+    assert_eq!(returned(unmap_outcome), 0);
+
+    // Verify metadata, pristine ranges, and backing are retired.
+    {
+        let mem_authority = dispatcher.mem();
+        let mem = mem_authority.lock();
+        assert!(!guest_vma_overlaps_locked(&mem, base, size_16t));
+        assert!(
+            !mem.deferred_anonymous
+                .snapshot()
+                .pristine
+                .iter()
+                .any(|r| r.start.raw() < base + size_16t && base < r.end.raw())
+        );
+    }
+    assert!(!dispatcher.range_has_host_alias_backing(base, size_16t));
+}
+
+#[test]
+fn large_vma_mmap_rw_noreserve_deferred_subrange_mprotect_and_munmap() {
+    const SYS_MMAP: u64 = 222;
+    const SYS_MPROTECT: u64 = 226;
+    const SYS_MUNMAP: u64 = 215;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 4 * LINUX_PAGE_SIZE as usize)
+        .with_defer_anon(true);
+    let reporter = CompatReporter::default();
+    let context = dispatcher.capture_one_task_context().expect("task context");
+
+    let size_16t = 16u64 << 40;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE;
+
+    // 1. Map 16 TiB with PROT_READ | PROT_WRITE | MAP_NORESERVE.
+    // It must return an address in high canonical space without attempting eager whole-mapping MapHostAlias.
+    let map_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    size_16t,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    flags,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("sys map dispatch");
+    let base = match map_outcome {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("expected returned address for large lazy RW mapping, got {other:?}"),
+    };
+    assert_eq!(base, crate::memory::LINUX_HIGH_VA_THRESHOLD);
+
+    // Verify pristine deferred anonymous interval and absence of physical backing.
+    let pristine = dispatcher
+        .mem()
+        .lock()
+        .deferred_anonymous
+        .snapshot()
+        .pristine;
+    assert!(
+        pristine
+            .iter()
+            .any(|r| r.start.raw() <= base && r.end.raw() >= base + size_16t),
+        "16 TiB reservation must be registered in pristine deferred anonymous state"
+    );
+    assert!(!dispatcher.range_has_host_alias_backing(base, size_16t));
+
+    // 2. mprotect single pages (first, middle, last) and verify per-subrange MapHostAlias.
+    let offsets = [
+        0,
+        (size_16t / 2 / LINUX_PAGE_SIZE) * LINUX_PAGE_SIZE,
+        size_16t - LINUX_PAGE_SIZE,
+    ];
+    for offset in offsets {
+        let addr = base + offset;
+        let prot_outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_MPROTECT,
+                    SyscallArgs([
+                        addr,
+                        LINUX_PAGE_SIZE,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("mprotect dispatch");
+        match prot_outcome {
+            DispatchOutcome::MapHostAlias {
+                va,
+                len,
+                prot,
+                transaction,
+                ..
+            } => {
+                assert_eq!(va.raw(), addr);
+                assert_eq!(len, LINUX_PAGE_SIZE);
+                assert_eq!(prot, LINUX_PROT_READ | LINUX_PROT_WRITE);
+                transaction
+                    .with_claim_for_test(|install| {
+                        dispatcher
+                            .commit_host_alias_install(install)
+                            .expect("publish host alias install");
+                    })
+                    .expect("claim host alias install");
+                assert!(dispatcher.range_has_host_alias_backing(addr, LINUX_PAGE_SIZE));
+            }
+            other => panic!("expected MapHostAlias for subrange mprotect, got {other:?}"),
+        }
+    }
+
+    // 3. munmap the entire 16 TiB reservation.
+    let unmap_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(SYS_MUNMAP, SyscallArgs([base, size_16t, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .expect("munmap dispatch");
+    assert_eq!(returned(unmap_outcome), 0);
+    assert!(!guest_vma_overlaps_locked(
+        &dispatcher.mem().lock(),
+        base,
+        size_16t
+    ));
+    assert!(!dispatcher.range_has_host_alias_backing(base, size_16t));
+}
+
+#[test]
+fn large_vma_mmap_host_alias_transaction_abort_rollback() {
+    const SYS_MMAP: u64 = 222;
+    const SYS_MPROTECT: u64 = 226;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 4 * LINUX_PAGE_SIZE as usize)
+        .with_defer_anon(true);
+    let reporter = CompatReporter::default();
+    let context = dispatcher.capture_one_task_context().expect("task context");
+
+    let size_16t = 16u64 << 40;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE;
+
+    let map_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(SYS_MMAP, SyscallArgs([0, size_16t, 0, flags, u64::MAX, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .expect("sys map dispatch");
+    let base = returned(map_outcome) as u64;
+
+    // mprotect first page -> yields MapHostAlias with a live transaction.
+    let prot_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                SYS_MPROTECT,
+                SyscallArgs([
+                    base,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("mprotect dispatch");
+
+    let va = match prot_outcome {
+        DispatchOutcome::MapHostAlias {
+            va, transaction, ..
+        } => {
+            // Abort transaction by dropping outcome/transaction without commit.
+            drop(transaction);
+            va.raw()
+        }
+        other => panic!("expected MapHostAlias, got {other:?}"),
+    };
+
+    // Assert that the aborted transaction published zero backing.
+    assert!(
+        !dispatcher.range_has_host_alias_backing(va, LINUX_PAGE_SIZE),
+        "aborted host-alias transaction must leave zero backing published"
+    );
+}
+
+#[test]
+fn large_vma_mmap_reserve_fresh_error_rollback() {
+    const SYS_MMAP: u64 = 222;
+    const SYS_MUNMAP: u64 = 215;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 4 * LINUX_PAGE_SIZE as usize)
+        .with_defer_anon(true);
+    let reporter = CompatReporter::default();
+    let context = dispatcher.capture_one_task_context().expect("task context");
+
+    let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+    // 1. Direct reserve_fresh error validation on unaligned / zero-length inputs.
+    let mem = dispatcher.mem();
+    assert!(
+        mem.lock()
+            .deferred_anonymous
+            .reserve_fresh(GuestVa(base + 1), LINUX_PAGE_SIZE as usize)
+            .is_err(),
+        "unaligned reserve_fresh must return an error"
+    );
+    assert!(
+        mem.lock()
+            .deferred_anonymous
+            .reserve_fresh(GuestVa(base), 0)
+            .is_err(),
+        "zero-length reserve_fresh must return an error"
+    );
+
+    // 2. Actual-path post-reservation failure and rollback during mmap dispatch:
+    // Arm resident fault range at `base` so `commit_mmap_locked_range` will invoke
+    // `populate_resident_range` -> `protect_range(base, len, PROT_READ | PROT_WRITE)`.
+    dispatcher.track_resident_fault_range(
+        base,
+        LINUX_PAGE_SIZE,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+    );
+
+    // Inject failure for non-zero protect_range calls (e.g. resident fault populate).
+    memory.set_fail_protect_non_zero(true);
+
+    // Dispatch mmap with MAP_LOCKED and PROT_NONE.
+    // In SyscallDispatcher::mmap:
+    // - prepare_mmap_locked_range succeeds.
+    // - memory.protect_range(base, len, 0) succeeds (prot is 0).
+    // - reserve_fresh(base, len) succeeds and publishes pristine deferred range.
+    // - commit_mmap_locked_range -> populate_resident_range -> protect_range(base, len, RW) fails.
+    // - The rollback path executes mark_range_unmapped and deferred_anonymous.retire.
+    let fail_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    base,
+                    LINUX_PAGE_SIZE,
+                    0,
+                    LINUX_MAP_FIXED
+                        | LINUX_MAP_PRIVATE
+                        | LINUX_MAP_ANONYMOUS
+                        | carrick_abi::LINUX_MAP_LOCKED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("mmap dispatch");
+
+    assert_eq!(
+        fail_outcome,
+        DispatchOutcome::errno(carrick_abi::LINUX_ENOMEM),
+        "populate_resident_range error must return LINUX_ENOMEM"
+    );
+
+    // Verify complete rollback of deferred anonymous interval, locked ranges, and metadata.
+    {
+        let mem_authority = dispatcher.mem();
+        let mem = mem_authority.lock();
+        assert!(
+            !mem.deferred_anonymous
+                .snapshot()
+                .pristine
+                .iter()
+                .any(|r| r.start.raw() < base + LINUX_PAGE_SIZE && base < r.end.raw()),
+            "rolled-back reservation must be retired from pristine deferred state"
+        );
+        assert!(
+            !mem.locked_ranges
+                .iter()
+                .any(|r| r.start().raw() < base + LINUX_PAGE_SIZE && base < r.end().raw()),
+            "failed mmap must not commit locked ranges"
+        );
+    }
+    assert!(
+        dispatcher.dynamic_mapping_for_test(base).is_none(),
+        "failed mmap must not publish dynamic mapping metadata"
+    );
+    assert!(
+        !dispatcher.range_has_host_alias_backing(base, LINUX_PAGE_SIZE),
+        "failed mmap must leave zero physical alias backing"
+    );
+
+    // 3. Allocator reuse / clean subsequent mapping:
+    // With fault injection disabled, the exact same address can be mapped and unmapped cleanly.
+    memory.set_fail_protect_non_zero(false);
+    let ok_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    base,
+                    LINUX_PAGE_SIZE,
+                    0,
+                    LINUX_MAP_FIXED | LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("retry mmap dispatch");
+    assert_eq!(returned(ok_outcome), base as i64);
+    assert!(
+        dispatcher.dynamic_mapping_for_test(base).is_some(),
+        "successful mmap must record dynamic mapping"
+    );
+    {
+        let mem_authority = dispatcher.mem();
+        let mem = mem_authority.lock();
+        assert!(
+            mem.deferred_anonymous
+                .snapshot()
+                .pristine
+                .iter()
+                .any(|r| r.start.raw() <= base && r.end.raw() >= base + LINUX_PAGE_SIZE),
+            "successful mmap must register pristine deferred state"
+        );
+    }
+
+    let unmap_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(SYS_MUNMAP, SyscallArgs([base, LINUX_PAGE_SIZE, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .expect("munmap dispatch");
+    assert_eq!(returned(unmap_outcome), 0);
+}
+
+#[test]
+fn large_vma_mmap_overlapping_hint_and_fixed_replacement() {
+    const SYS_MMAP: u64 = 222;
+    const SYS_MUNMAP: u64 = 215;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 4 * LINUX_PAGE_SIZE as usize)
+        .with_defer_anon(true);
+    let reporter = CompatReporter::default();
+    let context = dispatcher.capture_one_task_context().expect("task context");
+
+    let size_16t = 16u64 << 40;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE;
+
+    // 1. Reserve 16 TiB at LINUX_HIGH_VA_THRESHOLD.
+    let map_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(SYS_MMAP, SyscallArgs([0, size_16t, 0, flags, u64::MAX, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .expect("map 16 TiB");
+    let base = returned(map_outcome) as u64;
+    assert_eq!(base, crate::memory::LINUX_HIGH_VA_THRESHOLD);
+
+    // 2. Non-fixed mmap with hint inside the 16 TiB reservation.
+    // Hint collides, so it finds the next available high VA gap.
+    let hint_addr = base + (1u64 << 30);
+    let size_64g = 64u64 << 30;
+    let hinted_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([hint_addr, size_64g, 0, flags, u64::MAX, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("hinted map");
+    let hinted_base = returned(hinted_outcome) as u64;
+    assert_eq!(
+        hinted_base,
+        base + size_16t,
+        "colliding hint must fall back to the next available gap beyond the 16 TiB reservation"
+    );
+
+    // 3. MAP_FIXED replacement of 64 KiB inside the 16 TiB reservation.
+    let fixed_addr = base + (2u64 << 30);
+    let fixed_size = 64 * 1024u64;
+    let fixed_outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    fixed_addr,
+                    fixed_size,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_FIXED | LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .expect("fixed replacement map");
+    match fixed_outcome {
+        DispatchOutcome::MapHostAlias {
+            va,
+            len,
+            transaction,
+            ..
+        } => {
+            assert_eq!(va.raw(), fixed_addr);
+            assert_eq!(len, fixed_size);
+            transaction
+                .with_claim_for_test(|install| {
+                    dispatcher
+                        .commit_host_alias_install(install)
+                        .expect("commit fixed replacement alias");
+                })
+                .expect("claim fixed replacement alias");
+        }
+        DispatchOutcome::Returned { value } => {
+            assert_eq!(value as u64, fixed_addr);
+        }
+        other => panic!("expected fixed replacement outcome, got {other:?}"),
+    }
+
+    // 4. Cleanup.
+    let unmap_16t = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(SYS_MUNMAP, SyscallArgs([base, size_16t, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .expect("unmap 16 TiB");
+    assert_eq!(returned(unmap_16t), 0);
+
+    let unmap_hinted = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(SYS_MUNMAP, SyscallArgs([hinted_base, size_64g, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .expect("unmap hinted");
+    assert_eq!(returned(unmap_hinted), 0);
 }

@@ -1851,6 +1851,86 @@ fn boot_region_is_hidden_reservation(map: &ProcMapsEntry, layout: MemoryLayout) 
         || boot_region_is_hidden_private_overlay(map)
 }
 
+fn find_canonical_high_va_gap(
+    mem: &MemState,
+    length: u64,
+    congruence: MmapGrantCongruence,
+) -> Option<(u64, bool)> {
+    if length == 0 || length > (1u64 << 48) {
+        return None;
+    }
+    let mut occupied: Vec<(u64, u64)> = Vec::new();
+
+    for map in &mem.dynamic_maps {
+        if map.end > crate::memory::LINUX_HIGH_VA_THRESHOLD {
+            occupied.push((
+                map.start.max(crate::memory::LINUX_HIGH_VA_THRESHOLD),
+                map.end,
+            ));
+        }
+    }
+    for (_, current, vma_end) in &mem.growdown_ranges {
+        if *vma_end > crate::memory::LINUX_HIGH_VA_THRESHOLD {
+            occupied.push((
+                (*current).max(crate::memory::LINUX_HIGH_VA_THRESHOLD),
+                *vma_end,
+            ));
+        }
+    }
+    if let Some(ref regions) = mem.address_space_regions {
+        for map in regions {
+            if !boot_region_is_hidden_reservation(map, mem.layout)
+                && map.end > crate::memory::LINUX_HIGH_VA_THRESHOLD
+            {
+                occupied.push((
+                    map.start.max(crate::memory::LINUX_HIGH_VA_THRESHOLD),
+                    map.end,
+                ));
+            }
+        }
+    }
+    occupied.push((
+        crate::memory::LINUX_ROSETTA_VA_BASE,
+        crate::memory::LINUX_ROSETTA_VA_BASE
+            .saturating_add(crate::memory::LINUX_ROSETTA_WINDOW_SIZE),
+    ));
+
+    occupied.sort_unstable_by_key(|&(s, _)| s);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(occupied.len());
+    for (s, e) in occupied {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+
+    let high_va_top = 1u64 << 48;
+    let mut candidate = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+    for (occ_start, occ_end) in merged {
+        let start = congruence.first_at_or_after(candidate)?;
+        if let Some(end) = start.checked_add(length)
+            && end <= occ_start
+            && end <= high_va_top
+        {
+            return Some((start, false));
+        }
+        candidate = candidate.max(occ_end);
+    }
+
+    let start = congruence.first_at_or_after(candidate)?;
+    if let Some(end) = start.checked_add(length)
+        && end <= high_va_top
+    {
+        return Some((start, false));
+    }
+
+    None
+}
+
 fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
     fn append_uncovered(
         maps: &mut Vec<ProcMapsEntry>,
@@ -4336,55 +4416,68 @@ impl SyscallDispatcher {
             let canonical_alias_hint =
                 aligned_hint && mmap_address_uses_alias(requested, length, layout);
             if canonical_alias_hint {
-                return Some((requested, false));
+                let mem_authority_hint = self.mem();
+                let mem = mem_authority_hint.lock();
+                let rosetta_start = crate::memory::LINUX_ROSETTA_VA_BASE;
+                let rosetta_end =
+                    rosetta_start.saturating_add(crate::memory::LINUX_ROSETTA_WINDOW_SIZE);
+                if !guest_vma_overlaps_locked(&mem, requested, length)
+                    && !ranges_overlap(requested, length, rosetta_start, rosetta_end)
+                {
+                    return Some((requested, false));
+                }
             }
         }
 
         let mem_authority_12 = self.mem();
 
         let mut mem = mem_authority_12.lock();
-        // First free region with a congruent fit. The slack before a congruent
-        // start and the remainder after the grant both stay on the free list.
-        let fit = mem
-            .free_regions
-            .iter()
-            .enumerate()
-            .find_map(|(pos, &(s, l))| {
-                let start = congruence.first_at_or_after(s)?;
-                let region_end = s.checked_add(l)?;
-                let end = start.checked_add(length)?;
-                (end <= region_end).then_some((pos, s, start, end, region_end))
-            });
-        if let Some((pos, s, start, end, region_end)) = fit {
-            mem.free_regions.remove(pos);
-            if start > s {
-                free_regions_insert(&mut mem.free_regions, s, start - s);
+        if length <= layout.mmap_size {
+            // First free region with a congruent fit. The slack before a congruent
+            // start and the remainder after the grant both stay on the free list.
+            let fit = mem
+                .free_regions
+                .iter()
+                .enumerate()
+                .find_map(|(pos, &(s, l))| {
+                    let start = congruence.first_at_or_after(s)?;
+                    let region_end = s.checked_add(l)?;
+                    let end = start.checked_add(length)?;
+                    (end <= region_end).then_some((pos, s, start, end, region_end))
+                });
+            if let Some((pos, s, start, end, region_end)) = fit {
+                mem.free_regions.remove(pos);
+                if start > s {
+                    free_regions_insert(&mut mem.free_regions, s, start - s);
+                }
+                if end < region_end {
+                    free_regions_insert(&mut mem.free_regions, end, region_end - end);
+                }
+                return Some((start, true));
             }
-            if end < region_end {
-                free_regions_insert(&mut mem.free_regions, end, region_end - end);
+            if let Some(cursor) = align_up_u64(mem.mmap_next, page_size)
+                && let Some(address) = congruence.first_at_or_after(cursor)
+                && range_within(address, length, layout.mmap_base, layout.mmap_size)
+                && let Some(end) = address.checked_add(length)
+            {
+                // A congruent bump skipped `[cursor, address)`; park it for reuse
+                // rather than stranding it.
+                if address > cursor {
+                    free_regions_insert(&mut mem.free_regions, cursor, address - cursor);
+                }
+                mem.mmap_next = end;
+                // Same dirty-high-water discipline as the hint path: a bump allocation
+                // that dips below the high-water (because munmap lowered mmap_next over
+                // already-touched pages) must be zeroed, not returned with stale bytes.
+                let stale = address < mem.mmap_writable_high;
+                if writable {
+                    mem.mmap_writable_high = mem.mmap_writable_high.max(end);
+                }
+                return Some((address, stale));
             }
-            return Some((start, true));
         }
-        let cursor = align_up_u64(mem.mmap_next, page_size)?;
-        let address = congruence.first_at_or_after(cursor)?;
-        if !range_within(address, length, layout.mmap_base, layout.mmap_size) {
-            return None;
-        }
-        let end = address.checked_add(length)?;
-        // A congruent bump skipped `[cursor, address)`; park it for reuse
-        // rather than stranding it.
-        if address > cursor {
-            free_regions_insert(&mut mem.free_regions, cursor, address - cursor);
-        }
-        mem.mmap_next = end;
-        // Same dirty-high-water discipline as the hint path: a bump allocation
-        // that dips below the high-water (because munmap lowered mmap_next over
-        // already-touched pages) must be zeroed, not returned with stale bytes.
-        let stale = address < mem.mmap_writable_high;
-        if writable {
-            mem.mmap_writable_high = mem.mmap_writable_high.max(end);
-        }
-        Some((address, stale))
+
+        find_canonical_high_va_gap(&mem, length, congruence)
     }
 
     /// Snapshot one `SharedFile` fragment while its old guest translation is
@@ -5759,13 +5852,12 @@ impl SyscallDispatcher {
                 match this.next_mmap_address(requested.0, length, prot, flags, congruence) {
                 Some(pair) => pair,
                 None => {
-                    // A length that could not fit an EMPTY arena is a property
-                    // of the request, and Linux answers ENOMEM for it too —
-                    // CPython's `test_io` asks for 0x8000_0000_0000_1000 on
-                    // purpose. Only a request that would have fitted, and did
-                    // not, is carrick's own arena running out.
-                    let arena = this.mem().lock().layout.mmap_size;
-                    let refusal = if length > arena {
+                    // A length that could not fit an EMPTY address space is a
+                    // property of the request, and Linux answers ENOMEM for it
+                    // too — CPython's `test_io` asks for 0x8000_0000_0000_1000
+                    // on purpose. Only a request that would have fitted, and did
+                    // not, is carrick's address space running out.
+                    let refusal = if length > (1u64 << 48) {
                         MmapRefusal::Spec("length exceeds the entire mmap address-space arena")
                     } else {
                         MmapRefusal::Internal("no free address-space region: mmap arena exhausted")
@@ -5870,7 +5962,6 @@ impl SyscallDispatcher {
                 // benign (KVM/NVMM host-map lazily, HVF maps the arena eagerly).
                 if let Err(error) = memory.protect_range(address, length_usize, 0)
                     && (in_arena || memory.supports_concurrent_exec_protection())
-                    && !address_uses_alias
                 {
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
@@ -5881,7 +5972,36 @@ impl SyscallDispatcher {
                         ),
                     ));
                 }
-                this.commit_mmap_locked_range(memory, locked_range)?;
+                if map_flags.contains(LinuxMmapFlags::PRIVATE) {
+                    if let Err(error) = this
+                        .mem()
+                        .lock()
+                        .deferred_anonymous
+                        .reserve_fresh(GuestVa(address), length_usize)
+                    {
+                        mark_range_unmapped(memory, address, length_usize);
+                        return Ok(request.refused_by(
+                            MmapRefusal::Spec("invalid deferred anonymous range"),
+                            LINUX_EINVAL,
+                            format_args!("at {address:#x}+{length:#x}: {error}"),
+                        ));
+                    }
+                }
+                if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
+                    mark_range_unmapped(memory, address, length_usize);
+                    if map_flags.contains(LinuxMmapFlags::PRIVATE) {
+                        let _ = this
+                            .mem()
+                            .lock()
+                            .deferred_anonymous
+                            .retire(GuestVa(address), length_usize);
+                    }
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("mmap locked range population failed"),
+                        errno,
+                        format_args!("at {address:#x}+{length:#x}: errno={errno:?}"),
+                    ));
+                }
                 this.record_dynamic_mapping_with_file_offset(
                     address,
                     length,
@@ -5909,8 +6029,14 @@ impl SyscallDispatcher {
                 });
             }
 
+            let defer_anonymous = memory.supports_lazy_anonymous_mmap()
+                && this.linux_page_size() == 4096
+                && map_flags.contains(LinuxMmapFlags::PRIVATE)
+                && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
+                && !fixed_anonymous;
+
             if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
-                && !address_uses_alias
+                && (!address_uses_alias || defer_anonymous)
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 if fixed_anonymous {
@@ -5928,12 +6054,6 @@ impl SyscallDispatcher {
                 // guest faults from unmaterialized anonymous ranges. Keep
                 // fixed replacement eager until its unmap transaction proves
                 // that the previous backing has actually been retired.
-                let defer_anonymous = memory.supports_lazy_anonymous_mmap()
-                    && this.linux_page_size() == 4096
-                    && map_flags.contains(LinuxMmapFlags::PRIVATE)
-                    && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
-                    && !fixed_anonymous
-                    && in_arena;
                 let initial_prot = if defer_anonymous { 0 } else { prot };
                 // Unconditional (see the PROT_NONE arm above): reserve across
                 // the whole arena for demand-paged backends; fatal only in-arena.
@@ -5949,7 +6069,33 @@ impl SyscallDispatcher {
                         ),
                     ));
                 }
-                this.commit_mmap_locked_range(memory, locked_range)?;
+                if defer_anonymous {
+                    if let Err(error) = this.mem().lock().deferred_anonymous
+                        .reserve_fresh(GuestVa(address), length_usize)
+                    {
+                        mark_range_unmapped(memory, address, length_usize);
+                        return Ok(request.refused_by(
+                            MmapRefusal::Spec("invalid deferred anonymous range"),
+                            LINUX_EINVAL,
+                            format_args!("at {address:#x}+{length:#x}: {error}"),
+                        ));
+                    }
+                }
+                if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
+                    mark_range_unmapped(memory, address, length_usize);
+                    if defer_anonymous {
+                        let _ = this
+                            .mem()
+                            .lock()
+                            .deferred_anonymous
+                            .retire(GuestVa(address), length_usize);
+                    }
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("mmap locked range population failed"),
+                        errno,
+                        format_args!("at {address:#x}+{length:#x}: errno={errno:?}"),
+                    ));
+                }
                 // Observe the FIRST TOUCH of each page, so `mincore` can tell a
                 // written page from an untouched one.
                 //
@@ -6008,13 +6154,11 @@ impl SyscallDispatcher {
                         semantic_vmas: None,
                     },
                 );
-                if defer_anonymous {
-                    this.mem().lock().deferred_anonymous
-                        .reserve_fresh(GuestVa(address), length_usize)
-                        .unwrap_or_else(|_| std::process::abort());
-                }
                 if map_flags.contains(LinuxMmapFlags::POPULATE) {
                     this.mark_range_resident(address, length);
+                }
+                if address_uses_alias {
+                    this.record_alias_vma(address, length);
                 }
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);

@@ -1603,10 +1603,11 @@ impl PageTableManager {
         coalesced
     }
 
-    /// Block size in bytes mapped by a leaf at `level` (1=1 GiB, 2=2 MiB,
+    /// Block size in bytes mapped by a leaf at `level` (0=512 GiB, 1=1 GiB, 2=2 MiB,
     /// 3=4 KiB) and the matching PA mask.
     fn level_span(level: usize) -> (u64, u64) {
         match level {
+            0 => (1 << 39, !((1 << 39) - 1)),
             1 => (1 << 30, PA_MASK_1GIB),
             2 => (1 << 21, PA_MASK_2MIB),
             _ => (1 << 12, PA_MASK_4KIB),
@@ -1847,9 +1848,27 @@ impl PageTableManager {
         }
         // Reclaim any sub-table the edit left fully uniform (single-vCPU only;
         // see try_coalesce). Walk one VA per 2 MiB block touched.
-        if changed {
+        if changed && !self.multi_vcpu && self.offline_private_image {
             let mut block = va & !((1 << 21) - 1);
             while block < end {
+                let idx = indices(block);
+                let l0_entry = TableLocation::new(0, idx[0] * 8);
+                let Some(l1_pa) = self.child_table_pa(l0_entry) else {
+                    let next_l0 = (block & !((1 << 39) - 1)).saturating_add(1 << 39);
+                    block = next_l0.max(block + (1 << 21));
+                    continue;
+                };
+                let Ok(l1_loc) = self.pa_to_loc(l1_pa) else {
+                    let next_l0 = (block & !((1 << 39) - 1)).saturating_add(1 << 39);
+                    block = next_l0.max(block + (1 << 21));
+                    continue;
+                };
+                let l1_entry = l1_loc.entry(idx[1]);
+                let Some(_l2_pa) = self.child_table_pa(l1_entry) else {
+                    let next_l1 = (block & !((1 << 30) - 1)).saturating_add(1 << 30);
+                    block = next_l1.max(block + (1 << 21));
+                    continue;
+                };
                 if self.try_coalesce(block) {
                     flush_required = true;
                 }
@@ -1926,17 +1945,41 @@ impl PageTableManager {
     /// stale walk-cache (same break-before-make rule as coalesce). Returns
     /// whether anything was freed.
     fn reclaim_invalid_tables(&mut self, va: u64, len: usize) -> bool {
+        self.reclaim_invalid_tables_counting(va, len).0
+    }
+
+    fn reclaim_invalid_tables_counting(&mut self, va: u64, len: usize) -> (bool, usize) {
         if self.multi_vcpu {
-            return false;
+            return (false, 0);
         }
         let end = va + (len as u64).div_ceil(PT_PAGE) * PT_PAGE;
         let mut block = va & !((1 << 21) - 1);
         let mut freed = false;
+        let mut steps = 0;
         while block < end {
+            steps += 1;
+            let idx = indices(block);
+            let l0_entry = TableLocation::new(0, idx[0] * 8);
+            let Some(l1_pa) = self.child_table_pa(l0_entry) else {
+                let next_l0 = (block & !((1 << 39) - 1)).saturating_add(1 << 39);
+                block = next_l0.max(block + (1 << 21));
+                continue;
+            };
+            let Ok(l1_loc) = self.pa_to_loc(l1_pa) else {
+                let next_l0 = (block & !((1 << 39) - 1)).saturating_add(1 << 39);
+                block = next_l0.max(block + (1 << 21));
+                continue;
+            };
+            let l1_entry = l1_loc.entry(idx[1]);
+            let Some(_l2_pa) = self.child_table_pa(l1_entry) else {
+                let next_l1 = (block & !((1 << 30) - 1)).saturating_add(1 << 30);
+                block = next_l1.max(block + (1 << 21));
+                continue;
+            };
             freed |= self.reclaim_invalid_block(block);
             block += 1 << 21;
         }
-        freed
+        (freed, steps)
     }
 
     /// Walk the LIVE table structure and free every spare sub-table that is
@@ -2446,6 +2489,23 @@ impl PageTableManager {
             Ok((loc, _)) => self.read_desc(loc) & AP_MASK,
             Err(_) => 0,
         }
+    }
+
+    /// `unmap_aliased` returning exact traversal steps for algorithmic verification.
+    #[cfg(test)]
+    pub fn unmap_aliased_counting(
+        &mut self,
+        va: u64,
+        len: usize,
+        source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<(PageTableApplyOutcome, usize), PageTableError> {
+        let mut outcome = self.invalidate(va, len, source)?;
+        let (reclaimed, steps) = self.reclaim_invalid_tables_counting(va, len);
+        outcome.changed |= reclaimed;
+        if reclaimed {
+            outcome.flush_required = true;
+        }
+        Ok((outcome, steps))
     }
 }
 
@@ -4612,5 +4672,61 @@ mod tests {
         assert_eq!(child.base(), child_root, "child rebased root");
         assert_eq!(child.arenas[1].base, child_ext1.0, "child rebased arena 1");
         assert_eq!(child.arenas[2].base, child_ext2.0, "child rebased arena 2");
+    }
+
+    #[test]
+    fn large_vma_unmap_work_is_hierarchically_bounded_empty_and_populated_islands() {
+        let mut mgr = hvpatch_manager();
+        let size_16t = 16u64 << 40;
+        let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+
+        // 1. Unmapping a completely empty 16 TiB reservation traverses only the top-level
+        // descriptors (32 L0 slots covering 512 GiB each).
+        let (outcome, steps_empty) = mgr
+            .unmap_aliased_counting(base, size_16t as usize, None)
+            .expect("unmap empty 16 TiB");
+        assert!(!outcome.changed);
+        assert_eq!(
+            steps_empty, 32,
+            "empty 16 TiB traverses exactly 32 L0 slots"
+        );
+
+        // 2. Populate three isolated 2-MiB islands: first, middle, last.
+        let island_offsets = [
+            0,
+            (size_16t / 2 / (2 * 1024 * 1024)) * (2 * 1024 * 1024),
+            size_16t - 2 * 1024 * 1024,
+        ];
+        let ipa_base = 0x80_0000;
+        for (i, &offset) in island_offsets.iter().enumerate() {
+            let va = base + offset;
+            let ipa = ipa_base + (i as u64) * 0x20_0000;
+            mgr.map_aliased(va, ipa, 2 * 1024 * 1024, true, None)
+                .expect("map island");
+            assert!(mgr.is_valid(va), "island at {va:#x} must be valid");
+        }
+
+        // 3. Unmap the entire 16 TiB range with populated islands.
+        let (outcome_populated, steps_populated) = mgr
+            .unmap_aliased_counting(base, size_16t as usize, None)
+            .expect("unmap populated 16 TiB");
+        assert!(
+            outcome_populated.changed,
+            "populated islands must be reclaimed"
+        );
+
+        for &offset in &island_offsets {
+            let va = base + offset;
+            assert!(!mgr.is_valid(va), "island at {va:#x} must be invalidated");
+        }
+
+        // Without hierarchical skipping (the old 2 MiB linear sweep), steps would be
+        // 16 TiB / 2 MiB = 8,388,608.
+        // With hierarchical skipping, unpopulated L0 (512 GiB) and L1 (1 GiB) ranges are
+        // skipped in O(1) steps, keeping total steps bounded below 5,000.
+        assert!(
+            steps_populated < 5000,
+            "16 TiB reclaim steps must be hierarchically bounded: {steps_populated} < 5000 (old linear sweep = 8,388,608)"
+        );
     }
 }
