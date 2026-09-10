@@ -469,7 +469,7 @@
       "domain": "hvpatch::process_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
       "function": "CloneAdmissionGate::subscribe_change",
       "ordinal_in_function": 1,
       "fingerprint": "bbb540a54cd00bee5e6c3cd83760d74af8985e9fd1e3929f51b78fe04b0f7bb4",
@@ -480,7 +480,7 @@
       "domain": "vcpu_loop::vfork_wait"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
       "function": "<CloneAdmissionPermit as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "adeba2e95ebd43023dc72c83db1438a2cbbc1ce28c1420e2a1c8bc9a3ec008b0",
