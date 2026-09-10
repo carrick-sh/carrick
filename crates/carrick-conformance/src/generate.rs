@@ -183,6 +183,17 @@ const DOCKER_FLAG_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-llistxattr03", &["--cap-add", "SYS_ADMIN"]),
     ("ltp-clone301", &["--security-opt", "seccomp=unconfined"]),
     ("ltp-clone302", &["--security-opt", "seccomp=unconfined"]),
+    // semctl06 exercises SysV semaphore IPC permissions across UIDs/mode bits,
+    // requiring CAP_IPC_OWNER for overriding permissions when neither creator nor
+    // UID matches. Without it semop() fails with EACCES (errno 13). With it the
+    // native arm64 oracle passes.
+    ("ltp-semctl06", &["--cap-add", "IPC_OWNER"]),
+    // syslog12 validates parameter rejection in syslog(2) prior to checking
+    // effective root in non-root test cases. Linux requires CAP_SYSLOG before
+    // parameter validation; without it calls fail early with EPERM instead of
+    // EINVAL. With CAP_SYSLOG granted, the native arm64 oracle passes all 6
+    // assertions (including the non-root EPERM check).
+    ("ltp-syslog12", &["--cap-add", "SYSLOG"]),
 ];
 
 /// Oracle-fidelity docker_flags matched by suite-name PREFIX (family stem), so a
@@ -1344,5 +1355,171 @@ mod tests {
         // setrlimit06: EXCLUDED from both overrides (RLIMIT_CPU enforcement gap).
         assert_eq!(docker_flag_overrides("ltp-setrlimit06"), None);
         assert_eq!(known_gap_overrides("ltp-setrlimit06"), None);
+    }
+
+    #[test]
+    fn semctl06_and_syslog12_oracle_capabilities_are_exact_and_mirrored() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/conformance/suites.toml"
+        ))
+        .unwrap();
+        let m = Manifest::from_toml(&text).unwrap();
+        let find = |name: &str| m.suite.iter().find(|s| s.name == name).unwrap();
+
+        // 1. Regeneration overrides: exact least capability grant, mirrored to Carrick.
+        assert_eq!(
+            docker_flag_overrides("ltp-semctl06"),
+            Some(vec!["--cap-add".into(), "IPC_OWNER".into()]),
+            "ltp-semctl06 must grant the Docker oracle CAP_IPC_OWNER"
+        );
+        assert_eq!(
+            carrick_flags_for("ltp-semctl06"),
+            vec!["--fs", "host", "--cap-add", "IPC_OWNER"],
+            "ltp-semctl06 must mirror CAP_IPC_OWNER onto Carrick"
+        );
+        assert_eq!(
+            docker_flag_overrides("ltp-syslog12"),
+            Some(vec!["--cap-add".into(), "SYSLOG".into()]),
+            "ltp-syslog12 must grant the Docker oracle CAP_SYSLOG"
+        );
+        assert_eq!(
+            carrick_flags_for("ltp-syslog12"),
+            vec!["--fs", "host", "--cap-add", "SYSLOG"],
+            "ltp-syslog12 must mirror CAP_SYSLOG onto Carrick"
+        );
+
+        // Neither suite acquires broad/unconfined or privileged grants.
+        for name in ["ltp-semctl06", "ltp-syslog12"] {
+            let docker = docker_flag_overrides(name).unwrap();
+            assert!(
+                !docker.iter().any(|f| f == "--privileged"),
+                "{name} must not be granted broad --privileged"
+            );
+            assert!(
+                !docker.iter().any(|f| f == "seccomp=unconfined"),
+                "{name} must not be granted broad seccomp=unconfined"
+            );
+            assert_eq!(
+                known_gap_overrides(name),
+                None,
+                "{name} must not carry a known_gap"
+            );
+        }
+
+        // Sibling suites remain unprivileged in overrides.
+        for name in [
+            "ltp-semctl01",
+            "ltp-semctl02",
+            "ltp-semctl03",
+            "ltp-semctl04",
+            "ltp-semctl05",
+            "ltp-semctl07",
+            "ltp-semctl08",
+            "ltp-semctl09",
+        ] {
+            assert_eq!(
+                docker_flag_overrides(name),
+                None,
+                "{name} must stay unprivileged"
+            );
+            assert_eq!(
+                carrick_flags_for(name),
+                vec!["--fs", "host"],
+                "{name} must stay unprivileged on Carrick"
+            );
+        }
+        assert_eq!(
+            docker_flag_overrides("ltp-syslog11"),
+            None,
+            "ltp-syslog11 must stay unprivileged"
+        );
+        assert_eq!(
+            carrick_flags_for("ltp-syslog11"),
+            vec!["--fs", "host"],
+            "ltp-syslog11 must stay unprivileged on Carrick"
+        );
+
+        // 2. Committed manifest: exact least capability grant in suites.toml.
+        let semctl06 = find("ltp-semctl06");
+        assert_eq!(
+            semctl06.docker_flags,
+            ["--cap-add", "IPC_OWNER"],
+            "committed ltp-semctl06 docker_flags"
+        );
+        assert_eq!(
+            semctl06.carrick_flags,
+            ["--fs", "host", "--cap-add", "IPC_OWNER"],
+            "committed ltp-semctl06 carrick_flags"
+        );
+        assert_eq!(
+            semctl06.cmd,
+            ["/opt/ltp/testcases/bin/semctl06"],
+            "committed ltp-semctl06 cmd must be preserved"
+        );
+        assert_eq!(
+            semctl06.image, "localhost:5050/ltp:arm64",
+            "committed ltp-semctl06 image must be preserved"
+        );
+        assert_eq!(semctl06.timeout_s, 40);
+        assert_eq!(semctl06.tier, Tier::Full);
+        assert!(
+            semctl06.known_gaps.is_empty(),
+            "committed ltp-semctl06 must not carry known_gaps"
+        );
+
+        let syslog12 = find("ltp-syslog12");
+        assert_eq!(
+            syslog12.docker_flags,
+            ["--cap-add", "SYSLOG"],
+            "committed ltp-syslog12 docker_flags"
+        );
+        assert_eq!(
+            syslog12.carrick_flags,
+            ["--fs", "host", "--cap-add", "SYSLOG"],
+            "committed ltp-syslog12 carrick_flags"
+        );
+        assert_eq!(
+            syslog12.cmd,
+            ["/opt/ltp/testcases/bin/syslog12"],
+            "committed ltp-syslog12 cmd must be preserved"
+        );
+        assert_eq!(
+            syslog12.image, "localhost:5050/ltp:arm64",
+            "committed ltp-syslog12 image must be preserved"
+        );
+        assert_eq!(syslog12.timeout_s, 40);
+        assert_eq!(syslog12.tier, Tier::Full);
+        assert!(
+            syslog12.known_gaps.is_empty(),
+            "committed ltp-syslog12 must not carry known_gaps"
+        );
+
+        // Sibling suites in committed manifest remain untouched.
+        for name in [
+            "ltp-semctl01",
+            "ltp-semctl02",
+            "ltp-semctl03",
+            "ltp-semctl04",
+            "ltp-semctl05",
+            "ltp-semctl07",
+            "ltp-semctl08",
+            "ltp-semctl09",
+            "ltp-syslog11",
+        ] {
+            let s = find(name);
+            assert!(
+                s.docker_flags.is_empty(),
+                "{name} in committed manifest must have empty docker_flags"
+            );
+            assert_eq!(
+                s.carrick_flags,
+                ["--fs", "host"],
+                "{name} in committed manifest must have default carrick_flags"
+            );
+        }
+
+        // Total suite count invariant.
+        assert_eq!(m.suite.len(), 2_127);
     }
 }

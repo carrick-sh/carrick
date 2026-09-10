@@ -19238,7 +19238,8 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--fs", "host"]
+carrick_flags = ["--fs", "host", "--cap-add", "IPC_OWNER"]
+docker_flags = ["--cap-add", "IPC_OWNER"]
 
 [[suite]]
 name = "ltp-semctl07"
@@ -22449,7 +22450,8 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--fs", "host"]
+carrick_flags = ["--fs", "host", "--cap-add", "SYSLOG"]
+docker_flags = ["--cap-add", "SYSLOG"]
 
 [[suite]]
 name = "ltp-tee01"
