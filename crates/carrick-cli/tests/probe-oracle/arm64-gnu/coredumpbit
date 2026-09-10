@@ -1,4 +1,4 @@
-c2f3c40f9466688e
+71b855ffb0ce62ee
 sigabrt_wifsignaled=true
 sigabrt_wcoredump_set=true
 sigsegv_wifsignaled=true
@@ -9,3 +9,14 @@ sigterm_wifsignaled=true
 sigterm_wcoredump_clear=true
 sigkill_wifsignaled=true
 sigkill_wcoredump_clear=true
+sparse_core_transport_ok=true
+sparse_core_map_errno=0
+sparse_core_limit_errno=0
+sparse_core_reaped=true
+sparse_core_wait_status=139
+sparse_core_sigsegv=true
+sparse_core_wcoredump=true
+sparse_core_elf=true
+sparse_core_nonempty=true
+sparse_core_storage_within_limit=true
+sparse_core_full_load_extent=true
