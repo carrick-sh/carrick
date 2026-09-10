@@ -260,18 +260,6 @@ pub mod trap {
     // in the CHILD only, so the HVF-specific hooks below stay inert no-ops —
     // same pattern as the `host_signal` / `probes` Linux stubs below.
 
-    /// Count of live vCPUs — the execve thread-group drain invariant on BOTH
-    /// backends (`terminate_siblings_for_exec` spin-waits for `<= 1` after
-    /// kicking siblings, so the exec teardown can't free guest RAM under a
-    /// still-running sibling). On platform-linux this is the REAL counter
-    /// maintained by the KVM engine (vcpu construction / sibling-spec tickets
-    /// / KvmVcpu::drop); only non-linux scaffolding (bhyve) gets an inert
-    /// always-0 stub (no drain) until it implements the same contract.
-    #[cfg(feature = "platform-linux")]
-    pub use carrick_vmm_kvm::kvm::VCPU_LIVE;
-    #[cfg(not(feature = "platform-linux"))]
-    pub static VCPU_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
     /// Dump cross-thread kick statistics at process exit. No-op on Linux.
     pub fn dump_kick_stats() {}
 }

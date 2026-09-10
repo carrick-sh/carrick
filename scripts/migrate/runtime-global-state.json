@@ -1304,14 +1304,7 @@
       "fingerprint": "ce8c551c8e41d927d8d985ddb15f6cf630e23f2e0593911681f4fedd461b810f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static timer_delivery::cell::C in crates/carrick-runtime/src/lib.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/lib.rs",
-      "symbol": "trap::VCPU_LIVE",
-      "fingerprint": "95da3941cdd6081deeab7225bed1ebbd65b6a4947f8a1f75d91df7d7e83978be",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static trap::VCPU_LIVE in crates/carrick-runtime/src/lib.rs maintaining host process lifecycle or VM resources."
+
     },
     {
       "kind": "static",

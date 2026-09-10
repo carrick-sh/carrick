@@ -100,4 +100,4 @@ pub use scheduler::{
     PreemptOrContinue, SchedulingPolicy, TaskKey, TaskPlacement,
 };
 pub mod vcpu_census;
-pub use vcpu_census::{AdmissionRefused, VcpuCensus, VcpuLease};
+pub use vcpu_census::{VcpuCensus, VcpuLiveGuard};
