@@ -1972,7 +1972,7 @@ where
         let child_registry = Arc::new(ThreadRegistry::new(child_tid));
         let child_futex = Arc::new(crate::thread::FutexTable::new());
         let child_platform_futex = (self.platform_futex_factory)(Arc::clone(&child_futex));
-        let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let child_threads = VcpuThreadRegistry::new();
 
         // The kernel reservation owns the independently allocated namespace
         // PID until commit. Copy out that captured visible identity while all
@@ -2273,7 +2273,7 @@ where
             crate::kernel::LinuxTid::for_task_leader(child_id),
             child_kernel.fatal_signal.current_generation(),
             child_tid,
-            Arc::clone(&child_threads),
+            child_threads.clone(),
             Arc::clone(&child_kicker),
             carrick_hal::InGuestFlag::for_guest_thread(),
             self.max_traps,
@@ -2418,7 +2418,7 @@ where
             return Err(ops.fail_stop(error));
         }
         let member_publication = PersistentProcessMemberPublication::new(
-            Arc::clone(&child_threads),
+            child_threads.clone(),
             &logical.terminal_settlement,
         );
         let (_, vfork_parent_wait) = started.into_parts();

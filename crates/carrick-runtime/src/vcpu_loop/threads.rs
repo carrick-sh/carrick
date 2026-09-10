@@ -174,6 +174,77 @@ impl CloneTidOutputTransaction {
     }
 }
 
+/// Encapsulates the collection of active persistent vCPU thread handles for a process.
+#[derive(Clone, Default)]
+pub(crate) struct VcpuThreadRegistry(Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>);
+
+impl VcpuThreadRegistry {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(Vec::new())))
+    }
+
+    pub(crate) fn register(&self, terminal_settlement: &HvpatchExternalTerminalSettlement) -> bool {
+        self.register_handle(VcpuThreadHandle::Persistent {
+            terminal_settlement: terminal_settlement.clone(),
+        })
+    }
+
+    pub(crate) fn register_handle(&self, handle: VcpuThreadHandle) -> bool {
+        let mut handles = self.0.lock();
+        if handles
+            .iter()
+            .any(|h| h.completion().id() == handle.completion().id())
+        {
+            return false;
+        }
+        handles.push(handle);
+        true
+    }
+
+    pub(crate) fn take_by_id(&self, completion: continuation::JobId) -> Option<VcpuThreadHandle> {
+        let mut handles = self.0.lock();
+        let index = handles
+            .iter()
+            .position(|handle| handle.completion().id() == completion)?;
+        Some(handles.remove(index))
+    }
+
+    pub(crate) fn drain(&self) -> Vec<VcpuThreadHandle> {
+        let mut handles = self.0.lock();
+        std::mem::take(&mut *handles)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.lock().is_empty()
+    }
+
+    pub(crate) fn completions(&self) -> Vec<continuation::LogicalJobCompletion> {
+        self.0
+            .lock()
+            .iter()
+            .map(VcpuThreadHandle::completion)
+            .collect()
+    }
+}
+
+impl From<Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>> for VcpuThreadRegistry {
+    fn from(handles: Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>) -> Self {
+        Self(handles)
+    }
+}
+
+impl From<VcpuThreadRegistry> for Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>> {
+    fn from(registry: VcpuThreadRegistry) -> Self {
+        registry.0
+    }
+}
+
 #[cfg(test)]
 mod clone_tid_output_tests {
     use super::*;
@@ -242,6 +313,50 @@ mod clone_tid_output_tests {
         assert!(transaction.rollback(&mut memory).is_err());
         assert_eq!(memory.bytes[&parent], 99_i32.to_le_bytes());
         assert_eq!(memory.bytes[&child], 41_i32.to_le_bytes());
+    }
+
+    #[test]
+    fn vcpu_thread_registry_encapsulates_lifecycle_operations() {
+        let registry = VcpuThreadRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+
+        let settlement1 = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            continuation::LogicalJobCompletion::pending(),
+        );
+        let id1 = settlement1.completion().id();
+
+        let settlement2 = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            continuation::LogicalJobCompletion::pending(),
+        );
+        let id2 = settlement2.completion().id();
+
+        assert!(registry.register(&settlement1));
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.is_empty());
+
+        // Duplicate registration must fail.
+        assert!(!registry.register(&settlement1));
+        assert_eq!(registry.len(), 1);
+
+        assert!(registry.register(&settlement2));
+        assert_eq!(registry.len(), 2);
+
+        // Take by id removes the matching handle.
+        let taken = registry.take_by_id(id1);
+        assert!(taken.is_some());
+        assert_eq!(taken.unwrap().completion().id(), id1);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.take_by_id(id1).is_none());
+
+        // Drain takes remaining handles and leaves registry empty.
+        let drained = registry.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].completion().id(), id2);
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
     }
 }
 
@@ -315,12 +430,7 @@ where
                 "HVPatch persistent sibling drain lost exact Kernel thread".to_owned(),
             )
         })?;
-        let completions = self
-            .threads
-            .lock()
-            .iter()
-            .map(VcpuThreadHandle::completion)
-            .collect::<Vec<_>>();
+        let completions = self.threads.completions();
         let members = completions.len();
         let drain = continuation::ProcessDrain::for_scheduler(
             thread.key(),

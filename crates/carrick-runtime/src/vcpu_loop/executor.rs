@@ -10172,7 +10172,7 @@ pub(crate) mod tests {
         directory: Arc<HvpatchTaskBindingDirectory>,
         dormant: Option<super::PreparedHvpatchSubmission>,
         child_proof: HvpatchActivationProof,
-        child_threads: Arc<parking_lot::Mutex<Vec<crate::vcpu_loop::VcpuThreadHandle>>>,
+        child_threads: crate::vcpu_loop::VcpuThreadRegistry,
         terminal_settlement: super::super::HvpatchExternalTerminalSettlement,
         runtime_directory: Arc<super::super::HvpatchRuntimeDirectory>,
         job_result: super::super::HvpatchLoopResult,
@@ -10247,7 +10247,7 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-            let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let child_threads = crate::vcpu_loop::VcpuThreadRegistry::new();
             let terminal_settlement = super::super::HvpatchExternalTerminalSettlement::new(
                 job_result.clone(),
                 job_completion.clone(),
@@ -10281,7 +10281,7 @@ pub(crate) mod tests {
             proof: Option<HvpatchActivationProof>,
         ) -> super::PreparedVforkChildActivation {
             let member_pub = super::super::PersistentProcessMemberPublication::new(
-                Arc::clone(&self.child_threads),
+                self.child_threads.clone(),
                 &self.terminal_settlement,
             );
             let dormant = self.dormant.take().expect("dormant submission");
@@ -10338,7 +10338,7 @@ pub(crate) mod tests {
 
         assert_eq!(fixture.runtime_directory.live_job_group_count(), 0);
         assert_eq!(fixture.runtime_directory.live_process_job_count(), 0);
-        assert!(fixture.child_threads.lock().is_empty());
+        assert!(fixture.child_threads.is_empty());
     }
 
     #[test]
@@ -10443,7 +10443,7 @@ pub(crate) mod tests {
 
         assert_eq!(fixture.runtime_directory.live_job_group_count(), 0);
         assert_eq!(fixture.runtime_directory.live_process_job_count(), 0);
-        assert!(fixture.child_threads.lock().is_empty());
+        assert!(fixture.child_threads.is_empty());
     }
 
     #[test]
@@ -10545,7 +10545,7 @@ pub(crate) mod tests {
             .is_err()
         );
         // Child member publication rolled back
-        assert!(fixture.child_threads.lock().is_empty());
+        assert!(fixture.child_threads.is_empty());
         assert!(matches!(
             fixture.child.thread().execution_state(),
             ThreadExecutionState::Failed { .. }
@@ -10595,7 +10595,7 @@ pub(crate) mod tests {
             )
             .is_err()
         );
-        assert!(fixture.child_threads.lock().is_empty());
+        assert!(fixture.child_threads.is_empty());
         assert!(matches!(
             fixture.child.thread().execution_state(),
             ThreadExecutionState::Failed { .. }
