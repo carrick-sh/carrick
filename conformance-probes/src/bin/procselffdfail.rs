@@ -52,7 +52,36 @@ fn main() {
             libc::_exit(127);
         }
         let mut status = 0;
-        libc::waitpid(child, &mut status, 0);
+        let mut child_reaped = false;
+        if child > 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let waited = libc::waitpid(child, &mut status, libc::WNOHANG);
+                if waited == child {
+                    child_reaped = true;
+                    break;
+                }
+                if waited < 0 && conformance_probes::errno() != libc::EINTR {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    libc::kill(child, libc::SIGKILL);
+                    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while std::time::Instant::now() < reap_deadline {
+                        if libc::waitpid(child, &mut status, libc::WNOHANG) == child {
+                            child_reaped = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        let child_exit_127 = child_reaped
+            && libc::WIFEXITED(status)
+            && libc::WEXITSTATUS(status) == 127;
 
         let after_pid = list_fds(pid_fd_path.as_ptr());
         let after_self = list_fds(self_fd_path.as_ptr());
@@ -68,6 +97,6 @@ fn main() {
         let fd_listing_equal = if ok { 1 } else { 0 };
         let count = after_self.as_ref().map(|v| v.len()).unwrap_or(0);
 
-        report!(fd_listing_equal = fd_listing_equal, count = count);
+        report!(fd_listing_equal = fd_listing_equal, count = count, child_reaped = child_reaped, child_exit_127 = child_exit_127);
     }
 }
