@@ -226,33 +226,48 @@ impl PartialEq for SparseBuffer {
         if self.chunks == other.chunks {
             return true;
         }
+
         let mut offset = 0;
         while offset < self.len {
-            let next_self = self.chunks.range(offset..).next().map(|(&k, _)| k);
-            let next_other = other.chunks.range(offset..).next().map(|(&k, _)| k);
-
-            let next_active = match (next_self, next_other) {
-                (Some(s), Some(o)) => s.min(o),
-                (Some(s), None) => s,
-                (None, Some(o)) => o,
-                (None, None) => break,
+            let self_active_end = self
+                .chunks
+                .range(..=offset)
+                .next_back()
+                .map(|(&k, v)| k.saturating_add(v.len()))
+                .filter(|&end| end > offset);
+            let next_self_start = if self_active_end.is_some() {
+                offset
+            } else {
+                self.chunks
+                    .range(offset..)
+                    .next()
+                    .map(|(&k, _)| k)
+                    .unwrap_or(self.len)
             };
 
-            let self_pred_end = self
+            let other_active_end = other
                 .chunks
-                .range(..offset)
+                .range(..=offset)
                 .next_back()
                 .map(|(&k, v)| k.saturating_add(v.len()))
-                .unwrap_or(0);
-            let other_pred_end = other
-                .chunks
-                .range(..offset)
-                .next_back()
-                .map(|(&k, v)| k.saturating_add(v.len()))
-                .unwrap_or(0);
+                .filter(|&end| end > offset);
+            let next_other_start = if other_active_end.is_some() {
+                offset
+            } else {
+                other
+                    .chunks
+                    .range(offset..)
+                    .next()
+                    .map(|(&k, _)| k)
+                    .unwrap_or(self.len)
+            };
 
-            if offset < next_active && self_pred_end <= offset && other_pred_end <= offset {
-                offset = next_active;
+            if self_active_end.is_none() && other_active_end.is_none() {
+                let hole_end = next_self_start.min(next_other_start).min(self.len);
+                if hole_end > offset {
+                    offset = hole_end;
+                    continue;
+                }
             }
 
             if offset >= self.len {
@@ -265,6 +280,7 @@ impl PartialEq for SparseBuffer {
             }
             offset += step;
         }
+
         true
     }
 }
@@ -473,6 +489,23 @@ mod tests {
         let mut buf = SparseBuffer::new();
         let err = buf.write_range(usize::MAX - 10, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         assert_eq!(err, Err(SparseBufferError::Overflow));
+    }
+
+    #[test]
+    fn equality_checks_trailing_partial_chunk_controller() {
+        let mut left = SparseBuffer::new();
+        let mut right = SparseBuffer::new();
+        left.set_len(8192);
+        right.set_len(8192);
+        left.write_range(1, &vec![b'a'; 4096]).unwrap();
+        let mut bytes = vec![b'a'; 4096];
+        bytes[0] = 0;
+        right.write_range(0, &bytes).unwrap();
+        assert_ne!(left.read_range(4096, 1), right.read_range(4096, 1));
+        assert_ne!(
+            left, right,
+            "different trailing byte must make buffers unequal"
+        );
     }
 }
 
