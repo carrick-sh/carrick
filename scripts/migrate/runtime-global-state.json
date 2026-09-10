@@ -466,14 +466,6 @@
       "rationale": "Carrier-wide host infrastructure static HVPATCH_LANE in crates/carrick-runtime/src/dispatch/mod.rs maintaining host process lifecycle or VM resources."
     },
     {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "symbol": "internal::NEXT_INTERNAL_WAIT",
-      "fingerprint": "b336d734926bae2b1b399a6279596f9fac15467f0615d31f60e1da42d19e14b1",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator internal::NEXT_INTERNAL_WAIT in crates/carrick-runtime/src/dispatch/mod.rs generating unique IDs across the host process."
-    },
-    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
       "symbol": "publish_core_atomic::CARRICK_CORE_FAILPOINT",
@@ -752,6 +744,14 @@
       "fingerprint": "e050f8de716dc76a296742adc56a973f60c4915aefd51b0a44653218cf8da7d2",
       "classification": "test_only",
       "rationale": "Test-only subprocess sentinel for negative watchdog termination and child reaping verification."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/dispatch/wait_authority.rs",
+      "symbol": "internal::NEXT_INTERNAL_WAIT",
+      "fingerprint": "b336d734926bae2b1b399a6279596f9fac15467f0615d31f60e1da42d19e14b1",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator internal::NEXT_INTERNAL_WAIT in crates/carrick-runtime/src/dispatch/wait_authority.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
@@ -1312,7 +1312,6 @@
       "fingerprint": "ce8c551c8e41d927d8d985ddb15f6cf630e23f2e0593911681f4fedd461b810f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static timer_delivery::cell::C in crates/carrick-runtime/src/lib.rs maintaining host process lifecycle or VM resources."
-
     },
     {
       "kind": "static",
