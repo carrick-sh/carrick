@@ -11508,7 +11508,11 @@
   ],
   "rows_sha256": "8f82fcb44d069987192a137c86a3f5fdd8edcbdf978b6cf4c10bfe1f1f998345",
   "schema": 1,
+<<<<<<< HEAD
   "source_head": "6d1e21d7b32ebade746156cba69b428b85387889",
+=======
+  "source_head": "fb841b2a24f9ec056f114f3e06acc08d493e3f3f",
+>>>>>>> 5bf745278 (chore: reconcile line-pinned inventories for the process-state landing)
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
