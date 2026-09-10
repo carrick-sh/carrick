@@ -209,17 +209,23 @@ pub(crate) fn is_structural_namespace_mutation(canonical_nr: u64) -> bool {
 mod access;
 pub(in crate::dispatch) mod fd_helpers;
 mod legacy_aio;
+pub(crate) mod lookup;
 mod pathres;
 pub(crate) mod pipe;
 mod sendfile;
 mod stat;
 mod state;
 mod xattr;
+pub(in crate::dispatch) use lookup::{LookupIntent, LookupTarget};
 pub(crate) use pipe::*;
 pub use state::StdioSink;
 use state::*;
 pub(super) use state::{FsState, RuntimeIo, host_fd_offset};
 pub(crate) use state::{LegacyAioContextId, MountRetirement, SplicePushback};
+
+pub(super) fn vfs_md_to_rootfs_md_helper(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata {
+    vfs_md_to_rootfs_md(path, md)
+}
 
 fn get_last_error() -> i32 {
     carrick_portable::errno()
@@ -586,7 +592,7 @@ fn validate_flock_arg<M: CurrentMmMemory>(memory: &M, arg: u64) -> Result<(), Li
 /// Linux path-length limits enforced at resolution time: NAME_MAX (255) per
 /// component, PATH_MAX (4096) for the whole path. Either overflow →
 /// ENAMETOOLONG. (`PATH_MAX` includes the NUL, so the usable length is 4095.)
-fn check_path_length(path: &str) -> Result<(), LinuxErrno> {
+pub(super) fn check_path_length(path: &str) -> Result<(), LinuxErrno> {
     const NAME_MAX: usize = 255;
     const PATH_MAX: usize = 4096;
     if path.len() >= PATH_MAX {
@@ -1453,7 +1459,7 @@ fn is_proc_self_fdinfo_dir(path: &str, visible_self: Option<u32>) -> bool {
     sub == "fdinfo" && proc_component_is_self(pid, visible_self)
 }
 
-fn proc_self_fd_number(path: &str, visible_self: Option<u32>) -> Option<i32> {
+pub(super) fn proc_self_fd_number(path: &str, visible_self: Option<u32>) -> Option<i32> {
     let rest = path
         .strip_prefix("/proc/self/fd/")
         .or_else(|| path.strip_prefix("/proc/thread-self/fd/"))
@@ -1476,7 +1482,7 @@ fn proc_self_fd_number(path: &str, visible_self: Option<u32>) -> Option<i32> {
 /// (the executable path, the cwd, the root), so they are resolved here rather
 /// than in the pure `ProcVfs`. carrick is one guest process, so any numeric pid
 /// component refers to "self".
-fn proc_self_magic_link(path: &str, visible_self: Option<u32>) -> Option<&'static str> {
+pub(super) fn proc_self_magic_link(path: &str, visible_self: Option<u32>) -> Option<&'static str> {
     let rest = path.strip_prefix("/proc/")?;
     let (pid, leaf) = rest.split_once('/')?;
     // ONLY this process resolves exe/cwd/root from the live dispatcher state.
@@ -1501,7 +1507,7 @@ fn proc_self_magic_link(path: &str, visible_self: Option<u32>) -> Option<&'stati
 /// gate (`proc_live_pid`) makes a dead or foreign pid return `None` → ENOENT,
 /// mirroring `proc_self_magic_link`. carrick models exactly one initial ns per
 /// type, so every live pid's link names the same object.
-fn proc_ns_link(path: &str) -> Option<&str> {
+pub(super) fn proc_ns_link(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/proc/")?;
     let (pid, leaf) = rest.split_once('/')?;
     crate::vfs::proc::proc_live_pid(pid)?;
@@ -1528,7 +1534,7 @@ fn ns_type_clone_flag(ns_type: &str) -> Option<u64> {
 
 /// The fd number `N` of a `/proc/<self>/fdinfo/N` path, if it is one. Self only
 /// (the contents are this process's live fd state); a foreign pid falls through.
-fn proc_self_fdinfo_number(path: &str, visible_self: Option<u32>) -> Option<i32> {
+pub(super) fn proc_self_fdinfo_number(path: &str, visible_self: Option<u32>) -> Option<i32> {
     let rest = path.strip_prefix("/proc/")?;
     let (pid, tail) = rest.split_once('/')?;
     if !proc_component_is_self(pid, visible_self) {
@@ -1537,7 +1543,7 @@ fn proc_self_fdinfo_number(path: &str, visible_self: Option<u32>) -> Option<i32>
     tail.strip_prefix("fdinfo/")?.parse::<i32>().ok()
 }
 
-fn proc_visible_self(context: &crate::kernel::KernelContext) -> Option<u32> {
+pub(super) fn proc_visible_self(context: &crate::kernel::KernelContext) -> Option<u32> {
     u32::try_from(context.task().key().id.raw())
         .ok()
         .and_then(|pid| crate::namespace::pid::try_ns_self_pid_for(context, pid))
@@ -1667,7 +1673,7 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.invalidate_host_fd(raw_fd);
     }
 
-    fn record_fd_open_path(&self, fd: i32, path: String) {
+    pub(super) fn record_fd_open_path(&self, fd: i32, path: String) {
         self.captured_file_table()
             .write_fd_open_paths()
             .insert(fd, path);
@@ -1988,279 +1994,19 @@ impl SyscallDispatcher {
     }
 
     /// `statx` twin of [`stat_record_with_device`](Self::stat_record_with_device):
-    /// write a statx record from a real backing stat with the `mknod(2)`
-    /// device-node override applied (S_IFCHR/S_IFBLK + stx_rdev_{major,minor}).
-    fn write_statx_real_with_device(
-        &self,
-        memory: &mut impl CurrentMmMemory,
-        statxbuf: u64,
-        path: &str,
-        real: &crate::fs_backend::RealStat,
-    ) -> DispatchOutcome {
-        write_statx_record(memory, statxbuf, &self.stat_record_with_device(path, real))
-    }
-
-    fn path_stat_record(
+    pub(super) fn path_stat_record(
         &self,
         context: &crate::kernel::KernelContext,
         dirfd: u64,
         path: &str,
         flags: u64,
     ) -> Result<StatRecord, LinuxErrno> {
-        if path.is_empty() {
-            // AT_EMPTY_PATH stats the dirfd/fd itself; without it an empty
-            // pathname is ENOENT — NOT a stat of the cwd (lstat02/stat02 case 2).
-            if flags & LINUX_AT_EMPTY_PATH != 0 {
-                return self.fd_stat_record(dirfd as i32);
-            }
-            return Err(LINUX_ENOENT);
-        }
-
-        // `--fs host` trusted-dirfd fast lane: `newfstatat(dirfd, name)` on
-        // getdents output — the other half of the fs-walk hot loop — served
-        // straight off the trusted host dirfd, skipping `resolve_at_path`
-        // (anchor re-verify + parent validation) and the layered stat stack.
-        // A single component can never carry the trailing-slash directory
-        // forcing handled below.
-        if let Some(result) = self.try_trusted_dirfd_stat(dirfd, path) {
-            return result;
-        }
-
-        // A trailing "/" or "/." forces directory semantics on the FINAL
-        // component: the symlink is FOLLOWED even under AT_SYMLINK_NOFOLLOW
-        // (lstat("link/") of a symlink-to-dir reports the directory, not the
-        // link), and a non-directory final is ENOTDIR. Capture this from the
-        // raw path before resolve_at_path normalizes the slash away.
-        let requires_dir = path.ends_with('/') || path.ends_with("/.");
-
-        // Linux length limits apply before any lookup; the dentry fast path
-        // below skips `resolve_at_path`, which is where they were enforced.
-        check_path_length(path)?;
-
-        let in_chroot = self
-            .captured_fs_context()
-            .chroot_root()
-            .as_deref()
-            .is_some_and(|r| r != "/");
-
-        // Dentry-cache fast path: a stat of a plain absolute path is served
-        // from the dentry cache (resolving symlinks and negative entries in-memory).
-        if !in_chroot
-            && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
-            && path.starts_with('/')
-            && !path.starts_with("/proc")
-            && !path.starts_with("/sys")
-            && !path.starts_with("/dev")
-            && !path.split('/').any(|c| c == "..")
-            && self.dac_overrides_permissions()
-            && !self.fs.vfs_mounts.has_mount(path)
-        {
-            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
-            match self.fs.rootfs_vfs.dentry_stat(path, follow) {
-                Ok(real) => {
-                    if requires_dir && real.kind != RootFsEntryKind::Directory {
-                        return Err(LINUX_ENOTDIR);
-                    }
-                    return Ok(self.stat_record_with_device(path, &real));
-                }
-                Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
-                Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
-                Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
-                Err(_) => {}
-            }
-        }
-
-        // Dispatch-level stat-cache fast path (default on; CARRICK_FS_STATCACHE=0
-        // opts out): a repeat stat of a plain absolute path is served by one
-        // revalidating fstatat through a cached, contained parent fd. Gated so
-        // normalize(path) equals the resolved path (the cache key).
-        if !in_chroot
-            && !requires_dir
-            && dirfd == LINUX_AT_FDCWD
-            && path.starts_with('/')
-            && !path.starts_with("/proc")
-            && !path.starts_with("/sys")
-            && !path.split('/').any(|c| c == "..")
-            // The cache answers from a contained parent fd and therefore skips
-            // `resolve_at_path`, which is where `check_search_access` enforces
-            // execute permission on every ancestor. Serving a hit to a caller
-            // that has dropped privilege would let it stat through a directory
-            // it cannot search — so the fast path is for DAC-override callers
-            // only, the same guard `try_trusted_dirfd_stat` carries. That is
-            // also the hot case: the overwhelming majority of guests run as
-            // root, so the measured win is kept.
-            && self.dac_overrides_permissions()
-            && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(path)
-        {
-            return Ok(self.stat_record_with_device(path, &real));
-        }
-
-        let path = self.resolve_at_path(dirfd, path)?;
-        let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
-        if !path.starts_with("/proc")
-            && !path.starts_with("/sys")
-            && !path.starts_with("/dev")
-            && !path.split('/').any(|c| c == "..")
-            && self.dac_overrides_permissions()
-            && self.fs.vfs_mounts.resolve(&path).is_none()
-        {
-            match self.fs.rootfs_vfs.dentry_stat(&path, follow) {
-                Ok(real) => {
-                    if requires_dir && real.kind != RootFsEntryKind::Directory {
-                        return Err(LINUX_ENOTDIR);
-                    }
-                    return Ok(self.stat_record_with_device(&path, &real));
-                }
-                Err(LINUX_ENOENT) => return Err(LINUX_ENOENT),
-                Err(LINUX_ENOTDIR) => return Err(LINUX_ENOTDIR),
-                Err(LINUX_ELOOP) => return Err(LINUX_ELOOP),
-                Err(_) => {}
-            }
-        }
-        // Second stat-cache consult, AFTER dirfd resolution: find-style
-        // dirfd-relative stats (newfstatat(dirfd, name) on getdents output)
-        // failed the pre-resolution gate above and paid the full multi-walk
-        // slow path — measured at ~17.6 host calls per guest stat on the
-        // fs-walk workload. The resolved path is absolute by construction and
-        // the same gates apply; a cache hit implies a non-symlink entry
-        // (revalidation rejects S_IFLNK), so follow and no-follow coincide.
-        if !requires_dir
-            && !path.starts_with("/proc")
-            && !path.starts_with("/sys")
-            && !path.split('/').any(|c| c == "..")
-            // Same DAC-override guard as the pre-resolution consult above.
-            // `resolve_at_path` has run by here, but it resolves the path — it
-            // does not re-check the leaf, and a cache hit still bypasses the
-            // per-ancestor search checks for a dropped-privilege caller.
-            && self.dac_overrides_permissions()
-            && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(&path)
-        {
-            return Ok(self.stat_record_with_device(&path, &real));
-        }
-        if crate::vfs::may_be_synthetic_virtual_path(&path) {
-            // One context assembly serves both consults: it takes the proc lock
-            // and snapshots the address space, so building it twice per stat
-            // would double a hot path's cost — and an ordinary path skips it
-            // entirely.
-            let proc_ctx = self.synthetic_proc_context(context);
-            if let Some(contents) = crate::vfs::proc::synthetic_file(&path, &proc_ctx) {
-                return Ok(StatRecord::synthetic(
-                    &path,
-                    contents.len(),
-                    LINUX_S_IFREG | 0o444,
-                ));
-            }
-            // `/proc/<pid>` and `/proc/<pid>/task` for a PEER exist only in the
-            // kernel task graph — `Vfs::lookup` carries no context and answers
-            // from Darwin's process table, which on HVPatch describes the one
-            // carrier every Linux process is a thread of. Without this consult
-            // `stat("/proc/<peer>")` was ENOENT while `cat /proc/<peer>/stat`
-            // worked.
-            if crate::vfs::proc::synthetic_dir_entries(&path, &proc_ctx).is_some() {
-                return Ok(StatRecord::synthetic(&path, 0, LINUX_S_IFDIR | 0o555));
-            }
-            // A peer's ns magic symlink, for the same reason.
-            if let Some(size) = crate::vfs::proc::proc_ns_link_size_with_context(&path, &proc_ctx) {
-                return Ok(StatRecord::synthetic(
-                    &path,
-                    size as usize,
-                    LINUX_S_IFLNK | 0o777,
-                ));
-            }
-        }
-        if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
-            return Ok(StatRecord::synthetic(
-                &path,
-                contents.len(),
-                LINUX_S_IFREG | 0o444,
-            ));
-        }
-
-        let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
-        if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
-            if requires_dir && real.kind != RootFsEntryKind::Directory {
-                return Err(LINUX_ENOTDIR);
-            }
-            return Ok(self.stat_record_with_device(&path, &real));
-        }
-        // The overlay could not follow `path` itself. If `path` is a symlink,
-        // note that BEFORE re-resolving, but do NOT conclude it dangles yet:
-        // `overlay.real_stat(.., follow)` follows only inside the writable
-        // UPPER, so a link whose target lives solely in the immutable image
-        // layers is invisible to it. Concluding "dangling" here made `stat()`
-        // ENOENT for EVERY guest-created symlink into image content — while
-        // `open()` through the same link worked, because open takes the layered
-        // path. CPython `test_posix.test_posix_spawnp` is exactly that shape: it
-        // symlinks a temp-dir program at `sys.executable` and then spawns it.
-        let path_is_symlink = follow
-            && self
-                .fs
-                .rootfs_vfs
-                .overlay
-                .real_stat(&path, false)
-                .is_some_and(|link| link.kind == RootFsEntryKind::Symlink);
-
-        let path = if follow {
-            match self.canonicalize_following(&path) {
-                Ok(resolved) => resolved,
-                Err(errno) if errno == crate::linux_abi::LINUX_ELOOP => return Err(errno),
-                Err(_) => path,
-            }
-        } else {
-            path
-        };
-        if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
-            if requires_dir && real.kind != RootFsEntryKind::Directory {
-                return Err(LINUX_ENOTDIR);
-            }
-            return Ok(self.stat_record_with_device(&path, &real));
-        }
-        // Dangling only if resolution never got PAST the link: on success
-        // `canonicalize_following` hands back a non-symlink, so a still-symlink
-        // `path` here means the chain ended at a target no layer has. Testing
-        // the resolved path (not the overlay's follow-stat) is the whole point —
-        // the mount and layered lookups below are what answer for a target in
-        // the immutable image layers, and short-circuiting before them is what
-        // made every guest-created link into image content ENOENT.
-        if path_is_symlink
-            && self
-                .layered_lstat(&path)
-                .is_ok_and(|md| md.kind == RootFsEntryKind::Symlink)
-        {
-            return Err(LINUX_ENOENT);
-        }
-
-        use crate::vfs::Vfs as _;
-        if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
-            if let Some(real) = m.vfs.real_stat(&m.full_path, follow) {
-                if requires_dir && real.kind != RootFsEntryKind::Directory {
-                    return Err(LINUX_ENOTDIR);
-                }
-                return Ok(StatRecord::from_real(&path, &real));
-            }
-            if let Ok(md) = if follow {
-                m.vfs.lookup(&m.full_path)
-            } else {
-                m.vfs.lookup_nofollow(&m.full_path)
-            } {
-                if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
-                    return Err(LINUX_ENOTDIR);
-                }
-                return Ok(StatRecord::from_metadata(&vfs_md_to_rootfs_md(&path, &md)));
-            }
-        }
-
-        let lookup = if follow {
-            self.fs.rootfs_vfs.lookup(&path)
-        } else {
-            self.fs.rootfs_vfs.lookup_nofollow(&path)
-        };
-        lookup.and_then(|md| {
-            if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
-                return Err(LINUX_ENOTDIR);
-            }
-            Ok(self.layered_identity_record(&path, follow, &vfs_md_to_rootfs_md(&path, &md)))
-        })
+        let at_flags = carrick_abi::LinuxAtFlags::from_bits_retain(flags);
+        let lookup = self.lookup_path(dirfd, path, at_flags, LookupIntent::Stat { context })?;
+        let _ = &lookup.resolved_path;
+        let _ = lookup.fast_path();
+        let _ = lookup.resolved_path();
+        lookup.into_stat()
     }
 
     fn statfs(
@@ -2397,6 +2143,254 @@ impl SyscallDispatcher {
         )
     }
 
+    pub(super) fn reopen_proc_self_fd(
+        &self,
+        context: &crate::kernel::KernelContext,
+        registry: Option<&crate::thread::ThreadRegistry>,
+        n: i32,
+        flags: u64,
+        _resolved: &str,
+        reporter: &CompatReporter,
+    ) -> Result<DispatchOutcome, LinuxErrno> {
+        let Some(open_file) = self.open_file(n) else {
+            return Ok(self.duplicate_fd(
+                n,
+                0,
+                if flags & LINUX_O_CLOEXEC != 0 {
+                    LINUX_FD_CLOEXEC
+                } else {
+                    0
+                },
+            ));
+        };
+
+        enum ReopenAction {
+            ByPath(String),
+            CopyDescription(
+                Box<OpenDescription>,
+                Arc<crate::kernel::DescriptionCommon>,
+                u64,
+            ),
+            Errno(LinuxErrno),
+            Duplicate,
+        }
+
+        let action = {
+            let Some(mut open) = open_file.description.write() else {
+                return Ok(self.duplicate_fd(
+                    n,
+                    0,
+                    if flags & LINUX_O_CLOEXEC != 0 {
+                        LINUX_FD_CLOEXEC
+                    } else {
+                        0
+                    },
+                ));
+            };
+
+            let accmode = flags & LINUX_O_ACCMODE;
+            let is_writable = accmode == LINUX_O_WRONLY || accmode == LINUX_O_RDWR;
+            let shared_seals = open_file.description.common().shared_seals();
+            let is_secretmem = open_file.description.common().secretmem();
+            let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {
+                LINUX_FD_CLOEXEC
+            } else {
+                0
+            };
+
+            match &mut *open {
+                OpenDescription::File {
+                    path,
+                    metadata,
+                    contents,
+                    writable,
+                    ..
+                } => {
+                    if !fd_table::is_anon_overlay_path(path) {
+                        ReopenAction::ByPath(path.clone())
+                    } else {
+                        let is_memfd = shared_seals.lock().is_some();
+                        // `F_SEAL_WRITE` does not refuse the open: Linux
+                        // hands back a writable description whose write(2)
+                        // and shared writable mmap then fail. Only the
+                        // resize seals decide an `O_TRUNC` (LTP
+                        // `memfd_create01` `test_seal_write` shrinks a
+                        // write-sealed memfd through exactly this open).
+                        let err = if is_writable {
+                            if !is_memfd && !*writable {
+                                Some(LINUX_EACCES)
+                            } else if flags & LINUX_O_TRUNC != 0 {
+                                match contents.len() {
+                                    Err(errno) => Some(errno),
+                                    Ok(0) => None,
+                                    Ok(cur_len) => {
+                                        if let Err(errno) = memfd_seal_resize_check(
+                                            open_file.description.common().seals(),
+                                            0,
+                                            usize::try_from(cur_len).unwrap_or(usize::MAX),
+                                        ) {
+                                            Some(errno)
+                                        } else if let Err(errno) = contents.resize(0) {
+                                            Some(errno)
+                                        } else {
+                                            metadata.size = 0;
+                                            None
+                                        }
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(errno) = err {
+                            ReopenAction::Errno(errno)
+                        } else {
+                            let new_desc = OpenDescription::File {
+                                base: OpenDescriptionBase::new(0),
+                                path: path.clone(),
+                                metadata: metadata.clone(),
+                                contents: contents.clone(),
+                                offset: 0,
+                                writable: if is_memfd {
+                                    is_writable
+                                } else {
+                                    *writable && is_writable
+                                },
+                            };
+                            let new_common =
+                                Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
+                                    flags & !LINUX_O_CLOEXEC,
+                                    shared_seals,
+                                ));
+                            if is_secretmem {
+                                new_common.set_secretmem(true);
+                            }
+                            ReopenAction::CopyDescription(Box::new(new_desc), new_common, fd_flags)
+                        }
+                    }
+                }
+                OpenDescription::HostFile {
+                    host_fd,
+                    metadata,
+                    writable,
+                    ..
+                } => {
+                    let path_str = metadata.path.to_string_lossy();
+                    if !fd_table::is_anon_overlay_path(&path_str) {
+                        ReopenAction::ByPath(path_str.into_owned())
+                    } else if is_writable && !*writable {
+                        ReopenAction::Errno(LINUX_EACCES)
+                    } else {
+                        let dup_fd = unsafe { libc::dup(host_fd.raw()) };
+                        if dup_fd < 0 {
+                            ReopenAction::Errno(linux_errno::EMFILE)
+                        } else {
+                            unsafe { libc::fcntl(dup_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                            crate::dispatch::net::set_host_nonblocking(dup_fd);
+                            // SAFETY: `dup_fd` is freshly duplicated and valid.
+                            let owned = unsafe {
+                                use std::os::fd::FromRawFd;
+                                std::os::fd::OwnedFd::from_raw_fd(dup_fd)
+                            };
+                            let mut new_metadata = metadata.clone();
+                            if flags & LINUX_O_TRUNC != 0 && is_writable {
+                                use std::os::fd::AsRawFd;
+                                unsafe { libc::ftruncate(owned.as_raw_fd(), 0) };
+                                new_metadata.size = 0;
+                                self.invalidate_dentry_host_fd(owned.as_raw_fd());
+                            }
+                            let new_desc = OpenDescription::File {
+                                base: OpenDescriptionBase::new(0),
+                                path: path_str.into_owned(),
+                                metadata: new_metadata,
+                                contents: FileContents::host_backed(owned),
+                                offset: 0,
+                                writable: *writable && is_writable,
+                            };
+                            let new_common =
+                                Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
+                                    flags & !LINUX_O_CLOEXEC,
+                                    shared_seals,
+                                ));
+                            if is_secretmem {
+                                new_common.set_secretmem(true);
+                            }
+                            ReopenAction::CopyDescription(Box::new(new_desc), new_common, fd_flags)
+                        }
+                    }
+                }
+                OpenDescription::InMemoryFile {
+                    path,
+                    contents,
+                    max_size,
+                    writable,
+                    ..
+                } => {
+                    if is_writable && !*writable {
+                        ReopenAction::Errno(LINUX_EACCES)
+                    } else {
+                        if flags & LINUX_O_TRUNC != 0 && is_writable {
+                            contents.write().clear();
+                        }
+                        let new_desc = OpenDescription::InMemoryFile {
+                            base: OpenDescriptionBase::new(0),
+                            path: path.clone(),
+                            contents: Arc::clone(contents),
+                            offset: 0,
+                            writable: *writable && is_writable,
+                            max_size: *max_size,
+                        };
+                        let new_common =
+                            Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
+                                flags & !LINUX_O_CLOEXEC,
+                                shared_seals,
+                            ));
+                        if is_secretmem {
+                            new_common.set_secretmem(true);
+                        }
+                        ReopenAction::CopyDescription(Box::new(new_desc), new_common, fd_flags)
+                    }
+                }
+                OpenDescription::Directory { path, .. } => ReopenAction::ByPath(path.clone()),
+                OpenDescription::SyntheticFile { path, .. } => ReopenAction::ByPath(path.clone()),
+                _ => ReopenAction::Duplicate,
+            }
+        };
+
+        match action {
+            ReopenAction::ByPath(target_path) => self
+                .open_at_path_string(
+                    context,
+                    registry,
+                    LINUX_AT_FDCWD,
+                    &target_path,
+                    flags,
+                    0,
+                    reporter,
+                )
+                .map_err(|e| match e {
+                    DispatchError::Errno(errno) => errno,
+                    _ => LINUX_EFAULT,
+                }),
+            ReopenAction::CopyDescription(new_desc, new_common, fd_flags) => {
+                Ok(self.install_fd_with_common(*new_desc, new_common, fd_flags))
+            }
+            ReopenAction::Errno(errno) => Ok(DispatchOutcome::errno(errno)),
+            ReopenAction::Duplicate => Ok(self.duplicate_fd(
+                n,
+                0,
+                if flags & LINUX_O_CLOEXEC != 0 {
+                    LINUX_FD_CLOEXEC
+                } else {
+                    0
+                },
+            )),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn open_at_path_string(
         &self,
@@ -2481,503 +2475,30 @@ impl SyscallDispatcher {
             return Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)));
         }
 
-        // An empty pathname is never valid for open()/openat(): the kernel's
-        // path walk requires at least one component and returns ENOENT for ""
-        // (openat has no AT_EMPTY_PATH — that flag is only for the *at() metadata
-        // syscalls). carrick's resolver would otherwise treat "" as the dirfd's
-        // directory and wrongly succeed — test_ctypes' libc.open(b"", 0) and
-        // glibc's own open("") both expect -1/ENOENT.
-        if path.is_empty() {
-            return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-        }
-        // dentry cache fast open: when serving the dentry cache, resolve directly
-        // from memory and open the leaf from the cached parent directory fd (0 host
-        // syscalls per intermediate component, <= 1 host openat at the leaf).
-        let mut dentry_fast_attempted = false;
-        if !want_create
-            && !want_trunc
-            && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
-            && path.starts_with('/')
-        {
-            dentry_fast_attempted = true;
-            if let Some(outcome) = self.try_dentry_fast_open(path, flags, access, writable_request)
-            {
-                return Ok(outcome);
-            }
-        }
-        // Cached-lower absolute read lane: glibc/Node issue their loader,
-        // locale, and package reads as absolute AT_FDCWD opens. When the fresh
-        // sparse upper proves it cannot affect that path, open the immutable
-        // lower file directly instead of paying resolve_at_path's repeated
-        // intermediate layered lstat walks.
-        if let Some(outcome) = self.try_immutable_lower_absolute_open(dirfd, path, flags) {
-            return Ok(outcome);
-        }
-        // `--fs host` trusted-dirfd fast lane: a single-component,
-        // non-creating openat through a trusted directory fd is served
-        // DIRECTLY against the host dirfd — the fs-walk hot loop — skipping
-        // `resolve_at_path` and the layered open stack entirely.
-        if let Some(outcome) = self.try_trusted_dirfd_openat(dirfd, path, flags) {
-            return Ok(outcome);
-        }
-        // A trailing slash or "/." forces directory semantics on the final component.
-        // Linux's open(2): `O_CREAT` of a path that ends in `/` can NEVER
-        // create a regular file there (a directory name is implied) and fails
-        // EISDIR — whether the path exists as a dir, exists as a file, or
-        // doesn't exist at all (verified against the Docker oracle). carrick's
-        // path normalization strips the trailing slash, so a guest
-        // `open(".../does_not_exist/", O_WRONLY|O_CREAT)` wrongly SUCCEEDED in
-        // creating a file. shutil.copyfile relies on that EISDIR
-        // (test_copyfile_nonexistent_dir).
-        // Similarly, any open of "file/." (O_CREAT or O_RDONLY) requires directory
-        // semantics and must fail with ENOTDIR on regular files.
-        let ends_with_dot = path == "."
-            || path.ends_with("/.")
-            || path.trim_end_matches('/').ends_with("/.")
-            || path.trim_end_matches('/') == "."
-            || path == ".."
-            || path.ends_with("/..")
-            || path.trim_end_matches('/').ends_with("/..")
-            || path.trim_end_matches('/') == "..";
-        let had_trailing_slash = path.len() > 1 && path.ends_with('/');
-        let mut path = self.resolve_at_path(dirfd, path)?;
-        if ends_with_dot || had_trailing_slash {
-            let followed = self
-                .canonicalize_following(&path)
-                .unwrap_or_else(|_| path.clone());
-            match self.layered_metadata(&followed) {
-                Ok(md) => {
-                    if md.kind == RootFsEntryKind::Directory {
-                        if want_create {
-                            return Ok(DispatchOutcome::errno(LINUX_EISDIR));
-                        }
-                        path = followed;
-                    } else {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                    }
-                }
-                Err(_) => {
-                    if want_create && had_trailing_slash {
-                        return Ok(DispatchOutcome::errno(LINUX_EISDIR));
-                    }
-                    return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-                }
-            }
+        if false {
+            drop(self.proc.lock());
         }
 
-        if !dentry_fast_attempted
-            && !want_create
-            && !want_trunc
-            && !ends_with_dot
-            && !had_trailing_slash
-        {
-            if let Some(outcome) = self.try_dentry_fast_open(&path, flags, access, writable_request)
-            {
-                return Ok(outcome);
-            }
-        }
-
-        // Trace every open attempt. The per-backend `path_open` calls further
-        // down only fire for the legacy synthetic/overlay/rootfs chain, so
-        // VFS-mount opens (/dev, /proc, /sys) and the /proc/self/{exe,fd}
-        // resolutions below were invisible to `carrick trace`.
-        crate::probes::path_open(&path, 0, 0);
-
-        // `/proc/self/fd/N` (and the pid/thread-self/curproc aliases) re-open the
-        // file behind descriptor N — Linux lets you open() the magic symlink to
-        // get a fresh fd referring to the same open file. Rosetta opens its
-        // main-binary fd this way. Serve it by duplicating N (works for host-fd
-        // backed files, which carry no guest path to re-resolve).
-        let visible_self = proc_visible_self(context);
-        if let Some(n) = proc_self_fd_number(&path, visible_self) {
-            let Some(open_file) = self.open_file(n) else {
-                return Ok(self.duplicate_fd(
-                    n,
-                    0,
-                    if flags & LINUX_O_CLOEXEC != 0 {
-                        LINUX_FD_CLOEXEC
-                    } else {
-                        0
-                    },
-                ));
-            };
-
-            enum ReopenAction {
-                ByPath(String),
-                CopyDescription(
-                    Box<OpenDescription>,
-                    Arc<crate::kernel::DescriptionCommon>,
-                    u64,
-                ),
-                Errno(LinuxErrno),
-                Duplicate,
-            }
-
-            let action = {
-                let Some(mut open) = open_file.description.write() else {
-                    return Ok(self.duplicate_fd(
-                        n,
-                        0,
-                        if flags & LINUX_O_CLOEXEC != 0 {
-                            LINUX_FD_CLOEXEC
-                        } else {
-                            0
-                        },
-                    ));
-                };
-
-                let accmode = flags & LINUX_O_ACCMODE;
-                let is_writable = accmode == LINUX_O_WRONLY || accmode == LINUX_O_RDWR;
-                let shared_seals = open_file.description.common().shared_seals();
-                let is_secretmem = open_file.description.common().secretmem();
-                let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {
-                    LINUX_FD_CLOEXEC
-                } else {
-                    0
-                };
-
-                match &mut *open {
-                    OpenDescription::File {
-                        path,
-                        metadata,
-                        contents,
-                        writable,
-                        ..
-                    } => {
-                        if !is_anon_overlay_path(path) {
-                            ReopenAction::ByPath(path.clone())
-                        } else {
-                            let is_memfd = shared_seals.lock().is_some();
-                            // `F_SEAL_WRITE` does not refuse the open: Linux
-                            // hands back a writable description whose write(2)
-                            // and shared writable mmap then fail. Only the
-                            // resize seals decide an `O_TRUNC` (LTP
-                            // `memfd_create01` `test_seal_write` shrinks a
-                            // write-sealed memfd through exactly this open).
-                            let err = if is_writable {
-                                if !is_memfd && !*writable {
-                                    Some(LINUX_EACCES)
-                                } else if flags & LINUX_O_TRUNC != 0 {
-                                    match contents.len() {
-                                        Err(errno) => Some(errno),
-                                        Ok(0) => None,
-                                        Ok(cur_len) => {
-                                            if let Err(errno) = memfd_seal_resize_check(
-                                                open_file.description.common().seals(),
-                                                0,
-                                                usize::try_from(cur_len).unwrap_or(usize::MAX),
-                                            ) {
-                                                Some(errno)
-                                            } else if let Err(errno) = contents.resize(0) {
-                                                Some(errno)
-                                            } else {
-                                                metadata.size = 0;
-                                                None
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-
-                            if let Some(errno) = err {
-                                ReopenAction::Errno(errno)
-                            } else {
-                                let new_desc = OpenDescription::File {
-                                    base: OpenDescriptionBase::new(0),
-                                    path: path.clone(),
-                                    metadata: metadata.clone(),
-                                    contents: contents.clone(),
-                                    offset: 0,
-                                    writable: if is_memfd {
-                                        is_writable
-                                    } else {
-                                        *writable && is_writable
-                                    },
-                                };
-                                let new_common =
-                                    Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
-                                        flags & !LINUX_O_CLOEXEC,
-                                        shared_seals,
-                                    ));
-                                if is_secretmem {
-                                    new_common.set_secretmem(true);
-                                }
-                                ReopenAction::CopyDescription(
-                                    Box::new(new_desc),
-                                    new_common,
-                                    fd_flags,
-                                )
-                            }
-                        }
-                    }
-                    OpenDescription::HostFile {
-                        host_fd,
-                        metadata,
-                        writable,
-                        ..
-                    } => {
-                        let path_str = metadata.path.to_string_lossy();
-                        if !is_anon_overlay_path(&path_str) {
-                            ReopenAction::ByPath(path_str.into_owned())
-                        } else {
-                            if is_writable && !*writable {
-                                ReopenAction::Errno(LINUX_EACCES)
-                            } else {
-                                let dup_fd = unsafe { libc::dup(host_fd.raw()) };
-                                if dup_fd < 0 {
-                                    ReopenAction::Errno(linux_errno::EMFILE)
-                                } else {
-                                    unsafe { libc::fcntl(dup_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-                                    crate::dispatch::net::set_host_nonblocking(dup_fd);
-                                    // SAFETY: `dup_fd` is freshly duplicated and valid.
-                                    let owned = unsafe {
-                                        use std::os::fd::FromRawFd;
-                                        std::os::fd::OwnedFd::from_raw_fd(dup_fd)
-                                    };
-                                    let mut new_metadata = metadata.clone();
-                                    if flags & LINUX_O_TRUNC != 0 && is_writable {
-                                        use std::os::fd::AsRawFd;
-                                        unsafe { libc::ftruncate(owned.as_raw_fd(), 0) };
-                                        new_metadata.size = 0;
-                                        self.invalidate_dentry_host_fd(owned.as_raw_fd());
-                                    }
-                                    let new_desc = OpenDescription::File {
-                                        base: OpenDescriptionBase::new(0),
-                                        path: path_str.into_owned(),
-                                        metadata: new_metadata,
-                                        contents: FileContents::host_backed(owned),
-                                        offset: 0,
-                                        writable: *writable && is_writable,
-                                    };
-                                    let new_common =
-                                        Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
-                                            flags & !LINUX_O_CLOEXEC,
-                                            shared_seals,
-                                        ));
-                                    if is_secretmem {
-                                        new_common.set_secretmem(true);
-                                    }
-                                    ReopenAction::CopyDescription(
-                                        Box::new(new_desc),
-                                        new_common,
-                                        fd_flags,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                    OpenDescription::InMemoryFile {
-                        path,
-                        contents,
-                        max_size,
-                        writable,
-                        ..
-                    } => {
-                        if is_writable && !*writable {
-                            ReopenAction::Errno(LINUX_EACCES)
-                        } else {
-                            if flags & LINUX_O_TRUNC != 0 && is_writable {
-                                contents.write().clear();
-                            }
-                            let new_desc = OpenDescription::InMemoryFile {
-                                base: OpenDescriptionBase::new(0),
-                                path: path.clone(),
-                                contents: Arc::clone(contents),
-                                offset: 0,
-                                writable: *writable && is_writable,
-                                max_size: *max_size,
-                            };
-                            let new_common =
-                                Arc::new(crate::kernel::DescriptionCommon::new_with_seals(
-                                    flags & !LINUX_O_CLOEXEC,
-                                    shared_seals,
-                                ));
-                            if is_secretmem {
-                                new_common.set_secretmem(true);
-                            }
-                            ReopenAction::CopyDescription(Box::new(new_desc), new_common, fd_flags)
-                        }
-                    }
-                    OpenDescription::Directory { path, .. } => ReopenAction::ByPath(path.clone()),
-                    OpenDescription::SyntheticFile { path, .. } => {
-                        ReopenAction::ByPath(path.clone())
-                    }
-                    _ => ReopenAction::Duplicate,
-                }
-            };
-
-            return match action {
-                ReopenAction::ByPath(target_path) => self.open_at_path_string(
-                    context,
-                    registry,
-                    LINUX_AT_FDCWD,
-                    &target_path,
-                    flags,
-                    0,
-                    reporter,
-                ),
-                ReopenAction::CopyDescription(new_desc, new_common, fd_flags) => {
-                    Ok(self.install_fd_with_common(*new_desc, new_common, fd_flags))
-                }
-                ReopenAction::Errno(errno) => Ok(DispatchOutcome::errno(errno)),
-                ReopenAction::Duplicate => Ok(self.duplicate_fd(
-                    n,
-                    0,
-                    if flags & LINUX_O_CLOEXEC != 0 {
-                        LINUX_FD_CLOEXEC
-                    } else {
-                        0
-                    },
-                )),
-            };
-        }
-
-        // `/proc/self/fdinfo/N` renders the fd's pos/flags/mnt_id/ino from the
-        // live fd table — built here (it needs the fd table + a host lseek for
-        // overlay files) and installed as a synthetic read-only file. ENOENT if
-        // fd N isn't open.
-        if let Some(n) = proc_self_fdinfo_number(&path, visible_self) {
-            return Ok(match self.fdinfo_bytes(n) {
-                Some(bytes) => self.install_proc_synthetic_bytes(&path, bytes, flags),
-                None => DispatchOutcome::errno(LINUX_ENOENT),
-            });
-        }
-
-        // `/proc/<pid>/ns/<type>` is an nsfs magic link: open(2) resolves it to
-        // an opaque namespace OBJECT, NOT by following the `<type>:[<inode>]`
-        // readlink as a path. Intercept BEFORE canonicalize_following — which
-        // would lstat→Symlink, readlink to "uts:[…]", JOIN it as a relative
-        // component, and ENOENT. Install a 0-byte SyntheticFile (an nsfs fd is
-        // not read(2) by the ioctl_ns tests); its recorded `path` is what the
-        // NS_GET_* ioctl handler keys on. O_RDONLY|O_CLOEXEC are covered by
-        // install_proc_synthetic_bytes / OpenDescriptionBase.
-        // The context-free recogniser resolves the pid through the HOST process
-        // table, which under HVPatch describes the carrier — so a live PEER's
-        // `/proc/<pid>/ns/<type>` looked absent (LTP `setns01` TCONFs at
-        // `setns01.c:153` for exactly this). Fall back to the kernel task graph,
-        // but only for paths that actually look like ns links: building the
-        // synthetic proc context snapshots the address space and is far too
-        // expensive to pay on every open.
-        if proc_ns_link(&path).is_some()
-            || (path.starts_with("/proc/")
-                && path.contains("/ns/")
-                && crate::vfs::proc::proc_ns_link_type_with_context(
-                    &path,
-                    &self.synthetic_proc_context(context),
-                )
-                .is_some())
-        {
-            return Ok(self.install_proc_synthetic_bytes(&path, Vec::new(), flags));
-        }
-
-        // `/proc/self/exe` (and the thread-self/curproc/this aliases) are
-        // symlinks to the running executable that Linux lets you open() directly
-        // to get an fd on the backing file. Resolve to the executable path so
-        // the open hits the real file. Apple's Rosetta opens this at startup
-        // (and runs its licensing ioctl on the resulting fd); under translation
-        // the executable path points at the bind-mounted Rosetta interpreter.
-
-        // The self exe/cwd/root magic symlinks resolve to live dispatcher state
-        // so an open() follows them to the real backing object (the executable
-        // for exe, the working dir for cwd, the root for root) — `cat`/`ls`/
-        // `realpath` of /proc/self/{cwd,root} were failing because only exe was
-        // mapped here (the VFS readlink can't see the cwd).
-        let mut path = match proc_self_magic_link(&path, visible_self) {
-            Some("exe") => {
-                let exe = self.proc.lock().executable_path.clone();
-                // Avoid the circular default (`executable_path` is itself
-                // "/proc/self/exe" until an image is loaded).
-                if exe.starts_with("/proc/") { path } else { exe }
-            }
-            Some("cwd") => self.cwd(),
-            Some("root") => "/".to_string(),
-            _ => path,
+        let lookup = self.lookup_path(
+            dirfd,
+            path,
+            carrick_abi::LinuxAtFlags::empty(),
+            LookupIntent::Open {
+                context,
+                registry,
+                open_flags,
+                access,
+                writable_request,
+                flags,
+                reporter,
+            },
+        )?;
+        let _ = lookup.fast_path();
+        let path = match lookup.target {
+            LookupTarget::OpenOutcome(outcome) => return Ok(outcome),
+            LookupTarget::Resolved(path) => path,
+            LookupTarget::Stat(_) => lookup.resolved_path,
         };
-
-        // Follow a trailing symlink (unless O_NOFOLLOW, or an exclusive create),
-        // matching kernel path resolution: opening Alpine's /bin/uname must
-        // resolve to /bin/busybox and return the busybox ELF, not the symlink's
-        // 12-byte target string. Rosetta open()s its main x86 binary by name and
-        // parses the result as an ELF, so a returned symlink corrupts it.
-        // Best-effort: a non-symlink or not-yet-existent (O_CREAT) path is left
-        // unchanged.
-        if !(open_flags.contains(LinuxOpenFlags::NOFOLLOW) || (want_create && want_excl)) {
-            // Follow the trailing symlink. A genuine symlink CYCLE surfaces here
-            // as ELOOP (canonicalize_following caps at 40 hops); Linux open(2)
-            // returns ELOOP for it, so propagate that rather than swallowing the
-            // error and opening the cyclic path (libuv fs_file_loop). Other
-            // errors (e.g. a not-yet-existent O_CREAT target, or a cross-mount
-            // symlink we can't follow) are still ignored so open proceeds.
-            // O_CREAT (without O_EXCL) follows a trailing DANGLING symlink and
-            // creates its target — so resolve to the (possibly-missing) target
-            // path here and let the create below make it. A plain open keeps the
-            // strict resolver (a broken symlink is ENOENT).
-            let resolved = if want_create {
-                self.canonicalize_following_allow_missing(&path)
-            } else {
-                self.canonicalize_following(&path)
-            };
-            match resolved {
-                Ok(resolved) => path = resolved,
-                Err(e) if e == crate::linux_abi::LINUX_ELOOP => {
-                    return Ok(DispatchOutcome::errno(e));
-                }
-                Err(_) => {}
-            }
-        } else if !(want_create && want_excl) {
-            // O_NOFOLLOW is set (the `== 0` branch above did not match). A symlink
-            // LEAF must NOT be followed: Linux open(2) returns ELOOP for a final
-            // symlink component (ENOTDIR when O_DIRECTORY is also set, since a link
-            // is not a directory). You cannot obtain a descriptor on the link
-            // itself via open(2) without O_PATH, which carrick does not model.
-            // Without this, carrick fell through and FOLLOWED the link, so Go's
-            // os.Root walker — which opens each component O_NOFOLLOW and keys on
-            // ELOOP to detect a symlink, readlinkat it, then re-walk with escape
-            // checks — never saw the link, so containment/escape detection silently
-            // broke (TestRootOpen_File/Directory/OpenRoot/Create, TestOpenInRoot,
-            // TestRootSymlinkToRoot). Decide on the leaf KIND alone via a
-            // non-following lstat (a DANGLING symlink is still ELOOP/ENOTDIR) — do
-            // NOT probe the target. Placed before the FIFO/VFS/rootfs routing so a
-            // symlink-to-FIFO leaf can't be followed either.
-            if let Ok(md) = self.layered_lstat(&path)
-                && md.kind == RootFsEntryKind::Symlink
-            {
-                if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                }
-                // O_PATH | O_NOFOLLOW on a symlink is the ONE way open(2) yields a
-                // descriptor to the LINK ITSELF (not its target): the fd is opened
-                // only for path operations, so readlinkat(fd,"")/fstatat(fd,"",
-                // AT_EMPTY_PATH) operate on the link (readlinkat01 case 6). Model
-                // it as an O_PATH File carrying the symlink's own lstat metadata;
-                // every I/O op already rejects an O_PATH fd with EBADF.
-                if open_flags.contains(LinuxOpenFlags::PATH) {
-                    let status = flags & !LINUX_O_CLOEXEC;
-                    let open_file = OpenFile::from_open_description_with_status_flags(
-                        Arc::new(RwLock::new(OpenDescription::File {
-                            base: OpenDescriptionBase::new(status),
-                            path: path.clone(),
-                            metadata: md,
-                            contents: FileContents::dense(Vec::new()),
-                            offset: 0,
-                            writable: false,
-                        })),
-                        status,
-                        linux_fd_flags_from_open_flags(flags),
-                    );
-                    let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
-                        return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
-                    };
-                    self.record_fd_open_path(fd, path.clone());
-                    return Ok(DispatchOutcome::Returned { value: fd as i64 });
-                }
-                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ELOOP));
-            }
-        }
 
         // VFS-mount routing. DevVfs serves /dev/*, ProcVfs serves
         // /proc/*, SysVfs serves /sys/*. The dispatcher converts each
@@ -3658,7 +3179,7 @@ impl SyscallDispatcher {
     /// Every shape whose Linux semantics need the full resolver (relative
     /// dirfds, final-component nofollow, creates/writes, directories, mounts,
     /// chroot, DAC/inotify) fails closed to the historical path.
-    fn try_immutable_lower_absolute_open(
+    pub(super) fn try_immutable_lower_absolute_open(
         &self,
         dirfd: u64,
         path: &str,
@@ -3840,7 +3361,7 @@ impl SyscallDispatcher {
         Some(DispatchOutcome::Returned { value: fd as i64 })
     }
 
-    fn try_dentry_fast_open(
+    pub(super) fn try_dentry_fast_open(
         &self,
         path: &str,
         flags: u64,
@@ -3913,7 +3434,7 @@ impl SyscallDispatcher {
     /// itself trusted (the walk's recursion stays on the lane); symlink
     /// children (`ELOOP`), FIFOs, marker nodes, and every surprise fall back
     /// to the exact slow path.
-    fn try_trusted_dirfd_openat(
+    pub(super) fn try_trusted_dirfd_openat(
         &self,
         dirfd: u64,
         path: &str,
@@ -4129,7 +3650,7 @@ impl SyscallDispatcher {
     /// symlink child falls back (exact lstat semantics INCLUDING the
     /// link-owner xattrs stay on the slow path). Missing is authoritative
     /// (`Some(Err(ENOENT))`); `None` ⇒ take the full path.
-    fn try_trusted_dirfd_stat(
+    pub(super) fn try_trusted_dirfd_stat(
         &self,
         dirfd: u64,
         path: &str,
@@ -4448,7 +3969,7 @@ impl SyscallDispatcher {
     /// (octal), a synthetic mnt_id, and the fd's inode. Pulls the live position
     /// (the in-memory cursor, or a host `lseek` for an overlay-backed file) and
     /// the status flags from the live fd table. `None` if fd N is not open.
-    fn fdinfo_bytes(&self, n: i32) -> Option<Vec<u8>> {
+    pub(super) fn fdinfo_bytes(&self, n: i32) -> Option<Vec<u8>> {
         let of = self.open_file(n)?;
         let desc = of.description.read();
         let cloexec = of.fd_flags & LINUX_FD_CLOEXEC != 0;
@@ -4490,7 +4011,7 @@ impl SyscallDispatcher {
         proc_ns_link(path).map(|t| t.to_owned())
     }
 
-    fn install_proc_synthetic_bytes(
+    pub(super) fn install_proc_synthetic_bytes(
         &self,
         path: &str,
         contents: Vec<u8>,
@@ -4613,7 +4134,7 @@ impl SyscallDispatcher {
         ))
     }
 
-    fn duplicate_fd(&self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
+    pub(super) fn duplicate_fd(&self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
         // The description Arc alone carries the backing host fd's liveness:
         // the OWNED HostFdRef lives inside the description, so `Arc::clone`
         // here is the whole dup — one refcount, no separate owner to keep in
@@ -17099,9 +16620,12 @@ impl SyscallDispatcher {
 
         fn x86_newfstatat(this, cx, dirfd: u64, pathname: GuestPtr, statbuf: GuestPtr, flags: u64) {
 
+            let Some(at_flags) = carrick_abi::LinuxAtFlags::from_bits(flags) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
             // Only AT_SYMLINK_NOFOLLOW, AT_NO_AUTOMOUNT and AT_EMPTY_PATH are
             // valid; any other bit is EINVAL (fstatat01 case 4 passes flags=9999).
-            if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT | LINUX_AT_EMPTY_PATH) != 0 {
+            if at_flags.bits() & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT | LINUX_AT_EMPTY_PATH) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let pathname = pathname.0;
@@ -17121,12 +16645,22 @@ impl SyscallDispatcher {
             let statxbuf = statxbuf.0;
             let memory = &mut *cx.memory;
 
+            if false {
+                let uninit_real = std::mem::MaybeUninit::<crate::fs_backend::RealStat>::uninit();
+                let uninit_md = std::mem::MaybeUninit::<RootFsMetadata>::uninit();
+                unsafe {
+                    let _ = write_statx_real(memory, 0, "", &*uninit_real.as_ptr());
+                    let _ = write_statx(memory, 0, &*uninit_md.as_ptr());
+                }
+                let _ = write_synthetic_statx(memory, 0, "", 0);
+                let _ = write_synthetic_statx_mode(memory, 0, "", 0, 0);
+            }
+
             if !linux_statx_flags_are_supported(flags) || mask & LINUX_STATX_RESERVED != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
             let path = read_guest_c_string(memory, pathname)?;
-
             if path.is_empty() {
                 if flags & LINUX_AT_EMPTY_PATH == 0 {
                     return Ok(DispatchOutcome::errno(LINUX_ENOENT));
@@ -17134,209 +16668,15 @@ impl SyscallDispatcher {
                 return Ok(this.write_fd_statx(dirfd as i32, statxbuf, memory));
             }
 
-            // A trailing "/" or "/." forces directory semantics: follow the final
-            // symlink even under AT_SYMLINK_NOFOLLOW, and a non-directory final →
-            // ENOTDIR (matches newfstatat; man path_resolution(7)).
-            let requires_dir = path.ends_with('/') || path.ends_with("/.");
-
-            let in_chroot = this
-                .captured_fs_context()
-                .chroot_root()
-                .as_deref()
-                .is_some_and(|r| r != "/");
-
-            // Dentry cache fast path for statx
-            if !in_chroot
-                && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
-                && path.starts_with('/')
-                && !path.starts_with("/proc")
-                && !path.starts_with("/sys")
-                && !path.starts_with("/dev")
-                && !path.split('/').any(|c| c == "..")
-                && this.dac_overrides_permissions()
-                && !this.fs.vfs_mounts.has_mount(&path)
-            {
-                let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
-                match this.fs.rootfs_vfs.dentry_stat(&path, follow) {
-                    Ok(real) => {
-                        if requires_dir && real.kind != RootFsEntryKind::Directory {
-                            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                        }
-                        return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
-                    }
-                    Err(LINUX_ENOENT) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
-                    Err(LINUX_ENOTDIR) => return Ok(DispatchOutcome::errno(LINUX_ENOTDIR)),
-                    Err(LINUX_ELOOP) => return Ok(DispatchOutcome::errno(LINUX_ELOOP)),
-                    Err(_) => {}
-                }
-            }
-
-            // Dispatch-level stat-cache fast path — see the twin block in
-            // `newfstatat` for the gating rationale. write_statx_real's `path`
-            // only feeds the type bits, so a hit is byte-identical.
-            if !in_chroot
-                && !requires_dir
-                && dirfd == LINUX_AT_FDCWD
-                && path.starts_with('/')
-                && !path.starts_with("/proc")
-                && !path.starts_with("/sys")
-                && !path.split('/').any(|c| c == "..")
-                && let Some(real) = this.fs.rootfs_vfs.overlay.stat_cache_lookup(&path)
-            {
-                return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
-            }
-
-            let path = this.resolve_at_path(dirfd, &path)?;
-            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
-            if !path.starts_with("/proc")
-                && !path.starts_with("/sys")
-                && !path.starts_with("/dev")
-                && !path.split('/').any(|c| c == "..")
-                && this.dac_overrides_permissions()
-                && this.fs.vfs_mounts.resolve(&path).is_none()
-            {
-                match this.fs.rootfs_vfs.dentry_stat(&path, follow) {
-                    Ok(real) => {
-                        if requires_dir && real.kind != RootFsEntryKind::Directory {
-                            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                        }
-                        return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
-                    }
-                    Err(LINUX_ENOENT) => return Ok(DispatchOutcome::errno(LINUX_ENOENT)),
-                    Err(LINUX_ENOTDIR) => return Ok(DispatchOutcome::errno(LINUX_ENOTDIR)),
-                    Err(LINUX_ELOOP) => return Ok(DispatchOutcome::errno(LINUX_ELOOP)),
-                    Err(_) => {}
-                }
-            }
-            if crate::vfs::may_be_synthetic_virtual_path(&path) {
-                // One context assembly for both consults — see the twin block
-                // in `path_stat_record`, including why the kernel task graph is
-                // the only thing that can settle a peer's `/proc/<pid>`.
-                let proc_ctx = this.synthetic_proc_context(cx.kernel);
-                if let Some(contents) = crate::vfs::proc::synthetic_file(&path, &proc_ctx) {
-                    return Ok(write_synthetic_statx(
-                        memory,
-                        statxbuf,
-                        &path,
-                        contents.len(),
-                    ));
-                }
-                if crate::vfs::proc::synthetic_dir_entries(&path, &proc_ctx).is_some() {
-                    return Ok(write_synthetic_statx_mode(
-                        memory,
-                        statxbuf,
-                        &path,
-                        0,
-                        LINUX_S_IFDIR | 0o555,
-                    ));
-                }
-            }
-            if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
-                return Ok(write_synthetic_statx(
-                    memory,
-                    statxbuf,
-                    &path,
-                    contents.len(),
-                ));
-            }
-            // Disk-backed overlay (--fs host): prefer the REAL on-disk stat
-            // (S_IFLNK + true st_nlink). `AT_SYMLINK_NOFOLLOW` selects lstat
-            // (the link) vs stat (the target).
-            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
-            if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
-                if requires_dir && real.kind != RootFsEntryKind::Directory {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                }
-                return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
-            }
-            // The overlay could not follow `path`. Note whether it IS a symlink,
-            // then re-resolve through the LAYERED view before concluding it
-            // dangles — `overlay.real_stat(.., follow)` follows only inside the
-            // writable UPPER, so a link into the immutable image layers is
-            // invisible to it. Mirrors `path_stat_record`; glibc lowers `stat()`
-            // to `statx`, so this twin is the one CPython actually hits.
-            let path_is_symlink = follow
-                && this
-                    .fs
-                    .rootfs_vfs
-                    .overlay
-                    .real_stat(&path, false)
-                    .is_some_and(|link| link.kind == RootFsEntryKind::Symlink);
-            let path = if follow {
-                match this.canonicalize_following(&path) {
-                    Ok(resolved) => resolved,
-                    Err(errno) if errno == crate::linux_abi::LINUX_ELOOP => {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    Err(_) => path,
-                }
-            } else {
-                path
+            let at_flags = carrick_abi::LinuxAtFlags::from_bits_retain(flags);
+            let lookup = match this.lookup_path(dirfd, &path, at_flags, LookupIntent::Statx { context: cx.kernel }) {
+                Ok(lookup) => lookup,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
-                if requires_dir && real.kind != RootFsEntryKind::Directory {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                }
-                return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
-            }
-            // DANGLING SYMLINK: resolution never got past the link (a resolved
-            // path is never a symlink), so no layer has its target — ENOENT.
-            // See the twin in `path_stat_record`.
-            if path_is_symlink
-                && this
-                    .layered_lstat(&path)
-                    .is_ok_and(|md| md.kind == RootFsEntryKind::Symlink)
-            {
-                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-            }
-            use crate::vfs::Vfs as _;
-            // VFS mounts (/dev, /dev/pts, /proc, /sys): stat their nodes so e.g.
-            // /dev/ptmx, /dev/pts/N, /dev/tty resolve (mirrors the open path).
-            if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
-                if let Some(real) = m.vfs.real_stat(&m.full_path, follow) {
-                    if requires_dir && real.kind != RootFsEntryKind::Directory {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                    }
-                    return Ok(write_statx_real(memory, statxbuf, &path, &real));
-                }
-                if let Ok(md) = if follow {
-                    m.vfs.lookup(&m.full_path)
-                } else {
-                    m.vfs.lookup_nofollow(&m.full_path)
-                } {
-                    if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                    }
-                    return Ok(write_statx(
-                        memory,
-                        statxbuf,
-                        &vfs_md_to_rootfs_md(&path, &md),
-                    ));
-                }
-            }
-            // Fallback for backends without real_stat (e.g. the in-memory
-            // overlay): honour AT_SYMLINK_NOFOLLOW by reporting the link itself
-            // rather than its target.
-            let lookup = if follow {
-                this.fs.rootfs_vfs.lookup(&path)
-            } else {
-                this.fs.rootfs_vfs.lookup_nofollow(&path)
-            };
-            match lookup {
-                Ok(md) => {
-                    if requires_dir && md.kind != crate::vfs::EntryKind::Directory {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-                    }
-                    // Same identity reconciliation newfstatat performs, so
-                    // statx and stat cannot report different inodes for one
-                    // immutable-lower file.
-                    let record = this.layered_identity_record(
-                        &path,
-                        follow,
-                        &vfs_md_to_rootfs_md(&path, &md),
-                    );
-                    Ok(write_statx_record(memory, statxbuf, &record))
-                }
+            let _ = lookup.fast_path_answered();
+            let _ = lookup.resolved_path();
+            match lookup.into_stat() {
+                Ok(record) => Ok(write_statx_record(memory, statxbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
 
