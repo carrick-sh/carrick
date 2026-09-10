@@ -82,7 +82,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "ProcessDrain::excluding",
       "ordinal_in_function": 1,
-      "fingerprint": "256f55c61c326b075387e1472a1ab914363ae4c8e1a43c5b3048b36bf3906a49",
+      "fingerprint": "0fbd216d4fd702b4c2d8dc4d38eac590b074acce1812f0f45e6fc801870ed2d2",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::process_drain",
       "rationale": "Underflow in job completion subscription count indicates double-completion or corrupted drain synchronization state."
@@ -937,7 +937,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 1,
-      "fingerprint": "45bcab0a6310e47c49475479d7a8434c98e5c069d330290a6987e9c3923a39b5",
+      "fingerprint": "a52bb3df0251493ecdef50b25a19a85ac80f1c2e0b2d6c337faab994f8538665",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context on trap limit outcome assembly."

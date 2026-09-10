@@ -2760,6 +2760,38 @@
       "fingerprint": "ab0b08b97611e117782a41f621e4ace1ab4d3cc389433a60a25ff4abe830222f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static park_for_slot::GATE_MUTEX in crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "symbol": "tests::event_future_cancelled_observation_drains_inflight_operation_safely::CHILD_MARKER",
+      "fingerprint": "2fc33e88ecfb6489095a7a8292084be2bee3e9e18881e727efb05342750f7c9a",
+      "classification": "test_only",
+      "rationale": "Read only by the cfg(test) bounded self-spawn regression to select its exact owned child body; the parent kills and reaps that child on a failed deadline."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "symbol": "tests::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock::CHILD_MARKER",
+      "fingerprint": "2fc33e88ecfb6489095a7a8292084be2bee3e9e18881e727efb05342750f7c9a",
+      "classification": "test_only",
+      "rationale": "Read only by the cfg(test) bounded self-spawn regression to select its exact owned child body; the parent kills and reaps that child on a failed deadline."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "symbol": "tests::incoming_drain_waker_clone_runs_outside_registration_locks::VTABLE",
+      "fingerprint": "0eafa4b75689653182cfb4e78b2bb94eef95e2eba05242d45a43658f7f58bbeb",
+      "classification": "test_only",
+      "rationale": "Immutable RawWakerVTable in a cfg(test) callback-lock regression; carries no mutable process or guest state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "symbol": "tests::incoming_task_waker_clone_runs_outside_registration_locks::VTABLE",
+      "fingerprint": "0eafa4b75689653182cfb4e78b2bb94eef95e2eba05242d45a43658f7f58bbeb",
+      "classification": "test_only",
+      "rationale": "Immutable RawWakerVTable in a cfg(test) callback-lock regression; carries no mutable process or guest state."
     }
   ]
 }
