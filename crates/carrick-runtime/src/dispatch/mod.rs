@@ -4538,7 +4538,7 @@ mod core_publication_tests {
 
         // Verify that the stored file in VFS is a SparseBuffer with 64 GiB length and bounded memory
         let files = files_map.read();
-        let buf = files.get("/inmem/core").expect("published core file");
+        let buf = Arc::clone(files.get("/inmem/core").expect("published core file"));
         let lock = buf.read();
         assert_eq!(lock.len(), sparse_64gib as usize);
         assert_eq!(lock.allocated_bytes(), 4 + 3 * 4096);
@@ -4547,6 +4547,29 @@ mod core_publication_tests {
         assert_eq!(lock.read_range(8192, 4096), vec![0_u8; 4096]);
         assert_eq!(lock.read_range(32 * 1024 * 1024 * 1024, 4096), p2);
         assert_eq!(lock.read_range((sparse_64gib - 4096) as usize, 4096), p3);
+        drop(lock);
+        drop(files);
+
+        // Open the in-memory core file and verify fstat reports allocated blocks (< 1 MiB)
+        // rather than 64 GiB / 512 blocks
+        let open_desc = crate::dispatch::fd_table::OpenDescription::InMemoryFile {
+            path: "/inmem/core".to_string(),
+            contents: buf,
+            offset: 0,
+            writable: false,
+            max_size: usize::MAX,
+            base: crate::dispatch::fd_table::OpenDescriptionBase::new(0),
+        };
+        let stat_source = open_desc.stat_source();
+        if let crate::dispatch::fd_table::OpenStatSource::Record(rec) = stat_source {
+            assert_eq!(rec.size, sparse_64gib);
+            let allocated = 4 + 3 * 4096;
+            let expected_blocks = blocks_512(allocated) as u64;
+            assert_eq!(rec.blocks, Some(expected_blocks));
+            assert!(expected_blocks * 512 <= 1024 * 1024);
+        } else {
+            panic!("expected OpenStatSource::Record");
+        }
     }
 
     #[test]
@@ -10801,6 +10824,10 @@ fn write_stat_record(
     record: &StatRecord,
 ) -> DispatchOutcome {
     let size = record.size_usize();
+    let blocks = record
+        .blocks
+        .map(|b| b as i64)
+        .unwrap_or_else(|| blocks_512(size));
     let stat = LinuxStat {
         st_dev: 1,
         st_ino: record.ino,
@@ -10813,7 +10840,7 @@ fn write_stat_record(
         st_size: record.size as i64,
         st_blksize: 4096,
         __pad2: 0,
-        st_blocks: blocks_512(size),
+        st_blocks: blocks,
         st_atime: record.atime.0,
         st_atime_nsec: record.atime.1 as u64,
         st_mtime: record.mtime.0,
@@ -10839,6 +10866,10 @@ fn write_x8664_stat_record(
     record: &StatRecord,
 ) -> DispatchOutcome {
     let size = record.size_usize();
+    let blocks = record
+        .blocks
+        .map(|b| b as i64)
+        .unwrap_or_else(|| blocks_512(size));
     let stat = LinuxX8664Stat {
         st_dev: 1,
         st_ino: record.ino,
@@ -10850,7 +10881,7 @@ fn write_x8664_stat_record(
         st_rdev: record.rdev,
         st_size: record.size as i64,
         st_blksize: 4096,
-        st_blocks: blocks_512(size),
+        st_blocks: blocks,
         st_atime: record.atime.0,
         st_atime_nsec: record.atime.1,
         st_mtime: record.mtime.0,
@@ -10900,6 +10931,7 @@ pub(super) fn real_stat_from_libc(st: &libc::stat) -> crate::fs_backend::RealSta
         uid: carrick_abi::NsUid::ROOT,
         gid: carrick_abi::NsGid::ROOT,
         size: st.st_size as u64,
+        blocks: Some(st.st_blocks.max(0) as u64),
         atime: (st.st_atime, carrick_portable::stat_atime_nsec(st)),
         mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
         ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
@@ -10936,6 +10968,7 @@ fn write_statx_record(
         __reserved: 0,
     };
     let size = record.size_usize();
+    let blocks = record.blocks.unwrap_or_else(|| blocks_512(size) as u64);
     let statx = LinuxStatx {
         stx_mask: LINUX_STATX_BASIC_STATS,
         stx_blksize: LINUX_PAGE_SIZE as u32,
@@ -10947,7 +10980,7 @@ fn write_statx_record(
         __spare0: [0; 1],
         stx_ino: record.ino,
         stx_size: record.size,
-        stx_blocks: blocks_512(size) as u64,
+        stx_blocks: blocks,
         stx_attributes_mask: 0,
         stx_atime: stx_ts(record.atime),
         stx_btime: zero_time,
@@ -12065,7 +12098,7 @@ fn synthetic_readonly_access_with_errno(mode: u64, write_errno: LinuxErrno) -> D
     }
 }
 
-fn blocks_512(size: usize) -> i64 {
+pub(super) fn blocks_512(size: usize) -> i64 {
     if size == 0 {
         0
     } else {
