@@ -860,6 +860,7 @@ dependencies = [
  "applevisor-sys",
  "carrick-aarch64",
  "carrick-abi",
+ "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",

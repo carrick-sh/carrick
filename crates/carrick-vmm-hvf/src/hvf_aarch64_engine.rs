@@ -29,6 +29,8 @@
 
 use std::sync::{Arc, OnceLock};
 
+use carrick_fatal::carrick_fatal;
+
 use carrick_aarch64::engine::restore_aarch64_task_state;
 use carrick_aarch64::engine::{Aarch64ProcessSpec, Aarch64SiblingSpec};
 use carrick_aarch64::{
@@ -589,7 +591,10 @@ impl HvpatchTaskOnlyEngineState {
         task.publish_pending_fork_frame_receipts();
         task.registration = self._backend.take_registration();
         if self.parked_task.lock().replace(task).is_some() {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::task_activation",
+                "resident parked task already exists during activate_child"
+            );
         }
         Ok(())
     }
@@ -607,10 +612,10 @@ impl Drop for HvpatchTaskOnlyEngineState {
         if let Some(mut parked) = self.parked_task.lock().take() {
             if let Some(reg) = parked.registration.take() {
                 reg.cleanup().unwrap_or_else(|error| {
-                    eprintln!(
-                        "carrick: FATAL: exact task-only parked registration cleanup: {error}"
+                    carrick_fatal!(
+                        "hvpatch::task_backend_lifecycle",
+                        "parked task registration cleanup failed during Drop: error={error}"
                     );
-                    std::process::abort();
                 });
             }
         }
@@ -693,10 +698,14 @@ impl Drop for TaskOnlyNoExecutorAllocationGuard {
             || self.mailbox_claims
                 != crate::syscall_mailbox::current_thread_mailbox_slot_claims_total()
         {
-            eprintln!(
-                "carrick: FATAL: task-only HVPatch materializer allocated executor-local state"
+            carrick_fatal!(
+                "hvpatch::executor_boundary",
+                "task-only materializer allocated executor-local state: vcpu_creates={}/{} mailbox_claims={}/{}",
+                self.vcpu_creates,
+                crate::trap::current_thread_vcpu_created_total(),
+                self.mailbox_claims,
+                crate::syscall_mailbox::current_thread_mailbox_slot_claims_total()
             );
-            std::process::abort();
         }
     }
 }
@@ -806,18 +815,24 @@ pub fn attach_task_only_engine(
     asid_generation: u64,
     cpu: &carrick_hal::threaded::GuestCpuState,
 ) -> HvfAarch64Engine {
-    let projection = state
-        .runtime_projection
-        .take()
-        .unwrap_or_else(|_| std::process::abort());
-    if validate_task_only_runtime_projection(&projection, cpu).is_err() {
-        std::process::abort();
+    let projection = state.runtime_projection.take().unwrap_or_else(|error| {
+        carrick_fatal!(
+            "hvpatch::runtime_projection",
+            "missing runtime projection authority during attach: mm_generation={mm_generation} asid_generation={asid_generation} error={error}"
+        );
+    });
+    if let Err(error) = validate_task_only_runtime_projection(&projection, cpu) {
+        carrick_fatal!(
+            "hvpatch::runtime_projection",
+            "runtime projection validation failed during attach: mm_generation={mm_generation} asid_generation={asid_generation} error={error}"
+        );
     }
-    let mut parked = state
-        .parked_task
-        .lock()
-        .take()
-        .unwrap_or_else(|| std::process::abort());
+    let mut parked = state.parked_task.lock().take().unwrap_or_else(|| {
+        carrick_fatal!(
+            "hvpatch::task_activation",
+            "parked task state missing during task-only engine attach: mm_generation={mm_generation} asid_generation={asid_generation}"
+        );
+    });
     let expected_mm_access = parked.mm_access_authority();
     swap_hvpatch_task_state(&mut executor.state.task, &mut parked);
     executor.state.publish_live_vcpu();
@@ -826,10 +841,16 @@ pub fn attach_task_only_engine(
         &projection.page_tables,
         &projection.protections,
     ) {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::mm_authority",
+            "task runtime authorities mismatch after attach swap: mm_generation={mm_generation} asid_generation={asid_generation}"
+        );
     }
     if state.parked_task.lock().replace(parked).is_some() {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::task_activation",
+            "concurrent replacement of parked task state during attach: mm_generation={mm_generation} asid_generation={asid_generation}"
+        );
     }
     Aarch64EngineCore::from_injected_task_only_backend(
         executor,
@@ -886,20 +907,30 @@ pub fn detach_task_only_engine(
         &projection.page_tables,
         &projection.protections,
     ) {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::mm_authority",
+            "task runtime authorities mismatch during detach"
+        );
     }
-    let mut parked = state
-        .parked_task
-        .lock()
-        .take()
-        .unwrap_or_else(|| std::process::abort());
+    let mut parked = state.parked_task.lock().take().unwrap_or_else(|| {
+        carrick_fatal!(
+            "hvpatch::task_activation",
+            "parked task placeholder missing during detach"
+        );
+    });
     executor.state.clear_live_vcpu();
     swap_hvpatch_task_state(&mut executor.state.task, &mut parked);
     if state.parked_task.lock().replace(parked).is_some() {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::task_activation",
+            "restoring parked task during detach encountered unexpected resident state"
+        );
     }
-    if state.runtime_projection.put(projection).is_err() {
-        std::process::abort();
+    if let Err(error) = state.runtime_projection.put(projection) {
+        carrick_fatal!(
+            "hvpatch::runtime_projection",
+            "restoring runtime projection during detach failed: error={error}"
+        );
     }
     (executor, vcpu)
 }
@@ -2064,11 +2095,11 @@ mod task_only_materializer_tests {
             .split_once("fn validate_task_only_runtime_projection")
             .expect("end of attach")
             .0;
-        assert!(attach.contains("runtime_projection\n        .take()"));
+        assert!(attach.contains("runtime_projection.take()"));
         assert!(attach.contains("projection.page_tables"));
         assert!(attach.contains("projection.protections"));
         assert!(attach.contains("projection.process_asid"));
-        assert!(attach.contains("std::process::abort"));
+        assert!(attach.contains("carrick_fatal!"));
         assert!(!attach.contains("return Err"));
 
         let detach = source
@@ -2333,7 +2364,7 @@ mod task_only_materializer_tests {
         assert!(task_authority_shape.contains("apply(retirement.commit)"));
         assert!(task_authority_shape.contains("authenticate_pending_retirement"));
         assert!(task_authority_shape.contains("malformed successful HVPatch retirement receipt"));
-        assert!(task_authority_shape.contains("std::process::abort()"));
+        assert!(task_authority_shape.contains("carrick_fatal!"));
         let mm_authority_shape = include_str!("trap.rs")
             .split("struct HvpatchTaskMmAuthority")
             .nth(1)

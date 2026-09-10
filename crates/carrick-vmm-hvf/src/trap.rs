@@ -166,6 +166,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 
+use carrick_fatal::carrick_fatal;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod sparse_materialization;
 
@@ -9742,8 +9744,8 @@ mod task_only_carrier_directory_tests {
             .expect("end of mapping authority error")
             .0;
 
-        assert!(false_branch.contains("std::process::abort();"));
-        assert!(error_branch.contains("std::process::abort();"));
+        assert!(false_branch.contains("carrick_fatal!"));
+        assert!(error_branch.contains("carrick_fatal!"));
     }
 
     fn identity(generation: u64) -> HvpatchCarrierTaskIdentity {
@@ -13359,8 +13361,11 @@ struct AliasRegistry {
 impl AliasRegistry {
     fn bump_revision(&mut self) {
         self.revision = self.revision.checked_add(1).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: alias registry revision exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "alias registry revision counter overflow: revision={}",
+                self.revision
+            );
         });
     }
 
@@ -14156,15 +14161,35 @@ impl AliasRegistry {
             .copied();
         if let Some((seq, previous)) = exact {
             note_alias_state_rows_scanned(1);
-            let rows = self
-                .by_scope
-                .get_mut(&scope)
-                .unwrap_or_else(|| std::process::abort());
-            let pos = Self::bucket_position_in(rows, seq, &previous, None)
-                .unwrap_or_else(|| std::process::abort());
+            let rows = self.by_scope.get_mut(&scope).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::host_alias",
+                    "exact-key index scope absent from bucket map: scope={:?} start=0x{:x} ipa=0x{:x}",
+                    scope,
+                    alias.start,
+                    alias.ipa
+                );
+            });
+            let pos = Self::bucket_position_in(rows, seq, &previous, None).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::host_alias",
+                    "exact-key index sequence not found in scope bucket: scope={:?} seq={} start=0x{:x} ipa=0x{:x}",
+                    scope,
+                    seq,
+                    previous.start,
+                    previous.ipa
+                );
+            });
             let slot = &mut rows[pos];
             if slot.0 != seq || slot.1 != previous {
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::host_alias",
+                    "exact-key index entry disagrees with scope bucket: slot_seq={} seq={} slot_ipa=0x{:x} expected_ipa=0x{:x}",
+                    slot.0,
+                    seq,
+                    slot.1.ipa,
+                    previous.ipa
+                );
             }
             slot.1 = alias;
             if previous != alias {
@@ -14175,7 +14200,15 @@ impl AliasRegistry {
             self.exact_first_by_scope
                 .get_mut(&scope)
                 .and_then(|rows| rows.get_mut(&(alias.start, alias.ipa)))
-                .unwrap_or_else(|| std::process::abort())
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::host_alias",
+                        "exact-key index entry disappeared during exclusive upsert: scope={:?} start=0x{:x} ipa=0x{:x}",
+                        scope,
+                        alias.start,
+                        alias.ipa
+                    );
+                })
                 .1 = alias;
             return Some(previous);
         }
@@ -14199,7 +14232,13 @@ impl AliasRegistry {
             if let Some(replacement) = replacement
                 && alias_version_key(&replacement) != (start, ipa, scope)
             {
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::host_alias",
+                    "batch replacement value does not match target key: key=(0x{start:x}, 0x{ipa:x}, {scope:?}) replacement=(0x{:x}, 0x{:x}, {:?})",
+                    replacement.start,
+                    replacement.ipa,
+                    replacement.ownership_scope
+                );
             }
             keys_by_scope.entry(scope).or_default().insert((start, ipa));
         }
@@ -16575,7 +16614,10 @@ fn fail_stop_partial_process_stage2_rollback(context: &str, error: &TrapError) -
         "test carrier fail-stop after nonterminal structural stage-2 rollback",
     ));
     #[cfg(not(test))]
-    std::process::abort();
+    carrick_fatal!(
+        "hvpatch::mm_authority",
+        "{context}: structural stage-2 rollback could not terminalize before root-slot release: {error}"
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -18837,8 +18879,13 @@ fn unregister_alias_in(
         }
         physical_ipas.extend(old.into_iter().chain(after).map(|alias| alias.physical_ipa));
         bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external alias mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "alias epoch counter exhausted while unregistering alias: key=(0x{:x}, 0x{:x}, {:?})",
+                key.0,
+                key.1,
+                key.2
+            );
         });
         for id in reset_alias_chain(&mut versions.aliases, key, after) {
             versions.alias_version_owner.remove(&id);
@@ -18846,8 +18893,10 @@ fn unregister_alias_in(
     }
     for physical_ipa in physical_ipas {
         bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "replay epoch counter exhausted while unregistering alias: physical_ipa=0x{physical_ipa:x}"
+            );
         });
         let base = replay_rows_for_ipa(replay, physical_ipa);
         for id in reset_replay_chain(&mut versions.replays, physical_ipa, base) {
@@ -21281,10 +21330,11 @@ impl HvpatchFrameInventoryState {
             // would hand a later retirement an extent naming a mapping that
             // does not exist, which aborts anyway but much further from the
             // cause.
-            eprintln!(
-                "carrick: FATAL: roll back cancelled HVPatch alias staging: {error} staged={staged:?}"
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "rollback of unpublished alias mappings failed: error={error} staged_count={}",
+                staged.len()
             );
-            std::process::abort();
         }
         reservation.is_some() || commit.is_some()
     }
@@ -25932,14 +25982,25 @@ impl MmAccessState {
     fn bind_cow_runtime(&self, binding: MmCowRuntimeBinding) {
         if let Some(state) = binding.authority.deferred_anonymous_state() {
             let mm = carrick_hal::ForeignMmId::from_kernel_allocation(
-                std::num::NonZeroU64::new(binding.identity.mm)
-                    .unwrap_or_else(|| std::process::abort()),
+                std::num::NonZeroU64::new(binding.identity.mm).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::deferred_materialization_binding",
+                        "COW runtime binding supplied zero MM identity: asid={} tid={}",
+                        binding.identity.asid,
+                        binding.identity.linux_tid
+                    );
+                }),
             );
             let mut slot = self.deferred_anonymous.write();
             if slot.as_ref().is_some_and(|(old_mm, old_state)| {
                 *old_mm != mm || !std::sync::Arc::ptr_eq(old_state, &state)
             }) {
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::deferred_materialization_binding",
+                    "MM access state rebound to different MM or authority while prior binding live: mm={:?} asid={}",
+                    mm,
+                    binding.identity.asid
+                );
             }
             *slot = Some((mm, state));
         }
@@ -26074,8 +26135,12 @@ impl MmAccessState {
         }
 
         let authority = slot.take().unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: terminal stage-1 root authority disappeared");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::mm_authority",
+                "stage-1 root authority disappeared before retirement completion: root_slot=(0x{:x}, 0x{:x})",
+                expected_root_slot.0,
+                expected_root_slot.1
+            );
         });
         let key = authority.physical_extent;
         let owner = InventoryStage2OwnerIdentity {
@@ -26764,9 +26829,12 @@ fn materialize_foreign_pristine_write(
         &mut flush,
     )
     .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-    let receipt = published
-        .foreign_receipt
-        .unwrap_or_else(|| std::process::abort());
+    let receipt = published.foreign_receipt.unwrap_or_else(|| {
+        carrick_fatal!(
+            "hvpatch::foreign_sparse_materialization",
+            "foreign sparse publication completed without foreign-MM receipt: va=0x{start:x}"
+        );
+    });
     let key = (receipt.physical_base.raw(), receipt.physical_len);
     let owner = lease
         .custody
@@ -26775,19 +26843,43 @@ fn materialize_foreign_pristine_write(
         .get(&key)
         .and_then(GlobalFrameOwnerEntry::live_owner)
         .cloned()
-        .unwrap_or_else(|| std::process::abort());
+        .unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::foreign_sparse_materialization",
+                "anonymous sparse frame disappeared from global owner registry: gpa=0x{:x} len={}",
+                key.0,
+                key.1
+            );
+        });
     if owner.generation() != receipt.owner_generation.raw_for_probe() {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::foreign_sparse_materialization",
+            "global owner generation mismatch before foreign lease retention: owner_gen={} receipt_gen={} gpa=0x{:x}",
+            owner.generation(),
+            receipt.owner_generation.raw_for_probe(),
+            key.0
+        );
     }
-    let pin = owner.pin().unwrap_or_else(|_| std::process::abort());
+    let pin = owner.pin().unwrap_or_else(|error| {
+        carrick_fatal!(
+            "hvpatch::foreign_sparse_materialization",
+            "pinning anonymous sparse owner failed before foreign retention: gpa=0x{:x} error={error:?}",
+            key.0
+        );
+    });
     lease_guard.backing.extents.push(RetainedForeignExtent {
         key,
         owner: RetainedPhysicalOwner::Global(pin),
     });
     for region in published.extension_regions {
-        let owner = region
-            .structural_owner
-            .unwrap_or_else(|| std::process::abort());
+        let owner = region.structural_owner.unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::foreign_sparse_materialization",
+                "stage-1 extension region lacks structural owner: va=0x{:x} physical_ipa=0x{:x}",
+                region.start,
+                region.physical_ipa
+            );
+        });
         lease_guard.backing.extents.push(RetainedForeignExtent {
             key: (owner.physical_ipa, owner.physical_size as u64),
             owner: RetainedPhysicalOwner::Structural(owner),
@@ -26855,9 +26947,12 @@ fn materialize_foreign_private_file_write(
         &mut flush,
     )
     .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-    let receipt = published
-        .foreign_receipt
-        .unwrap_or_else(|| std::process::abort());
+    let receipt = published.foreign_receipt.unwrap_or_else(|| {
+        carrick_fatal!(
+            "hvpatch::foreign_file_materialization",
+            "foreign private-file publication completed without required foreign-MM receipt"
+        )
+    });
     let key = (receipt.physical_base.raw(), receipt.physical_len);
     let owner = lease
         .custody
@@ -26866,19 +26961,35 @@ fn materialize_foreign_private_file_write(
         .get(&key)
         .and_then(GlobalFrameOwnerEntry::live_owner)
         .cloned()
-        .unwrap_or_else(|| std::process::abort());
+        .unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::foreign_file_materialization",
+                "newly committed private-file sparse frame disappeared from global owner registry before lease retention"
+            )
+        });
     if owner.generation() != receipt.owner_generation.raw_for_probe() {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::foreign_file_materialization",
+            "global owner generation mismatch for committed private-file sparse receipt"
+        );
     }
-    let pin = owner.pin().unwrap_or_else(|_| std::process::abort());
+    let pin = owner.pin().unwrap_or_else(|_| {
+        carrick_fatal!(
+            "hvpatch::foreign_file_materialization",
+            "failed to pin newly committed private-file sparse owner before foreign lease retention"
+        )
+    });
     lease_guard.backing.extents.push(RetainedForeignExtent {
         key,
         owner: RetainedPhysicalOwner::Global(pin),
     });
     for region in published.extension_regions {
-        let owner = region
-            .structural_owner
-            .unwrap_or_else(|| std::process::abort());
+        let owner = region.structural_owner.unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::foreign_file_materialization",
+                "stage-1 extension for private-file materialization missing structural owner"
+            )
+        });
         lease_guard.backing.extents.push(RetainedForeignExtent {
             key: (owner.physical_ipa, owner.physical_size as u64),
             owner: RetainedPhysicalOwner::Structural(owner),
@@ -27335,14 +27446,22 @@ fn perform_foreign_cow_transaction(
                 .invalidate_exact_asid(binding, deadline)
                 .is_err()
             {
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "stage-1 TLB invalidation failed during foreign COW page-table error rollback"
+                );
             }
         } else {
             *lease.state.cow_rollback_scratch.lock() = recycled;
         }
         return Err(error);
     }
-    let rollback = rollback.unwrap_or_else(|| std::process::abort());
+    let rollback = rollback.unwrap_or_else(|| {
+        carrick_fatal!(
+            "hvpatch::mm_authority",
+            "missing page-table rollback pre-image after successful page-table modification"
+        )
+    });
     if let Err(error) = invalidator.invalidate_exact_asid(binding, deadline) {
         let recycled_manager = unsafe {
             page_tables_authority.restore_image_and_host(rollback, 9, resolve_page_table_host)
@@ -27352,7 +27471,10 @@ fn perform_foreign_cow_transaction(
             .invalidate_exact_asid(binding, deadline)
             .is_err()
         {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::mm_authority",
+                "stage-1 TLB invalidation failed during foreign COW invalidation-error rollback"
+            );
         }
         return Err(error);
     }
@@ -27365,7 +27487,10 @@ fn perform_foreign_cow_transaction(
             .invalidate_exact_asid(binding, deadline)
             .is_err()
         {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::mm_authority",
+                "stage-1 TLB invalidation failed during foreign COW failpoint rollback"
+            );
         }
         return Err(error);
     }
@@ -27387,12 +27512,21 @@ fn perform_foreign_cow_transaction(
     committed_mapping_ids.dedup();
     let challenge = commit.receipt_challenge();
     let cow_length = carrick_hal::FrameLength::from_mapping_extent(
-        std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE)
-            .unwrap_or_else(|| std::process::abort()),
+        std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "zero compound size constant when constructing foreign COW frame length"
+            )
+        }),
     );
     let owner_generation_token = std::num::NonZeroU64::new(owner_generation)
         .map(carrick_hal::ForeignOwnerGeneration::from_backend_counter)
-        .unwrap_or_else(|| std::process::abort());
+        .unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "zero owner generation token returned when registering global frame host owner"
+            )
+        });
     let owner_is_live = lease
         .custody
         .global_frame_host_owners
@@ -27403,14 +27537,22 @@ fn perform_foreign_cow_transaction(
             owner.generation() == owner_generation && std::ptr::eq(owner.as_ptr(), new_host_ptr)
         });
     if !owner_is_live {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::host_alias",
+            "global frame host owner was not found in registry with matching generation and host mapping pointer prior to foreign COW publication"
+        );
     }
     let (apply_receipt, kernel_proof, authenticated_owner_generation) = match runtime
         .authority
         .apply_foreign_cow(
             commit,
             carrick_guest_mem::GuestVa(span.va),
-            std::num::NonZeroUsize::new(span.len).unwrap_or_else(|| std::process::abort()),
+            std::num::NonZeroUsize::new(span.len).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::cow_token",
+                    "zero length in armed foreign COW span violates non-zero span length invariants"
+                )
+            }),
             split.new_extent.mapping,
             split.new_extent.frame,
             carrick_guest_mem::Gpa(new_physical_ipa),
@@ -27423,7 +27565,12 @@ fn perform_foreign_cow_transaction(
                 .cow_rollback_scratch
                 .lock()
                 .take()
-                .unwrap_or_else(|| std::process::abort());
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::mm_authority",
+                        "missing rollback pre-image in scratch storage during foreign COW kernel publication failure"
+                    )
+                });
             let recycled_manager = unsafe {
                 page_tables_authority.restore_image_and_host(rollback, 11, resolve_page_table_host)
             };
@@ -27432,20 +27579,34 @@ fn perform_foreign_cow_transaction(
                 .invalidate_exact_asid(binding, deadline)
                 .is_err()
             {
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "stage-1 TLB invalidation failed during foreign COW publication-error rollback"
+                );
             }
             return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
         }
     };
     if authenticated_owner_generation != owner_generation_token {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::host_alias",
+            "authenticated owner generation returned from kernel foreign COW publication does not match registered host owner generation token"
+        );
     }
-    let expected_mm = std::num::NonZeroU64::new(requested.mm.raw_for_probe())
-        .unwrap_or_else(|| std::process::abort());
+    let expected_mm =
+        std::num::NonZeroU64::new(requested.mm.raw_for_probe()).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::mm_authority",
+                "zero MM identity in foreign MM request during challenge authentication"
+            )
+        });
     if !challenge.authenticate_apply(&apply_receipt, expected_mm)
         || !apply_receipt.authorizes(split.new_extent.mapping, split.new_extent.frame)
     {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::frame_inventory",
+            "foreign COW apply receipt failed cryptographic challenge authentication or failed to authorize replacement mapping and frame"
+        );
     }
     let retired_old_stage2 = {
         let mut inventory = lease.state.frame_inventory.ledger.lock();
@@ -27457,7 +27618,12 @@ fn perform_foreign_cow_transaction(
                 split.old.stage2_length,
             )
         })
-        .unwrap_or_else(|_| std::process::abort())
+        .unwrap_or_else(|_| {
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "committing frame inventory split into carrier ledger failed after kernel publication"
+            )
+        })
     };
     record_cow_inventory_lifecycle(
         CowDiagnosticLifecycleKind::InventoryRemoved,
@@ -27573,7 +27739,12 @@ fn perform_foreign_cow_transaction(
         cow_length,
     ) {
         Ok(true) => {}
-        Ok(false) | Err(_) => std::process::abort(),
+        Ok(false) | Err(_) => {
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "post-publication verification that replacement mapping is live in kernel authority failed or returned false"
+            );
+        }
     }
     let owner_is_live = lease
         .custody
@@ -27585,10 +27756,16 @@ fn perform_foreign_cow_transaction(
             owner.generation() == owner_generation && std::ptr::eq(owner.as_ptr(), new_host_ptr)
         });
     if !owner_is_live {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::host_alias",
+            "global frame host owner entry was missing or modified in registry following post-publication verification"
+        );
     }
     if !committed_mapping_ids.contains(&split.new_extent.mapping) {
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::frame_inventory",
+            "committed mapping ID list does not contain replacement mapping after processing reservation commit events"
+        );
     }
     owner_rollback.commit();
     lease.state.cow_armed.lock().disarm(span);
@@ -27611,10 +27788,18 @@ fn perform_foreign_cow_transaction(
         .get(&(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE))
         .and_then(GlobalFrameOwnerEntry::live_owner)
         .cloned()
-        .unwrap_or_else(|| std::process::abort());
-    let new_owner_pin = new_owner_arc
-        .pin()
-        .unwrap_or_else(|_| std::process::abort());
+        .unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "failed to retrieve registered global frame host owner when retaining foreign extent for lease guard"
+            )
+        });
+    let new_owner_pin = new_owner_arc.pin().unwrap_or_else(|_| {
+        carrick_fatal!(
+            "hvpatch::host_alias",
+            "pinning newly published global owner failed after inventory and kernel publication committed"
+        )
+    });
     lease_guard.backing.extents.push(RetainedForeignExtent {
         key: (new_physical_ipa, CowArmedRanges::COMPOUND_SIZE),
         owner: RetainedPhysicalOwner::Global(new_owner_pin),
@@ -28757,8 +28942,10 @@ impl Drop for PendingExecStage2Cleanup {
     fn drop(&mut self) {
         if self.armed {
             if let Err(error) = self.retire() {
-                eprintln!("carrick: FATAL: drop pending exec predecessor cleanup: {error}");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::exec_commit",
+                    "drop pending exec predecessor cleanup failed: {error}"
+                );
             }
         }
     }
@@ -28913,18 +29100,24 @@ impl HvfTaskState {
             return;
         }
         let authority = self.cow_authority.as_ref().unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: pending fork-frame receipt has no COW authority");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::cow_token",
+                "pending fork-frame receipt has no COW authority"
+            )
         });
         let identity = self.cow_identity.unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: pending fork-frame receipt has no COW identity");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::cow_token",
+                "pending fork-frame receipt has no COW identity"
+            )
         });
         for receipt in std::mem::take(&mut self.pending_fork_frame_receipts) {
             let length = carrick_hal::FrameLength::from_mapping_extent(
                 std::num::NonZeroU64::new(receipt.length).unwrap_or_else(|| {
-                    eprintln!("carrick: FATAL: pending fork-frame receipt has zero length");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::fork_publication",
+                        "pending fork-frame receipt has zero length"
+                    )
                 }),
             );
             match authority.mapping_is_live(
@@ -28935,18 +29128,18 @@ impl HvfTaskState {
             ) {
                 Ok(true) => {}
                 Ok(false) => {
-                    eprintln!(
-                        "carrick: FATAL: fork-frame receipt child mapping {:?} is not live",
+                    carrick_fatal!(
+                        "hvpatch::fork_publication",
+                        "fork-frame receipt child mapping {:?} is not live",
                         receipt.child_mapping
                     );
-                    std::process::abort();
                 }
                 Err(error) => {
-                    eprintln!(
-                        "carrick: FATAL: authenticate fork-frame receipt mapping {:?}: {error}",
+                    carrick_fatal!(
+                        "hvpatch::cow_token",
+                        "authenticate fork-frame receipt mapping {:?}: {error}",
                         receipt.child_mapping
                     );
-                    std::process::abort();
                 }
             }
             let event = carrick_observability::probes::HvpatchForkFrameShare::new(
@@ -28962,8 +29155,10 @@ impl HvfTaskState {
                 receipt.length,
             )
             .unwrap_or_else(|error| {
-                eprintln!("carrick: FATAL: construct authenticated fork-frame receipt: {error}");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::fork_publication",
+                    "construct authenticated fork-frame receipt failed: {error}"
+                )
             });
             publish(event);
         }
@@ -30100,13 +30295,21 @@ impl HvfVmState {
         let mm = carrick_hal::ForeignMmId::from_kernel_allocation(
             self.cow_identity
                 .and_then(|identity| std::num::NonZeroU64::new(identity.mm))
-                .unwrap_or_else(|| std::process::abort()),
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::deferred_materialization_binding",
+                        "local HVF state has no nonzero COW MM identity while binding deferred-memory authority"
+                    )
+                }),
         );
         let mut binding = self.mm_access.deferred_anonymous.write();
         if let Some((bound_mm, bound_state)) = binding.as_ref()
             && (*bound_mm != mm || !std::sync::Arc::ptr_eq(bound_state, &state))
         {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::deferred_materialization_binding",
+                "local HVF state already holds a different MM or deferred-memory authority"
+            );
         }
         *binding = Some((mm, state));
     }
@@ -30195,7 +30398,10 @@ impl HvfVmState {
             &self.carrier_foreign_mm_transport,
             &other.carrier_foreign_mm_transport,
         ) {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::executor_boundary",
+                "swapping persistent executor-local state across mismatched carrier foreign MM transport instances"
+            );
         }
         std::mem::swap(&mut self._vm, &mut other._vm);
         std::mem::swap(&mut self.carrier_mappings, &mut other.carrier_mappings);
@@ -32565,22 +32771,23 @@ impl Drop for PersistentCarrierMappings {
                     drop(lease);
                 } else {
                     lease.try_retire().unwrap_or_else(|error| {
-                        eprintln!(
-                            "carrick: FATAL: retire persistent carrier stage-2 lease at IPA 0x{:x} size {}: {error}",
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "retire persistent carrier stage-2 lease failed at IPA 0x{:x} size {}: {error}",
                             mapping.physical_ipa, mapping.physical_size
                         );
-                        std::process::abort();
                     });
                 }
             } else if !vm_destroyed {
                 let rc =
                     unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };
                 if rc != 0 {
-                    eprintln!(
-                        "carrick: FATAL: retire persistent carrier stage-2 IPA 0x{:x} size {} failed: 0x{rc:x}",
-                        mapping.physical_ipa, mapping.physical_size
+                    carrick_fatal!(
+                        "hvpatch::mm_authority",
+                        "retire persistent carrier stage-2 IPA 0x{:x} size {} failed: 0x{rc:x}",
+                        mapping.physical_ipa,
+                        mapping.physical_size
                     );
-                    std::process::abort();
                 }
             }
             // Stage-2 is gone before OwnedHostMapping releases the backing.
@@ -33638,8 +33845,10 @@ impl HvpatchTaskOnlyBackendState {
             return;
         };
         registration.cleanup().unwrap_or_else(|error| {
-            eprintln!("carrick: FATAL: exact deferred HVPatch task cleanup: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::task_backend_lifecycle",
+                "exact deferred HVPatch task cleanup: {error}"
+            );
         });
     }
 }
@@ -34054,10 +34263,10 @@ impl HvpatchTaskInventoryAuthority {
                             Ok(())
                         }
                         Ok(_) => {
-                            eprintln!(
-                                "carrick: FATAL: Kernel returned a malformed successful HVPatch inventory receipt"
+                            carrick_fatal!(
+                                "hvpatch::frame_inventory",
+                                "Kernel returned a malformed successful HVPatch inventory receipt"
                             );
-                            std::process::abort();
                         }
                         Err(_) => {
                             let mut inventory = ledger.lock();
@@ -34295,8 +34504,9 @@ impl HvpatchTaskInventoryAuthority {
                             )
                         })
                         .collect();
-                    eprintln!(
-                        "carrick: FATAL: Kernel returned a malformed successful HVPatch retirement receipt\
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "Kernel returned a malformed successful HVPatch retirement receipt\
                          (challenge={challenge} revision_advanced={revision_advanced} \
                          transaction_distinct={transaction_distinct} {audit:?} \
                          receipt_revision={} retired_revision={} expected_mappings={} \
@@ -34308,7 +34518,6 @@ impl HvpatchTaskInventoryAuthority {
                         retired.mapping_set().len(),
                         pending_receipts.len(),
                     );
-                    std::process::abort();
                 }
                 Err(error) => {
                     *self = Self::Active {
@@ -34640,11 +34849,11 @@ impl Drop for HvpatchTaskMmAuthority {
             .get_mut()
             .rollback_unpublished()
             .unwrap_or_else(|error| {
-                eprintln!(
-                    "carrick: FATAL: drop HVPatch MM authority \
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "drop HVPatch MM authority \
                      (phase={phase} mm_root_slot={mm_root_slot:?} kernel_mm={kernel_mm:?} holder={holder}): {error}"
                 );
-                std::process::abort();
             });
         #[cfg(test)]
         if let Some(order) = &self.drop_order {
@@ -34708,8 +34917,10 @@ fn abort_prepared_task_and_carrier(
     // stage-2 entries while the leases unmap them.
     task.rollback_unpublished_inventory()
         .unwrap_or_else(|error| {
-            eprintln!("carrick: FATAL: rollback prepared HVPatch inventory before carrier teardown: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "rollback prepared HVPatch inventory before carrier teardown: {error}"
+            );
         });
     let state_result = state.abort();
     let mut owner_rollback_error = None;
@@ -35022,8 +35233,10 @@ fn scoped_alias_epoch_update(
 ) {
     if let Some((key, after)) = alias_change {
         bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external alias mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external alias mutation epoch exhausted"
+            );
         });
         for id in reset_alias_chain(&mut versions.aliases, key, after) {
             versions.alias_version_owner.remove(&id);
@@ -35031,8 +35244,10 @@ fn scoped_alias_epoch_update(
     }
     for physical_ipa in replay_ipas {
         bump_version_epoch(&mut versions.replay_epochs, *physical_ipa).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external replay mutation epoch exhausted"
+            );
         });
         let base = replay_rows_for_ipa(replay, *physical_ipa);
         for id in reset_replay_chain(&mut versions.replays, *physical_ipa, base) {
@@ -35157,8 +35372,10 @@ fn retire_process_aliases_in(
             }
         }
         bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external alias mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external alias mutation epoch exhausted"
+            );
         });
         for id in reset_alias_chain(&mut versions.aliases, key, after) {
             versions.alias_version_owner.remove(&id);
@@ -35169,8 +35386,10 @@ fn retire_process_aliases_in(
     // replay-side diff can only report the IPAs the alias changes already imply.
     for physical_ipa in affected_physical {
         bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external replay mutation epoch exhausted"
+            );
         });
         let base = replay_rows_for_ipa(replay, physical_ipa);
         for id in reset_replay_chain(&mut versions.replays, physical_ipa, base) {
@@ -35245,8 +35464,10 @@ fn mutate_external_alias_state_in<R>(
             }
         }
         bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external alias mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external alias mutation epoch exhausted"
+            );
         });
         for id in reset_alias_chain(&mut versions.aliases, key, after) {
             versions.alias_version_owner.remove(&id);
@@ -35283,8 +35504,10 @@ fn mutate_external_alias_state_in<R>(
     }
     for physical_ipa in affected_physical_ipas {
         bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external replay mutation epoch exhausted"
+            );
         });
         let base = replay_rows_for_ipa(replay, physical_ipa);
         for id in reset_replay_chain(&mut versions.replays, physical_ipa, base) {
@@ -35331,8 +35554,10 @@ fn mutate_known_external_alias_state<R>(
             continue;
         }
         bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external alias mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external alias mutation epoch exhausted"
+            );
         });
         for id in reset_alias_chain(&mut versions.aliases, key, after) {
             versions.alias_version_owner.remove(&id);
@@ -35344,8 +35569,10 @@ fn mutate_known_external_alias_state<R>(
             continue;
         }
         bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "external replay mutation epoch exhausted"
+            );
         });
         for id in reset_replay_chain(&mut versions.replays, physical_ipa, after) {
             versions.replay_version_owner.remove(&id);
@@ -35494,12 +35721,22 @@ impl AliasPublicationReceipt {
                 let chain = versions
                     .aliases
                     .get_mut(&chain_key)
-                    .unwrap_or_else(|| std::process::abort());
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "missing alias version chain for owned receipt version: key={chain_key:?} id={id:?}"
+                        );
+                    });
                 let version_index = chain
                     .versions
                     .iter()
                     .position(|version| version.id == id)
-                    .unwrap_or_else(|| std::process::abort());
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "missing alias receipt version in chain: key={chain_key:?} id={id:?}"
+                        );
+                    });
                 let was_top = version_index + 1 == chain.versions.len();
                 let removed = chain.versions.remove(version_index);
                 let base = chain.base;
@@ -35540,7 +35777,12 @@ impl AliasPublicationReceipt {
                         );
                     }
                     bump_version_epoch(&mut versions.alias_epochs, chain_key)
-                        .unwrap_or_else(|| std::process::abort());
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "hvpatch::host_alias",
+                                "alias version epoch exhausted on receipt retirement: key={chain_key:?}"
+                            );
+                        });
                 }
                 if empty {
                     versions.aliases.remove(&chain_key);
@@ -35550,12 +35792,22 @@ impl AliasPublicationReceipt {
                 let chain = versions
                     .replays
                     .get_mut(&physical_ipa)
-                    .unwrap_or_else(|| std::process::abort());
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "missing replay version chain for owned receipt version: ipa={physical_ipa:#x} id={id:?}"
+                        );
+                    });
                 let version_index = chain
                     .versions
                     .iter()
                     .position(|version| version.id == id)
-                    .unwrap_or_else(|| std::process::abort());
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "missing replay receipt version in chain: ipa={physical_ipa:#x} id={id:?}"
+                        );
+                    });
                 let was_top = version_index + 1 == chain.versions.len();
                 let removed = chain.versions.remove(version_index);
                 let base = chain.base.clone();
@@ -35574,7 +35826,12 @@ impl AliasPublicationReceipt {
                         replay.extend(base);
                     }
                     bump_version_epoch(&mut versions.replay_epochs, physical_ipa)
-                        .unwrap_or_else(|| std::process::abort());
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "hvpatch::host_alias",
+                                "replay version epoch exhausted on receipt retirement: ipa={physical_ipa:#x}"
+                            );
+                        });
                 }
                 if empty {
                     versions.replays.remove(&physical_ipa);
@@ -35635,12 +35892,16 @@ impl Default for HvpatchCarrierTaskStateDirectory {
                 |current| current.checked_add(1),
             )
             .unwrap_or_else(|_| {
-                eprintln!("carrick: FATAL: HVPatch carrier directory identity exhausted");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::task_directory",
+                    "HVPatch carrier directory identity exhausted"
+                );
             });
         let instance = std::num::NonZeroU64::new(instance).unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: zero HVPatch carrier directory identity");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::task_directory",
+                "zero HVPatch carrier directory identity"
+            );
         });
         let (_, verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
         Self::new(instance, verifier)
@@ -35864,10 +36125,10 @@ impl HvpatchTaskRegistration {
                     access
                         .install_prepared_mm_root_stage2_authority(authority)
                         .unwrap_or_else(|error| {
-                            eprintln!(
-                                "carrick: FATAL: install published task-only root authority: {error}"
+                            carrick_fatal!(
+                                "hvpatch::mm_authority",
+                                "install published task-only root authority failed: {error}"
                             );
-                            std::process::abort();
                         });
                 }
                 for mapping in &task_mm.mappings {
@@ -35878,10 +36139,11 @@ impl HvpatchTaskRegistration {
                                 std::sync::Arc::clone(owner),
                             )
                             .unwrap_or_else(|error| {
-                                eprintln!(
-                                    "carrick: FATAL: install task-only structural MM authority: {error}"
+                                carrick_fatal!(
+                                    "hvpatch::mm_authority",
+                                    "install task-only structural MM authority failed: slot={:?} error={error}",
+                                    task_mm.mm_root_slot
                                 );
-                                std::process::abort();
                             });
                     }
                 }
@@ -36277,14 +36539,32 @@ impl HvpatchPreparedCarrierTaskState {
         mut self,
         directory: std::sync::Arc<HvpatchCarrierTaskStateDirectory>,
     ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
-        let state = self.state.take().unwrap_or_else(|| std::process::abort());
-        let task = self.task.take().unwrap_or_else(|| std::process::abort());
+        let state = self.state.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::task_backend_commit",
+                "carrier task state missing during prepared carrier commit: identity={:?}",
+                self.identity
+            );
+        });
+        let task = self.task.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::task_backend_commit",
+                "prepared task authority missing during prepared carrier commit: identity={:?}",
+                self.identity
+            );
+        });
         directory.publish(self.identity, state, task)
     }
 
     pub(crate) fn abort(mut self) -> Result<(), TrapError> {
         if let Some(state) = self.state.take() {
-            let task = self.task.take().unwrap_or_else(|| std::process::abort());
+            let task = self.task.take().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "prepared task authority missing during prepared carrier abort: identity={:?}",
+                    self.identity
+                );
+            });
             abort_prepared_task_and_carrier(task, state)?;
         }
         Ok(())
@@ -36295,10 +36575,19 @@ impl HvpatchPreparedCarrierTaskState {
 impl Drop for HvpatchPreparedCarrierTaskState {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            let task = self.task.take().unwrap_or_else(|| std::process::abort());
+            let task = self.task.take().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "prepared task authority missing during prepared carrier drop: identity={:?}",
+                    self.identity
+                );
+            });
             abort_prepared_task_and_carrier(task, state).unwrap_or_else(|error| {
-                eprintln!("carrick: FATAL: abort deferred HVPatch task/carrier state: {error}");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "abort deferred HVPatch task/carrier state during drop failed: identity={:?} error={error}",
+                    self.identity
+                );
             });
         }
     }
@@ -36469,9 +36758,13 @@ impl HvpatchCarrierTaskStateDirectory {
                         stage2_logical_leases: Vec::new(),
                         custody: std::sync::Arc::downgrade(&carrier_custody),
                         frames: std::sync::Arc::clone(
-                            carrier_frames
-                                .as_ref()
-                                .unwrap_or_else(|| std::process::abort()),
+                            carrier_frames.as_ref().unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "hvpatch::frame_inventory",
+                                    "carrier frame inventory missing when constructing live carrier MM authority for sibling task: identity={:?}",
+                                    identity
+                                );
+                            }),
                         ),
                     }))
                 }),
@@ -36484,9 +36777,13 @@ impl HvpatchCarrierTaskStateDirectory {
                         stage2_logical_leases: Vec::new(),
                         custody: std::sync::Arc::downgrade(&carrier_custody),
                         frames: std::sync::Arc::clone(
-                            carrier_frames
-                                .as_ref()
-                                .unwrap_or_else(|| std::process::abort()),
+                            carrier_frames.as_ref().unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "hvpatch::frame_inventory",
+                                    "carrier frame inventory missing when constructing live carrier MM authority for shared-process task: identity={:?}",
+                                    identity
+                                );
+                            }),
                         ),
                     }))
                 }),
@@ -36535,9 +36832,13 @@ impl HvpatchCarrierTaskStateDirectory {
                         ),
                         custody: std::sync::Arc::downgrade(&carrier_custody),
                         frames: std::sync::Arc::clone(
-                            carrier_frames
-                                .as_ref()
-                                .unwrap_or_else(|| std::process::abort()),
+                            carrier_frames.as_ref().unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "hvpatch::frame_inventory",
+                                    "carrier frame inventory missing when constructing live carrier MM authority for process task: identity={:?}",
+                                    identity
+                                );
+                            }),
                         ),
                     })),
                     None,
@@ -36626,20 +36927,27 @@ impl HvpatchCarrierTaskStateDirectory {
             )
             .is_some()
         {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::task_backend_lifecycle",
+                "duplicate carrier task registration during publication: key={key:?}"
+            );
         }
         if failpoint == 2 {
-            let row = inner
-                .states
-                .remove(&key)
-                .unwrap_or_else(|| std::process::abort());
+            let row = inner.states.remove(&key).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "carrier task state row missing immediately after insertion during failpoint rollback: key={key:?}"
+                );
+            });
             drop(inner);
             let (row, carrier_mm) = rollback_failed_directory_publication(
                 &task_mm, row, carrier_mm,
             )
             .unwrap_or_else(|error| {
-                eprintln!("carrick: FATAL: rollback failed HVPatch directory publication: {error}");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::task_backend_lifecycle",
+                    "rollback failed HVPatch directory publication: {error}"
+                );
             });
             drop(row);
             drop(carrier_mm);
@@ -36879,10 +37187,10 @@ fn switch_exec_stage2_transaction(
         if let Err(error) = unmap(extent) {
             for restore in &old[..old_unmapped] {
                 map(restore).unwrap_or_else(|rollback| {
-                    eprintln!(
-                        "carrick: FATAL: restore HVPatch exec predecessor after unmap failure: {rollback}"
+                    carrick_fatal!(
+                        "hvpatch::exec_commit",
+                        "restore HVPatch exec predecessor after unmap failure: {rollback}"
                     );
-                    std::process::abort();
                 });
             }
             return Err(error);
@@ -36895,18 +37203,18 @@ fn switch_exec_stage2_transaction(
          map: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>| {
             for replacement in new[..mapped].iter().rev() {
                 unmap(replacement).unwrap_or_else(|error| {
-                    eprintln!(
-                        "carrick: FATAL: rollback HVPatch exec replacement stage-2 mapping: {error}"
+                    carrick_fatal!(
+                        "hvpatch::exec_commit",
+                        "rollback HVPatch exec replacement stage-2 mapping: {error}"
                     );
-                    std::process::abort();
                 });
             }
             for predecessor in old {
                 map(predecessor).unwrap_or_else(|error| {
-                    eprintln!(
-                        "carrick: FATAL: restore HVPatch exec predecessor stage-2 mapping: {error}"
+                    carrick_fatal!(
+                        "hvpatch::exec_commit",
+                        "restore HVPatch exec predecessor stage-2 mapping: {error}"
                     );
-                    std::process::abort();
                 });
             }
         };
@@ -37181,10 +37489,10 @@ impl Drop for GlobalFrameOwnerRollback {
         for &(ipa, length) in self.keys.iter().rev() {
             let outcome = retire_global_frame_host_owner_in(&self.custody, ipa, length);
             if matches!(outcome, GlobalFrameRetirementOutcome::NotFound { .. }) {
-                eprintln!(
-                    "carrick: FATAL: rollback lost global frame owner IPA 0x{ipa:x} size {length}"
+                carrick_fatal!(
+                    "hvpatch::frame_inventory",
+                    "rollback lost global frame owner IPA 0x{ipa:x} size {length}"
                 );
-                std::process::abort();
             }
         }
     }
@@ -37635,7 +37943,10 @@ impl HvfVmState {
 
     fn inventory_generation(raw: u64) -> carrick_hal::MappingGeneration {
         let Some(raw) = std::num::NonZeroU64::new(raw) else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "attempted to construct MappingGeneration from zero raw counter"
+            );
         };
         carrick_hal::MappingGeneration::from_backend_counter(raw)
     }
@@ -37644,8 +37955,10 @@ impl HvfVmState {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if serial == 0 {
-            eprintln!("carrick: FATAL: HVPatch private backing identity exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "HVPatch private backing identity exhausted"
+            );
         }
         InventoryBackingIdentity::Private(serial)
     }
@@ -37654,8 +37967,10 @@ impl HvfVmState {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if serial == 0 {
-            eprintln!("carrick: FATAL: HVPatch private file-view backing identity exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "HVPatch private file-view backing identity exhausted"
+            );
         }
         InventoryBackingIdentity::PrivateFileView(serial)
     }
@@ -37664,8 +37979,10 @@ impl HvfVmState {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if serial == 0 {
-            eprintln!("carrick: FATAL: HVPatch shared-anonymous backing identity exhausted");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "HVPatch shared-anonymous backing identity exhausted"
+            );
         }
         InventoryBackingIdentity::SharedAnon(serial)
     }
@@ -39135,8 +39452,10 @@ impl HvfVmState {
 
             let frames = std::sync::Arc::clone(&inventory.frames);
             let mut reservation = inventory.retirement_reservation.take().unwrap_or_else(|| {
-                eprintln!("carrick: FATAL: validated HVPatch retirement reservation disappeared");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::frame_inventory",
+                    "validated HVPatch retirement reservation disappeared before candidate staging"
+                );
             });
             let diagnostic_extents = if cow_refusal_diagnostics_enabled() {
                 inventory
@@ -40933,10 +41252,10 @@ impl HvfVmState {
                     // All ordinary allocation failures preceded this boundary.
                     self.commit_process_alias_retirement(start, semantic_len, retirement)
                         .unwrap_or_else(|error| {
-                            eprintln!(
-                                "carrick: FATAL: committed private-file retirement failed: {error}"
+                            carrick_fatal!(
+                                "hvpatch::host_alias",
+                                "committed private-file retirement failed: start=0x{start:x} len=0x{semantic_len:x} error={error}"
                             );
-                            std::process::abort();
                         });
                 }
             },
@@ -41370,8 +41689,10 @@ impl HvfVmState {
                 },
             );
             if let Err(flush_error) = flush_stage1() {
-                eprintln!("carrick: FATAL: retained reuse rollback TLBI failed: {flush_error}");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "retained reuse rollback TLBI failed: {flush_error}"
+                );
             }
             Self::rollback_unpublished_mappings(
                 &mut self.frame_inventory.lock(),
@@ -41388,12 +41709,16 @@ impl HvfVmState {
             },
         );
         if let Err(error) = flush_stage1() {
-            eprintln!("carrick: FATAL: retained reuse stage-1 TLBI failed: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::mm_authority",
+                "retained reuse stage-1 TLBI failed: {error}"
+            );
         }
         if let Err(error) = authority.apply(reservation.commit(())) {
-            eprintln!("carrick: FATAL: retained reuse inventory commit failed: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "retained reuse inventory commit failed: {error}"
+            );
         }
         owner_rollback.commit();
 
@@ -41402,18 +41727,26 @@ impl HvfVmState {
             inventory_mapping.frame,
             carrick_guest_mem::Gpa(new_physical_ipa),
             carrick_hal::FrameLength::from_mapping_extent(
-                std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE)
-                    .unwrap_or_else(|| std::process::abort()),
+                std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "retained reuse compound extent is zero"
+                    );
+                }),
             ),
         ) {
             Ok(true) => {}
             Ok(false) => {
-                eprintln!("carrick: FATAL: retained reuse mapping absent after commit");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::cow_token",
+                    "retained reuse mapping absent after commit"
+                );
             }
             Err(error) => {
-                eprintln!("carrick: FATAL: authenticate retained reuse mapping: {error}");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::cow_token",
+                    "authenticate retained reuse mapping: {error}"
+                );
             }
         }
 
@@ -42119,8 +42452,10 @@ impl HvfTaskState {
             trigger.ttbr0,
         )
         .unwrap_or_else(|error| {
-            eprintln!("carrick: FATAL: construct HVPatch frame-COW trigger: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::cow_token",
+                "construct HVPatch frame-COW trigger: {error}"
+            );
         });
         crate::probes::hvpatch_frame_cow_trigger(trigger_event);
 
@@ -42353,8 +42688,10 @@ impl HvfTaskState {
                 new_physical_ipa,
             )
             .unwrap_or_else(|error| {
-                eprintln!("carrick: FATAL: construct HVPatch frame-COW receipt: {error}");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::cow_token",
+                    "construct HVPatch frame-COW receipt: {error}"
+                );
             });
             crate::probes::hvpatch_frame_cow(event);
         };
@@ -42529,10 +42866,10 @@ impl HvfTaskState {
                 },
             );
             if let Err(flush_error) = flush_stage1() {
-                eprintln!(
-                    "carrick: FATAL: HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
                 );
-                std::process::abort();
             }
             if fresh_destination {
                 let _ = retire_global_frame_host_owner_in(
@@ -42552,13 +42889,17 @@ impl HvfTaskState {
             },
         );
         if let Err(error) = flush_stage1() {
-            eprintln!("carrick: FATAL: HVPatch COW stage-1 TLBI failed: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::mm_authority",
+                "HVPatch COW stage-1 TLBI failed: {error}"
+            );
         }
         emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Stage1Published);
         if let Err(error) = authority.apply(reservation.commit(())) {
-            eprintln!("carrick: FATAL: HVPatch COW inventory commit failed: {error}");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "HVPatch COW inventory commit failed: {error}"
+            );
         }
         let inventory_ledger = std::sync::Arc::clone(&self.frame_inventory.ledger);
         let retired_old_stage2 = {
@@ -42571,10 +42912,10 @@ impl HvfTaskState {
                 )
             })
             .unwrap_or_else(|error| {
-                eprintln!(
-                    "carrick: FATAL: commit HVPatch backend COW inventory after kernel commit: {error}"
+                carrick_fatal!(
+                    "hvpatch::frame_inventory",
+                    "commit HVPatch backend COW inventory after kernel commit: {error}"
                 );
-                std::process::abort();
             })
         };
         record_cow_inventory_lifecycle(
@@ -42659,8 +43000,10 @@ impl HvfTaskState {
             });
         }
         let Some(cow_extent) = std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE) else {
-            eprintln!("carrick: FATAL: HVPatch COW compound extent is zero");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "HVPatch COW compound extent is zero"
+            );
         };
         let cow_length = carrick_hal::FrameLength::from_mapping_extent(cow_extent);
         match authority.mapping_is_live(
@@ -42671,17 +43014,16 @@ impl HvfTaskState {
         ) {
             Ok(true) => {}
             Ok(false) => {
-                eprintln!(
-                    "carrick: FATAL: authenticated HVPatch COW mapping {new_mapping:?} \
-                     was absent immediately after commit"
+                carrick_fatal!(
+                    "hvpatch::cow_token",
+                    "authenticated HVPatch COW mapping {new_mapping:?} was absent immediately after commit"
                 );
-                std::process::abort();
             }
             Err(error) => {
-                eprintln!(
-                    "carrick: FATAL: authenticate HVPatch COW mapping {new_mapping:?}: {error}"
+                carrick_fatal!(
+                    "hvpatch::cow_token",
+                    "authenticate HVPatch COW mapping {new_mapping:?}: {error}"
                 );
-                std::process::abort();
             }
         }
         emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Committed);
@@ -43344,20 +43686,33 @@ impl HvfVmState {
             if receipt.va < overlap_start {
                 remaining.push(PendingFrameCowPublication {
                     va: receipt.va,
-                    len: usize::try_from(overlap_start - receipt.va)
-                        .unwrap_or_else(|_| std::process::abort()),
+                    len: usize::try_from(overlap_start - receipt.va).unwrap_or_else(|_| {
+                        carrick_fatal!(
+                            "hvpatch::cow_token",
+                            "invalid leading span length in COW publication"
+                        );
+                    }),
                     expected_ipa: receipt.expected_ipa,
                 });
             }
             if overlap_end < receipt_end {
                 remaining.push(PendingFrameCowPublication {
                     va: overlap_end,
-                    len: usize::try_from(receipt_end - overlap_end)
-                        .unwrap_or_else(|_| std::process::abort()),
+                    len: usize::try_from(receipt_end - overlap_end).unwrap_or_else(|_| {
+                        carrick_fatal!(
+                            "hvpatch::cow_token",
+                            "invalid trailing span length in COW publication"
+                        );
+                    }),
                     expected_ipa: receipt
                         .expected_ipa
                         .checked_add(overlap_end - receipt.va)
-                        .unwrap_or_else(|| std::process::abort()),
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "hvpatch::cow_token",
+                                "expected IPA overflow for trailing COW publication"
+                            );
+                        }),
                 });
             }
         }
@@ -43920,10 +44275,10 @@ impl HvfVmState {
         if self.persistent_vm_lifecycle {
             let mut inventory = self.frame_inventory.lock();
             let mut reservation = inventory.alias_reservation.take().unwrap_or_else(|| {
-                eprintln!(
-                    "carrick: FATAL: HVPatch alias mapped without frame inventory reservation"
+                carrick_fatal!(
+                    "hvpatch::frame_inventory",
+                    "HVPatch alias mapped without frame inventory reservation"
                 );
-                std::process::abort();
             });
             match Self::stage_mapping_in(
                 self.custody(),
@@ -43958,8 +44313,10 @@ impl HvfVmState {
                         .push(((ipa, physical_size as u64), extent));
                 }
                 Err(error) => {
-                    eprintln!("carrick: FATAL: stage inventory after HVPatch alias map: {error}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "stage inventory after HVPatch alias map: {error}"
+                    );
                 }
             }
             inventory.alias_commit = Some(reservation.commit(()));
@@ -45026,10 +45383,10 @@ impl HvfVmState {
         self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
         let actual_leases = unregister_alias(va, len, self.mm_root_slot, self.container_root);
         if actual_leases != planned_leases {
-            eprintln!(
-                "carrick: FATAL: HVPatch alias registry changed under topology lock: planned={planned_leases:?} actual={actual_leases:?}"
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "HVPatch alias registry changed under topology lock: planned={planned_leases:?} actual={actual_leases:?}"
             );
-            std::process::abort();
         }
         record_alias_unmap_lifecycle(
             CowDiagnosticLifecycleSite::AliasUnmap,
@@ -45068,8 +45425,9 @@ impl HvfVmState {
                 .filter(|(_, extent)| retiring.contains(&extent.mapping))
                 .map(|(&key, extent)| (key, extent.mapping, extent.frame, extent.backing))
                 .collect();
-            eprintln!(
-                "carrick: FATAL: apply HVPatch alias retirement inventory: {error}\n  \
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "apply HVPatch alias retirement inventory: {error}\n  \
                  va={va:#x} len={len:#x} retiring={:?}\n  frames={:?} leases={:?}\n  \
                  every extent naming those mappings: {naming:?}\n  \
                  live extents={} planned_leases={planned_leases:?}",
@@ -45078,16 +45436,15 @@ impl HvfVmState {
                 retirement.stage2_leases,
                 inventory.extents.len(),
             );
-            std::process::abort();
         }
         {
             let mut inventory = self.frame_inventory.lock();
             Self::commit_inventory_lease_retirement(&mut inventory, &retirement).unwrap_or_else(
                 |error| {
-                    eprintln!(
-                        "carrick: FATAL: commit HVPatch alias retirement backend ledger: {error}"
-                    );
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "commit HVPatch alias retirement backend ledger: {error}"
+                    )
                 },
             );
         }
@@ -47594,11 +47951,11 @@ impl HvfVmState {
                             &mut inventory,
                             &staged_inventory_mappings,
                         )
-                            .unwrap_or_else(|rollback_error| {
-                                eprintln!(
-                                    "carrick: FATAL: rollback task-only child inventory: {rollback_error}"
-                                );
-                                std::process::abort();
+                        .unwrap_or_else(|rollback_error| {
+                            carrick_fatal!(
+                                "hvpatch::frame_inventory",
+                                "rollback task-only child inventory: {rollback_error}"
+                            )
                         });
                         drop(inventory);
                         drop(mapped);
@@ -48080,16 +48437,13 @@ impl HvfVmState {
                 ) {
                     Ok(staged) => staged,
                     Err(error) => {
-                        Self::rollback_unpublished_mappings(
-                            &mut inventory,
-                            &staged_mappings,
-                        )
-                        .unwrap_or_else(|rollback_error| {
-                            eprintln!(
-                                "carrick: FATAL: rollback HVPatch child inventory staging: {rollback_error}"
-                            );
-                            std::process::abort();
-                        });
+                        Self::rollback_unpublished_mappings(&mut inventory, &staged_mappings)
+                            .unwrap_or_else(|rollback_error| {
+                                carrick_fatal!(
+                                    "hvpatch::frame_inventory",
+                                    "rollback HVPatch child inventory staging: {rollback_error}"
+                                )
+                            });
                         drop(inventory);
                         for mapping in &state.mappings {
                             if is_reusable_global_frame_extent(
@@ -48408,8 +48762,7 @@ impl HvfVmState {
                 if let Err(rollback_error) =
                     verify_exec_authority_rollback(&authority_before, &authority_after)
                 {
-                    eprintln!("carrick: FATAL: {rollback_error}");
-                    std::process::abort();
+                    carrick_fatal!("hvpatch::exec_commit", "{rollback_error}");
                 }
                 return Err(error);
             }
@@ -48435,8 +48788,10 @@ impl HvfVmState {
                 if let Err(error) =
                     Self::stage_retirement(&mut inventory, retired, authority.as_ref())
                 {
-                    eprintln!("carrick: FATAL: stage inventory after HVPatch exec unmap: {error}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "stage inventory after HVPatch exec unmap: {error}"
+                    );
                 }
                 for (key, extent) in diagnostic_extents {
                     record_cow_inventory_lifecycle(
@@ -48597,8 +48952,10 @@ impl HvfVmState {
                 })
                 .is_some()
             {
-                eprintln!("carrick: FATAL: overlapping detached exec predecessor cleanup");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::exec_commit",
+                    "overlapping detached exec predecessor cleanup"
+                );
             }
             crate::probes::hvpatch_exec_predecessor_classification(predecessor_classification);
         } else {
@@ -48684,8 +49041,10 @@ impl HvfVmState {
                     Some(replacement_mm_root_slot),
                 )
                 .unwrap_or_else(|error| {
-                    eprintln!("carrick: FATAL: publish HVPatch exec global-frame owner: {error}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "publish HVPatch exec global-frame owner: {error}"
+                    )
                 });
                 if let Some(owner) = region.structural_owner.as_ref() {
                     self.mm_access
@@ -48694,10 +49053,10 @@ impl HvfVmState {
                             std::sync::Arc::clone(owner),
                         )
                         .unwrap_or_else(|error| {
-                            eprintln!(
-                                "carrick: FATAL: install exec structural MM authority: {error}"
-                            );
-                            std::process::abort();
+                            carrick_fatal!(
+                                "hvpatch::mm_authority",
+                                "install exec structural MM authority: {error}"
+                            )
                         });
                 }
                 self.mappings.insert(region);
@@ -48718,11 +49077,11 @@ impl HvfVmState {
                 for region in &self.mappings {
                     let stage2_owner = mapped_region_stage2_owner_identity(region)
                         .unwrap_or_else(|| {
-                            eprintln!(
-                                "carrick: FATAL: HVPatch exec inventory region IPA 0x{:x} has invalid physical owner offset",
+                            carrick_fatal!(
+                                "hvpatch::frame_inventory",
+                                "HVPatch exec inventory region IPA 0x{:x} has invalid physical owner offset",
                                 region.physical_ipa
-                            );
-                            std::process::abort();
+                            )
                         });
                     let staged = match Self::stage_mapping_in(
                         &custody,
@@ -48740,10 +49099,10 @@ impl HvfVmState {
                     ) {
                         Ok(staged) => staged,
                         Err(error) => {
-                            eprintln!(
-                                "carrick: FATAL: stage inventory after HVPatch exec map: {error}"
+                            carrick_fatal!(
+                                "hvpatch::frame_inventory",
+                                "stage inventory after HVPatch exec map: {error}"
                             );
-                            std::process::abort();
                         }
                     };
                     staged_mappings
@@ -48755,24 +49114,26 @@ impl HvfVmState {
             let retired_commit = retired.map(|retired| retired.commit(()));
             let fallback_replacement_commit = if self.registration.is_some() {
                 let replacement_challenge = replacement_commit.receipt_challenge();
-                let owner_hosts = collect_carrier_stage2_owner_hosts(self.mappings.iter().map(
-                    |mapping| {
-                        let owner = mapped_region_stage2_owner_identity(mapping).unwrap_or_else(|| {
-                            eprintln!(
-                                "carrick: FATAL: exec carrier lease has invalid physical host offset"
-                            );
-                            std::process::abort();
-                        });
+                let owner_hosts =
+                    collect_carrier_stage2_owner_hosts(self.mappings.iter().map(|mapping| {
+                        let owner =
+                            mapped_region_stage2_owner_identity(mapping).unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "hvpatch::frame_inventory",
+                                    "exec carrier lease has invalid physical host offset"
+                                )
+                            });
                         (
                             (mapping.physical_ipa, mapping.physical_size as u64),
                             owner.host_addr,
                         )
-                    },
-                ))
-                .unwrap_or_else(|error| {
-                    eprintln!("carrick: FATAL: collect exec carrier lease owners: {error}");
-                    std::process::abort();
-                });
+                    }))
+                    .unwrap_or_else(|error| {
+                        carrick_fatal!(
+                            "hvpatch::frame_inventory",
+                            "collect exec carrier lease owners: {error}"
+                        )
+                    });
                 let mut stage2_leases = Vec::new();
                 for region in &mut self.mappings {
                     if let Some(stage2_lease) = region.stage2_lease.take() {
@@ -48785,10 +49146,10 @@ impl HvfVmState {
                             // Replacement inventory already names every candidate.
                             // Fail-stop before unwinding can drop their leases or host
                             // backings out from under that published authority.
-                            eprintln!(
-                                "carrick: FATAL: register carrier stage2 lease for exec: {error}"
-                            );
-                            std::process::abort();
+                            carrick_fatal!(
+                                "hvpatch::frame_inventory",
+                                "register carrier stage2 lease for exec: {error}"
+                            )
                         });
                 let mapped_task_mappings: Vec<HvpatchTaskMappingState> = self
                     .mappings
@@ -48850,8 +49211,10 @@ impl HvfVmState {
                 });
 
                 let Some(ref mut reg) = self.registration else {
-                    eprintln!("carrick: FATAL: missing registration for HVPatch exec rebind");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::task_backend_lifecycle",
+                        "missing registration for HVPatch exec rebind"
+                    );
                 };
                 if let Err(error) = reg.rebind_exec_authority(
                     new_task_mm,
@@ -48860,8 +49223,10 @@ impl HvfVmState {
                     &custody,
                     shared_projection,
                 ) {
-                    eprintln!("carrick: FATAL: rebind HVPatch exec MM authority: {error}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::task_backend_lifecycle",
+                        "rebind HVPatch exec MM authority: {error}"
+                    );
                 }
                 None
             } else {
@@ -48981,10 +49346,10 @@ impl HvfVmState {
             // frames. Returning would let `owner_rollback` retire their leases
             // while leaving those authorities published, so the only sound
             // outcome after this indeterminate boundary is process fail-stop.
-            eprintln!(
-                "carrick: FATAL: HVPatch exec post-publication register/mailbox failure: {error}"
+            carrick_fatal!(
+                "hvpatch::exec_commit",
+                "HVPatch exec post-publication register/mailbox failure: {error}"
             );
-            std::process::abort();
         });
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::Mailbox,
@@ -49891,8 +50256,10 @@ fn emit_global_frame_stage2(
         permissions,
     )
     .unwrap_or_else(|error| {
-        eprintln!("carrick: FATAL: construct global-frame stage-2 receipt: {error}");
-        std::process::abort();
+        carrick_fatal!(
+            "hvpatch::frame_inventory",
+            "construct global-frame stage-2 receipt: {error}"
+        );
     });
     crate::probes::hvpatch_global_frame_stage2(event);
 }
