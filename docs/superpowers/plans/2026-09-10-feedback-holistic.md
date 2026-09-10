@@ -63,3 +63,25 @@ Sequenced after wave 1 lands because they share files with it. Splits (T10–T13
 are pure moves committed the same day they start, reconciled with
 `just reconcile-inventories`, because `trap.rs` alone sees ~9 commits a day
 from sibling branches.
+
+## Progress log
+
+- 2026-09-10 wave 1 LANDED on main: clippy fix (643b4f0a5); `OwnedFd` wrappers
+  + std errno (f06d4acc9); `carrick-fatal` + ledger gate (094233272); typed
+  return constructors `dispatch/retval.rs` (dd5d4435a); unified fs path lookup
+  `dispatch/fs/lookup.rs` (c6a2187c2); DSR + native-darwin removal
+  (cc7d9eaa2, four crates, bench-native, 121K lines).
+- 2026-09-10 wave 2a LANDED: abort shards for leaf crates (d0a6dc970), vcpu_loop
+  (3eff19088), carrick-vmm-hvf (f7fa24e44), fs.rs typed returns + semgrep rule
+  `carrick-no-raw-returned-as-i64` (20add4f9f). The runtime shard (T5c) lands
+  once its gate is green. After it: every ledger row is `sink: fatal`; the
+  ledger gate refuses any new raw `std::process::abort()` anywhere under
+  `crates/` except the sink itself.
+- Carried into wave 2b: `typed_error_debt` rows still `sink: fatal` (22 in
+  runtime.json, 3 in vcpu-loop.json — their conversion needs cross-file
+  signature changes; T8 owns them); the semgrep rule still excludes
+  `dispatch/mod.rs` (two `Returned { value: … as i64 }` sites; T4c).
+- Two integration tests in `tests/integration/syscall_fs_open.rs` were red
+  on main before this campaign (bisected to 8236ed8bf and b2d22a814); fix
+  branch `agy/fsopen-red-bisect-sep10` routes overlay mutations through the VFS
+  and drops the host-isatty authority for guest stdio.
