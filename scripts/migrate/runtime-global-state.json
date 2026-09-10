@@ -2290,14 +2290,6 @@
       "rationale": "Carrier-wide host infrastructure static VCPU_CREATED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
     },
     {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "VCPU_LIVE",
-      "fingerprint": "2b50670b08f7ef0ad214fe1fc6304ecd1172ab9eb28ebf9e4751b520387ffe4a",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static VCPU_LIVE in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
-    },
-    {
       "kind": "env_var_os",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "admission_trace_enabled::CARRICK_HVF_ADMISSION_TRACE",

@@ -8,11 +8,11 @@
 // targets to keep `cargo clippy -- -D warnings` clean on container-104.
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use carrick_fatal::carrick_fatal;
-use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
+use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuCensus, VcpuExit, VcpuLease};
 use carrick_mem::memory::AddressSpace;
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
@@ -61,26 +61,10 @@ pub(crate) fn append_vcpu_state(_fd: &VcpuFd, msg: &mut String) {
     msg.push_str(" regs=<aarch64: per-register get_one_reg, no whole-frame dump>");
 }
 
-/// Process-global count of live KVM vCPUs (created-or-in-flight minus
-/// dropped) — the Linux implementation of the `crate::trap::VCPU_LIVE` drain
-/// contract the shared threaded run loop relies on (carrick-runtime
-/// re-exports this under `platform-linux`; HVF has its own identical counter
-/// in carrick-vmm-hvf's trap module). LOAD-BEARING, not a diagnostic:
-/// `terminate_siblings_for_exec` spin-waits for this to reach 1 after kicking
-/// sibling vCPU threads, so the execing thread cannot delete the VM's
-/// memslots / munmap the old `GuestRam` while a just-kicked sibling is still
-/// mid-dispatch holding raw pointers into those mmaps (host use-after-free)
-/// or mid-`map_host_alias` (`next_slot` racing `reset_slot_counter`).
-/// Measured without the drain: 60/60 multithreaded-execv iterations spewed
-/// sibling `KVM_RUN: Bad address` after the slot teardown.
-///
-/// Incremented at OWNED vcpu construction (`add_vcpu`: boot + the fork-child
-/// rebuild) or at sibling-spec creation (`VcpuLiveTicket` — see its doc for
-/// the in-flight window), decremented in [`KvmVcpu::drop`] — which runs at
-/// the end of a sibling's `run_vcpu_until_exit`, AFTER its last guest-RAM
-/// access. A fork CHILD inherits the parent's value (plain static, copied by
-/// `libc::fork`) but owns exactly one vCPU; the fork child path re-stores 1.
-pub static VCPU_LIVE: AtomicI64 = AtomicI64::new(0);
+/// Process-global count of live KVM vCPUs, managed via [`VcpuCensus`].
+pub(crate) fn vcpu_census() -> &'static VcpuCensus {
+    carrick_hal::vcpu_census::global()
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum KvmStat {
@@ -234,38 +218,31 @@ pub(crate) fn print_kvm_stats_once(reason: &str) {
     );
 }
 
-/// A reserved slot in [`VCPU_LIVE`] for a sibling that is IN FLIGHT — its
+/// A reserved slot in [`VcpuCensus`] for a sibling that is IN FLIGHT — its
 /// guest `clone()` has returned but its host thread has not yet constructed
 /// its vCPU. Without this, the execve drain has a blind window: the parent's
 /// `build_sibling_spec` runs synchronously with the trapped clone, the guest
-/// proceeds to execve, `terminate_siblings_for_exec` reads `VCPU_LIVE <= 1`
-/// (the sibling's vCPU doesn't exist yet) and tears the address space down —
-/// then the sibling materializes onto deleted memslots (measured: 9/60
-/// multithreaded-execv iterations still EFAULT'd with construction-time
-/// counting alone).
+/// proceeds to execve, the sibling's vCPU doesn't exist yet, and tears the
+/// address space down — then the sibling materializes onto deleted memslots.
 ///
-/// Ownership of the +1: acquired at `build_sibling_spec`, TRANSFERRED to the
+/// Ownership of the lease: acquired at `build_sibling_spec`, TRANSFERRED to the
 /// sibling's `KvmVcpu` at construction (`consume` — the vcpu's `Drop` then
-/// owns the decrement), or released by this ticket's own `Drop` if the
+/// owns the decrement), or released by this ticket's inner [`VcpuLease`] drop if the
 /// sibling never materializes (host spawn failure, spec dropped).
-pub(crate) struct VcpuLiveTicket(());
+pub(crate) struct VcpuLiveTicket(VcpuLease);
 
 impl VcpuLiveTicket {
     pub(crate) fn acquire() -> Self {
-        VCPU_LIVE.fetch_add(1, Ordering::SeqCst);
-        Self(())
+        let lease = vcpu_census()
+            .admit()
+            .unwrap_or_else(|_| vcpu_census().adopt_lease());
+        Self(lease)
     }
 
-    /// Transfer the +1 to a just-constructed sibling `KvmVcpu` (whose creation
-    /// path deliberately does NOT increment — see `add_sibling_vcpu`).
+    /// Transfer the lease to a just-constructed sibling `KvmVcpu` (whose creation
+    /// path adopts the lease — see `add_sibling_vcpu`).
     pub(crate) fn consume(self) {
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for VcpuLiveTicket {
-    fn drop(&mut self) {
-        VCPU_LIVE.fetch_sub(1, Ordering::SeqCst);
+        self.0.disarm();
     }
 }
 
@@ -629,9 +606,10 @@ pub struct KvmVcpu {
     recycle: Option<Arc<Mutex<Vec<ParkedVcpu>>>>,
     /// `true` for a TRANSIENT view built by the x86 M:N reclaim path over an
     /// already-live shared slot (see [`KvmReclaimHandle::with_vcpu`]): its `Drop`
-    /// must NOT take/park the fd (the real `KvmVcpu` still owns it) nor decrement
-    /// [`VCPU_LIVE`] (it never incremented). A normal vCPU leaves this `false`.
+    /// must NOT take/park the fd (the real `KvmVcpu` still owns it) nor drop a lease
+    /// (it never incremented). A normal vCPU leaves this `false`.
     borrowed: bool,
+    _lease: Option<VcpuLease>,
     #[cfg(target_arch = "x86_64")]
     last_x86_restore: Option<KvmX86RestoreState>,
 }
@@ -924,6 +902,7 @@ impl KvmReclaimHandle {
             recycle: None,
             borrowed: true,
             last_x86_restore: None,
+            _lease: None,
         };
         f(&mut view)
     }
@@ -1021,7 +1000,7 @@ impl Drop for KvmVcpu {
         // observes VCPU_LIVE <= 1 it tears down the guest RAM, so everything
         // this vCPU's thread does after the decrement must be RAM-free (it is:
         // only registry/kicker bookkeeping follows the engine drop).
-        VCPU_LIVE.fetch_sub(1, Ordering::SeqCst);
+        drop(self._lease.take());
     }
 }
 
@@ -1189,7 +1168,9 @@ impl KvmVm {
         // clone-returned-but-not-yet-materialized window; the caller consumes
         // the ticket right after this returns, transferring that +1 to the
         // vcpu (whose Drop decrements).
-        self.create_vcpu_on_shared_vm()
+        let mut vcpu = self.create_vcpu_on_shared_vm()?;
+        vcpu._lease = Some(vcpu_census().adopt_lease());
+        Ok(vcpu)
     }
 
     /// `KVM_CREATE_VCPU` + preferred-target init on the shared `VmFd` (`&self`
@@ -1338,6 +1319,7 @@ impl KvmVm {
             borrowed: false,
             #[cfg(target_arch = "x86_64")]
             last_x86_restore: None,
+            _lease: None,
         })
     }
 
@@ -1459,10 +1441,13 @@ impl HvVm for KvmVm {
         // aarch64: KVM_CREATE_VCPU + preferred-target init. Shared with the
         // sibling path ([`Self::add_sibling_vcpu`]) so the feature bits
         // (PSCI 0.2) cannot drift between bring-up and clone(CLONE_THREAD).
-        let vcpu = self.create_vcpu_on_shared_vm()?;
+        let mut vcpu = self.create_vcpu_on_shared_vm()?;
         // OWNED vcpu (boot / fork-child rebuild): count it at construction.
         // (The sibling path counts at spec creation instead — VcpuLiveTicket.)
-        VCPU_LIVE.fetch_add(1, Ordering::SeqCst);
+        let lease = vcpu_census()
+            .admit()
+            .map_err(|e| os_err("kvm add_vcpu", e))?;
+        vcpu._lease = Some(lease);
         Ok(vcpu)
     }
 

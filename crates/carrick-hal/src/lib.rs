@@ -99,3 +99,5 @@ pub use scheduler::{
     CpuAffinity, CpuLoad, CpuQueueView, GuestCpuId, GuestCpuPolicy, MAX_GUEST_CPUS,
     PreemptOrContinue, SchedulingPolicy, TaskKey, TaskPlacement,
 };
+pub mod vcpu_census;
+pub use vcpu_census::{AdmissionRefused, VcpuCensus, VcpuLease};
