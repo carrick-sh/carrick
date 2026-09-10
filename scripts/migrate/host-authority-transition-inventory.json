@@ -1211,18 +1211,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1195 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1216 in `raise_host_nofile_backing`, `libc::getrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000059",
     "source": {
-      "byte_end": 59176,
-      "byte_start": 59161,
+      "byte_end": 60421,
+      "byte_start": 60406,
       "column": 15,
       "column_end": 30,
       "column_start": 15,
       "file": "crates/carrick-runtime/src/dispatch/time.rs",
-      "line": 1195,
-      "line_end": 1195,
-      "line_start": 1195
+      "line": 1216,
+      "line_end": 1216,
+      "line_start": 1216
     }
   },
   {
@@ -1611,18 +1611,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1264 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1285 in `raise_host_nofile_backing`, `libc::setrlimit` acts only on the current runtime internal-FD capacity used by `raise_host_nofile_backing`; no guest identity selects its host target.",
     "review_id": "HA-000076",
     "source": {
-      "byte_end": 62483,
-      "byte_start": 62468,
+      "byte_end": 63728,
+      "byte_start": 63713,
       "column": 9,
       "column_end": 24,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/dispatch/time.rs",
-      "line": 1264,
-      "line_end": 1264,
-      "line_start": 1264
+      "line": 1285,
+      "line_end": 1285,
+      "line_start": 1285
     }
   },
   {
@@ -5797,18 +5797,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1231 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/time.rs:1252 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
     "review_id": "HA-000642",
     "source": {
-      "byte_end": 60925,
-      "byte_start": 60908,
+      "byte_end": 62170,
+      "byte_start": 62153,
       "column": 5,
       "column_end": 22,
       "column_start": 5,
       "file": "crates/carrick-runtime/src/dispatch/time.rs",
-      "line": 1231,
-      "line_end": 1231,
-      "line_start": 1231
+      "line": 1252,
+      "line_end": 1252,
+      "line_start": 1252
     }
   },
   {
