@@ -519,9 +519,12 @@ fn probe_diagnostic(probe: &ReadinessProbe) -> (String, Vec<DiagnosticPollFd>) {
             format!("shared-word addr={:#x}", generation.addr),
             Vec::new(),
         ),
-        ReadinessProbe::HostWrite { write, .. } => (
-            format!("host-write fd={}", write.lock().host_fd()),
-            Vec::new(),
+        ReadinessProbe::HostWrite { host_fd, .. } => (
+            format!("host-write fd={host_fd}"),
+            vec![DiagnosticPollFd {
+                fd: *host_fd,
+                events: libc::POLLOUT,
+            }],
         ),
         ReadinessProbe::RecordLock { .. } => ("record-lock".to_owned(), Vec::new()),
         ReadinessProbe::TaskWake { task, observed, .. } => (
@@ -2513,6 +2516,7 @@ enum ReadinessProbe {
         deadline: Option<Instant>,
     },
     HostWrite {
+        host_fd: i32,
         write: Arc<Mutex<BlockingHostWrite>>,
         completion: Arc<Mutex<Option<DispatchOutcome>>>,
     },
@@ -2737,10 +2741,14 @@ impl ReadinessProbe {
                 value: *value,
                 deadline: state.deadline,
             },
-            ContinuationDetail::HostWrite(write) => Self::HostWrite {
-                write: Arc::clone(write),
-                completion: Arc::clone(&state.producer_completion),
-            },
+            ContinuationDetail::HostWrite(write) => {
+                let host_fd = write.lock().host_fd();
+                Self::HostWrite {
+                    host_fd,
+                    write: Arc::clone(write),
+                    completion: Arc::clone(&state.producer_completion),
+                }
+            }
             // Enroll against the generation the CHILD SCAN observed, never
             // the one the capture re-read: the capture happens after the
             // syscall has already decided to block, so a child that exits in
@@ -2854,23 +2862,33 @@ impl ReadinessProbe {
                     .is_none_or(|current| current != *value)
                     .then_some(ContinuationEvent::Ready)
             }
-            Self::HostWrite { write, completion } => {
-                let mut write = write.lock();
-                match crate::dispatch::drive_blocking_host_write(&mut write) {
-                    crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
-                        *completion.lock() = Some(outcome);
-                        Some(ContinuationEvent::Ready)
+            Self::HostWrite {
+                write, completion, ..
+            } => {
+                let outcome = {
+                    let mut write = write.lock();
+                    match crate::dispatch::drive_blocking_host_write(&mut write) {
+                        crate::dispatch::BlockingHostWriteStep::Done(outcome) => Some(outcome),
+                        crate::dispatch::BlockingHostWriteStep::Wait => None,
                     }
-                    crate::dispatch::BlockingHostWriteStep::Wait => None,
+                };
+                if let Some(outcome) = outcome {
+                    *completion.lock() = Some(outcome);
+                    Some(ContinuationEvent::Ready)
+                } else {
+                    None
                 }
             }
             Self::RecordLock { lock, completion } => {
-                match crate::dispatch::try_drive_blocking_record_lock(lock) {
-                    crate::dispatch::BlockingRecordLockStep::Done(outcome) => {
-                        *completion.lock() = Some(outcome);
-                        Some(ContinuationEvent::Ready)
-                    }
+                let outcome = match crate::dispatch::try_drive_blocking_record_lock(lock) {
+                    crate::dispatch::BlockingRecordLockStep::Done(outcome) => Some(outcome),
                     crate::dispatch::BlockingRecordLockStep::Wait => None,
+                };
+                if let Some(outcome) = outcome {
+                    *completion.lock() = Some(outcome);
+                    Some(ContinuationEvent::Ready)
+                } else {
+                    None
                 }
             }
             Self::TaskWake {
@@ -3347,9 +3365,13 @@ impl CarrierWaitServiceInner {
                                 sources.push(FdSource::Ready(entry.token));
                             }
                         }
-                        ReadinessProbe::HostWrite { write, completion } => {
+                        ReadinessProbe::HostWrite {
+                            host_fd,
+                            write,
+                            completion,
+                        } => {
                             pollfds.push(libc::pollfd {
-                                fd: write.lock().host_fd(),
+                                fd: *host_fd,
                                 events: libc::POLLOUT,
                                 revents: 0,
                             });
@@ -3457,10 +3479,16 @@ impl CarrierWaitServiceInner {
                         inner.publish_event(token, ContinuationEvent::Ready);
                     }
                     FdSource::HostWrite(token, write, completion) => {
-                        let mut write = write.lock();
-                        if let crate::dispatch::BlockingHostWriteStep::Done(outcome) =
-                            crate::dispatch::drive_blocking_host_write(&mut write)
-                        {
+                        let outcome = {
+                            let mut write = write.lock();
+                            match crate::dispatch::drive_blocking_host_write(&mut write) {
+                                crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
+                                    Some(outcome)
+                                }
+                                crate::dispatch::BlockingHostWriteStep::Wait => None,
+                            }
+                        };
+                        if let Some(outcome) = outcome {
                             *completion.lock() = Some(outcome);
                             inner.publish_event(token, ContinuationEvent::Ready);
                         }
@@ -3495,9 +3523,11 @@ impl CarrierWaitServiceInner {
                     .collect::<Vec<_>>()
             };
             for (token, lock, completion) in record_locks {
-                if let crate::dispatch::BlockingRecordLockStep::Done(outcome) =
-                    crate::dispatch::try_drive_blocking_record_lock(&lock)
-                {
+                let outcome = match crate::dispatch::try_drive_blocking_record_lock(&lock) {
+                    crate::dispatch::BlockingRecordLockStep::Done(outcome) => Some(outcome),
+                    crate::dispatch::BlockingRecordLockStep::Wait => None,
+                };
+                if let Some(outcome) = outcome {
                     *completion.lock() = Some(outcome);
                     inner.publish_event(token, ContinuationEvent::Ready);
                 }
@@ -3803,10 +3833,11 @@ impl CarrierWaitService {
         &self,
         registration: &ContinuationRegistration,
     ) -> Result<Option<ContinuationEvent>, WaitServiceError> {
-        let event = {
-            let mut state = self.inner.state.lock();
-            let mut entry = state
-                .registration_mut(registration.token.continuation)
+        let (probe, signal_readiness) = {
+            let state = self.inner.state.lock();
+            let entry = state
+                .entries
+                .get(&registration.token.continuation)
                 .filter(|entry| entry.token == registration.token)
                 .ok_or(WaitServiceError::StaleRegistration)?;
             if !matches!(
@@ -3815,11 +3846,10 @@ impl CarrierWaitService {
             ) {
                 return Ok(entry.event.clone());
             }
-            entry
-                .signal_readiness
-                .event()
-                .or_else(|| entry.probe.poll())
+            (entry.probe.clone(), entry.signal_readiness.clone())
         };
+        let mut probe = probe;
+        let event = signal_readiness.event().or_else(|| probe.poll());
         if let Some(event) = event.as_ref() {
             self.inner.publish_event(registration.token, event.clone());
         }
@@ -9254,5 +9284,436 @@ mod tests {
         assert_eq!(service.topology().shared_reactors(), 1);
         assert_eq!(service.topology().task_waiter_threads(), 0);
         drop(owned);
+    }
+
+    #[test]
+    fn deterministic_rendezvous_enrollment_vs_reactor_host_write_interleaving() {
+        let (kernel, context) = bootstrap(15_380);
+        let generation = publish(&context, 0x720);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
+
+        let pipe = pipe_pair();
+        let payload = vec![11, 22, 33, 44];
+        let write = BlockingHostWrite::for_tests(
+            pipe[1],
+            payload.clone(),
+            0,
+            context.thread().registry_id(),
+            false,
+        )
+        .expect("write state");
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingHostWrite(write),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("write continuation");
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+
+        let barrier_start = Arc::new(Barrier::new(2));
+        let barrier_drive = Arc::new(Barrier::new(2));
+
+        let write_arc = match &continuation.state().detail {
+            ContinuationDetail::HostWrite(write) => Arc::clone(write),
+            _ => unreachable!(),
+        };
+        let completion_arc = Arc::clone(&continuation.state().producer_completion);
+
+        let reactor_service = service.clone();
+        let b_start = Arc::clone(&barrier_start);
+        let b_drive = Arc::clone(&barrier_drive);
+        let write_for_thread = Arc::clone(&write_arc);
+        let completion_for_thread = Arc::clone(&completion_arc);
+
+        let reactor_thread = thread::spawn(move || {
+            b_start.wait();
+            // Step 1: Drive write under write lock
+            let outcome = {
+                let mut write = write_for_thread.lock();
+                match crate::dispatch::drive_blocking_host_write(&mut write) {
+                    crate::dispatch::BlockingHostWriteStep::Done(outcome) => Some(outcome),
+                    crate::dispatch::BlockingHostWriteStep::Wait => None,
+                }
+            };
+            // Step 2: Set completion without holding write lock
+            if let Some(outcome) = outcome {
+                *completion_for_thread.lock() = Some(outcome);
+            }
+            // Step 3: Rendezvous with enrollment thread
+            b_drive.wait();
+            // Step 4: Publish event without holding write or completion lock
+            reactor_service
+                .inner
+                .publish_event(token, ContinuationEvent::Ready)
+        });
+
+        // Test thread: enroll and recheck concurrently
+        barrier_start.wait();
+        service.enroll(&mut registration).expect("enroll write");
+        barrier_drive.wait();
+
+        let receipt = reactor_thread.join().expect("reactor thread join");
+        assert!(
+            receipt.accepted()
+                || registration.settled
+                || service
+                    .inner
+                    .state
+                    .lock()
+                    .entries
+                    .get(&token.continuation)
+                    .is_some_and(|e| e.state == RegistrationState::Ready)
+        );
+
+        assert_eq!(
+            await_event(&service, token).expect("write event"),
+            ContinuationEvent::Ready
+        );
+
+        // Verify exact pipe bytes read
+        let mut buf = vec![0u8; payload.len()];
+        let read_bytes = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(read_bytes as usize, payload.len());
+        assert_eq!(buf, payload);
+
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
+        let resume_outcome = continuation
+            .resume(ContinuationEvent::Ready, &context)
+            .expect("resume write")
+            .completion;
+        assert!(matches!(
+            resume_outcome,
+            ContinuationCompletion::BlockingWrite {
+                outcome: BlockingWriteOutcome::Return(4),
+                ..
+            }
+        ));
+
+        close_pair(pipe);
+    }
+
+    #[test]
+    fn cancellation_and_retirement_vs_inflight_readiness_drive() {
+        let (kernel, context) = bootstrap(15_381);
+        let generation = publish(&context, 0x721);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
+
+        let pipe = pipe_pair();
+        let payload = vec![1, 2, 3, 4, 5];
+        let write = BlockingHostWrite::for_tests(
+            pipe[1],
+            payload.clone(),
+            0,
+            context.thread().registry_id(),
+            false,
+        )
+        .expect("write state");
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingHostWrite(write),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("write continuation");
+        let registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+
+        let write_arc = match &continuation.state().detail {
+            ContinuationDetail::HostWrite(write) => Arc::clone(write),
+            _ => unreachable!(),
+        };
+        let completion_arc = Arc::clone(&continuation.state().producer_completion);
+
+        let barrier_start = Arc::new(Barrier::new(2));
+        let barrier_cancel = Arc::new(Barrier::new(2));
+
+        let reactor_service = service.clone();
+        let b_start = Arc::clone(&barrier_start);
+        let b_cancel = Arc::clone(&barrier_cancel);
+        let write_for_thread = Arc::clone(&write_arc);
+        let completion_for_thread = Arc::clone(&completion_arc);
+
+        let driver_thread = thread::spawn(move || {
+            let mut write = write_for_thread.lock();
+            b_start.wait();
+            let outcome = match crate::dispatch::drive_blocking_host_write(&mut write) {
+                crate::dispatch::BlockingHostWriteStep::Done(outcome) => Some(outcome),
+                crate::dispatch::BlockingHostWriteStep::Wait => None,
+            };
+            drop(write);
+            if let Some(outcome) = outcome {
+                *completion_for_thread.lock() = Some(outcome);
+            }
+            // Wait until main thread has cancelled registration
+            b_cancel.wait();
+            // Try to publish after cancellation
+            reactor_service
+                .inner
+                .publish_event(token, ContinuationEvent::Ready)
+        });
+
+        barrier_start.wait();
+        // Cancel the wait before publication
+        service
+            .cancel_registration_with_cause(registration, CancellationCause::ProcessExit)
+            .expect("cancel wait");
+        barrier_cancel.wait();
+
+        let publish_receipt = driver_thread.join().expect("driver thread join");
+        assert!(
+            !publish_receipt.accepted(),
+            "publish after cancellation must be rejected"
+        );
+
+        // Verify exact pipe bytes
+        let mut buf = vec![0u8; payload.len()];
+        let read_bytes = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(read_bytes as usize, payload.len());
+        assert_eq!(buf, payload);
+
+        close_pair(pipe);
+    }
+
+    #[test]
+    fn stale_and_reused_token_rejection_prevents_cross_wait_resurrection() {
+        let (kernel, context) = bootstrap(15_382);
+        let generation = publish(&context, 0x722);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
+
+        let continuation1 = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(60),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("continuation1");
+        let mut registration1 = service.prepare_registration(&continuation1);
+        service.enroll(&mut registration1).expect("enroll 1");
+        let stale_token = registration1.wake_token();
+
+        // Cancel registration 1
+        service
+            .cancel_registration_with_cause(registration1, CancellationCause::ProcessExit)
+            .expect("cancel 1");
+
+        // Prepare registration 2
+        let continuation2 = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(60),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("continuation2");
+        let mut registration2 = service.prepare_registration(&continuation2);
+        service.enroll(&mut registration2).expect("enroll 2");
+        let fresh_token = registration2.wake_token();
+
+        // Publishing with stale token must be rejected
+        let stale_receipt = service
+            .inner
+            .publish_event(stale_token, ContinuationEvent::Ready);
+        assert!(
+            !stale_receipt.accepted(),
+            "stale token publication must be rejected"
+        );
+
+        // Fresh token is still Enrolled and not ready
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&fresh_token.continuation)
+                .expect("fresh entry")
+                .state,
+            RegistrationState::Enrolled
+        );
+
+        // Publishing with fresh token succeeds
+        let fresh_receipt = service
+            .inner
+            .publish_event(fresh_token, ContinuationEvent::Ready);
+        assert!(
+            fresh_receipt.accepted(),
+            "fresh token publication must succeed"
+        );
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&fresh_token.continuation)
+                .expect("fresh entry")
+                .state,
+            RegistrationState::Ready
+        );
+
+        drop(continuation1);
+        drop(continuation2);
+    }
+
+    #[test]
+    fn unrelated_waiter_progress_during_concurrent_host_write() {
+        let (kernel, context) = bootstrap(15_383);
+        let generation = publish(&context, 0x723);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
+
+        let pipe = pipe_pair();
+        let write = BlockingHostWrite::for_tests(
+            pipe[1],
+            vec![1, 2, 3, 4],
+            0,
+            context.thread().registry_id(),
+            false,
+        )
+        .expect("write state");
+        let write_cont = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingHostWrite(write),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("write continuation");
+        let mut write_reg = service.prepare_registration(&write_cont);
+        service.enroll(&mut write_reg).expect("enroll write");
+
+        let write_arc = match &write_cont.state().detail {
+            ContinuationDetail::HostWrite(w) => Arc::clone(w),
+            _ => unreachable!(),
+        };
+
+        let barrier_locked = Arc::new(Barrier::new(2));
+        let barrier_finish = Arc::new(Barrier::new(2));
+
+        let b_locked = Arc::clone(&barrier_locked);
+        let b_finish = Arc::clone(&barrier_finish);
+        let w_held = Arc::clone(&write_arc);
+
+        let locker_thread = thread::spawn(move || {
+            let _guard = w_held.lock();
+            b_locked.wait();
+            b_finish.wait();
+        });
+
+        // Wait until locker_thread holds write.lock()
+        barrier_locked.wait();
+
+        // An unrelated waiter enrolls and rechecks while write.lock() is held
+        let sleep_cont = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_millis(1),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("sleep continuation");
+        let mut sleep_reg = service.prepare_registration(&sleep_cont);
+        service
+            .enroll(&mut sleep_reg)
+            .expect("enroll sleep must not block on write lock");
+
+        let sleep_token = sleep_reg.wake_token();
+        let sleep_receipt = service
+            .inner
+            .publish_event(sleep_token, ContinuationEvent::Ready);
+        assert!(sleep_receipt.accepted());
+
+        barrier_finish.wait();
+        locker_thread.join().expect("locker thread join");
+        close_pair(pipe);
+    }
+
+    #[test]
+    fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
+        let (kernel, context) = bootstrap(15_384);
+        let generation = publish(&context, 0x724);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
+
+        let pipe = pipe_pair();
+        let payload = vec![1, 2, 3, 4];
+        let write = BlockingHostWrite::for_tests(
+            pipe[1],
+            payload.clone(),
+            0,
+            context.thread().registry_id(),
+            false,
+        )
+        .expect("write state");
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingHostWrite(write),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("write continuation");
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+
+        let write_arc = match &continuation.state().detail {
+            ContinuationDetail::HostWrite(w) => Arc::clone(w),
+            _ => unreachable!(),
+        };
+        let completion_arc = Arc::clone(&continuation.state().producer_completion);
+
+        let barrier_start = Arc::new(Barrier::new(2));
+        let barrier_done = Arc::new(Barrier::new(2));
+
+        let b_start = Arc::clone(&barrier_start);
+        let b_done = Arc::clone(&barrier_done);
+        let service_for_reactor = service.clone();
+        let write_for_reactor = Arc::clone(&write_arc);
+        let completion_for_reactor = Arc::clone(&completion_arc);
+
+        let reactor_thread = thread::spawn(move || {
+            b_start.wait();
+            let outcome = {
+                let mut write = write_for_reactor.lock();
+                match crate::dispatch::drive_blocking_host_write(&mut write) {
+                    crate::dispatch::BlockingHostWriteStep::Done(outcome) => Some(outcome),
+                    crate::dispatch::BlockingHostWriteStep::Wait => None,
+                }
+            };
+            if let Some(outcome) = outcome {
+                *completion_for_reactor.lock() = Some(outcome);
+            }
+            let receipt = service_for_reactor
+                .inner
+                .publish_event(token, ContinuationEvent::Ready);
+            b_done.wait();
+            receipt
+        });
+
+        barrier_start.wait();
+        service.enroll(&mut registration).expect("enroll write");
+        barrier_done.wait();
+
+        let receipt = reactor_thread.join().expect("reactor join");
+        assert!(
+            receipt.accepted()
+                || registration.settled
+                || service
+                    .inner
+                    .state
+                    .lock()
+                    .entries
+                    .get(&token.continuation)
+                    .is_some_and(|e| e.state == RegistrationState::Ready)
+        );
+
+        assert_eq!(
+            await_event(&service, token).expect("ready event"),
+            ContinuationEvent::Ready
+        );
+
+        let mut buf = vec![0u8; payload.len()];
+        let read_bytes = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(read_bytes as usize, payload.len());
+
+        close_pair(pipe);
     }
 }
