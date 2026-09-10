@@ -20,7 +20,6 @@ rules:
         - "crates/carrick-runtime/src/dispatch/**"
       exclude:
         - "crates/carrick-runtime/src/dispatch/retval.rs"
-        - "crates/carrick-runtime/src/dispatch/mod.rs" # pending migration in task T4a
         - "**/tests/**"
         - "**/*_test.rs"
         - "**/test_*.rs"
