@@ -431,8 +431,10 @@ dependencies = [
  "carrick-image",
  "carrick-runtime",
  "carrick-spec",
+ "carrick-test-support",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
