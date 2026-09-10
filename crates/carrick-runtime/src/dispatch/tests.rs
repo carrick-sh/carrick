@@ -4032,7 +4032,7 @@ mod hvpatch_in_process_fork_tests {
         }
 
         // 2. Modifying shared buffer via child is visible to parent
-        shared_buf.write().extend_from_slice(b"_appended");
+        shared_buf.write().extend_from_slice(b"_appended").unwrap();
         assert_eq!(&*shared_buf.read(), b"initial_data_appended");
 
         // 3. Exec retains non-CLOEXEC file (fd 3) and closes CLOEXEC file (fd 4)
