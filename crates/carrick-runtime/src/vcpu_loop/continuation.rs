@@ -2923,11 +2923,12 @@ struct RegistrationOperationGate {
     drain_condvar: Condvar,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 struct OperationGateState {
     cancelled: bool,
     consumed: bool,
     in_flight: usize,
+    drain_waker: Option<Waker>,
 }
 
 struct OperationClaimGuard {
@@ -2940,6 +2941,9 @@ impl Drop for OperationClaimGuard {
         state.in_flight = state.in_flight.saturating_sub(1);
         if state.in_flight == 0 {
             self.gate.drain_condvar.notify_all();
+            if let Some(waker) = state.drain_waker.take() {
+                waker.wake();
+            }
         }
     }
 }
@@ -2952,6 +2956,7 @@ impl RegistrationOperationGate {
                 cancelled: false,
                 consumed: false,
                 in_flight: 0,
+                drain_waker: None,
             }),
             drain_condvar: Condvar::new(),
         }
@@ -2974,17 +2979,18 @@ impl RegistrationOperationGate {
         })
     }
 
-    fn mark_cancelled_and_drain(&self) {
+    fn close_admission_cancelled(&self) {
         let mut state = self.state.lock();
         state.cancelled = true;
-        while state.in_flight > 0 {
-            self.drain_condvar.wait(&mut state);
-        }
     }
 
-    fn mark_consumed_and_drain(&self) {
+    fn close_admission_consumed(&self) {
         let mut state = self.state.lock();
         state.consumed = true;
+    }
+
+    fn drain(&self) {
+        let mut state = self.state.lock();
         while state.in_flight > 0 {
             self.drain_condvar.wait(&mut state);
         }
@@ -3200,7 +3206,9 @@ impl CarrierWaitState {
                     | RegistrationState::Enrolled
                     | RegistrationState::Ready
             ) {
+                entry.operation_gate.close_admission_cancelled();
                 entry.state = RegistrationState::Cancelled(cause);
+                let _ = entry.event.take();
                 if let Some(waker) = entry.task_waker.take() {
                     wakers.push(waker);
                 }
@@ -3327,7 +3335,6 @@ impl CarrierWaitServiceInner {
                 return false;
             }
             let gate = Arc::clone(&entry.operation_gate);
-            let task_waker = entry.task_waker.take();
             let was_active = matches!(
                 entry.state,
                 RegistrationState::Prepared | RegistrationState::Enrolled
@@ -3338,11 +3345,14 @@ impl CarrierWaitServiceInner {
                     | RegistrationState::Enrolled
                     | RegistrationState::Ready
             ) {
+                entry.operation_gate.close_admission_cancelled();
                 entry.state = RegistrationState::Cancelled(cause);
+                let _ = entry.event.take();
             }
+            let task_waker = entry.task_waker.take();
             (gate, task_waker, was_active)
         };
-        gate.mark_cancelled_and_drain();
+        gate.drain();
         self.nudge_reactor();
         if let Some(waker) = task_waker {
             waker.wake();
@@ -3363,13 +3373,15 @@ impl CarrierWaitServiceInner {
             if entry.state != RegistrationState::Ready {
                 return Err(ContinuationResumeError::MissingContinuation);
             }
+            entry.operation_gate.close_admission_consumed();
             entry.state = RegistrationState::Consumed;
             let gate = Arc::clone(&entry.operation_gate);
             drop(entry);
-            state.remove_registration(token.continuation);
             gate
         };
-        gate.mark_consumed_and_drain();
+        gate.drain();
+        let mut state = self.state.lock();
+        state.remove_registration(token.continuation);
         Ok(())
     }
 
@@ -3719,7 +3731,7 @@ impl Drop for CarrierWaitService {
         self.inner.shutdown.store(true, Ordering::Release);
         self.inner.nudge_reactor();
         for gate in gates {
-            gate.mark_cancelled_and_drain();
+            gate.drain();
         }
         for waker in wakers {
             waker.wake();
@@ -4003,6 +4015,12 @@ impl CarrierWaitService {
                 entry.state,
                 RegistrationState::Enrolled | RegistrationState::Prepared
             ) {
+                if matches!(
+                    entry.state,
+                    RegistrationState::Cancelled(_) | RegistrationState::Consumed
+                ) {
+                    return Ok(None);
+                }
                 return Ok(entry.event.clone());
             }
             (
@@ -4024,6 +4042,12 @@ impl CarrierWaitService {
                 .get(&registration.token.continuation)
                 .filter(|entry| entry.token == registration.token)
             {
+                if matches!(
+                    entry.state,
+                    RegistrationState::Cancelled(_) | RegistrationState::Consumed
+                ) {
+                    return Ok(None);
+                }
                 return Ok(entry.event.clone());
             }
             return Err(WaitServiceError::StaleRegistration);
@@ -4049,6 +4073,12 @@ impl CarrierWaitService {
                 .get(&registration.token.continuation)
                 .filter(|entry| entry.token == registration.token)
             {
+                if matches!(
+                    entry.state,
+                    RegistrationState::Cancelled(_) | RegistrationState::Consumed
+                ) {
+                    return Ok(None);
+                }
                 return Ok(entry.event.clone());
             }
             return Ok(None);
@@ -4203,10 +4233,16 @@ impl Future for ContinuationEventFuture {
             ),
             RegistrationState::Cancelled(cause) => {
                 let gate = Arc::clone(&entry.operation_gate);
+                let mut gate_state = gate.state.lock();
+                gate_state.cancelled = true;
+                if gate_state.in_flight > 0 {
+                    gate_state.drain_waker = Some(context.waker().clone());
+                    entry.task_waker = Some(context.waker().clone());
+                    return Poll::Pending;
+                }
+                drop(gate_state);
                 drop(entry);
                 state.remove_registration(self.token.continuation);
-                drop(state);
-                gate.mark_cancelled_and_drain();
                 Poll::Ready(Err(WaitServiceError::Cancelled(cause)))
             }
             RegistrationState::Consumed => Poll::Ready(Err(WaitServiceError::StaleRegistration)),
@@ -9816,32 +9852,98 @@ mod tests {
             cancel_done_tx.send(receipt).expect("send receipt");
         });
 
-        // Event future polled concurrently
-        let event_future = service.event(token);
-        let (poll_done_tx, poll_done_rx) = std::sync::mpsc::sync_channel(1);
-        let poll_thread = thread::spawn(move || {
-            let result = block_on(event_future);
-            poll_done_tx.send(result).expect("send poll result");
-        });
+        // 1. Verify cancel thread blocks while in-flight claim is held
+        assert!(
+            cancel_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "cancel must block on drain while in-flight operation is active"
+        );
 
-        // Release hook so claim drops
+        // 2. Verify cancellation linearization point: admission is closed, no new claims admitted
+        let (gate, is_cancelled) = {
+            let state = service.inner.state.lock();
+            let entry = state
+                .entries
+                .get(&token.continuation)
+                .expect("entry must NOT be removed from map while operation is in-flight");
+            (
+                Arc::clone(&entry.operation_gate),
+                entry.state == RegistrationState::Cancelled(CancellationCause::ProcessExit),
+            )
+        };
+        assert!(is_cancelled, "cancellation state must be linearized");
+        assert!(
+            gate.try_claim(token).is_none(),
+            "no fresh claim admitted after cancellation linearization point"
+        );
+
+        // 3. Verify event future poll is non-blocking and returns Pending while in-flight operation active
+        struct TestNoopWake;
+        impl std::task::Wake for TestNoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        let mut event_future = service.event(token);
+        let noop_waker = std::task::Waker::from(Arc::new(TestNoopWake));
+        let mut cx = Context::from_waker(&noop_waker);
+        let poll_result = Pin::new(&mut event_future).poll(&mut cx);
+        assert!(
+            poll_result.is_pending(),
+            "poll must return Pending without blocking while in-flight operation is active"
+        );
+
+        // 4. Verify unrelated waiter progress during in-flight operation
+        let unrelated_continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_millis(1),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("sleep continuation");
+        let mut unrelated_reg = service.prepare_registration(&unrelated_continuation);
+        let unrelated_token = unrelated_reg.wake_token();
+        service
+            .enroll(&mut unrelated_reg)
+            .expect("enroll unrelated");
+        assert_eq!(
+            await_event(&service, unrelated_token).expect("unrelated event"),
+            ContinuationEvent::Timeout
+        );
+
+        // 5. Release hook so claim drops
         cancel_started_tx.send(()).expect("unblock reactor drive");
 
         let cancel_receipt = cancel_done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("cancel completed");
         assert_eq!(cancel_receipt.cause(), CancellationCause::ProcessExit);
-
-        let poll_result = poll_done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("poll completed");
-        assert!(matches!(
-            poll_result,
-            Err(WaitServiceError::Cancelled(CancellationCause::ProcessExit))
-        ));
-
         cancel_thread.join().expect("cancel thread join");
-        poll_thread.join().expect("poll thread join");
+
+        // 6. Polling event future now returns Cancelled and removes the registration
+        let poll_result_2 = Pin::new(&mut event_future).poll(&mut cx);
+        assert!(matches!(
+            poll_result_2,
+            Poll::Ready(Err(WaitServiceError::Cancelled(
+                CancellationCause::ProcessExit
+            )))
+        ));
+        assert!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token.continuation)
+                .is_none(),
+            "registration removed only after quiescence"
+        );
+
+        // 7. Verify payload was written before cancel completed
+        let mut buf = vec![0u8; payload.len()];
+        let read_bytes = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(read_bytes as usize, payload.len());
+        assert_eq!(buf, payload);
 
         service.clear_test_hooks();
         close_pair(pipe);
@@ -10277,13 +10379,26 @@ mod tests {
             .expect("attach registration");
 
         let (reactor_reached_tx, reactor_reached_rx) = std::sync::mpsc::sync_channel(1);
-        let (recheck_done_tx, recheck_done_rx) = std::sync::mpsc::sync_channel(1);
-        let recheck_done_rx = Arc::new(std::sync::Mutex::new(recheck_done_rx));
+        let (reactor_unblock_tx, reactor_unblock_rx) = std::sync::mpsc::sync_channel(1);
+        let reactor_unblock_rx = Arc::new(std::sync::Mutex::new(reactor_unblock_rx));
 
-        // Real reactor hook in CarrierWaitService's background reactor thread
+        let (recheck_reached_tx, recheck_reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (recheck_unblock_tx, recheck_unblock_rx) = std::sync::mpsc::sync_channel(1);
+        let recheck_unblock_rx = Arc::new(std::sync::Mutex::new(recheck_unblock_rx));
+
+        // 1. Real reactor hook inside drive_blocking_host_write while holding write lock & claim
         service.set_inside_host_write_hook(move || {
             let _ = reactor_reached_tx.send(());
-            let _ = recheck_done_rx
+            let _ = reactor_unblock_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+        });
+
+        // 2. Recheck hook after acquiring claim, before probing write lock
+        service.set_after_recheck_claim_hook(move || {
+            let _ = recheck_reached_tx.send(());
+            let _ = recheck_unblock_rx
                 .lock()
                 .unwrap()
                 .recv_timeout(Duration::from_secs(5));
@@ -10293,7 +10408,7 @@ mod tests {
         drain_pipe(pipe[0], dummy.len());
         service.nudge_reactor_for_test();
 
-        // Wait until real reactor thread is inside drive holding OperationClaimGuard
+        // Wait until real reactor thread is inside write lock holding OperationClaimGuard
         reactor_reached_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("real reactor reached inside drive hook");
@@ -10310,8 +10425,14 @@ mod tests {
             service_for_recheck.recheck_registration(&reg)
         });
 
-        // Unblock reactor inside hook
-        recheck_done_tx.send(()).expect("unblock reactor");
+        // Acknowledge that recheck reached its claim point without deadlocking on service.state
+        recheck_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recheck reached claim hook concurrently");
+
+        // Unblock both threads in defined order
+        recheck_unblock_tx.send(()).expect("unblock recheck");
+        reactor_unblock_tx.send(()).expect("unblock reactor");
 
         let recheck_result = recheck_thread.join().expect("recheck join");
         assert!(recheck_result.is_ok());
