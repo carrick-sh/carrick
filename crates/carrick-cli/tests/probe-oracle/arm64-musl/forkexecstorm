@@ -1,0 +1,16 @@
+2c10b3c3fd5f015d
+threads_started=4
+threads_completed=4
+threads_joined=4
+total_attempted=200
+total_spawned=200
+total_reaped=200
+total_exited_ok=200
+vfork_failures=0
+first_vfork_errno=0
+wait_failures=0
+first_wait_errno=0
+unexpected_status_count=0
+first_unexpected_status=0
+timed_out=false
+fork_exec_storm_success=true
