@@ -110,3 +110,10 @@ from sibling branches.
   the same day (`seekholemap` 9bf699d88, `statfslifetime` 9bf699d88,
   `tty0state` 4392584d0, `packetv3state` 1655fd6dd). No campaign regression
   on the probe gate. Log: `target/perf/probes-wave2b-sep10.log`.
+- 2026-09-10 `just ci` GREEN on main at 73bb6d842 (log
+  `target/perf/ci-wave2b4-sep10.log`). Before the campaign main failed
+  `just clippy` (15 lints), four runtime integration tests (O_TMPFILE
+  materialisation, TIOCSCTTY on stdio, the syslog manifest owner,
+  timer_create thread-clock SIGEV_THREAD_ID) and the conformance-next
+  retained-probe manifest check; all fixed forward and attributed to
+  pre-campaign commits in their commit bodies.
