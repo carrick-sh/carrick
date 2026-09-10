@@ -334,6 +334,46 @@ impl DeferredAnonymousState {
             .get(index)
             .is_some_and(|r| r.start <= start.raw() && end <= r.end)
     }
+    /// Enumerate all materialized (non-pristine) subranges within `[start, start + len)`.
+    ///
+    /// Any subrange that is NOT covered by `state.pristine` has had physical backing
+    /// populated / written to, and contains actual data for core dump capture.
+    pub fn materialized_subranges(&self, start: GuestVa, len: usize) -> Vec<Range<GuestVa>> {
+        let Ok(len_u64) = u64::try_from(len) else {
+            return Vec::new();
+        };
+        if len == 0 {
+            return Vec::new();
+        }
+        let Some(req_end) = start.raw().checked_add(len_u64) else {
+            return Vec::new();
+        };
+        let req_start = start.raw();
+
+        let state = self.state.lock();
+        let mut materialized = Vec::new();
+        let mut cursor = req_start;
+
+        let first_idx = state.pristine.partition_point(|r| r.end <= req_start);
+        for p in &state.pristine[first_idx..] {
+            if p.start >= req_end {
+                break;
+            }
+            if p.start > cursor {
+                let gap_end = p.start.min(req_end);
+                materialized.push(GuestVa(cursor)..GuestVa(gap_end));
+            }
+            cursor = cursor.max(p.end);
+            if cursor >= req_end {
+                break;
+            }
+        }
+        if cursor < req_end {
+            materialized.push(GuestVa(cursor)..GuestVa(req_end));
+        }
+
+        materialized
+    }
     /// Check whether one retained private-file recipe covers the range.
     /// Callers separately authenticate the exact MM and access permission.
     pub fn covers_private_file(&self, start: GuestVa, len: usize) -> bool {
@@ -772,5 +812,37 @@ mod tests {
             .unwrap()
             .commit();
         assert_eq!(state.snapshot().private_file.len(), 1);
+    }
+
+    #[test]
+    fn materialized_subranges_enumerates_gaps_in_pristine_state() {
+        let state = DeferredAnonymousState::new();
+        let base = GuestVa(0x1000_0000);
+        let len = 64 * 1024 * 1024; // 64 MiB
+        state.reserve_fresh(base, len).unwrap();
+
+        // Initially pristine: 0 materialized subranges.
+        assert_eq!(state.materialized_subranges(base, len), vec![]);
+
+        // Touch first page (0x1000_0000), middle page (0x1200_0000), and last page (0x13ff_f000).
+        state.begin_materialization(base, 0x1000).unwrap().commit();
+        state
+            .begin_materialization(GuestVa(0x1200_0000), 0x1000)
+            .unwrap()
+            .commit();
+        state
+            .begin_materialization(GuestVa(0x13ff_f000), 0x1000)
+            .unwrap()
+            .commit();
+
+        let subranges = state.materialized_subranges(base, len);
+        assert_eq!(
+            subranges,
+            vec![
+                GuestVa(0x1000_0000)..GuestVa(0x1000_1000),
+                GuestVa(0x1200_0000)..GuestVa(0x1200_1000),
+                GuestVa(0x13ff_f000)..GuestVa(0x1400_0000),
+            ]
+        );
     }
 }

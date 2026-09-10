@@ -3543,10 +3543,16 @@ impl Drop for AutoCloseFd {
     }
 }
 
-fn write_all_host_fd(fd: i32, mut bytes: &[u8]) -> Result<(), crate::linux_abi::LinuxErrno> {
+fn pwrite_all_host_fd(
+    fd: i32,
+    mut bytes: &[u8],
+    mut offset: u64,
+) -> Result<(), crate::linux_abi::LinuxErrno> {
     while !bytes.is_empty() {
+        let off = libc::off_t::try_from(offset).map_err(|_| crate::linux_abi::LINUX_EFBIG)?;
         // BLOCKING-IO-OK: core dump publication writes to an unshared temporary host file
-        let rc = unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+        let rc =
+            unsafe { libc::pwrite(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len(), off) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -3558,7 +3564,9 @@ fn write_all_host_fd(fd: i32, mut bytes: &[u8]) -> Result<(), crate::linux_abi::
         if rc == 0 {
             return Err(crate::linux_abi::LINUX_EIO);
         }
-        bytes = &bytes[rc as usize..];
+        let written = rc as usize;
+        bytes = &bytes[written..];
+        offset = offset.saturating_add(written as u64);
     }
     Ok(())
 }
@@ -4402,6 +4410,175 @@ mod core_publication_tests {
                 .file_contents(&publication.path),
             Some(Vec::new())
         );
+    }
+
+    struct MockInMemoryMountVfs {
+        files: Arc<
+            parking_lot::RwLock<
+                std::collections::BTreeMap<
+                    String,
+                    Arc<parking_lot::RwLock<crate::vfs::SparseBuffer>>,
+                >,
+            >,
+        >,
+    }
+
+    impl MockInMemoryMountVfs {
+        fn new() -> Self {
+            Self {
+                files: Arc::new(parking_lot::RwLock::new(std::collections::BTreeMap::new())),
+            }
+        }
+    }
+
+    impl crate::vfs::Vfs for MockInMemoryMountVfs {
+        fn open(
+            &self,
+            path: &str,
+            flags: crate::vfs::OpenFlags,
+            _ctx: &crate::vfs::OpenContext<'_>,
+        ) -> Result<crate::vfs::VfsHandle, crate::vfs::VfsError> {
+            let mut files = self.files.write();
+            let buf = files
+                .entry(path.to_string())
+                .or_insert_with(|| {
+                    Arc::new(parking_lot::RwLock::new(crate::vfs::SparseBuffer::new()))
+                })
+                .clone();
+            Ok(crate::vfs::VfsHandle::InMemoryFile {
+                path: path.to_string(),
+                contents: buf,
+                status_flags: 0,
+                writable: flags.write,
+                max_size: usize::MAX,
+            })
+        }
+
+        fn lookup(&self, path: &str) -> Result<crate::vfs::Metadata, crate::vfs::VfsError> {
+            let files = self.files.read();
+            if let Some(buf) = files.get(path) {
+                Ok(crate::vfs::Metadata {
+                    kind: crate::vfs::EntryKind::File,
+                    mode: 0o600,
+                    size: buf.read().len() as u64,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                    uid: 0,
+                    gid: 0,
+                })
+            } else {
+                Err(crate::linux_abi::LINUX_ENOENT)
+            }
+        }
+
+        fn rename(&self, old_path: &str, new_path: &str) -> Result<(), crate::vfs::VfsError> {
+            let mut files = self.files.write();
+            if let Some(buf) = files.remove(old_path) {
+                files.insert(new_path.to_string(), buf);
+                Ok(())
+            } else {
+                Err(crate::linux_abi::LINUX_ENOENT)
+            }
+        }
+
+        fn unlink(&self, path: &str) -> Result<(), crate::vfs::VfsError> {
+            let mut files = self.files.write();
+            if files.remove(path).is_some() {
+                Ok(())
+            } else {
+                Err(crate::linux_abi::LINUX_ENOENT)
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_core_publication_on_in_memory_vfs_preserves_holes_and_bounds_allocation() {
+        let sparse_64gib = 64 * 1024 * 1024 * 1024_u64;
+        let mut dispatcher = SyscallDispatcher::new();
+        let inmem_vfs = MockInMemoryMountVfs::new();
+        let files_map = Arc::clone(&inmem_vfs.files);
+        dispatcher
+            .fs
+            .vfs_mounts_mut()
+            .mount("/inmem", Box::new(inmem_vfs));
+
+        let mut snapshot = snapshot();
+        snapshot.cwd = "/inmem".to_owned();
+
+        let header = vec![0x7f, b'E', b'L', b'F'];
+        let p1 = vec![0x11_u8; 4096];
+        let p2 = vec![0x22_u8; 4096];
+        let p3 = vec![0x33_u8; 4096];
+        let extents = vec![
+            crate::core_dump::CoreExtent {
+                offset: 4096,
+                bytes: p1.clone(),
+            },
+            crate::core_dump::CoreExtent {
+                offset: 32 * 1024 * 1024 * 1024,
+                bytes: p2.clone(),
+            },
+            crate::core_dump::CoreExtent {
+                offset: sparse_64gib - 4096,
+                bytes: p3.clone(),
+            },
+        ];
+        let payload = crate::core_dump::CorePayload {
+            header: header.clone(),
+            extents,
+            logical_size: sparse_64gib,
+        };
+
+        let pub_res = dispatcher
+            .publish_core_atomic(&snapshot, 42, payload)
+            .expect("sparse core publication on in-memory mount");
+
+        assert_eq!(pub_res.path, "/inmem/core");
+        assert_eq!(pub_res.bytes, 4 + 3 * 4096);
+
+        // Verify that the stored file in VFS is a SparseBuffer with 64 GiB length and bounded memory
+        let files = files_map.read();
+        let buf = files.get("/inmem/core").expect("published core file");
+        let lock = buf.read();
+        assert_eq!(lock.len(), sparse_64gib as usize);
+        assert_eq!(lock.allocated_bytes(), 4 + 3 * 4096);
+        assert_eq!(lock.read_range(0, 4), header);
+        assert_eq!(lock.read_range(4096, 4096), p1);
+        assert_eq!(lock.read_range(8192, 4096), vec![0_u8; 4096]);
+        assert_eq!(lock.read_range(32 * 1024 * 1024 * 1024, 4096), p2);
+        assert_eq!(lock.read_range((sparse_64gib - 4096) as usize, 4096), p3);
+    }
+
+    #[test]
+    fn sparse_core_publication_failure_cleanup_on_in_memory_vfs() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let inmem_vfs = MockInMemoryMountVfs::new();
+        let files_map = Arc::clone(&inmem_vfs.files);
+        dispatcher
+            .fs
+            .vfs_mounts_mut()
+            .mount("/inmem_fail", Box::new(inmem_vfs));
+
+        let mut snapshot = snapshot();
+        snapshot.cwd = "/inmem_fail".to_owned();
+
+        let payload = crate::core_dump::CorePayload {
+            header: vec![1, 2, 3, 4],
+            extents: vec![crate::core_dump::CoreExtent {
+                offset: 1024 * 1024,
+                bytes: vec![5, 6, 7, 8],
+            }],
+            logical_size: 2 * 1024 * 1024,
+        };
+
+        let err = dispatcher
+            .publish_core_atomic_with_failpoint(&snapshot, 43, payload, Some("rename"))
+            .expect_err("failpoint must fail");
+        assert!(matches!(err, CorePublicationError::Failpoint("rename")));
+
+        // Verify that temporary files were cleaned up
+        let files = files_map.read();
+        assert!(files.is_empty() || files.values().all(|b| b.read().is_empty()));
     }
 
     #[test]
@@ -6847,19 +7024,20 @@ impl SyscallDispatcher {
         &self,
         snapshot: &CoreProcessSnapshot,
         generation: u64,
-        bytes: Vec<u8>,
+        payload: impl Into<crate::core_dump::CorePayload>,
     ) -> Result<CorePublication, CorePublicationError> {
         let failpoint = std::env::var("CARRICK_CORE_FAILPOINT").ok();
-        self.publish_core_atomic_with_failpoint(snapshot, generation, bytes, failpoint.as_deref())
+        self.publish_core_atomic_with_failpoint(snapshot, generation, payload, failpoint.as_deref())
     }
 
     fn publish_core_atomic_with_failpoint(
         &self,
         snapshot: &CoreProcessSnapshot,
         generation: u64,
-        bytes: Vec<u8>,
+        payload: impl Into<crate::core_dump::CorePayload>,
         failpoint: Option<&str>,
     ) -> Result<CorePublication, CorePublicationError> {
+        let payload = payload.into();
         let resolved_cwd = self
             .canonicalize_following(&snapshot.cwd)
             .unwrap_or_else(|_| snapshot.cwd.clone());
@@ -6915,7 +7093,7 @@ impl SyscallDispatcher {
                         error: crate::fs_backend::BackendError::Host(errno),
                     })?;
 
-                let bytes_len = bytes.len();
+                let bytes_len = usize::try_from(payload.emitted_bytes()).unwrap_or(usize::MAX);
                 let publication = (|| {
                     match handle {
                         crate::vfs::VfsHandle::HostFd { host_fd, .. } => {
@@ -6923,13 +7101,46 @@ impl SyscallDispatcher {
                             if failpoint == Some("short-write") {
                                 return Err(CorePublicationError::Failpoint("short-write"));
                             }
-                            write_all_host_fd(scoped_fd.as_raw_fd(), &bytes).map_err(|errno| {
-                                CorePublicationError::Backend {
+                            pwrite_all_host_fd(scoped_fd.as_raw_fd(), &payload.header, 0).map_err(
+                                |errno| CorePublicationError::Backend {
                                     operation: "write",
                                     path: temp_path.clone(),
                                     error: crate::fs_backend::BackendError::Host(errno),
+                                },
+                            )?;
+                            for ext in &payload.extents {
+                                pwrite_all_host_fd(scoped_fd.as_raw_fd(), &ext.bytes, ext.offset)
+                                    .map_err(|errno| CorePublicationError::Backend {
+                                    operation: "write",
+                                    path: temp_path.clone(),
+                                    error: crate::fs_backend::BackendError::Host(errno),
+                                })?;
+                            }
+                            if payload.logical_size > 0 {
+                                let off =
+                                    libc::off_t::try_from(payload.logical_size).map_err(|_| {
+                                        CorePublicationError::Backend {
+                                            operation: "ftruncate",
+                                            path: temp_path.clone(),
+                                            error: crate::fs_backend::BackendError::Host(
+                                                crate::linux_abi::LINUX_EFBIG,
+                                            ),
+                                        }
+                                    })?;
+                                let rc = unsafe { libc::ftruncate(scoped_fd.as_raw_fd(), off) };
+                                if rc < 0 {
+                                    let raw_errno = std::io::Error::last_os_error()
+                                        .raw_os_error()
+                                        .unwrap_or(libc::EIO);
+                                    return Err(CorePublicationError::Backend {
+                                        operation: "ftruncate",
+                                        path: temp_path.clone(),
+                                        error: crate::fs_backend::BackendError::Host(
+                                            crate::host_to_linux_errno(raw_errno),
+                                        ),
+                                    });
                                 }
-                            })?;
+                            }
                             if failpoint == Some("fsync") {
                                 return Err(CorePublicationError::Failpoint("fsync"));
                             }
@@ -6952,7 +7163,27 @@ impl SyscallDispatcher {
                             if failpoint == Some("short-write") {
                                 return Err(CorePublicationError::Failpoint("short-write"));
                             }
-                            contents.write().clone_from(&bytes);
+                            let logical_size =
+                                usize::try_from(payload.logical_size).map_err(|_| {
+                                    CorePublicationError::Backend {
+                                        operation: "write",
+                                        path: temp_path.clone(),
+                                        error: crate::fs_backend::BackendError::Invalid,
+                                    }
+                                })?;
+                            let mut lock = contents.write();
+                            lock.set_len(logical_size);
+                            lock.write_range(0, &payload.header);
+                            for ext in &payload.extents {
+                                let offset = usize::try_from(ext.offset).map_err(|_| {
+                                    CorePublicationError::Backend {
+                                        operation: "write",
+                                        path: temp_path.clone(),
+                                        error: crate::fs_backend::BackendError::Invalid,
+                                    }
+                                })?;
+                                lock.write_range(offset, &ext.bytes);
+                            }
                             if failpoint == Some("fsync") {
                                 return Err(CorePublicationError::Failpoint("fsync"));
                             }
@@ -7008,18 +7239,42 @@ impl SyscallDispatcher {
                         path: temp_path.clone(),
                         error,
                     })?;
-                let bytes_len = bytes.len();
+                let bytes_len = usize::try_from(payload.emitted_bytes()).unwrap_or(usize::MAX);
                 let publication = (|| {
                     if failpoint == Some("short-write") {
                         return Err(CorePublicationError::Failpoint("short-write"));
                     }
+                    let logical_size = usize::try_from(payload.logical_size).map_err(|_| {
+                        CorePublicationError::Backend {
+                            operation: "write",
+                            path: temp_path.clone(),
+                            error: crate::fs_backend::BackendError::Invalid,
+                        }
+                    })?;
+                    let initial_size = logical_size.max(payload.header.len());
                     backend
-                        .set_file_contents(&temp_path, bytes)
+                        .write_file_range(&temp_path, 0, &payload.header, initial_size)
                         .map_err(|error| CorePublicationError::Backend {
                             operation: "write",
                             path: temp_path.clone(),
                             error,
                         })?;
+                    for ext in &payload.extents {
+                        let offset = usize::try_from(ext.offset).map_err(|_| {
+                            CorePublicationError::Backend {
+                                operation: "write",
+                                path: temp_path.clone(),
+                                error: crate::fs_backend::BackendError::Invalid,
+                            }
+                        })?;
+                        backend
+                            .write_file_range(&temp_path, offset, &ext.bytes, logical_size)
+                            .map_err(|error| CorePublicationError::Backend {
+                                operation: "write",
+                                path: temp_path.clone(),
+                                error,
+                            })?;
+                    }
                     if failpoint == Some("fsync") {
                         return Err(CorePublicationError::Failpoint("fsync"));
                     }
@@ -11533,6 +11788,42 @@ fn read_from_contents_at(
             .write_bytes(iov_base, &remaining[..read_len])
             .is_err()
         {
+            return Ok(total);
+        }
+        offset += read_len;
+        total = total
+            .checked_add(read_len)
+            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        if read_len < iov_len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+fn read_from_sparse_buffer_at(
+    memory: &mut impl CurrentMmMemory,
+    buffer: &crate::vfs::SparseBuffer,
+    mut offset: usize,
+    iovecs: &[LinuxIovec],
+) -> Result<usize, DispatchError> {
+    let mut total = 0usize;
+    for iovec in iovecs {
+        let iov_base = iovec.iov_base;
+        let iov_len = usize::try_from(iovec.iov_len)
+            .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+        if iov_len == 0 {
+            continue;
+        }
+        if offset >= buffer.len() {
+            break;
+        }
+        let read_len = iov_len.min(buffer.len().saturating_sub(offset));
+        if read_len == 0 {
+            break;
+        }
+        let bytes = buffer.read_range(offset, read_len);
+        if memory.write_bytes(iov_base, &bytes).is_err() {
             return Ok(total);
         }
         offset += read_len;

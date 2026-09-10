@@ -92,6 +92,7 @@ pub mod mount;
 pub mod proc;
 pub mod resolvconf;
 pub mod rootfs;
+pub mod sparse_buffer;
 pub mod sys;
 
 pub use bind::BindVfs;
@@ -107,6 +108,7 @@ pub use proc::{
 };
 pub use resolvconf::{HostResolverLaunchError, HostResolverSnapshot, ResolvConfVfs};
 pub use rootfs::RootFsVfs;
+pub use sparse_buffer::SparseBuffer;
 pub use sys::SysVfs;
 
 /// Maximum size Carrick will materialize as a `Vec<u8>` for memory-backed
@@ -329,7 +331,7 @@ pub enum VfsHandle {
     /// to `contents`.
     InMemoryFile {
         path: String,
-        contents: std::sync::Arc<parking_lot::RwLock<Vec<u8>>>,
+        contents: std::sync::Arc<parking_lot::RwLock<SparseBuffer>>,
         status_flags: u32,
         writable: bool,
         max_size: usize,

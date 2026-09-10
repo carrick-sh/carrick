@@ -3503,7 +3503,7 @@ enum HvpatchContinuationInput {
 
 struct PreparedCorePublication {
     snapshot: crate::dispatch::CoreProcessSnapshot,
-    bytes: Vec<u8>,
+    payload: crate::core_dump::CorePayload,
     generation: u64,
     fatal_tid: i32,
 }
@@ -4384,7 +4384,7 @@ fn bootstrap_thread_child_probe_ordinal_is_append_only() {
 enum PersistentTerminal {
     Outcome {
         outcome: VcpuLoopOutcome,
-        prepared_core: Option<PreparedCorePublication>,
+        prepared_core: Option<Box<PreparedCorePublication>>,
     },
     Error(RuntimeError),
 }
@@ -5704,7 +5704,7 @@ where
                 });
         }
         let prepared_core = match &terminal {
-            PersistentTerminal::Outcome { prepared_core, .. } => prepared_core.as_ref(),
+            PersistentTerminal::Outcome { prepared_core, .. } => prepared_core.as_deref(),
             _ => None,
         };
         let core_publication = match prepared_core {
@@ -5712,7 +5712,7 @@ where
                 match self.kernel.dispatcher.publish_core_atomic(
                     &prepared.snapshot,
                     prepared.generation,
-                    prepared.bytes.clone(),
+                    prepared.payload.clone(),
                 ) {
                     Ok(publ) => {
                         crate::probes::hvpatch_core_lifecycle(
@@ -6106,7 +6106,7 @@ where
                         .state
                         .capture_core_for_publication(&self.kernel, engine, fatal)
                     {
-                        Ok(p) => p,
+                        Ok(p) => p.map(Box::new),
                         Err(error) => {
                             tracing::warn!(%error, "capture core for publication");
                             None
@@ -9816,17 +9816,27 @@ where
                     )
                 })?;
             // No pre-emptive refusal on size: core(5) truncates an oversized
-            // dump rather than suppressing it, and `to_bytes_bounded` applies
+            // dump rather than suppressing it, and `build_payload` applies
             // RLIMIT_CORE at serialisation. Failing closed here published NO
             // core and therefore cleared WCOREDUMP for any process whose
             // readable regions merely exceeded the limit.
             let deferred_anonymous = kernel
                 .dispatcher
                 .deferred_anonymous_state(context.shared().mm().id());
-            let mut region_bytes = Vec::with_capacity(process.maps.len());
+            let mut regions = Vec::with_capacity(process.maps.len());
+            let mut dumpable_maps = Vec::with_capacity(process.maps.len());
             for map in &process.maps {
+                let size = map.end.saturating_sub(map.start);
+                let flags = crate::core_dump::region_flags(map.read, map.write, map.execute);
                 if !map.read {
-                    region_bytes.push(Vec::new());
+                    regions.push(crate::core_dump::MemoryRegion {
+                        start: map.start,
+                        flags,
+                        bytes: &[],
+                        size,
+                        dumped: false,
+                    });
+                    dumpable_maps.push(false);
                     continue;
                 }
                 // Linux's default coredump filter omits the CONTENTS of
@@ -9846,7 +9856,14 @@ where
                     .iter()
                     .any(|fm| fm.start < map.end && map.start < fm.end);
                 if file_backed && map.execute {
-                    region_bytes.push(Vec::new());
+                    regions.push(crate::core_dump::MemoryRegion {
+                        start: map.start,
+                        flags,
+                        bytes: &[],
+                        size,
+                        dumped: false,
+                    });
+                    dumpable_maps.push(false);
                     continue;
                 }
                 // `MADV_DONTDUMP`: same shape Linux produces -- the VMA is
@@ -9856,46 +9873,25 @@ where
                     .iter()
                     .any(|&(start, end)| start < map.end && map.start < end)
                 {
-                    region_bytes.push(Vec::new());
+                    regions.push(crate::core_dump::MemoryRegion {
+                        start: map.start,
+                        flags,
+                        bytes: &[],
+                        size,
+                        dumped: false,
+                    });
+                    dumpable_maps.push(false);
                     continue;
                 }
-                if std::env::var_os("CARRICK_CORE_FAILPOINT")
-                    .is_some_and(|value| value == "memory-read")
-                {
-                    return Err(RuntimeError::Configuration(
-                        "core publication failpoint memory-read".to_owned(),
-                    ));
-                }
-                let length = usize::try_from(map.end.saturating_sub(map.start)).map_err(|_| {
-                    RuntimeError::Configuration(format!(
-                        "core region length does not fit host usize at {:#x}",
-                        map.start
-                    ))
-                })?;
-                if deferred_anonymous.as_ref().is_some_and(|deferred| {
-                    deferred.covers_pristine(carrick_guest_mem::GuestVa(map.start), length)
-                }) {
-                    region_bytes.push(Vec::new());
-                    continue;
-                }
-                region_bytes.push(engine.read_core_bytes(map.start, length).map_err(|error| {
-                    RuntimeError::Trap(TrapError::Hypervisor(format!(
-                        "read core region {:#x}..{:#x}: {error}",
-                        map.start, map.end
-                    )))
-                })?);
-            }
-            let regions = process
-                .maps
-                .iter()
-                .zip(&region_bytes)
-                .map(|(map, bytes)| crate::core_dump::MemoryRegion {
+                regions.push(crate::core_dump::MemoryRegion {
                     start: map.start,
-                    flags: crate::core_dump::region_flags(map.read, map.write, map.execute),
-                    bytes: bytes.as_slice(),
-                    size: map.end.saturating_sub(map.start),
-                })
-                .collect::<Vec<_>>();
+                    flags,
+                    bytes: &[],
+                    size,
+                    dumped: true,
+                });
+                dumpable_maps.push(true);
+            }
             let mappings = process.file_mappings.clone();
             // How many `NT_PRSTATUS` notes Linux would have written, versus how
             // many carrick actually collected. They differ exactly when a live
@@ -9948,10 +9944,77 @@ where
                 mappings,
                 regions,
             };
-            let bytes = dump
-                .to_bytes_bounded(process.rlimit_core)
+            let segment_offsets = dump.load_segment_file_offsets().map_err(|error| {
+                RuntimeError::FsBackend(anyhow::anyhow!("layout core segment offsets: {error}"))
+            })?;
+            if std::env::var_os("CARRICK_CORE_FAILPOINT")
+                .is_some_and(|value| value == "memory-read")
+            {
+                return Err(RuntimeError::Configuration(
+                    "core publication failpoint memory-read".to_owned(),
+                ));
+            }
+            let mut extents = Vec::new();
+            let mut remaining_budget = process.rlimit_core;
+            for (idx, map) in process.maps.iter().enumerate() {
+                if !dumpable_maps[idx] || remaining_budget == 0 {
+                    continue;
+                }
+                let seg_offset = segment_offsets[idx];
+                let length = usize::try_from(map.end.saturating_sub(map.start)).map_err(|_| {
+                    RuntimeError::Configuration(format!(
+                        "core region length does not fit host usize at {:#x}",
+                        map.start
+                    ))
+                })?;
+                let subranges: Vec<std::ops::Range<carrick_guest_mem::GuestVa>> =
+                    match &deferred_anonymous {
+                        Some(deferred) => deferred
+                            .materialized_subranges(carrick_guest_mem::GuestVa(map.start), length),
+                        None => {
+                            vec![
+                                carrick_guest_mem::GuestVa(map.start)
+                                    ..carrick_guest_mem::GuestVa(map.end),
+                            ]
+                        }
+                    };
+                for sub in subranges {
+                    if remaining_budget == 0 {
+                        break;
+                    }
+                    let sub_start = sub.start.raw();
+                    let sub_len =
+                        usize::try_from(sub.end.raw().saturating_sub(sub_start)).unwrap_or(0);
+                    if sub_len == 0 {
+                        continue;
+                    }
+                    let to_read =
+                        sub_len.min(usize::try_from(remaining_budget).unwrap_or(usize::MAX));
+                    if to_read == 0 {
+                        break;
+                    }
+                    let bytes = engine
+                        .read_core_bytes(sub_start, to_read)
+                        .map_err(|error| {
+                            RuntimeError::Trap(TrapError::Hypervisor(format!(
+                                "read core region {:#x}..{:#x}: {error}",
+                                sub_start,
+                                sub_start.saturating_add(to_read as u64)
+                            )))
+                        })?;
+                    let relative_offset = sub_start.saturating_sub(map.start);
+                    let file_offset = seg_offset.saturating_add(relative_offset);
+                    remaining_budget = remaining_budget.saturating_sub(bytes.len() as u64);
+                    extents.push(crate::core_dump::CoreExtent {
+                        offset: file_offset,
+                        bytes,
+                    });
+                }
+            }
+            let payload = dump
+                .build_payload(process.rlimit_core, extents)
                 .map_err(|error| {
-                    RuntimeError::FsBackend(anyhow::anyhow!("serialise bounded core: {error}"))
+                    RuntimeError::FsBackend(anyhow::anyhow!("build core payload: {error}"))
                 })?;
             if std::env::var_os("CARRICK_CORE_FAILPOINT").is_some_and(|value| value == "validator")
             {
@@ -9959,8 +10022,7 @@ where
                     "core publication failpoint validator".to_owned(),
                 ));
             }
-            use sha2::Digest as _;
-            let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+            let digest = payload.manifest_digest();
             let mut hash_words = [0_u64; 4];
             for (word, octets) in hash_words.iter_mut().zip(digest.chunks_exact(8)) {
                 let mut octet_array = [0_u8; 8];
@@ -9972,15 +10034,13 @@ where
                 mapping_count,
                 4_u64.saturating_add(thread_count.saturating_mul(3)),
                 region_count,
-                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                payload.emitted_bytes(),
             );
             crate::probes::hvpatch_core_hash(generation.get(), hash_words);
             lifecycle(3, 0);
             Ok(Some(PreparedCorePublication {
                 snapshot: process,
-                bytes,
-                // Wire boundary: the publication path and its probes carry the
-                // raw generation number.
+                payload,
                 generation: generation.get(),
                 fatal_tid: fatal.tid.raw(),
             }))
@@ -20558,6 +20618,8 @@ mod tests {
         fn kick(&self) {}
     }
 
+    type CrashReadTracker = Arc<Mutex<Vec<(u64, usize)>>>;
+
     #[derive(Default)]
     struct CrashCaptureTestEngine {
         next_syscall: Option<carrick_hal::RawSyscall>,
@@ -20575,6 +20637,8 @@ mod tests {
         frame_cow_owner_inventory: Option<Arc<dyn carrick_hal::FrameCowOwnerInventory>>,
         installed_table_arena_sources: usize,
         guest_memory: std::collections::BTreeMap<u64, Vec<u8>>,
+        read_tracker: Option<CrashReadTracker>,
+        fail_read_at: Option<u64>,
     }
 
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
@@ -20583,6 +20647,12 @@ mod tests {
             address: u64,
             length: usize,
         ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            if self.fail_read_at == Some(address) {
+                return Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length });
+            }
+            if let Some(tracker) = &self.read_tracker {
+                tracker.lock().push((address, length));
+            }
             Ok(self
                 .guest_memory
                 .get(&address)
@@ -21086,8 +21156,8 @@ mod tests {
         let acquire = protected.find("acquire_crash_lease_drain(").unwrap();
         let prepare = protected.find("engine.prepare_core_snapshot()").unwrap();
         let quorum = protected.find("quorum.poll()").unwrap();
-        let read = protected.find("engine.read_core_bytes").unwrap();
-        let serialize = protected.find(".to_bytes_bounded(").unwrap();
+        let read = protected.find(".read_core_bytes").unwrap();
+        let serialize = protected.find(".build_payload(").unwrap();
         let publication = protected.find("PreparedCorePublication {").unwrap();
         assert!(barrier_raise < acquire);
         assert!(acquire < prepare);
@@ -21096,8 +21166,8 @@ mod tests {
         assert!(read < serialize);
         assert!(serialize < publication);
         assert_eq!(
-            protected.matches("engine.read_core_bytes").count(),
-            capture.matches("engine.read_core_bytes").count(),
+            protected.matches(".read_core_bytes").count(),
+            capture.matches(".read_core_bytes").count(),
             "every live engine read must remain inside the drain-guard closure"
         );
         assert!(
@@ -21266,6 +21336,310 @@ mod tests {
         assert!(!barrier.is_quiescing());
         assert!(barrier.try_begin_fork());
         barrier.end_fork();
+    }
+
+    #[test]
+    fn capture_core_sparse_large_vma_reads_only_materialized_subranges_and_preserves_filesz() {
+        let (process, root) = crate::hvpatch::process_context_for_tests(70_260);
+        let plan = crate::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::THREAD
+                | carrick_abi::LinuxCloneFlags::SIGHAND
+                | carrick_abi::LinuxCloneFlags::VM,
+        )
+        .expect("thread clone plan");
+        let worker = process
+            .kernel_graph()
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve crash worker")
+            .prepare(ThreadId::synthetic_for_tests(70_261))
+            .expect("prepare crash worker")
+            .commit()
+            .expect("publish crash worker")
+            .start_thread()
+            .expect("start crash worker")
+            .into_context();
+        let dispatcher = SyscallDispatcher::new();
+        let mut auxv_bytes = Vec::new();
+        auxv_bytes.extend_from_slice(&6_u64.to_le_bytes()); // AT_PAGESZ
+        auxv_bytes.extend_from_slice(&4096_u64.to_le_bytes());
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes()); // AT_NULL
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes());
+        dispatcher.set_auxv_image(auxv_bytes);
+        dispatcher.bind_hvpatch_process(process.clone());
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            Some(process.clone()),
+            None,
+            None,
+        ));
+        let barrier = kernel
+            .process_fork_barrier
+            .clone()
+            .expect("HVPatch crash barrier");
+        let authority = kernel
+            .crash_capture
+            .clone()
+            .expect("HVPatch crash authority");
+        let owner = ThreadId::synthetic_for_tests(70_261);
+        let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let kicker = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        register_crash_test_vcpu(kicker.as_ref(), owner, &owner_in_guest);
+        let kicker: Arc<dyn VcpuRegistry> = kicker;
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(owner)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            Some(Arc::clone(&barrier)),
+            Some(Arc::clone(&authority)),
+            Some(Arc::clone(worker.thread())),
+            Some(process.pid()),
+            worker.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            owner,
+            Arc::new(Mutex::new(Vec::new())),
+            kicker,
+            owner_in_guest,
+            1_000,
+        );
+        state.service_kernel_context = Some(worker.retain_exact());
+
+        let sparse_addr = 0x0000_1000_0000_0000_u64;
+        let sparse_len = 64 * 1024 * 1024 * 1024_usize; // 64 GiB
+
+        let deferred = kernel
+            .dispatcher
+            .deferred_anonymous_state(root.task().shared().mm().id())
+            .expect("deferred anonymous state");
+        deferred
+            .reserve_fresh(carrick_guest_mem::GuestVa(sparse_addr), sparse_len)
+            .expect("reserve fresh 64GiB VMA");
+
+        // Touch 3 distinct pages: first, middle, last
+        let page_first = sparse_addr;
+        let page_middle = sparse_addr + 32 * 1024 * 1024 * 1024;
+        let page_last = sparse_addr + (64 << 30) - 4096;
+
+        deferred
+            .begin_materialization(carrick_guest_mem::GuestVa(page_first), 4096)
+            .expect("materialize first")
+            .commit();
+        deferred
+            .begin_materialization(carrick_guest_mem::GuestVa(page_middle), 4096)
+            .expect("materialize middle")
+            .commit();
+        deferred
+            .begin_materialization(carrick_guest_mem::GuestVa(page_last), 4096)
+            .expect("materialize last")
+            .commit();
+
+        kernel.dispatcher.record_dynamic_mapping(
+            sparse_addr,
+            sparse_len as u64,
+            carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::WRITE,
+            crate::vfs::ProcMapSharing::Private,
+            String::new(),
+        );
+
+        let tracker = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = CrashCaptureTestEngine {
+            read_tracker: Some(Arc::clone(&tracker)),
+            ..CrashCaptureTestEngine::default()
+        };
+        engine.guest_memory.insert(page_first, vec![0x11; 4096]);
+        engine.guest_memory.insert(page_middle, vec![0x22; 4096]);
+        engine.guest_memory.insert(page_last, vec![0x33; 4096]);
+
+        let result = state.capture_core_for_publication(
+            &kernel,
+            &mut engine,
+            FatalSignalRecord {
+                image_generation: kernel.fatal_signal.current_generation(),
+                tid: worker.thread().key().tid,
+                signo: 11,
+                code: 1,
+                addr: page_first,
+            },
+        );
+
+        let prepared = result
+            .expect("capture core must succeed")
+            .expect("fatal signal must yield prepared publication");
+
+        // 1. Verify read_core_bytes was called ONLY for the 3 touched pages (total 12 KiB)
+        let reads = tracker.lock().clone();
+        assert_eq!(
+            reads.len(),
+            3,
+            "must only read the 3 touched pages, got {} reads: {:?}",
+            reads.len(),
+            reads
+        );
+        for (addr, len) in &reads {
+            assert_eq!(*len, 4096, "each read must be page-sized");
+            assert!(
+                *addr == page_first || *addr == page_middle || *addr == page_last,
+                "unexpected read at address {addr:#x}"
+            );
+        }
+
+        // 2. Verify payload extents and size
+        assert_eq!(prepared.payload.extents.len(), 3);
+        assert!(
+            prepared.payload.emitted_bytes() < 32 * 1024,
+            "emitted bytes must be O(touched bytes), got {}",
+            prepared.payload.emitted_bytes()
+        );
+
+        // 3. Verify PT_LOAD in ELF header preserves filesz == memsz == 64 GiB
+        let phdr_bytes = &prepared.payload.header;
+        let ehdr_size = usize::from(crate::core_dump::EHDR_SIZE);
+        let phdr_size = usize::from(crate::core_dump::PHDR_SIZE);
+        let phnum = crate::core_dump::read_u16(phdr_bytes, 56).unwrap() as usize;
+        let mut found_sparse_load = false;
+        for i in 0..phnum {
+            let offset = ehdr_size + i * phdr_size;
+            let kind = crate::core_dump::read_u32(phdr_bytes, offset).unwrap();
+            let vaddr = crate::core_dump::read_u64(phdr_bytes, offset + 16).unwrap();
+            let filesz = crate::core_dump::read_u64(phdr_bytes, offset + 32).unwrap();
+            let memsz = crate::core_dump::read_u64(phdr_bytes, offset + 40).unwrap();
+            if kind == crate::core_dump::PT_LOAD && vaddr == sparse_addr {
+                assert_eq!(
+                    filesz, sparse_len as u64,
+                    "PT_LOAD filesz must equal VMA length"
+                );
+                assert_eq!(
+                    memsz, sparse_len as u64,
+                    "PT_LOAD memsz must equal VMA length"
+                );
+                found_sparse_load = true;
+                break;
+            }
+        }
+        assert!(
+            found_sparse_load,
+            "must find PT_LOAD for 64GiB sparse VMA in ELF header"
+        );
+    }
+
+    #[test]
+    fn capture_core_engine_read_error_fails_closed() {
+        let (process, root) = crate::hvpatch::process_context_for_tests(70_270);
+        let plan = crate::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::THREAD
+                | carrick_abi::LinuxCloneFlags::SIGHAND
+                | carrick_abi::LinuxCloneFlags::VM,
+        )
+        .expect("thread clone plan");
+        let worker = process
+            .kernel_graph()
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve crash worker")
+            .prepare(ThreadId::synthetic_for_tests(70_271))
+            .expect("prepare crash worker")
+            .commit()
+            .expect("publish crash worker")
+            .start_thread()
+            .expect("start crash worker")
+            .into_context();
+        let dispatcher = SyscallDispatcher::new();
+        let mut auxv_bytes = Vec::new();
+        auxv_bytes.extend_from_slice(&6_u64.to_le_bytes()); // AT_PAGESZ
+        auxv_bytes.extend_from_slice(&4096_u64.to_le_bytes());
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes()); // AT_NULL
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes());
+        dispatcher.set_auxv_image(auxv_bytes);
+        dispatcher.bind_hvpatch_process(process.clone());
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            Some(process.clone()),
+            None,
+            None,
+        ));
+        let barrier = kernel
+            .process_fork_barrier
+            .clone()
+            .expect("HVPatch crash barrier");
+        let authority = kernel
+            .crash_capture
+            .clone()
+            .expect("HVPatch crash authority");
+        let owner = ThreadId::synthetic_for_tests(70_271);
+        let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let kicker = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        register_crash_test_vcpu(kicker.as_ref(), owner, &owner_in_guest);
+        let kicker: Arc<dyn VcpuRegistry> = kicker;
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(owner)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            Some(Arc::clone(&barrier)),
+            Some(Arc::clone(&authority)),
+            Some(Arc::clone(worker.thread())),
+            Some(process.pid()),
+            worker.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            owner,
+            Arc::new(Mutex::new(Vec::new())),
+            kicker,
+            owner_in_guest,
+            1_000,
+        );
+        state.service_kernel_context = Some(worker.retain_exact());
+
+        let target_addr = 0x0000_1000_0000_0000_u64;
+        let target_len = 4096_usize;
+
+        let deferred = kernel
+            .dispatcher
+            .deferred_anonymous_state(root.task().shared().mm().id())
+            .expect("deferred anonymous state");
+        deferred
+            .reserve_fresh(carrick_guest_mem::GuestVa(target_addr), target_len)
+            .expect("reserve VMA");
+        deferred
+            .begin_materialization(carrick_guest_mem::GuestVa(target_addr), target_len)
+            .expect("materialize")
+            .commit();
+
+        kernel.dispatcher.record_dynamic_mapping(
+            target_addr,
+            target_len as u64,
+            carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::WRITE,
+            crate::vfs::ProcMapSharing::Private,
+            String::new(),
+        );
+
+        let mut engine = CrashCaptureTestEngine {
+            fail_read_at: Some(target_addr),
+            ..CrashCaptureTestEngine::default()
+        };
+
+        let result = state.capture_core_for_publication(
+            &kernel,
+            &mut engine,
+            FatalSignalRecord {
+                image_generation: kernel.fatal_signal.current_generation(),
+                tid: worker.thread().key().tid,
+                signo: 11,
+                code: 1,
+                addr: target_addr,
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "engine read error during core capture must fail closed"
+        );
     }
 
     #[test]

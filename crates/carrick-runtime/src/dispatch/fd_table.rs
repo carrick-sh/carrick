@@ -1025,7 +1025,7 @@ pub(super) enum OpenDescription {
     InMemoryFile {
         base: OpenDescriptionBase,
         path: String,
-        contents: Arc<parking_lot::RwLock<Vec<u8>>>,
+        contents: Arc<parking_lot::RwLock<crate::vfs::SparseBuffer>>,
         offset: usize,
         writable: bool,
         max_size: usize,
@@ -2693,7 +2693,7 @@ mod tests {
         let backing = Arc::new(RwLock::new(OpenDescription::InMemoryFile {
             base: OpenDescriptionBase::new(0),
             path: "/mapped".into(),
-            contents: Arc::new(RwLock::new(vec![42])),
+            contents: Arc::new(RwLock::new(crate::vfs::SparseBuffer::from(vec![42]))),
             offset: 0,
             writable: true,
             max_size: 4096,
