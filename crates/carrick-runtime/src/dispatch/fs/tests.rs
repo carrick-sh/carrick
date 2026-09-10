@@ -7574,3 +7574,575 @@ fn test_stat_and_lookup_dot_leaf() {
     );
     assert_eq!(mode & 0o170000, 0o040000, "dirsym/. must be S_IFDIR");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_path_resolution_observable_behavior_pinned() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    backend.make_dir("/mydir").unwrap();
+    backend
+        .set_file_contents("/mydir/myfile", b"hello world".to_vec())
+        .unwrap();
+    backend.symlink("/mydir", "/mydir/dirsym").unwrap();
+    backend.symlink("/mydir/myfile", "/mydir/filesym").unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x20000]);
+
+    // Helpers to call each of the 7 entry points:
+    // 1. openat (56)
+    let call_openat = |dispatcher: &mut SyscallDispatcher,
+                       memory: &mut LinearMemory,
+                       dirfd: u64,
+                       path: &str,
+                       flags: u64|
+     -> i64 {
+        memory
+            .write_bytes(0x4000, format!("{path}\0").as_bytes())
+            .unwrap();
+        lane_syscall(dispatcher, memory, 56, [dirfd, 0x4000, flags, 0, 0, 0])
+    };
+    // 2. newfstatat (79)
+    let call_newfstatat = |dispatcher: &mut SyscallDispatcher,
+                           memory: &mut LinearMemory,
+                           dirfd: u64,
+                           path: &str,
+                           flags: u64|
+     -> (i64, u32) {
+        memory
+            .write_bytes(0x4000, format!("{path}\0").as_bytes())
+            .unwrap();
+        memory.write_bytes(0x7000, &[0u8; 256]).unwrap();
+        let rc = lane_syscall(dispatcher, memory, 79, [dirfd, 0x4000, 0x7000, flags, 0, 0]);
+        let mode = if rc == 0 {
+            u32::from_ne_bytes(
+                memory
+                    .read_bytes(0x7000 + 16, 4)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            0
+        };
+        (rc, mode)
+    };
+    // 3. fstat (80)
+    let call_fstat =
+        |dispatcher: &mut SyscallDispatcher, memory: &mut LinearMemory, fd: i32| -> (i64, u32) {
+            memory.write_bytes(0x7000, &[0u8; 256]).unwrap();
+            let rc = lane_syscall(dispatcher, memory, 80, [fd as u64, 0x7000, 0, 0, 0, 0]);
+            let mode = if rc == 0 {
+                u32::from_ne_bytes(
+                    memory
+                        .read_bytes(0x7000 + 16, 4)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                0
+            };
+            (rc, mode)
+        };
+    // 4. statx (291)
+    let call_statx = |dispatcher: &mut SyscallDispatcher,
+                      memory: &mut LinearMemory,
+                      dirfd: u64,
+                      path: &str,
+                      flags: u64|
+     -> (i64, u32) {
+        memory
+            .write_bytes(0x4000, format!("{path}\0").as_bytes())
+            .unwrap();
+        memory.write_bytes(0x8000, &[0u8; 256]).unwrap();
+        let rc = lane_syscall(
+            dispatcher,
+            memory,
+            291,
+            [dirfd, 0x4000, flags, 0x7ff, 0x8000, 0],
+        );
+        let mode = if rc == 0 {
+            u16::from_ne_bytes(
+                memory
+                    .read_bytes(0x8000 + 28, 2)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ) as u32
+        } else {
+            0
+        };
+        (rc, mode)
+    };
+    // 5. x86_stat
+    let call_x86_stat =
+        |dispatcher: &mut SyscallDispatcher, memory: &mut LinearMemory, path: &str| -> (i64, u32) {
+            memory
+                .write_bytes(0x4000, format!("{path}\0").as_bytes())
+                .unwrap();
+            memory.write_bytes(0x7000, &[0u8; 256]).unwrap();
+            let rc = lane_syscall(
+                dispatcher,
+                memory,
+                carrick_abi::CARRICK_PRIVATE_X86_STAT,
+                [0x4000, 0x7000, 0, 0, 0, 0],
+            );
+            let mode = if rc == 0 {
+                u32::from_ne_bytes(
+                    memory
+                        .read_bytes(0x7000 + 24, 4)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                0
+            };
+            (rc, mode)
+        };
+    // 6. x86_lstat
+    let call_x86_lstat =
+        |dispatcher: &mut SyscallDispatcher, memory: &mut LinearMemory, path: &str| -> (i64, u32) {
+            memory
+                .write_bytes(0x4000, format!("{path}\0").as_bytes())
+                .unwrap();
+            memory.write_bytes(0x7000, &[0u8; 256]).unwrap();
+            let rc = lane_syscall(
+                dispatcher,
+                memory,
+                carrick_abi::CARRICK_PRIVATE_X86_LSTAT,
+                [0x4000, 0x7000, 0, 0, 0, 0],
+            );
+            let mode = if rc == 0 {
+                u32::from_ne_bytes(
+                    memory
+                        .read_bytes(0x7000 + 24, 4)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                0
+            };
+            (rc, mode)
+        };
+    // 7. x86_fstat
+    let call_x86_fstat =
+        |dispatcher: &mut SyscallDispatcher, memory: &mut LinearMemory, fd: i32| -> (i64, u32) {
+            memory.write_bytes(0x7000, &[0u8; 256]).unwrap();
+            let rc = lane_syscall(
+                dispatcher,
+                memory,
+                carrick_abi::CARRICK_PRIVATE_X86_FSTAT,
+                [fd as u64, 0x7000, 0, 0, 0, 0],
+            );
+            let mode = if rc == 0 {
+                u32::from_ne_bytes(
+                    memory
+                        .read_bytes(0x7000 + 24, 4)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                0
+            };
+            (rc, mode)
+        };
+    // 8. x86_newfstatat
+    let call_x86_newfstatat = |dispatcher: &mut SyscallDispatcher,
+                               memory: &mut LinearMemory,
+                               dirfd: u64,
+                               path: &str,
+                               flags: u64|
+     -> (i64, u32) {
+        memory
+            .write_bytes(0x4000, format!("{path}\0").as_bytes())
+            .unwrap();
+        memory.write_bytes(0x7000, &[0u8; 256]).unwrap();
+        let rc = lane_syscall(
+            dispatcher,
+            memory,
+            carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT,
+            [dirfd, 0x4000, 0x7000, flags, 0, 0],
+        );
+        let mode = if rc == 0 {
+            u32::from_ne_bytes(
+                memory
+                    .read_bytes(0x7000 + 24, 4)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            0
+        };
+        (rc, mode)
+    };
+
+    let enotdir = -i64::from(crate::linux_abi::LINUX_ENOTDIR.get());
+    let eloop = -i64::from(crate::linux_abi::LINUX_ELOOP.get());
+
+    // 1. Plain path: /mydir/myfile
+    let fd = call_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/myfile",
+        LINUX_O_RDONLY,
+    );
+    assert!(fd >= 0, "openat plain path should succeed, got {fd}");
+    let (rc, mode) = call_fstat(&mut dispatcher, &mut memory, fd as i32);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        mode & 0o170000,
+        0o100000,
+        "fstat plain path must be S_IFREG"
+    );
+    let (rc, mode) = call_x86_fstat(&mut dispatcher, &mut memory, fd as i32);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        mode & 0o170000,
+        0o100000,
+        "x86_fstat plain path must be S_IFREG"
+    );
+    lane_syscall(&mut dispatcher, &mut memory, 57, [fd as u64, 0, 0, 0, 0, 0]);
+
+    let (rc, mode) = call_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/myfile",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_statx(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/myfile",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_x86_stat(&mut dispatcher, &mut memory, "/mydir/myfile");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_x86_lstat(&mut dispatcher, &mut memory, "/mydir/myfile");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_x86_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/myfile",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+
+    // 2. Trailing slash on file: /mydir/myfile/ (ENOTDIR)
+    assert_eq!(
+        call_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/mydir/myfile/",
+            LINUX_O_RDONLY
+        ),
+        enotdir
+    );
+    assert_eq!(
+        call_newfstatat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/mydir/myfile/",
+            0
+        )
+        .0,
+        enotdir
+    );
+    assert_eq!(
+        call_statx(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/mydir/myfile/",
+            0
+        )
+        .0,
+        enotdir
+    );
+    assert_eq!(
+        call_x86_stat(&mut dispatcher, &mut memory, "/mydir/myfile/").0,
+        enotdir
+    );
+    assert_eq!(
+        call_x86_lstat(&mut dispatcher, &mut memory, "/mydir/myfile/").0,
+        enotdir
+    );
+    assert_eq!(
+        call_x86_newfstatat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/mydir/myfile/",
+            0
+        )
+        .0,
+        enotdir
+    );
+
+    // Trailing slash on dir: /mydir/
+    let dir_fd = call_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/",
+        LINUX_O_RDONLY,
+    );
+    assert!(dir_fd >= 0, "openat /mydir/ should succeed");
+    lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        57,
+        [dir_fd as u64, 0, 0, 0, 0, 0],
+    );
+    let (rc, mode) = call_newfstatat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, "/mydir/", 0);
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o040000, "must be S_IFDIR");
+    let (rc, mode) = call_statx(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, "/mydir/", 0);
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o040000, "must be S_IFDIR");
+    let (rc, mode) = call_x86_stat(&mut dispatcher, &mut memory, "/mydir/");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o040000, "must be S_IFDIR");
+    let (rc, mode) = call_x86_lstat(&mut dispatcher, &mut memory, "/mydir/");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o040000, "must be S_IFDIR");
+    let (rc, mode) =
+        call_x86_newfstatat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, "/mydir/", 0);
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o040000, "must be S_IFDIR");
+
+    // 3. /proc/self/... synthetic path: /proc/self/status
+    let proc_fd = call_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/proc/self/status",
+        LINUX_O_RDONLY,
+    );
+    assert!(proc_fd >= 0, "openat /proc/self/status should succeed");
+    lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        57,
+        [proc_fd as u64, 0, 0, 0, 0, 0],
+    );
+    let (rc, mode) = call_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/proc/self/status",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_statx(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/proc/self/status",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_x86_stat(&mut dispatcher, &mut memory, "/proc/self/status");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_x86_lstat(&mut dispatcher, &mut memory, "/proc/self/status");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_x86_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/proc/self/status",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+
+    // 4. Escape above rootfs: /../../mydir/myfile (clamped to /mydir/myfile)
+    let esc_fd = call_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/../../mydir/myfile",
+        LINUX_O_RDONLY,
+    );
+    assert!(esc_fd >= 0, "openat /../../mydir/myfile should succeed");
+    lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        57,
+        [esc_fd as u64, 0, 0, 0, 0, 0],
+    );
+    let (rc, mode) = call_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/../../mydir/myfile",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_statx(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/../../mydir/myfile",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_x86_stat(&mut dispatcher, &mut memory, "/../../mydir/myfile");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_x86_lstat(&mut dispatcher, &mut memory, "/../../mydir/myfile");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+    let (rc, mode) = call_x86_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/../../mydir/myfile",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o100000);
+
+    // 5. AT_SYMLINK_NOFOLLOW on a symlinked dir: /mydir/dirsym -> /mydir
+    // Under AT_SYMLINK_NOFOLLOW: reports S_IFLNK
+    let (rc, mode) = call_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/dirsym",
+        crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(
+        mode & 0o170000,
+        0o120000,
+        "newfstatat NOFOLLOW must report S_IFLNK"
+    );
+    let (rc, mode) = call_statx(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/dirsym",
+        crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(
+        mode & 0o170000,
+        0o120000,
+        "statx NOFOLLOW must report S_IFLNK"
+    );
+    let (rc, mode) = call_x86_lstat(&mut dispatcher, &mut memory, "/mydir/dirsym");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o120000, "x86_lstat must report S_IFLNK");
+    let (rc, mode) = call_x86_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/dirsym",
+        crate::linux_abi::LINUX_AT_SYMLINK_NOFOLLOW,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(
+        mode & 0o170000,
+        0o120000,
+        "x86_newfstatat NOFOLLOW must report S_IFLNK"
+    );
+    // openat with O_NOFOLLOW on symlink to dir reports ELOOP
+    assert_eq!(
+        call_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/mydir/dirsym",
+            LINUX_O_RDONLY | carrick_abi::LINUX_O_NOFOLLOW
+        ),
+        eloop,
+        "openat O_NOFOLLOW on symlink to dir must report ELOOP"
+    );
+
+    // Without NOFOLLOW: reports S_IFDIR
+    let (rc, mode) = call_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/dirsym",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(
+        mode & 0o170000,
+        0o040000,
+        "newfstatat following must report S_IFDIR"
+    );
+    let (rc, mode) = call_statx(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/dirsym",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(
+        mode & 0o170000,
+        0o040000,
+        "statx following must report S_IFDIR"
+    );
+    let (rc, mode) = call_x86_stat(&mut dispatcher, &mut memory, "/mydir/dirsym");
+    assert_eq!(rc, 0);
+    assert_eq!(mode & 0o170000, 0o040000, "x86_stat must report S_IFDIR");
+    let (rc, mode) = call_x86_newfstatat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/dirsym",
+        0,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(
+        mode & 0o170000,
+        0o040000,
+        "x86_newfstatat following must report S_IFDIR"
+    );
+    let open_follow_fd = call_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/mydir/dirsym",
+        LINUX_O_RDONLY,
+    );
+    assert!(
+        open_follow_fd >= 0,
+        "openat following symlink to dir should succeed"
+    );
+    lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        57,
+        [open_follow_fd as u64, 0, 0, 0, 0, 0],
+    );
+}
