@@ -1802,7 +1802,7 @@ mod tests {
                 contents, writable, ..
             } => {
                 assert!(writable);
-                contents.write().extend_from_slice(b" extra");
+                contents.write().extend_from_slice(b" extra").unwrap();
             }
             other => panic!("expected InMemoryFile, got {other:?}"),
         }

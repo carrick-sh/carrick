@@ -1,9 +1,27 @@
 use std::collections::BTreeMap;
 
+const CHUNK_SIZE: usize = 4096;
+
+/// Error returned when operating on a sparse buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseBufferError {
+    Overflow,
+}
+
+impl std::fmt::Display for SparseBufferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overflow => write!(f, "sparse buffer offset + length overflow"),
+        }
+    }
+}
+
+impl std::error::Error for SparseBufferError {}
+
 /// A memory-efficient sparse byte buffer supporting large logical file sizes with
 /// sparse allocation of written extents. Unwritten holes read back as zeros without
 /// materializing physical host memory.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Eq)]
 pub struct SparseBuffer {
     len: usize,
     chunks: BTreeMap<usize, Vec<u8>>,
@@ -23,7 +41,11 @@ impl SparseBuffer {
         let len = data.len();
         let mut chunks = BTreeMap::new();
         if !data.is_empty() {
-            chunks.insert(0, data);
+            for (i, slice) in data.chunks(CHUNK_SIZE).enumerate() {
+                let mut chunk = slice.to_vec();
+                chunk.shrink_to_fit();
+                chunks.insert(i * CHUNK_SIZE, chunk);
+            }
         }
         Self { len, chunks }
     }
@@ -41,7 +63,7 @@ impl SparseBuffer {
     /// Sum of physical bytes held by materialized chunks.
     #[must_use]
     pub fn allocated_bytes(&self) -> usize {
-        self.chunks.values().map(Vec::len).sum()
+        self.chunks.values().map(Vec::capacity).sum()
     }
 
     /// Set the logical length of the sparse buffer, pruning any chunks beyond `new_len`.
@@ -72,52 +94,73 @@ impl SparseBuffer {
             let keep = bound.saturating_sub(start);
             if keep < chunk.len() {
                 chunk.truncate(keep);
+                chunk.shrink_to_fit();
             }
         }
     }
 
     /// Write bytes at `offset`, expanding logical length if necessary.
-    pub fn write_range(&mut self, offset: usize, bytes: &[u8]) {
+    pub fn write_range(&mut self, offset: usize, bytes: &[u8]) -> Result<(), SparseBufferError> {
         if bytes.is_empty() {
-            return;
+            return Ok(());
         }
-        let end = match offset.checked_add(bytes.len()) {
-            Some(e) => e,
-            None => return,
-        };
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(SparseBufferError::Overflow)?;
         if end > self.len {
             self.len = end;
         }
 
-        // 1. Inspect predecessor chunk starting before `offset`
-        if let Some((&pred_start, pred_chunk)) = self.chunks.range_mut(..offset).next_back() {
-            let pred_end = pred_start.saturating_add(pred_chunk.len());
-            if pred_end > offset {
-                if pred_end > end {
-                    // Predecessor spans across the entire write range: split into prefix + suffix
-                    let suffix = pred_chunk[end - pred_start..].to_vec();
-                    pred_chunk.truncate(offset - pred_start);
-                    self.chunks.insert(end, suffix);
-                } else {
-                    // Predecessor tail is overwritten: truncate in place with zero cloning
-                    pred_chunk.truncate(offset - pred_start);
+        let mut cur_offset = offset;
+        for chunk_slice in bytes.chunks(CHUNK_SIZE) {
+            let chunk_len = chunk_slice.len();
+            let chunk_end = cur_offset + chunk_len;
+
+            // 1. Inspect predecessor chunk starting before `cur_offset`
+            if let Some((&pred_start, pred_chunk)) = self.chunks.range_mut(..cur_offset).next_back()
+            {
+                let pred_end = pred_start.saturating_add(pred_chunk.len());
+                if pred_end > cur_offset {
+                    if pred_end > chunk_end {
+                        // Predecessor spans across the entire chunk: split into prefix + suffix
+                        let mut suffix = pred_chunk[chunk_end - pred_start..].to_vec();
+                        suffix.shrink_to_fit();
+                        pred_chunk.truncate(cur_offset - pred_start);
+                        pred_chunk.shrink_to_fit();
+                        self.chunks.insert(chunk_end, suffix);
+                    } else {
+                        // Predecessor tail is overwritten: truncate in place
+                        pred_chunk.truncate(cur_offset - pred_start);
+                        pred_chunk.shrink_to_fit();
+                    }
                 }
             }
-        }
 
-        // 2. Inspect chunks starting in `offset..end`
-        let keys_in_range: Vec<usize> = self.chunks.range(offset..end).map(|(&k, _)| k).collect();
-        for k in keys_in_range {
-            if let Some(chunk) = self.chunks.remove(&k) {
-                let chunk_end = k.saturating_add(chunk.len());
-                if chunk_end > end {
-                    let suffix = chunk[end - k..].to_vec();
-                    self.chunks.insert(end, suffix);
+            // 2. Inspect chunks starting in `cur_offset..chunk_end`
+            let keys_in_range: Vec<usize> = self
+                .chunks
+                .range(cur_offset..chunk_end)
+                .map(|(&k, _)| k)
+                .collect();
+            for k in keys_in_range {
+                if let Some(chunk) = self.chunks.remove(&k) {
+                    let chunk_end_existing = k.saturating_add(chunk.len());
+                    if chunk_end_existing > chunk_end {
+                        let mut suffix = chunk[chunk_end - k..].to_vec();
+                        suffix.shrink_to_fit();
+                        self.chunks.insert(chunk_end, suffix);
+                    }
                 }
             }
+
+            let mut new_chunk = chunk_slice.to_vec();
+            new_chunk.shrink_to_fit();
+            self.chunks.insert(cur_offset, new_chunk);
+
+            cur_offset = chunk_end;
         }
 
-        self.chunks.insert(offset, bytes.to_vec());
+        Ok(())
     }
 
     /// Read a subrange from `offset` of length `length`. Unpopulated holes return zeros.
@@ -158,8 +201,8 @@ impl SparseBuffer {
     }
 
     /// Append bytes to the end of the buffer.
-    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
-        self.write_range(self.len, bytes);
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), SparseBufferError> {
+        self.write_range(self.len, bytes)
     }
 }
 
@@ -172,6 +215,57 @@ impl From<Vec<u8>> for SparseBuffer {
 impl From<&[u8]> for SparseBuffer {
     fn from(data: &[u8]) -> Self {
         Self::from_vec(data.to_vec())
+    }
+}
+
+impl PartialEq for SparseBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        if self.chunks == other.chunks {
+            return true;
+        }
+        let mut offset = 0;
+        while offset < self.len {
+            let next_self = self.chunks.range(offset..).next().map(|(&k, _)| k);
+            let next_other = other.chunks.range(offset..).next().map(|(&k, _)| k);
+
+            let next_active = match (next_self, next_other) {
+                (Some(s), Some(o)) => s.min(o),
+                (Some(s), None) => s,
+                (None, Some(o)) => o,
+                (None, None) => break,
+            };
+
+            let self_pred_end = self
+                .chunks
+                .range(..offset)
+                .next_back()
+                .map(|(&k, v)| k.saturating_add(v.len()))
+                .unwrap_or(0);
+            let other_pred_end = other
+                .chunks
+                .range(..offset)
+                .next_back()
+                .map(|(&k, v)| k.saturating_add(v.len()))
+                .unwrap_or(0);
+
+            if offset < next_active && self_pred_end <= offset && other_pred_end <= offset {
+                offset = next_active;
+            }
+
+            if offset >= self.len {
+                break;
+            }
+
+            let step = (self.len - offset).min(CHUNK_SIZE);
+            if self.read_range(offset, step) != other.read_range(offset, step) {
+                return false;
+            }
+            offset += step;
+        }
+        true
     }
 }
 
@@ -236,9 +330,9 @@ mod tests {
         let p2 = [0xbb_u8; 4096];
         let p3 = [0xcc_u8; 4096];
 
-        buf.write_range(0, &p1);
-        buf.write_range(32 * 1024 * 1024 * 1024, &p2);
-        buf.write_range(sparse_size - 4096, &p3);
+        buf.write_range(0, &p1).unwrap();
+        buf.write_range(32 * 1024 * 1024 * 1024, &p2).unwrap();
+        buf.write_range(sparse_size - 4096, &p3).unwrap();
 
         assert_eq!(buf.len(), sparse_size);
         assert_eq!(buf.allocated_bytes(), 3 * 4096);
@@ -272,7 +366,7 @@ mod tests {
 
         // 2000 sequential page writes: must be fast (bounded O(log N) per write)
         for i in 0..page_count {
-            buf.write_range(i * page_size * 2, &page); // leave a 4096-byte hole between each page
+            buf.write_range(i * page_size * 2, &page).unwrap(); // leave a 4096-byte hole between each page
         }
 
         assert_eq!(buf.len(), (page_count * 2 - 1) * page_size);
@@ -291,7 +385,7 @@ mod tests {
     fn chunk_overwrite_split_and_middle_mutation() {
         let mut buf = SparseBuffer::from_vec(vec![0x11; 100]);
         // Overwrite bytes 40..60 with 0x22
-        buf.write_range(40, &[0x22; 20]);
+        buf.write_range(40, &[0x22; 20]).unwrap();
 
         assert_eq!(buf.len(), 100);
         assert_eq!(buf.read_range(0, 40), vec![0x11; 40]);
@@ -299,7 +393,7 @@ mod tests {
         assert_eq!(buf.read_range(60, 40), vec![0x11; 40]);
 
         // Overwrite bytes 10..90 with 0x33 spanning multiple chunks
-        buf.write_range(10, &[0x33; 80]);
+        buf.write_range(10, &[0x33; 80]).unwrap();
         assert_eq!(buf.len(), 100);
         assert_eq!(buf.read_range(0, 10), vec![0x11; 10]);
         assert_eq!(buf.read_range(10, 80), vec![0x33; 80]);
@@ -310,8 +404,8 @@ mod tests {
     fn partial_eq_without_dense_allocation() {
         let mut buf = SparseBuffer::new();
         buf.set_len(10);
-        buf.write_range(2, &[0xaa, 0xbb]);
-        buf.write_range(6, &[0xcc]);
+        buf.write_range(2, &[0xaa, 0xbb]).unwrap();
+        buf.write_range(6, &[0xcc]).unwrap();
 
         let reference = vec![0_u8, 0, 0xaa, 0xbb, 0, 0, 0xcc, 0, 0, 0];
         assert_eq!(buf, reference.as_slice());
@@ -319,6 +413,13 @@ mod tests {
         let mut mismatched = reference.clone();
         mismatched[0] = 1; // non-zero in hole
         assert_ne!(buf, mismatched.as_slice());
+
+        let mut buf2 = SparseBuffer::new();
+        buf2.set_len(10);
+        buf2.write_range(2, &[0xaa]).unwrap();
+        buf2.write_range(3, &[0xbb]).unwrap();
+        buf2.write_range(6, &[0xcc]).unwrap();
+        assert_eq!(buf, buf2);
     }
 
     #[test]
@@ -330,7 +431,7 @@ mod tests {
 
         // Insert N non-contiguous pages
         for i in 0..N {
-            buf.write_range(i * 2 * PAGE, &data);
+            buf.write_range(i * 2 * PAGE, &data).unwrap();
         }
 
         assert_eq!(buf.len(), (2 * N - 1) * PAGE);
@@ -355,7 +456,7 @@ mod tests {
 
         // Overwrite middle of chunk 4500 with split
         let overwrite = [0x33_u8; 100];
-        buf.write_range(offset + 100, &overwrite);
+        buf.write_range(offset + 100, &overwrite).unwrap();
         // Original chunk is split into prefix (100 bytes) + new chunk (100 bytes) + suffix (PAGE - 200 bytes)
         // Total allocated bytes remains identical
         assert_eq!(buf.allocated_bytes(), N * PAGE);
@@ -365,5 +466,33 @@ mod tests {
             buf.read_range(offset + 200, PAGE - 200),
             vec![0x7f_u8; PAGE - 200]
         );
+    }
+
+    #[test]
+    fn write_range_overflow_fails_closed() {
+        let mut buf = SparseBuffer::new();
+        let err = buf.write_range(usize::MAX - 10, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(err, Err(SparseBufferError::Overflow));
+    }
+}
+
+#[cfg(test)]
+mod overwrite_storage_controller {
+    use super::*;
+    #[test]
+    fn small_overwrites_do_not_retain_full_suffix_allocations_controller() {
+        let logical = 1024 * 1024;
+        let mut buffer = SparseBuffer::from_vec(vec![b'a'; logical]);
+        for offset in 1..=64 {
+            buffer.write_range(offset * 16, b"b").unwrap();
+        }
+        let retained: usize = buffer.chunks.values().map(Vec::capacity).sum();
+        assert!(
+            retained <= 4 * logical,
+            "64 one-byte overwrites retained {retained} bytes for {logical} logical bytes"
+        );
+        for offset in 1..=64 {
+            assert_eq!(buffer.read_range(offset * 16, 1), b"b");
+        }
     }
 }

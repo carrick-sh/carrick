@@ -12592,10 +12592,16 @@ impl SyscallDispatcher {
                     } else {
                         offset as usize
                     };
-                    if write_at + bytes.len() > *max_size {
+                    let end = match write_at.checked_add(bytes.len()) {
+                        Some(e) => e,
+                        None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
+                    };
+                    if end > *max_size {
                         return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                     }
-                    data.write_range(write_at, &bytes);
+                    if data.write_range(write_at, &bytes).is_err() {
+                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                    }
                     this.fs.rootfs_vfs.notify_inode_changed(path, None);
                     return Ok(DispatchOutcome::Returned {
                         value: bytes.len() as i64,
@@ -12791,14 +12797,28 @@ impl SyscallDispatcher {
                             continue;
                         }
                         let buf = unsafe { std::slice::from_raw_parts(iov.iov_base as *const u8, len) };
-                        if cur + len > *max_size {
+                        let end = match cur.checked_add(len) {
+                            Some(e) => e,
+                            None => {
+                                if total > 0 {
+                                    break;
+                                }
+                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                            }
+                        };
+                        if end > *max_size {
                             if total > 0 {
                                 break;
                             }
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
-                        data.write_range(cur, buf);
-                        cur += len;
+                        if data.write_range(cur, buf).is_err() {
+                            if total > 0 {
+                                break;
+                            }
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        cur = end;
                         total += len as i64;
                     }
                 } else if let PwritevPayloads::Staged(staged_iovecs) = &payloads {
@@ -12807,14 +12827,28 @@ impl SyscallDispatcher {
                         if len == 0 {
                             continue;
                         }
-                        if cur + len > *max_size {
+                        let end = match cur.checked_add(len) {
+                            Some(e) => e,
+                            None => {
+                                if total > 0 {
+                                    break;
+                                }
+                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                            }
+                        };
+                        if end > *max_size {
                             if total > 0 {
                                 break;
                             }
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
-                        data.write_range(cur, buf);
-                        cur += len;
+                        if data.write_range(cur, buf).is_err() {
+                            if total > 0 {
+                                break;
+                            }
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        cur = end;
                         total += len as i64;
                     }
                 }
@@ -14893,12 +14927,17 @@ impl SyscallDispatcher {
                                 Ok(len) => bytes.truncate(len),
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             }
-                            if write_offset + bytes.len() > *max_size {
+                            let end = match write_offset.checked_add(bytes.len()) {
+                                Some(e) => e,
+                                None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
+                            };
+                            if end > *max_size {
                                 return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                             }
                             let mut data = contents.write();
-                            data.write_range(write_offset, &bytes);
-                            let end = write_offset + bytes.len();
+                            if data.write_range(write_offset, &bytes).is_err() {
+                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                            }
                             *offset = end;
                             this.fs.rootfs_vfs.notify_inode_changed(path, None);
                             outcome = DispatchOutcome::Returned {
@@ -15464,11 +15503,16 @@ impl SyscallDispatcher {
                                 } else {
                                     *offset
                                 };
-                                if write_offset + bytes.len() > *max_size {
+                                let end = match write_offset.checked_add(bytes.len()) {
+                                    Some(e) => e,
+                                    None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
+                                };
+                                if end > *max_size {
                                     return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                                 }
-                                data.write_range(write_offset, &bytes);
-                                let end = write_offset + bytes.len();
+                                if data.write_range(write_offset, &bytes).is_err() {
+                                    return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                                }
                                 *offset = end;
                                 this.fs.rootfs_vfs.notify_inode_changed(path, None);
                                 outcome = DispatchOutcome::Returned {

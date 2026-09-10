@@ -7196,7 +7196,13 @@ impl SyscallDispatcher {
                                 })?;
                             let mut lock = contents.write();
                             lock.set_len(logical_size);
-                            lock.write_range(0, &payload.header);
+                            lock.write_range(0, &payload.header).map_err(|_| {
+                                CorePublicationError::Backend {
+                                    operation: "write",
+                                    path: temp_path.clone(),
+                                    error: crate::fs_backend::BackendError::Invalid,
+                                }
+                            })?;
                             for ext in &payload.extents {
                                 let offset = usize::try_from(ext.offset).map_err(|_| {
                                     CorePublicationError::Backend {
@@ -7205,7 +7211,13 @@ impl SyscallDispatcher {
                                         error: crate::fs_backend::BackendError::Invalid,
                                     }
                                 })?;
-                                lock.write_range(offset, &ext.bytes);
+                                lock.write_range(offset, &ext.bytes).map_err(|_| {
+                                    CorePublicationError::Backend {
+                                        operation: "write",
+                                        path: temp_path.clone(),
+                                        error: crate::fs_backend::BackendError::Invalid,
+                                    }
+                                })?;
                             }
                             if failpoint == Some("fsync") {
                                 return Err(CorePublicationError::Failpoint("fsync"));
