@@ -44,6 +44,7 @@
 use crate::linux_abi::LinuxErrno;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1303,26 +1304,15 @@ impl Drop for OpenDescription {
 
 #[derive(Debug)]
 struct HostFdOwner {
-    fd: i32,
+    _fd: Option<OwnedFd>,
+    raw_fd: i32,
     private_file_source: carrick_guest_mem::PrivateFileSource,
-}
-
-impl Drop for HostFdOwner {
-    fn drop(&mut self) {
-        // Deliberately a bare per-process close: carrick forks real host
-        // processes, and each address space independently closes its inherited
-        // copy of the fd. Fork-correctness depends on this staying a plain
-        // `libc::close` — never anything fancier.
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
 }
 
 /// The OWNED, Arc-refcounted handle to a host kernel fd. The single owner of a
 /// host-backed [`OpenDescription`]'s fd lives IN the description (`host_fd`
 /// field); `Clone` bumps the refcount (never `dup(2)`s), and the last clone's
-/// drop closes the fd. Borrow the number for a libc call via [`HostFdRef::raw`]
+/// drop closes the fd via [`OwnedFd`]. Borrow the number for a libc call via [`HostFdRef::raw`]
 /// or as the Copy view type via [`HostFdRef::view`].
 #[derive(Debug, Clone)]
 pub(crate) struct HostFdRef(Arc<HostFdOwner>);
@@ -1336,8 +1326,16 @@ impl HostFdRef {
         fd: i32,
         private_file_source: carrick_guest_mem::PrivateFileSource,
     ) -> Self {
+        let is_valid = unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+        let owned = if is_valid {
+            // SAFETY: `fd` was verified to be a valid, live open descriptor.
+            Some(unsafe { OwnedFd::from_raw_fd(fd) })
+        } else {
+            None
+        };
         Self(Arc::new(HostFdOwner {
-            fd,
+            _fd: owned,
+            raw_fd: fd,
             private_file_source,
         }))
     }
@@ -1350,14 +1348,14 @@ impl HostFdRef {
     /// keep a `HostFdRef` alive for as long as the number is used).
     #[inline]
     pub(crate) fn raw(&self) -> i32 {
-        self.0.fd
+        self.0.raw_fd
     }
 
     /// The Copy borrowed VIEW of this fd (see [`HostFd`]); same liveness
     /// caveat as [`HostFdRef::raw`].
     #[inline]
     pub(super) fn view(&self) -> HostFd {
-        HostFd(self.0.fd)
+        HostFd(self.0.raw_fd)
     }
 }
 

@@ -16,7 +16,7 @@
 //! type-check-only stubs) this degrades to a bounded `poll` loop.
 
 use carrick_abi::LinuxErrno;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -75,18 +75,7 @@ pub enum WaitResult {
 }
 
 struct PinnedWaitFd {
-    fd: RawFd,
-    owned: bool,
-}
-
-impl Drop for PinnedWaitFd {
-    fn drop(&mut self) {
-        if self.owned {
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
-    }
+    _fd: OwnedFd,
 }
 
 struct PinnedWaitFds {
@@ -100,7 +89,7 @@ impl PinnedWaitFds {
     /// ANY dup() failure (host fd table exhausted) return Err with a LINUX
     /// errno — never fall back to parking on the raw, unowned guest fd (the
     /// exact fd-reuse race this dup is meant to prevent). The partially-duped
-    /// set is dropped via PinnedWaitFd::Drop (RAII rollback).
+    /// set is dropped via PinnedWaitFd's OwnedFd drop (RAII rollback).
     fn new(fds: &[WaitFd]) -> Result<Self, LinuxErrno> {
         let mut wait_fds = Vec::with_capacity(fds.len());
         let mut pinned = Vec::with_capacity(fds.len());
@@ -130,11 +119,10 @@ impl PinnedWaitFds {
                 };
                 return Err(linux_errno); // partial `pinned` drops here → closes already-duped fds
             }
-            wait_fds.push((duped, events));
-            pinned.push(PinnedWaitFd {
-                fd: duped,
-                owned: true,
-            });
+            // SAFETY: `duped` is a valid open descriptor from a successful `libc::dup`.
+            let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+            wait_fds.push((owned.as_raw_fd(), events));
+            pinned.push(PinnedWaitFd { _fd: owned });
         }
         Ok(Self {
             wait_fds,
