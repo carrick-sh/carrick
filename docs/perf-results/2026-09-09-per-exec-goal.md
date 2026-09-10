@@ -1,5 +1,67 @@
 # Per-exec overhead: baseline and next goal
 
+## Scoped goal accepted — 2026-09-09
+
+The pinned normal Python-spawn goal is satisfied on committed source
+`4a67db3403d69f2b6abdf179b40af22800e4cc89`. Two predeclared, untraced serial
+Docker/base/candidate/candidate/base/Docker screens yielded **1.921574x** and
+**1.976005x**; combining all arms gives **9.317571 ms / 4.782080 ms = 1.948435x**.
+Each arm uses five 50-spawn batches after five warmups; statistics are means
+of per-arm batch medians. The paired stack-tail baseline is 12.490447 ms,
+so the final candidate reduces normal-spawn time by **25.402%** in this pair.
+The initial 14.06 ms campaign baseline remains historical, not the paired
+control for this percentage.
+
+| Workload | Paired base ms | Final ms | Docker ms | Final / Docker |
+|---|---:|---:|---:|---:|
+| Normal Python spawn | 12.490447 | 9.317571 | 4.782080 | **1.948435x** |
+| Python `-S` spawn | 11.049271 | 7.983676 | 3.874101 | 2.060782x |
+| `/bin/true` spawn | 1.740490 | 1.580184 | 0.172696 | 9.150063x |
+| CPython multiprocessing_main_handling | 9443 | 7908 | 2896 | 2.730663x |
+| CPython subprocess | 60078.5 | 58419.5 | 20635 | 2.831088x |
+
+All four full CPython ABBA arms MATCH the fresh pinned native-arm64 Docker
+oracle: 39/39 multiprocessing and 297/297 subprocess cases. Paired reductions
+are 16.255% and 2.761%, respectively. The overall ecosystem <=2x objective is
+**not** achieved; Python-S, true and these full CPython workloads remain above
+2x. No broader conformance or platform closure is claimed.
+
+Acceptance artifact: `target/perf/exec-overhead-20260909/carrick-replacement-gated`,
+SHA-256 `fe405065fa97b02132fb4c0893cf9672145c2bc514cd4996642ca8c00fe0dd1d`,
+LC_UUID `23F0B8D4-CD37-3152-AED8-25501B359369`. Signature/CDHash, hypervisor
+entitlement, DTrace section, clean source HEAD and empty source-patch hash are
+recorded in `replacement-gated-provenance.json`. The final documentation
+commit follows this acceptance source without changing executable code.
+
+Validation on the accepted source/artifact:
+- Full public signed gate exits 0: 876 unique generic executions (438 musl,
+  438 GNU), 31 dedicated cases, the CLI boundary test and retained lane
+  (46 passed, 1 ignored). Both signed manifests and negative controls are
+  preserved. The 30 amd64 report-only DIFFs are outside this arm64 acceptance.
+- Full serial runtime: 2582 passed, 2 ignored. HVF: 474 passed, 3 ignored.
+  Reviewed Clippy and full `just lint-domains` pass. Host-authority capture
+  remains macOS-only, with other platform profiles explicitly pending.
+- Prior-artifact host mmap and stage-2 failures returned ENOMEM then zeroed
+  data; both final-artifact injections return ENOMEM and preserve dirty byte
+  90. Controls restore original file byte 65. Inventory/after-sync rollback
+  coverage checks exact descriptors, ownership/inventory, aliases and bytes;
+  moving retirement early is a failing mutation control. Explicit reservation
+  refusal is additionally exercised through a temporary host-test authority
+  patch, archived as `replacement-reservation-test-only.patch`; committed
+  source is restored and its test rerun green. No guest binary is changed.
+- All 30 recorded run IDs have zero live Carrick/Docker processes; a final
+  census also finds zero Carrick carriers. The frozen binary remains unchanged.
+
+Final receipts under `target/perf/exec-overhead-20260909`: `replacement-gated`
+and `replacement-gated-repeat` raw JSON/outputs, `replacement-gated-summary.json`,
+`cpython-replacement-gated-abba.json` and summary, `replacement-public-final`
+log/result and manifest archive, `replacement-public-signed-stages.json`,
+`replacement-final-cleanup.json`, and `replacement-final-acceptance-audit.json`.
+The investigation history below preserves failed instruments, rejected
+hypotheses and earlier open-state notes; this acceptance supersedes their
+historical status statements. All work is on local main; nothing was pushed.
+
+
 Measured 2026-09-09 on main e7db055ae; no runtime changes. The signed binary SHA-256 is afccec0cc339993c1ac265a3e6bf9c4c609f16da4d07150247a90201ab10d953, identical to the latest campaign receipt at 62c63d979; intervening changes are documentation only. LC_UUID 21E916E9-C9CD-3A7B-A0AB-9AB490809A71; hypervisor entitlement and __dof_carrick verified.
 
 ## Baseline
@@ -20,7 +82,7 @@ The existing hvpatch-phase4-exec-profile.d captured 501 balanced begin/end windo
 
 Source inspection identifies discover_next_free_spare in PageTableManager::new scanning every spare page for nonzero bytes before truncating the image. Establish the exact bytes scanned/copied and why each reconstruction occurs before choosing a change. Preserve last-nonzero-page semantics, zero holes, owner generations, rollback and publication invariants.
 
-## Active objective
+## Original scoped objective
 
 Bring the pinned Python spawn benchmark to <=2x native-arm64 Docker (currently approximately 8.55 ms target versus 14.06 ms baseline), diagnosing and removing unnecessary per-exec work beginning with repeated page-table reconstruction. Track /bin/true and Python -S separately so improvements cannot hide another phase. Validate impact on cpython-subprocess and cpython-multiprocessing_main_handling with correctness intact and paired interleaved base/candidate runs at fixed worker counts. Retain the overall <=2x ecosystem objective; this scoped goal does not assert full conformance closure.
 
