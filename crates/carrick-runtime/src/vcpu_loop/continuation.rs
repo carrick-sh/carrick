@@ -20,8 +20,8 @@ use carrick_guest_mem::{GuestVa, SharedFutexLocation};
 use parking_lot::{Condvar, Mutex};
 
 use crate::dispatch::{
-    BlockingHostWrite, BlockingRecordLock, DispatchOutcome, SyscallRequest, WaitFdAuthority,
-    WaitFds,
+    BlockingHostWrite, BlockingRecordLock, DispatchOutcome, FdWaitCompletion, SyscallRequest,
+    WaitFdAuthority, WaitFds,
 };
 use crate::kernel::objects::{ExecutionGeneration, ThreadKey};
 use crate::kernel::{
@@ -899,8 +899,6 @@ pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
             | DispatchOutcome::SharedFutexWaitv { .. }
             | DispatchOutcome::WaitOnSharedWord { .. }
             | DispatchOutcome::WaitOnFds { .. }
-            | DispatchOutcome::WaitOnFdsSelect { .. }
-            | DispatchOutcome::WaitOnPollFds { .. }
             | DispatchOutcome::BlockingHostWrite(_)
             | DispatchOutcome::BlockingRecordLock(_)
             | DispatchOutcome::WaitOnProcExit { .. }
@@ -993,8 +991,7 @@ impl BlockedContinuation {
                 },
             )),
             DispatchOutcome::SharedFutexWait {
-                location,
-                waiter_key,
+                target,
                 generation,
                 value,
                 timeout,
@@ -1003,16 +1000,15 @@ impl BlockedContinuation {
                 Vec::new(),
                 None,
                 ContinuationDetail::SharedFutex {
-                    location,
-                    waiter_key,
+                    location: target.location,
+                    waiter_key: target.waiter_key,
                     generation,
                     value,
                     index: None,
                 },
             )),
             DispatchOutcome::SharedFutexWaitv {
-                location,
-                waiter_key,
+                target,
                 generation,
                 value,
                 timeout,
@@ -1022,8 +1018,8 @@ impl BlockedContinuation {
                 Vec::new(),
                 None,
                 ContinuationDetail::SharedFutex {
-                    location,
-                    waiter_key,
+                    location: target.location,
+                    waiter_key: target.waiter_key,
                     generation,
                     value,
                     index: Some(index),
@@ -1050,71 +1046,63 @@ impl BlockedContinuation {
             DispatchOutcome::WaitOnFds {
                 fds,
                 timeout,
-                on_timeout,
                 sig_mask,
-            } => {
-                let registrations = own_wait_fds(&fds)?;
-                let fd_authority = exact_slot_authorities(&fds)?;
-                Self::WaitOnFds(new_state(
-                    deadline(timeout),
-                    Vec::new(),
-                    Some(sig_mask),
-                    ContinuationDetail::Fds {
-                        registrations,
-                        file_table: Arc::clone(&file_table),
-                        fd_authority,
-                        on_timeout,
-                        sig_mask,
-                    },
-                ))
-            }
-            DispatchOutcome::WaitOnFdsSelect {
-                fds,
-                timeout,
-                sig_mask,
-                clear_on_timeout,
-            } => {
-                let registrations = own_wait_fds(&fds)?;
-                let fd_authority = exact_slot_authorities(&fds)?;
-                let outputs = clear_on_timeout
-                    .into_iter()
-                    .map(|(address, len)| {
-                        GuestOutputRange::new(GuestVa(address), len, mm, asid_generation)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Self::WaitOnFdsSelect(new_state(
-                    deadline(timeout),
-                    outputs,
-                    Some(sig_mask),
-                    ContinuationDetail::Select {
-                        registrations,
-                        file_table: Arc::clone(&file_table),
-                        fd_authority,
-                        sig_mask,
-                    },
-                ))
-            }
-            DispatchOutcome::WaitOnPollFds {
-                fds,
-                timeout,
-                on_timeout,
-                sig_mask,
-            } => {
-                let registrations = own_wait_fds(&fds)?;
-                let fd_authority = exact_slot_authorities(&fds)?;
-                Self::WaitOnPollFds(new_state(
-                    deadline(timeout),
-                    Vec::new(),
-                    Some(sig_mask),
-                    ContinuationDetail::Fds {
-                        registrations,
-                        file_table,
-                        fd_authority,
-                        on_timeout,
-                        sig_mask,
-                    },
-                ))
-            }
+                completion,
+            } => match completion {
+                FdWaitCompletion::Fd { on_timeout } => {
+                    let registrations = own_wait_fds(&fds)?;
+                    let fd_authority = exact_slot_authorities(&fds)?;
+                    Self::WaitOnFds(new_state(
+                        deadline(timeout),
+                        Vec::new(),
+                        Some(sig_mask),
+                        ContinuationDetail::Fds {
+                            registrations,
+                            file_table: Arc::clone(&file_table),
+                            fd_authority,
+                            on_timeout,
+                            sig_mask,
+                        },
+                    ))
+                }
+                FdWaitCompletion::Select { clear_on_timeout } => {
+                    let registrations = own_wait_fds(&fds)?;
+                    let fd_authority = exact_slot_authorities(&fds)?;
+                    let outputs = clear_on_timeout
+                        .into_iter()
+                        .map(|(address, len)| {
+                            GuestOutputRange::new(GuestVa(address), len, mm, asid_generation)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Self::WaitOnFdsSelect(new_state(
+                        deadline(timeout),
+                        outputs,
+                        Some(sig_mask),
+                        ContinuationDetail::Select {
+                            registrations,
+                            file_table: Arc::clone(&file_table),
+                            fd_authority,
+                            sig_mask,
+                        },
+                    ))
+                }
+                FdWaitCompletion::Poll { on_timeout } => {
+                    let registrations = own_wait_fds(&fds)?;
+                    let fd_authority = exact_slot_authorities(&fds)?;
+                    Self::WaitOnPollFds(new_state(
+                        deadline(timeout),
+                        Vec::new(),
+                        Some(sig_mask),
+                        ContinuationDetail::Fds {
+                            registrations,
+                            file_table,
+                            fd_authority,
+                            on_timeout,
+                            sig_mask,
+                        },
+                    ))
+                }
+            },
             DispatchOutcome::BlockingHostWrite(write) => Self::BlockingHostWrite(new_state(
                 None,
                 Vec::new(),
@@ -5323,6 +5311,7 @@ mod tests {
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 
     use super::*;
+    use crate::dispatch::SharedFutexTarget;
 
     fn spawn_contained_test_child(test_name: &str, marker: &str) -> std::process::Child {
         std::process::Command::new(std::env::current_exe().expect("test executable"))
@@ -5426,8 +5415,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -6545,22 +6534,26 @@ mod tests {
                 index: 4,
             },
             ContinuationFamily::SharedFutexWait => DispatchOutcome::SharedFutexWait {
-                location: SharedFutexLocation::Direct {
-                    word: HostVa(0x3000),
+                target: SharedFutexTarget {
+                    location: SharedFutexLocation::Direct {
+                        word: HostVa(0x3000),
+                        waiter_key: 31,
+                    },
                     waiter_key: 31,
                 },
-                waiter_key: 31,
                 generation: carrick_thread::platform_futex::carrier_shared_futex_table()
                     .prepare_wait(31),
                 value: 7,
                 timeout: Some(Duration::from_secs(4)),
             },
             ContinuationFamily::SharedFutexWaitv => DispatchOutcome::SharedFutexWaitv {
-                location: SharedFutexLocation::Direct {
-                    word: HostVa(0x4000),
+                target: SharedFutexTarget {
+                    location: SharedFutexLocation::Direct {
+                        word: HostVa(0x4000),
+                        waiter_key: 41,
+                    },
                     waiter_key: 41,
                 },
-                waiter_key: 41,
                 generation: carrick_thread::platform_futex::carrier_shared_futex_table()
                     .prepare_wait(41),
                 value: 8,
@@ -6581,20 +6574,22 @@ mod tests {
             ContinuationFamily::WaitOnFds => DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: Some(Duration::from_secs(6)),
-                on_timeout: -11,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: -11 },
             },
-            ContinuationFamily::WaitOnFdsSelect => DispatchOutcome::WaitOnFdsSelect {
+            ContinuationFamily::WaitOnFdsSelect => DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: Some(Duration::from_secs(7)),
                 sig_mask: WaitSigMask::NONE,
-                clear_on_timeout: vec![(0x7000, 16), (0x7100, 8)],
+                completion: FdWaitCompletion::Select {
+                    clear_on_timeout: vec![(0x7000, 16), (0x7100, 8)],
+                },
             },
-            ContinuationFamily::WaitOnPollFds => DispatchOutcome::WaitOnPollFds {
+            ContinuationFamily::WaitOnPollFds => DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: Some(Duration::from_secs(8)),
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Poll { on_timeout: 0 },
             },
             ContinuationFamily::BlockingHostWrite => {
                 let fds = pipe_pair();
@@ -7180,11 +7175,11 @@ mod tests {
                 duration: Duration::from_secs(30),
                 remaining: Some(crate::dispatch::GuestPtr(0xa000)),
             },
-            ContinuationFamily::WaitOnPollFds => DispatchOutcome::WaitOnPollFds {
+            ContinuationFamily::WaitOnPollFds => DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: Some(Duration::from_secs(30)),
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Poll { on_timeout: 0 },
             },
             ContinuationFamily::FutexWait => {
                 let table = Arc::new(FutexTable::new());
@@ -7931,8 +7926,8 @@ mod tests {
                 fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)])
                     .with_slot_authorities(vec![authority]),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -7969,8 +7964,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::raw_one(fds[0], libc::POLLIN).with_slot_authorities(vec![authority]),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -8012,8 +8007,8 @@ mod tests {
                 DispatchOutcome::WaitOnFds {
                     fds,
                     timeout: None,
-                    on_timeout: 0,
                     sig_mask: WaitSigMask::NONE,
+                    completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 },
                 capture(&context, generation, ContinuationBackend::Hvpatch),
             )
@@ -8062,8 +8057,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::raw_one(fds[0], libc::POLLIN),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         );
@@ -8084,8 +8079,8 @@ mod tests {
                 DispatchOutcome::WaitOnFds {
                     fds,
                     timeout: None,
-                    on_timeout: 0,
                     sig_mask: WaitSigMask::NONE,
+                    completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 },
                 capture(&context, generation, ContinuationBackend::Hvpatch),
             );
@@ -8102,11 +8097,11 @@ mod tests {
         let generation = publish(&context, 0x556);
         let fds = WaitFds::raw_one(-1, 0).with_slot_authorities(vec![authority]);
         let continuation = BlockedContinuation::from_dispatch_outcome(
-            DispatchOutcome::WaitOnPollFds {
+            DispatchOutcome::WaitOnFds {
                 fds,
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Poll { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -8262,8 +8257,8 @@ mod tests {
                 fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)])
                     .with_slot_authorities(vec![authority]),
                 timeout: Some(Duration::from_secs(1)),
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -8791,8 +8786,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::Replace(SigSet::EMPTY),
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -8835,8 +8830,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -8874,8 +8869,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::Replace(SigSet::EMPTY),
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -8937,8 +8932,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -8976,8 +8971,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -9005,8 +9000,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -9062,8 +9057,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -9098,8 +9093,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -9277,8 +9272,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::Replace(SigSet::EMPTY),
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -9320,8 +9315,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::Additive(usr1_set),
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -9401,8 +9396,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -9508,8 +9503,8 @@ mod tests {
                     DispatchOutcome::WaitOnFds {
                         fds: WaitFds::empty(),
                         timeout: None,
-                        on_timeout: 0,
                         sig_mask: WaitSigMask::NONE,
+                        completion: FdWaitCompletion::Fd { on_timeout: 0 },
                     },
                     capture(&context, generation, ContinuationBackend::Hvpatch),
                 )
@@ -9610,8 +9605,8 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
                 timeout: None,
-                on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -9653,8 +9648,8 @@ mod tests {
                 DispatchOutcome::WaitOnFds {
                     fds: WaitFds::empty(),
                     timeout: None,
-                    on_timeout: 0,
                     sig_mask: WaitSigMask::NONE,
+                    completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 },
                 capture(&context, generation, ContinuationBackend::Hvpatch),
             )
@@ -11292,7 +11287,13 @@ mod tests {
             .dispatch(&context, req, &mut memory, &reporter)
             .unwrap();
         assert!(
-            matches!(&outcome, DispatchOutcome::WaitOnPollFds { .. }),
+            matches!(
+                &outcome,
+                DispatchOutcome::WaitOnFds {
+                    completion: FdWaitCompletion::Poll { .. },
+                    ..
+                }
+            ),
             "mixed ppoll must yield: {outcome:?}"
         );
         let generation = publish(&context, 0x982);
@@ -11484,7 +11485,13 @@ mod tests {
             .dispatch(&context, req, &mut memory, &reporter)
             .unwrap();
         assert!(
-            matches!(&outcome, DispatchOutcome::WaitOnPollFds { .. }),
+            matches!(
+                &outcome,
+                DispatchOutcome::WaitOnFds {
+                    completion: FdWaitCompletion::Poll { .. },
+                    ..
+                }
+            ),
             "nested epoll wait must yield: {outcome:?}"
         );
         let generation = publish(&context, 0x983);
@@ -11602,10 +11609,7 @@ mod tests {
         let outcome = dispatcher
             .dispatch(&context, req, &mut memory, &reporter)
             .unwrap();
-        assert!(matches!(
-            &outcome,
-            DispatchOutcome::WaitOnFds { .. } | DispatchOutcome::WaitOnPollFds { .. }
-        ));
+        assert!(matches!(&outcome, DispatchOutcome::WaitOnFds { .. }));
 
         let generation = publish(&context, 0x984);
         let mut continuation = BlockedContinuation::from_dispatch_outcome(
@@ -11972,7 +11976,13 @@ mod tests {
             .dispatch(&context, req, &mut memory, &reporter)
             .unwrap();
         assert!(
-            matches!(&outcome, DispatchOutcome::WaitOnPollFds { .. }),
+            matches!(
+                &outcome,
+                DispatchOutcome::WaitOnFds {
+                    completion: FdWaitCompletion::Poll { .. },
+                    ..
+                }
+            ),
             "nested 5-level epoll wait must yield: {outcome:?}"
         );
         let generation = publish(&context, 0x986);

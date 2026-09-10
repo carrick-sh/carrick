@@ -3282,14 +3282,19 @@ fn splice_synthetic_devices_pipe_capacity_and_nonblocking() {
     let DispatchOutcome::WaitOnFds {
         fds,
         timeout,
-        on_timeout,
         sig_mask,
+        completion,
     } = outcome
     else {
         panic!("expected blocking splice on full pipe to return WaitOnFds, got {outcome:?}");
     };
     assert_eq!(timeout, None);
-    assert_eq!(on_timeout, LINUX_EAGAIN.guest_retval());
+    assert_eq!(
+        completion,
+        FdWaitCompletion::Fd {
+            on_timeout: LINUX_EAGAIN.guest_retval()
+        }
+    );
     assert_eq!(sig_mask, carrick_abi::WaitSigMask::NONE);
     assert_eq!(
         fds.first(),
@@ -4582,15 +4587,20 @@ fn vmsplice_in_memory_pipe_writer_full_blocking_parks_on_write_readiness_pollin(
     let DispatchOutcome::WaitOnFds {
         fds,
         timeout,
-        on_timeout,
         sig_mask,
+        completion,
     } = outcome
     else {
         panic!("expected blocking vmsplice on full pipe to park on WaitOnFds, got {outcome:?}");
     };
 
     assert_eq!(timeout, None);
-    assert_eq!(on_timeout, LINUX_EAGAIN.guest_retval());
+    assert_eq!(
+        completion,
+        FdWaitCompletion::Fd {
+            on_timeout: LINUX_EAGAIN.guest_retval()
+        }
+    );
     assert_eq!(sig_mask, carrick_abi::WaitSigMask::NONE);
     assert_eq!(
         fds.first(),
@@ -4719,11 +4729,16 @@ fn assert_wait_on(outcome: DispatchOutcome, expected_fd: i32, events: i16) {
         DispatchOutcome::WaitOnFds {
             fds,
             timeout,
-            on_timeout,
             sig_mask,
+            completion,
         } => {
             assert_eq!(timeout, None);
-            assert_eq!(on_timeout, LINUX_EAGAIN.guest_retval());
+            assert_eq!(
+                completion,
+                FdWaitCompletion::Fd {
+                    on_timeout: LINUX_EAGAIN.guest_retval()
+                }
+            );
             assert_eq!(sig_mask, carrick_abi::WaitSigMask::NONE);
             assert_eq!(fds.first(), Some((expected_fd, events)));
         }
@@ -5888,7 +5903,12 @@ fn pselect6_parks_full_pipe_write_end_on_readiness_pipe_pollin() {
         SYS_PSELECT6,
         [write_fd + 1, 0, writefds_addr, 0, timeout_addr, 0],
     );
-    let DispatchOutcome::WaitOnFdsSelect { fds, .. } = outcome else {
+    let DispatchOutcome::WaitOnFds {
+        fds,
+        completion: FdWaitCompletion::Select { .. },
+        ..
+    } = outcome
+    else {
         panic!("expected select on a full pipe to park, got {outcome:?}");
     };
     assert_eq!(

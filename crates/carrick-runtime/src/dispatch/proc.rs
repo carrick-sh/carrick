@@ -2401,8 +2401,7 @@ impl SyscallDispatcher {
                         // sched_yield) or KVM's host SYS_futex is reached
                         // uniformly. The loop completes with the count woken.
                         return Ok(DispatchOutcome::SharedFutexWake {
-                            location,
-                            waiter_key: location.waiter_key(),
+                            target: SharedFutexTarget::new(location, location.waiter_key()),
                             count: value,
                         });
                     }
@@ -2453,8 +2452,7 @@ impl SyscallDispatcher {
                     };
                     if let Some(location) = shared_location {
                         return Ok(DispatchOutcome::SharedFutexWait {
-                            location,
-                            waiter_key: location.waiter_key(),
+                            target: SharedFutexTarget::new(location, location.waiter_key()),
                             generation:
                                 carrick_thread::platform_futex::carrier_shared_futex_table()
                                     .prepare_wait(location.waiter_key() as u64),
@@ -2496,10 +2494,8 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         };
                         return Ok(DispatchOutcome::SharedFutexRequeue {
-                            from: location,
-                            from_key: location.waiter_key(),
-                            to: to_location,
-                            to_key: to_location.waiter_key(),
+                            from: SharedFutexTarget::new(location, location.waiter_key()),
+                            to: SharedFutexTarget::new(to_location, to_location.waiter_key()),
                             wake: nr_wake,
                             requeue: nr_requeue,
                         });
@@ -3506,11 +3502,11 @@ impl SyscallDispatcher {
                             Ok(fds) => fds,
                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         };
-                        return Ok(DispatchOutcome::WaitOnPollFds {
+                        return Ok(DispatchOutcome::WaitOnFds {
                             fds,
                             timeout: None,
-                            on_timeout: 0,
                             sig_mask: carrick_abi::WaitSigMask::NONE,
+                            completion: FdWaitCompletion::Poll { on_timeout: 0 },
                         });
                     }
                 if transport == PtraceTransport::VirtualNative {

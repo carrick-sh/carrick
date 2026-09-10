@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use super::DispatchOutcome;
-use crate::dispatch::WaitFds;
 use crate::dispatch::fd_table::{HostFdRef, make_readiness_pipe};
+use crate::dispatch::{FdWaitCompletion, WaitFds};
 
 pub(crate) const DEFAULT_PIPE_CAPACITY: usize = 65536; // 64 KiB = 16 Linux pages
 pub(crate) const MAX_PIPE_CAPACITY: usize = 1048576; // 1 MiB (/proc/sys/fs/pipe-max-size)
@@ -244,8 +244,10 @@ fn wait_for_pipe_readable_locked(
         DispatchOutcome::WaitOnFds {
             fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
             timeout: None,
-            on_timeout: LINUX_EAGAIN.guest_retval(),
             sig_mask: carrick_abi::WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd {
+                on_timeout: LINUX_EAGAIN.guest_retval(),
+            },
         }
     } else {
         DispatchOutcome::errno(LINUX_EMFILE)
@@ -473,8 +475,10 @@ pub(crate) fn write_pipe(
             return DispatchOutcome::WaitOnFds {
                 fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
                 timeout: None,
-                on_timeout: LINUX_EAGAIN.guest_retval(),
                 sig_mask: carrick_abi::WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd {
+                    on_timeout: LINUX_EAGAIN.guest_retval(),
+                },
             };
         }
 
@@ -697,8 +701,10 @@ mod tests {
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
                 timeout: None,
-                on_timeout: LINUX_EAGAIN.guest_retval(),
                 sig_mask: carrick_abi::WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd {
+                    on_timeout: LINUX_EAGAIN.guest_retval(),
+                },
             }
         );
     }

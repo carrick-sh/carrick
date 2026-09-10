@@ -1855,8 +1855,10 @@ impl SyscallDispatcher {
                     DispatchOutcome::WaitOnFds {
                         fds,
                         timeout,
-                        on_timeout: LINUX_EAGAIN.guest_retval(),
                         sig_mask: carrick_abi::WaitSigMask::NONE,
+                        completion: FdWaitCompletion::Fd {
+                            on_timeout: LINUX_EAGAIN.guest_retval(),
+                        },
                     }
                 }
             }
@@ -2655,15 +2657,15 @@ impl SyscallDispatcher {
             Ok(fds) => fds,
             Err(errno) => return DispatchOutcome::errno(errno),
         };
-        DispatchOutcome::WaitOnPollFds {
+        DispatchOutcome::WaitOnFds {
             // Synthetic netlink sockets have no host fd to poll. A negative
             // pollfd is ignored by poll(2); enqueue_netlink_message publishes
             // queue state before waking the registered dispatcher-aware waiter,
             // which then re-samples this queue without a periodic timer.
             fds,
             timeout: None,
-            on_timeout: 0,
             sig_mask: carrick_abi::WaitSigMask::NONE,
+            completion: FdWaitCompletion::Poll { on_timeout: 0 },
         }
     }
 
@@ -3090,8 +3092,10 @@ impl SyscallDispatcher {
             return DispatchOutcome::WaitOnFds {
                 fds,
                 timeout: None,
-                on_timeout: LINUX_EINPROGRESS.guest_retval(),
                 sig_mask: carrick_abi::WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd {
+                    on_timeout: LINUX_EINPROGRESS.guest_retval(),
+                },
             };
         }
         DispatchOutcome::errno(e)
@@ -6063,11 +6067,11 @@ impl SyscallDispatcher {
                         Ok(fds) => fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
-                    return Ok(DispatchOutcome::WaitOnPollFds {
+                    return Ok(DispatchOutcome::WaitOnFds {
                         fds,
                         timeout,
-                        on_timeout: 0,
                         sig_mask,
+                        completion: FdWaitCompletion::Poll { on_timeout: 0 },
                     });
                 }
                 if !has_interests {
@@ -6093,11 +6097,11 @@ impl SyscallDispatcher {
                         Ok(fds) => fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
-                    return Ok(DispatchOutcome::WaitOnPollFds {
+                    return Ok(DispatchOutcome::WaitOnFds {
                         fds,
                         timeout,
-                        on_timeout: 0,
                         sig_mask,
+                        completion: FdWaitCompletion::Poll { on_timeout: 0 },
                     });
                 }
                 crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 1);
@@ -6122,11 +6126,11 @@ impl SyscallDispatcher {
                     Ok(fds) => fds,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
-                return Ok(DispatchOutcome::WaitOnPollFds {
+                return Ok(DispatchOutcome::WaitOnFds {
                     fds,
                     timeout,
-                    on_timeout: 0,
                     sig_mask,
+                    completion: FdWaitCompletion::Poll { on_timeout: 0 },
                 });
             }
 
@@ -6985,8 +6989,8 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::WaitOnFds {
                     fds: WaitFds::empty(),
                     timeout,
-                    on_timeout: 0,
                     sig_mask,
+                    completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 });
             } else if let Some(host_fds) = all_host {
                 let mut pollfds: Vec<libc::pollfd> = host_fds
@@ -7004,7 +7008,7 @@ impl SyscallDispatcher {
                 // between dispatches, not a host signal that interrupts poll —
                 // so select could never return EINTR. Instead, if nothing is
                 // ready and the caller wants to wait, hand off to the runtime's
-                // signal-interruptible waiter via WaitOnFdsSelect (mirrors how
+                // signal-interruptible waiter via WaitOnFds (mirrors how
                 // ppoll uses WaitOnFds).
                 let n = unsafe {
                     libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 0)
@@ -7044,11 +7048,11 @@ impl SyscallDispatcher {
                         Ok(wait_fds) => wait_fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
-                    return Ok(DispatchOutcome::WaitOnFdsSelect {
+                    return Ok(DispatchOutcome::WaitOnFds {
                         fds: wait_fds,
                         timeout,
                         sig_mask,
-                        clear_on_timeout,
+                        completion: FdWaitCompletion::Select { clear_on_timeout },
                     });
                 }
                 for (i, (slot, p)) in revents.iter_mut().zip(pollfds.iter()).enumerate() {
@@ -7118,11 +7122,11 @@ impl SyscallDispatcher {
                         Ok(wait_fds) => wait_fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
-                    return Ok(DispatchOutcome::WaitOnFdsSelect {
+                    return Ok(DispatchOutcome::WaitOnFds {
                         fds: wait_fds,
                         timeout,
                         sig_mask,
-                        clear_on_timeout,
+                        completion: FdWaitCompletion::Select { clear_on_timeout },
                     });
                 }
             }
@@ -7448,8 +7452,8 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::WaitOnFds {
                     fds: wait_fds,
                     timeout,
-                    on_timeout: 0,
                     sig_mask,
+                    completion: FdWaitCompletion::Fd { on_timeout: 0 },
                 });
             }
 
@@ -7501,11 +7505,11 @@ impl SyscallDispatcher {
                 Ok(wait_fds) => wait_fds,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            return Ok(DispatchOutcome::WaitOnPollFds {
+            return Ok(DispatchOutcome::WaitOnFds {
                 fds: wait_fds,
                 timeout,
-                on_timeout: 0,
                 sig_mask,
+                completion: FdWaitCompletion::Poll { on_timeout: 0 },
             });
         }
 
@@ -8366,8 +8370,10 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::WaitOnFds {
                     fds,
                     timeout: None,
-                    on_timeout: LINUX_EINPROGRESS.guest_retval(),
                     sig_mask: carrick_abi::WaitSigMask::NONE,
+                    completion: FdWaitCompletion::Fd {
+                        on_timeout: LINUX_EINPROGRESS.guest_retval(),
+                    },
                 });
             }
             if is_unspec_disconnect && (e == LINUX_EAFNOSUPPORT || e == LINUX_EINVAL) {
@@ -11719,20 +11725,21 @@ mod nested_epoll_readiness_tests {
             DispatchOutcome::WaitOnFds {
                 fds,
                 timeout,
-                on_timeout,
-                ..
-            }
-            | DispatchOutcome::WaitOnPollFds {
-                fds,
-                timeout,
-                on_timeout,
+                completion,
                 ..
             } => {
                 assert_eq!(*timeout, Some(std::time::Duration::from_millis(500)));
-                assert_eq!(*on_timeout, 0);
+                match completion {
+                    FdWaitCompletion::Fd { on_timeout } | FdWaitCompletion::Poll { on_timeout } => {
+                        assert_eq!(*on_timeout, 0);
+                    }
+                    FdWaitCompletion::Select { .. } => {
+                        panic!("unexpected Select completion for ppoll");
+                    }
+                }
                 assert!(!fds.is_empty(), "WaitFds must contain host poll target");
             }
-            other => panic!("expected WaitOnFds / WaitOnPollFds outcome, got {other:?}"),
+            other => panic!("expected WaitOnFds outcome, got {other:?}"),
         }
 
         // Write to eventfd (0 -> 1)

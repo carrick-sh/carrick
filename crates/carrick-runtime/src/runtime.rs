@@ -99,8 +99,8 @@ use carrick_guest_mem::{Gpa, GuestVa, HostVa};
 
 use crate::compat::CompatReporter;
 use crate::dispatch::{
-    CurrentMmMemory, DispatchOutcome, GuestMemory, MemoryError, PreparedDispatch, PreparedSyscall,
-    SyscallCompletionToken, SyscallDispatcher, SyscallRequest,
+    CurrentMmMemory, DispatchOutcome, FdWaitCompletion, GuestMemory, MemoryError, PreparedDispatch,
+    PreparedSyscall, SyscallCompletionToken, SyscallDispatcher, SyscallRequest,
 };
 use crate::linux_abi::LinuxErrno;
 use crate::memory::{AddressSpace, AddressSpaceError};
@@ -1106,8 +1106,6 @@ where
             DispatchOutcome::WaitOnFds { .. }
             | DispatchOutcome::BlockingHostWrite(_)
             | DispatchOutcome::BlockingRecordLock(_)
-            | DispatchOutcome::WaitOnFdsSelect { .. }
-            | DispatchOutcome::WaitOnPollFds { .. }
             | DispatchOutcome::WaitOnProcExit { .. }
             | DispatchOutcome::WaitOnProcState { .. }
             | DispatchOutcome::WaitOnHvpatchChild { .. }
@@ -1355,8 +1353,7 @@ where
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::SharedFutexWait {
-                location,
-                waiter_key,
+                target,
                 generation,
                 value,
                 timeout,
@@ -1373,14 +1370,19 @@ where
                 let retval = if prewoken {
                     0
                 } else {
-                    shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid)
+                    shared_futex_wait(
+                        target.location.wait_addr(),
+                        target.waiter_key,
+                        value,
+                        timeout,
+                        this_tid,
+                    )
                 };
                 complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::SharedFutexWaitv {
-                location,
-                waiter_key,
+                target,
                 generation,
                 value,
                 timeout,
@@ -1391,7 +1393,13 @@ where
                 let retval = if prewoken {
                     0
                 } else {
-                    shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid)
+                    shared_futex_wait(
+                        target.location.wait_addr(),
+                        target.waiter_key,
+                        value,
+                        timeout,
+                        this_tid,
+                    )
                 };
                 let retval = if retval == 0 { index } else { retval };
                 complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
@@ -1479,36 +1487,39 @@ where
                     }
                 }
             },
-            DispatchOutcome::SharedFutexWake {
-                location,
-                waiter_key,
-                count,
-            } => {
+            DispatchOutcome::SharedFutexWake { target, count } => {
                 // Cross-process MAP_SHARED futex wake from a single-threaded
                 // guest (LTP tst_checkpoint_wake). Same __ulock one-at-a-time +
                 // sched_yield as the threaded loop's PlatformFutex::shared_wake.
-                let retval = shared_futex_wake(location.wait_addr().raw(), waiter_key, count);
+                let retval =
+                    shared_futex_wake(target.location.wait_addr().raw(), target.waiter_key, count);
                 complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::SharedFutexRequeue {
                 from,
-                from_key,
                 to,
-                to_key,
                 wake,
                 requeue,
             } => {
-                trace_shared_futex_requeue(0, from_key, to_key, wake, requeue, 0, 0);
+                trace_shared_futex_requeue(0, from.waiter_key, to.waiter_key, wake, requeue, 0, 0);
                 let (woken, requeued) = crate::ulock::requeue_counted(
-                    from.wait_addr().raw(),
-                    from_key,
-                    to.wait_addr().raw(),
-                    to_key,
+                    from.location.wait_addr().raw(),
+                    from.waiter_key,
+                    to.location.wait_addr().raw(),
+                    to.waiter_key,
                     wake,
                     requeue,
                 );
-                trace_shared_futex_requeue(1, from_key, to_key, wake, requeue, woken, requeued);
+                trace_shared_futex_requeue(
+                    1,
+                    from.waiter_key,
+                    to.waiter_key,
+                    wake,
+                    requeue,
+                    woken,
+                    requeued,
+                );
                 let retval = i64::from(woken + requeued);
                 complete_single_threaded_syscall(runtime, &mut completion, &reporter, retval)?;
                 last_syscall_retval = Some(retval);
@@ -1714,92 +1725,80 @@ where
             DispatchOutcome::WaitOnFds {
                 fds,
                 timeout,
-                on_timeout,
                 sig_mask,
-            } => {
-                waiter.ensure_full();
-                match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
-                    WaitResult::Ready => continue,
-                    WaitResult::TimedOut => {
-                        return Ok(DispatchOutcome::Returned { value: on_timeout });
-                    }
-                    WaitResult::Interrupted => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        });
-                    }
-                    // Could not pin a watched fd (host fd table exhausted). The
-                    // errno is already Linux; surface it verbatim.
-                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
-                }
-            }
-            DispatchOutcome::WaitOnFdsSelect {
-                fds,
-                timeout,
-                sig_mask,
-                clear_on_timeout,
-            } => {
-                waiter.ensure_full();
-                match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
-                    // A fd became ready -> re-dispatch; the handler re-reads the
-                    // (untouched) input sets and reports the now-ready fds.
-                    WaitResult::Ready => continue,
-                    // Timeout -> select returns 0 with the fd-sets zeroed. The
-                    // handler left them intact (so Ready/EINTR are correct), so
-                    // zero them here before completing.
-                    WaitResult::TimedOut => {
-                        for (addr, len) in &clear_on_timeout {
-                            let _ = memory.zero_guest_range(*addr, *len);
-                        }
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    // Signal interrupt -> EINTR; Linux leaves the fd-sets
-                    // unmodified on EINTR, and the handler already did.
-                    WaitResult::Interrupted => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        });
-                    }
-                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
-                }
-            }
-            DispatchOutcome::WaitOnPollFds {
-                fds,
-                timeout,
-                on_timeout,
-                sig_mask,
-            } => {
-                waiter.ensure_full();
-                let timeout = match timeout {
-                    Some(duration) => {
-                        let deadline =
-                            *poll_deadline.get_or_insert_with(|| Instant::now() + duration);
-                        let now = Instant::now();
-                        if now >= deadline {
+                completion,
+            } => match completion {
+                FdWaitCompletion::Fd { on_timeout } => {
+                    waiter.ensure_full();
+                    match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+                        WaitResult::Ready => continue,
+                        WaitResult::TimedOut => {
                             return Ok(DispatchOutcome::Returned { value: on_timeout });
                         }
-                        Some(deadline - now)
+                        WaitResult::Interrupted => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
+                        }
+                        WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                     }
-                    None => {
-                        poll_deadline = None;
-                        None
-                    }
-                };
-                match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
-                    WaitResult::Ready => continue,
-                    WaitResult::TimedOut => {
-                        return Ok(DispatchOutcome::Returned { value: on_timeout });
-                    }
-                    WaitResult::Interrupted => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        });
-                    }
-                    // Could not pin a watched fd (host fd table exhausted). The
-                    // errno is already Linux; surface it verbatim.
-                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
-            }
+                FdWaitCompletion::Select { clear_on_timeout } => {
+                    waiter.ensure_full();
+                    match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
+                        // A fd became ready -> re-dispatch; the handler re-reads the
+                        // (untouched) input sets and reports the now-ready fds.
+                        WaitResult::Ready => continue,
+                        // Timeout -> select returns 0 with the fd-sets zeroed. The
+                        // handler left them intact (so Ready/EINTR are correct), so
+                        // zero them here before completing.
+                        WaitResult::TimedOut => {
+                            for (addr, len) in &clear_on_timeout {
+                                let _ = memory.zero_guest_range(*addr, *len);
+                            }
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                        // Signal interrupt -> EINTR; Linux leaves the fd-sets
+                        // unmodified on EINTR, and the handler already did.
+                        WaitResult::Interrupted => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
+                        }
+                        WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    }
+                }
+                FdWaitCompletion::Poll { on_timeout } => {
+                    waiter.ensure_full();
+                    let timeout = match timeout {
+                        Some(duration) => {
+                            let deadline =
+                                *poll_deadline.get_or_insert_with(|| Instant::now() + duration);
+                            let now = Instant::now();
+                            if now >= deadline {
+                                return Ok(DispatchOutcome::Returned { value: on_timeout });
+                            }
+                            Some(deadline - now)
+                        }
+                        None => {
+                            poll_deadline = None;
+                            None
+                        }
+                    };
+                    match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
+                        WaitResult::Ready => continue,
+                        WaitResult::TimedOut => {
+                            return Ok(DispatchOutcome::Returned { value: on_timeout });
+                        }
+                        WaitResult::Interrupted => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
+                        }
+                        WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    }
+                }
+            },
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                 waiter.ensure_full();
                 match waiter.wait_proc_exit(pid, sig_mask.block_mask()) {

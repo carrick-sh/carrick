@@ -5344,11 +5344,13 @@ mod tests {
             .expect("recapture futex waiter");
         let continuation = BlockedContinuation::from_dispatch_outcome(
             crate::dispatch::DispatchOutcome::SharedFutexWait {
-                location: SharedFutexLocation::Direct {
-                    word: HostVa(waiter_key),
+                target: crate::dispatch::SharedFutexTarget::new(
+                    SharedFutexLocation::Direct {
+                        word: HostVa(waiter_key),
+                        waiter_key,
+                    },
                     waiter_key,
-                },
-                waiter_key,
+                ),
                 generation: carrier_shared_futex_table().prepare_wait(waiter_key as u64),
                 value: 0,
                 timeout: None,

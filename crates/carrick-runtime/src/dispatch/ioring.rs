@@ -1128,8 +1128,8 @@ impl SyscallDispatcher {
         DispatchOutcome::WaitOnFds {
             fds,
             timeout: None,
-            on_timeout: 0,
             sig_mask: carrick_abi::WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
         }
     }
 
