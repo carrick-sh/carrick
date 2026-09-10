@@ -48,7 +48,8 @@
 //! and `xattr`.
 use super::*;
 use crate::linux_abi::{
-    LINUX_ELOOP, LINUX_ENOSPC, LINUX_ENXIO, LINUX_SEEK_DATA, LINUX_SEEK_HOLE, LINUX_TIOCSIG,
+    LINUX_ELOOP, LINUX_ENOSPC, LINUX_ENXIO, LINUX_EOVERFLOW, LINUX_SEEK_DATA, LINUX_SEEK_HOLE,
+    LINUX_TIOCSIG,
 };
 use crate::vfs::PtyRole;
 
@@ -638,9 +639,9 @@ fn tee_host_passthrough(
             flags.bits() as libc::c_uint,
         )
     };
-    Ok(DispatchOutcome::Returned {
-        value: n.host_syscall_errno()? as i64,
-    })
+    Ok(DispatchOutcome::returned_len_or_errno(
+        n.host_syscall_errno()?,
+    ))
 }
 
 /// Same-file identity used for F_SETLEASE conflict accounting (see
@@ -2455,7 +2456,7 @@ impl SyscallDispatcher {
                     linux_fd_flags_from_open_flags(flags),
                 );
                 return match self.install_fd_at_or_above(0, open_file) {
-                    Ok(fd) => Ok(DispatchOutcome::Returned { value: fd as i64 }),
+                    Ok(fd) => Ok(DispatchOutcome::returned_i32(fd)),
                     Err(_) => Ok(DispatchOutcome::errno(linux_errno::EMFILE)),
                 };
             }
@@ -2631,7 +2632,7 @@ impl SyscallDispatcher {
                         self.record_fd_open_path(fd, path.clone());
                     }
                 }
-                return Ok(DispatchOutcome::Returned { value: fd as i64 });
+                return Ok(DispatchOutcome::returned_i32(fd));
             }
             VfsOpenAttempt::Errno(errno) => {
                 return Ok(DispatchOutcome::errno(errno));
@@ -2777,7 +2778,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
                     };
                     self.record_fd_open_path(fd, path.clone());
-                    return Ok(DispatchOutcome::Returned { value: fd as i64 });
+                    return Ok(DispatchOutcome::returned_i32(fd));
                 }
                 // The non-blocking open failed — most commonly O_WRONLY with no
                 // reader (ENXIO, the correct O_NONBLOCK errno).
@@ -3101,7 +3102,7 @@ impl SyscallDispatcher {
         if inotify_created {
             self.dnotify_child(context, &record_path, LinuxDnotifyMask::CREATE);
         }
-        Ok(DispatchOutcome::Returned { value: fd as i64 })
+        Ok(DispatchOutcome::returned_i32(fd))
     }
 
     // === Trusted-dirfd fast lane (`--fs host`) ===
@@ -3251,7 +3252,7 @@ impl SyscallDispatcher {
             return Some(DispatchOutcome::errno(linux_errno::EMFILE));
         };
         self.record_fd_open_path(fd, path.to_owned());
-        Some(DispatchOutcome::Returned { value: fd as i64 })
+        Some(DispatchOutcome::returned_i32(fd))
     }
 
     /// `--fs host` trusted directory open — the lane SEED. A plain read-only
@@ -3358,7 +3359,7 @@ impl SyscallDispatcher {
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
             return Some(DispatchOutcome::errno(linux_errno::EMFILE));
         };
-        Some(DispatchOutcome::Returned { value: fd as i64 })
+        Some(DispatchOutcome::returned_i32(fd))
     }
 
     pub(super) fn try_dentry_fast_open(
@@ -3416,7 +3417,7 @@ impl SyscallDispatcher {
                 );
                 if let Ok(fd) = self.install_fd_at_or_above(0, open_file) {
                     self.record_fd_open_path(fd, canonical_path);
-                    Some(DispatchOutcome::Returned { value: fd as i64 })
+                    Some(DispatchOutcome::returned_i32(fd))
                 } else {
                     Some(DispatchOutcome::errno(linux_errno::EMFILE))
                 }
@@ -3572,9 +3573,7 @@ impl SyscallDispatcher {
             let Ok(new_fd) = self.install_fd_at_or_above(0, open_file) else {
                 return Some(DispatchOutcome::errno(linux_errno::EMFILE));
             };
-            return Some(DispatchOutcome::Returned {
-                value: new_fd as i64,
-            });
+            return Some(DispatchOutcome::returned_i32(new_fd));
         }
         if typ != libc::S_IFREG as u32 {
             // FIFO (must route through the non-blocking FIFO machinery),
@@ -3636,9 +3635,7 @@ impl SyscallDispatcher {
         // readlink(/proc/self/fd/N) recovers the guest path from
         // fd_open_paths for host-fd-backed descriptions (slow-arm parity).
         self.record_fd_open_path(new_fd, full);
-        Some(DispatchOutcome::Returned {
-            value: new_fd as i64,
-        })
+        Some(DispatchOutcome::returned_i32(new_fd))
     }
 
     /// Single-component `newfstatat`/`statx` through a TRUSTED host dirfd:
@@ -4029,7 +4026,7 @@ impl SyscallDispatcher {
             linux_fd_flags_from_open_flags(flags),
         );
         match self.install_fd_at_or_above(0, open_file) {
-            Ok(fd) => DispatchOutcome::Returned { value: fd as i64 },
+            Ok(fd) => DispatchOutcome::returned_i32(fd),
             Err(_) => DispatchOutcome::errno(linux_errno::EMFILE),
         }
     }
@@ -4160,9 +4157,7 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(linux_errno::EMFILE);
             }
         };
-        DispatchOutcome::Returned {
-            value: new_fd as i64,
-        }
+        DispatchOutcome::returned_i32(new_fd)
     }
 
     fn duplicate_fd_to(
@@ -4182,9 +4177,7 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(LINUX_EINVAL);
             }
             return if self.fd_is_valid(old_fd) {
-                DispatchOutcome::Returned {
-                    value: new_fd as i64,
-                }
+                DispatchOutcome::returned_i32(new_fd)
             } else {
                 DispatchOutcome::errno(LINUX_EBADF)
             };
@@ -4271,9 +4264,7 @@ impl SyscallDispatcher {
             self.close_open_file_and_free_pty(&replaced);
         }
         self.clear_closed_stdio(new_fd);
-        DispatchOutcome::Returned {
-            value: new_fd as i64,
-        }
+        DispatchOutcome::returned_i32(new_fd)
     }
 
     /// Try to satisfy an open via the VFS mount table. Returns
@@ -5078,9 +5069,9 @@ impl SyscallDispatcher {
                     out_nonblocking,
                 ))
             }
-            pipe::InMemoryTeeOutcome::Transferred(written) => Ok(DispatchOutcome::Returned {
-                value: written as i64,
-            }),
+            pipe::InMemoryTeeOutcome::Transferred(written) => {
+                Ok(DispatchOutcome::returned_len_or_errno(written))
+            }
         }
     }
 
@@ -5200,9 +5191,7 @@ impl SyscallDispatcher {
                 _ => break,
             }
         }
-        Ok(DispatchOutcome::Returned {
-            value: written as i64,
-        })
+        Ok(DispatchOutcome::returned_len_or_errno(written))
     }
 
     fn host_pipe_splice_staging_target(&self, fd: i32) -> Option<(i32, usize)> {
@@ -5698,9 +5687,7 @@ impl SyscallDispatcher {
                     2 => self.io.stderr.lock().extend_from_slice(bytes),
                     _ => return DispatchOutcome::errno(LINUX_EBADF),
                 }
-                DispatchOutcome::Returned {
-                    value: bytes.len() as i64,
-                }
+                DispatchOutcome::returned_len_or_errno(bytes.len())
             }
             // BLOCKING-IO-OK: the inherited stdout/stderr (the user's
             // tty/pipe); blocking here is the correct backpressure.
@@ -5720,9 +5707,7 @@ impl SyscallDispatcher {
                 // UFCS: `std::io::Write` is not imported anywhere in this file
                 // (no `use std::io` at all) and one call does not earn one.
                 match std::io::Write::write_all(&mut *writer, bytes) {
-                    Ok(()) => DispatchOutcome::Returned {
-                        value: bytes.len() as i64,
-                    },
+                    Ok(()) => DispatchOutcome::returned_len_or_errno(bytes.len()),
                     Err(error) => DispatchOutcome::errno(crate::host_to_linux_errno(
                         error.raw_os_error().unwrap_or(libc::EIO),
                     )),
@@ -5782,7 +5767,7 @@ impl SyscallDispatcher {
             }
             break;
         }
-        DispatchOutcome::Returned { value: off as i64 }
+        DispatchOutcome::returned_len_or_errno(off)
     }
 
     fn read_host_pipe_iovecs<M: CurrentMmMemory>(
@@ -5864,9 +5849,7 @@ impl SyscallDispatcher {
                     {
                         DispatchOutcome::errno(LINUX_EINVAL)
                     } else {
-                        DispatchOutcome::Returned {
-                            value: bytes.len() as i64,
-                        }
+                        DispatchOutcome::returned_len_or_errno(bytes.len())
                     };
                 }
             }
@@ -5917,7 +5900,7 @@ impl SyscallDispatcher {
         {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
-        DispatchOutcome::Returned { value: n as i64 }
+        DispatchOutcome::returned_len_or_errno(n)
     }
 
     /// Pull up to `count` bytes off a `splice(2)` SOURCE pipe.
@@ -6159,16 +6142,13 @@ impl SyscallDispatcher {
                         } else {
                             open_file.description.common().status_flags()
                         };
-                        return write_pipe(
-                            bytes,
-                            pipe,
-                            flags,
-                            fd,
-                            self.captured_slot_authority(fd)
-                                .map(WaitFdAuthority::logical)
-                                .unwrap_or_else(|| std::process::abort()),
-                            || false,
-                        );
+                        let Some(wait_authority) = self
+                            .captured_slot_authority(fd)
+                            .map(WaitFdAuthority::logical)
+                        else {
+                            return DispatchOutcome::errno(LINUX_EBADF);
+                        };
+                        return write_pipe(bytes, pipe, flags, fd, wait_authority, || false);
                     }
                     OpenDescription::HostPipe {
                         base,
@@ -6221,10 +6201,14 @@ impl SyscallDispatcher {
                                 (bytes.to_vec(), 0)
                             };
                             if bytes_to_write.is_empty() && consumed_count > 0 {
-                                return DispatchOutcome::Returned {
-                                    value: consumed_count as i64,
-                                };
+                                return DispatchOutcome::returned_len_or_errno(consumed_count);
                             }
+                            let Some(wait_authority) = self
+                                .captured_slot_authority(fd)
+                                .map(WaitFdAuthority::logical)
+                            else {
+                                return DispatchOutcome::errno(LINUX_EBADF);
+                            };
                             let res = write_host_pipe_owned(
                                 bytes_to_write,
                                 HostPipeWriteTarget {
@@ -6241,21 +6225,22 @@ impl SyscallDispatcher {
                                     ),
                                     tid,
                                     sigpipe_on_epipe: true,
-                                    authority: self
-                                        .captured_slot_authority(fd)
-                                        .map(WaitFdAuthority::logical)
-                                        .unwrap_or_else(|| std::process::abort()),
+                                    authority: wait_authority,
                                 },
                             );
                             match res {
-                                DispatchOutcome::Returned { value } => DispatchOutcome::Returned {
-                                    value: value + consumed_count as i64,
-                                },
+                                DispatchOutcome::Returned { value } => {
+                                    let total = usize::try_from(value)
+                                        .ok()
+                                        .and_then(|v| v.checked_add(consumed_count));
+                                    match total {
+                                        Some(t) => DispatchOutcome::returned_len_or_errno(t),
+                                        None => DispatchOutcome::errno(LINUX_EOVERFLOW),
+                                    }
+                                }
                                 other => {
                                     if consumed_count > 0 {
-                                        DispatchOutcome::Returned {
-                                            value: consumed_count as i64,
-                                        }
+                                        DispatchOutcome::returned_len_or_errno(consumed_count)
                                     } else {
                                         other
                                     }
@@ -6264,6 +6249,12 @@ impl SyscallDispatcher {
                         };
                     }
                     OpenDescription::HostSocket { host_fd, .. } => {
+                        let Some(wait_authority) = self
+                            .captured_slot_authority(fd)
+                            .map(WaitFdAuthority::logical)
+                        else {
+                            return DispatchOutcome::errno(LINUX_EBADF);
+                        };
                         return write_host_pipe_owned(
                             bytes.to_vec(),
                             HostPipeWriteTarget {
@@ -6274,10 +6265,7 @@ impl SyscallDispatcher {
                                 pipe_state: None,
                                 tid,
                                 sigpipe_on_epipe: false,
-                                authority: self
-                                    .captured_slot_authority(fd)
-                                    .map(WaitFdAuthority::logical)
-                                    .unwrap_or_else(|| std::process::abort()),
+                                authority: wait_authority,
                             },
                         );
                     }
@@ -6286,9 +6274,7 @@ impl SyscallDispatcher {
                         return match socket.send_stream(bytes, Vec::new()) {
                             Ok(written) => {
                                 self.notify_inmem_epoll();
-                                DispatchOutcome::Returned {
-                                    value: written as i64,
-                                }
+                                DispatchOutcome::returned_len_or_errno(written)
                             }
                             Err(errno) => DispatchOutcome::errno(errno),
                         };
@@ -6327,6 +6313,12 @@ impl SyscallDispatcher {
                                 };
                             }
                         }
+                        let Some(wait_authority) = self
+                            .captured_slot_authority(fd)
+                            .map(WaitFdAuthority::logical)
+                        else {
+                            return DispatchOutcome::errno(LINUX_EBADF);
+                        };
                         return write_host_pipe(
                             bytes,
                             HostPipeWriteTarget {
@@ -6337,10 +6329,7 @@ impl SyscallDispatcher {
                                 pipe_state: None,
                                 tid,
                                 sigpipe_on_epipe: false,
-                                authority: self
-                                    .captured_slot_authority(fd)
-                                    .map(WaitFdAuthority::logical)
-                                    .unwrap_or_else(|| std::process::abort()),
+                                authority: wait_authority,
                             },
                         );
                     }
@@ -6366,9 +6355,7 @@ impl SyscallDispatcher {
                             Err(_) => *offset as u64,
                         };
                         metadata.size = usize::try_from(cur_len).unwrap_or(metadata.size);
-                        outcome = DispatchOutcome::Returned {
-                            value: written as i64,
-                        };
+                        outcome = DispatchOutcome::returned_len_or_errno(written);
                         writeback = (!is_anon_overlay_path(path)).then(|| {
                             (
                                 path.clone(),
@@ -7825,9 +7812,7 @@ impl SyscallDispatcher {
             // the terminating NUL), not the buffer address. glibc tolerates a
             // positive non-length, but tools that use the return value as a
             // length (and the kernel ABI) require the real count.
-            Ok(DispatchOutcome::Returned {
-                value: bytes.len() as i64,
-            })
+            Ok(DispatchOutcome::returned_len_or_errno(bytes.len()))
 
         }
 
@@ -8133,9 +8118,9 @@ impl SyscallDispatcher {
                     };
                     match &*open {
                         OpenDescription::PipeReader { pipe, .. }
-                        | OpenDescription::PipeWriter { pipe, .. } => DispatchOutcome::Returned {
-                            value: pipe.get_capacity() as i64,
-                        },
+                        | OpenDescription::PipeWriter { pipe, .. } => {
+                            DispatchOutcome::returned_len_or_errno(pipe.get_capacity())
+                        }
                         OpenDescription::HostPipe { base, .. } => DispatchOutcome::Returned {
                             // The per-description capacity, set by a prior
                             // F_SETPIPE_SZ or the default pipe buffer size.
@@ -8220,9 +8205,7 @@ impl SyscallDispatcher {
                         Ok(crate::file_authority::Outcome::CanonicalPipeCapacitySet {
                             capacity,
                             ..
-                        }) => DispatchOutcome::Returned {
-                            value: capacity.raw() as i64,
-                        },
+                        }) => DispatchOutcome::returned_u32(capacity.raw()),
                         Ok(_) => {
                             return Err(DispatchError::FileAuthorityFatal(
                                 crate::file_authority::AuthorityFatal::InvariantViolation(
@@ -8274,9 +8257,7 @@ impl SyscallDispatcher {
                 }
                 LINUX_F_GETFD => {
                     if let Some(open_file) = this.open_file(fd.0) {
-                        return Ok(DispatchOutcome::Returned {
-                            value: open_file.fd_flags as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_u64_or_errno(open_file.fd_flags));
                     }
                     // stdio without an OpenDescription: stdio is not CLOEXEC by
                     // default (Linux: stdio survives exec), but a prior
@@ -8330,9 +8311,7 @@ impl SyscallDispatcher {
                         {
                             flags |= LINUX_O_RDWR;
                         }
-                        return Ok(DispatchOutcome::Returned {
-                            value: flags as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_u64_or_errno(flags));
                     }
                     // stdio without an OpenDescription: glibc cat/head/etc
                     // probe `fcntl(1, F_GETFL)` on startup to decide whether
@@ -8345,9 +8324,7 @@ impl SyscallDispatcher {
                         } else {
                             LINUX_O_WRONLY
                         };
-                        return Ok(DispatchOutcome::Returned {
-                            value: flags as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_u64_or_errno(flags));
                     }
                     DispatchOutcome::errno(LINUX_EBADF)
                 }
@@ -8615,7 +8592,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     let lease = open_file.description.common().lease();
-                    DispatchOutcome::Returned { value: lease as i64 }
+                    DispatchOutcome::returned_i32(lease)
                 }
                 // File sealing (memfd_create01). The seal set lives on the
                 // open-file description (shared across dup). F_GET_SEALS returns
@@ -8712,7 +8689,7 @@ impl SyscallDispatcher {
                     } else {
                         owner.owner_pid
                     };
-                    DispatchOutcome::Returned { value: val as i64 }
+                    DispatchOutcome::returned_i32(val)
                 }
                 LINUX_F_SETOWN_EX => {
                     let Some(open_file) = this.open_file(fd.0) else {
@@ -8768,7 +8745,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     let sig = open_file.description.common().async_sig();
-                    DispatchOutcome::Returned { value: sig as i64 }
+                    DispatchOutcome::returned_i32(sig)
                 }
                 _ => DispatchOutcome::errno(LINUX_EINVAL),
             })
@@ -9292,7 +9269,7 @@ impl SyscallDispatcher {
                     // The CLONE_NEW* flag for this link's type, as the RETURN
                     // value (not written to *arg).
                     LINUX_NS_GET_NSTYPE => match ns_type_clone_flag(&ns_type) {
-                        Some(flag) => DispatchOutcome::Returned { value: flag as i64 },
+                        Some(flag) => DispatchOutcome::returned_u64_or_errno(flag),
                         None => DispatchOutcome::errno(LINUX_EINVAL),
                     },
                     // The owning user namespace's uid. The initial user ns is
@@ -10509,8 +10486,8 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                 }
                 Err(error) => {
-                    tracing::error!(%error, "close_range unshare publication invariant failed");
-                    std::process::abort();
+                    tracing::error!(%error, "close_range unshare publication failed");
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
             };
             let successor = unshared.context().resources().files();
@@ -10611,9 +10588,7 @@ impl SyscallDispatcher {
 
             memory.write_bytes(address, &out)?;
 
-            Ok(DispatchOutcome::Returned {
-                value: out.len() as i64,
-            })
+            Ok(DispatchOutcome::returned_len_or_errno(out.len()))
 
         }
 
@@ -10669,7 +10644,7 @@ impl SyscallDispatcher {
                     Ok(r) => r,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
-                return Ok(DispatchOutcome::Returned { value: r as i64 });
+                return Ok(DispatchOutcome::returned_offset_or_errno(r));
             }
 
             // A CHARACTER device (/dev/null, /dev/zero, /dev/full, /dev/random,
@@ -10698,7 +10673,7 @@ impl SyscallDispatcher {
                         Ok(r) => r,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
-                    return Ok(DispatchOutcome::Returned { value: r as i64 });
+                    return Ok(DispatchOutcome::returned_offset_or_errno(r));
                 }
             }
 
@@ -10755,7 +10730,7 @@ impl SyscallDispatcher {
                                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                                 };
                                 *file_offset = r as usize;
-                                return Ok(DispatchOutcome::Returned { value: r as i64 });
+                                return Ok(DispatchOutcome::returned_offset_or_errno(r));
                             }
                             FileContents::Dense(_) | FileContents::RootFsBacked { .. } => {
                                 if offset < 0 {
@@ -10774,7 +10749,7 @@ impl SyscallDispatcher {
                                     file_size as i64
                                 };
                                 *file_offset = next as usize;
-                                return Ok(DispatchOutcome::Returned { value: next });
+                                return Ok(DispatchOutcome::returned_offset_or_errno(next));
                             }
                         }
                     }
@@ -10803,7 +10778,7 @@ impl SyscallDispatcher {
                             file_size as i64
                         };
                         *file_offset = next as usize;
-                        return Ok(DispatchOutcome::Returned { value: next });
+                        return Ok(DispatchOutcome::returned_offset_or_errno(next));
                     }
                     (*file_offset as i64, contents.len() as i64)
                 }
@@ -10826,7 +10801,7 @@ impl SyscallDispatcher {
                             file_size as i64
                         };
                         *file_offset = next as usize;
-                        return Ok(DispatchOutcome::Returned { value: next });
+                        return Ok(DispatchOutcome::returned_offset_or_errno(next));
                     }
                     (*file_offset as i64, contents.read().len() as i64)
                 }
@@ -10943,7 +10918,7 @@ impl SyscallDispatcher {
             {
                 *listing = DirListing::Pending;
             }
-            Ok(DispatchOutcome::Returned { value: next })
+            Ok(DispatchOutcome::returned_offset_or_errno(next))
 
         }
 
@@ -11206,9 +11181,7 @@ impl SyscallDispatcher {
                             if memory.write_bytes(address, &bytes).is_err() {
                                 DispatchOutcome::errno(LINUX_EFAULT)
                             } else {
-                                DispatchOutcome::Returned {
-                                    value: bytes.len() as i64,
-                                }
+                                DispatchOutcome::returned_len_or_errno(bytes.len())
                             }
                         }
                         Err(errno) => DispatchOutcome::errno(errno),
@@ -11239,6 +11212,12 @@ impl SyscallDispatcher {
                     let pipe = Arc::clone(pipe);
                     let flags = open_file.description.common().status_flags();
                     drop(open);
+                    let Some(wait_authority) = this
+                        .captured_slot_authority(fd.0)
+                        .map(WaitFdAuthority::logical)
+                    else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
                     return Ok(read_pipe(
                         memory,
                         address,
@@ -11246,9 +11225,7 @@ impl SyscallDispatcher {
                         &pipe,
                         flags,
                         fd.0,
-                        this.captured_slot_authority(fd.0)
-                            .map(WaitFdAuthority::logical)
-                            .unwrap_or_else(|| std::process::abort()),
+                        wait_authority,
                     ));
                 }
                 OpenDescription::HostPipe {
@@ -11273,9 +11250,7 @@ impl SyscallDispatcher {
                             this.restore_splice_pipe_bytes(fd.0, &staged);
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         }
-                        return Ok(DispatchOutcome::Returned {
-                            value: staged.len() as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_len_or_errno(staged.len()));
                     }
                     let outcome = read_host_pipe(
                         memory,
@@ -11358,9 +11333,7 @@ impl SyscallDispatcher {
                                 if memory.write_bytes(address, &buf[..read_len]).is_err() {
                                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                                 }
-                                return Ok(DispatchOutcome::Returned {
-                                    value: read_len as i64,
-                                });
+                                return Ok(DispatchOutcome::returned_len_or_errno(read_len));
                             } else {
                                 return Ok(DispatchOutcome::Returned { value: 0 });
                             }
@@ -11396,9 +11369,7 @@ impl SyscallDispatcher {
                 }
             };
             memory.write_bytes(address, &bytes)?;
-            Ok(DispatchOutcome::Returned {
-                value: read_len as i64,
-            })
+            Ok(DispatchOutcome::returned_len_or_errno(read_len))
 
         }
 
@@ -11450,7 +11421,7 @@ impl SyscallDispatcher {
                         unsafe { libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt) }
                     };
                     let n = n.host_syscall_errno()?;
-                    return Ok(DispatchOutcome::Returned { value: n as i64 });
+                    return Ok(DispatchOutcome::returned_isize_or_errno(n));
                 }
                 let mut total = 0i64;
                 for iov in &iovecs {
@@ -11511,9 +11482,7 @@ impl SyscallDispatcher {
                         if read_len < staged.len() {
                             this.restore_splice_pipe_bytes(fd.0, &staged[read_len..]);
                         }
-                        return Ok(DispatchOutcome::Returned {
-                            value: read_len as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_len_or_errno(read_len));
                     }
                     let outcome = Self::read_host_pipe_iovecs(
                         memory,
@@ -11592,6 +11561,15 @@ impl SyscallDispatcher {
                         if len == 0 {
                             continue;
                         }
+                        let Some(wait_authority) = this
+                            .captured_slot_authority(fd.0)
+                            .map(WaitFdAuthority::logical)
+                        else {
+                            if total > 0 {
+                                break;
+                            }
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        };
                         match read_pipe(
                             memory,
                             iov.iov_base,
@@ -11599,9 +11577,7 @@ impl SyscallDispatcher {
                             &pipe,
                             flags,
                             fd.0,
-                            this.captured_slot_authority(fd.0)
-                                .map(WaitFdAuthority::logical)
-                                .unwrap_or_else(|| std::process::abort()),
+                            wait_authority,
                         ) {
                             DispatchOutcome::Returned { value } => {
                                 total += value;
@@ -11677,9 +11653,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             };
-            Ok(DispatchOutcome::Returned {
-                value: read_len as i64,
-            })
+            Ok(DispatchOutcome::returned_len_or_errno(read_len))
 
         }
 
@@ -11735,7 +11709,7 @@ impl SyscallDispatcher {
                 if n > 0 && memory.write_bytes(buffer, &buf[..n]).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
-                return Ok(DispatchOutcome::Returned { value: n as i64 });
+                return Ok(DispatchOutcome::returned_len_or_errno(n));
             }
             let bytes = match &*open {
                 OpenDescription::Closed { .. } => {
@@ -11812,9 +11786,7 @@ impl SyscallDispatcher {
             if read_len > 0 {
                 memory.write_bytes(buffer, &bytes)?;
             }
-            Ok(DispatchOutcome::Returned {
-                value: read_len as i64,
-            })
+            Ok(DispatchOutcome::returned_len_or_errno(read_len))
 
         }
 
@@ -11897,7 +11869,7 @@ impl SyscallDispatcher {
                         }
                     };
                     let n = n.host_syscall_errno()?;
-                    return Ok(DispatchOutcome::Returned { value: n as i64 });
+                    return Ok(DispatchOutcome::returned_isize_or_errno(n));
                 }
                 let mut total = 0i64;
                 let mut cur = offset;
@@ -11980,9 +11952,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
                 }
             };
-            Ok(DispatchOutcome::Returned {
-                value: read_len as i64,
-            })
+            Ok(DispatchOutcome::returned_len_or_errno(read_len))
 
         }
 
@@ -12040,9 +12010,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
                     }
                     _ => {
-                        return Ok(DispatchOutcome::Returned {
-                            value: length as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_len_or_errno(length));
                     }
                 }
             }
@@ -12085,7 +12053,7 @@ impl SyscallDispatcher {
                 if n > 0 {
                     this.invalidate_dentry_host_fd(host_fd.raw());
                 }
-                return Ok(DispatchOutcome::Returned { value: n as i64 });
+                return Ok(DispatchOutcome::returned_isize_or_errno(n));
             }
             // In-memory File (memfd / O_TMPFILE fallback): positional write into
             // the cached contents, honoring memfd write/grow seals. Previously an
@@ -12124,9 +12092,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                     }
                     this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                    return Ok(DispatchOutcome::Returned {
-                        value: bytes.len() as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
                 }
                 if let OpenDescription::File {
                     path,
@@ -12175,9 +12141,7 @@ impl SyscallDispatcher {
                             .rootfs_vfs
                             .write_file_range(&path, write_at, &bytes[..written], final_size);
                     }
-                    return Ok(DispatchOutcome::Returned {
-                        value: written as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_len_or_errno(written));
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
@@ -12429,7 +12393,7 @@ impl SyscallDispatcher {
                     if n > 0 {
                         this.invalidate_dentry_host_fd(hfd);
                     }
-                    return Ok(DispatchOutcome::Returned { value: n as i64 });
+                    return Ok(DispatchOutcome::returned_isize_or_errno(n));
                 }
                 let mut total = 0i64;
                 let mut cur = offset;
@@ -12569,7 +12533,7 @@ impl SyscallDispatcher {
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
-                    Ok(DispatchOutcome::Returned { value: sent as i64 })
+                    Ok(DispatchOutcome::returned_len_or_errno(sent))
                 };
                 match (rc as i64).host_syscall_errno() {
                     Ok(_) => return advance_and_return(offset, sent, memory),
@@ -12799,9 +12763,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
 
-            Ok(DispatchOutcome::Returned {
-                value: written as i64,
-            })
+            Ok(DispatchOutcome::returned_len_or_errno(written))
 
         }
 
@@ -12995,7 +12957,7 @@ impl SyscallDispatcher {
                 if written < bytes.len() {
                     Self::restore_pipe_bytes(&pipe, &bytes[written..]);
                 }
-                return Ok(DispatchOutcome::Returned { value: written as i64 });
+                return Ok(DispatchOutcome::returned_len_or_errno(written));
             }
 
             // Splice OUT of a real host pipe's read end (the fork-safe pipe model;
@@ -13049,9 +13011,7 @@ impl SyscallDispatcher {
                 if written < buf.len() {
                     this.restore_splice_pipe_bytes(in_fd.0, &buf[written..]);
                 }
-                return Ok(DispatchOutcome::Returned {
-                    value: written as i64,
-                });
+                return Ok(DispatchOutcome::returned_len_or_errno(written));
             }
 
             // Splice OUT of a host socket (socket -> pipe, and socket -> socket).
@@ -13111,9 +13071,7 @@ impl SyscallDispatcher {
                     buf.truncate(n as usize);
                     let consumed = buf.len();
                     this.stage_splice_pipe_bytes_owned(pipe_read_fd, buf);
-                    return Ok(DispatchOutcome::Returned {
-                        value: consumed as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_len_or_errno(consumed));
                 }
                 // PEEK first, then consume EXACTLY what the destination accepts.
                 // The destination is typically Go's O_NONBLOCK splice pipe (64 KiB
@@ -13191,9 +13149,7 @@ impl SyscallDispatcher {
                 // `consumed == written` in every normal case (the peeked bytes are
                 // present). Report the bytes moved into the destination; the drain
                 // above keeps the socket position in lockstep so nothing is lost.
-                return Ok(DispatchOutcome::Returned {
-                    value: written as i64,
-                });
+                return Ok(DispatchOutcome::returned_len_or_errno(written));
             }
 
             match this.fd_is_pipe_writer(out_fd.0) {
@@ -13253,9 +13209,7 @@ impl SyscallDispatcher {
                         return Ok(complete_wait(outcome));
                     };
                     let written = usize::try_from(value).unwrap_or(0).min(bytes.len());
-                    return Ok(DispatchOutcome::Returned {
-                        value: written as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_len_or_errno(written));
                 }
             }
 
@@ -13486,7 +13440,7 @@ impl SyscallDispatcher {
                         }
                         off += len;
                     }
-                    Ok(DispatchOutcome::Returned { value: off as i64 })
+                    Ok(DispatchOutcome::returned_len_or_errno(off))
                 }
             }
         }
@@ -13528,7 +13482,7 @@ impl SyscallDispatcher {
                 this.fs
                     .inotify_registry
                     .register(&path, &state, wd, effective);
-                return Ok(DispatchOutcome::Returned { value: wd as i64 });
+                return Ok(DispatchOutcome::returned_i32(wd));
             }
             // Try the per-instance backend first (kqueue host-vnode watch on
             // macOS/BSD, native inotify on Linux) so cross-process directory
@@ -13586,7 +13540,7 @@ impl SyscallDispatcher {
             // this instance; suppress the kqueue backend's duplicate synthesis
             // (it stays a poll_fd readiness source only).
             state.mark_dispatch_authoritative();
-            Ok(DispatchOutcome::Returned { value: wd as i64 })
+            Ok(DispatchOutcome::returned_i32(wd))
         }
 
         fn inotify_rm_watch(this, cx, fd: Fd, wd: u64) {
@@ -14189,9 +14143,9 @@ impl SyscallDispatcher {
                                     return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
                                 }
                                 _ => {
-                                    return Ok(DispatchOutcome::Returned {
-                                        value: bytes.len() as i64,
-                                    });
+                                    return Ok(DispatchOutcome::returned_len_or_errno(
+                                        bytes.len(),
+                                    ));
                                 }
                             }
                         }
@@ -14203,14 +14157,18 @@ impl SyscallDispatcher {
                             let flags = open_file.description.common().status_flags();
                             let tid = cx.tid();
                             drop(open);
+                            let Some(wait_authority) = this
+                                .captured_slot_authority(fd)
+                                .map(WaitFdAuthority::logical)
+                            else {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            };
                             let outcome = write_pipe(
                                 &bytes,
                                 &pipe,
                                 flags,
                                 fd,
-                                this.captured_slot_authority(fd)
-                                    .map(WaitFdAuthority::logical)
-                                    .unwrap_or_else(|| std::process::abort()),
+                                wait_authority,
                                 || {
                                     this.has_deliverable_dispatch_pending_for_wait(
                                         cx.kernel,
@@ -14274,8 +14232,15 @@ impl SyscallDispatcher {
                                 (bytes, 0)
                             };
                             let out = if bytes_to_write.is_empty() && consumed_count > 0 {
-                                DispatchOutcome::Returned { value: consumed_count as i64 }
+                                DispatchOutcome::returned_len_or_errno(consumed_count)
                             } else {
+                                let Some(wait_authority) = this
+                                    .captured_slot_authority(fd)
+                                    .map(WaitFdAuthority::logical)
+                                else {
+                                    drop(open);
+                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                };
                                 let res = write_host_pipe_owned(
                                     bytes_to_write,
                                     HostPipeWriteTarget {
@@ -14292,19 +14257,22 @@ impl SyscallDispatcher {
                                         ),
                                         tid: cx.tid(),
                                         sigpipe_on_epipe: true,
-                                        authority: this
-                                            .captured_slot_authority(fd)
-                                            .map(WaitFdAuthority::logical)
-                                            .unwrap_or_else(|| std::process::abort()),
+                                        authority: wait_authority,
                                     },
                                 );
                                 match res {
                                     DispatchOutcome::Returned { value } => {
-                                        DispatchOutcome::Returned { value: value + consumed_count as i64 }
+                                        let total = usize::try_from(value)
+                                            .ok()
+                                            .and_then(|v| v.checked_add(consumed_count));
+                                        match total {
+                                            Some(t) => DispatchOutcome::returned_len_or_errno(t),
+                                            None => DispatchOutcome::errno(LINUX_EOVERFLOW),
+                                        }
                                     }
                                     other => {
                                         if consumed_count > 0 {
-                                            DispatchOutcome::Returned { value: consumed_count as i64 }
+                                            DispatchOutcome::returned_len_or_errno(consumed_count)
                                         } else {
                                             other
                                         }
@@ -14328,6 +14296,13 @@ impl SyscallDispatcher {
                             // write(2) on a connected socket maps directly to a
                             // host write(2). Unconnected sockets will surface
                             // their own ENOTCONN via the host.
+                            let Some(wait_authority) = this
+                                .captured_slot_authority(fd)
+                                .map(WaitFdAuthority::logical)
+                            else {
+                                drop(open);
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            };
                             let out = write_host_pipe_owned(
                                 bytes,
                                 HostPipeWriteTarget {
@@ -14338,10 +14313,7 @@ impl SyscallDispatcher {
                                     pipe_state: None,
                                     tid: cx.tid(),
                                     sigpipe_on_epipe: false,
-                                    authority: this
-                                        .captured_slot_authority(fd)
-                                        .map(WaitFdAuthority::logical)
-                                        .unwrap_or_else(|| std::process::abort()),
+                                    authority: wait_authority,
                                 },
                             );
                             // Signal-driven I/O readiness edge on the socket peer.
@@ -14360,9 +14332,9 @@ impl SyscallDispatcher {
                             match socket.send_stream(&bytes, Vec::new()) {
                                 Ok(written) => {
                                     this.notify_inmem_epoll();
-                                    return Ok(DispatchOutcome::Returned {
-                                        value: written as i64,
-                                    });
+                                    return Ok(DispatchOutcome::returned_len_or_errno(
+                                        written,
+                                    ));
                                 }
                                 Err(LINUX_EPIPE) => {
                                     let outcome = DispatchOutcome::errno(LINUX_EPIPE);
@@ -14403,6 +14375,13 @@ impl SyscallDispatcher {
                             }
                             // libc::write to the real fd: advances the
                             // kernel offset and is visible across fork.
+                            let Some(wait_authority) = this
+                                .captured_slot_authority(fd)
+                                .map(WaitFdAuthority::logical)
+                            else {
+                                drop(open);
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            };
                             let out = write_host_pipe_owned(
                                 bytes,
                                 HostPipeWriteTarget {
@@ -14413,10 +14392,7 @@ impl SyscallDispatcher {
                                     pipe_state: None,
                                     tid: cx.tid(),
                                     sigpipe_on_epipe: false,
-                                    authority: this
-                                        .captured_slot_authority(fd)
-                                        .map(WaitFdAuthority::logical)
-                                        .unwrap_or_else(|| std::process::abort()),
+                                    authority: wait_authority,
                                 },
                             );
                             if let DispatchOutcome::Returned { value } = out && value > 0 {
@@ -14461,9 +14437,7 @@ impl SyscallDispatcher {
                             }
                             *offset = end;
                             this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                            outcome = DispatchOutcome::Returned {
-                                value: bytes.len() as i64,
-                            };
+                            outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
                             writeback = None;
                         }
                         OpenDescription::File {
@@ -14509,9 +14483,7 @@ impl SyscallDispatcher {
                                 Err(_) => cur_len.max(write_offset.saturating_add(written)),
                             };
                             metadata.size = new_len;
-                            outcome = DispatchOutcome::Returned {
-                                value: written as i64,
-                            };
+                            outcome = DispatchOutcome::returned_len_or_errno(written);
                             writeback = (!is_anon_overlay_path(path)).then(|| {
                                 FileWriteback::Range {
                                     path: path.clone(),
@@ -14539,7 +14511,7 @@ impl SyscallDispatcher {
                                 crate::vfs::proc::write_userns_map(ns, privileged, path, &bytes)
                             });
                             return Ok(match result {
-                                Ok(n) => DispatchOutcome::Returned { value: n as i64 },
+                                Ok(n) => DispatchOutcome::returned_len_or_errno(n),
                                 Err(errno) => DispatchOutcome::errno(errno),
                             });
                         }
@@ -14560,13 +14532,12 @@ impl SyscallDispatcher {
                             // may name ANOTHER process, so it cannot be routed
                             // to "the current one" — LTP writes the library
                             // process's file from the test child.
-                            let written = bytes.len() as i64;
                             let parsed =
                                 crate::vfs::proc::parse_tunable_write(path, &bytes);
                             return Ok(match parsed {
                                 Err(errno) => DispatchOutcome::errno(errno),
                                 Ok(crate::vfs::proc::TunableWrite::Ignored) => {
-                                    DispatchOutcome::Returned { value: written }
+                                    DispatchOutcome::returned_len_or_errno(bytes.len())
                                 }
                                 Ok(crate::vfs::proc::TunableWrite::OomScoreAdj {
                                     pid,
@@ -14585,7 +14556,7 @@ impl SyscallDispatcher {
                                                 .registry()
                                                 .set_oom_score_adj(target, value)
                                             ) {
-                                                DispatchOutcome::Returned { value: written }
+                                                DispatchOutcome::returned_len_or_errno(bytes.len())
                                             } else {
                                                 // The process exited between
                                                 // open(2) and write(2).
@@ -14596,7 +14567,7 @@ impl SyscallDispatcher {
                                             crate::vfs::proc::set_single_process_oom_score_adj(
                                                 value,
                                             );
-                                            DispatchOutcome::Returned { value: written }
+                                            DispatchOutcome::returned_len_or_errno(bytes.len())
                                         }
                                     }
                                 }
@@ -14747,6 +14718,12 @@ impl SyscallDispatcher {
                 if target.append {
                     unsafe { libc::lseek(target.host_fd, 0, libc::SEEK_END) };
                 }
+                let Some(wait_authority) = this
+                    .captured_slot_authority(fd)
+                    .map(WaitFdAuthority::logical)
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
                 let outcome = write_host_pipe_owned(
                     bytes,
                     HostPipeWriteTarget {
@@ -14757,10 +14734,7 @@ impl SyscallDispatcher {
                         pipe_state: target.pipe_state,
                         tid: cx.tid(),
                         sigpipe_on_epipe: target.sigpipe_on_epipe,
-                        authority: this
-                            .captured_slot_authority(fd)
-                            .map(WaitFdAuthority::logical)
-                            .unwrap_or_else(|| std::process::abort()),
+                        authority: wait_authority,
                     },
                 );
                 if let DispatchOutcome::Returned { value } = outcome && value > 0 {
@@ -14824,23 +14798,27 @@ impl SyscallDispatcher {
                                         return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
                                     }
                                     _ => {
-                                        outcome = DispatchOutcome::Returned {
-                                            value: bytes.len() as i64,
-                                        };
+                                        outcome = DispatchOutcome::returned_len_or_errno(
+                                            bytes.len(),
+                                        );
                                         writeback = None;
                                     }
                                 }
                             }
                             OpenDescription::PipeWriter { pipe, .. } => {
+                                let Some(wait_authority) = this
+                                    .captured_slot_authority(fd)
+                                    .map(WaitFdAuthority::logical)
+                                else {
+                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                };
                                 let tid = cx.tid();
                                 outcome = write_pipe(
                                     &bytes,
                                     pipe,
                                     open_file.description.common().status_flags(),
                                     fd,
-                                    this.captured_slot_authority(fd)
-                                        .map(WaitFdAuthority::logical)
-                                        .unwrap_or_else(|| std::process::abort()),
+                                    wait_authority,
                                     || {
                                         this.has_deliverable_dispatch_pending_for_wait(
                                             cx.kernel,
@@ -14889,8 +14867,14 @@ impl SyscallDispatcher {
                                     (bytes, 0)
                                 };
                                 outcome = if bytes_to_write.is_empty() && consumed_count > 0 {
-                                    DispatchOutcome::Returned { value: consumed_count as i64 }
+                                    DispatchOutcome::returned_len_or_errno(consumed_count)
                                 } else {
+                                    let Some(wait_authority) = this
+                                        .captured_slot_authority(fd)
+                                        .map(WaitFdAuthority::logical)
+                                    else {
+                                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                    };
                                     let res = write_host_pipe_owned(
                                         bytes_to_write,
                                         HostPipeWriteTarget {
@@ -14907,19 +14891,22 @@ impl SyscallDispatcher {
                                             ),
                                             tid: cx.tid(),
                                             sigpipe_on_epipe: true,
-                                            authority: this
-                                                .captured_slot_authority(fd)
-                                                .map(WaitFdAuthority::logical)
-                                                .unwrap_or_else(|| std::process::abort()),
+                                            authority: wait_authority,
                                         },
                                     );
                                     match res {
                                         DispatchOutcome::Returned { value } => {
-                                            DispatchOutcome::Returned { value: value + consumed_count as i64 }
+                                            let total = usize::try_from(value)
+                                                .ok()
+                                                .and_then(|v| v.checked_add(consumed_count));
+                                            match total {
+                                                Some(t) => DispatchOutcome::returned_len_or_errno(t),
+                                                None => DispatchOutcome::errno(LINUX_EOVERFLOW),
+                                            }
                                         }
                                         other => {
                                             if consumed_count > 0 {
-                                                DispatchOutcome::Returned { value: consumed_count as i64 }
+                                                DispatchOutcome::returned_len_or_errno(consumed_count)
                                             } else {
                                                 other
                                             }
@@ -14929,6 +14916,12 @@ impl SyscallDispatcher {
                                 writeback = None;
                             }
                             OpenDescription::HostSocket { host_fd, .. } => {
+                                let Some(wait_authority) = this
+                                    .captured_slot_authority(fd)
+                                    .map(WaitFdAuthority::logical)
+                                else {
+                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                };
                                 outcome = write_host_pipe_owned(
                                     bytes,
                                     HostPipeWriteTarget {
@@ -14939,10 +14932,7 @@ impl SyscallDispatcher {
                                         pipe_state: None,
                                         tid: cx.tid(),
                                         sigpipe_on_epipe: false,
-                                        authority: this
-                                            .captured_slot_authority(fd)
-                                            .map(WaitFdAuthority::logical)
-                                            .unwrap_or_else(|| std::process::abort()),
+                                        authority: wait_authority,
                                     },
                                 );
                                 writeback = None;
@@ -14952,9 +14942,7 @@ impl SyscallDispatcher {
                                 match socket.send_stream(&bytes, Vec::new()) {
                                     Ok(written) => {
                                         this.notify_inmem_epoll();
-                                        outcome = DispatchOutcome::Returned {
-                                            value: written as i64,
-                                        };
+                                        outcome = DispatchOutcome::returned_len_or_errno(written);
                                     }
                                     Err(LINUX_EPIPE) => {
                                         outcome = DispatchOutcome::errno(LINUX_EPIPE);
@@ -14982,6 +14970,12 @@ impl SyscallDispatcher {
                                 {
                                     unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                                 }
+                                let Some(wait_authority) = this
+                                    .captured_slot_authority(fd)
+                                    .map(WaitFdAuthority::logical)
+                                else {
+                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                };
                                 outcome = write_host_pipe_owned(
                                     bytes,
                                     HostPipeWriteTarget {
@@ -14992,10 +14986,7 @@ impl SyscallDispatcher {
                                         pipe_state: None,
                                         tid: cx.tid(),
                                         sigpipe_on_epipe: false,
-                                        authority: this
-                                            .captured_slot_authority(fd)
-                                            .map(WaitFdAuthority::logical)
-                                            .unwrap_or_else(|| std::process::abort()),
+                                        authority: wait_authority,
                                     },
                                 );
                                 if let DispatchOutcome::Returned { value } = outcome && value > 0 {
@@ -15036,9 +15027,7 @@ impl SyscallDispatcher {
                                 }
                                 *offset = end;
                                 this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                                outcome = DispatchOutcome::Returned {
-                                    value: bytes.len() as i64,
-                                };
+                                outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
                                 writeback = None;
                             }
                             OpenDescription::File {
@@ -15078,9 +15067,7 @@ impl SyscallDispatcher {
                                     Err(_) => cur_len.max(write_offset.saturating_add(written)),
                                 };
                                 metadata.size = new_len;
-                                outcome = DispatchOutcome::Returned {
-                                    value: written as i64,
-                                };
+                                outcome = DispatchOutcome::returned_len_or_errno(written);
                                 writeback = (!is_anon_overlay_path(path)).then(|| {
                                     FileWriteback::Range {
                                         path: path.clone(),
@@ -15120,9 +15107,7 @@ impl SyscallDispatcher {
                         // the writer, same as write(2) (busybox `yes | head`
                         // wants exit 141, write05).
                         if total > 0 {
-                            return Ok(DispatchOutcome::Returned {
-                                value: total as i64,
-                            });
+                            return Ok(DispatchOutcome::returned_len_or_errno(total));
                         }
                         return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
                     };
@@ -15135,9 +15120,7 @@ impl SyscallDispatcher {
                     // semantics; continuing would write a later iovec AFTER an
                     // unfilled earlier one — a gap/reorder in the byte stream.
                     if (value as usize) < iov_len {
-                        return Ok(DispatchOutcome::Returned {
-                            value: total as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_len_or_errno(total));
                     }
                     continue;
                 }
@@ -15153,9 +15136,7 @@ impl SyscallDispatcher {
                 }
             }
 
-            Ok(DispatchOutcome::Returned {
-                value: total as i64,
-            })
+            Ok(DispatchOutcome::returned_len_or_errno(total))
 
         }
 
@@ -15290,9 +15271,7 @@ impl SyscallDispatcher {
             let decoded = crate::pathcodec::decode_to_bytes(&target);
             let written = decoded.len().min(buffer_size);
             cx.memory.write_bytes(buffer, &decoded[..written])?;
-            Ok(DispatchOutcome::Returned {
-                value: written as i64,
-            })
+            Ok(DispatchOutcome::returned_len_or_errno(written))
 
         }
 
@@ -16777,9 +16756,7 @@ fn read_fanotify<M: CurrentMmMemory>(
         group.requeue_front(events);
         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
     }
-    Ok(DispatchOutcome::Returned {
-        value: bytes.len() as i64,
-    })
+    Ok(DispatchOutcome::returned_len_or_errno(bytes.len()))
 }
 
 #[cfg(test)]

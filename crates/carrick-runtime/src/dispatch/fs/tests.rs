@@ -2871,9 +2871,7 @@ fn splice_pipe_to_writable_null_and_zero_devices_consumes_bytes() {
                 SYS_WRITE,
                 [write_fd, PAYLOAD, BYTES.len() as u64, 0, 0, 0],
             ),
-            DispatchOutcome::Returned {
-                value: BYTES.len() as i64,
-            },
+            DispatchOutcome::returned_len_or_errno(BYTES.len()),
         );
         let device_fd = match run(
             &mut dispatcher,
@@ -2892,9 +2890,7 @@ fn splice_pipe_to_writable_null_and_zero_devices_consumes_bytes() {
                 SYS_SPLICE,
                 [read_fd, 0, device_fd, 0, BYTES.len() as u64, 0],
             ),
-            DispatchOutcome::Returned {
-                value: BYTES.len() as i64,
-            },
+            DispatchOutcome::returned_len_or_errno(BYTES.len()),
         );
         assert_eq!(
             run(
@@ -2934,9 +2930,7 @@ fn splice_pipe_to_writable_null_and_zero_devices_consumes_bytes() {
                 SYS_WRITE,
                 [write_fd, PAYLOAD, BYTES.len() as u64, 0, 0, 0],
             ),
-            DispatchOutcome::Returned {
-                value: BYTES.len() as i64,
-            },
+            DispatchOutcome::returned_len_or_errno(BYTES.len()),
         );
         let append_fd = match run(
             &mut dispatcher,
@@ -3148,9 +3142,7 @@ fn splice_synthetic_devices_to_pipe_transfers_bytes_or_eof() {
                     SpliceTestRig::SYS_READ,
                     [read_fd, 0x5000, count as u64, 0, 0, 0]
                 ),
-                DispatchOutcome::Returned {
-                    value: count as i64
-                },
+                DispatchOutcome::returned_len_or_errno(count),
             );
             let read_bytes = rig.memory.read_bytes(0x5000, count).unwrap();
             if expect_zeroes {
@@ -3248,7 +3240,7 @@ fn splice_synthetic_devices_pipe_capacity_and_nonblocking() {
                 SpliceTestRig::SYS_WRITE,
                 [write_fd, 0x5000, room as u64, 0, 0, 0]
             ),
-            DispatchOutcome::Returned { value: room as i64 },
+            DispatchOutcome::returned_len_or_errno(room),
         );
     }
     assert_eq!(
@@ -4406,9 +4398,7 @@ fn threaded_dispatch_synthetic_device_write_routes_without_unhandled_syscall() {
 
     assert_eq!(
         write_null_outcome,
-        DispatchOutcome::Returned {
-            value: PAYLOAD.len() as i64,
-        }
+        DispatchOutcome::returned_len_or_errno(PAYLOAD.len())
     );
 
     let open_full = dispatcher
@@ -5227,9 +5217,7 @@ fn dispatch_threaded_pipe_reader_write_shared_ebadf_not_enosys() {
 
     assert_eq!(
         write_writer_outcome,
-        DispatchOutcome::Returned {
-            value: PAYLOAD.len() as i64,
-        }
+        DispatchOutcome::returned_len_or_errno(PAYLOAD.len())
     );
 
     let read_reader_outcome = pair
@@ -5257,9 +5245,7 @@ fn dispatch_threaded_pipe_reader_write_shared_ebadf_not_enosys() {
 
     assert_eq!(
         read_reader_outcome,
-        DispatchOutcome::Returned {
-            value: PAYLOAD.len() as i64,
-        }
+        DispatchOutcome::returned_len_or_errno(PAYLOAD.len())
     );
 
     let report = reporter.finish();
@@ -5872,7 +5858,7 @@ fn pselect6_parks_full_pipe_write_end_on_readiness_pipe_pollin() {
             SpliceTestRig::SYS_WRITE,
             [write_fd, 0x8000, room as u64, 0, 0, 0]
         ),
-        DispatchOutcome::Returned { value: room as i64 },
+        DispatchOutcome::returned_len_or_errno(room),
     );
     let write_poll_fd = match &*rig
         .dispatcher
@@ -6029,12 +6015,7 @@ fn memfd_proc_self_fd_reopen_access_mode_and_seals() {
         SYS_FCNTL,
         [ro_fd as u64, F_GET_SEALS, 0, 0, 0, 0],
     );
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Returned {
-            value: F_SEAL_GROW as i64
-        }
-    );
+    assert_eq!(outcome, DispatchOutcome::returned_u64_or_errno(F_SEAL_GROW));
 
     let outcome = run(
         &mut dispatcher,
@@ -6084,9 +6065,7 @@ fn memfd_proc_self_fd_reopen_access_mode_and_seals() {
     );
     assert_eq!(
         outcome,
-        DispatchOutcome::Returned {
-            value: (F_SEAL_GROW | F_SEAL_WRITE) as i64
-        }
+        DispatchOutcome::returned_u64_or_errno(F_SEAL_GROW | F_SEAL_WRITE)
     );
 }
 

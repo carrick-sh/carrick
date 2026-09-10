@@ -227,7 +227,7 @@ impl SyscallDispatcher {
         // `close(0); open("/dev/null")` and treats anything but fd 0 as an error
         // ("can't open /dev/null") — else the lowest fd >= 3.
         match self.install_fd_at_or_above(0, open_file) {
-            Ok(fd) => DispatchOutcome::Returned { value: fd as i64 },
+            Ok(fd) => DispatchOutcome::returned_i32(fd),
             Err(_) => DispatchOutcome::errno(linux_errno::EMFILE),
         }
     }

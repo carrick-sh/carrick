@@ -155,9 +155,7 @@ impl SyscallDispatcher {
         // size == 0 is the "tell me how big" probe: return the length without
         // copying anything.
         if size == 0 {
-            return Ok(DispatchOutcome::Returned {
-                value: value.len() as i64,
-            });
+            return Ok(DispatchOutcome::returned_len_or_errno(value.len()));
         }
         if value.len() > size {
             return Ok(DispatchOutcome::errno(LINUX_ERANGE));
@@ -165,9 +163,7 @@ impl SyscallDispatcher {
         memory
             .write_bytes(buf_addr, &value)
             .map_err(|_| DispatchError::Errno(LINUX_EFAULT))?;
-        Ok(DispatchOutcome::Returned {
-            value: value.len() as i64,
-        })
+        Ok(DispatchOutcome::returned_len_or_errno(value.len()))
     }
 
     pub(super) fn listxattr(
@@ -190,9 +186,7 @@ impl SyscallDispatcher {
             list.push(0);
         }
         if size == 0 {
-            return Ok(DispatchOutcome::Returned {
-                value: list.len() as i64,
-            });
+            return Ok(DispatchOutcome::returned_len_or_errno(list.len()));
         }
         if list.len() > size {
             return Ok(DispatchOutcome::errno(LINUX_ERANGE));
@@ -200,9 +194,7 @@ impl SyscallDispatcher {
         memory
             .write_bytes(buf_addr, &list)
             .map_err(|_| DispatchError::Errno(LINUX_EFAULT))?;
-        Ok(DispatchOutcome::Returned {
-            value: list.len() as i64,
-        })
+        Ok(DispatchOutcome::returned_len_or_errno(list.len()))
     }
 
     pub(super) fn removexattr(

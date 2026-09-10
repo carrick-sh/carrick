@@ -227,9 +227,7 @@ pub(super) fn io_submit<M: CurrentMmMemory>(
             return Ok(DispatchOutcome::errno(errno));
         }
     }
-    Ok(DispatchOutcome::Returned {
-        value: count.get() as i64,
-    })
+    Ok(DispatchOutcome::returned_u64_or_errno(count.get()))
 }
 
 pub(super) fn io_cancel<M: CurrentMmMemory>(

@@ -525,9 +525,9 @@ impl SyscallDispatcher {
                             return Ok(PathLookup {
                                 resolved_path: path,
                                 fast_path: FastPathKind::None,
-                                target: LookupTarget::OpenOutcome(DispatchOutcome::Returned {
-                                    value: fd as i64,
-                                }),
+                                target: LookupTarget::OpenOutcome(DispatchOutcome::returned_i32(
+                                    fd,
+                                )),
                             });
                         }
                         return Ok(PathLookup {
