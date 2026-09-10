@@ -4169,32 +4169,26 @@ where
                 let authority = submission_authority.take();
                 let replacement_record =
                     scheduler.retarget_running_exec(&mut running, transition, lease, |committed| {
-                        backend
-                            .validate_loaded_hardware_identity()
-                            .map_err(|error| error.to_string())?;
+                        backend.validate_loaded_hardware_identity()?;
                         let identity = TaskLoadIdentity {
                             abi: binding.load_identity().abi,
                             version: binding.load_identity().version,
                             mm: committed.successor_mm,
                             asid_generation: committed.successor_asid_generation,
                         };
-                        let replacement_record = resolver
-                            .replace_exec(
-                                scheduler,
-                                ExecBindingTransition {
-                                    predecessor_thread,
-                                    predecessor_generation,
-                                    successor_thread: committed.successor_thread,
-                                    successor_generation,
-                                    identity,
-                                    replacement_mm: Some(Arc::clone(&replacement_mm)),
-                                    authority,
-                                },
-                            )
-                            .map_err(|error| error.to_string())?;
-                        binding
-                            .mark_exec_transferred()
-                            .map_err(|error| error.to_string())?;
+                        let replacement_record = resolver.replace_exec(
+                            scheduler,
+                            ExecBindingTransition {
+                                predecessor_thread,
+                                predecessor_generation,
+                                successor_thread: committed.successor_thread,
+                                successor_generation,
+                                identity,
+                                replacement_mm: Some(Arc::clone(&replacement_mm)),
+                                authority,
+                            },
+                        )?;
+                        binding.mark_exec_transferred()?;
                         if backend
                             .retarget_loaded_task(Arc::clone(&replacement_record.binding))
                             .is_err()
@@ -8407,20 +8401,18 @@ pub(crate) mod tests {
         };
         let replacement_record = scheduler
             .retarget_running_exec(&mut running, committed, new_lease, |transition| {
-                directory
-                    .replace_exec(
-                        &scheduler,
-                        ExecBindingTransition {
-                            predecessor_thread: context.thread().key(),
-                            predecessor_generation: old_generation,
-                            successor_thread: transition.successor_thread,
-                            successor_generation: new_generation,
-                            identity,
-                            replacement_mm: None,
-                            authority: Some(predecessor_authority),
-                        },
-                    )
-                    .map_err(|error| error.to_string())
+                directory.replace_exec(
+                    &scheduler,
+                    ExecBindingTransition {
+                        predecessor_thread: context.thread().key(),
+                        predecessor_generation: old_generation,
+                        successor_thread: transition.successor_thread,
+                        successor_generation: new_generation,
+                        identity,
+                        replacement_mm: None,
+                        authority: Some(predecessor_authority),
+                    },
+                )
             })
             .unwrap();
         let super::ExecBindingReplacement {

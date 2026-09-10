@@ -1199,9 +1199,8 @@ where
                             new_image.initial_stack_pointer().unwrap_or(0),
                             new_image.regions().len() as u64,
                         );
-                        let prepared_kernel_exec = dispatcher
-                            .prepare_one_task_kernel_exec(&kernel_context)
-                            .map_err(RuntimeError::Configuration)?;
+                        let prepared_kernel_exec =
+                            dispatcher.prepare_one_task_kernel_exec(&kernel_context)?;
                         dispatcher.set_executable_identity(path.clone(), proc_argv, proc_env);
                         dispatcher.reset_signal_handlers_on_execve(&kernel_context);
                         // Reset and refresh memory proc state as one VMA generation.
@@ -1211,9 +1210,8 @@ where
                             &new_image,
                         );
                         runtime.execve_into(&new_image)?;
-                        let exec_context = dispatcher
-                            .commit_one_task_kernel_exec(prepared_kernel_exec)
-                            .map_err(RuntimeError::Configuration)?;
+                        let exec_context =
+                            dispatcher.commit_one_task_kernel_exec(prepared_kernel_exec)?;
                         prepared_dispatch_mm_exec.commit();
                         crate::namespace::pid::mark_self_execed_for(&exec_context);
                         // execve_into rebuilt a fresh (zeroed) identity page;

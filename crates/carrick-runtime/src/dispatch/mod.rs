@@ -5495,22 +5495,17 @@ impl SyscallDispatcher {
     pub(crate) fn prepare_one_task_kernel_exec(
         &self,
         context: &crate::kernel::KernelContext,
-    ) -> Result<crate::kernel::PreparedExec, String> {
-        context
-            .kernel()
-            .prepare_exec(context, None)
-            .map_err(|error| error.to_string())
+    ) -> Result<crate::kernel::PreparedExec, crate::kernel::ExecPrepareError> {
+        Ok(context.kernel().prepare_exec(context, None)?)
     }
 
     pub(crate) fn commit_one_task_kernel_exec(
         &self,
         prepared: crate::kernel::PreparedExec,
-    ) -> Result<crate::kernel::KernelContext, String> {
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::ExecPrepareError> {
         let old_files = prepared.old_file_table();
         let kernel = Arc::clone(self.kernel_binding.read().kernel());
-        let context = kernel
-            .commit_exec(prepared, None)
-            .map_err(|error| error.to_string())?;
+        let context = kernel.commit_exec(prepared, None)?;
         *self.kernel_binding.write() = context.task_binding();
         self.publish_external_credential_projection(&context, &context.resources().credentials());
         let successor_files = context.resources().files();
@@ -5580,9 +5575,8 @@ impl SyscallDispatcher {
         &self,
         inherited: &crate::kernel::KernelContext,
         registry_id: crate::thread::ThreadId,
-    ) -> Result<crate::kernel::KernelContext, String> {
-        let observed_pid = i32::try_from(std::process::id())
-            .map_err(|_| "host PID does not fit Linux task identity".to_owned())?;
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::ExecPrepareError> {
+        let observed_pid = i32::try_from(std::process::id())?;
         let inherited_credentials = inherited.resources().credentials();
         let inherited_fs_context = inherited.resources().fs_context();
         let inherited_files = inherited.resources().files();
@@ -5592,26 +5586,19 @@ impl SyscallDispatcher {
             observed_pid,
             registry_id,
             "one-task-fork-child-adapter".to_owned(),
-        )
-        .map_err(|error| error.to_string())?;
-        let (kernel, context) =
-            crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| error.to_string())?;
-        let context = kernel
-            .copy_file_table_for_host_fork(&context, &inherited_files)
-            .map_err(|error| error.to_string())?;
+        )?;
+        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap)?;
+        let context = kernel.copy_file_table_for_host_fork(&context, &inherited_files)?;
         context
             .shared()
             .mm()
-            .copy_io_uring_mappings_for_host_fork(&inherited_mm)
-            .map_err(|error| error.to_string())?;
+            .copy_io_uring_mappings_for_host_fork(&inherited_mm)?;
         let replacement_fs_context = context.resources().fs_context();
         replacement_fs_context.set_cwd(inherited_fs_context.cwd());
         replacement_fs_context.set_chroot_root(inherited_fs_context.chroot_root());
-        let context = kernel
-            .update_credentials(&context, |credentials| {
-                credentials.copy_values_from(&inherited_credentials);
-            })
-            .map_err(|error| error.to_string())?;
+        let context = kernel.update_credentials(&context, |credentials| {
+            credentials.copy_values_from(&inherited_credentials);
+        })?;
         context
             .shared()
             .sighand()
