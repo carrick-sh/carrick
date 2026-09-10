@@ -76,7 +76,7 @@ impl clap::builder::TypedValueParser for ExecBackendValueParser {
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 pub(crate) struct Cli {
-    #[arg(long, env = "CARRICK_HOME", global = true)]
+    #[arg(long, env = "CARRICK_HOME", global = true, display_order = 20)]
     pub(crate) store: Option<PathBuf>,
     #[command(subcommand)]
     pub(crate) command: Commands,
@@ -97,6 +97,257 @@ impl From<PullArg> for carrick_image::PullPolicy {
             PullArg::Always => carrick_image::PullPolicy::Always,
             PullArg::Missing => carrick_image::PullPolicy::Missing,
             PullArg::Never => carrick_image::PullPolicy::Never,
+        }
+    }
+}
+
+// Container launch arguments shared across `run`, `create`, and `run-elf`.
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct RunArgs {
+    /// Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the
+    /// OCI manifest entry for multi-arch images. Defaults to the host-native
+    /// architecture, so it is not needed for a native run (arm64 on Apple
+    /// Silicon, amd64 on the x86_64 lanes). On Apple Silicon, `linux/amd64`
+    /// runs the x86_64 guest through Apple Rosetta 2 and requires it to be
+    /// installed.
+    #[arg(long, value_name = "OS/ARCH", display_order = 10)]
+    pub(crate) platform: Option<String>,
+
+    /// Allocate a pseudo-terminal and run interactively (like `docker run -it`).
+    #[arg(short = 't', long = "tty", display_order = 70)]
+    pub(crate) tty: bool,
+
+    /// Keep STDIN open even if not attached (like `docker run -it`).
+    #[arg(short = 'i', long = "interactive", display_order = 80)]
+    pub(crate) interactive: bool,
+
+    /// Which writable-layer backend to use. Defaults to `host`. The
+    /// in-memory backend (`memory`) is opt-in (`--features fs-memory`).
+    #[arg(long, value_enum, display_order = 100)]
+    pub(crate) fs: Option<FsBackendKind>,
+
+    /// Execution backend policy. `native` is experimental and trusted-code-only.
+    #[arg(
+        long = "exec-backend",
+        value_parser = ExecBackendValueParser,
+        default_value = "hvpatch",
+        env = "CARRICK_EXEC_BACKEND",
+        display_order = 110
+    )]
+    pub(crate) exec_backend: ExecBackendRequest,
+
+    /// PID namespace mode (like `docker run --pid`). `private` (default)
+    /// runs the container in its own PID namespace (init is pid 1); `host`
+    /// shares the host PID namespace (no remap).
+    #[arg(long, value_enum, default_value_t = PidMode::Private, display_order = 120)]
+    pub(crate) pid: PidMode,
+
+    /// Docker `--pull` policy: `always` re-checks the registry and re-pulls a
+    /// moved tag, `missing` (default) pulls only when the image is absent,
+    /// `never` uses only the local cache.
+    #[arg(long, value_enum, default_value = "missing", display_order = 130)]
+    pub(crate) pull: PullArg,
+
+    /// Container network mode: host, bridge, none, or container:<id|name>.
+    #[arg(
+        long = "net",
+        alias = "network",
+        default_value = "host",
+        display_order = 140
+    )]
+    pub(crate) network: String,
+
+    /// Add a service alias on the bridge network.
+    #[arg(long = "network-alias", value_name = "ALIAS", display_order = 150)]
+    pub(crate) network_alias: Vec<String>,
+
+    /// Assign a static IPv4 address on the bridge network.
+    #[arg(long = "ip", value_name = "IPv4", display_order = 160)]
+    pub(crate) ip: Option<String>,
+
+    /// Add a custom host-to-IP mapping in the guest's /etc/hosts.
+    #[arg(long = "add-host", value_name = "HOST:IP", display_order = 170)]
+    pub(crate) add_host: Vec<String>,
+
+    /// Set a custom DNS nameserver.
+    #[arg(long = "dns", value_name = "IP", display_order = 180)]
+    pub(crate) dns: Vec<String>,
+
+    /// Set a custom DNS search domain.
+    #[arg(long = "dns-search", value_name = "DOMAIN", display_order = 190)]
+    pub(crate) dns_search: Vec<String>,
+
+    /// Set a custom DNS resolver option.
+    #[arg(long = "dns-option", value_name = "OPTION", display_order = 200)]
+    pub(crate) dns_option: Vec<String>,
+
+    /// Set environment variables
+    #[arg(
+        short = 'e',
+        long = "env",
+        value_name = "KEY=VALUE",
+        display_order = 210
+    )]
+    pub(crate) env: Vec<String>,
+
+    /// Read in a file of environment variables (may be repeated)
+    #[arg(long = "env-file", value_name = "FILE", display_order = 220)]
+    pub(crate) env_file: Vec<PathBuf>,
+
+    /// Working directory inside the container
+    #[arg(short = 'w', long = "workdir", value_name = "DIR", display_order = 230)]
+    pub(crate) workdir: Option<String>,
+
+    /// Username or UID
+    #[arg(short = 'u', long = "user", value_name = "USER", display_order = 240)]
+    pub(crate) user: Option<String>,
+
+    /// Overwrite the default ENTRYPOINT of the image
+    #[arg(long = "entrypoint", value_name = "COMMAND", display_order = 250)]
+    pub(crate) entrypoint: Option<String>,
+
+    /// Bind mount a volume
+    #[arg(
+        short = 'v',
+        long = "volume",
+        value_name = "host-src:container-dest[:ro|rw]",
+        display_order = 260
+    )]
+    pub(crate) volume: Vec<String>,
+
+    /// Mount volumes from another container.
+    #[arg(
+        long = "volumes-from",
+        value_name = "CONTAINER[:ro|:rw]",
+        display_order = 270
+    )]
+    pub(crate) volumes_from: Vec<String>,
+
+    /// Attach a filesystem mount to the container
+    #[arg(
+        long = "mount",
+        value_name = "type=bind,source=host-src,target=container-dest[,readonly]",
+        display_order = 280
+    )]
+    pub(crate) mount: Vec<String>,
+
+    /// Assign a name to the container
+    #[arg(long = "name", value_name = "NAME", display_order = 290)]
+    pub(crate) name: Option<String>,
+
+    /// Automatically remove the container when it exits
+    #[arg(long = "rm", display_order = 300)]
+    pub(crate) rm: bool,
+
+    /// Signal to stop the container (name like `SIGQUIT`/`TERM` or number).
+    /// Overrides the image's `STOPSIGNAL`; defaults to `SIGTERM`.
+    #[arg(long = "stop-signal", value_name = "SIGNAL", display_order = 310)]
+    pub(crate) stop_signal: Option<String>,
+
+    /// Seconds to wait for the container to stop before SIGKILL (used by
+    /// `stop`/`restart` when `-t` is not given). Defaults to 10.
+    #[arg(long = "stop-timeout", value_name = "SECONDS", display_order = 320)]
+    pub(crate) stop_timeout: Option<u64>,
+
+    /// Publish a container's port(s) to the host (no-op under host networking)
+    #[arg(
+        short = 'p',
+        long = "publish",
+        value_name = "hostPort:containerPort",
+        display_order = 330
+    )]
+    pub(crate) publish: Vec<String>,
+
+    /// Docker-compatible security options. Supported: `seccomp=unconfined`
+    /// (disable the launch-time default syscall policy — carrick's model of
+    /// Docker's builtin seccomp profile) and `seccomp=default`/
+    /// `seccomp=builtin`. Custom profile files are not supported.
+    #[arg(long = "security-opt", value_name = "OPTION", display_order = 340)]
+    pub(crate) security_opt: Vec<String>,
+
+    /// Docker-compatible `--cap-add`: grant a capability beyond the
+    /// container default set, by its `capabilities(7)` name without the
+    /// `CAP_` prefix (`SYS_ADMIN`, `SYS_PTRACE`, `SYS_NICE`, ...).
+    /// Repeatable. Docker's default bounding set drops most capabilities
+    /// AND its seccomp profile is capability-conditional, so this both
+    /// raises the modeled set and lifts the launch-time denials that
+    /// capability gates.
+    #[arg(long = "cap-add", value_name = "CAPABILITY", display_order = 350)]
+    pub(crate) cap_add: Vec<String>,
+}
+
+impl Default for RunArgs {
+    fn default() -> Self {
+        Self {
+            platform: None,
+            tty: false,
+            interactive: false,
+            fs: None,
+            exec_backend: ExecBackendRequest::HvPatch,
+            pid: PidMode::Private,
+            pull: PullArg::Missing,
+            network: "host".to_string(),
+            network_alias: Vec::new(),
+            ip: None,
+            add_host: Vec::new(),
+            dns: Vec::new(),
+            dns_search: Vec::new(),
+            dns_option: Vec::new(),
+            env: Vec::new(),
+            env_file: Vec::new(),
+            workdir: None,
+            user: None,
+            entrypoint: None,
+            volume: Vec::new(),
+            volumes_from: Vec::new(),
+            mount: Vec::new(),
+            name: None,
+            rm: false,
+            stop_signal: None,
+            stop_timeout: None,
+            publish: Vec::new(),
+            security_opt: Vec::new(),
+            cap_add: Vec::new(),
+        }
+    }
+}
+
+// Execution-time arguments shared between `run` and `run-elf` that `create` lacks.
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct ExecutionArgs {
+    /// Opt-in debugging bound on guest traps (default: unlimited). Use it to
+    /// stop a runaway guest while tracing; it is NOT a health check —
+    /// exceeding a fixed count of successfully-serviced syscalls says
+    /// nothing about whether the guest is stuck.
+    #[arg(long, default_value_t = DEFAULT_MAX_TRAPS, display_order = 30)]
+    pub(crate) max_traps: usize,
+
+    /// See `run-elf --debug-state-path`.
+    #[arg(long = "debug-state-path", display_order = 40)]
+    pub(crate) debug_state_path: Option<PathBuf>,
+
+    /// Write `post-mortem.json` and `event-ring.jsonl` here if this run's
+    /// kernel is ever aborted — by the always-on process-graph liveness
+    /// invariant or by `carrick debug abort --run-id`. Equivalent to
+    /// setting `CARRICK_POSTMORTEM_DIR`.
+    #[arg(long = "post-mortem-dir", display_order = 50)]
+    pub(crate) post_mortem_dir: Option<PathBuf>,
+
+    /// `KEY=VAL` env vars to set in this process before the guest starts.
+    /// Carries `CARRICK_*` tunables across `sudo`'s env_reset without needing
+    /// SETENV in sudoers (CLI args survive sudo where env vars don't). Same
+    /// idiom as `run-elf`/`trace --forward-env`.
+    #[arg(long = "forward-env", value_name = "KEY=VAL", display_order = 360)]
+    pub(crate) forward_env: Vec<String>,
+}
+
+impl Default for ExecutionArgs {
+    fn default() -> Self {
+        Self {
+            max_traps: DEFAULT_MAX_TRAPS,
+            debug_state_path: None,
+            post_mortem_dir: None,
+            forward_env: Vec::new(),
         }
     }
 }
@@ -148,58 +399,19 @@ pub(crate) enum Commands {
     /// <oci>`, or the `carrick-kvm run-elf` dev driver for a bare ELF.
     #[cfg(feature = "platform-macos")]
     RunElf {
+        #[clap(flatten)]
+        run_args: RunArgs,
+        #[clap(flatten)]
+        exec_args: ExecutionArgs,
         path: PathBuf,
-        #[arg(long = "rootfs-layer")]
+        #[arg(long = "rootfs-layer", display_order = 25)]
         rootfs_layers: Vec<PathBuf>,
-        /// Opt-in debugging bound on guest traps (default: unlimited). Use it to
-        /// stop a runaway guest while tracing; it is NOT a health check —
-        /// exceeding a fixed count of successfully-serviced syscalls says
-        /// nothing about whether the guest is stuck.
-        #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
-        max_traps: usize,
-        /// Write a JSON dump of the guest address-space layout (PIE base,
-        /// interpreter base, HVF mappings, vector + trampoline pages) to
-        /// this path BEFORE starting the vCPU. The dump is what the
-        /// `carrick.lldb` Python plugin reads to translate guest addresses
-        /// back to image / segment / file context.
-        #[arg(long = "debug-state-path")]
-        debug_state_path: Option<PathBuf>,
         /// Suppress the JSON compat-report envelope. The guest's stdout
         /// goes to the carrick process's stdout, stderr to stderr, and
         /// the host exit code matches the guest's exit_group code.
         /// Makes carrick feel like a normal command runner.
-        #[arg(long)]
+        #[arg(long, display_order = 65)]
         raw: bool,
-        /// Which writable-layer backend to use. Defaults to `host`. The
-        /// in-memory backend (`memory`) is opt-in: build with
-        /// `--features fs-memory`. It is incoherent across guest `fork`.
-        #[arg(long, value_enum)]
-        fs: Option<FsBackendKind>,
-        /// Bind-mount a host directory/file into the guest:
-        /// `HOST:GUEST[:ro]`. Needed under `--fs host` (a sandboxed scratch, not
-        /// the real host FS) to expose host paths — e.g. a test's `testdata/`.
-        #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
-        volume: Vec<String>,
-        /// The guest's initial working directory. Defaults (under `--fs host`) to
-        /// carrick's launch directory.
-        #[arg(short = 'w', long = "workdir", value_name = "DIR")]
-        workdir: Option<String>,
-        /// `KEY=VAL` env vars to set in this process before the guest starts.
-        /// Lets a `sudo`-launched run carry `CARRICK_*` tunables (e.g.
-        /// `CARRICK_EXPOSED_CPUS`) across sudo's `env_reset` without needing
-        /// SETENV in sudoers - CLI args survive sudo where env vars don't. Same
-        /// idiom as `trace --forward-env`.
-        #[arg(long = "forward-env", value_name = "KEY=VAL")]
-        forward_env: Vec<String>,
-        /// Execution backend policy. `native` is experimental and trusted-code-only.
-        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "hvpatch", env = "CARRICK_EXEC_BACKEND")]
-        exec_backend: ExecBackendRequest,
-        /// Launch-time syscall policy. `run-elf` drives a bare host ELF and
-        /// defaults to UNCONFINED (no policy); pass `seccomp=default` to opt
-        /// into the container policy model `carrick run` applies by default
-        /// (the shape the conformance Docker oracle runs under).
-        #[arg(long = "security-opt", value_name = "OPTION")]
-        security_opt: Vec<String>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -331,242 +543,35 @@ pub(crate) enum Commands {
         registry: Option<String>,
     },
     Run {
+        #[clap(flatten)]
+        run_args: RunArgs,
+        #[clap(flatten)]
+        exec_args: ExecutionArgs,
         image: String,
-        /// Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the
-        /// OCI manifest entry for multi-arch images. Defaults to the host-native
-        /// architecture, so it is not needed for a native run (arm64 on Apple
-        /// Silicon, amd64 on the x86_64 lanes). On Apple Silicon, `linux/amd64`
-        /// runs the x86_64 guest through Apple Rosetta 2 and requires it to be
-        /// installed.
-        #[arg(long, value_name = "OS/ARCH")]
-        platform: Option<String>,
-        /// Opt-in debugging bound on guest traps (default: unlimited). Use it to
-        /// stop a runaway guest while tracing; it is NOT a health check —
-        /// exceeding a fixed count of successfully-serviced syscalls says
-        /// nothing about whether the guest is stuck.
-        #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
-        max_traps: usize,
-        /// See `run-elf --debug-state-path`.
-        #[arg(long = "debug-state-path")]
-        debug_state_path: Option<PathBuf>,
-        /// Write `post-mortem.json` and `event-ring.jsonl` here if this run's
-        /// kernel is ever aborted — by the always-on process-graph liveness
-        /// invariant or by `carrick debug abort --run-id`. Equivalent to
-        /// setting `CARRICK_POSTMORTEM_DIR`.
-        #[arg(long = "post-mortem-dir")]
-        post_mortem_dir: Option<PathBuf>,
         /// Emit the JSON compat-report envelope (exit code, traps, report) on
         /// stdout instead of behaving like `docker run`. Opt-in; off by default.
-        #[arg(long)]
+        #[arg(long, display_order = 60)]
         json: bool,
-        /// Allocate a pseudo-terminal and run interactively (like `docker run -it`).
-        #[arg(short = 't', long = "tty")]
-        tty: bool,
-        /// Keep STDIN open even if not attached (like `docker run -it`).
-        #[arg(short = 'i', long = "interactive")]
-        interactive: bool,
         /// Run the container detached (like `docker run -d`): start it in the
         /// background, print its id, and return immediately. The container runs
         /// as one background VM carrier with stdout/stderr captured to a log;
         /// manage it with `carrick ps|stop|kill|rm`.
-        #[arg(short = 'd', long = "detach", conflicts_with_all = ["tty", "interactive"])]
+        #[arg(
+            short = 'd',
+            long = "detach",
+            conflicts_with_all = ["tty", "interactive"],
+            display_order = 90
+        )]
         detach: bool,
-        /// Which writable-layer backend to use. Defaults to `host`. The
-        /// in-memory backend (`memory`) is opt-in (`--features fs-memory`).
-        #[arg(long, value_enum)]
-        fs: Option<FsBackendKind>,
-        /// Execution backend policy. `native` is experimental and trusted-code-only.
-        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "hvpatch", env = "CARRICK_EXEC_BACKEND")]
-        exec_backend: ExecBackendRequest,
-        /// PID namespace mode (like `docker run --pid`). `private` (default)
-        /// runs the container in its own PID namespace (init is pid 1); `host`
-        /// shares the host PID namespace (no remap).
-        #[arg(long, value_enum, default_value_t = PidMode::Private)]
-        pid: PidMode,
-        /// Docker `--pull` policy: `always` re-checks the registry and re-pulls a
-        /// moved tag, `missing` (default) pulls only when the image is absent,
-        /// `never` uses only the local cache.
-        #[arg(long, value_enum, default_value = "missing")]
-        pull: PullArg,
-        /// Container network mode: host, bridge, none, or container:<id|name>.
-        #[arg(long = "net", alias = "network", default_value = "host")]
-        network: String,
-        /// Add a service alias on the bridge network.
-        #[arg(long = "network-alias", value_name = "ALIAS")]
-        network_alias: Vec<String>,
-        /// Assign a static IPv4 address on the bridge network.
-        #[arg(long = "ip", value_name = "IPv4")]
-        ip: Option<String>,
-        /// Add a custom host-to-IP mapping in the guest's /etc/hosts.
-        #[arg(long = "add-host", value_name = "HOST:IP")]
-        add_host: Vec<String>,
-        /// Set a custom DNS nameserver.
-        #[arg(long = "dns", value_name = "IP")]
-        dns: Vec<String>,
-        /// Set a custom DNS search domain.
-        #[arg(long = "dns-search", value_name = "DOMAIN")]
-        dns_search: Vec<String>,
-        /// Set a custom DNS resolver option.
-        #[arg(long = "dns-option", value_name = "OPTION")]
-        dns_option: Vec<String>,
-        /// Set environment variables
-        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
-        env: Vec<String>,
-        /// Read in a file of environment variables (may be repeated)
-        #[arg(long = "env-file", value_name = "FILE")]
-        env_file: Vec<PathBuf>,
-        /// Working directory inside the container
-        #[arg(short = 'w', long = "workdir", value_name = "DIR")]
-        workdir: Option<String>,
-        /// Username or UID
-        #[arg(short = 'u', long = "user", value_name = "USER")]
-        user: Option<String>,
-        /// Overwrite the default ENTRYPOINT of the image
-        #[arg(long = "entrypoint", value_name = "COMMAND")]
-        entrypoint: Option<String>,
-        /// Bind mount a volume
-        #[arg(
-            short = 'v',
-            long = "volume",
-            value_name = "host-src:container-dest[:ro|rw]"
-        )]
-        volume: Vec<String>,
-        /// Mount volumes from another container.
-        #[arg(long = "volumes-from", value_name = "CONTAINER[:ro|:rw]")]
-        volumes_from: Vec<String>,
-        /// Attach a filesystem mount to the container
-        #[arg(
-            long = "mount",
-            value_name = "type=bind,source=host-src,target=container-dest[,readonly]"
-        )]
-        mount: Vec<String>,
-        /// Assign a name to the container
-        #[arg(long = "name", value_name = "NAME")]
-        name: Option<String>,
-        /// Automatically remove the container when it exits
-        #[arg(long = "rm")]
-        rm: bool,
-        /// Signal to stop the container (name like `SIGQUIT`/`TERM` or number).
-        /// Overrides the image's `STOPSIGNAL`; defaults to `SIGTERM`.
-        #[arg(long = "stop-signal", value_name = "SIGNAL")]
-        stop_signal: Option<String>,
-        /// Seconds to wait for the container to stop before SIGKILL (used by
-        /// `stop`/`restart` when `-t` is not given). Defaults to 10.
-        #[arg(long = "stop-timeout", value_name = "SECONDS")]
-        stop_timeout: Option<u64>,
-        /// Publish a container's port(s) to the host (no-op under host networking)
-        #[arg(short = 'p', long = "publish", value_name = "hostPort:containerPort")]
-        publish: Vec<String>,
-        /// Docker-compatible security options. Supported: `seccomp=unconfined`
-        /// (disable the launch-time default syscall policy — carrick's model of
-        /// Docker's builtin seccomp profile) and `seccomp=default`/
-        /// `seccomp=builtin`. Custom profile files are not supported.
-        #[arg(long = "security-opt", value_name = "OPTION")]
-        security_opt: Vec<String>,
-        /// Docker-compatible `--cap-add`: grant a capability beyond the
-        /// container default set, by its `capabilities(7)` name without the
-        /// `CAP_` prefix (`SYS_ADMIN`, `SYS_PTRACE`, `SYS_NICE`, ...).
-        /// Repeatable. Docker's default bounding set drops most capabilities
-        /// AND its seccomp profile is capability-conditional, so this both
-        /// raises the modeled set and lifts the launch-time denials that
-        /// capability gates.
-        #[arg(long = "cap-add", value_name = "CAPABILITY")]
-        cap_add: Vec<String>,
-        /// `KEY=VAL` env vars to set in this process before the guest starts.
-        /// Carries `CARRICK_*` tunables across `sudo`'s env_reset without needing
-        /// SETENV in sudoers (CLI args survive sudo where env vars don't). Same
-        /// idiom as `run-elf`/`trace --forward-env`.
-        #[arg(long = "forward-env", value_name = "KEY=VAL")]
-        forward_env: Vec<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Create a container without starting it (like `docker create`). Pulls the
     /// image and persists the config; launch it later with `carrick start`.
     Create {
+        #[clap(flatten)]
+        run_args: RunArgs,
         image: String,
-        #[arg(long, value_name = "OS/ARCH")]
-        platform: Option<String>,
-        /// Which writable-layer backend to use. Defaults to `host`. The
-        /// in-memory backend (`memory`) is opt-in (`--features fs-memory`).
-        #[arg(long, value_enum)]
-        fs: Option<FsBackendKind>,
-        /// Execution backend policy. `native` is experimental and trusted-code-only.
-        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "hvpatch", env = "CARRICK_EXEC_BACKEND")]
-        exec_backend: ExecBackendRequest,
-        #[arg(long, value_enum, default_value_t = PidMode::Private)]
-        pid: PidMode,
-        /// Docker `--pull` policy: `always` re-checks the registry and re-pulls a
-        /// moved tag, `missing` (default) pulls only when the image is absent,
-        /// `never` uses only the local cache.
-        #[arg(long, value_enum, default_value = "missing")]
-        pull: PullArg,
-        /// Container network mode: host, bridge, none, or container:<id|name>.
-        #[arg(long = "net", alias = "network", default_value = "host")]
-        network: String,
-        /// Add a service alias on the bridge network.
-        #[arg(long = "network-alias", value_name = "ALIAS")]
-        network_alias: Vec<String>,
-        /// Assign a static IPv4 address on the bridge network.
-        #[arg(long = "ip", value_name = "IPv4")]
-        ip: Option<String>,
-        /// Add a custom host-to-IP mapping in the guest's /etc/hosts.
-        #[arg(long = "add-host", value_name = "HOST:IP")]
-        add_host: Vec<String>,
-        /// Set a custom DNS nameserver.
-        #[arg(long = "dns", value_name = "IP")]
-        dns: Vec<String>,
-        /// Set a custom DNS search domain.
-        #[arg(long = "dns-search", value_name = "DOMAIN")]
-        dns_search: Vec<String>,
-        /// Set a custom DNS resolver option.
-        #[arg(long = "dns-option", value_name = "OPTION")]
-        dns_option: Vec<String>,
-        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
-        env: Vec<String>,
-        #[arg(long = "env-file", value_name = "FILE")]
-        env_file: Vec<PathBuf>,
-        #[arg(short = 'w', long = "workdir", value_name = "DIR")]
-        workdir: Option<String>,
-        #[arg(short = 'u', long = "user", value_name = "USER")]
-        user: Option<String>,
-        #[arg(long = "entrypoint", value_name = "COMMAND")]
-        entrypoint: Option<String>,
-        #[arg(
-            short = 'v',
-            long = "volume",
-            value_name = "host-src:container-dest[:ro|rw]"
-        )]
-        volume: Vec<String>,
-        /// Mount volumes from another container.
-        #[arg(long = "volumes-from", value_name = "CONTAINER[:ro|:rw]")]
-        volumes_from: Vec<String>,
-        #[arg(long = "mount", value_name = "type=bind,source=...,target=...")]
-        mount: Vec<String>,
-        #[arg(long = "name", value_name = "NAME")]
-        name: Option<String>,
-        /// Automatically remove the container when it exits
-        #[arg(long = "rm")]
-        rm: bool,
-        #[arg(short = 't', long = "tty")]
-        tty: bool,
-        #[arg(short = 'i', long = "interactive")]
-        interactive: bool,
-        /// Publish a container's port(s) to the host.
-        #[arg(short = 'p', long = "publish", value_name = "hostPort:containerPort")]
-        publish: Vec<String>,
-        /// Signal to stop the container (overrides the image `STOPSIGNAL`).
-        #[arg(long = "stop-signal", value_name = "SIGNAL")]
-        stop_signal: Option<String>,
-        /// Seconds to wait before SIGKILL when stopping. Defaults to 10.
-        #[arg(long = "stop-timeout", value_name = "SECONDS")]
-        stop_timeout: Option<u64>,
-        /// Docker-compatible security options (see `run --security-opt`).
-        #[arg(long = "security-opt", value_name = "OPTION")]
-        security_opt: Vec<String>,
-        /// Docker-compatible `--cap-add` (see `run --cap-add`).
-        #[arg(long = "cap-add", value_name = "CAPABILITY")]
-        cap_add: Vec<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },

@@ -102,6 +102,7 @@ pub struct CliNetworkAttachment {
 #[derive(Debug, Clone)]
 pub struct RunRequest {
     pub image_ref: String,
+    pub image_source: carrick_spec::ImageSource,
     /// Raw OCI platform string (`--platform linux/amd64`), or `None` for the
     /// host-native architecture (see [`Platform::host_native`]).
     pub platform: Option<String>,
@@ -174,6 +175,7 @@ impl Default for RunRequest {
     fn default() -> Self {
         Self {
             image_ref: String::new(),
+            image_source: carrick_spec::ImageSource::default(),
             platform: None,
             args: Vec::new(),
             env_overrides: Vec::new(),
@@ -520,9 +522,13 @@ pub fn resolve_run_spec(req: RunRequest, image: ResolvedImage) -> Result<Resolve
     }
 
     // 6. Launch-time syscall policy: docker's default profile model unless
-    //    `--security-opt seccomp=unconfined` opts out.
-    let seccomp_policy =
-        resolve_seccomp_policy(SeccompPolicy::ContainerDefault, &req.security_opts)?;
+    //    `--security-opt seccomp=unconfined` opts out. For a host ELF, defaults
+    //    to Unconfined unless opted into seccomp=default.
+    let base_seccomp_policy = match req.image_source {
+        carrick_spec::ImageSource::HostElf { .. } => SeccompPolicy::Unconfined,
+        carrick_spec::ImageSource::Oci(_) => SeccompPolicy::ContainerDefault,
+    };
+    let seccomp_policy = resolve_seccomp_policy(base_seccomp_policy, &req.security_opts)?;
 
     let spec = RunSpec {
         cap_add: req.cap_add.clone(),
@@ -701,30 +707,85 @@ impl Engine {
     /// execute. The CLI drives it on a throwaway current-thread runtime that it
     /// drops before `carrick_runtime::Runtime::execute` (`block_on_oci`).
     pub async fn resolve(&self, req: RunRequest) -> Result<Resolved, anyhow::Error> {
-        let image_ref = carrick_spec::ImageReference::parse(&req.image_ref)
-            .map_err(|e| anyhow::anyhow!("invalid image reference: {}", e))?;
+        match req.image_source.clone() {
+            carrick_spec::ImageSource::HostElf {
+                path,
+                rootfs_layers,
+            } => {
+                let platform = request_platform(&req);
+                check_platform_runnable(platform).map_err(anyhow::Error::msg)?;
+                let canonical_path = path.canonicalize_utf8().unwrap_or_else(|_| path.clone());
+                let executable_path = canonical_path.as_str().to_string();
+                let mut mounts = req.mounts.clone();
+                // Bind the host ELF read-only at the executable path inside the guest
+                // so /proc/self/exe is resolvable and openable.
+                mounts.push(carrick_spec::Mount {
+                    source: canonical_path,
+                    target: Utf8PathBuf::from(&executable_path),
+                    readonly: true,
+                });
+                let mut req = req;
+                req.mounts = mounts;
+                if req.entrypoint_override.is_none() {
+                    req.entrypoint_override = Some(vec![executable_path]);
+                }
+                let mut env = Vec::new();
+                for key in [
+                    "GODEBUG",
+                    "GOMAXPROCS",
+                    "GOTRACEBACK",
+                    "GOGC",
+                    "GODEBUGFLAGS",
+                ] {
+                    if let Some(host_env) = &req.host_env {
+                        if let Some((_, val)) = host_env.iter().find(|(k, _)| k == key) {
+                            env.push(format!("{key}={val}"));
+                        }
+                    } else if let Ok(val) = std::env::var(key) {
+                        env.push(format!("{key}={val}"));
+                    }
+                }
+                let image = carrick_image::ResolvedImage {
+                    layers: rootfs_layers,
+                    config: carrick_spec::ImageConfig {
+                        env,
+                        ..carrick_spec::ImageConfig::default()
+                    },
+                };
+                resolve_run_spec(req, image).map_err(anyhow::Error::msg)
+            }
+            carrick_spec::ImageSource::Oci(s) => {
+                let effective_ref = if !s.is_empty() {
+                    s
+                } else {
+                    req.image_ref.clone()
+                };
+                let image_ref = carrick_spec::ImageReference::parse(&effective_ref)
+                    .map_err(|e| anyhow::anyhow!("invalid image reference: {}", e))?;
 
-        // Select the OCI manifest entry for the requested platform. amd64
-        // images are cached separately from the host-native arm64 so the two
-        // never collide in the store, and pulling honours the platform hint.
-        let platform = request_platform(&req);
-        // Reject an unrunnable target (e.g. `--platform linux/amd64` on an Apple
-        // Silicon host without Rosetta) BEFORE pulling its image, with an
-        // actionable message. This is the authoritative gate every run path
-        // funnels through (foreground `run`, `start`, the detached child).
-        check_platform_runnable(platform).map_err(anyhow::Error::msg)?;
-        let target = carrick_image::PlatformTarget {
-            os: "linux".to_string(),
-            arch: platform.oci_arch().to_string(),
-            variant: None,
-        };
-        let resolved = self
-            .store
-            .resolve_with_platform_and_policy(&image_ref, &target, req.pull)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to resolve image: {}", e))?;
+                // Select the OCI manifest entry for the requested platform. amd64
+                // images are cached separately from the host-native arm64 so the two
+                // never collide in the store, and pulling honours the platform hint.
+                let platform = request_platform(&req);
+                // Reject an unrunnable target (e.g. `--platform linux/amd64` on an Apple
+                // Silicon host without Rosetta) BEFORE pulling its image, with an
+                // actionable message. This is the authoritative gate every run path
+                // funnels through (foreground `run`, `start`, the detached child).
+                check_platform_runnable(platform).map_err(anyhow::Error::msg)?;
+                let target = carrick_image::PlatformTarget {
+                    os: "linux".to_string(),
+                    arch: platform.oci_arch().to_string(),
+                    variant: None,
+                };
+                let resolved = self
+                    .store
+                    .resolve_with_platform_and_policy(&image_ref, &target, req.pull)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to resolve image: {}", e))?;
 
-        resolve_run_spec(req, resolved).map_err(anyhow::Error::msg)
+                resolve_run_spec(req, resolved).map_err(anyhow::Error::msg)
+            }
+        }
     }
 }
 
@@ -1436,6 +1497,49 @@ mod tests {
         assert!(
             err.contains("nobody"),
             "error must name the user when layers empty: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_elf_resolves_into_run_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let elf_path = dir.path().join("my-elf");
+        std::fs::write(&elf_path, b"fake elf").unwrap();
+        let utf8_elf = Utf8PathBuf::from_path_buf(elf_path.canonicalize().unwrap()).unwrap();
+
+        let req = RunRequest {
+            image_source: carrick_spec::ImageSource::HostElf {
+                path: utf8_elf.clone(),
+                rootfs_layers: vec![],
+            },
+            args: vec!["--flag".to_string(), "arg1".to_string()],
+            max_traps: 50,
+            ..RunRequest::default()
+        };
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(store_dir.path());
+        let engine = Engine::new(store);
+        let resolved = engine.resolve(req).await.expect("resolve host elf");
+        assert_eq!(resolved.spec.executable, utf8_elf.as_str());
+        assert_eq!(
+            resolved.spec.argv,
+            vec![
+                utf8_elf.as_str().to_string(),
+                "--flag".to_string(),
+                "arg1".to_string()
+            ]
+        );
+        assert_eq!(
+            resolved.spec.seccomp_policy,
+            carrick_spec::SeccompPolicy::Unconfined
+        );
+        assert!(
+            resolved
+                .spec
+                .mounts
+                .iter()
+                .any(|m| m.target == utf8_elf && m.readonly)
         );
     }
 }

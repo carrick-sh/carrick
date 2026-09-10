@@ -10,11 +10,14 @@ Arguments:
           
 
 Options:
-      --rootfs-layer <ROOTFS_LAYERS>
-          
+      --platform <OS/ARCH>
+          Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the OCI manifest entry for multi-arch images. Defaults to the host-native architecture, so it is not needed for a native run (arm64 on Apple Silicon, amd64 on the x86_64 lanes). On Apple Silicon, `linux/amd64` runs the x86_64 guest through Apple Rosetta 2 and requires it to be installed
 
       --store <STORE>
           [env: CARRICK_HOME=]
+
+      --rootfs-layer <ROOTFS_LAYERS>
+          
 
       --max-traps <MAX_TRAPS>
           Opt-in debugging bound on guest traps (default: unlimited). Use it to stop a runaway guest while tracing; it is NOT a health check — exceeding a fixed count of successfully-serviced syscalls says nothing about whether the guest is stuck
@@ -22,25 +25,25 @@ Options:
           [default: 18446744073709551615]
 
       --debug-state-path <DEBUG_STATE_PATH>
-          Write a JSON dump of the guest address-space layout (PIE base, interpreter base, HVF mappings, vector + trampoline pages) to this path BEFORE starting the vCPU. The dump is what the `carrick.lldb` Python plugin reads to translate guest addresses back to image / segment / file context
+          See `run-elf --debug-state-path`
+
+      --post-mortem-dir <POST_MORTEM_DIR>
+          Write `post-mortem.json` and `event-ring.jsonl` here if this run's kernel is ever aborted — by the always-on process-graph liveness invariant or by `carrick debug abort --run-id`. Equivalent to setting `CARRICK_POSTMORTEM_DIR`
 
       --raw
           Suppress the JSON compat-report envelope. The guest's stdout goes to the carrick process's stdout, stderr to stderr, and the host exit code matches the guest's exit_group code. Makes carrick feel like a normal command runner
 
+  -t, --tty
+          Allocate a pseudo-terminal and run interactively (like `docker run -it`)
+
+  -i, --interactive
+          Keep STDIN open even if not attached (like `docker run -it`)
+
       --fs <FS>
-          Which writable-layer backend to use. Defaults to `host`. The in-memory backend (`memory`) is opt-in: build with `--features fs-memory`. It is incoherent across guest `fork`
+          Which writable-layer backend to use. Defaults to `host`. The in-memory backend (`memory`) is opt-in (`--features fs-memory`)
 
           Possible values:
           - host: Host-APFS passthrough via cap-std: the kernel is the single fork-coherent source of truth. The only backend in a default build
-
-  -v, --volume <HOST:GUEST[:ro]>
-          Bind-mount a host directory/file into the guest: `HOST:GUEST[:ro]`. Needed under `--fs host` (a sandboxed scratch, not the real host FS) to expose host paths — e.g. a test's `testdata/`
-
-  -w, --workdir <DIR>
-          The guest's initial working directory. Defaults (under `--fs host`) to carrick's launch directory
-
-      --forward-env <KEY=VAL>
-          `KEY=VAL` env vars to set in this process before the guest starts. Lets a `sudo`-launched run carry `CARRICK_*` tunables (e.g. `CARRICK_EXPOSED_CPUS`) across sudo's `env_reset` without needing SETENV in sudoers - CLI args survive sudo where env vars don't. Same idiom as `trace --forward-env`
 
       --exec-backend <EXEC_BACKEND>
           Execution backend policy. `native` is experimental and trusted-code-only
@@ -49,8 +52,91 @@ Options:
           [default: hvpatch]
           [possible values: hvpatch]
 
+      --pid <PID>
+          PID namespace mode (like `docker run --pid`). `private` (default) runs the container in its own PID namespace (init is pid 1); `host` shares the host PID namespace (no remap)
+
+          Possible values:
+          - private: A fresh PID namespace (default; `docker run` default)
+          - host:    Share the host PID namespace (`docker run --pid=host`)
+          
+          [default: private]
+
+      --pull <PULL>
+          Docker `--pull` policy: `always` re-checks the registry and re-pulls a moved tag, `missing` (default) pulls only when the image is absent, `never` uses only the local cache
+          
+          [default: missing]
+          [possible values: always, missing, never]
+
+      --net <NETWORK>
+          Container network mode: host, bridge, none, or container:<id|name>
+          
+          [default: host]
+
+      --network-alias <ALIAS>
+          Add a service alias on the bridge network
+
+      --ip <IPv4>
+          Assign a static IPv4 address on the bridge network
+
+      --add-host <HOST:IP>
+          Add a custom host-to-IP mapping in the guest's /etc/hosts
+
+      --dns <IP>
+          Set a custom DNS nameserver
+
+      --dns-search <DOMAIN>
+          Set a custom DNS search domain
+
+      --dns-option <OPTION>
+          Set a custom DNS resolver option
+
+  -e, --env <KEY=VALUE>
+          Set environment variables
+
+      --env-file <FILE>
+          Read in a file of environment variables (may be repeated)
+
+  -w, --workdir <DIR>
+          Working directory inside the container
+
+  -u, --user <USER>
+          Username or UID
+
+      --entrypoint <COMMAND>
+          Overwrite the default ENTRYPOINT of the image
+
+  -v, --volume <host-src:container-dest[:ro|rw]>
+          Bind mount a volume
+
+      --volumes-from <CONTAINER[:ro|:rw]>
+          Mount volumes from another container
+
+      --mount <type=bind,source=host-src,target=container-dest[,readonly]>
+          Attach a filesystem mount to the container
+
+      --name <NAME>
+          Assign a name to the container
+
+      --rm
+          Automatically remove the container when it exits
+
+      --stop-signal <SIGNAL>
+          Signal to stop the container (name like `SIGQUIT`/`TERM` or number). Overrides the image's `STOPSIGNAL`; defaults to `SIGTERM`
+
+      --stop-timeout <SECONDS>
+          Seconds to wait for the container to stop before SIGKILL (used by `stop`/`restart` when `-t` is not given). Defaults to 10
+
+  -p, --publish <hostPort:containerPort>
+          Publish a container's port(s) to the host (no-op under host networking)
+
       --security-opt <OPTION>
-          Launch-time syscall policy. `run-elf` drives a bare host ELF and defaults to UNCONFINED (no policy); pass `seccomp=default` to opt into the container policy model `carrick run` applies by default (the shape the conformance Docker oracle runs under)
+          Docker-compatible security options. Supported: `seccomp=unconfined` (disable the launch-time default syscall policy — carrick's model of Docker's builtin seccomp profile) and `seccomp=default`/ `seccomp=builtin`. Custom profile files are not supported
+
+      --cap-add <CAPABILITY>
+          Docker-compatible `--cap-add`: grant a capability beyond the container default set, by its `capabilities(7)` name without the `CAP_` prefix (`SYS_ADMIN`, `SYS_PTRACE`, `SYS_NICE`, ...). Repeatable. Docker's default bounding set drops most capabilities AND its seccomp profile is capability-conditional, so this both raises the modeled set and lifts the launch-time denials that capability gates
+
+      --forward-env <KEY=VAL>
+          `KEY=VAL` env vars to set in this process before the guest starts. Carries `CARRICK_*` tunables across `sudo`'s env_reset without needing SETENV in sudoers (CLI args survive sudo where env vars don't). Same idiom as `run-elf`/`trace --forward-env`
 
   -h, --help
           Print help (see a summary with '-h')

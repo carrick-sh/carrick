@@ -169,6 +169,36 @@ impl<'de> Deserialize<'de> for ImageReference {
     }
 }
 
+/// The source of a runnable container/guest image: an OCI image reference or
+/// a freestanding host ELF binary with optional rootfs layers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageSource {
+    Oci(String),
+    HostElf {
+        path: Utf8PathBuf,
+        #[serde(default)]
+        rootfs_layers: Vec<Utf8PathBuf>,
+    },
+}
+
+impl Default for ImageSource {
+    fn default() -> Self {
+        Self::Oci(String::new())
+    }
+}
+
+impl From<String> for ImageSource {
+    fn from(s: String) -> Self {
+        Self::Oci(s)
+    }
+}
+
+impl From<&str> for ImageSource {
+    fn from(s: &str) -> Self {
+        Self::Oci(s.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ImageConfig {
@@ -1330,5 +1360,27 @@ mod tests {
         };
         let round: ImageConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(round.stop_signal.as_deref(), Some("SIGQUIT"));
+    }
+
+    #[test]
+    fn image_source_round_trips_and_defaults() {
+        let oci = ImageSource::Oci("alpine:latest".to_string());
+        let json = serde_json::to_string(&oci).unwrap();
+        let round: ImageSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, oci);
+
+        let elf = ImageSource::HostElf {
+            path: Utf8PathBuf::from("/bin/hello"),
+            rootfs_layers: vec![Utf8PathBuf::from("/rootfs.tar.gz")],
+        };
+        let json = serde_json::to_string(&elf).unwrap();
+        let round: ImageSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, elf);
+
+        assert_eq!(ImageSource::default(), ImageSource::Oci(String::new()));
+        assert_eq!(
+            ImageSource::from("ubuntu"),
+            ImageSource::Oci("ubuntu".to_string())
+        );
     }
 }
