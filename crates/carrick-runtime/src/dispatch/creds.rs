@@ -41,6 +41,7 @@
 use super::*;
 use crate::linux_abi::LinuxErrno;
 use carrick_abi::{NsGid, NsUid};
+use carrick_fatal::carrick_fatal;
 
 syscall_table! {
     /// Per-module syscall routing for the `creds` subsystem (Task A1).
@@ -280,8 +281,10 @@ impl SyscallDispatcher {
         }
         #[cfg(not(test))]
         {
-            tracing::error!("credential read escaped its captured KernelContext scope");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::credentials",
+                "credential read escaped its captured KernelContext scope"
+            );
         }
     }
 
@@ -334,7 +337,7 @@ impl SyscallDispatcher {
             }
             Err(error) => {
                 tracing::error!(%error, "credential COW publication invariant failed");
-                std::process::abort();
+                Err(crate::linux_abi::LINUX_EAGAIN)
             }
         }
     }
@@ -342,12 +345,14 @@ impl SyscallDispatcher {
     fn update_fs_umask(&self, kernel: &crate::kernel::KernelContext, umask: u32) -> u32 {
         match kernel.kernel().update_fs_umask(kernel, umask) {
             Ok((_, previous)) => previous,
-            Err(error) => {
+            Err(_error) => {
                 // umask(2) has no error return. Reservation contention is
                 // retried inside Kernel; any remaining failure means the exact
                 // dispatch context violated its authority boundary.
-                tracing::error!(%error, "CLONE_FS umask publication invariant failed");
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::credentials",
+                    "CLONE_FS umask publication invariant failed"
+                );
             }
         }
     }
@@ -377,13 +382,12 @@ impl SyscallDispatcher {
             return pid;
         }
         let proc = self.proc.lock();
-        if let Some(internal_pid) = proc.virtual_pid {
+        if let Some(_internal_pid) = proc.virtual_pid {
             return proc.namespace_pid.unwrap_or_else(|| {
-                tracing::error!(
-                    internal_id = internal_pid,
+                carrick_fatal!(
+                    "dispatch::pid_identity",
                     "bound HVPatch dispatcher is missing its cached namespace-local pid"
                 );
-                std::process::abort();
             });
         }
         drop(proc);

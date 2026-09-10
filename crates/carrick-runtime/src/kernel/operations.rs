@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
+use carrick_fatal::carrick_fatal;
+
 use carrick_abi::{LinuxSiginfo, LinuxWaitOptions, NsUid};
 use carrick_hal::{KernelTransactionId, ThreadId};
 use parking_lot::{Condvar, Mutex};
@@ -1359,7 +1361,12 @@ impl PreparedThreadClone {
             // invariant violation as an ordinary error would leave a ghost
             // namespace member behind.
             task.publish_thread(Arc::clone(&thread))
-                .unwrap_or_else(|_| std::process::abort());
+                .unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "kernel::thread_publication",
+                        "publish_thread failed in PreparedThreadClone::commit"
+                    );
+                });
             record.thread_claims.insert(tid, claim);
             record.revision = published_revision;
             kernel.observe_thread_publication(&thread, &resources, published_revision);
@@ -1403,13 +1410,23 @@ impl Kernel {
             .get(&caller.task().session())
             .filter(|record| record.container == container)
             .map(|record| Arc::clone(&record.object))
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::tty_identity",
+                    "session not found in initialize_launch_controlling_tty"
+                );
+            });
         let foreground = state
             .process_groups
             .get(&caller.task().process_group())
             .filter(|record| record.container == container)
             .map(|record| Arc::clone(&record.object))
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::tty_identity",
+                    "process group not found in initialize_launch_controlling_tty"
+                );
+            });
         let mut ttys = self.controlling_ttys.lock();
         ttys.entry(container)
             .or_insert(super::core::ControllingTtyState {
@@ -3645,9 +3662,17 @@ impl Kernel {
         if tid != LinuxTid::for_task_leader(context.task.key().id)
             && let Some(region) = context.task.pid_ns_region()
         {
-            let internal = u32::try_from(tid.raw()).unwrap_or_else(|_| std::process::abort());
+            let internal = u32::try_from(tid.raw()).unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "kernel::thread_retirement",
+                    "tid exceeds u32 in exit_thread"
+                );
+            });
             if !region.unregister_reaped(internal) {
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::thread_retirement",
+                    "failed to unregister reaped thread in exit_thread"
+                );
             }
         }
         self.retire_file_table_if_unreferenced(&files);
@@ -3961,7 +3986,10 @@ impl Kernel {
             }
             let Some((revision, task, thread, resources)) = caller_publication else {
                 tracing::error!("umask publication lost its already-validated caller");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::fs_context_publication",
+                    "umask publication lost its already-validated caller"
+                );
             };
             return Ok((
                 KernelContext::from_parts(
@@ -4093,7 +4121,10 @@ impl Kernel {
         let published_revision = next_revision(target_revision)?;
         if !group_exists {
             let Some(namespace_id) = target_namespace_id else {
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::process_group_identity",
+                    "missing target_namespace_id in set_process_group"
+                );
             };
             if !state.sessions.contains_key(&caller.session()) {
                 return Err(KernelOperationError::IdentityObjectMissing);
@@ -4720,8 +4751,14 @@ impl Kernel {
         let mut retired_secondary_namespace_tids = Vec::new();
         for (tid, claim) in thread_claims {
             if tid != leader_tid {
-                retired_secondary_namespace_tids
-                    .push(u32::try_from(tid.raw()).unwrap_or_else(|_| std::process::abort()));
+                retired_secondary_namespace_tids.push(u32::try_from(tid.raw()).unwrap_or_else(
+                    |_| {
+                        carrick_fatal!(
+                            "kernel::task_exit_identity",
+                            "secondary tid exceeds u32 in commit_task_exit_notifying"
+                        );
+                    },
+                ));
             }
             if let Some(thread) = task.thread(tid) {
                 state
@@ -4784,7 +4821,10 @@ impl Kernel {
         if let Some(region) = pid_region {
             for tid in retired_secondary_namespace_tids {
                 if !region.unregister_reaped(tid) {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "kernel::task_exit_identity",
+                        "failed to unregister reaped secondary thread"
+                    );
                 }
             }
         }
@@ -5276,10 +5316,17 @@ impl Kernel {
                 drop(state);
                 self.auditors().reaped(parent, zombie.key);
                 if let Some(region) = parent_pid_region {
-                    let internal =
-                        u32::try_from(id.raw()).unwrap_or_else(|_| std::process::abort());
+                    let internal = u32::try_from(id.raw()).unwrap_or_else(|_| {
+                        carrick_fatal!(
+                            "kernel::child_reaping",
+                            "zombie id exceeds u32 in wait_child_matching"
+                        );
+                    });
                     if !region.unregister_reaped(internal) {
-                        std::process::abort();
+                        carrick_fatal!(
+                            "kernel::child_reaping",
+                            "failed to unregister reaped child in wait_child_matching"
+                        );
                     }
                 }
             }

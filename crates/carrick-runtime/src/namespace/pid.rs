@@ -18,6 +18,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use carrick_fatal::carrick_fatal;
 use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::pidns::{PID_NAMESPACE_SLOTS, PidNamespaceRef, PidNamespaceSlot};
@@ -775,7 +776,10 @@ pub fn unregister_reaped(host_pid: u32) {
 pub fn mark_self_execed_for(context: &crate::kernel::KernelContext) {
     let Some(r) = region_for(context) else { return };
     let Ok(internal) = u32::try_from(context.task().key().id.raw()) else {
-        std::process::abort();
+        carrick_fatal!(
+            "namespace::exec_identity",
+            "task ID exceeds u32 in mark_self_execed_for"
+        );
     };
     r.mark_execed(internal);
 }
@@ -886,7 +890,10 @@ pub fn ns_self_pid_for(context: &crate::kernel::KernelContext, host_pid: u32) ->
             container = context.container().id().raw(),
             "live task is missing its namespace-local identity"
         );
-        std::process::abort();
+        carrick_fatal!(
+            "namespace::self_identity",
+            "live task is missing its namespace-local identity"
+        );
     })
 }
 

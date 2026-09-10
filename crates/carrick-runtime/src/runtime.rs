@@ -94,6 +94,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa};
 
 use crate::compat::CompatReporter;
@@ -1291,13 +1292,22 @@ where
                                 // Backend `Err` does not prove that stage-2/page-table
                                 // mutation never began. Process teardown is the only
                                 // sound rollback until the backend Result is stronger.
-                                std::process::abort();
+                                carrick_fatal!(
+                                    "runtime::host_alias_mapping",
+                                    "backend map_host_alias failed in single-threaded loop"
+                                );
                             }
                             let Ok(len) = usize::try_from(len) else {
-                                std::process::abort();
+                                carrick_fatal!(
+                                    "runtime::host_alias_mapping",
+                                    "host alias length exceeds usize"
+                                );
                             };
                             if prot_none && runtime.protect_range(va.raw(), len, 0).is_err() {
-                                std::process::abort();
+                                carrick_fatal!(
+                                    "runtime::host_alias_mapping",
+                                    "protect_range PROT_NONE failed for host alias"
+                                );
                             }
                             // Publish the dispatcher's authoritative Linux VMA
                             // protection + sharing only after the backend mapping and
@@ -1320,15 +1330,24 @@ where
                             );
                             if let Some((bus_start, bus_len)) = install.bus_fault_range() {
                                 let Ok(bus_len) = usize::try_from(bus_len) else {
-                                    std::process::abort();
+                                    carrick_fatal!(
+                                        "runtime::host_alias_mapping",
+                                        "bus fault length exceeds usize"
+                                    );
                                 };
                                 if runtime.protect_range(bus_start, bus_len, 0).is_err() {
-                                    std::process::abort();
+                                    carrick_fatal!(
+                                        "runtime::host_alias_mapping",
+                                        "protect_range failed for bus fault range"
+                                    );
                                 }
                                 runtime.set_no_access(bus_start, bus_len, true);
                             }
                             if dispatcher.commit_host_alias_install(install).is_err() {
-                                std::process::abort();
+                                carrick_fatal!(
+                                    "runtime::host_alias_mapping",
+                                    "commit_host_alias_install failed"
+                                );
                             }
                             success_retval
                         }

@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use carrick_fatal::carrick_fatal;
+
 use super::{AuthorityError, PipeCapacity, PipeEnd};
 
 #[derive(Debug)]
@@ -39,7 +41,10 @@ impl PipeStreamState {
         };
         *refs = refs.checked_sub(1).unwrap_or_else(|| {
             tracing::error!("pipe-end reference underflow");
-            std::process::abort();
+            carrick_fatal!(
+                "file_authority::pipe_stream",
+                "pipe-end reference underflow"
+            );
         });
     }
 

@@ -50,6 +50,7 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
+use carrick_fatal::carrick_fatal;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 syscall_table! {
@@ -327,7 +328,12 @@ impl MemAuthority {
                 forked
                     .deferred_anonymous
                     .clear_zero_read_residency(GuestVa(range.va), range.len as usize)
-                    .unwrap_or_else(|_| std::process::abort());
+                    .unwrap_or_else(|_| {
+                        carrick_fatal!(
+                            "dispatch::deferred_anonymous_fork",
+                            "wipeonfork clear_zero_read_residency failed"
+                        )
+                    });
             }
         }
         Ok((
@@ -391,7 +397,10 @@ impl MemAuthority {
             .fetch_add(1, std::sync::atomic::Ordering::Release)
             == u64::MAX
         {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mem_revision",
+                "mem authority revision counter overflow"
+            );
         }
     }
 }
@@ -3123,7 +3132,10 @@ impl SyscallDispatcher {
         match failure {
             carrick_guest_mem::RepointPrivateError::Clean(_) => {
                 if self.mem().lock().overlay.free(candidate).is_none() {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "dispatch::mem_overlay",
+                        "freeing candidate private overlay slot failed"
+                    );
                 }
                 PrivateRepointRecovery::RecoveredCleanly
             }
@@ -3156,12 +3168,18 @@ impl SyscallDispatcher {
         commit: HostAliasMmapCommit,
     ) {
         let Some(end) = commit.start.checked_add(commit.len) else {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::host_alias",
+                "commit_host_alias_mmap_on end address overflow"
+            );
         };
         let Some(replacement) =
             crate::vfs::GuestMemoryRange::new(GuestVa(commit.start), GuestVa(end))
         else {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::host_alias",
+                "commit_host_alias_mmap_on invalid replacement range"
+            );
         };
         let (read, write, execute) = prot_to_proc_perms(commit.prot);
         let mut mem = authority.mem.lock();
@@ -3229,7 +3247,12 @@ impl SyscallDispatcher {
         };
         let semantic = if let Some(semantic_vmas) = commit.semantic_vmas {
             MremapForkSemantics::capture(&semantic_vmas, commit.start, commit.len)
-                .unwrap_or_else(|| std::process::abort())
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "dispatch::host_alias",
+                        "commit_host_alias_mmap_on semantic capture failed"
+                    )
+                })
                 .vmas
         } else {
             let mut semantic = semantic_vmas_from_boot_regions(
@@ -3913,7 +3936,12 @@ impl SyscallDispatcher {
         let semantic_vmas = source
             .fork_semantics
             .project(start, len)
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "dispatch::mremap",
+                    "record_remapped_dynamic_mapping projection failed"
+                )
+            });
         self.record_dynamic_mapping_with_file_offset(
             start,
             len,
@@ -3963,10 +3991,16 @@ impl SyscallDispatcher {
 
     fn record_alias_vma(&self, start: u64, len: u64) {
         let Some(end) = start.checked_add(len) else {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::host_alias",
+                "record_alias_vma end address overflow"
+            );
         };
         let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::host_alias",
+                "record_alias_vma invalid guest memory range"
+            );
         };
         locked_ranges_insert(&mut self.mem().lock().alias_vma_ranges, range);
     }
@@ -4198,7 +4232,10 @@ impl SyscallDispatcher {
 
     pub(crate) fn commit_mmap_growdown(&self, plan: MmapGrowdownFaultPlan) {
         if !self.owns_host_alias_dispatch(&plan.exclusion) {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mmap_growdown",
+                "caller lacks host alias dispatch exclusion in commit_mmap_growdown"
+            );
         }
         let mem_authority_7 = self.mem();
         let mut mem = mem_authority_7.lock();
@@ -4715,7 +4752,10 @@ impl SyscallDispatcher {
                     };
                     let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
                     if cx.memory.protect_range(grow_start, grow_len, rw).is_err() {
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::brk",
+                            "protect_range failed during brk heap expansion"
+                        );
                     }
                     cx.memory.set_mapping_protection(grow_start, grow_len, false, false);
                     update_semantic_heap_pages(&mut mem, old_page_end, new_page_end);
@@ -4732,11 +4772,17 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::returned_u64(current)?);
                     };
                     if cx.memory.protect_range(shrink_start, shrink_len, 0).is_err() {
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::brk",
+                            "protect_range failed during brk heap contraction"
+                        );
                     }
                     cx.memory.set_unmapped(shrink_start, shrink_len, true);
                     if cx.memory.zero_backing(shrink_start, shrink_len).is_err() {
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::brk",
+                            "zero_backing failed during brk heap contraction"
+                        );
                     }
                     update_semantic_heap_pages(&mut mem, old_page_end, new_page_end);
                     mem.brk_current = requested;
@@ -4957,7 +5003,10 @@ impl SyscallDispatcher {
                 let Some(backing) = description
                     .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
                 else {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "dispatch::mmap_ioring",
+                        "ring file description missing concrete backing"
+                    );
                 };
                 let Some((region, region_layout)) = backing.region(offset) else {
                     return Ok(request.refused(
@@ -5292,7 +5341,10 @@ impl SyscallDispatcher {
                             // Live translation state is unknown. Retain BOTH the
                             // fresh candidate and prior owners; recycling either
                             // could hand active guest leaves to another mapping.
-                            std::process::abort();
+                            carrick_fatal!(
+                                "dispatch::mmap_overlay",
+                                "private repoint failure entered indeterminate state during overlay"
+                            );
                         }
                     }
                 }
@@ -5314,13 +5366,19 @@ impl SyscallDispatcher {
                     {
                         // Backend publication succeeded, so ownership cannot be
                         // recovered if the validated carve transaction disappeared.
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::mmap_overlay",
+                            "overlay carve_source_range failed after backend publication succeeded"
+                        );
                     }
                     let Some(displaced) = mem
                         .shared
                         .reserve_private_range(requested.0, length)
                     else {
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::mmap_overlay",
+                            "shared reserve_private_range failed after backend publication succeeded"
+                        );
                     };
                     displaced
                 };
@@ -5343,18 +5401,27 @@ impl SyscallDispatcher {
                     // guest with split backing/metadata ownership after a
                     // post-replacement failure.
                     mark_range_unmapped(memory, requested.0, length_usize);
-                    std::process::abort();
+                    carrick_fatal!(
+                        "dispatch::mmap_overlay",
+                        "protect_range failed on repointed memory range during private overlay"
+                    );
                 }
                 if let Some((bus_start, bus_len)) = bus_fault {
                     let Ok(bus_len_usize) = usize::try_from(bus_len) else {
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::mmap_overlay",
+                            "bus-fault length exceeds usize during private overlay"
+                        );
                     };
                     if memory
                         .protect_range(bus_start, bus_len_usize, 0)
                         .is_err()
                     {
                         mark_range_unmapped(memory, requested.0, length_usize);
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::mmap_overlay",
+                            "protect_range failed on bus fault range during overlay setup"
+                        );
                     }
                     memory.set_mapping_protection(bus_start, bus_len_usize, true, false);
                     if let Some(protections) = memory.protections() {
@@ -5683,7 +5750,10 @@ impl SyscallDispatcher {
                             // The page-table edit may already be live even when
                             // its required TLB flush reports failure. Recycling
                             // this VA would publish unowned translation state.
-                            std::process::abort();
+                            carrick_fatal!(
+                                "dispatch::mmap_shared",
+                                "restore_shared_identity backend operation failed"
+                            );
                         }
                         if this.mem()
                             .lock()
@@ -5691,7 +5761,10 @@ impl SyscallDispatcher {
                             .mark_identity_restored(addr, map_len)
                             .is_none()
                         {
-                            std::process::abort();
+                            carrick_fatal!(
+                                "dispatch::mmap_shared",
+                                "mark_identity_restored failed in shared aperture tracking"
+                            );
                         }
                     }
                     // Make the REQUESTED protection guest-visible: the
@@ -6755,7 +6828,10 @@ impl SyscallDispatcher {
                     .carve_source_range(address.0, aligned_len, None)
                     .is_none()
                 {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "dispatch::munmap_overlay",
+                        "overlay carve_source_range failed during private overlay munmap"
+                    );
                 }
                 if had_vma {
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
@@ -6791,10 +6867,16 @@ impl SyscallDispatcher {
                         .carve_source_range(address.0, aligned_len, None)
                         .is_none()
                     {
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::munmap_overlay",
+                            "overlay carve_source_range failed during shared/overlay munmap"
+                        );
                     }
                     let Some(displaced) = mem.shared.carve_guest_range(address.0, aligned_len) else {
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::munmap_shared",
+                            "shared aperture carve_guest_range failed during munmap"
+                        );
                     };
                     displaced
                 };
@@ -6868,7 +6950,10 @@ impl SyscallDispatcher {
                 .carve_source_range(address.0, aligned_len, None)
                 .is_none()
             {
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::munmap_overlay",
+                    "overlay carve_source_range failed during anonymous arena munmap"
+                );
             }
             if address.0.checked_add(aligned_len) == Some(mem.mmap_next) {
                 let mem = &mut *mem;
@@ -7797,7 +7882,12 @@ impl SyscallDispatcher {
                             source_metadata
                                 .fork_semantics
                                 .project(va, new_size)
-                                .unwrap_or_else(|| std::process::abort()),
+                                .unwrap_or_else(|| {
+                                    carrick_fatal!(
+                                        "dispatch::mremap",
+                                        "mremap fork semantics projection failed"
+                                    )
+                                }),
                         ),
                         None,
                         read_only_shared_file,
@@ -7881,7 +7971,10 @@ impl SyscallDispatcher {
                                 // The page-table edit may already be live even
                                 // when its TLB flush reports failure; recycling
                                 // this VA would publish unowned translation.
-                                std::process::abort();
+                                carrick_fatal!(
+                                    "dispatch::mremap_shared",
+                                    "restore_shared_identity failed during mremap"
+                                );
                             }
                             if this.mem()
                                 .lock()
@@ -7889,7 +7982,10 @@ impl SyscallDispatcher {
                                 .mark_identity_restored(claim_start, claim_len)
                                 .is_none()
                             {
-                                std::process::abort();
+                                carrick_fatal!(
+                                    "dispatch::mremap_shared",
+                                    "mark_identity_restored failed during mremap"
+                                );
                             }
                         }
                         // The aperture is boot-mapped RW, so the grown tail
@@ -7943,7 +8039,7 @@ impl SyscallDispatcher {
                         let unmap_result = if !tracked_shared
                             && !tracked_overlay
                             && (this.range_is_alias_vma(old_address.0, old_size)
-                                || mmap_address_uses_alias(old_address.0, old_size, layout))
+                                 || mmap_address_uses_alias(old_address.0, old_size, layout))
                         {
                             memory.unmap_alias_range(tail_start, tail_len_usize)
                         } else {
@@ -7964,7 +8060,10 @@ impl SyscallDispatcher {
                             // The backend tail is already gone. Preflight above
                             // proved this exact shrink valid, so failure here is
                             // an internal ownership/accounting violation.
-                            std::process::abort();
+                            carrick_fatal!(
+                                "dispatch::mremap_shared",
+                                "shrinking shared aperture allocation in mremap failed"
+                            );
                         }
                         if tracked_overlay
                             && this.mem()
@@ -7976,7 +8075,10 @@ impl SyscallDispatcher {
                             // The SOURCE tail is no longer reachable after the
                             // backend unmap. Losing the preflighted overlay carve
                             // would leave reusable storage with stale ownership.
-                            std::process::abort();
+                            carrick_fatal!(
+                                "dispatch::mremap_overlay",
+                                "carving source overlay range in mremap failed"
+                            );
                         }
                     }
                     this.record_remapped_dynamic_mapping(
@@ -8403,7 +8505,10 @@ impl SyscallDispatcher {
                             "carrick: FATAL: mremap MOVE published                              0x{new_addr:x}+0x{new_size:x} but could not reclaim source                              0x{:x}+0x{old_len:x}: {first}; retry: {retry}",
                             old_address.0
                         );
-                        std::process::abort();
+                        carrick_fatal!(
+                            "dispatch::mremap",
+                            "mremap move could not reclaim source address range"
+                        );
                     }
                     mark_range_unmapped(memory, old_address.0, old_len);
                     this.remove_mapping_metadata(old_address.0, old_size);
@@ -8543,7 +8648,12 @@ impl SyscallDispatcher {
                                 reservation
                                     .fork_semantics
                                     .project(address.0, length)
-                                    .unwrap_or_else(|| std::process::abort()),
+                                    .unwrap_or_else(|| {
+                                        carrick_fatal!(
+                                            "dispatch::mprotect",
+                                            "mprotect reservation fork semantics projection failed"
+                                        )
+                                    }),
                             ),
                             locked: None,
                             resident: false,
@@ -9236,7 +9346,10 @@ impl SyscallDispatcher {
 
     pub(crate) fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
         if !self.owns_host_alias_dispatch(&plan.exclusion) {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::resident_fault",
+                "caller lacks host alias dispatch exclusion during commit_resident_fault"
+            );
         }
         let Some(end) = plan.page.checked_add(self.linux_page_size()) else {
             return;
@@ -9449,7 +9562,10 @@ impl SyscallDispatcher {
             // while a live host mapping remains outside the VMA allocator.
             // Fail-stop so the host kernel reclaims it with the process.
             if memory.supports_concurrent_exec_protection() {
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::mmap_rollback",
+                    "shared-anon rollback unmap failed under concurrent-exec protection"
+                );
             }
             return Err(MemoryError::HostMap(format!(
                 "shared-anon rollback unmap at 0x{address:x} for {mapped_length} bytes failed: \
@@ -9484,7 +9600,10 @@ impl SyscallDispatcher {
             && let Err(retry) = memory.unmap_range(address, len_usize)
         {
             if memory.supports_concurrent_exec_protection() {
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::mmap_rollback",
+                    "arena rollback unmap failed under concurrent-exec protection"
+                );
             }
             return Err(MemoryError::HostMap(format!(
                 "arena rollback unmap at 0x{address:x} for {len} bytes failed: \

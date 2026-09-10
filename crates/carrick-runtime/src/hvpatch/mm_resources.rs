@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use carrick_fatal::carrick_fatal;
 use parking_lot::{Condvar, Mutex};
 
 use super::asid::{AsidError, AsidGeneration, AsidLoad, AsidResidencyError};
@@ -278,7 +279,10 @@ impl ExecMmReservation {
                 disposition,
             } => (replacement, *disposition),
             ExecMmReservationState::FailClosed | ExecMmReservationState::Settled => {
-                std::process::abort()
+                carrick_fatal!(
+                    "hvpatch::mm_reservation",
+                    "attempted to access active components on settled or fail-closed ExecMmReservation"
+                );
             }
         }
     }
@@ -319,7 +323,10 @@ impl ExecMmReservation {
             disposition,
         } = state
         else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::mm_reservation",
+                "ExecMmReservation was not in Active state during abort"
+            );
         };
         let replacement_generation = replacement.asid_generation();
         let settlement = match replacement.abort() {
@@ -350,7 +357,12 @@ impl ExecMmReservation {
             .clear_exec_reservation(&mut resources_state, self.generation)
             // `validate` just proved the marker is ours under this same lock;
             // its absence here is a broken state authority, not a guest error.
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::mm_reservation",
+                    "exec reservation marker vanished between validate and clear"
+                );
+            });
         #[cfg(test)]
         self.record_settlement(ExecDispositionSettlementStep::MarkerCleared);
         drop(resources_state);
@@ -386,7 +398,10 @@ impl ExecMmReservation {
 
         let state = std::mem::replace(&mut self.state, ExecMmReservationState::Settled);
         let ExecMmReservationState::Active { replacement, .. } = state else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::mm_reservation",
+                "ExecMmReservation was not in Active state during commit"
+            );
         };
         let replacement = replacement.commit();
         let receipt = match predecessor_retirement {
@@ -411,7 +426,12 @@ impl ExecMmReservation {
             .clear_exec_reservation(&mut resources_state, self.generation)
             // `validate` just proved the marker is ours under this same lock;
             // its absence here is a broken state authority, not a guest error.
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::mm_reservation",
+                    "exec reservation marker vanished between validate and clear during commit"
+                );
+            });
         drop(resources_state);
         wake.run();
         Ok(receipt)
@@ -533,6 +553,10 @@ pub(crate) enum MmResourcesError {
     InjectedExecReservationFailure(ExecReservationConstructionFailpoint),
     #[error(transparent)]
     Residency(#[from] AsidResidencyError),
+    #[error("stage-1 mm owner count exceeded u32 representation")]
+    OwnerCountExhausted,
+    #[error("stage-1 exec reservation counter exhausted")]
+    ExecReservationIdExhausted,
 }
 
 impl From<AsidError> for MmResourcesError {
@@ -621,12 +645,20 @@ impl Drop for OwnerSetEditHold {
         let mut state = self.resources.state.lock();
         let remaining = match state.owner_set_edit_holds.get_mut(&self.generation) {
             Some(holds) => {
-                *holds = holds
-                    .checked_sub(1)
-                    .unwrap_or_else(|| std::process::abort());
+                *holds = holds.checked_sub(1).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::mm_reservation",
+                        "owner-set edit hold count underflow on release"
+                    );
+                });
                 *holds
             }
-            None => std::process::abort(),
+            None => {
+                carrick_fatal!(
+                    "hvpatch::mm_reservation",
+                    "owner-set edit hold released for generation with no hold entry"
+                );
+            }
         };
         if remaining == 0 {
             state.owner_set_edit_holds.remove(&self.generation);
@@ -786,7 +818,10 @@ impl MmResources {
             .unwrap_or(0)
     }
 
-    fn owner_count(state: &MmResourceState, lease: &Arc<Stage1MmLease>) -> u32 {
+    fn owner_count(
+        state: &MmResourceState,
+        lease: &Arc<Stage1MmLease>,
+    ) -> Result<u32, MmResourcesError> {
         u32::try_from(
             state
                 .leases
@@ -794,7 +829,7 @@ impl MmResources {
                 .filter(|candidate| Arc::ptr_eq(candidate, lease))
                 .count(),
         )
-        .unwrap_or_else(|_| std::process::abort())
+        .map_err(|_| MmResourcesError::OwnerCountExhausted)
     }
 
     fn exec_conflict(
@@ -838,7 +873,12 @@ impl MmResources {
             u32::from(lease.binding().asid.raw()),
             owner_count,
         )
-        .unwrap_or_else(|_| std::process::abort());
+        .unwrap_or_else(|_| {
+            carrick_fatal!(
+                "hvpatch::observability",
+                "failed to construct HvpatchMmLeaseLifecycle probe event"
+            );
+        });
         crate::probes::hvpatch_mm_lease_lifecycle(event);
     }
 
@@ -854,7 +894,12 @@ impl MmResources {
             related_pid,
             related_serial,
         )
-        .unwrap_or_else(|_| std::process::abort());
+        .unwrap_or_else(|_| {
+            carrick_fatal!(
+                "hvpatch::observability",
+                "failed to construct HvpatchMmLeaseRelation probe event"
+            );
+        });
         crate::probes::hvpatch_mm_lease_relation(event);
     }
 
@@ -969,7 +1014,7 @@ impl MmResources {
         }
         let backend = lease.backend();
         state.leases.insert(child, Arc::clone(&lease));
-        let owner_count = Self::owner_count(state, &lease);
+        let owner_count = Self::owner_count(state, &lease)?;
         Self::publish_relation(
             carrick_observability::probes::HvpatchMmLeasePhase::SharedChildPublished,
             child,
@@ -1040,7 +1085,7 @@ impl MmResources {
             .leases
             .get(&task)
             .ok_or(MmResourcesError::UnknownTask(task))?;
-        let owner_count = Self::owner_count(&state, lease);
+        let owner_count = Self::owner_count(&state, lease)?;
         Self::publish_relation(
             carrick_observability::probes::HvpatchMmLeasePhase::ExecObserved,
             task,
@@ -1214,7 +1259,7 @@ impl MmResources {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
-            .unwrap_or_else(|_| std::process::abort());
+            .map_err(|_| MmResourcesError::ExecReservationIdExhausted)?;
         let id = Arc::new(ExecReservationId(reservation_id));
         let inserted = state.exec_reservations.insert(
             generation,
@@ -1239,7 +1284,18 @@ impl MmResources {
             return Err(MmResourcesError::InjectedExecReservationFailure(failpoint));
         }
 
-        let disposition = if Self::owner_count(&state, &predecessor) == 1 {
+        let owner_count = match Self::owner_count(&state, &predecessor) {
+            Ok(count) => count,
+            Err(error) => {
+                let wake = self.clear_exec_reservation(&mut state, generation);
+                drop(state);
+                if let Some(wake) = wake {
+                    wake.run();
+                }
+                return Err(error);
+            }
+        };
+        let disposition = if owner_count == 1 {
             ExecMmDispositionKind::RetireOldMm
         } else {
             ExecMmDispositionKind::RetainOldMm
@@ -1309,7 +1365,7 @@ impl MmResources {
             .leases
             .iter()
             .any(|(other_task, other)| *other_task != task && Arc::ptr_eq(other, &predecessor));
-        let predecessor_owner_count = Self::owner_count(&state, &predecessor);
+        let predecessor_owner_count = Self::owner_count(&state, &predecessor)?;
         Self::publish_lifecycle(
             if shared {
                 carrick_observability::probes::HvpatchMmLeasePhase::ExecCommitPreShared
@@ -1379,7 +1435,7 @@ impl MmResources {
         };
         state.leases.remove(&task);
         state.retired.insert(task);
-        let remaining_owner_count = Self::owner_count(state, &lease);
+        let remaining_owner_count = Self::owner_count(state, &lease)?;
         Self::publish_lifecycle(
             if shared {
                 carrick_observability::probes::HvpatchMmLeasePhase::TaskEdgeRetiredShared

@@ -24,6 +24,8 @@ use super::{
 use parking_lot::MutexGuard;
 use std::marker::PhantomData;
 
+use carrick_fatal::carrick_fatal;
+
 /// Borrow-bound guard over a process's SysV attachments and captured namespace reference.
 ///
 /// This guard must be acquired first before any paired SysV namespace access.
@@ -114,7 +116,10 @@ impl<'a> SysvProcessGuard<'a> {
         reservation: PendingShmat,
     ) -> u64 {
         let Some(va) = self.guard.remapped_attachments.iter().next().copied() else {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::sysv_shmat",
+                "missing remapped attachment address in commit_remapped_shmat"
+            );
         };
         let old_shmid = self.guard.attachments.insert(va, shmid);
         if old_shmid == Some(shmid) {
@@ -132,7 +137,12 @@ impl<'a> SysvProcessGuard<'a> {
         }
         let _ = reservation
             .commit_under_paired_guard(namespace, &mut paired.state, unix_now_secs(), lpid)
-            .unwrap_or_else(|()| std::process::abort());
+            .unwrap_or_else(|()| {
+                carrick_fatal!(
+                    "dispatch::sysv_shmat",
+                    "failed to commit reservation under paired guard"
+                );
+            });
         va
     }
 
@@ -164,16 +174,25 @@ impl<'a> SysvProcessGuard<'a> {
         if self.guard.remapped_attachments.contains(&addr)
             || self.guard.attachments.get(&addr).copied() != Some(shmid)
         {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::sysv_shmdt",
+                "attachment metadata mismatch in commit_shmdt"
+            );
         }
         let permit = self.namespace_permit();
         let mut paired = permit.lock_paired();
         if !paired.state.segments.contains_key(&shmid) {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::sysv_shmdt",
+                "shared memory segment missing in commit_shmdt"
+            );
         }
         let ok = decrement_shm_attachment(&mut paired.state, shmid, lpid, Some(dtime));
         if !ok {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::sysv_shmdt",
+                "failed to decrement shared memory attachment"
+            );
         }
         drop(paired);
         self.guard.attachments.remove(&addr);
@@ -182,7 +201,10 @@ impl<'a> SysvProcessGuard<'a> {
     /// Paired host-alias commit: Record the newly installed attachment and commit the reservation.
     pub(crate) fn commit_host_alias_shmat(&mut self, commit: HostAliasShmatCommit) {
         if self.guard.attachments.contains_key(&commit.va) {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::sysv_shmat",
+                "attachment table collision in commit_host_alias_shmat"
+            );
         }
         let namespace = self.namespace;
         let permit = self.namespace_permit();
@@ -190,7 +212,12 @@ impl<'a> SysvProcessGuard<'a> {
         let shmid = commit
             .reservation
             .commit_under_paired_guard(namespace, &mut paired.state, commit.atime, commit.lpid)
-            .unwrap_or_else(|()| std::process::abort());
+            .unwrap_or_else(|()| {
+                carrick_fatal!(
+                    "dispatch::sysv_shmat",
+                    "failed to commit host alias reservation under paired guard"
+                );
+            });
         drop(paired);
         self.guard.attachments.insert(commit.va, shmid);
     }

@@ -33,6 +33,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use carrick_fatal::carrick_fatal;
 use zerocopy::{FromBytes, IntoBytes};
 
 const U32: u32 = 4;
@@ -514,7 +515,7 @@ impl Drop for CrossProcessLock<'_> {
         lock.l_start = 0;
         lock.l_len = 1;
         if unsafe { libc::fcntl(self.backing.lock_fd.as_raw_fd(), libc::F_SETLK, &lock) } != 0 {
-            std::process::abort();
+            carrick_fatal!("dispatch", "CrossProcessLock unlock failed");
         }
     }
 }
@@ -796,14 +797,14 @@ impl SyscallDispatcher {
         }
 
         let common = Arc::new(crate::kernel::DescriptionCommon::new(LINUX_O_RDWR));
-        let description = Arc::new(
-            crate::kernel::FileDescription::concrete_with_common(backing, common).unwrap_or_else(
-                |error| {
+        let description =
+            match crate::kernel::FileDescription::concrete_with_common(backing, common) {
+                Ok(desc) => Arc::new(desc),
+                Err(error) => {
                     tracing::error!(%error, "io_uring description identity allocation failed");
-                    std::process::abort();
-                },
-            ),
-        );
+                    return DispatchOutcome::errno(linux_errno::ENOMEM);
+                }
+            };
         let Ok(fd) = self.install_fd_at_or_above(3, OpenFile::new(description, 0)) else {
             return DispatchOutcome::errno(linux_errno::EMFILE);
         };

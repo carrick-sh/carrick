@@ -42,6 +42,7 @@
 //! the source of truth; the host pipe is the wakeup channel.
 
 use crate::linux_abi::LinuxErrno;
+use carrick_fatal::carrick_fatal;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -1369,7 +1370,10 @@ pub(super) fn kernel_file_description(
         )
         .unwrap_or_else(|error| {
             tracing::error!(%error, "file-description identity allocation failed");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::fd_table",
+                "file-description identity allocation failed"
+            );
         }),
     )
 }
@@ -1396,7 +1400,10 @@ impl crate::kernel::FileSlot {
             crate::kernel::FileDescription::concrete_with_common(description, common)
                 .unwrap_or_else(|error| {
                     tracing::error!(%error, "file-description identity allocation failed");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "dispatch::fd_table",
+                        "file-description identity allocation failed"
+                    );
                 }),
         );
         Self::new(file_desc, fd_flags)
@@ -2442,7 +2449,10 @@ impl OpenDescription {
         match self {
             OpenDescription::Closed { .. } => {
                 tracing::error!("closed file description escaped into fstat");
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::fd_table",
+                    "closed file description escaped into fstat"
+                );
             }
             OpenDescription::File { path, metadata, .. } if is_anon_overlay_path(path) => {
                 OpenStatSource::Record(StatRecord::from_metadata(metadata))

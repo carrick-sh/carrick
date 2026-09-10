@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
+use carrick_fatal::carrick_fatal;
 use parking_lot::{Condvar, Mutex};
 
 pub use carrick_hal::{
@@ -717,7 +718,10 @@ impl<'a> IdleAnnouncement<'a> {
                 // An idle count that went negative means an executor released
                 // an announcement it never took: placement and wake targeting
                 // would both be reading a fiction from here on.
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::run_queue",
+                    "idle count went negative in IdleAnnouncement::release"
+                );
             }
             self.held = false;
         }
@@ -1008,7 +1012,10 @@ impl RunQueueInner {
 
     fn poke_control(&self) {
         if self.control_epoch.fetch_add(1, Ordering::AcqRel) == u64::MAX {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::scheduler_control",
+                "control epoch overflow in poke_control"
+            );
         }
         self.nudge_all_cpus();
         self.changed.notify_all();
@@ -1060,7 +1067,10 @@ impl RunQueueInner {
     fn release_wake_admission(&self) {
         let previous = self.wake_admissions.fetch_sub(1, Ordering::SeqCst);
         if previous & !Self::CLOSING_BIT == 0 {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::run_queue_admissions",
+                "wake admission count underflow in release_wake_admission"
+            );
         }
         self.settle_close_if_closing();
     }
@@ -1104,7 +1114,10 @@ impl RunQueueInner {
         if online {
             slot.fetch_add(1, Ordering::AcqRel);
         } else if slot.fetch_sub(1, Ordering::AcqRel) == 0 {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::run_queue",
+                "executor online count underflow in set_executor_online"
+            );
         }
     }
 
@@ -1437,7 +1450,10 @@ impl RunQueueInner {
 
     fn finish_claim(&self) {
         if self.claimed.fetch_sub(1, Ordering::SeqCst) == 0 {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::run_queue",
+                "claimed count underflow in finish_claim"
+            );
         }
         self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
         self.settle_close_if_closing();
@@ -1449,7 +1465,10 @@ impl RunQueueInner {
         // its authority would be reachable by nothing.
         self.clear_unpublished(key);
         if self.active_authorities.fetch_sub(1, Ordering::SeqCst) == 0 {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::run_queue",
+                "active authorities count underflow in release_authority"
+            );
         }
         self.settle_close_if_closing();
     }
@@ -1901,7 +1920,9 @@ pub(crate) fn publish_guest_cpu_count(ncpu: usize) {
     match EXPOSED_GUEST_CPUS.compare_exchange(0, ncpu, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {}
         Err(published) if published == ncpu => {}
-        Err(_published) => std::process::abort(),
+        Err(_published) => {
+            carrick_fatal!("kernel::scheduler", "conflicting guest cpu count published");
+        }
     }
 }
 
@@ -2110,10 +2131,9 @@ impl RunQueue {
                 // CPU look busy to a placement taken in that window.
                 continue;
             }
-            local.waiters = local
-                .waiters
-                .checked_add(1)
-                .unwrap_or_else(|| std::process::abort());
+            local.waiters = local.waiters.checked_add(1).unwrap_or_else(|| {
+                carrick_fatal!("kernel::run_queue", "waiters overflow in take_row");
+            });
             let park_epoch = local.close_epoch;
             // The executor is about to sleep with no row: report the park on
             // the REAL guest CPU it serves, so an auditor reading the pair
@@ -2127,10 +2147,9 @@ impl RunQueue {
             {
                 cpu.idle_condvar.wait(&mut local);
             }
-            local.waiters = local
-                .waiters
-                .checked_sub(1)
-                .unwrap_or_else(|| std::process::abort());
+            local.waiters = local.waiters.checked_sub(1).unwrap_or_else(|| {
+                carrick_fatal!("kernel::run_queue", "waiters underflow in take_row");
+            });
             let observed_close_epoch = local.close_epoch;
             if observed_close_epoch != park_epoch {
                 executor
@@ -2196,7 +2215,12 @@ impl RunQueue {
                 state.closed_waiter_observations = state
                     .closed_waiter_observations
                     .checked_add(1)
-                    .unwrap_or_else(|| std::process::abort());
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "kernel::run_queue",
+                            "closed_waiter_observations overflow in observe_close"
+                        );
+                    });
                 self.inner.maybe_finish_close(&mut state);
             }
             return Some(RunQueueError::Closed);
@@ -2227,21 +2251,24 @@ impl RunQueue {
                     state.closed_waiter_observations = state
                         .closed_waiter_observations
                         .checked_add(1)
-                        .unwrap_or_else(|| std::process::abort());
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "kernel::run_queue",
+                                "closed_waiter_observations overflow in park_spare"
+                            );
+                        });
                     self.inner.maybe_finish_close(&mut state);
                 }
                 return Err(RunQueueError::Closed);
             }
-            state.spare_waiters = state
-                .spare_waiters
-                .checked_add(1)
-                .unwrap_or_else(|| std::process::abort());
+            state.spare_waiters = state.spare_waiters.checked_add(1).unwrap_or_else(|| {
+                carrick_fatal!("kernel::run_queue", "spare_waiters overflow in park_spare");
+            });
             let close_epoch = state.close_epoch;
             self.inner.changed.wait(&mut state);
-            state.spare_waiters = state
-                .spare_waiters
-                .checked_sub(1)
-                .unwrap_or_else(|| std::process::abort());
+            state.spare_waiters = state.spare_waiters.checked_sub(1).unwrap_or_else(|| {
+                carrick_fatal!("kernel::run_queue", "spare_waiters underflow in park_spare");
+            });
             if state.close_epoch != close_epoch {
                 executor
                     .close_observation_epoch
@@ -2335,10 +2362,9 @@ impl RunQueue {
         if state.lifecycle == QueueLifecycle::Open {
             self.inner
                 .publish_lifecycle(&mut state, QueueLifecycle::Closing);
-            state.close_epoch = state
-                .close_epoch
-                .checked_add(1)
-                .unwrap_or_else(|| std::process::abort());
+            state.close_epoch = state.close_epoch.checked_add(1).unwrap_or_else(|| {
+                carrick_fatal!("kernel::run_queue", "close_epoch overflow in close");
+            });
             let epoch = state.close_epoch;
             self.inner.close_epoch.store(epoch, Ordering::Release);
             let mut expected = state.spare_waiters;
@@ -2383,7 +2409,12 @@ impl RunQueue {
         state.closed_waiter_observations = state
             .closed_waiter_observations
             .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::run_queue",
+                    "closed_waiter_observations overflow in retire_executor"
+                );
+            });
         self.inner.maybe_finish_close(&mut state);
         self.inner.changed.notify_all();
     }
@@ -2544,7 +2575,12 @@ impl RunnableThread {
     }
 
     pub fn lease(&self) -> &ThreadExecutionLease {
-        self.lease.as_ref().unwrap_or_else(|| std::process::abort())
+        self.lease.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::runnable_thread",
+                "missing execution lease in RunnableThread::lease"
+            );
+        })
     }
 
     #[cfg(test)]
@@ -2557,7 +2593,12 @@ impl RunnableThread {
     }
 
     pub(crate) fn take_lease(&mut self) -> ThreadExecutionLease {
-        self.lease.take().unwrap_or_else(|| std::process::abort())
+        self.lease.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::runnable_thread",
+                "missing execution lease in RunnableThread::take_lease"
+            );
+        })
     }
 
     pub(crate) fn restore_lease(
@@ -3617,17 +3658,22 @@ impl Scheduler {
         let mut published = None;
         let mut publication_error = None;
         let mut publish = Some(publish);
-        let mut publish_once =
-            || match publish.take().unwrap_or_else(|| std::process::abort())(&committed) {
-                Ok(value) => {
-                    published = Some(value);
-                    true
-                }
-                Err(error) => {
-                    publication_error = Some(error);
-                    false
-                }
-            };
+        let mut publish_once = || match publish.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::scheduler_exec_retarget",
+                "publish closure missing in retarget_running_exec"
+            );
+        })(&committed)
+        {
+            Ok(value) => {
+                published = Some(value);
+                true
+            }
+            Err(error) => {
+                publication_error = Some(error);
+                false
+            }
+        };
         if !self
             .executors
             .rebind_exact_with(running.binding, successor, &mut publish_once)
@@ -3638,9 +3684,17 @@ impl Scheduler {
             // The Kernel replacement and combined record are already visible;
             // continuing without the matching kick token would split worker
             // authority. There is no safe predecessor rollback here.
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::scheduler_exec_retarget",
+                "rebind_exact_with failed in retarget_running_exec"
+            );
         }
-        let published = published.unwrap_or_else(|| std::process::abort());
+        let published = published.unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::scheduler_exec_retarget",
+                "missing published receipt in retarget_running_exec"
+            );
+        });
         running.thread = replacement;
         running.key = QueueKey {
             thread: successor.thread,
@@ -3671,7 +3725,12 @@ impl Scheduler {
                         .thread
                         .execution_state()
                         .generation()
-                        .unwrap_or_else(|| std::process::abort())
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "kernel::thread_settlement",
+                                "missing generation in settle_failed"
+                            );
+                        })
                 })
                 .map_err(|(error, lease)| (error, Some(lease)))
         } else {

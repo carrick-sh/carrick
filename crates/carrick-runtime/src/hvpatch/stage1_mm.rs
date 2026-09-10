@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use carrick_fatal::carrick_fatal;
 use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
@@ -290,19 +292,34 @@ impl Stage1MmLease {
     ) -> carrick_hal::ForeignStage1Identity {
         let binding = self.binding();
         let mm = carrick_hal::ForeignMmId::from_kernel_allocation(
-            std::num::NonZeroU64::new(mm.raw()).unwrap_or_else(|| std::process::abort()),
+            std::num::NonZeroU64::new(mm.raw()).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::stage1_mm",
+                    "zero mm id in foreign_stage1_identity"
+                );
+            }),
         );
         let asid = carrick_hal::ForeignAsid::from_kernel_allocation(
-            std::num::NonZeroU16::new(binding.asid.raw()).unwrap_or_else(|| std::process::abort()),
+            std::num::NonZeroU16::new(binding.asid.raw()).unwrap_or_else(|| {
+                carrick_fatal!("hvpatch::stage1_mm", "zero asid in foreign_stage1_identity");
+            }),
         );
         let binding = carrick_hal::ForeignMmBinding::for_aarch64(asid, binding.stage1_root.gpa());
         let asid_generation = carrick_hal::ForeignAsidGeneration::from_runtime_binding(
             asid,
-            std::num::NonZeroU64::new(self.asid.generation())
-                .unwrap_or_else(|| std::process::abort()),
+            std::num::NonZeroU64::new(self.asid.generation()).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::stage1_mm",
+                    "zero asid generation in foreign_stage1_identity"
+                );
+            }),
         );
-        carrick_hal::ForeignStage1Identity::new(mm, binding, asid_generation)
-            .unwrap_or_else(|| std::process::abort())
+        carrick_hal::ForeignStage1Identity::new(mm, binding, asid_generation).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::stage1_mm",
+                "failed to construct ForeignStage1Identity"
+            );
+        })
     }
 
     /// Whether this lease has stopped admitting executor loads, for either
@@ -343,7 +360,12 @@ impl Stage1MmLease {
             .observed
             .get(&executor)
             .cloned()
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::stage1_mm",
+                    "missing observed atomic in cow_invalidation_observer"
+                );
+            });
         CowInvalidationObserver {
             executor,
             asid: self.asid,
@@ -355,12 +377,19 @@ impl Stage1MmLease {
     pub(crate) fn publish_cow_invalidation(&self) -> CowInvalidationPublication {
         let pending = self.residency.residents();
         let mut state = self.cow_invalidation.lock();
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        state.generation = state.generation.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::stage1_mm",
+                "cow invalidation generation overflow in publish_cow_invalidation"
+            );
+        });
         let generation = carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
-            std::num::NonZeroU64::new(state.generation).unwrap_or_else(|| std::process::abort()),
+            std::num::NonZeroU64::new(state.generation).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::stage1_mm",
+                    "zero cow invalidation generation in publish_cow_invalidation"
+                );
+            }),
         );
         for executor in &pending {
             state
@@ -392,8 +421,12 @@ impl Stage1MmLease {
             .then_some(CowInvalidationTicket {
                 asid: self.asid,
                 generation: carrick_hal::ForeignCowInvalidationGeneration::from_runtime_publication(
-                    std::num::NonZeroU64::new(state.generation)
-                        .unwrap_or_else(|| std::process::abort()),
+                    std::num::NonZeroU64::new(state.generation).unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::stage1_mm",
+                            "zero cow invalidation generation in pending_cow_invalidation"
+                        );
+                    }),
                 ),
             })
     }
@@ -418,7 +451,12 @@ impl Stage1MmLease {
         state
             .observed
             .get(&executor)
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::stage1_mm",
+                    "missing observed atomic in acknowledge_cow_invalidation"
+                );
+            })
             .store(state.generation, Ordering::Release);
         Ok(())
     }
@@ -434,7 +472,10 @@ impl Stage1MmLease {
         if observer.asid != self.asid
             || !Arc::ptr_eq(&observer.published, &self.cow_invalidation_published)
         {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::stage1_mm",
+                "cow invalidation observer binding mismatch"
+            );
         }
         if !observer.needs_service() {
             return Ok(());
@@ -443,11 +484,19 @@ impl Stage1MmLease {
         self.cow_invalidation_slow_paths
             .fetch_add(1, Ordering::Relaxed);
         let Some(ticket) = self.pending_cow_invalidation(observer.executor) else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::stage1_mm",
+                "missing pending cow invalidation ticket"
+            );
         };
         invalidate(ticket.asid_generation())?;
         self.acknowledge_cow_invalidation(observer.executor, ticket)
-            .unwrap_or_else(|_| std::process::abort());
+            .unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "hvpatch::stage1_mm",
+                    "acknowledge_cow_invalidation failed in service_pending_cow_invalidation"
+                );
+            });
         Ok(())
     }
 
@@ -725,14 +774,20 @@ impl PreparedStage1MmRetirement {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pending(&self) -> Vec<crate::kernel::objects::ExecutorId> {
         let Some(residency) = self.residency.as_ref() else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::stage1_retirement",
+                "missing residency in PreparedStage1MmRetirement::pending"
+            );
         };
         residency.pending()
     }
 
     fn requires_quarantine(&self) -> bool {
         let Some(residency) = self.residency.as_ref() else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::stage1_retirement",
+                "missing residency in PreparedStage1MmRetirement::requires_quarantine"
+            );
         };
         residency.requires_quarantine()
     }
@@ -745,11 +800,17 @@ impl PreparedStage1MmRetirement {
             "prepared stage-1 retirement lost its lease-gate reservation"
         );
         let Some(residency) = self.residency.take() else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::stage1_retirement",
+                "missing residency in PreparedStage1MmRetirement::commit"
+            );
         };
         let residency = residency.commit();
         let Some(asid) = self.asid.take() else {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::stage1_retirement",
+                "missing asid in PreparedStage1MmRetirement::commit"
+            );
         };
         let asid = asid.commit();
         *lifecycle = Stage1MmLeaseLifecycle::Retired;
@@ -760,7 +821,12 @@ impl PreparedStage1MmRetirement {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     current.checked_add(1)
                 })
-                .unwrap_or_else(|_| std::process::abort())
+                .unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "hvpatch::stage1_retirement",
+                        "root retirement nonce overflow in PreparedStage1MmRetirement::commit"
+                    );
+                })
         });
         let extension_slots = self.lease.extension_slots.lock().drain(..).collect();
         Stage1MmRetirement {
@@ -1166,7 +1232,10 @@ impl Stage1MmBackend {
 
     fn bump_revision(&self) {
         if self.revision.fetch_add(1, Ordering::Release) == u64::MAX {
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::stage1_revision",
+                "stage1 revision overflow in bump_revision"
+            );
         }
     }
 }
