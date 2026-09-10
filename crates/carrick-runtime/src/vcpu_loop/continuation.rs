@@ -10095,6 +10095,8 @@ mod tests {
             gate_unlocked: Arc<AtomicBool>,
             service_unlocked: Arc<AtomicBool>,
         }
+        // Not `Waker::noop()`: the test observes WHEN this waker is dropped.
+        #[allow(clippy::manual_noop_waker)]
         impl std::task::Wake for DropCheckingWake {
             fn wake(self: Arc<Self>) {}
         }
@@ -10192,6 +10194,8 @@ mod tests {
             observed: Arc<AtomicBool>,
             service_unlocked: Arc<AtomicBool>,
         }
+        // Not `Waker::noop()`: the test observes WHEN this waker is dropped.
+        #[allow(clippy::manual_noop_waker)]
         impl std::task::Wake for DropCheckingWake {
             fn wake(self: Arc<Self>) {}
         }
@@ -10366,13 +10370,9 @@ mod tests {
         );
 
         // 3. Verify event future poll is non-blocking and returns Pending while in-flight operation active
-        struct TestNoopWake;
-        impl std::task::Wake for TestNoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
         let mut event_future = service.event(token);
-        let noop_waker = std::task::Waker::from(Arc::new(TestNoopWake));
-        let mut cx = Context::from_waker(&noop_waker);
+        let noop_waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(noop_waker);
         let poll_result = Pin::new(&mut event_future).poll(&mut cx);
         assert!(
             poll_result.is_pending(),
@@ -10416,13 +10416,12 @@ mod tests {
             )))
         ));
         assert!(
-            service
+            !service
                 .inner
                 .state
                 .lock()
                 .entries
-                .get(&token.continuation)
-                .is_none(),
+                .contains_key(&token.continuation),
             "registration removed only after quiescence"
         );
 
@@ -11166,13 +11165,12 @@ mod tests {
             "awaiting event on cancelled token must return Cancelled(ProcessExit)"
         );
         assert!(
-            service
+            !service
                 .inner
                 .state
                 .lock()
                 .entries
-                .get(&wake_token.continuation)
-                .is_none(),
+                .contains_key(&wake_token.continuation),
             "cancelled entry must be fully purged after event future resolution"
         );
         assert!(
@@ -11381,7 +11379,7 @@ mod tests {
         );
         // inner epoll watches efd (EPOLLIN, data=101)
         let mut ev = [0u8; 16];
-        ev[0..4].copy_from_slice(&(carrick_abi::LINUX_EPOLLIN as u32).to_le_bytes());
+        ev[0..4].copy_from_slice(&carrick_abi::LINUX_EPOLLIN.to_le_bytes());
         ev[8..16].copy_from_slice(&101u64.to_le_bytes());
         memory.write_bytes(0x4000, &ev).unwrap();
         assert_eq!(
@@ -11393,7 +11391,7 @@ mod tests {
                             21,
                             SyscallArgs([
                                 inner as u64,
-                                carrick_abi::LINUX_EPOLL_CTL_ADD as u64,
+                                carrick_abi::LINUX_EPOLL_CTL_ADD,
                                 efd as u64,
                                 0x4000,
                                 0,
@@ -11419,7 +11417,7 @@ mod tests {
                             21,
                             SyscallArgs([
                                 outer as u64,
-                                carrick_abi::LINUX_EPOLL_CTL_ADD as u64,
+                                carrick_abi::LINUX_EPOLL_CTL_ADD,
                                 inner as u64,
                                 0x4020,
                                 0,
@@ -11881,7 +11879,7 @@ mod tests {
                        data: u64,
                        addr: u64| {
             let mut ev = [0u8; 16];
-            ev[0..4].copy_from_slice(&(carrick_abi::LINUX_EPOLLIN as u32).to_le_bytes());
+            ev[0..4].copy_from_slice(&carrick_abi::LINUX_EPOLLIN.to_le_bytes());
             ev[8..16].copy_from_slice(&data.to_le_bytes());
             memory.write_bytes(addr, &ev).unwrap();
             dispatcher
@@ -11891,7 +11889,7 @@ mod tests {
                         21,
                         SyscallArgs([
                             ep as u64,
-                            carrick_abi::LINUX_EPOLL_CTL_ADD as u64,
+                            carrick_abi::LINUX_EPOLL_CTL_ADD,
                             target as u64,
                             addr,
                             0,
@@ -12014,8 +12012,8 @@ mod tests {
         let events = out_event.events;
         let data = out_event.data;
         assert_eq!(
-            events & (carrick_abi::LINUX_EPOLLIN as u32),
-            carrick_abi::LINUX_EPOLLIN as u32
+            events & carrick_abi::LINUX_EPOLLIN,
+            carrick_abi::LINUX_EPOLLIN
         );
         assert_eq!(data, 505);
     }
