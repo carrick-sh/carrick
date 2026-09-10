@@ -1,4 +1,4 @@
-6bb1d9485abc968e
+9361a478b8a2f167
 epollpri_pipe_add_errno=0
 nested_epoll_add_errno=0
 nested_epoll_cycle_errno=40
@@ -54,3 +54,18 @@ epollfd_thread_read=8
 epollfd_thread_value=1
 epollfd_thread_drained_child=0
 epollfd_thread_drained_poll=0
+mixed_netlink_socket_errno=0
+mixed_netlink_bind_rc=0
+mixed_netlink_bind_errno=0
+mixed_netlink_spawn_errno=0
+mixed_netlink_ppoll_rc=1
+mixed_netlink_ppoll_errno=0
+mixed_netlink_eventfd_mask=0
+mixed_netlink_reply_mask=1
+mixed_netlink_producer_joined=true
+mixed_netlink_sent=32
+mixed_netlink_send_errno=0
+mixed_netlink_late_poll_rc=1
+mixed_netlink_late_reply_mask=1
+mixed_netlink_received_reply=true
+mixed_netlink_recv_errno=0
