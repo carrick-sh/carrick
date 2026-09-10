@@ -82,6 +82,86 @@ fn sparse_large_mapping(label: &str, length: usize) {
     }
 }
 
+/// Large writable reservations must support both guest faults and kernel-first
+/// copyin/copyout on distinct, previously untouched pages. All pipe I/O is
+/// nonblocking so a broken transfer is an observation rather than a stuck probe.
+fn sparse_large_rw_mapping(label: &str, length: usize) {
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let base = libc::mmap(
+            core::ptr::null_mut(),
+            length,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        let map_errno = if base == libc::MAP_FAILED { errno() } else { 0 };
+        let mut initial_zero = 0;
+        let mut distinct = 0;
+        let mut kernel_copyin = 0;
+        let mut kernel_copyout = 0;
+        let mut pipe_errno = 0;
+        let mut unmap_rc = -1;
+        if base != libc::MAP_FAILED {
+            let offsets = [0, (length / 2 / page) * page, length - 3 * page];
+            let mut pipes = [-1; 2];
+            let pipe_ok = libc::pipe2(pipes.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) == 0;
+            if !pipe_ok {
+                pipe_errno = errno();
+            }
+            for (i, offset) in offsets.iter().enumerate() {
+                let direct = (base as usize + offset) as *mut u8;
+                let input = direct.add(page);
+                let output = direct.add(2 * page);
+                // Kernel reads this fresh page before any guest load/store.
+                if pipe_ok {
+                    let mut observed = 0xffu8;
+                    if libc::write(pipes[1], input.cast(), 1) == 1
+                        && libc::read(pipes[0], (&mut observed as *mut u8).cast(), 1) == 1
+                        && observed == 0
+                    {
+                        kernel_copyin += 1;
+                    }
+                    let value = (i + 11) as u8;
+                    // Kernel writes a different fresh page before its first guest access.
+                    if libc::write(pipes[1], (&value as *const u8).cast(), 1) == 1
+                        && libc::read(pipes[0], output.cast(), 1) == 1
+                        && output.read_volatile() == value
+                    {
+                        kernel_copyout += 1;
+                    }
+                }
+                if direct.read_volatile() == 0 {
+                    initial_zero += 1;
+                }
+                direct.write_volatile((i + 1) as u8);
+            }
+            if pipe_ok {
+                libc::close(pipes[0]);
+                libc::close(pipes[1]);
+            }
+            for (i, offset) in offsets.iter().enumerate() {
+                let direct = (base as usize + offset) as *const u8;
+                if direct.read_volatile() == (i + 1) as u8
+                    && direct.add(page).read_volatile() == 0
+                    && direct.add(2 * page).read_volatile() == (i + 11) as u8
+                {
+                    distinct += 1;
+                }
+            }
+            unmap_rc = libc::munmap(base, length);
+        }
+        println!("{label}_rw_map_errno={map_errno}");
+        println!("{label}_rw_pipe_errno={pipe_errno}");
+        println!("{label}_rw_initial_zero_pages={initial_zero}");
+        println!("{label}_rw_distinct_groups={distinct}");
+        println!("{label}_rw_kernel_first_copyin={kernel_copyin}");
+        println!("{label}_rw_kernel_first_copyout={kernel_copyout}");
+        println!("{label}_rw_unmap={unmap_rc}");
+    }
+}
+
 fn main() {
     unsafe {
         libc::mkdir(c"/tmp".as_ptr(), 0o777);
@@ -258,6 +338,8 @@ fn main() {
     }
     sparse_large_mapping("vma64g", 64usize << 30);
     sparse_large_mapping("vma16t", 16usize << 40);
+    sparse_large_rw_mapping("vma64g", 64usize << 30);
+    sparse_large_rw_mapping("vma16t", 16usize << 40);
 }
 
 unsafe fn errno_reset() {
