@@ -93,6 +93,7 @@ debug = true
 split-debuginfo = "packed"
 
 [workspace.dependencies]
+carrick-fatal = { path = "crates/carrick-fatal" }
 arc-swap = "1.7.1"
 chrono = "0.4.44"
 anyhow = "1.0.100"

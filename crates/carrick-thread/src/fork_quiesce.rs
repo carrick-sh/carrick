@@ -41,16 +41,15 @@
 //!     including `?`-propagated errors.
 // INVARIANT: every `.unwrap()` in this module is on a std::sync Mutex/Condvar
 // guard. `lock()`/`wait()` only return `Err` on poisoning — a thread panicking
-// while holding the guard — which cannot occur in this no-panic codebase. The
-// allow is module-scoped because every lock site shares the identical
-// invariant; a per-line allow would be pure noise.
-#![allow(clippy::unwrap_used)]
+// while holding the guard — which cannot occur in this no-panic codebase.
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
+
+use carrick_fatal::carrick_fatal;
 
 // No-op USDT probe stubs. The real probes live in carrick-vmm-hvf's probes module;
 // carrick-thread must not depend on that crate. These probe calls are
@@ -148,6 +147,7 @@ pub struct TopologyReleaseSubscription {
 
 impl Drop for TopologyReleaseSubscription {
     fn drop(&mut self) {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut publication = topology_release_publication().lock().unwrap();
         if publication
             .listeners
@@ -165,6 +165,7 @@ pub enum TopologyReleaseEnrollment {
 }
 
 pub fn topology_release_generation() -> u64 {
+    #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
     topology_release_publication().lock().unwrap().generation
 }
 
@@ -172,13 +173,17 @@ pub fn subscribe_topology_release(
     expected_generation: u64,
     callback: Arc<dyn Fn(u64) + Send + Sync + 'static>,
 ) -> TopologyReleaseEnrollment {
+    #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
     let mut publication = topology_release_publication().lock().unwrap();
     if publication.generation != expected_generation {
         return TopologyReleaseEnrollment::Ready(publication.generation);
     }
     let id = NEXT_TOPOLOGY_LISTENER.fetch_add(1, Ordering::Relaxed);
     if id == 0 || id == u64::MAX {
-        std::process::abort();
+        carrick_fatal!(
+            "thread::topology",
+            "topology listener id exhausted or wrapped: id={id}"
+        );
     }
     publication.listeners.insert(
         id,
@@ -195,11 +200,11 @@ pub fn subscribe_topology_release(
 
 fn publish_topology_release() {
     let (generation, callbacks) = {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut publication = topology_release_publication().lock().unwrap();
-        publication.generation = publication
-            .generation
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        publication.generation = publication.generation.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal!("thread::topology", "topology release generation overflow");
+        });
         let generation = publication.generation;
         let callbacks = std::mem::take(&mut publication.listeners)
             .into_values()
@@ -387,6 +392,7 @@ pub fn try_acquire_topology_lock(
 
 #[cfg(test)]
 mod topology_probe_tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use carrick_observability::probes::HvpatchTopologyOperation;
 
@@ -607,6 +613,7 @@ impl Drop for QuiesceProgressSubscription {
         let Some(barrier) = self.barrier.upgrade() else {
             return;
         };
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut progress = barrier.progress.lock().unwrap();
         if progress
             .listeners
@@ -628,6 +635,7 @@ impl Drop for QuiesceSubscription {
         let Some(barrier) = self.barrier.upgrade() else {
             return;
         };
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut publication = barrier.publication.lock().unwrap();
         if publication
             .listeners
@@ -723,12 +731,14 @@ impl QuiesceBarrier {
             return true;
         }
         let deadline = Instant::now() + timeout;
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut paused = self.paused.lock().unwrap();
         while *paused < others {
             let now = Instant::now();
             if now >= deadline {
                 return false;
             }
+            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let (g, res) = self.cv.wait_timeout(paused, deadline - now).unwrap();
             paused = g;
             if res.timed_out() && *paused < others {
@@ -745,6 +755,7 @@ impl QuiesceBarrier {
 
     /// Number of threads currently parked at the barrier (diagnostic).
     pub fn paused_count(&self) -> usize {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         *self.paused.lock().unwrap()
     }
 
@@ -754,11 +765,14 @@ impl QuiesceBarrier {
         if !self.is_quiescing() {
             return;
         }
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut paused = self.paused.lock().unwrap();
         *paused += 1;
         self.cv.notify_all(); // wake the forking thread's count-wait
         while self.quiescing.load(Ordering::SeqCst) {
-            paused = self.cv.wait(paused).unwrap();
+            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
+            let next = self.cv.wait(paused).unwrap();
+            paused = next;
         }
         *paused -= 1;
     }
@@ -767,6 +781,7 @@ impl QuiesceBarrier {
     /// to lower the flag and release the parked threads.
     pub fn end_quiesce(&self) {
         self.quiescing.store(false, Ordering::SeqCst);
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let _g = self.paused.lock().unwrap();
         self.cv.notify_all();
         self.publish_quiesce_event(QuiesceEventKind::Released);
@@ -777,11 +792,14 @@ impl QuiesceBarrier {
     /// polling a vCPU count while occupying a worker.
     pub fn notify_quiesced_progress(&self) {
         let (generation, callbacks) = {
+            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let mut progress = self.progress.lock().unwrap();
-            progress.generation = progress
-                .generation
-                .checked_add(1)
-                .unwrap_or_else(|| std::process::abort());
+            progress.generation = progress.generation.checked_add(1).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "thread::fork_quiesce",
+                    "quiesced progress generation overflow"
+                );
+            });
             let generation = progress.generation;
             let callbacks = std::mem::take(&mut progress.listeners)
                 .into_values()
@@ -795,6 +813,7 @@ impl QuiesceBarrier {
     }
 
     pub fn progress_generation(&self) -> u64 {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         self.progress.lock().unwrap().generation
     }
 
@@ -803,13 +822,17 @@ impl QuiesceBarrier {
         expected_generation: u64,
         callback: QuiesceProgressCallback,
     ) -> QuiesceProgressEnrollment {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut progress = self.progress.lock().unwrap();
         if progress.generation != expected_generation {
             return QuiesceProgressEnrollment::Ready(progress.generation);
         }
         let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
         if id == 0 || id == u64::MAX {
-            std::process::abort();
+            carrick_fatal!(
+                "thread::fork_quiesce",
+                "quiesced progress listener id exhausted or wrapped: id={id}"
+            );
         }
         progress.listeners.insert(
             id,
@@ -826,6 +849,7 @@ impl QuiesceBarrier {
     }
 
     pub fn publication_generation(&self) -> u64 {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         self.publication.lock().unwrap().generation
     }
 
@@ -834,6 +858,7 @@ impl QuiesceBarrier {
         expected_generation: u64,
         callback: QuiesceCallback,
     ) -> QuiesceEnrollment {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut publication = self.publication.lock().unwrap();
         if publication.generation != expected_generation {
             return QuiesceEnrollment::Ready(QuiesceEvent {
@@ -843,7 +868,10 @@ impl QuiesceBarrier {
         }
         let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
         if id == 0 || id == u64::MAX {
-            std::process::abort();
+            carrick_fatal!(
+                "thread::fork_quiesce",
+                "quiesce listener id exhausted or wrapped: id={id}"
+            );
         }
         publication.listeners.insert(
             id,
@@ -861,11 +889,11 @@ impl QuiesceBarrier {
 
     fn publish_quiesce_event(&self, kind: QuiesceEventKind) {
         let (event, callbacks) = {
+            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let mut publication = self.publication.lock().unwrap();
-            publication.generation = publication
-                .generation
-                .checked_add(1)
-                .unwrap_or_else(|| std::process::abort());
+            publication.generation = publication.generation.checked_add(1).unwrap_or_else(|| {
+                carrick_fatal!("thread::fork_quiesce", "quiesce event generation overflow");
+            });
             publication.kind = kind;
             let event = QuiesceEvent {
                 generation: publication.generation,
@@ -898,6 +926,7 @@ impl QuiesceBarrier {
     /// sides can (and must) release it. Callers drop the guard immediately
     /// after the fork returns, BEFORE touching the barrier again.
     pub fn lock_paused_across_fork(&self) -> std::sync::MutexGuard<'_, usize> {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         self.paused.lock().unwrap()
     }
 
@@ -910,7 +939,9 @@ impl QuiesceBarrier {
     /// because `lock_paused_across_fork` made the child's copy of the mutex
     /// consistent (owned by the forking thread, released on guard drop).
     pub fn reset_paused_for_child(&self) {
-        *self.paused.lock().unwrap() = 0;
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
+        let mut guard = self.paused.lock().unwrap();
+        *guard = 0;
     }
 }
 
@@ -1036,9 +1067,12 @@ impl PtQuiesce {
     /// OTHER thread (or a coordinator-CAS loser) parks here until the pause
     /// ends, keeping its vCPU. Called at the lock-safe run-loop top.
     pub fn park(&self) {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut g = self.lock.lock().unwrap();
         while self.quiescing.load(Ordering::SeqCst) {
-            g = self.cv.wait(g).unwrap();
+            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
+            let next = self.cv.wait(g).unwrap();
+            g = next;
         }
     }
 
@@ -1054,6 +1088,7 @@ impl PtQuiesce {
     ) {
         let participant = PtInvalidationParticipant { stage1, tid };
         let mut serviced_phase = 0;
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut g = self.lock.lock().unwrap();
         while self.quiescing.load(Ordering::SeqCst) {
             let work = g.invalidation.as_ref().and_then(|state| {
@@ -1063,7 +1098,9 @@ impl PtQuiesce {
             if let Some((phase, request)) = work {
                 drop(g);
                 let result = service(request);
-                g = self.lock.lock().unwrap();
+                #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
+                let acquired = self.lock.lock().unwrap();
+                g = acquired;
                 serviced_phase = phase.0;
                 if let Some(state) = g
                     .invalidation
@@ -1082,7 +1119,9 @@ impl PtQuiesce {
                 }
                 continue;
             }
-            g = self.cv.wait(g).unwrap();
+            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
+            let next = self.cv.wait(g).unwrap();
+            g = next;
         }
     }
 
@@ -1097,6 +1136,7 @@ impl PtQuiesce {
     /// contention but the second half of a deadlock. Bounding it downgrades a
     /// silent carrier-wide stop to a typed, probed, guest-visible failure.
     pub fn park_until(&self, deadline: Instant) -> bool {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut g = self.lock.lock().unwrap();
         loop {
             if !self.quiescing.load(Ordering::SeqCst) {
@@ -1108,6 +1148,7 @@ impl PtQuiesce {
             if remaining.is_zero() {
                 return false;
             }
+            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let (next, _timed_out) = self.cv.wait_timeout(g, remaining).unwrap();
             g = next;
         }
@@ -1115,6 +1156,7 @@ impl PtQuiesce {
 
     /// Coordinator: end the pause, wake parked threads, drop coordinator.
     pub fn end(&self) {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut g = self.lock.lock().unwrap();
         g.invalidation = None;
         self.quiescing.store(false, Ordering::SeqCst);
@@ -1158,14 +1200,17 @@ impl PtPauseGuard {
         if !self.barrier.quiescing.load(Ordering::SeqCst) {
             return Err(PtInvalidationError::PauseNotActive);
         }
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut state = self.barrier.lock.lock().unwrap();
         if state.invalidation.is_some() {
             return Err(PtInvalidationError::AlreadyPublished);
         }
-        state.next_invalidation = state
-            .next_invalidation
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        state.next_invalidation = state.next_invalidation.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal!(
+                "thread::fork_quiesce",
+                "page table next invalidation phase overflow"
+            );
+        });
         let phase = PtInvalidationPhase(state.next_invalidation);
         state.invalidation = Some(PtInvalidationState {
             phase,
@@ -1189,6 +1234,7 @@ impl PtPauseGuard {
         phase: &PtInvalidationPhase,
         deadline: Instant,
     ) -> Result<(), PtInvalidationError> {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut guard = self.barrier.lock.lock().unwrap();
         loop {
             let state = guard
@@ -1211,6 +1257,7 @@ impl PtPauseGuard {
                     .ok_or(PtInvalidationError::StalePhase)?;
                 return Err(PtInvalidationError::TimedOut(missing.tid));
             };
+            #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let (next, _) = self.barrier.cv.wait_timeout(guard, remaining).unwrap();
             guard = next;
         }
@@ -1223,6 +1270,7 @@ impl PtPauseGuard {
         &self,
         phase: &PtInvalidationPhase,
     ) -> Result<(), PtInvalidationError> {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut guard = self.barrier.lock.lock().unwrap();
         match guard.invalidation.as_ref() {
             Some(state) if state.phase == *phase => {
@@ -1237,6 +1285,7 @@ impl PtPauseGuard {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use std::collections::BTreeSet;
     use std::sync::Arc;

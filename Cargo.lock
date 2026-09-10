@@ -562,6 +562,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-fatal"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "carrick-guest-mem"
 version = "0.1.0"
 dependencies = [
@@ -801,6 +808,7 @@ name = "carrick-thread"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-fatal",
  "carrick-hal",
  "carrick-observability",
  "libc",

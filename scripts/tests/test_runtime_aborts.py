@@ -28,7 +28,10 @@ def abort_row(
     typed_error: str | None = None,
     failure_domain: str = "test_domain",
     rationale: str = "test rationale",
+    sink: str | None = None,
+    domain: str | None = None,
 ) -> dict:
+    row_sink = sink if sink is not None else getattr(finding, "sink", "raw")
     row = {
         "file": finding.file,
         "function": finding.function,
@@ -37,9 +40,14 @@ def abort_row(
         "verdict": verdict,
         "failure_domain": failure_domain,
         "rationale": rationale,
+        "sink": row_sink,
     }
     if typed_error is not None:
         row["typed_error"] = typed_error
+    if row_sink == "fatal":
+        row["domain"] = domain if domain is not None else getattr(finding, "domain", "test_domain")
+    elif domain is not None:
+        row["domain"] = domain
     return row
 
 
@@ -1136,6 +1144,266 @@ impl TypeB {
         self.assertEqual(len(with_log), 1)
         self.assertEqual(len(without_log), 1)
         self.assertNotEqual(with_log[0].fingerprint, without_log[0].fingerprint)
+
+    def test_discovers_carrick_fatal_with_literal_domain_and_fatal_sink(self):
+        source = r'''fn publish() {
+    carrick_fatal!("domain_publish", "fatal invariant violated: {}", 1);
+}'''
+        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].sink, "fatal")
+        self.assertEqual(rows[0].domain, "domain_publish")
+        self.assertEqual(rows[0].function, "publish")
+        self.assertEqual(rows[0].ordinal_in_function, 1)
+
+    def test_carrick_fatal_requires_string_literal_domain(self):
+        source = r'''fn publish() {
+    carrick_fatal!(NON_LITERAL_DOMAIN, "message");
+}'''
+        with self.assertRaises(LedgerError):
+            scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
+
+    def test_validate_shards_requires_valid_sink_in_row(self):
+        finding = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "a" * 64,
+        )
+        row_missing_sink = abort_row(finding)
+        del row_missing_sink["sink"]
+        with self.assertRaises(LedgerError):
+            validate_shards((finding,), ledger_set([row_missing_sink], debt_ceiling=0))
+
+        row_invalid_sink = abort_row(finding, sink="unknown")
+        with self.assertRaises(LedgerError):
+            validate_shards((finding,), ledger_set([row_invalid_sink], debt_ceiling=0))
+
+    def test_validate_shards_requires_domain_for_fatal_sink(self):
+        finding = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "a" * 64,
+            sink="fatal",
+            domain="test_dom",
+        )
+        row = abort_row(finding, sink="fatal")
+        del row["domain"]
+        with self.assertRaises(LedgerError):
+            validate_shards((finding,), ledger_set([row], debt_ceiling=0))
+
+    def test_validate_shards_rejects_domain_for_raw_sink(self):
+        finding = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "a" * 64,
+        )
+        row = abort_row(finding, sink="raw", domain="illegal_domain")
+        with self.assertRaises(LedgerError):
+            validate_shards((finding,), ledger_set([row], debt_ceiling=0))
+
+    def test_validate_shards_rejects_new_raw_abort_site(self):
+        finding = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "a" * 64,
+            sink="raw",
+        )
+        with self.assertRaises(LedgerError) as ctx:
+            validate_shards((finding,), ledger_set([], debt_ceiling=0))
+        self.assertIn("raw", str(ctx.exception).lower())
+
+    def test_validate_shards_rejects_sink_flip_from_fatal_to_raw(self):
+        finding = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "a" * 64,
+            sink="raw",
+        )
+        row = abort_row(finding, sink="fatal", domain="dom")
+        with self.assertRaises(LedgerError) as ctx:
+            validate_shards((finding,), ledger_set([row], debt_ceiling=0))
+        self.assertIn("fatal back to raw", str(ctx.exception).lower())
+
+    def test_validate_shards_rejects_fingerprint_change_without_raw_to_fatal_flip(self):
+        finding_raw = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "a" * 64,
+            sink="raw",
+        )
+        row_raw = abort_row(finding_raw, sink="raw")
+        row_raw["fingerprint"] = "b" * 64
+        with self.assertRaises(LedgerError):
+            validate_shards((finding_raw,), ledger_set([row_raw], debt_ceiling=0))
+
+        finding_fatal = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "a" * 64,
+            sink="fatal",
+            domain="dom",
+        )
+        row_fatal = abort_row(finding_fatal, sink="fatal", domain="dom")
+        row_fatal["fingerprint"] = "b" * 64
+        with self.assertRaises(LedgerError):
+            validate_shards((finding_fatal,), ledger_set([row_fatal], debt_ceiling=0))
+
+    def test_check_mode_rejects_unblessed_raw_to_fatal_flip(self):
+        finding = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "new_fp" + "0" * 58,
+            sink="fatal",
+            domain="dom_fatal",
+        )
+        row = abort_row(finding, sink="raw")
+        row["fingerprint"] = "old_fp" + "0" * 58
+        ledgers = ledger_set([row], debt_ceiling=0)
+        with self.assertRaises(LedgerError) as ctx:
+            validate_shards((finding,), ledgers, mode="check")
+        self.assertIn("migrated raw→fatal; run --migrate to re-bless", str(ctx.exception))
+
+    def test_validate_shards_defaults_to_check_mode(self):
+        finding = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "new_fp" + "0" * 58,
+            sink="fatal",
+            domain="dom_fatal",
+        )
+        row = abort_row(finding, sink="raw")
+        row["fingerprint"] = "old_fp" + "0" * 58
+        ledgers = ledger_set([row], debt_ceiling=0)
+        with self.assertRaises(LedgerError) as ctx:
+            validate_shards((finding,), ledgers)
+        self.assertIn("migrated raw→fatal; run --migrate to re-bless", str(ctx.exception))
+
+    def test_migrate_mode_blesses_exactly_that_row_and_nothing_else(self):
+        finding1 = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "new_fp1" + "0" * 57,
+            sink="fatal",
+            domain="dom_fatal",
+        )
+        finding2 = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            2,
+            "same_fp2" + "0" * 56,
+            sink="raw",
+        )
+        row1 = abort_row(
+            finding1,
+            verdict="carrier_fault",
+            failure_domain="fd_one",
+            rationale="rat_one",
+            sink="raw",
+        )
+        row1["fingerprint"] = "old_fp1" + "0" * 57
+        row2 = abort_row(
+            finding2,
+            verdict="typed_error_debt",
+            typed_error="Result<(), Error>",
+            failure_domain="fd_two",
+            rationale="rat_two",
+            sink="raw",
+        )
+        ledgers = ledger_set([row1, row2], debt_ceiling=1)
+        validate_shards((finding1, finding2), ledgers, mode="migrate")
+
+        reblessed_row1 = ledgers["vcpu-loop.json"]["rows"][0]
+        self.assertEqual(reblessed_row1["sink"], "fatal")
+        self.assertEqual(reblessed_row1["domain"], "dom_fatal")
+        self.assertEqual(reblessed_row1["fingerprint"], finding1.fingerprint)
+        self.assertEqual(reblessed_row1["verdict"], "carrier_fault")
+        self.assertEqual(reblessed_row1["failure_domain"], "fd_one")
+        self.assertEqual(reblessed_row1["rationale"], "rat_one")
+
+        untouched_row2 = ledgers["vcpu-loop.json"]["rows"][1]
+        self.assertEqual(untouched_row2["sink"], "raw")
+        self.assertNotIn("domain", untouched_row2)
+        self.assertEqual(untouched_row2["fingerprint"], finding2.fingerprint)
+        self.assertEqual(untouched_row2["verdict"], "typed_error_debt")
+        self.assertEqual(untouched_row2["typed_error"], "Result<(), Error>")
+        self.assertEqual(untouched_row2["failure_domain"], "fd_two")
+        self.assertEqual(untouched_row2["rationale"], "rat_two")
+
+    def test_migrate_mode_refuses_fatal_to_raw_flip(self):
+        finding = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "a" * 64,
+            sink="raw",
+        )
+        row = abort_row(finding, sink="fatal", domain="dom")
+        with self.assertRaises(LedgerError) as ctx:
+            validate_shards((finding,), ledger_set([row], debt_ceiling=0), mode="migrate")
+        self.assertIn("fatal back to raw", str(ctx.exception).lower())
+
+    def test_migrate_mode_refuses_fingerprint_change_on_unflipped_row(self):
+        # Raw unflipped
+        finding_raw = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "new_raw_fp" + "0" * 54,
+            sink="raw",
+        )
+        row_raw = abort_row(finding_raw, sink="raw")
+        row_raw["fingerprint"] = "old_raw_fp" + "0" * 54
+        with self.assertRaises(LedgerError) as ctx:
+            validate_shards((finding_raw,), ledger_set([row_raw], debt_ceiling=0), mode="migrate")
+        self.assertIn("fingerprint drift", str(ctx.exception).lower())
+
+        # Fatal unflipped
+        finding_fatal = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "new_fatal_fp" + "0" * 52,
+            sink="fatal",
+            domain="dom",
+        )
+        row_fatal = abort_row(finding_fatal, sink="fatal", domain="dom")
+        row_fatal["fingerprint"] = "old_fatal_fp" + "0" * 52
+        with self.assertRaises(LedgerError) as ctx:
+            validate_shards((finding_fatal,), ledger_set([row_fatal], debt_ceiling=0), mode="migrate")
+        self.assertIn("fingerprint drift", str(ctx.exception).lower())
+
+    def test_validate_shards_rejects_fatal_domain_mismatch(self):
+        finding = AbortFinding(
+            "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+            "publish",
+            1,
+            "a" * 64,
+            sink="fatal",
+            domain="new_dom",
+        )
+        row = abort_row(finding, sink="fatal", domain="old_dom")
+        with self.assertRaises(LedgerError):
+            validate_shards((finding,), ledger_set([row], debt_ceiling=0))
+
+    def test_routes_other_crates_to_other_shard(self):
+        self.assertEqual(CHECKER.route_shard("crates/carrick-thread/src/thread.rs"), "other.json")
+        self.assertEqual(CHECKER.route_shard("crates/carrick-hal/src/arch/aarch64/mod.rs"), "other.json")
+        with self.assertRaises(LedgerError):
+            CHECKER.route_shard("crates/carrick-conformance/src/lib.rs")
+        with self.assertRaises(LedgerError):
+            CHECKER.route_shard("crates/carrick-dsr/src/lib.rs")
+        with self.assertRaises(LedgerError):
+            CHECKER.route_shard("crates/carrick-native-darwin/src/lib.rs")
 
 
 if __name__ == "__main__":
