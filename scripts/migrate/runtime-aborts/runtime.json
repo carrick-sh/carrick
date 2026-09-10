@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 22,
+  "typed_error_debt_ceiling": 24,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -2411,6 +2411,63 @@
       "rationale": "The activated root could not recapture its exact kernel context before terminal-route publication; continuing could bind carrier-wide TTY service to the wrong task generation.",
       "sink": "fatal",
       "domain": "threaded_loop::root_activation"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "FsState::rootfs_vfs_mut",
+      "ordinal_in_function": 1,
+      "fingerprint": "241a6fe549fdb3713979a021dc339682e3960e107cb55adb4cbcdfe91853dbec",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::fs_mounts",
+      "rationale": "Mutating shared rootfs VFS after fork occurs before execution and should return a typed configuration error instead of aborting.",
+      "typed_error": "RuntimeError",
+      "sink": "fatal",
+      "domain": "dispatch::fs_mounts"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "FsState::vfs_mounts_mut",
+      "ordinal_in_function": 1,
+      "fingerprint": "6303405f788787a2813b1db198d3b43f425202fdf69964846dfa3b7202b25e52",
+      "verdict": "typed_error_debt",
+      "failure_domain": "dispatch::fs_mounts",
+      "rationale": "Mutating shared VFS mounts after fork occurs before execution and should return a typed configuration error instead of aborting.",
+      "typed_error": "RuntimeError",
+      "sink": "fatal",
+      "domain": "dispatch::fs_mounts"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "MountRetirement::clear",
+      "ordinal_in_function": 1,
+      "fingerprint": "acbfc19c323ba47be71e2495557def22844465fa75ce5295260b9efb06273ec2",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mount_retirement",
+      "rationale": "Mount destruction was requested without first proving sole ownership; continuing could publish a retired container while live dispatchers still use its mount table.",
+      "sink": "fatal",
+      "domain": "dispatch::mount_retirement"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "MountRetirement::clear",
+      "ordinal_in_function": 2,
+      "fingerprint": "cb128a606f2b0fcdef5386728381304d89536435cd2822bad349485c05c9d2e2",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mount_retirement",
+      "rationale": "A prepared mount-retirement token lost its exact table before destruction; continuing would fabricate cleanup accounting for a table that was already removed.",
+      "sink": "fatal",
+      "domain": "dispatch::mount_retirement"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+      "function": "MountRetirement::clear",
+      "ordinal_in_function": 3,
+      "fingerprint": "09a047115c0c4eb4b34f8e19102415e203617274b356a089e34621872b851823",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mount_retirement",
+      "rationale": "A new mount-table owner appeared after sole ownership was proven; continuing could destroy storage still reachable by another container executor.",
+      "sink": "fatal",
+      "domain": "dispatch::mount_retirement"
     }
   ]
 }

@@ -2,6 +2,7 @@
 
 use super::super::*;
 use crate::linux_abi::{LinuxDnotifyMask, LinuxErrno};
+use carrick_fatal::carrick_fatal;
 
 #[derive(Debug, Clone)]
 pub(in crate::dispatch) struct DnotifyRegistration {
@@ -268,11 +269,23 @@ impl MountRetirement {
     /// cleanup evidence.
     pub(crate) fn clear(&mut self) -> usize {
         if !self.prepared {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mount_retirement",
+                "mount destruction requested without first proving sole ownership"
+            );
         }
-        let mounts = self.mounts.take().unwrap_or_else(|| std::process::abort());
-        let mut mounts = std::sync::Arc::try_unwrap(mounts).unwrap_or_else(|_| {
-            std::process::abort();
+        let mounts = self.mounts.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "dispatch::mount_retirement",
+                "prepared mount-retirement token lost its mount table before destruction"
+            );
+        });
+        let mut mounts = std::sync::Arc::try_unwrap(mounts).unwrap_or_else(|shared| {
+            carrick_fatal!(
+                "dispatch::mount_retirement",
+                "a new mount-table owner appeared after sole ownership was proven: strong={}",
+                std::sync::Arc::strong_count(&shared)
+            );
         });
         let count = mounts.clear_all();
         self.prepared = false;
@@ -430,17 +443,23 @@ pub(super) fn set_host_fd_offset(host_fd: crate::dispatch::HostFd, offset: u64) 
 
 impl FsState {
     pub(in crate::dispatch) fn vfs_mounts_mut(&mut self) -> &mut crate::vfs::VfsMounts {
+        let strong = std::sync::Arc::strong_count(&self.vfs_mounts);
         let Some(mounts) = std::sync::Arc::get_mut(&mut self.vfs_mounts) else {
-            eprintln!("carrick: FATAL: VFS mounts cannot be reconfigured after guest fork");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::fs_mounts",
+                "VFS mounts cannot be reconfigured after guest fork: strong={strong}"
+            );
         };
         mounts
     }
 
     pub(in crate::dispatch) fn rootfs_vfs_mut(&mut self) -> &mut crate::vfs::RootFsVfs {
+        let strong = std::sync::Arc::strong_count(&self.rootfs_vfs);
         let Some(rootfs) = std::sync::Arc::get_mut(&mut self.rootfs_vfs) else {
-            eprintln!("carrick: FATAL: rootfs cannot be reconfigured after guest fork");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::fs_mounts",
+                "rootfs cannot be reconfigured after guest fork: strong={strong}"
+            );
         };
         rootfs
     }
