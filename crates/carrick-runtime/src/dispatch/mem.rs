@@ -3295,11 +3295,8 @@ impl SyscallDispatcher {
             }
             OpenDescription::InMemoryFile { contents, .. } => {
                 let data = contents.read();
-                if offset_usize < data.len() {
-                    let available = &data[offset_usize..];
-                    let copy_len = available.len().min(length);
-                    bytes[..copy_len].copy_from_slice(&available[..copy_len]);
-                }
+                let read_bytes = data.read_range(offset_usize, length);
+                bytes[..read_bytes.len()].copy_from_slice(&read_bytes);
                 shared_file_bus_offset(data.len() as u64, offset, length_u64, page_size)
             }
             OpenDescription::HostFile { host_fd, .. } => {
@@ -5972,6 +5969,14 @@ impl SyscallDispatcher {
                         ),
                     ));
                 }
+                if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
+                    mark_range_unmapped(memory, address, length_usize);
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("mmap locked range population failed"),
+                        errno,
+                        format_args!("at {address:#x}+{length:#x}: errno={errno:?}"),
+                    ));
+                }
                 if map_flags.contains(LinuxMmapFlags::PRIVATE) {
                     if let Err(error) = this
                         .mem()
@@ -5986,21 +5991,6 @@ impl SyscallDispatcher {
                             format_args!("at {address:#x}+{length:#x}: {error}"),
                         ));
                     }
-                }
-                if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
-                    mark_range_unmapped(memory, address, length_usize);
-                    if map_flags.contains(LinuxMmapFlags::PRIVATE) {
-                        let _ = this
-                            .mem()
-                            .lock()
-                            .deferred_anonymous
-                            .retire(GuestVa(address), length_usize);
-                    }
-                    return Ok(request.refused_by(
-                        MmapRefusal::Internal("mmap locked range population failed"),
-                        errno,
-                        format_args!("at {address:#x}+{length:#x}: errno={errno:?}"),
-                    ));
                 }
                 this.record_dynamic_mapping_with_file_offset(
                     address,
@@ -6069,6 +6059,14 @@ impl SyscallDispatcher {
                         ),
                     ));
                 }
+                if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
+                    mark_range_unmapped(memory, address, length_usize);
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("mmap locked range population failed"),
+                        errno,
+                        format_args!("at {address:#x}+{length:#x}: errno={errno:?}"),
+                    ));
+                }
                 if defer_anonymous {
                     if let Err(error) = this.mem().lock().deferred_anonymous
                         .reserve_fresh(GuestVa(address), length_usize)
@@ -6080,21 +6078,6 @@ impl SyscallDispatcher {
                             format_args!("at {address:#x}+{length:#x}: {error}"),
                         ));
                     }
-                }
-                if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
-                    mark_range_unmapped(memory, address, length_usize);
-                    if defer_anonymous {
-                        let _ = this
-                            .mem()
-                            .lock()
-                            .deferred_anonymous
-                            .retire(GuestVa(address), length_usize);
-                    }
-                    return Ok(request.refused_by(
-                        MmapRefusal::Internal("mmap locked range population failed"),
-                        errno,
-                        format_args!("at {address:#x}+{length:#x}: errno={errno:?}"),
-                    ));
                 }
                 // Observe the FIRST TOUCH of each page, so `mincore` can tell a
                 // written page from an untouched one.
@@ -6291,7 +6274,7 @@ impl SyscallDispatcher {
                             bytes[..copy_len].copy_from_slice(&available[..copy_len]);
                         }
                     }
-                    OpenDescription::InMemoryFile { contents, path, .. } => {
+                    OpenDescription::InMemoryFile { contents, .. } => {
                         let data = contents.read();
                         if let Some(bus_offset) = shared_file_bus_offset(
                                 data.len() as u64,
@@ -6302,11 +6285,8 @@ impl SyscallDispatcher {
                         {
                             bus_fault_offset = Some(bus_offset);
                         }
-                        if offset_usize < data.len() {
-                            let available = &data[offset_usize..];
-                            let copy_len = available.len().min(length_usize);
-                            bytes[..copy_len].copy_from_slice(&available[..copy_len]);
-                        }
+                        let read_bytes = data.read_range(offset_usize, length_usize);
+                        bytes[..read_bytes.len()].copy_from_slice(&read_bytes);
                     }
                     OpenDescription::HostFile { host_fd, .. } => {
                         if let Some(file_len) = host_fd_file_len(host_fd.raw())

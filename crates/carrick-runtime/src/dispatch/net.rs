@@ -4616,7 +4616,9 @@ mod netlink_readiness_tests {
             Arc::new(RwLock::new(OpenDescription::InMemoryFile {
                 base: OpenDescriptionBase::new(0),
                 path: "/fixture/inmem".to_string(),
-                contents: Arc::new(parking_lot::RwLock::new(b"inmem content".to_vec())),
+                contents: Arc::new(parking_lot::RwLock::new(crate::vfs::SparseBuffer::from(
+                    b"inmem content".to_vec(),
+                ))),
                 offset: 0,
                 writable: true,
                 max_size: 4096,

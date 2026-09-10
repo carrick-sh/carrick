@@ -76,8 +76,8 @@ pub const ORACLE_SIGINFO_SIZE: usize = 0x80;
 pub const AARCH64_FPREGSET_SIZE: usize = 0x210;
 pub const AARCH64_TLS_SIZE: usize = 0x10;
 
-const EHDR_SIZE: u16 = 64;
-const PHDR_SIZE: u16 = 56;
+pub(crate) const EHDR_SIZE: u16 = 64;
+pub(crate) const PHDR_SIZE: u16 = 56;
 const SHDR_SIZE: u16 = 64;
 /// Every core carries exactly one section header: the reserved index-0 entry.
 /// It is written unconditionally rather than only when [`PN_XNUM`] fires, so
@@ -161,12 +161,102 @@ pub struct MemoryRegion<'a> {
     pub start: u64,
     /// Permissions as `PF_*`.
     pub flags: u32,
-    /// Contents. An empty slice records the mapping with `p_filesz = 0` —
-    /// which is exactly what Linux does for a region it does not dump (the
-    /// oracle's first `LOAD` had `filesz 0`, `memsz 0x20000`).
+    /// Direct in-memory contents if available (empty for large/sparse VMAs or omitted VMAs).
     pub bytes: &'a [u8],
-    /// Size of the mapping in the address space, which may exceed `bytes`.
+    /// Size of the mapping in the address space.
     pub size: u64,
+    /// Whether this region represents a dumpable mapping. When true, `p_filesz == size`.
+    /// When false and `bytes` is empty, `p_filesz == 0` (e.g. `MADV_DONTDUMP` or omitted file text).
+    pub dumped: bool,
+}
+
+/// One contiguous materialized byte chunk emitted into the core file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreExtent {
+    /// File offset within the core file where this chunk begins.
+    pub offset: u64,
+    /// Materialized bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// A structured core dump payload consisting of an immutable ELF header and
+/// disjoint materialized extents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorePayload {
+    /// The serialized ELF header, Program Headers, Section Header 0, and Notes.
+    pub header: Vec<u8>,
+    /// Materialized data extents located at specific file offsets.
+    pub extents: Vec<CoreExtent>,
+    /// Total logical size of the core file.
+    pub logical_size: u64,
+}
+
+impl CorePayload {
+    pub fn dense(bytes: Vec<u8>) -> Self {
+        let logical_size = bytes.len() as u64;
+        Self {
+            header: bytes,
+            extents: Vec::new(),
+            logical_size,
+        }
+    }
+
+    pub fn emitted_bytes(&self) -> u64 {
+        self.header
+            .len()
+            .saturating_add(self.extents.iter().map(|e| e.bytes.len()).sum::<usize>())
+            as u64
+    }
+
+    pub fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+
+    /// Versioned extent-manifest SHA-256 digest over the header and all extents.
+    ///
+    /// O(emitted bytes) rather than O(logical size), avoiding memory/hashing
+    /// amplification on sparse core files.
+    pub fn manifest_digest(&self) -> [u8; 32] {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"carrick-core-manifest-v1\0");
+        hasher.update(self.logical_size.to_le_bytes());
+        hasher.update((self.header.len() as u64).to_le_bytes());
+        hasher.update(&self.header);
+        hasher.update((self.extents.len() as u64).to_le_bytes());
+        for ext in &self.extents {
+            hasher.update(ext.offset.to_le_bytes());
+            hasher.update((ext.bytes.len() as u64).to_le_bytes());
+            hasher.update(&ext.bytes);
+        }
+        hasher.finalize().into()
+    }
+
+    /// Flatten the payload into a contiguous byte buffer. Bounded by `limit`.
+    pub fn to_bytes_bounded(&self, limit: u64) -> Result<Vec<u8>, CoreDumpError> {
+        let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+        let logical_usize =
+            usize::try_from(self.logical_size).map_err(|_| CoreDumpError::LayoutOverflow)?;
+        let target_len = logical_usize.min(limit_usize);
+        let mut out = vec![0; target_len];
+        let header_copy = self.header.len().min(target_len);
+        out[..header_copy].copy_from_slice(&self.header[..header_copy]);
+        for ext in &self.extents {
+            let offset = usize::try_from(ext.offset).map_err(|_| CoreDumpError::LayoutOverflow)?;
+            if offset >= target_len {
+                continue;
+            }
+            let copy_len = ext.bytes.len().min(target_len - offset);
+            out[offset..offset + copy_len].copy_from_slice(&ext.bytes[..copy_len]);
+        }
+        Ok(out)
+    }
+}
+
+impl From<Vec<u8>> for CorePayload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::dense(bytes)
+    }
 }
 
 /// One `NT_FILE` entry: a file-backed mapping.
@@ -224,19 +314,19 @@ fn checked_align_up(value: usize, align: usize) -> Option<usize> {
         .map(|rounded| rounded / align * align)
 }
 
-fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
+pub(crate) fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
     ))
 }
 
-fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+pub(crate) fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
     ))
 }
 
-fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
+pub(crate) fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(
         bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
     ))
@@ -250,6 +340,7 @@ fn validate_serialized_core(
     bytes: &[u8],
     expected_loads: usize,
     expected_notes: usize,
+    logical_size: Option<u64>,
 ) -> Result<(), CoreDumpError> {
     let invalid = |message: &str| CoreDumpError::InvalidSerialized(message.to_owned());
     if bytes.len() < usize::from(EHDR_SIZE) || bytes.get(..4) != Some(b"\x7fELF") {
@@ -347,11 +438,11 @@ fn validate_serialized_core(
         let end = offset
             .checked_add(filesz)
             .ok_or(CoreDumpError::LayoutOverflow)?;
-        if end > bytes.len() {
-            return Err(invalid("segment extends beyond artifact"));
-        }
         match kind {
             PT_NOTE => {
+                if end > bytes.len() {
+                    return Err(invalid("PT_NOTE segment extends beyond artifact"));
+                }
                 if note_range.replace((offset, end)).is_some() {
                     return Err(invalid("multiple PT_NOTE segments"));
                 }
@@ -362,6 +453,16 @@ fn validate_serialized_core(
                     .ok_or(CoreDumpError::LayoutOverflow)?;
                 if u64::try_from(filesz).map_or(true, |size| size > memsz) {
                     return Err(invalid("PT_LOAD filesz exceeds memsz"));
+                }
+                if let Some(limit) = logical_size {
+                    let segment_end = (offset as u64)
+                        .checked_add(filesz as u64)
+                        .ok_or(CoreDumpError::LayoutOverflow)?;
+                    if segment_end > limit && filesz != 0 {
+                        return Err(invalid("segment extends beyond artifact logical size"));
+                    }
+                } else if end > bytes.len() {
+                    return Err(invalid("segment extends beyond artifact"));
                 }
                 let vaddr = read_u64(bytes, at + 16)
                     .ok_or_else(|| invalid("missing PT_LOAD virtual address"))?;
@@ -383,6 +484,9 @@ fn validate_serialized_core(
         return Err(invalid("overlapping PT_LOAD virtual ranges"));
     }
     let (mut cursor, note_end) = note_range.ok_or_else(|| invalid("missing PT_NOTE"))?;
+    if note_end > bytes.len() {
+        return Err(invalid("PT_NOTE extends beyond header"));
+    }
     let mut note_count = 0usize;
     while cursor < note_end {
         let header_end = cursor
@@ -769,82 +873,89 @@ impl CoreDump<'_> {
         Ok(())
     }
 
-    /// Validate and serialise without ever publishing a prefix. `limit` is
-    /// the caller's effective Linux `RLIMIT_CORE`; equality is permitted.
-    pub fn to_bytes_bounded(&self, limit: u64) -> Result<Vec<u8>, CoreDumpError> {
-        self.validate()?;
-        let mut bytes = self.try_to_bytes()?;
-        // core(5): RLIMIT_CORE is the maximum SIZE of the core file, and a dump
-        // that would exceed it is TRUNCATED — the process still counts as
-        // having dumped core. Refusing the whole publication instead cleared
-        // WCOREDUMP, which is what LTP waitpid01 catches: it deliberately sets
-        // RLIMIT_CORE to one page and still asserts WCOREDUMP for all ten
-        // core-carrying signals in both its variants (20 assertions).
-        //
-        // A zero limit means "no core at all" and is handled by the caller
-        // before we are reached, so a truncated prefix here is never mistaken
-        // for a suppressed dump.
-        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-        bytes.truncate(limit);
-        Ok(bytes)
-    }
-
-    #[cfg(test)]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.validate()
-            .and_then(|_| self.try_to_bytes())
-            .expect("test core must serialize")
-    }
-
-    /// Serialise the whole core file.
-    ///
-    /// Layout follows the oracle: ELF header, then the program header table,
-    /// then `PT_NOTE`'s contents, then each `PT_LOAD`'s bytes page-aligned.
-    fn try_to_bytes(&self) -> Result<Vec<u8>, CoreDumpError> {
-        let mut notes = Vec::new();
-        // Match Linux's note order exactly: the crashing thread's PRSTATUS,
-        // process-wide notes, its optional register sets, then each sibling's
-        // PRSTATUS and register sets.
+    fn encode_notes(&self, notes: &mut Vec<u8>) {
         if let Some(thread) = self.threads.first() {
-            push_note(
-                &mut notes,
-                NT_PRSTATUS,
-                as_bytes(&prstatus_note(self, thread)),
-            );
+            push_note(notes, NT_PRSTATUS, as_bytes(&prstatus_note(self, thread)));
         }
-        push_note(
-            &mut notes,
-            NT_PRPSINFO,
-            as_bytes(&prpsinfo_note(&self.identity)),
-        );
-        push_note(
-            &mut notes,
-            NT_SIGINFO,
-            as_bytes(&siginfo_note(&self.signal)),
-        );
-        push_note(&mut notes, NT_AUXV, &auxv_note(&self.auxv));
-        push_note(&mut notes, NT_FILE, &file_note(&self.mappings));
+        push_note(notes, NT_PRPSINFO, as_bytes(&prpsinfo_note(&self.identity)));
+        push_note(notes, NT_SIGINFO, as_bytes(&siginfo_note(&self.signal)));
+        push_note(notes, NT_AUXV, &auxv_note(&self.auxv));
+        push_note(notes, NT_FILE, &file_note(&self.mappings));
         if let Some(thread) = self.threads.first() {
-            push_thread_arch_notes(&mut notes, thread);
+            push_thread_arch_notes(notes, thread);
         }
         for thread in self.threads.iter().skip(1) {
-            push_note(
-                &mut notes,
-                NT_PRSTATUS,
-                as_bytes(&prstatus_note(self, thread)),
-            );
-            push_thread_arch_notes(&mut notes, thread);
+            push_note(notes, NT_PRSTATUS, as_bytes(&prstatus_note(self, thread)));
+            push_thread_arch_notes(notes, thread);
         }
+    }
+
+    /// Calculate the file offset where each `PT_LOAD` segment starts in the core file.
+    pub fn load_segment_file_offsets(&self) -> Result<Vec<u64>, CoreDumpError> {
+        let mut notes = Vec::new();
+        self.encode_notes(&mut notes);
 
         let phnum = self
             .regions
             .len()
             .checked_add(1)
             .ok_or(CoreDumpError::LayoutOverflow)?;
-        // `e_phnum` is 16-bit. A count it cannot hold is not an error — the
-        // gABI escape hatch is to store `PN_XNUM` there and the real count in
-        // section header 0's `sh_info`, which is 32-bit. Only a count past
-        // THAT is unrepresentable.
+        let phoff = usize::from(EHDR_SIZE);
+        let shoff = phnum
+            .checked_mul(usize::from(PHDR_SIZE))
+            .and_then(|table| phoff.checked_add(table))
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        let notes_offset = shoff
+            .checked_add(usize::from(SHNUM) * usize::from(SHDR_SIZE))
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        let notes_end = notes_offset
+            .checked_add(notes.len())
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        let mut data_offset =
+            checked_align_up(notes_end, GUEST_PAGE).ok_or(CoreDumpError::LayoutOverflow)?;
+
+        let mut offsets = Vec::with_capacity(self.regions.len());
+        for region in &self.regions {
+            let filesz = if region.dumped || !region.bytes.is_empty() {
+                region.size
+            } else {
+                0
+            };
+            if filesz == 0 {
+                offsets.push(0);
+            } else {
+                offsets
+                    .push(u64::try_from(data_offset).map_err(|_| CoreDumpError::LayoutOverflow)?);
+                let filesz_usize =
+                    usize::try_from(filesz).map_err(|_| CoreDumpError::LayoutOverflow)?;
+                data_offset = data_offset
+                    .checked_add(
+                        checked_align_up(filesz_usize, GUEST_PAGE)
+                            .ok_or(CoreDumpError::LayoutOverflow)?,
+                    )
+                    .ok_or(CoreDumpError::LayoutOverflow)?;
+            }
+        }
+        Ok(offsets)
+    }
+
+    /// Build a structured, sparse core dump payload without dense memory expansion.
+    ///
+    /// Applies `limit` (`RLIMIT_CORE`) to bound emitted bytes before doing large serialization.
+    pub fn build_payload(
+        &self,
+        limit: u64,
+        mut extents: Vec<CoreExtent>,
+    ) -> Result<CorePayload, CoreDumpError> {
+        self.validate()?;
+        let mut notes = Vec::new();
+        self.encode_notes(&mut notes);
+
+        let phnum = self
+            .regions
+            .len()
+            .checked_add(1)
+            .ok_or(CoreDumpError::LayoutOverflow)?;
         let (phnum_u16, section_phnum) = if phnum >= usize::from(PN_XNUM) {
             (
                 PN_XNUM,
@@ -891,64 +1002,158 @@ impl CoreDump<'_> {
             e_shnum: SHNUM,
             ..wire::Elf64Ehdr::default()
         };
-        let mut out = Vec::new();
-        out.extend_from_slice(as_bytes(&header));
+        let mut header_bytes = Vec::new();
+        header_bytes.extend_from_slice(as_bytes(&header));
 
-        out.extend_from_slice(as_bytes(&wire::Elf64Phdr {
+        header_bytes.extend_from_slice(as_bytes(&wire::Elf64Phdr {
             p_type: PT_NOTE,
             p_offset: u64::try_from(notes_offset).map_err(|_| CoreDumpError::LayoutOverflow)?,
             p_filesz: u64::try_from(notes.len()).map_err(|_| CoreDumpError::LayoutOverflow)?,
             p_align: NOTE_ALIGN as u64,
             ..wire::Elf64Phdr::default()
         }));
+
+        let caller_provided_extents = !extents.is_empty();
         for region in &self.regions {
-            let filesz =
-                u64::try_from(region.bytes.len()).map_err(|_| CoreDumpError::LayoutOverflow)?;
-            out.extend_from_slice(as_bytes(&wire::Elf64Phdr {
+            let filesz = if region.dumped || !region.bytes.is_empty() {
+                region.size
+            } else {
+                0
+            };
+            let offset = if filesz == 0 {
+                0
+            } else {
+                u64::try_from(data_offset).map_err(|_| CoreDumpError::LayoutOverflow)?
+            };
+            header_bytes.extend_from_slice(as_bytes(&wire::Elf64Phdr {
                 p_type: PT_LOAD,
                 p_flags: region.flags,
-                p_offset: if filesz == 0 {
-                    0
-                } else {
-                    u64::try_from(data_offset).map_err(|_| CoreDumpError::LayoutOverflow)?
-                },
+                p_offset: offset,
                 p_vaddr: region.start,
                 p_filesz: filesz,
                 p_memsz: region.size,
                 p_align: GUEST_PAGE as u64,
                 ..wire::Elf64Phdr::default()
             }));
-            data_offset = data_offset
-                .checked_add(
-                    checked_align_up(region.bytes.len(), GUEST_PAGE)
-                        .ok_or(CoreDumpError::LayoutOverflow)?,
-                )
-                .ok_or(CoreDumpError::LayoutOverflow)?;
+            if filesz != 0 {
+                if !region.bytes.is_empty() && !caller_provided_extents {
+                    extents.push(CoreExtent {
+                        offset,
+                        bytes: region.bytes.to_vec(),
+                    });
+                }
+                let filesz_usize =
+                    usize::try_from(filesz).map_err(|_| CoreDumpError::LayoutOverflow)?;
+                data_offset = data_offset
+                    .checked_add(
+                        checked_align_up(filesz_usize, GUEST_PAGE)
+                            .ok_or(CoreDumpError::LayoutOverflow)?,
+                    )
+                    .ok_or(CoreDumpError::LayoutOverflow)?;
+            }
         }
-        debug_assert_eq!(out.len(), shoff);
-        out.extend_from_slice(as_bytes(&wire::Elf64Shdr {
+        debug_assert_eq!(header_bytes.len(), shoff);
+        header_bytes.extend_from_slice(as_bytes(&wire::Elf64Shdr {
             sh_type: SHT_NULL,
             sh_info: section_phnum,
             ..wire::Elf64Shdr::default()
         }));
-        debug_assert_eq!(out.len(), notes_offset);
+        debug_assert_eq!(header_bytes.len(), notes_offset);
+        header_bytes.extend_from_slice(&notes);
 
-        out.extend_from_slice(&notes);
-        for region in &self.regions {
-            if region.bytes.is_empty() {
-                continue;
-            }
-            out.resize(align_up(out.len(), GUEST_PAGE), 0);
-            out.extend_from_slice(region.bytes);
-        }
+        let max_ext_end = extents
+            .iter()
+            .map(|e| e.offset.saturating_add(e.bytes.len() as u64))
+            .max()
+            .unwrap_or(0);
+        let layout_logical_size = (data_offset as u64)
+            .max(max_ext_end)
+            .max(header_bytes.len() as u64);
+
         let expected_notes = self
             .threads
             .len()
             .checked_mul(3)
             .and_then(|count| count.checked_add(4))
             .ok_or(CoreDumpError::LayoutOverflow)?;
-        validate_serialized_core(&out, self.regions.len(), expected_notes)?;
-        Ok(out)
+        validate_serialized_core(
+            &header_bytes,
+            self.regions.len(),
+            expected_notes,
+            Some(layout_logical_size),
+        )?;
+
+        if limit == 0 {
+            return Err(CoreDumpError::LimitExceeded {
+                limit: 0,
+                required: header_bytes.len() as u64,
+            });
+        }
+        if (header_bytes.len() as u64) > limit {
+            header_bytes.truncate(limit as usize);
+            return Ok(CorePayload {
+                header: header_bytes,
+                extents: Vec::new(),
+                logical_size: limit,
+            });
+        }
+
+        let mut remaining_budget = limit.saturating_sub(header_bytes.len() as u64);
+        let mut budget_exhausted = false;
+        let mut bounded_extents = Vec::with_capacity(extents.len());
+        for ext in extents {
+            if remaining_budget == 0 {
+                budget_exhausted = true;
+                break;
+            }
+            if ext.bytes.is_empty() {
+                continue;
+            }
+            let to_take = (ext.bytes.len() as u64).min(remaining_budget) as usize;
+            if to_take < ext.bytes.len() {
+                budget_exhausted = true;
+            }
+            let bytes = if to_take == ext.bytes.len() {
+                ext.bytes
+            } else {
+                ext.bytes[..to_take].to_vec()
+            };
+            bounded_extents.push(CoreExtent {
+                offset: ext.offset,
+                bytes,
+            });
+            remaining_budget = remaining_budget.saturating_sub(to_take as u64);
+        }
+
+        let logical_size = if budget_exhausted {
+            let last_ext_end = bounded_extents
+                .iter()
+                .map(|e| e.offset.saturating_add(e.bytes.len() as u64))
+                .max()
+                .unwrap_or(header_bytes.len() as u64);
+            last_ext_end.max(header_bytes.len() as u64)
+        } else {
+            layout_logical_size
+        };
+
+        Ok(CorePayload {
+            header: header_bytes,
+            extents: bounded_extents,
+            logical_size,
+        })
+    }
+
+    /// Validate and serialise without ever publishing a prefix. `limit` is
+    /// the caller's effective Linux `RLIMIT_CORE`; equality is permitted.
+    pub fn to_bytes_bounded(&self, limit: u64) -> Result<Vec<u8>, CoreDumpError> {
+        let payload = self.build_payload(limit, Vec::new())?;
+        payload.to_bytes_bounded(limit)
+    }
+
+    #[cfg(test)]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.to_bytes_bounded(u64::MAX)
+            .expect("test core must serialize")
     }
 }
 
@@ -1118,6 +1323,7 @@ mod tests {
             flags: region_flags(true, false, true),
             bytes: &[],
             size: 0x20000,
+            dumped: false,
         });
         let bytes = dump.to_bytes();
         // Second program header: the PT_NOTE comes first.
@@ -1199,6 +1405,7 @@ mod tests {
                 flags: region_flags(true, false, false),
                 bytes: &[],
                 size: GUEST_PAGE as u64,
+                dumped: false,
             })
             .collect();
         let expected = dump.regions.len() + 1;
@@ -1257,18 +1464,18 @@ mod tests {
         let mut bad_phentsize = bytes.clone();
         let at = std::mem::offset_of!(wire::Elf64Ehdr, e_phentsize);
         bad_phentsize[at..at + 2].copy_from_slice(&0_u16.to_le_bytes());
-        assert!(validate_serialized_core(&bad_phentsize, 0, 0).is_err());
+        assert!(validate_serialized_core(&bad_phentsize, 0, 0, None).is_err());
 
         let mut bad_machine = bytes.clone();
         let at = std::mem::offset_of!(wire::Elf64Ehdr, e_machine);
         bad_machine[at..at + 2].copy_from_slice(&0_u16.to_le_bytes());
-        assert!(validate_serialized_core(&bad_machine, 0, 0).is_err());
+        assert!(validate_serialized_core(&bad_machine, 0, 0, None).is_err());
 
         let mut bad_note = bytes.clone();
         let phoff = usize::from(EHDR_SIZE);
         let filesz = phoff + std::mem::offset_of!(wire::Elf64Phdr, p_filesz);
         bad_note[filesz..filesz + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(validate_serialized_core(&bad_note, 0, 0).is_err());
+        assert!(validate_serialized_core(&bad_note, 0, 0, None).is_err());
     }
 
     #[test]
@@ -1280,12 +1487,14 @@ mod tests {
                 flags: region_flags(true, true, false),
                 bytes: &[],
                 size: 0x2000,
+                dumped: true,
             },
             MemoryRegion {
                 start: 0x2000,
                 flags: region_flags(true, false, false),
                 bytes: &[],
                 size: 0x1000,
+                dumped: true,
             },
         ];
         assert!(overlapping.to_bytes_bounded(u64::MAX).is_err());
@@ -1297,19 +1506,228 @@ mod tests {
                 flags: region_flags(true, true, false),
                 bytes: &[],
                 size: 0x1000,
+                dumped: true,
             },
             MemoryRegion {
                 start: 0x2000,
                 flags: region_flags(true, false, false),
                 bytes: &[],
                 size: 0x1000,
+                dumped: true,
             },
         ];
         let mut bytes = partitioned.to_bytes();
         let second_load = usize::from(EHDR_SIZE) + (2 * usize::from(PHDR_SIZE));
         let vaddr = second_load + std::mem::offset_of!(wire::Elf64Phdr, p_vaddr);
         bytes[vaddr..vaddr + 8].copy_from_slice(&0x1800_u64.to_le_bytes());
-        assert!(validate_serialized_core(&bytes, 2, 10).is_err());
+        assert!(validate_serialized_core(&bytes, 2, 10, None).is_err());
+    }
+
+    #[test]
+    fn large_sparse_vma_build_payload_preserves_full_filesz_with_sparse_extents() {
+        let sparse_64gib = 64 * 1024 * 1024 * 1024_u64;
+        let mut dump = sample();
+        dump.regions = vec![MemoryRegion {
+            start: 0x0000_1000_0000_0000,
+            flags: region_flags(true, true, false),
+            bytes: &[],
+            size: sparse_64gib,
+            dumped: true,
+        }];
+
+        let offsets = dump.load_segment_file_offsets().expect("segment offsets");
+        assert_eq!(offsets.len(), 1);
+        let seg_offset = offsets[0];
+
+        let page1 = vec![0x11_u8; GUEST_PAGE];
+        let page2 = vec![0x22_u8; GUEST_PAGE];
+        let page3 = vec![0x33_u8; GUEST_PAGE];
+
+        let extents = vec![
+            CoreExtent {
+                offset: seg_offset,
+                bytes: page1.clone(),
+            },
+            CoreExtent {
+                offset: seg_offset + 32 * 1024 * 1024 * 1024,
+                bytes: page2.clone(),
+            },
+            CoreExtent {
+                offset: seg_offset + sparse_64gib - GUEST_PAGE as u64,
+                bytes: page3.clone(),
+            },
+        ];
+
+        let payload = dump
+            .build_payload(u64::MAX, extents)
+            .expect("sparse payload build");
+
+        assert_eq!(payload.extents.len(), 3);
+        assert!(
+            payload.emitted_bytes() < 32 * 1024,
+            "sparse payload must only charge emitted bytes (got {})",
+            payload.emitted_bytes()
+        );
+
+        // Verify that in the ELF header, PT_LOAD filesz == memsz == 64 GiB
+        let phdr_offset = usize::from(EHDR_SIZE) + usize::from(PHDR_SIZE); // 2nd phdr (after PT_NOTE)
+        let filesz = read_u64(
+            &payload.header,
+            phdr_offset + std::mem::offset_of!(wire::Elf64Phdr, p_filesz),
+        )
+        .unwrap();
+        let memsz = read_u64(
+            &payload.header,
+            phdr_offset + std::mem::offset_of!(wire::Elf64Phdr, p_memsz),
+        )
+        .unwrap();
+        assert_eq!(filesz, sparse_64gib);
+        assert_eq!(memsz, sparse_64gib);
+
+        // Verify extent manifest digest is deterministic and O(emitted bytes)
+        let digest1 = payload.manifest_digest();
+        let digest2 = payload.manifest_digest();
+        assert_eq!(digest1, digest2);
+        assert_ne!(digest1, [0_u8; 32]);
+    }
+
+    #[test]
+    fn sparse_core_limit_preserves_emitted_extent_offsets_controller() {
+        let sparse_64gib = 64 * 1024 * 1024 * 1024_u64;
+        let mut dump = sample();
+        dump.regions = vec![MemoryRegion {
+            start: 0x0000_1000_0000_0000,
+            flags: region_flags(true, true, false),
+            bytes: &[],
+            size: sparse_64gib,
+            dumped: true,
+        }];
+
+        let offsets = dump.load_segment_file_offsets().expect("segment offsets");
+        assert_eq!(offsets.len(), 1);
+        let seg_offset = offsets[0];
+
+        let page1 = vec![0x11_u8; GUEST_PAGE];
+        let page2 = vec![0x22_u8; GUEST_PAGE];
+        let page3 = vec![0x33_u8; GUEST_PAGE];
+
+        let extents = vec![
+            CoreExtent {
+                offset: seg_offset,
+                bytes: page1.clone(),
+            },
+            CoreExtent {
+                offset: seg_offset + 32 * 1024 * 1024 * 1024,
+                bytes: page2.clone(),
+            },
+            CoreExtent {
+                offset: seg_offset + sparse_64gib - GUEST_PAGE as u64,
+                bytes: page3.clone(),
+            },
+        ];
+
+        let payload = dump
+            .build_payload(1024 * 1024, extents)
+            .expect("sparse payload build");
+
+        assert_eq!(payload.extents.len(), 3);
+        assert!(
+            payload
+                .extents
+                .iter()
+                .all(|extent| extent.offset + extent.bytes.len() as u64 <= payload.logical_size),
+            "every budget-admitted data extent must survive the publisher final file length; holes do not consume RLIMIT_CORE"
+        );
+        assert!(
+            payload.emitted_bytes() < 32 * 1024,
+            "sparse payload must only charge emitted bytes (got {})",
+            payload.emitted_bytes()
+        );
+
+        // Verify that in the ELF header, PT_LOAD filesz == memsz == 64 GiB
+        let phdr_offset = usize::from(EHDR_SIZE) + usize::from(PHDR_SIZE); // 2nd phdr (after PT_NOTE)
+        let filesz = read_u64(
+            &payload.header,
+            phdr_offset + std::mem::offset_of!(wire::Elf64Phdr, p_filesz),
+        )
+        .unwrap();
+        let memsz = read_u64(
+            &payload.header,
+            phdr_offset + std::mem::offset_of!(wire::Elf64Phdr, p_memsz),
+        )
+        .unwrap();
+        assert_eq!(filesz, sparse_64gib);
+        assert_eq!(memsz, sparse_64gib);
+
+        // Verify extent manifest digest is deterministic and O(emitted bytes)
+        let digest1 = payload.manifest_digest();
+        let digest2 = payload.manifest_digest();
+        assert_eq!(digest1, digest2);
+        assert_ne!(digest1, [0_u8; 32]);
+    }
+
+    #[test]
+    fn sparse_core_limit_negative_controls() {
+        let sparse_64gib = 64 * 1024 * 1024 * 1024_u64;
+        let mut dump = sample();
+        dump.regions = vec![MemoryRegion {
+            start: 0x0000_1000_0000_0000,
+            flags: region_flags(true, true, false),
+            bytes: &[],
+            size: sparse_64gib,
+            dumped: true,
+        }];
+
+        let offsets = dump.load_segment_file_offsets().expect("segment offsets");
+        let seg_offset = offsets[0];
+        let page1 = vec![0x11_u8; GUEST_PAGE];
+        let page2 = vec![0x22_u8; GUEST_PAGE];
+        let extents = vec![
+            CoreExtent {
+                offset: seg_offset,
+                bytes: page1.clone(),
+            },
+            CoreExtent {
+                offset: seg_offset + 32 * 1024 * 1024 * 1024,
+                bytes: page2.clone(),
+            },
+        ];
+
+        // Control 1: limit 0 fails with LimitExceeded
+        let err = dump.build_payload(0, extents.clone()).unwrap_err();
+        assert!(matches!(err, CoreDumpError::LimitExceeded { limit: 0, .. }));
+
+        // Control 2: limit smaller than header truncates header and emits 0 extents
+        let tiny_payload = dump
+            .build_payload(16, extents.clone())
+            .expect("tiny payload");
+        assert_eq!(tiny_payload.header.len(), 16);
+        assert!(tiny_payload.extents.is_empty());
+        assert_eq!(tiny_payload.logical_size, 16);
+        assert_eq!(tiny_payload.emitted_bytes(), 16);
+
+        // Control 3: limit large enough for header + only 1 page admits exactly 1 page and drops 2nd
+        let hdr_len = dump
+            .build_payload(1024 * 1024, Vec::new())
+            .unwrap()
+            .header
+            .len() as u64;
+        let single_page_limit = hdr_len + GUEST_PAGE as u64;
+        let partial_payload = dump
+            .build_payload(single_page_limit, extents)
+            .expect("partial payload");
+        assert_eq!(partial_payload.extents.len(), 1);
+        assert_eq!(partial_payload.extents[0].offset, seg_offset);
+        assert_eq!(partial_payload.extents[0].bytes.len(), GUEST_PAGE);
+        assert_eq!(partial_payload.emitted_bytes(), single_page_limit);
+        assert!(
+            partial_payload.logical_size < seg_offset + sparse_64gib,
+            "budget exhaustion before the distant second page must not extend EOF through the unprocessed remainder of the VMA: logical_size={}",
+            partial_payload.logical_size
+        );
+        assert!(
+            partial_payload.extents[0].offset + GUEST_PAGE as u64 <= partial_payload.logical_size
+        );
     }
 
     #[test]
@@ -1325,6 +1743,7 @@ mod tests {
                 flags: region_flags(true, true, false),
                 bytes: &page,
                 size: GUEST_PAGE as u64,
+                dumped: true,
             },
             // Unpopulated 64 GiB sparse VMA (filesz = 0, memsz = 64 GiB)
             MemoryRegion {
@@ -1332,6 +1751,7 @@ mod tests {
                 flags: region_flags(true, true, false),
                 bytes: &[],
                 size: sparse_64gib,
+                dumped: false,
             },
             // Unpopulated 16 TiB sparse VMA (filesz = 0, memsz = 16 TiB)
             MemoryRegion {
@@ -1339,6 +1759,7 @@ mod tests {
                 flags: region_flags(true, true, false),
                 bytes: &[],
                 size: sparse_16tib,
+                dumped: false,
             },
         ];
 
@@ -1429,12 +1850,14 @@ mod oracle_validation {
                     flags: region_flags(true, false, true),
                     bytes: &[],
                     size: 0x20000,
+                    dumped: false,
                 },
                 MemoryRegion {
                     start: 0x0000_aaaa_0002_0000,
                     flags: region_flags(true, true, false),
                     bytes: &[0x5a; 0x1000],
                     size: 0x1000,
+                    dumped: true,
                 },
             ],
         };
@@ -1462,6 +1885,7 @@ mod oracle_validation {
                 flags: region_flags(true, true, false),
                 bytes: &page,
                 size: GUEST_PAGE as u64,
+                dumped: true,
             })
             .collect();
         let dump = CoreDump {

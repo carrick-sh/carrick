@@ -14,8 +14,8 @@ use carrick_abi::{
     LinuxErrno, NsGid, NsUid,
 };
 pub use carrick_runtime::vfs::{
-    DirEnt, EntryKind, MAX_IN_MEMORY_FILE_SIZE, Metadata, OpenContext, OpenFlags, Vfs, VfsError,
-    VfsHandle,
+    DirEnt, EntryKind, MAX_IN_MEMORY_FILE_SIZE, Metadata, OpenContext, OpenFlags, SparseBuffer,
+    Vfs, VfsError, VfsHandle,
 };
 use parking_lot::{Mutex, RwLock};
 
@@ -46,7 +46,7 @@ pub(crate) fn normalize_path(path: &str) -> String {
 #[derive(Clone)]
 enum InMemNode {
     File {
-        contents: Arc<RwLock<Vec<u8>>>,
+        contents: Arc<RwLock<SparseBuffer>>,
         mode: u32,
         uid: NsUid,
         gid: NsGid,
@@ -246,7 +246,7 @@ impl InMemoryFileVfs {
         nodes.insert(
             path_str,
             InMemNode::File {
-                contents: Arc::new(RwLock::new(data)),
+                contents: Arc::new(RwLock::new(SparseBuffer::from(data))),
                 mode,
                 uid,
                 gid,
@@ -363,7 +363,7 @@ impl InMemoryFileVfs {
         let nodes = self.nodes.read();
         let target_path = Self::resolve_symlinks_locked(&nodes, path, 32)?;
         match nodes.get(&target_path) {
-            Some(InMemNode::File { contents, .. }) => Ok(contents.read().clone()),
+            Some(InMemNode::File { contents, .. }) => Ok(contents.read().to_vec()),
             Some(InMemNode::HostFd { fd, size, .. }) => {
                 let len = *size as usize;
                 let mut buf = vec![0u8; len];
@@ -393,7 +393,7 @@ impl InMemoryFileVfs {
         nodes
             .iter()
             .filter_map(|(path, node)| match node {
-                InMemNode::File { contents, .. } => Some((path.clone(), contents.read().clone())),
+                InMemNode::File { contents, .. } => Some((path.clone(), contents.read().to_vec())),
                 InMemNode::HostFd { fd, size, .. } => {
                     let len = *size as usize;
                     let mut buf = vec![0u8; len];
@@ -613,7 +613,7 @@ impl Vfs for InMemoryFileVfs {
             None => return Err(LINUX_ENOENT),
         }
 
-        let contents = Arc::new(RwLock::new(Vec::new()));
+        let contents = Arc::new(RwLock::new(SparseBuffer::new()));
         nodes.insert(
             resolved_path.clone(),
             InMemNode::File {
@@ -845,12 +845,7 @@ impl Vfs for InMemoryFileVfs {
         match nodes.get(&norm) {
             Some(InMemNode::File { contents, .. }) => {
                 let mut data = contents.write();
-                let len = len as usize;
-                if len > data.len() {
-                    data.resize(len, 0);
-                } else {
-                    data.truncate(len);
-                }
+                data.set_len(len as usize);
                 Ok(())
             }
             Some(InMemNode::HostFd { fd, size: _, .. }) => {

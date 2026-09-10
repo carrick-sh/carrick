@@ -3980,7 +3980,9 @@ mod hvpatch_in_process_fork_tests {
         let parent_context = parent.capture_one_task_context().unwrap();
         let parent_tid = parent_context.thread().registry_id();
 
-        let shared_buf = Arc::new(RwLock::new(b"initial_data".to_vec()));
+        let shared_buf = Arc::new(RwLock::new(crate::vfs::SparseBuffer::from(
+            b"initial_data".to_vec(),
+        )));
         let desc_non_cloexec = kernel_file_description(
             Arc::new(RwLock::new(OpenDescription::InMemoryFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
@@ -3996,7 +3998,9 @@ mod hvpatch_in_process_fork_tests {
             Arc::new(RwLock::new(OpenDescription::InMemoryFile {
                 base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                 path: "/in_memory_2.txt".to_string(),
-                contents: Arc::new(RwLock::new(b"secret".to_vec())),
+                contents: Arc::new(RwLock::new(crate::vfs::SparseBuffer::from(
+                    b"secret".to_vec(),
+                ))),
                 offset: 0,
                 writable: true,
                 max_size: 1024 * 1024,

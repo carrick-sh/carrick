@@ -261,9 +261,7 @@ impl SyscallDispatcher {
             }
             OpenDescription::InMemoryFile { contents, .. } => {
                 let data = contents.read();
-                let available = data.get(offset..).unwrap_or_default();
-                let write_len = available.len().min(want);
-                available[..write_len].to_vec()
+                data.read_range(offset, want)
             }
             OpenDescription::HostFile { .. } => return Err(LINUX_EINVAL),
             OpenDescription::Directory { .. }

@@ -10586,7 +10586,7 @@ impl SyscallDispatcher {
                         }
                         let mut data = contents.write();
                         if (new_size as usize) > data.len() {
-                            data.resize(new_size as usize, 0);
+                            data.set_len(new_size as usize);
                             this.fs.rootfs_vfs.notify_inode_changed(path, None);
                         }
                         writeback = None;
@@ -10708,13 +10708,9 @@ impl SyscallDispatcher {
                         }
                         let new_len = length as usize;
                         let mut data = contents.write();
-                        if new_len > data.len() {
-                            data.resize(new_len, 0);
-                        } else {
-                            data.truncate(new_len);
-                            if *offset > new_len {
-                                *offset = new_len;
-                            }
+                        data.set_len(new_len);
+                        if *offset > new_len {
+                            *offset = new_len;
                         }
                         this.fs.rootfs_vfs.notify_inode_changed(path, None);
                         writeback = None;
@@ -11552,9 +11548,8 @@ impl SyscallDispatcher {
                     ..
                 } => {
                     let data = contents.read();
-                    let remaining: &[u8] = data.get(*offset..).unwrap_or(&[]);
-                    let read_len = remaining.len().min(length);
-                    let bytes = remaining[..read_len].to_vec();
+                    let bytes = data.read_range(*offset, length);
+                    let read_len = bytes.len();
                     *offset += read_len;
                     (read_len, bytes)
                 }
@@ -12120,7 +12115,7 @@ impl SyscallDispatcher {
                     contents, offset, ..
                 } => {
                     let data = contents.read();
-                    let read_len = read_from_contents_at(memory, &data, *offset, &iovecs)?;
+                    let read_len = read_from_sparse_buffer_at(memory, &data, *offset, &iovecs)?;
                     *offset += read_len;
                     read_len
                 }
@@ -12245,12 +12240,7 @@ impl SyscallDispatcher {
                     .collect(),
                 OpenDescription::InMemoryFile { contents, .. } => contents
                     .read()
-                    .get(offset..)
-                    .unwrap_or_default()
-                    .iter()
-                    .take(length)
-                    .copied()
-                    .collect(),
+                    .read_range(offset, length),
                 OpenDescription::SyntheticDevice { kind, .. } => {
                     match kind {
                         crate::vfs::SyntheticDeviceKind::Null => Vec::new(),
@@ -12433,7 +12423,7 @@ impl SyscallDispatcher {
                 }
                 OpenDescription::InMemoryFile { contents, .. } => {
                     let data = contents.read();
-                    read_from_contents_at(memory, &data, offset, &iovecs)?
+                    read_from_sparse_buffer_at(memory, &data, offset, &iovecs)?
                 }
                 OpenDescription::SyntheticDevice { kind, .. } => {
                     read_from_synthetic_device_iovecs(memory, *kind, &iovecs)?
@@ -12603,14 +12593,7 @@ impl SyscallDispatcher {
                     if write_at + bytes.len() > *max_size {
                         return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                     }
-                    if write_at > data.len() {
-                        data.resize(write_at, 0);
-                    }
-                    let end = write_at + bytes.len();
-                    if end > data.len() {
-                        data.resize(end, 0);
-                    }
-                    data[write_at..end].copy_from_slice(&bytes);
+                    data.write_range(write_at, &bytes);
                     this.fs.rootfs_vfs.notify_inode_changed(path, None);
                     return Ok(DispatchOutcome::Returned {
                         value: bytes.len() as i64,
@@ -12812,14 +12795,7 @@ impl SyscallDispatcher {
                             }
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
-                        if cur > data.len() {
-                            data.resize(cur, 0);
-                        }
-                        let end = cur + len;
-                        if end > data.len() {
-                            data.resize(end, 0);
-                        }
-                        data[cur..end].copy_from_slice(buf);
+                        data.write_range(cur, buf);
                         cur += len;
                         total += len as i64;
                     }
@@ -12835,14 +12811,7 @@ impl SyscallDispatcher {
                             }
                             return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                         }
-                        if cur > data.len() {
-                            data.resize(cur, 0);
-                        }
-                        let end = cur + len;
-                        if end > data.len() {
-                            data.resize(end, 0);
-                        }
-                        data[cur..end].copy_from_slice(buf);
+                        data.write_range(cur, buf);
                         cur += len;
                         total += len as i64;
                     }
@@ -14926,14 +14895,8 @@ impl SyscallDispatcher {
                                 return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                             }
                             let mut data = contents.write();
-                            if write_offset > data.len() {
-                                data.resize(write_offset, 0);
-                            }
+                            data.write_range(write_offset, &bytes);
                             let end = write_offset + bytes.len();
-                            if end > data.len() {
-                                data.resize(end, 0);
-                            }
-                            data[write_offset..end].copy_from_slice(&bytes);
                             *offset = end;
                             this.fs.rootfs_vfs.notify_inode_changed(path, None);
                             outcome = DispatchOutcome::Returned {
@@ -15502,14 +15465,8 @@ impl SyscallDispatcher {
                                 if write_offset + bytes.len() > *max_size {
                                     return Ok(DispatchOutcome::errno(LINUX_EFBIG));
                                 }
-                                if write_offset > data.len() {
-                                    data.resize(write_offset, 0);
-                                }
+                                data.write_range(write_offset, &bytes);
                                 let end = write_offset + bytes.len();
-                                if end > data.len() {
-                                    data.resize(end, 0);
-                                }
-                                data[write_offset..end].copy_from_slice(&bytes);
                                 *offset = end;
                                 this.fs.rootfs_vfs.notify_inode_changed(path, None);
                                 outcome = DispatchOutcome::Returned {

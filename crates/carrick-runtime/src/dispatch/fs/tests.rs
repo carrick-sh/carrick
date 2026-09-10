@@ -6628,7 +6628,9 @@ fn lseek_data_and_hole_across_backends() {
     let memfile_desc = OpenDescription::InMemoryFile {
         base: OpenDescriptionBase::new(0),
         path: "/inmem_file".to_string(),
-        contents: Arc::new(parking_lot::RwLock::new(vec![0xCC; 100])),
+        contents: Arc::new(parking_lot::RwLock::new(crate::vfs::SparseBuffer::from(
+            vec![0xCC; 100],
+        ))),
         offset: 0,
         writable: true,
         max_size: 1000,

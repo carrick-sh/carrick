@@ -1,4 +1,9 @@
 //! Strict reader for the HVPatch live-core lifecycle DTrace protocol.
+//!
+//! The HVPatch crash capture protocol emits lifecycle, context, census, and
+//! hash events. The hash record carries the versioned extent-manifest SHA-256
+//! digest (`carrick-core-manifest-v1`) computed over the ELF header and emitted
+//! extents to bound memory and avoid whole-file hashing over large sparse holes.
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::fs;

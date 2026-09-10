@@ -708,6 +708,7 @@ mod tests {
             flags: 5,
             bytes: b"authoritative-load",
             size: 0x1_0000,
+            dumped: true,
         }])
     }
 
@@ -878,12 +879,14 @@ mod tests {
                 flags: 5,
                 bytes: b"first",
                 size: 0x1_0000,
+                dumped: true,
             },
             MemoryRegion {
                 start: 0x2_0000,
                 flags: 3,
                 bytes: b"second",
                 size: 0x1_0000,
+                dumped: true,
             },
         ]);
         let second_load = size_of::<wire::Elf64Ehdr>() + (2 * size_of::<wire::Elf64Phdr>());

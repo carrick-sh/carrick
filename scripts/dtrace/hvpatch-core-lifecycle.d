@@ -3,7 +3,8 @@
  * Prove that one HVPatch crash capture has a complete, fail-closed lifecycle
  * from the fatal task's request through the wait-status commit. The output
  * binds the task-local generation to exact PID/TID, snapshot populations,
- * serialized length, and SHA-256 words for the bytes offered to publication.
+ * serialized length, and extent-manifest SHA-256 words (carrick-core-manifest-v1)
+ * for the emitted bytes offered to publication.
  *
  * Provider ABI qualified from carrick-observability on macOS 26.0.1 arm64:
  * carrick*:::hvpatch-core-lifecycle carries
@@ -17,7 +18,8 @@
  * carrick*:::hvpatch-core-census carries
  * (generation, NT_FILE mappings, ELF notes, PT_LOADs, serialized bytes).
  * carrick*:::hvpatch-core-hash carries generation followed by the exact
- * SHA-256 digest as four big-endian uint64_t words.
+ * versioned extent-manifest SHA-256 digest (carrick-core-manifest-v1) as four
+ * big-endian uint64_t words.
  *
  * The authenticated temporal contract is exact: request, quiesce, context,
  * snapshot, census, hash, serialization, rename, wait-status commit. This
