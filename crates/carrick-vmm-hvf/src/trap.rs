@@ -19101,40 +19101,6 @@ fn open_global_vcpu_slot(slot: usize) -> Option<libc::c_int> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ADMISSION_PERMIT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Emit a gated admission-trace line on the FIRST park and every ~100th.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const ADMISSION_PERMIT_TRACE_EVERY: u32 = 100;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn trace_permit_park(what: &str, budget: usize, parks: u32, waited: std::time::Duration) {
-    if admission_trace_enabled()
-        && (parks == 1 || parks.is_multiple_of(ADMISSION_PERMIT_TRACE_EVERY))
-    {
-        eprintln!(
-            "[hvf-admission pid={}] {what} budget {budget} full; park #{parks} (waited {waited:?})",
-            unsafe { libc::getpid() },
-        );
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn permit_exhausted(
-    what: &str,
-    budget: usize,
-    parks: u32,
-    waited: std::time::Duration,
-) -> TrapError {
-    if admission_trace_enabled() {
-        eprintln!(
-            "[hvf-admission pid={}] {what} budget {budget} still full after {waited:?} / {parks} park(s); host exhausted, propagating",
-            unsafe { libc::getpid() },
-        );
-    }
-    TrapError::HostResourceExhausted {
-        what: format!("{what}: budget {budget} still full after {waited:?} / {parks} park(s)"),
-    }
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn acquire_global_vcpu_permit(budget: usize) -> Result<GlobalVcpuPermit, TrapError> {
     // `hv_vm_get_max_vcpu_count` is a per-VM ceiling. A fork storm creates many
@@ -19163,7 +19129,7 @@ fn acquire_global_vcpu_permit(budget: usize) -> Result<GlobalVcpuPermit, TrapErr
         }
         drop(state);
         if start.elapsed() >= ADMISSION_PERMIT_MAX_WAIT {
-            return Err(permit_exhausted(
+            return Err(vcpu_gate::permit_exhausted(
                 "vcpu permit (flock)",
                 budget,
                 parks,
@@ -19171,7 +19137,7 @@ fn acquire_global_vcpu_permit(budget: usize) -> Result<GlobalVcpuPermit, TrapErr
             ));
         }
         parks += 1;
-        trace_permit_park("vcpu permit (flock)", budget, parks, start.elapsed());
+        vcpu_gate::trace_permit_park("vcpu permit (flock)", budget, parks, start.elapsed());
         std::thread::sleep(backoff.next_delay());
     }
 }
@@ -19805,7 +19771,7 @@ fn acquire_atomic_vcpu_permit(budget: usize) -> Result<PermitToken, TrapError> {
             return Ok(token);
         }
         if start.elapsed() >= ADMISSION_PERMIT_MAX_WAIT {
-            return Err(permit_exhausted(
+            return Err(vcpu_gate::permit_exhausted(
                 "vcpu permit (atomic)",
                 budget,
                 parks,
@@ -19813,7 +19779,7 @@ fn acquire_atomic_vcpu_permit(budget: usize) -> Result<PermitToken, TrapError> {
             ));
         }
         parks += 1;
-        trace_permit_park("vcpu permit (atomic)", budget, parks, start.elapsed());
+        vcpu_gate::trace_permit_park("vcpu permit (atomic)", budget, parks, start.elapsed());
         std::thread::sleep(backoff.next_delay());
     }
 }
@@ -19905,7 +19871,7 @@ pub fn cooperative_release_atomic_permit() -> usize {
 /// True when park+retry admission tracing is requested (`CARRICK_HVF_ADMISSION_TRACE`).
 /// Cached once; park+retry is rare, so this stays off the hot path.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn admission_trace_enabled() -> bool {
+pub(super) fn admission_trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CARRICK_HVF_ADMISSION_TRACE").is_some())
 }

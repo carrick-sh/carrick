@@ -98,3 +98,42 @@ pub(crate) fn park_for_slot(timeout: std::time::Duration) {
     let guard = GATE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let _ = GATE_CV.wait_timeout(guard, timeout);
 }
+
+/// Emit a gated admission-trace line on the FIRST park and every ~100th.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const ADMISSION_PERMIT_TRACE_EVERY: u32 = 100;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn trace_permit_park(
+    what: &str,
+    budget: usize,
+    parks: u32,
+    waited: std::time::Duration,
+) {
+    if super::admission_trace_enabled()
+        && (parks == 1 || parks.is_multiple_of(ADMISSION_PERMIT_TRACE_EVERY))
+    {
+        eprintln!(
+            "[hvf-admission pid={}] {what} budget {budget} full; park #{parks} (waited {waited:?})",
+            unsafe { libc::getpid() },
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn permit_exhausted(
+    what: &str,
+    budget: usize,
+    parks: u32,
+    waited: std::time::Duration,
+) -> super::TrapError {
+    if super::admission_trace_enabled() {
+        eprintln!(
+            "[hvf-admission pid={}] {what} budget {budget} still full after {waited:?} / {parks} park(s); host exhausted, propagating",
+            unsafe { libc::getpid() },
+        );
+    }
+    super::TrapError::HostResourceExhausted {
+        what: format!("{what}: budget {budget} still full after {waited:?} / {parks} park(s)"),
+    }
+}
