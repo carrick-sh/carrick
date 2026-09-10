@@ -16,6 +16,7 @@ workspace = true
 # on the lowest leaf crates so both carrick-vmm-hvf and carrick-vmm-kvm can use it
 # without depending on each other.
 [dependencies]
+carrick-fatal = { workspace = true }
 carrick-hal = { path = "../carrick-hal" }
 carrick-abi = { path = "../carrick-abi" }
 # Neutral USDT provider: the shared cross-process-futex seam fires the

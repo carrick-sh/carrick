@@ -11,8 +11,14 @@ from pathlib import Path, PurePosixPath
 import sys
 from typing import Sequence
 
-SHARD_NAMES = ("runtime.json", "hvf.json", "vcpu-loop.json")
+SHARD_NAMES = ("runtime.json", "hvf.json", "vcpu-loop.json", "other.json")
 REQUIRED_SHARDS = frozenset(SHARD_NAMES)
+
+EXCLUDED_CRATE_PREFIXES = (
+    "crates/carrick-conformance",
+    "crates/carrick-dsr",
+    "crates/carrick-native-darwin",
+)
 
 
 @dataclass(frozen=True)
@@ -21,6 +27,8 @@ class AbortFinding:
     function: str
     ordinal_in_function: int
     fingerprint: str
+    sink: str = "raw"
+    domain: str | None = None
 
 
 class LedgerError(Exception):
@@ -507,7 +515,34 @@ def compute_fingerprint(context_tokens: list[Token]) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 
-def extract_statement_context(tokens: list[Token], abort_idx: int, fn_body_brace_idx: int) -> list[Token]:
+def parse_string_literal(text: str) -> str:
+    if text.startswith("r"):
+        p = 1
+        num_hashes = 0
+        while p < len(text) and text[p] == "#":
+            num_hashes += 1
+            p += 1
+        if p < len(text) and text[p] == '"':
+            p += 1
+            end = len(text) - 1 - num_hashes
+            return text[p:end]
+    elif text.startswith('"') and text.endswith('"') and len(text) >= 2:
+        import ast
+        try:
+            val = ast.literal_eval(text)
+            if isinstance(val, str):
+                return val
+        except Exception:
+            return text[1:-1]
+    return text
+
+
+def extract_statement_context(
+    tokens: list[Token],
+    abort_idx: int,
+    fn_body_brace_idx: int,
+    site_end_idx: int | None = None,
+) -> list[Token]:
     # Scan from fn_body_brace_idx + 1 to abort_idx to find the start of the enclosing statement at fn depth
     depth = 0
     stmt_start = fn_body_brace_idx + 1
@@ -552,7 +587,7 @@ def extract_statement_context(tokens: list[Token], abort_idx: int, fn_body_brace
         elif tokens[idx].text == "}":
             depth -= 1
 
-    end = abort_idx + 7
+    end = site_end_idx if site_end_idx is not None else abort_idx + 7
     while end < len(tokens):
         t = tokens[end]
         if t.text == "{":
@@ -1274,7 +1309,7 @@ def scan_abort_source(
             i += 1
             continue
 
-        if (
+        is_raw_abort = (
             tok.text == "std"
             and i + 6 < n
             and tokens[i + 1].text == "::"
@@ -1283,7 +1318,55 @@ def scan_abort_source(
             and tokens[i + 4].text == "abort"
             and tokens[i + 5].text == "("
             and tokens[i + 6].text == ")"
-        ):
+        )
+        is_carrick_fatal = (
+            tok.text == "carrick_fatal"
+            and i + 1 < n
+            and tokens[i + 1].text == "!"
+            and i + 2 < n
+            and tokens[i + 2].text in ("(", "[", "{")
+        )
+
+        site_sink: str | None = None
+        site_domain: str | None = None
+        site_end_idx: int | None = None
+        next_i: int | None = None
+
+        if is_raw_abort:
+            site_sink = "raw"
+            site_domain = None
+            site_end_idx = i + 7
+            next_i = i + 7
+        elif is_carrick_fatal:
+            open_idx = i + 2
+            open_delim = tokens[open_idx].text
+            close_delim = {"(": ")", "[": "]", "{": "}"}[open_delim]
+            if open_idx + 1 >= n:
+                raise LedgerError(f"{posix_path}: empty carrick_fatal! invocation")
+            first_arg_tok = tokens[open_idx + 1]
+            if first_arg_tok.kind != "string":
+                raise LedgerError(f"{posix_path}: carrick_fatal! domain must be a string literal")
+            domain_str = parse_string_literal(first_arg_tok.text)
+
+            depth = 1
+            k = open_idx + 1
+            while k < n and depth > 0:
+                if tokens[k].text == open_delim:
+                    depth += 1
+                elif tokens[k].text == close_delim:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            if depth != 0:
+                raise LedgerError(f"{posix_path}: unclosed carrick_fatal! macro invocation")
+            macro_close_idx = k
+            site_sink = "fatal"
+            site_domain = domain_str
+            site_end_idx = macro_close_idx + 1
+            next_i = macro_close_idx + 1
+
+        if site_sink is not None and next_i is not None:
             is_in_test = pending_test or any(s.is_test for s in scopes)
             if not is_in_test:
                 fn_name = "<module>"
@@ -1312,7 +1395,7 @@ def scan_abort_source(
                 ord_val = fn_ordinals.get(ordinal_key, 0) + 1
                 fn_ordinals[ordinal_key] = ord_val
 
-                context_tokens = extract_statement_context(tokens, i, fn_body_brace_idx)
+                context_tokens = extract_statement_context(tokens, i, fn_body_brace_idx, site_end_idx)
                 fp = compute_fingerprint(context_tokens)
 
                 finding = AbortFinding(
@@ -1320,6 +1403,8 @@ def scan_abort_source(
                     function=qualified_fn,
                     ordinal_in_function=ord_val,
                     fingerprint=fp,
+                    sink=site_sink,
+                    domain=site_domain,
                 )
                 if finding in finding_identities:
                     raise LedgerError(
@@ -1329,7 +1414,7 @@ def scan_abort_source(
                 finding_identities.add(finding)
                 findings.append(finding)
 
-            i += 7
+            i = next_i
             continue
 
         i += 1
@@ -1339,28 +1424,29 @@ def scan_abort_source(
 
 def discover_runtime_aborts(root: Path) -> Sequence[AbortFinding]:
     findings: list[AbortFinding] = []
-    search_dirs = [
-        root / "crates/carrick-runtime/src",
-        root / "crates/carrick-vmm-hvf/src",
-    ]
-    for d in search_dirs:
-        if not d.is_dir():
+    crates_dir = root / "crates"
+    for p in sorted(crates_dir.rglob("*.rs")):
+        rel = p.relative_to(root).as_posix()
+        if any(rel.startswith(ex) for ex in EXCLUDED_CRATE_PREFIXES):
             continue
-        for p in sorted(d.rglob("*.rs")):
-            source = p.read_text(encoding="utf-8")
-            rel = p.relative_to(root).as_posix()
-            findings.extend(scan_abort_source(rel, source))
+        source = p.read_text(encoding="utf-8")
+        findings.extend(scan_abort_source(rel, source))
     return tuple(findings)
 
 
 def route_shard(file_path: str) -> str:
     p = PurePosixPath(file_path)
-    if "crates/carrick-runtime/src/vcpu_loop" in p.as_posix():
+    posix_str = p.as_posix()
+    if any(posix_str.startswith(ex) for ex in EXCLUDED_CRATE_PREFIXES):
+        raise LedgerError(f"file is in excluded crate: {file_path}")
+    if "crates/carrick-runtime/src/vcpu_loop" in posix_str:
         return "vcpu-loop.json"
-    if "crates/carrick-runtime/src" in p.as_posix():
+    if "crates/carrick-runtime/src" in posix_str:
         return "runtime.json"
-    if "crates/carrick-vmm-hvf/src" in p.as_posix():
+    if "crates/carrick-vmm-hvf/src" in posix_str:
         return "hvf.json"
+    if posix_str.startswith("crates/"):
+        return "other.json"
     raise LedgerError(f"unknown shard for file: {file_path}")
 
 
@@ -1386,8 +1472,13 @@ def validate_required_shards(ledgers: dict[str, dict]) -> None:
 
 
 def validate_shards(
-    findings: Sequence[AbortFinding], ledgers: dict[str, dict]
+    findings: Sequence[AbortFinding],
+    ledgers: dict[str, dict],
+    mode: str = "check",
 ) -> None:
+    if mode not in ("check", "migrate"):
+        raise ValueError(f"unknown validation mode: {mode}")
+
     # Explicitly check for duplicate actual identities before constructing index
     seen_finding_keys: set[tuple[str, str, int]] = set()
     for f in findings:
@@ -1465,6 +1556,18 @@ def validate_shards(
             elif typed_error is not None:
                 raise LedgerError(f"{shard_name}: carrier_fault must not have typed_error")
 
+            sink = row.get("sink")
+            domain = row.get("domain")
+
+            if sink not in ("raw", "fatal"):
+                raise LedgerError(f"{shard_name}: invalid or missing sink {sink} in row {file_p} {func} #{ord_val}")
+
+            if sink == "fatal":
+                if not domain or not isinstance(domain, str) or not domain.strip():
+                    raise LedgerError(f"{shard_name}: fatal sink requires non-empty domain in row {file_p} {func} #{ord_val}")
+            elif domain is not None:
+                raise LedgerError(f"{shard_name}: raw sink must not have domain in row {file_p} {func} #{ord_val}")
+
             key = (file_p, func, ord_val)
             if key in seen_row_keys:
                 raise LedgerError(f"{shard_name}: duplicate row for {key}")
@@ -1482,16 +1585,52 @@ def validate_shards(
 
         missing = actual_keys - seen_row_keys
         if missing:
+            raw_missing = [
+                f for f in actual_findings
+                if (f.file, f.function, f.ordinal_in_function) in missing and f.sink == "raw"
+            ]
+            if raw_missing:
+                raise LedgerError(
+                    f"{shard_name}: new raw abort site forbidden: "
+                    f"{raw_missing[0].file} {raw_missing[0].function} #{raw_missing[0].ordinal_in_function}"
+                )
             raise LedgerError(f"{shard_name}: missing classifications for {len(missing)} calls: {sorted(missing)[:3]}")
 
         stale = seen_row_keys - actual_keys
         if stale:
             raise LedgerError(f"{shard_name}: stale rows present for {len(stale)} calls: {sorted(stale)[:3]}")
 
-        # Check fingerprints match
+        # Check sink transitions and fingerprints
         for f in actual_findings:
             key = (f.file, f.function, f.ordinal_in_function)
             row = rows_by_key[key]
+
+            # Rule: sink flipped from fatal back to raw is forbidden in both modes
+            if row["sink"] == "fatal" and f.sink == "raw":
+                raise LedgerError(
+                    f"{shard_name}: sink flipped from fatal back to raw for {f.file} {f.function} #{f.ordinal_in_function}"
+                )
+
+            # Rule: raw -> fatal flip
+            if row["sink"] == "raw" and f.sink == "fatal":
+                if mode == "check":
+                    raise LedgerError(
+                        f"{shard_name}: site {f.file} {f.function} #{f.ordinal_in_function} migrated raw→fatal; run --migrate to re-bless"
+                    )
+                if mode == "migrate":
+                    row["sink"] = "fatal"
+                    row["domain"] = f.domain
+                    row["fingerprint"] = f.fingerprint
+                    continue
+
+            # If both are fatal, verify domain matches
+            if row["sink"] == "fatal" and f.sink == "fatal":
+                if row.get("domain") != f.domain:
+                    raise LedgerError(
+                        f"{shard_name}: fatal domain mismatch for {f.file} {f.function} #{f.ordinal_in_function}: ledger={row.get('domain')} vs source={f.domain}"
+                    )
+
+            # If not a raw -> fatal flip, fingerprint must match exactly (refuse fingerprint change on unflipped row)
             if row["fingerprint"] != f.fingerprint:
                 raise LedgerError(
                     f"{shard_name}: fingerprint drift for {f.file} {f.function} #{f.ordinal_in_function}"
@@ -1528,6 +1667,35 @@ def main() -> int:
     target_shard = check_shard or only_shard
     all_findings = discover_runtime_aborts(root)
 
+    if "--migrate" in args:
+        shards_to_migrate = [target_shard] if target_shard else list(SHARD_NAMES)
+        ledgers = {}
+        for s in shards_to_migrate:
+            p = shards_dir / s
+            if not p.is_file():
+                print(f"FAIL: required shard file not found: {p}", file=sys.stderr)
+                return 1
+            ledger = load_shard(p)
+            for row in ledger.get("rows", []):
+                if "sink" not in row:
+                    row["sink"] = "raw"
+            ledgers[s] = ledger
+
+        active_findings = [f for f in all_findings if route_shard(f.file) in ledgers]
+        try:
+            if target_shard is None:
+                validate_required_shards(ledgers)
+            validate_shards(active_findings, ledgers, mode="migrate")
+        except LedgerError as e:
+            print(f"FAIL: {e}", file=sys.stderr)
+            return 1
+
+        for s, l in ledgers.items():
+            p = shards_dir / s
+            p.write_text(json.dumps(l, indent=2) + "\n", encoding="utf-8")
+            print(f"MIGRATED: {s} ({len(l['rows'])} rows)")
+        return 0
+
     if target_shard and not ("--check" in args and only_shard):
         shard_path = shards_dir / target_shard
         if not shard_path.is_file():
@@ -1536,7 +1704,7 @@ def main() -> int:
         ledger = load_shard(shard_path)
         shard_findings = [f for f in all_findings if route_shard(f.file) == target_shard]
         try:
-            validate_shards(shard_findings, {target_shard: ledger})
+            validate_shards(shard_findings, {target_shard: ledger}, mode="check")
         except LedgerError as e:
             print(f"FAIL: {e}", file=sys.stderr)
             return 1
@@ -1561,7 +1729,7 @@ def main() -> int:
         try:
             if only_shard is None:
                 validate_required_shards(ledgers)
-            validate_shards(active_findings, ledgers)
+            validate_shards(active_findings, ledgers, mode="check")
         except LedgerError as e:
             print(f"FAIL: {e}", file=sys.stderr)
             return 1
@@ -1572,7 +1740,7 @@ def main() -> int:
             print(f"OK: shard {s} valid ({len(l['rows'])} aborts: {cf} carrier_fault, {td} typed_error_debt)")
         return 0
 
-    print("Usage: check-runtime-aborts.py [--check [--only <shard>] | --check-shard <shard>]")
+    print("Usage: check-runtime-aborts.py [--check [--only <shard>] | --check-shard <shard> | --migrate]")
     return 1
 
 

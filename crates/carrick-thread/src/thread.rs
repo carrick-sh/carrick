@@ -66,6 +66,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
+use carrick_fatal::carrick_fatal;
+
 use parking_lot::Mutex as ParkingMutex;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, RequeueOp, UnparkResult, UnparkToken};
 
@@ -1190,7 +1192,9 @@ impl FutexTable {
     pub fn prepare_wait(&self, addr: u64) -> FutexWait {
         let mut queue = self.queue.lock();
         let id = queue.next_ticket;
-        queue.next_ticket = id.checked_add(1).unwrap_or_else(|| std::process::abort());
+        queue.next_ticket = id
+            .checked_add(1)
+            .unwrap_or_else(|| carrick_fatal!("thread::futex", "futex queue ticket overflow"));
         let slot = Arc::new(FutexQueueSlot {
             id,
             state: AtomicU8::new(FUTEX_SLOT_QUEUED),

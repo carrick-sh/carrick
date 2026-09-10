@@ -419,6 +419,8 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
 - **For a wedged/deadlocked process, take a real CORE and `bt all`**
   (`sudo lldb -p <pid> -o "process save-core …" -o detach`). `sample`/`SIGQUIT`
   have mislabeled fork-quiesce deadlocks as lost-wakeups — don't trust them.
+  If the process aborted via `carrick_fatal!`, inspect the static `CARRICK_LAST_FATAL`
+  record from lldb (`memory read` or `p CARRICK_LAST_FATAL`) to read the fatal domain and message.
 - **Verify diagnoses empirically.** A "race / coherence / Heisenbug" label is the
   easiest place to be wrong. Instrument the exact failure point and read the real
   values before changing code; treat memory notes and prior diagnoses as

@@ -471,6 +471,36 @@ enables an optional autonomous file dump — a 1 Hz watchdog thread writes
 reader for real debugging); the file dump is a convenience for a quick
 reproducible run. The in-memory ring itself is always-on, feature or not.
 
+### Carrier invariant violations: `carrick_fatal!` and `CARRICK_LAST_FATAL`
+
+When the carrier detects an unrecoverable kernel graph corruption or internal invariant
+violation (e.g. lost wake, dead child, poisoned lock, generation mismatch), it invokes
+`carrick_fatal!(domain, "fmt", ...)`. This is the carrier's analogue of Linux's `BUG()`.
+
+**Policy:**
+- **Never ignore or silently swallow carrier invariant violations**: aborting creates a core dump for post-mortem analysis.
+- **Never use raw `std::process::abort()`**: raw abort carries no diagnosis into the core, and buffered stdout/stderr may not flush.
+- Always route fatal aborts through `carrick_fatal!(domain, ...)`. The macro formats into a non-allocating stack buffer, writes `carrick fatal [<domain>]: <msg>\n` directly to stderr (fd 2) via `libc::write`, fires any pre-abort hook registered via `carrick_fatal::set_hook`, publishes the event into the static `CARRICK_LAST_FATAL` record, and aborts via `std::process::abort()`.
+
+#### Format of `CARRICK_LAST_FATAL`
+The record is stored in a static global `CARRICK_LAST_FATAL` (crate `carrick-fatal`):
+- `magic: u64`: `0x4341_5252_4641_544c` (ASCII `'CARRFATL'`).
+- `length: u32`: byte length of the message written into `message` (up to 1024).
+- `domain_len: u32`: byte length of the domain string written into `domain` (up to 64).
+- `domain: [u8; 64]`: ASCII domain name (e.g. `"fork_quiesce"`, `"thread"`).
+- `message: [u8; 1024]`: UTF-8 diagnostic message, truncated if longer than 1024 bytes.
+
+#### Reading `CARRICK_LAST_FATAL` from lldb
+When examining a core dump or live process under `lldb`:
+```sh
+# Read the fatal record:
+(lldb) p CARRICK_LAST_FATAL
+
+# Or inspect the domain and message directly from memory:
+(lldb) memory read --size 1 --format c --count 64 &CARRICK_LAST_FATAL.domain
+(lldb) memory read --size 1 --format c --count 256 &CARRICK_LAST_FATAL.message
+```
+
 ---
 
 ## 3. Debug-trace build features
