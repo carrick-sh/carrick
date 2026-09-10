@@ -4199,7 +4199,8 @@ impl Future for ContinuationEventFuture {
     type Output = Result<ContinuationEvent, WaitServiceError>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let incoming_waker = context.waker().clone();
+        let mut incoming_drain_waker = Some(context.waker().clone());
+        let mut incoming_task_waker = Some(context.waker().clone());
         let mut old_drain_waker = None;
         let mut old_task_waker = None;
         let mut removed_entry = None;
@@ -4225,7 +4226,10 @@ impl Future for ContinuationEventFuture {
                         let mut gate_state = gate.state.lock();
                         gate_state.cancelled = true;
                         if gate_state.in_flight > 0 {
-                            let displaced = gate_state.drain_waker.replace(incoming_waker.clone());
+                            let displaced = std::mem::replace(
+                                &mut gate_state.drain_waker,
+                                incoming_drain_waker.take(),
+                            );
                             (true, displaced)
                         } else {
                             (false, None)
@@ -4233,7 +4237,8 @@ impl Future for ContinuationEventFuture {
                     };
                     old_drain_waker = drain_waker_displaced;
                     if is_in_flight {
-                        old_task_waker = entry.task_waker.replace(incoming_waker);
+                        old_task_waker =
+                            std::mem::replace(&mut entry.task_waker, incoming_task_waker.take());
                         Poll::Pending
                     } else {
                         old_task_waker = entry.task_waker.take();
@@ -4246,7 +4251,8 @@ impl Future for ContinuationEventFuture {
                     Poll::Ready(Err(WaitServiceError::StaleRegistration))
                 }
                 RegistrationState::Prepared | RegistrationState::Enrolled => {
-                    old_task_waker = entry.task_waker.replace(incoming_waker);
+                    old_task_waker =
+                        std::mem::replace(&mut entry.task_waker, incoming_task_waker.take());
                     Poll::Pending
                 }
             }
@@ -4254,6 +4260,8 @@ impl Future for ContinuationEventFuture {
         drop(old_drain_waker);
         drop(old_task_waker);
         drop(removed_entry);
+        drop(incoming_drain_waker);
+        drop(incoming_task_waker);
         result
     }
 }
@@ -9814,6 +9822,150 @@ mod tests {
 
         service.clear_test_hooks();
         close_pair(pipe);
+    }
+
+    #[test]
+    fn incoming_drain_waker_clone_runs_outside_registration_locks() {
+        struct CloneChecking {
+            gate: Arc<RegistrationOperationGate>,
+            service: Arc<CarrierWaitServiceInner>,
+            locked_clone: AtomicBool,
+        }
+        unsafe fn clone_raw(data: *const ()) -> std::task::RawWaker {
+            // SAFETY: every raw waker owns one Arc count of CloneChecking.
+            let owner = unsafe { &*data.cast::<CloneChecking>() };
+            if owner
+                .gate
+                .state
+                .try_lock_for(Duration::from_millis(50))
+                .is_none()
+                || owner
+                    .service
+                    .state
+                    .try_lock_for(Duration::from_millis(50))
+                    .is_none()
+            {
+                owner.locked_clone.store(true, Ordering::Release);
+            }
+            // SAFETY: the source waker retains a live Arc throughout cloning.
+            unsafe { Arc::increment_strong_count(data.cast::<CloneChecking>()) };
+            std::task::RawWaker::new(data, &VTABLE)
+        }
+        unsafe fn drop_raw(data: *const ()) {
+            // SAFETY: consume the single Arc count owned by this raw waker.
+            drop(unsafe { Arc::from_raw(data.cast::<CloneChecking>()) });
+        }
+        unsafe fn wake_ref_raw(_: *const ()) {}
+        static VTABLE: std::task::RawWakerVTable =
+            std::task::RawWakerVTable::new(clone_raw, drop_raw, wake_ref_raw, drop_raw);
+        let (kernel, context) = bootstrap(15_392);
+        let generation = publish(&context, 0x732);
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(60),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("sleep continuation");
+        let registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        let gate = Arc::clone(
+            &service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token.continuation)
+                .expect("prepared registration")
+                .operation_gate,
+        );
+        let claim = gate.try_claim(token).expect("admitted operation");
+        let _ = service
+            .inner
+            .state
+            .lock()
+            .cancel_all_active(CancellationCause::ProcessExit);
+        let owner = Arc::new(CloneChecking {
+            gate,
+            service: Arc::clone(&service.inner),
+            locked_clone: AtomicBool::new(false),
+        });
+        let data = Arc::into_raw(Arc::clone(&owner)).cast::<()>();
+        // SAFETY: VTABLE retains/releases one Arc count for each owned Waker.
+        let waker = unsafe { Waker::from_raw(std::task::RawWaker::new(data, &VTABLE)) };
+        let mut future = service.event(token);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(claim);
+        assert!(
+            !owner.locked_clone.load(Ordering::Acquire),
+            "incoming drain waker clone callback must run outside both registration locks"
+        );
+    }
+
+    #[test]
+    fn incoming_task_waker_clone_runs_outside_registration_locks() {
+        struct CloneChecking {
+            service: Arc<CarrierWaitServiceInner>,
+            locked_clone: AtomicBool,
+        }
+        unsafe fn clone_raw(data: *const ()) -> std::task::RawWaker {
+            // SAFETY: every raw waker owns one Arc count of CloneChecking.
+            let owner = unsafe { &*data.cast::<CloneChecking>() };
+            if owner
+                .service
+                .state
+                .try_lock_for(Duration::from_millis(50))
+                .is_none()
+            {
+                owner.locked_clone.store(true, Ordering::Release);
+            }
+            // SAFETY: the source waker retains a live Arc throughout cloning.
+            unsafe { Arc::increment_strong_count(data.cast::<CloneChecking>()) };
+            std::task::RawWaker::new(data, &VTABLE)
+        }
+        unsafe fn drop_raw(data: *const ()) {
+            // SAFETY: consume the single Arc count owned by this raw waker.
+            drop(unsafe { Arc::from_raw(data.cast::<CloneChecking>()) });
+        }
+        unsafe fn wake_ref_raw(_: *const ()) {}
+        static VTABLE: std::task::RawWakerVTable =
+            std::task::RawWakerVTable::new(clone_raw, drop_raw, wake_ref_raw, drop_raw);
+        let (kernel, context) = bootstrap(15_393);
+        let generation = publish(&context, 0x733);
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(60),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("sleep continuation");
+        let registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        let owner = Arc::new(CloneChecking {
+            service: Arc::clone(&service.inner),
+            locked_clone: AtomicBool::new(false),
+        });
+        let data = Arc::into_raw(Arc::clone(&owner)).cast::<()>();
+        // SAFETY: VTABLE retains/releases one Arc count for each owned Waker.
+        let waker = unsafe { Waker::from_raw(std::task::RawWaker::new(data, &VTABLE)) };
+        let mut future = service.event(token);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert!(
+            !owner.locked_clone.load(Ordering::Acquire),
+            "incoming task waker clone callback must run outside registration lock"
+        );
     }
 
     #[test]
