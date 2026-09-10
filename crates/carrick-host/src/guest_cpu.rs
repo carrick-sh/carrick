@@ -28,7 +28,7 @@ use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
     FLAG_ADOPTED, FLAG_ALIVE, ProcessRecord, ProcessRecordRef, ProcessRecordTransitionAction,
-    ProcessRecordTransitionError, ProcessSection, REGISTERING, VirtualPtraceControl,
+    ProcessRecordTransitionError, ProcessSection, RecordState, VirtualPtraceControl,
     VirtualPtraceState,
 };
 
@@ -566,11 +566,7 @@ fn release_child_record(r: ProcessRecordRef) {
 
 fn iter_child_records() -> impl Iterator<Item = &'static ProcessRecord> {
     process_records().iter().filter(|record| {
-        let pid = record_pid(record);
-        pid != 0
-            && pid != REGISTERING
-            && !record_is_tid_entry(record)
-            && !record.transition_claimed()
+        matches!(record.state(), RecordState::Live { .. }) && !record_is_tid_entry(record)
     })
 }
 
@@ -1218,8 +1214,11 @@ pub fn adopted_child_wait(waiter_pid: u32, target_pid: i32) -> Option<AdoptedChi
         let mut pending = None;
         let mut busy = false;
         for (index, record) in process_records().iter().enumerate() {
-            let pid = record_host_pid(record);
-            if pid == 0 || pid == REGISTERING || record_is_tid_entry(record) {
+            let Some(host_pid) = record.host_pid() else {
+                continue;
+            };
+            let pid = host_pid.raw();
+            if record_is_tid_entry(record) {
                 continue;
             }
             let Some(generation) = record_generation(record) else {
@@ -2135,7 +2134,9 @@ mod tests {
         record_child_exit_status(child, 9876, 0x0900, false);
         let record_ref = find_child_record(child).expect("adopted child record");
         let record = record_for_ref(record_ref).expect("live adopted child record");
-        assert!(record.try_claim_transition());
+        let guard = record
+            .begin_transition()
+            .expect("live adopted child transition");
 
         let (tx, rx) = std::sync::mpsc::channel();
         let join = std::thread::spawn(move || {
@@ -2147,7 +2148,7 @@ mod tests {
             "reap must wait rather than clean metadata outside the transition"
         );
 
-        record.release_transition();
+        drop(guard);
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(1))
                 .expect("reap completes after transition unlock"),

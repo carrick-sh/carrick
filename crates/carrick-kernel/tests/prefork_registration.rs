@@ -69,8 +69,6 @@ fn fork_storm_never_exposes_incomplete_records() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use carrick_kernel::process::REGISTERING;
-
     const CHILDREN: u32 = 200;
     const NS_BASE: u32 = 0x5107_0000;
 
@@ -84,10 +82,10 @@ fn fork_storm_never_exposes_incomplete_records() {
             let section = &arena.layout().processes;
             while !stop.load(Ordering::Acquire) {
                 for record in section.records.iter() {
-                    let host = record.host_pid.load(Ordering::Acquire);
-                    if host == 0 || host == REGISTERING {
+                    let Some(host_pid) = record.state().host_pid() else {
                         continue; // unpublished: invisible by contract
-                    }
+                    };
+                    let host = host_pid.raw();
                     let ns = record.ns_pid.load(Ordering::Acquire);
                     if !(NS_BASE..NS_BASE + CHILDREN).contains(&ns) {
                         continue; // not one of this test's records
@@ -147,4 +145,95 @@ fn fork_storm_never_exposes_incomplete_records() {
         Ok(Err(msg)) => panic!("{msg}"),
         Err(_) => panic!("scanner thread panicked"),
     }
+}
+
+#[test]
+fn typed_record_state_transitions_and_refusals() {
+    use carrick_kernel::process::{Busy, RecordState, RecordStateCell};
+
+    let cell = RecordStateCell::new();
+    assert_eq!(cell.state(), RecordState::Free);
+    assert!(cell.state().is_free());
+    assert_eq!(cell.state().host_pid(), None);
+
+    // Refusal: cannot begin_transition on Free
+    assert!(cell.begin_transition().is_none());
+    // Refusal: cannot publish_deferred on Free
+    assert!(!cell.publish_deferred(HostPid::new(100)));
+
+    // Transition: Free -> Registering via claim()
+    let token = cell.claim().expect("claim on Free succeeds");
+    assert_eq!(cell.state(), RecordState::Registering);
+    assert!(cell.state().is_registering());
+    assert_eq!(cell.state().host_pid(), None);
+
+    // Refusal: cannot claim while Registering
+    assert!(matches!(cell.claim(), Err(Busy)));
+    // Refusal: cannot begin_transition while Registering
+    assert!(cell.begin_transition().is_none());
+
+    // Drop without publish reverts Registering -> Free
+    drop(token);
+    assert_eq!(cell.state(), RecordState::Free);
+
+    // Claim again
+    let token = cell.claim().expect("claim on Free succeeds again");
+    assert_eq!(cell.state(), RecordState::Registering);
+
+    // Transition: Registering -> Live { host_pid } via publish()
+    let pid = HostPid::new(1234);
+    cell.publish(token, pid);
+    assert_eq!(cell.state(), RecordState::Live { host_pid: pid });
+    assert!(cell.state().is_live());
+    assert_eq!(cell.state().host_pid(), Some(pid));
+
+    // Refusal: cannot claim while Live
+    assert!(matches!(cell.claim(), Err(Busy)));
+    // Idempotent publication with same pid succeeds
+    assert!(cell.publish_deferred(pid));
+    // Refusal: publish_deferred with different pid fails
+    assert!(!cell.publish_deferred(HostPid::new(9999)));
+
+    // Transition: Live -> Transitioning via begin_transition()
+    let guard = cell.begin_transition().expect("begin_transition succeeds");
+    assert_eq!(cell.state(), RecordState::Transitioning { host_pid: pid });
+    assert!(cell.state().is_transitioning());
+    assert_eq!(cell.state().host_pid(), Some(pid));
+
+    // Refusal: cannot claim while Transitioning
+    assert!(matches!(cell.claim(), Err(Busy)));
+    // Refusal: cannot begin_transition while already Transitioning
+    assert!(cell.begin_transition().is_none());
+    // Refusal: cannot publish_deferred while Transitioning
+    assert!(!cell.publish_deferred(pid));
+
+    // Drop guard reverts Transitioning -> Live
+    drop(guard);
+    assert_eq!(cell.state(), RecordState::Live { host_pid: pid });
+
+    // Transition to Transitioning again
+    let guard = cell.begin_transition().expect("begin_transition succeeds");
+    // Transition: Transitioning -> Retiring via guard.retire()
+    guard.retire();
+    assert_eq!(cell.state(), RecordState::Retiring);
+    assert!(cell.state().is_retiring());
+    assert_eq!(cell.state().host_pid(), None);
+
+    // Refusal: cannot claim while Retiring
+    assert!(matches!(cell.claim(), Err(Busy)));
+    // Refusal: cannot begin_transition while Retiring
+    assert!(cell.begin_transition().is_none());
+    // Refusal: cannot publish_deferred while Retiring
+    assert!(!cell.publish_deferred(pid));
+
+    // Transition: Retiring -> Free via finish_retire()
+    cell.finish_retire();
+    assert_eq!(cell.state(), RecordState::Free);
+
+    // Deferred publication workflow (e.g. pre-fork claim)
+    let mut token = cell.claim().expect("claim on Free succeeds");
+    token.disarm();
+    assert_eq!(cell.state(), RecordState::Registering);
+    assert!(cell.publish_deferred(pid));
+    assert_eq!(cell.state(), RecordState::Live { host_pid: pid });
 }
