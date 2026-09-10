@@ -1762,8 +1762,13 @@
         "macos-runtime-default"
       ],
       "source": {
+<<<<<<< HEAD
         "byte_end": 104437,
         "byte_start": 104423,
+=======
+        "byte_end": 104359,
+        "byte_start": 104345,
+>>>>>>> 5ce2d0758 (chore: reconcile line-pinned inventories for the DSR removal)
         "column": 20,
         "column_end": 34,
         "column_start": 20,
@@ -4462,8 +4467,13 @@
         "macos-runtime-default"
       ],
       "source": {
+<<<<<<< HEAD
         "byte_end": 51709,
         "byte_start": 51701,
+=======
+        "byte_end": 51631,
+        "byte_start": 51623,
+>>>>>>> 5ce2d0758 (chore: reconcile line-pinned inventories for the DSR removal)
         "column": 20,
         "column_end": 28,
         "column_start": 20,
@@ -4483,8 +4493,13 @@
         "macos-runtime-default"
       ],
       "source": {
+<<<<<<< HEAD
         "byte_end": 51818,
         "byte_start": 51810,
+=======
+        "byte_end": 51740,
+        "byte_start": 51732,
+>>>>>>> 5ce2d0758 (chore: reconcile line-pinned inventories for the DSR removal)
         "column": 81,
         "column_end": 89,
         "column_start": 81,
@@ -11563,8 +11578,13 @@
         "macos-runtime-default"
       ],
       "source": {
+<<<<<<< HEAD
         "byte_end": 367925,
         "byte_start": 367900,
+=======
+        "byte_end": 367921,
+        "byte_start": 367896,
+>>>>>>> 5ce2d0758 (chore: reconcile line-pinned inventories for the DSR removal)
         "column": 35,
         "column_end": 60,
         "column_start": 35,
@@ -12074,8 +12094,13 @@
         "macos-runtime-default"
       ],
       "source": {
+<<<<<<< HEAD
         "byte_end": 406062,
         "byte_start": 406044,
+=======
+        "byte_end": 406058,
+        "byte_start": 406040,
+>>>>>>> 5ce2d0758 (chore: reconcile line-pinned inventories for the DSR removal)
         "column": 17,
         "column_end": 35,
         "column_start": 17,
@@ -12586,8 +12611,13 @@
         "macos-runtime-default"
       ],
       "source": {
+<<<<<<< HEAD
         "byte_end": 397084,
         "byte_start": 397062,
+=======
+        "byte_end": 397080,
+        "byte_start": 397058,
+>>>>>>> 5ce2d0758 (chore: reconcile line-pinned inventories for the DSR removal)
         "column": 13,
         "column_end": 35,
         "column_start": 13,
@@ -12638,9 +12668,15 @@
       }
     }
   ],
+<<<<<<< HEAD
   "rows_sha256": "053f6eb547985271ad5551d2f94bb14ae033d99fcaca117e7802df6e4cfaa522",
   "schema": 1,
   "source_head": "2b50cb5a5e9fa80f9f9cb4541b8e544f7dcd5aa6",
+=======
+  "rows_sha256": "31da82b2f3a26056d40a280ddf5ca4f1be68b1750c99e2e67be9cda74a175931",
+  "schema": 1,
+  "source_head": "f3dcfa6bbc7d8bae8922be0dbeed2cd972fb1388",
+>>>>>>> 5ce2d0758 (chore: reconcile line-pinned inventories for the DSR removal)
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
