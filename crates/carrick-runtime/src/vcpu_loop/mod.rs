@@ -938,6 +938,7 @@ mod exec;
 pub(crate) mod quiesce;
 mod signal;
 mod threads;
+pub(crate) use threads::VcpuThreadRegistry;
 
 // Re-export the free fns that moved into submodules so the in-crate callers
 // (`crate::runtime`, this module's own code) keep naming them as
@@ -3498,7 +3499,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     cow_refault_watch: Option<(u64, u64, Option<u64>, u32)>,
     reserved_signal: Option<continuation::ReservedSignal>,
     this_tid: ThreadId,
-    threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    threads: VcpuThreadRegistry,
     /// The object-safe vCPU registry (the kicker). The shared loop never names
     /// the concrete `VcpuKicker`.
     kicker: Arc<dyn VcpuRegistry>,
@@ -6530,10 +6531,7 @@ where
         });
         if let Some(completion) = completion {
             let id = completion.id();
-            self.state
-                .threads
-                .lock()
-                .retain(|handle| handle.completion().id() != id);
+            let _ = self.state.threads.take_by_id(id);
             // Completion is the final irrevocable publication. Every backend,
             // binding, scheduler, Kernel, registry, handle, and copyout owner
             // above is gone before a waiter can observe it.
@@ -7001,7 +6999,7 @@ where
             linux_tid,
             self.kernel.fatal_signal.current_generation(),
             tid,
-            Arc::clone(&self.state.threads),
+            self.state.threads.clone(),
             Arc::clone(&self.state.kicker),
             carrick_hal::InGuestFlag::for_guest_thread(),
             self.state.max_traps,
@@ -9032,7 +9030,7 @@ where
             });
         } else {
             let kernel = Arc::clone(&self.kernel);
-            let threads = Arc::clone(&self.state.threads);
+            let threads = self.state.threads.clone();
             let current = self.completion.clone();
             let owner = self.state.this_tid;
             if let Err(failure) = std::thread::Builder::new()
@@ -9488,7 +9486,7 @@ where
         linux_tid: crate::kernel::LinuxTid,
         fatal_image_generation: u64,
         this_tid: ThreadId,
-        threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
+        threads: impl Into<VcpuThreadRegistry>,
         kicker: Arc<dyn VcpuRegistry>,
         in_guest: carrick_hal::InGuestFlag,
         max_traps: usize,
@@ -9517,7 +9515,7 @@ where
             cow_refault_watch: None,
             reserved_signal: None,
             this_tid,
-            threads,
+            threads: threads.into(),
             kicker,
             in_guest,
             max_traps,
@@ -11315,41 +11313,29 @@ impl VcpuThreadHandle {
 }
 
 fn enroll_persistent_process_member(
-    threads: &Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    threads: &VcpuThreadRegistry,
     terminal_settlement: &HvpatchExternalTerminalSettlement,
 ) {
-    let mut handles = threads.lock();
-    if handles
-        .iter()
-        .any(|handle| handle.completion().id() == terminal_settlement.completion().id())
-    {
+    if !threads.register(terminal_settlement) {
         carrick_fatal!(
             "vcpu_loop::process_membership",
             "Duplicate terminal settlement registration in persistent process handle list"
         );
     }
-    handles.push(VcpuThreadHandle::Persistent {
-        terminal_settlement: terminal_settlement.clone(),
-    });
 }
 
-fn remove_persistent_process_member(
-    threads: &Arc<Mutex<Vec<VcpuThreadHandle>>>,
-    completion: continuation::JobId,
-) {
-    threads
-        .lock()
-        .retain(|handle| handle.completion().id() != completion);
+fn remove_persistent_process_member(threads: &VcpuThreadRegistry, completion: continuation::JobId) {
+    let _ = threads.take_by_id(completion);
 }
 
 /// Settle every enrolled member externally; returns how many member
 /// `ThreadDone` results this drain published (members that never finished
 /// their own job).
 fn finish_persistent_process_handles(
-    threads: &Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    threads: &VcpuThreadRegistry,
     current: &continuation::LogicalJobCompletion,
 ) -> Result<(usize, Vec<continuation::LogicalJobCompletion>), RuntimeError> {
-    let handles = std::mem::take(&mut *threads.lock());
+    let handles = threads.drain();
     let mut completions = handles
         .iter()
         .map(VcpuThreadHandle::completion)
@@ -11371,7 +11357,7 @@ fn finish_persistent_process_handles(
 
 fn publish_unexpected_executor_failure_retirement(
     kernel: &Kernel,
-    threads: &Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    threads: &VcpuThreadRegistry,
     current: &continuation::LogicalJobCompletion,
 ) -> Result<(), RuntimeError> {
     let (_published, completions) = finish_persistent_process_handles(threads, current)?;
@@ -11381,14 +11367,14 @@ fn publish_unexpected_executor_failure_retirement(
 }
 
 pub(crate) struct PersistentProcessMemberPublication {
-    threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    threads: VcpuThreadRegistry,
     completion: continuation::JobId,
     armed: bool,
 }
 
 impl PersistentProcessMemberPublication {
     pub(crate) fn new(
-        threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
+        threads: VcpuThreadRegistry,
         terminal_settlement: &HvpatchExternalTerminalSettlement,
     ) -> Self {
         enroll_persistent_process_member(&threads, terminal_settlement);
@@ -11621,7 +11607,7 @@ pub(crate) fn launch_persistent_hvpatch_job<E: ThreadedEngine + 'static>(
     platform_futex_factory: PlatformFutexFactory,
     linux_tid: crate::kernel::LinuxTid,
     this_tid: ThreadId,
-    threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    threads: impl Into<VcpuThreadRegistry>,
     kicker: Arc<dyn VcpuRegistry>,
     in_guest: carrick_hal::InGuestFlag,
     max_traps: usize,
@@ -11629,6 +11615,7 @@ pub(crate) fn launch_persistent_hvpatch_job<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
+    let threads = threads.into();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
         let _ = (
@@ -11713,7 +11700,7 @@ where
         drop(parked_vcpu);
 
         let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
-        let process_members = Arc::clone(&threads);
+        let process_members = threads.clone();
         let mut state = ThreadRuntimeState::<HvfEngine>::new(
             registry,
             futex,
@@ -13919,7 +13906,7 @@ mod tests {
             let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
             let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
             let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
-            let threads = Arc::new(Mutex::new(Vec::new()));
+            let threads = VcpuThreadRegistry::default();
             let mut state =
                 ThreadRuntimeState::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>::new(
                     Arc::clone(&registry),
@@ -13933,7 +13920,7 @@ mod tests {
                     root.thread().key().tid,
                     kernel.fatal_signal.current_generation(),
                     this_tid,
-                    Arc::clone(&threads),
+                    threads.clone(),
                     kicker,
                     carrick_hal::InGuestFlag::for_guest_thread(),
                     1_000,
@@ -14011,7 +13998,7 @@ mod tests {
             assert_eq!(memory.0[&0x2000], 22_i32.to_le_bytes());
             assert_eq!(root.task().threads().len(), 1);
             assert_eq!(registry.live_count(), 1);
-            assert!(threads.lock().is_empty());
+            assert!(threads.is_empty());
             assert_eq!(scheduler.queued_len(), 1);
             runtime
                 .persistent_bindings()
@@ -15000,7 +14987,7 @@ mod tests {
             .persistent_bindings()
             .retire(root.thread().key(), generation);
 
-        let threads = Arc::new(Mutex::new(Vec::new()));
+        let threads = VcpuThreadRegistry::default();
         let root_result = HvpatchLoopResult::pending();
         let root_completion = continuation::LogicalJobCompletion::pending();
         let root_settlement =
@@ -15030,7 +15017,7 @@ mod tests {
             root.thread().key().tid,
             kernel.fatal_signal.current_generation(),
             this_tid,
-            Arc::clone(&threads),
+            threads.clone(),
             kicker,
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
@@ -16731,7 +16718,7 @@ mod tests {
         let (_process, context) = crate::hvpatch::process_context_for_tests(70_102);
         let directory = HvpatchRuntimeDirectory::default();
         let (scheduler, _) = directory.continuation_services(context.kernel());
-        let handles = Arc::new(Mutex::new(Vec::new()));
+        let handles = VcpuThreadRegistry::default();
         let leader_result = HvpatchLoopResult::pending();
         let leader_completion = continuation::LogicalJobCompletion::pending();
         let exec_result = HvpatchLoopResult::pending();
@@ -16749,11 +16736,7 @@ mod tests {
             context.thread().key(),
             &scheduler,
             exec_completion.id(),
-            handles
-                .lock()
-                .iter()
-                .map(VcpuThreadHandle::completion)
-                .collect(),
+            handles.completions(),
         );
         assert!(!drain.is_ready(), "exec must wait for the suspended leader");
 
@@ -22236,7 +22219,7 @@ mod tests {
         let task_state = executor::tests::task_state(&context, 104);
         let binding = executor::tests::hvpatch_test_binding(&context, &task_state, 104);
         let quantum_strong_before = Arc::strong_count(binding.quantum());
-        let handles = Arc::new(Mutex::new(Vec::new()));
+        let handles = VcpuThreadRegistry::default();
         let removed_result = HvpatchLoopResult::pending();
         let removed_completion = continuation::LogicalJobCompletion::pending();
         let removed = HvpatchExternalTerminalSettlement::new(
@@ -22258,7 +22241,7 @@ mod tests {
         let (published, _) = finish_persistent_process_handles(&handles, &owner.completion())
             .expect("removed Kernel thread settles without a job repoll");
         assert_eq!(published, 1);
-        assert!(handles.lock().is_empty());
+        assert!(handles.is_empty());
         assert!(removed.result_is_ready());
         assert!(removed_completion.is_finished());
         assert!(matches!(
@@ -22288,7 +22271,7 @@ mod tests {
             consumed_result.wait(),
             Ok(VcpuLoopOutcome::ThreadDone)
         ));
-        let consumed_handles = Arc::new(Mutex::new(Vec::new()));
+        let consumed_handles = VcpuThreadRegistry::default();
         enroll_persistent_process_member(&consumed_handles, &consumed);
         enroll_persistent_process_member(&consumed_handles, &owner);
         let (published, _) =
@@ -22302,7 +22285,7 @@ mod tests {
 
     #[test]
     fn terminal_physical_retirement_includes_a_sole_current_member() {
-        let handles = Arc::new(Mutex::new(Vec::new()));
+        let handles = VcpuThreadRegistry::default();
         let current = continuation::LogicalJobCompletion::pending();
 
         let (published, completions) =
