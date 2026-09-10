@@ -2918,7 +2918,6 @@ impl ReadinessProbe {
 
 #[derive(Debug)]
 struct RegistrationOperationGate {
-    #[allow(dead_code)]
     token: ContinuationWakeToken,
     state: Mutex<OperationGateState>,
     drain_condvar: Condvar,
@@ -2958,12 +2957,13 @@ impl RegistrationOperationGate {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn token(&self) -> ContinuationWakeToken {
-        self.token
-    }
-
-    fn try_claim(self: &Arc<Self>) -> Option<OperationClaimGuard> {
+    fn try_claim(
+        self: &Arc<Self>,
+        expected_token: ContinuationWakeToken,
+    ) -> Option<OperationClaimGuard> {
+        if self.token != expected_token {
+            return None;
+        }
         let mut state = self.state.lock();
         if state.cancelled || state.consumed {
             return None;
@@ -3196,7 +3196,9 @@ impl CarrierWaitState {
         for (id, entry) in entries.iter_mut() {
             if matches!(
                 entry.state,
-                RegistrationState::Prepared | RegistrationState::Enrolled
+                RegistrationState::Prepared
+                    | RegistrationState::Enrolled
+                    | RegistrationState::Ready
             ) {
                 entry.state = RegistrationState::Cancelled(cause);
                 if let Some(waker) = entry.task_waker.take() {
@@ -3316,30 +3318,36 @@ impl CarrierWaitServiceInner {
     }
 
     fn cancel_exact(&self, token: ContinuationWakeToken, cause: CancellationCause) -> bool {
-        let (gate, task_waker) = {
+        let (gate, task_waker, was_active) = {
             let mut state = self.state.lock();
             let Some(mut entry) = state.registration_mut(token.continuation) else {
                 return false;
             };
-            if entry.token != token
-                || !matches!(
-                    entry.state,
-                    RegistrationState::Prepared | RegistrationState::Enrolled
-                )
-            {
+            if entry.token != token {
                 return false;
             }
-            entry.state = RegistrationState::Cancelled(cause);
-            let task_waker = entry.task_waker.take();
             let gate = Arc::clone(&entry.operation_gate);
-            (gate, task_waker)
+            let task_waker = entry.task_waker.take();
+            let was_active = matches!(
+                entry.state,
+                RegistrationState::Prepared | RegistrationState::Enrolled
+            );
+            if matches!(
+                entry.state,
+                RegistrationState::Prepared
+                    | RegistrationState::Enrolled
+                    | RegistrationState::Ready
+            ) {
+                entry.state = RegistrationState::Cancelled(cause);
+            }
+            (gate, task_waker, was_active)
         };
         gate.mark_cancelled_and_drain();
         self.nudge_reactor();
         if let Some(waker) = task_waker {
             waker.wake();
         }
-        true
+        was_active
     }
 
     fn consume_ready_exact(
@@ -3593,7 +3601,7 @@ impl CarrierWaitServiceInner {
                         {
                             hook();
                         }
-                        if let Some(claim) = gate.try_claim() {
+                        if let Some(claim) = gate.try_claim(token) {
                             let outcome = {
                                 let mut write = write.lock();
                                 #[cfg(test)]
@@ -3654,7 +3662,7 @@ impl CarrierWaitServiceInner {
                     .collect::<Vec<_>>()
             };
             for (token, lock, completion, gate) in record_locks {
-                if let Some(claim) = gate.try_claim() {
+                if let Some(claim) = gate.try_claim(token) {
                     let outcome = match crate::dispatch::try_drive_blocking_record_lock(&lock) {
                         crate::dispatch::BlockingRecordLockStep::Done(outcome) => Some(outcome),
                         crate::dispatch::BlockingRecordLockStep::Wait => None,
@@ -3960,7 +3968,7 @@ impl CarrierWaitService {
             location, value, ..
         } = &probe
         {
-            if let Some(claim) = gate.try_claim() {
+            if let Some(claim) = gate.try_claim(token) {
                 let current = unsafe {
                     (location.wait_addr().raw() as *const std::sync::atomic::AtomicU32)
                         .as_ref()
@@ -4009,7 +4017,7 @@ impl CarrierWaitService {
             hook();
         }
 
-        let Some(claim) = gate.try_claim() else {
+        let Some(claim) = gate.try_claim(registration.token) else {
             let state = self.inner.state.lock();
             if let Some(entry) = state
                 .entries
@@ -4194,8 +4202,11 @@ impl Future for ContinuationEventFuture {
                     .ok_or(WaitServiceError::StaleRegistration),
             ),
             RegistrationState::Cancelled(cause) => {
+                let gate = Arc::clone(&entry.operation_gate);
                 drop(entry);
                 state.remove_registration(self.token.continuation);
+                drop(state);
+                gate.mark_cancelled_and_drain();
                 Poll::Ready(Err(WaitServiceError::Cancelled(cause)))
             }
             RegistrationState::Consumed => Poll::Ready(Err(WaitServiceError::StaleRegistration)),
@@ -9570,6 +9581,9 @@ mod tests {
 
         // Enroll while pipe is full: recheck gets EAGAIN and parks in pollable set
         service.enroll(&mut registration).expect("enroll write");
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
 
         let (reactor_reached_tx, reactor_reached_rx) = std::sync::mpsc::sync_channel(1);
         let (enroll_done_tx, enroll_done_rx) = std::sync::mpsc::sync_channel(1);
@@ -9606,9 +9620,6 @@ mod tests {
         assert_eq!(read_bytes as usize, payload.len());
         assert_eq!(buf, payload);
 
-        continuation
-            .attach_registration(registration)
-            .expect("attach registration");
         let resume_outcome = continuation
             .resume(ContinuationEvent::Ready, &context)
             .expect("resume write")
@@ -9626,7 +9637,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_during_inflight_host_write_drive_drains_safely() {
+    fn cancellation_during_inflight_host_write_competing_with_ready_event_drains_safely() {
         let (kernel, context) = bootstrap(15_381);
         let generation = publish(&context, 0x721);
         let scheduler = Arc::new(Scheduler::new(kernel));
@@ -9668,7 +9679,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5));
         });
 
-        // Drain dummy bytes to make pipe writable
+        // Drain dummy bytes to make pipe writable and wake reactor
         drain_pipe(pipe[0], dummy.len());
         service.nudge_reactor_for_test();
 
@@ -9677,6 +9688,21 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("reactor started drive");
 
+        // While HostWrite is in-flight, an independent producer publishes Ready
+        let publish_receipt = service.inner.publish_event(token, ContinuationEvent::Ready);
+        assert!(publish_receipt.accepted());
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token.continuation)
+                .expect("entry")
+                .state,
+            RegistrationState::Ready
+        );
+
         let (cancel_done_tx, cancel_done_rx) = std::sync::mpsc::sync_channel(1);
 
         let cancel_thread = thread::spawn(move || {
@@ -9684,17 +9710,36 @@ mod tests {
             cancel_done_tx.send(receipt).expect("send receipt");
         });
 
-        // Tell hook to release after a short delay to let cancel_exact reach mark_cancelled_and_drain
-        thread::sleep(Duration::from_millis(10));
+        // Assert that cancel CANNOT complete/retire while operation claim is held (drain blocks)
+        assert!(
+            cancel_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "cancellation must block on operation gate drain and cannot retire early"
+        );
+
+        // Tell inside hook to complete and drop OperationClaimGuard
         cancel_started_tx.send(()).expect("unblock reactor drive");
 
         let receipt = cancel_done_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("cancel completed");
+            .expect("cancel completed after claim dropped");
         assert_eq!(receipt.cause(), CancellationCause::ProcessExit);
         assert_eq!(receipt.cleanup_count(), 1);
 
         cancel_thread.join().expect("cancel thread join");
+
+        // Verify gate is permanently closed: no fresh drive can claim
+        let entry_gate = {
+            let state = service.inner.state.lock();
+            let entry = state.entries.get(&token.continuation).expect("entry");
+            assert_eq!(
+                entry.state,
+                RegistrationState::Cancelled(CancellationCause::ProcessExit)
+            );
+            Arc::clone(&entry.operation_gate)
+        };
+        assert!(entry_gate.try_claim(token).is_none());
 
         // Verify that publish_event after cancellation is rejected
         let publish_receipt = service.inner.publish_event(token, ContinuationEvent::Ready);
@@ -9714,9 +9759,98 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_before_drive_prevents_fresh_host_work() {
+    fn event_future_cancelled_observation_drains_inflight_operation_safely() {
         let (kernel, context) = bootstrap(15_382);
         let generation = publish(&context, 0x722);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
+
+        let pipe = pipe_pair();
+        let dummy = fill_pipe(pipe[1]);
+
+        let payload = vec![9, 8, 7, 6];
+        let write = BlockingHostWrite::for_tests(
+            pipe[1],
+            payload.clone(),
+            0,
+            context.thread().registry_id(),
+            false,
+        )
+        .expect("write state");
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingHostWrite(write),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("write continuation");
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        service.enroll(&mut registration).expect("enroll write");
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
+
+        let (drive_started_tx, drive_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (cancel_started_tx, cancel_started_rx) = std::sync::mpsc::sync_channel(1);
+        let cancel_started_rx = Arc::new(std::sync::Mutex::new(cancel_started_rx));
+
+        service.set_inside_host_write_hook(move || {
+            let _ = drive_started_tx.send(());
+            let _ = cancel_started_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+        });
+
+        // Drain dummy bytes to wake reactor
+        drain_pipe(pipe[0], dummy.len());
+        service.nudge_reactor_for_test();
+
+        drive_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reactor started drive");
+
+        // Cancel registration while reactor is inside hook
+        let (cancel_done_tx, cancel_done_rx) = std::sync::mpsc::sync_channel(1);
+        let cancel_thread = thread::spawn(move || {
+            let receipt = continuation.cancel(CancellationCause::ProcessExit);
+            cancel_done_tx.send(receipt).expect("send receipt");
+        });
+
+        // Event future polled concurrently
+        let event_future = service.event(token);
+        let (poll_done_tx, poll_done_rx) = std::sync::mpsc::sync_channel(1);
+        let poll_thread = thread::spawn(move || {
+            let result = block_on(event_future);
+            poll_done_tx.send(result).expect("send poll result");
+        });
+
+        // Release hook so claim drops
+        cancel_started_tx.send(()).expect("unblock reactor drive");
+
+        let cancel_receipt = cancel_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancel completed");
+        assert_eq!(cancel_receipt.cause(), CancellationCause::ProcessExit);
+
+        let poll_result = poll_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("poll completed");
+        assert!(matches!(
+            poll_result,
+            Err(WaitServiceError::Cancelled(CancellationCause::ProcessExit))
+        ));
+
+        cancel_thread.join().expect("cancel thread join");
+        poll_thread.join().expect("poll thread join");
+
+        service.clear_test_hooks();
+        close_pair(pipe);
+    }
+
+    #[test]
+    fn cancellation_before_drive_prevents_fresh_host_work() {
+        let (kernel, context) = bootstrap(15_383);
+        let generation = publish(&context, 0x723);
         let scheduler = Arc::new(Scheduler::new(kernel));
         let service = CarrierWaitService::new(scheduler);
 
@@ -9764,21 +9898,22 @@ mod tests {
 
     #[test]
     fn shared_word_lifetime_and_safety_through_cancellation_retirement() {
-        let (kernel, context) = bootstrap(15_383);
-        let generation = publish(&context, 0x723);
+        let (kernel, context) = bootstrap(15_384);
+        let generation = publish(&context, 0x724);
         let scheduler = Arc::new(Scheduler::new(kernel));
         let service = CarrierWaitService::new(scheduler);
 
         // Allocate atomic word on heap (simulating guest memory)
-        let word = std::sync::atomic::AtomicU32::new(42);
+        let word_box = Box::new(std::sync::atomic::AtomicU32::new(42));
+        let word_raw = Box::into_raw(word_box);
         let location = SharedFutexLocation::Direct {
-            word: HostVa((&word as *const std::sync::atomic::AtomicU32) as usize),
+            word: HostVa(word_raw as usize),
             waiter_key: 0xbeef,
         };
 
         let futex_wait =
             carrick_thread::platform_futex::carrier_shared_futex_table().prepare_wait(0xbeef);
-        let continuation = BlockedContinuation::from_dispatch_outcome(
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::WaitOnSharedWord {
                 location,
                 waiter_key: 0xbeef,
@@ -9790,7 +9925,11 @@ mod tests {
         )
         .expect("shared word continuation");
         let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
         service.enroll(&mut registration).expect("enroll");
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
 
         let (claim_started_tx, claim_started_rx) = std::sync::mpsc::sync_channel(1);
         let (cancel_started_tx, cancel_started_rx) = std::sync::mpsc::sync_channel(1);
@@ -9805,7 +9944,6 @@ mod tests {
         });
 
         let service_for_recheck = service.clone();
-        let token = registration.wake_token();
         let recheck_thread = thread::spawn(move || {
             // Background thread runs recheck_registration
             let reg = ContinuationRegistration {
@@ -9827,7 +9965,14 @@ mod tests {
             cancel_done_tx.send(receipt).expect("send receipt");
         });
 
-        thread::sleep(Duration::from_millis(10));
+        // Verify cancel cannot retire while recheck claim is held
+        assert!(
+            cancel_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "cancel must block on drain while claim is held"
+        );
+
         cancel_started_tx.send(()).expect("unblock recheck");
 
         let receipt = cancel_done_rx
@@ -9842,27 +9987,24 @@ mod tests {
 
         cancel_thread.join().expect("cancel thread join");
 
-        // Now memory is safely dropped without any risk of concurrent access
-        drop(word);
+        // Now memory is safely dropped on heap without any risk of concurrent access
+        unsafe {
+            drop(Box::from_raw(word_raw));
+        }
 
         service.clear_test_hooks();
     }
 
     #[test]
     fn recheck_registration_race_rejects_late_publication_and_requeues_reserved_signal() {
-        let (kernel, context) = bootstrap(15_384);
-        let generation = publish(&context, 0x724);
+        let (kernel, context) = bootstrap(15_385);
+        let generation = publish(&context, 0x725);
         let scheduler = Arc::new(Scheduler::new(kernel));
         let service = CarrierWaitService::new(scheduler);
 
-        // Queue a deliverable signal to the task
         let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
-        context
-            .signal_authority()
-            .enqueue_thread_standard(signal, None);
-        context.task().wake();
 
-        let continuation = BlockedContinuation::from_dispatch_outcome(
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::WaitOnSignals {
                 wait_set: SigSet::EMPTY.with(signal.raw()),
                 block_mask: SigBlockMask::NONE,
@@ -9871,7 +10013,17 @@ mod tests {
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
         .expect("signals continuation");
-        let registration = service.prepare_registration(&continuation);
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        service.enroll(&mut registration).expect("enroll");
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
+
+        // Queue deliverable signal after enrollment so recheck_registration exercises the probe race
+        context
+            .signal_authority()
+            .enqueue_thread_standard(signal, None);
 
         let (probe_started_tx, probe_started_rx) = std::sync::mpsc::sync_channel(1);
         let (cancel_done_tx, cancel_done_rx) = std::sync::mpsc::sync_channel(1);
@@ -9886,12 +10038,11 @@ mod tests {
         });
 
         let service_for_recheck = service.clone();
-        let token = registration.wake_token();
         let recheck_thread = thread::spawn(move || {
             let reg = ContinuationRegistration {
                 token,
                 service: Arc::downgrade(&service_for_recheck.inner),
-                enrolled: false,
+                enrolled: true,
                 settled: true,
             };
             service_for_recheck.recheck_registration(&reg)
@@ -9901,16 +10052,33 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("recheck reached probe");
 
-        // Cancel registration while recheck is in flight
-        service
-            .cancel_registration_with_cause(registration, CancellationCause::ProcessExit)
-            .expect("cancel");
+        // Cancel continuation while recheck is in flight
+        let (cancel_receipt_tx, cancel_receipt_rx) = std::sync::mpsc::sync_channel(1);
+        let cancel_thread = thread::spawn(move || {
+            let receipt = continuation.cancel(CancellationCause::ProcessExit);
+            cancel_receipt_tx.send(receipt).expect("send receipt");
+        });
+
+        // Verify cancel blocks until recheck drops claim
+        assert!(
+            cancel_receipt_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "cancel must block on drain"
+        );
+
         cancel_done_tx.send(()).expect("unblock recheck");
 
         let recheck_result = recheck_thread.join().expect("recheck join");
         assert!(recheck_result.is_ok());
         // Since publication was rejected, recheck_registration returns Ok(None)
         assert_eq!(recheck_result.unwrap(), None);
+
+        let cancel_receipt = cancel_receipt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancel completed");
+        assert_eq!(cancel_receipt.cause(), CancellationCause::ProcessExit);
+        cancel_thread.join().expect("cancel thread join");
 
         // Verify that the signal was requeued to the signal authority and not lost
         assert!(
@@ -9925,8 +10093,8 @@ mod tests {
 
     #[test]
     fn stale_and_reused_token_rejection_prevents_cross_wait_resurrection() {
-        let (kernel, context) = bootstrap(15_385);
-        let generation = publish(&context, 0x725);
+        let (kernel, context) = bootstrap(15_386);
+        let generation = publish(&context, 0x726);
         let scheduler = Arc::new(Scheduler::new(kernel));
         let service = CarrierWaitService::new(scheduler);
 
@@ -10008,8 +10176,8 @@ mod tests {
 
     #[test]
     fn unrelated_waiter_progress_during_concurrent_host_write() {
-        let (kernel, context) = bootstrap(15_386);
-        let generation = publish(&context, 0x726);
+        let (kernel, context) = bootstrap(15_387);
+        let generation = publish(&context, 0x727);
         let scheduler = Arc::new(Scheduler::new(kernel));
         let service = CarrierWaitService::new(scheduler);
 
@@ -10078,12 +10246,14 @@ mod tests {
 
     #[test]
     fn lock_ordering_opposing_locks_rendezvous_completes_without_deadlock() {
-        let (kernel, context) = bootstrap(15_387);
-        let generation = publish(&context, 0x727);
+        let (kernel, context) = bootstrap(15_388);
+        let generation = publish(&context, 0x728);
         let scheduler = Arc::new(Scheduler::new(kernel));
         let service = CarrierWaitService::new(scheduler);
 
         let pipe = pipe_pair();
+        let dummy = fill_pipe(pipe[1]);
+
         let payload = vec![1, 2, 3, 4];
         let write = BlockingHostWrite::for_tests(
             pipe[1],
@@ -10093,7 +10263,7 @@ mod tests {
             false,
         )
         .expect("write state");
-        let continuation = BlockedContinuation::from_dispatch_outcome(
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::BlockingHostWrite(write),
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
@@ -10101,62 +10271,50 @@ mod tests {
         let mut registration = service.prepare_registration(&continuation);
         let token = registration.wake_token();
 
-        let write_arc = match &continuation.state().detail {
-            ContinuationDetail::HostWrite(w) => Arc::clone(w),
-            _ => unreachable!(),
-        };
-        let completion_arc = Arc::clone(&continuation.state().producer_completion);
+        service.enroll(&mut registration).expect("enroll write");
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
 
-        let (recheck_reached_tx, recheck_reached_rx) = std::sync::mpsc::sync_channel(1);
-        let (reactor_locked_tx, reactor_locked_rx) = std::sync::mpsc::sync_channel(1);
-        let reactor_locked_rx = Arc::new(std::sync::Mutex::new(reactor_locked_rx));
+        let (reactor_reached_tx, reactor_reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (recheck_done_tx, recheck_done_rx) = std::sync::mpsc::sync_channel(1);
+        let recheck_done_rx = Arc::new(std::sync::Mutex::new(recheck_done_rx));
 
-        service.set_before_recheck_hook(move || {
-            let _ = recheck_reached_tx.send(());
-            let _ = reactor_locked_rx
+        // Real reactor hook in CarrierWaitService's background reactor thread
+        service.set_inside_host_write_hook(move || {
+            let _ = reactor_reached_tx.send(());
+            let _ = recheck_done_rx
                 .lock()
                 .unwrap()
                 .recv_timeout(Duration::from_secs(5));
         });
 
-        let service_for_reactor = service.clone();
-        let write_for_reactor = Arc::clone(&write_arc);
-        let completion_for_reactor = Arc::clone(&completion_arc);
+        // Drain pipe so real reactor wakes and executes drive_blocking_host_write
+        drain_pipe(pipe[0], dummy.len());
+        service.nudge_reactor_for_test();
 
-        let reactor_thread = thread::spawn(move || {
-            // Wait until recheck reaches hook
-            recheck_reached_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("recheck reached hook");
-            let mut write = write_for_reactor.lock();
-            reactor_locked_tx.send(()).expect("unblock recheck hook");
-            let outcome = match crate::dispatch::drive_blocking_host_write(&mut write) {
-                crate::dispatch::BlockingHostWriteStep::Done(outcome) => Some(outcome),
-                crate::dispatch::BlockingHostWriteStep::Wait => None,
+        // Wait until real reactor thread is inside drive holding OperationClaimGuard
+        reactor_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("real reactor reached inside drive hook");
+
+        // Concurrent thread runs recheck_registration while reactor is inside drive hook
+        let service_for_recheck = service.clone();
+        let recheck_thread = thread::spawn(move || {
+            let reg = ContinuationRegistration {
+                token,
+                service: Arc::downgrade(&service_for_recheck.inner),
+                enrolled: true,
+                settled: true,
             };
-            if let Some(outcome) = outcome {
-                *completion_for_reactor.lock() = Some(outcome);
-            }
-            drop(write);
-            service_for_reactor
-                .inner
-                .publish_event(token, ContinuationEvent::Ready)
+            service_for_recheck.recheck_registration(&reg)
         });
 
-        service.enroll(&mut registration).expect("enroll write");
+        // Unblock reactor inside hook
+        recheck_done_tx.send(()).expect("unblock reactor");
 
-        let receipt = reactor_thread.join().expect("reactor join");
-        assert!(
-            receipt.accepted()
-                || registration.settled
-                || service
-                    .inner
-                    .state
-                    .lock()
-                    .entries
-                    .get(&token.continuation)
-                    .is_some_and(|e| e.state == RegistrationState::Ready)
-        );
+        let recheck_result = recheck_thread.join().expect("recheck join");
+        assert!(recheck_result.is_ok());
 
         assert_eq!(
             await_event(&service, token).expect("ready event"),
@@ -10166,6 +10324,7 @@ mod tests {
         let mut buf = vec![0u8; payload.len()];
         let read_bytes = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
         assert_eq!(read_bytes as usize, payload.len());
+        assert_eq!(buf, payload);
 
         service.clear_test_hooks();
         close_pair(pipe);
