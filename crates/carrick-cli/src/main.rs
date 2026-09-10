@@ -260,43 +260,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn configure_process_environment() {
-    // Ignore SIGPIPE in the host so a guest writing to a closed
-    // pipe end (eg `ls | head` after head exits) gets EPIPE from
-    // libc::write instead of having the host carrick process killed
-    // by SIGPIPE. The dispatcher then translates EPIPE into the
-    // guest's errno; the guest sees Linux's standard EPIPE behavior.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-    }
-
-    // Relocate `environ` onto the heap so the contiguous argv/env stack
-    // bytes become a wider writable buffer for `set_host_process_name`.
-    // MUST run BEFORE any setenv: the first setenv on the pristine env
-    // appends a heap-allocated entry to the environ array, which breaks
-    // our contiguity walk (the new heap string doesn't abut the stack
-    // run) and forces the legacy argv[0]-only fallback. libuv/Postgres
-    // also relocate before any env mutation. Subsequent setenv may
-    // realloc our heap environ — fine: the title buffer is the stack
-    // range, not the env array, so it's unaffected.
-    carrick_runtime::dispatch::proctitle_init();
-
-    // Disable Apple's os_log activity tracing for this process tree.
-    // Hypervisor.framework's `hv_vcpu_create` initializes an os_log
-    // handle internally, and that handle is NOT fork-safe - a forked
-    // child calling `hv_vcpu_create` crashes inside `_os_log_find`
-    // with EXC_BAD_ACCESS ~14% of the time (verified via macOS
-    // DiagnosticReports). Setting OS_ACTIVITY_MODE=disable before any
-    // HVF call drops os_log out of the path entirely and makes
-    // repeated fork() + hv_vcpu_create cycles deterministic.
-    // INVARIANT: both are static string literals with no interior NUL byte, so
-    // CString::new cannot fail.
-    #[allow(clippy::unwrap_used)]
-    unsafe {
-        let key = std::ffi::CString::new("OS_ACTIVITY_MODE").unwrap();
-        let val = std::ffi::CString::new("disable").unwrap();
-        libc::setenv(key.as_ptr(), val.as_ptr(), 1);
-    }
-
+    carrick_runtime::host_process::prepare();
     install_guest_abort_banner();
 
     tracing_subscriber::fmt()

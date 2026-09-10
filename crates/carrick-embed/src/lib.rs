@@ -85,9 +85,9 @@ pub mod vfs;
 #[cfg(test)]
 pub(crate) static CARRIER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-pub use builder::{ContainerBuilder, StdioConfig};
+pub use builder::{Container, ContainerBuilder, StdioConfig};
 pub use carrier::Carrier;
-pub use error::EmbedError;
+pub use error::{BuildError, EmbedError};
 pub use prepared::PreparedContainer;
 pub use result::ContainerResult;
 pub use shared_buffer::{SharedBuffer, SharedBufferError, SharedBufferLease};
@@ -124,4 +124,7 @@ pub use carrick_runtime::observe::{
     SyscallInterceptor, SyscallObserver, SyscallOutcome, WakeRejectionReason, is_shortable_syscall,
 };
 pub use carrick_runtime::runtime::{RunResult, RuntimeError, TerminalReason};
-pub use carrick_spec::{Mount, Platform, RunSpec, StdioMode};
+pub use carrick_spec::{
+    Mount, MountSpec, NetworkSpec, Platform, ProcessSpec, ResourceSpec, RunSpec, SecuritySpec,
+    StdioMode,
+};

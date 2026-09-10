@@ -249,7 +249,7 @@ impl Default for NamespaceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum FsBackendKind {
     /// In-memory writable overlay. Gated behind the default-off `fs-memory`
@@ -259,6 +259,7 @@ pub enum FsBackendKind {
     Memory,
     /// Host-APFS passthrough via cap-std: the kernel is the single fork-coherent
     /// source of truth. The only backend in a default build.
+    #[default]
     Host,
 }
 
@@ -853,66 +854,30 @@ impl Default for Platform {
 /// layer. `carrick-engine::resolve_run_spec` produces it by folding the user's
 /// CLI request over the resolved [`ImageConfig`]; `carrick-runtime` consumes it
 /// and re-reads neither the flags nor the image metadata. Read in that light,
-/// the fields split into three groups:
+/// the fields compose five typed sub-specs:
 ///
-/// - *What to run*: `executable` / `argv` / `envp` / `cwd` — the resolved
-///   entrypoint+cmd, environment, and working directory after the image
-///   defaults and CLI overrides have been reconciled.
-/// - *What it sees*: `rootfs_layers` (the OCI layer dirs to stack into the
-///   guest root), `fs_backend` (in-memory overlay vs. host-APFS passthrough,
-///   see [`FsBackendKind`]), and `mounts` (host bind mounts).
-/// - *How it behaves*: `tty` (pty allocation) and `stdio` (where guest fd 1/2
-///   bytes go — see [`StdioMode`]),
-///   `platform` (native aarch64 vs. Rosetta-translated amd64), `pid`
-///   (PID-namespace mode), `uid` / `gid` (initial guest credentials),
-///   `max_traps` (a syscall-count guard rail for tests/debugging), and
-///   `debug_state_path` (where to dump guest state).
+/// - [`ProcessSpec`]: what to run (`executable`, `argv`, `envp`, `cwd`, `tty`,
+///   `stdio`, initial `uid`/`gid`, and `pid` mode).
+/// - [`MountSpec`]: what it sees (`rootfs_layers`, `fs_backend`, `mounts`).
+/// - [`NetworkSpec`]: network environment (`namespace`, `extra_hosts`, `hostname`).
+/// - [`ResourceSpec`]: limits and debugging (`max_traps`, `debug_state_path`).
+/// - [`SecuritySpec`]: security policies (`seccomp_policy`, `cap_add`).
+/// - `platform` and `exec_backend`: execution target and backend selection.
 ///
-/// The trailing fields carry `#[serde(default)]` so a `RunSpec` persisted by an
-/// older build still deserializes — see the crate-level note on additive
-/// evolution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunSpec {
+/// The sub-specs and trailing fields carry `#[serde(default)]` so a `RunSpec`
+/// persisted by an older build still deserializes.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProcessSpec {
     pub executable: String,
     pub argv: Vec<String>,
     pub envp: Vec<String>,
     pub cwd: Option<Utf8PathBuf>,
-    pub rootfs_layers: Vec<Utf8PathBuf>,
-    pub fs_backend: FsBackendKind,
-    pub mounts: Vec<Mount>,
     pub tty: bool,
     /// Output mode for guest fd 1/2 — see [`StdioMode`]. Serde-defaults to
     /// `Inherit`, the docker-shaped streaming mode.
     #[serde(default)]
     pub stdio: StdioMode,
-    pub max_traps: usize,
-    pub debug_state_path: Option<Utf8PathBuf>,
-    /// Target ISA of the container. On an aarch64 host, `Amd64` enables Rosetta 2
-    /// translation: the runtime redirects x86_64 ELF loads through Rosetta and
-    /// bind-mounts the host Rosetta runtime into the guest VFS; on an x86_64 host
-    /// `Amd64` is the native ISA. Defaults to the host-native architecture (see
-    /// [`Platform::host_native`]).
-    #[serde(default)]
-    pub platform: Platform,
-    /// Execution backend requested by CLI/API policy. `Auto` preserves the
-    /// platform default; explicit `Native` is experimental and trusted-code-only.
-    #[serde(default)]
-    pub exec_backend: ExecBackendRequest,
-    /// PID namespace mode (`docker run --pid`). `Private` (default) gives the
-    /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
-    #[serde(default)]
-    pub pid: PidMode,
-    /// Docker-compatible container hostname / UTS identity. `None` preserves the
-    /// runtime's host-derived fallback for legacy and non-container runs.
-    #[serde(default)]
-    pub hostname: Option<String>,
-    /// Network namespace mode and resolved bridge view.
-    #[serde(default)]
-    pub network: NetworkNamespaceSpec,
-    /// Docker-compatible `/etc/hosts` additions, expressed as `name:ip` or
-    /// `name=ip`.
-    #[serde(default)]
-    pub extra_hosts: Vec<String>,
     /// Initial guest user id (`docker run --user` / image `USER`). The guest's
     /// real/effective/saved/fs uid are all seeded to this. Defaults to 0 (root).
     #[serde(default)]
@@ -921,6 +886,50 @@ pub struct RunSpec {
     /// with no group, docker uses gid 0.
     #[serde(default)]
     pub gid: carrick_abi::NsGid,
+    /// PID namespace mode (`docker run --pid`). `Private` (default) gives the
+    /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
+    #[serde(default)]
+    pub pid: PidMode,
+}
+
+/// Filesystem and mount configuration for the container root and overlays.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MountSpec {
+    pub rootfs_layers: Vec<Utf8PathBuf>,
+    pub fs_backend: FsBackendKind,
+    pub mounts: Vec<Mount>,
+}
+
+/// Network configuration, namespace parameters, and host identity.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkSpec {
+    /// Network namespace mode and resolved bridge view.
+    #[serde(default)]
+    pub namespace: NetworkNamespaceSpec,
+    /// Docker-compatible `/etc/hosts` additions, expressed as `name:ip` or
+    /// `name=ip`.
+    #[serde(default)]
+    pub extra_hosts: Vec<String>,
+    /// Docker-compatible container hostname / UTS identity. `None` preserves the
+    /// runtime's host-derived fallback for legacy and non-container runs.
+    #[serde(default)]
+    pub hostname: Option<String>,
+}
+
+/// Resource constraints and debug dump paths.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourceSpec {
+    pub max_traps: usize,
+    pub debug_state_path: Option<Utf8PathBuf>,
+}
+
+/// Security policies and Linux capability sets.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecuritySpec {
     /// Launch-time container syscall policy (`--security-opt seccomp=...`).
     /// Serde-defaults to [`SeccompPolicy::ContainerDefault`]: a container spec
     /// is docker-shaped, and docker applies its default profile unless the user
@@ -929,13 +938,25 @@ pub struct RunSpec {
     pub seccomp_policy: SeccompPolicy,
     /// Capabilities granted beyond the Docker default set (`--cap-add`), by
     /// their `capabilities(7)` names WITHOUT the `CAP_` prefix, exactly as
-    /// docker spells them (`SYS_ADMIN`, `SYS_PTRACE`, ...). Docker's default
-    /// bounding set drops most of these, and its seccomp profile is
-    /// capability-CONDITIONAL — granting `SYS_ADMIN` re-enables the syscalls
-    /// the profile otherwise denies — so this one field drives both the
-    /// modeled capability set and the launch-time deny table.
+    /// docker spells them (`SYS_ADMIN`, `SYS_PTRACE`, ...).
     #[serde(default)]
     pub cap_add: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunSpec {
+    pub process: ProcessSpec,
+    pub mounts: MountSpec,
+    pub network: NetworkSpec,
+    pub resources: ResourceSpec,
+    pub security: SecuritySpec,
+    /// Target ISA of the container. Defaults to the host-native architecture.
+    #[serde(default)]
+    pub platform: Platform,
+    /// Execution backend requested by CLI/API policy.
+    #[serde(default)]
+    pub exec_backend: ExecBackendRequest,
 }
 
 #[cfg(test)]
@@ -1018,27 +1039,36 @@ mod tests {
     #[test]
     fn run_spec_network_defaults_to_host() {
         let json = r#"{
-            "executable": "/bin/sh",
-            "argv": ["/bin/sh"],
-            "envp": [],
-            "cwd": "/",
-            "rootfs_layers": [],
-            "fs_backend": "Host",
-            "mounts": [],
-            "tty": false,
-            "max_traps": 100,
-            "debug_state_path": null
+            "process": {
+                "executable": "/bin/sh",
+                "argv": ["/bin/sh"],
+                "envp": [],
+                "cwd": "/",
+                "tty": false
+            },
+            "mounts": {
+                "rootfs_layers": [],
+                "fs_backend": "Host",
+                "mounts": []
+            },
+            "resources": {
+                "max_traps": 100,
+                "debug_state_path": null
+            }
         }"#;
 
-        let spec: RunSpec = serde_json::from_str(json).expect("legacy spec should deserialize");
-        assert_eq!(spec.network.mode, NetworkMode::Host);
-        assert!(spec.network.namespace_id.is_none());
-        assert!(spec.network.published_ports.is_empty());
+        let spec: RunSpec = serde_json::from_str(json).expect("spec should deserialize");
+        assert_eq!(spec.network.namespace.mode, NetworkMode::Host);
+        assert!(spec.network.namespace.namespace_id.is_none());
+        assert!(spec.network.namespace.published_ports.is_empty());
         // No `stdio` key: the serde default is the streaming CLI mode.
-        assert_eq!(spec.stdio, StdioMode::Inherit);
+        assert_eq!(spec.process.stdio, StdioMode::Inherit);
         // A container spec without the field is docker-shaped: the launch-time
         // default seccomp model applies.
-        assert_eq!(spec.seccomp_policy, SeccompPolicy::ContainerDefault);
+        assert_eq!(
+            spec.security.seccomp_policy,
+            SeccompPolicy::ContainerDefault
+        );
     }
 
     #[test]
@@ -1163,16 +1193,22 @@ mod tests {
     #[test]
     fn native_code_mode_is_ignored_legacy_state() {
         let json = r#"{
-            "executable": "/bin/sh",
-            "argv": ["/bin/sh"],
-            "envp": [],
-            "cwd": "/",
-            "rootfs_layers": [],
-            "fs_backend": "Host",
-            "mounts": [],
-            "tty": false,
-            "max_traps": 100,
-            "debug_state_path": null
+            "process": {
+                "executable": "/bin/sh",
+                "argv": ["/bin/sh"],
+                "envp": [],
+                "cwd": "/",
+                "tty": false
+            },
+            "mounts": {
+                "rootfs_layers": [],
+                "fs_backend": "Host",
+                "mounts": []
+            },
+            "resources": {
+                "max_traps": 100,
+                "debug_state_path": null
+            }
         }"#;
 
         let mut value: serde_json::Value = serde_json::from_str(json).expect("valid spec JSON");

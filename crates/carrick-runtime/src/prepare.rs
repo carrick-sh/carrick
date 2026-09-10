@@ -70,16 +70,16 @@ pub fn resolve_plan(spec: &RunSpec, launch: LaunchContext) -> Result<ExecutionPl
         page.page_geometry.linux_page_size,
         crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
     );
-    let host_resolver = HostResolverSnapshot::capture_for_network(&spec.network)
+    let host_resolver = HostResolverSnapshot::capture_for_network(&spec.network.namespace)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     // Name the host process `carrick: <argv>` up front so it's identifiable in
     // ps/Activity Monitor even before the guest sets its own comm via prctl.
     {
-        let cmdline = spec.argv.join(" ");
+        let cmdline = spec.process.argv.join(" ");
         crate::dispatch::set_host_process_name(cmdline.as_bytes());
     }
     let network = Arc::new(
-        RuntimeNetwork::create(&spec.network)
+        RuntimeNetwork::create(&spec.network.namespace)
             .map_err(|e| RuntimeError::Unsupported(format!("network setup failed: {e}")))?,
     );
     // The environment is already fully resolved by the engine layer (image
@@ -91,7 +91,7 @@ pub fn resolve_plan(spec: &RunSpec, launch: LaunchContext) -> Result<ExecutionPl
         page,
         host_resolver,
         network,
-        env: spec.envp.clone(),
+        env: spec.process.envp.clone(),
     })
 }
 
@@ -203,13 +203,13 @@ impl RuntimeExtensions {
 /// engine's contract, the sink is the embedder's; they must say the same
 /// thing, and a tty run streams by definition.
 fn resolve_stdio(spec: &RunSpec, ext: Option<StdioSink>) -> Result<StdioSink, RuntimeError> {
-    if spec.tty && spec.stdio != StdioMode::Inherit {
+    if spec.process.tty && spec.process.stdio != StdioMode::Inherit {
         return Err(RuntimeError::Configuration(format!(
             "tty runs stream to the carrier's terminal; StdioMode::{:?} is not a tty mode",
-            spec.stdio
+            spec.process.stdio
         )));
     }
-    match (spec.stdio, ext) {
+    match (spec.process.stdio, ext) {
         (StdioMode::Inherit, None) => Ok(StdioSink::Inherit),
         (StdioMode::Captured, None) => Ok(StdioSink::Captured),
         (StdioMode::Piped, Some(sink @ StdioSink::Piped { .. })) => Ok(sink),
@@ -264,17 +264,17 @@ fn configure_identity_and_policy(
     spec: &RunSpec,
     container: &crate::kernel::Container,
 ) {
-    if let Some(cwd) = &spec.cwd {
+    if let Some(cwd) = &spec.process.cwd {
         dispatcher.set_cwd(cwd.as_str());
     }
-    dispatcher.set_credentials(spec.uid, spec.gid);
+    dispatcher.set_credentials(spec.process.uid, spec.process.gid);
     // Launch-time container syscall policy (the Docker default-seccomp model,
     // or unconfined) — before boot, inherited by the whole guest process tree.
-    dispatcher.apply_launch_privileges(spec.seccomp_policy, container);
+    dispatcher.apply_launch_privileges(spec.security.seccomp_policy, container);
 }
 
 fn install_spec_mounts(dispatcher: &mut SyscallDispatcher, spec: &RunSpec) {
-    for mount in &spec.mounts {
+    for mount in &spec.mounts.mounts {
         let host_path = PathBuf::from(mount.source.as_std_path());
         let target_path = PathBuf::from(mount.target.as_std_path());
         let bind_vfs = BindVfs::new(mount.target.as_str(), host_path, mount.readonly);
@@ -286,7 +286,8 @@ fn install_spec_mounts(dispatcher: &mut SyscallDispatcher, spec: &RunSpec) {
 }
 
 fn layer_paths(spec: &RunSpec) -> Vec<PathBuf> {
-    spec.rootfs_layers
+    spec.mounts
+        .rootfs_layers
         .iter()
         .map(|p| PathBuf::from(p.as_std_path()))
         .collect()
@@ -362,7 +363,7 @@ fn prepare_host_backend(
     // Sandboxed container fs: forbid the execve host-fs fallback so a target
     // absent from the container ENOENTs instead of escaping to the host.
     dispatcher.sandbox_exec_to_container();
-    dispatcher.set_executable_path(spec.executable.clone());
+    dispatcher.set_executable_path(spec.process.executable.clone());
     configure_identity_and_policy(&mut dispatcher, spec, container);
 
     let hosts_entries = plan
@@ -372,9 +373,9 @@ fn prepare_host_backend(
     seed_guest_baseline(
         &mut host,
         dispatcher.rootfs(),
-        &spec.network,
+        &spec.network.namespace,
         &hosts_entries,
-        &spec.extra_hosts,
+        &spec.network.extra_hosts,
         &guest_hostname,
     );
     install_spec_mounts(&mut dispatcher, spec);
@@ -390,8 +391,10 @@ fn prepare_memory_backend(
 ) -> Result<(SyscallDispatcher, crate::rootfs::RootFs), RuntimeError> {
     let rootfs = crate::rootfs::RootFs::from_layer_paths(&layer_paths(spec))
         .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {e}")))?;
-    let mut dispatcher =
-        SyscallDispatcher::with_rootfs_and_executable(rootfs.clone(), spec.executable.clone());
+    let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
+        rootfs.clone(),
+        spec.process.executable.clone(),
+    );
     dispatcher.set_container(Arc::clone(container));
     if let Some(snapshot) = plan.host_resolver.as_ref() {
         dispatcher.set_host_resolver_snapshot(snapshot);
@@ -499,7 +502,7 @@ fn prepare_with_lease(
         let net = match Arc::try_unwrap(network) {
             Ok(net) => net.with_interposer(interposer),
             Err(_) => {
-                let net = RuntimeNetwork::create(&spec.network)
+                let net = RuntimeNetwork::create(&spec.network.namespace)
                     .map_err(|e| RuntimeError::Unsupported(format!("network setup failed: {e}")))?;
                 net.with_interposer(interposer)
             }
@@ -522,7 +525,7 @@ fn prepare_with_lease(
         plan.network.model.clone(),
         guest_hostname.as_ref(),
     )
-    .with_launch_capabilities(&spec.cap_add);
+    .with_launch_capabilities(&spec.security.cap_add);
     if let Some(control) = time {
         container = container.with_time_control(control);
     }
@@ -531,7 +534,7 @@ fn prepare_with_lease(
     }
     let container = Arc::new(container);
 
-    match spec.pid {
+    match spec.process.pid {
         PidMode::Host => {}
         PidMode::Private => {
             let region = crate::namespace::pid::NsSharedRegion::allocate(
@@ -548,7 +551,7 @@ fn prepare_with_lease(
         }
     }
 
-    let (mut dispatcher, root) = match spec.fs_backend {
+    let (mut dispatcher, root) = match spec.mounts.fs_backend {
         FsBackendKind::Host => (
             prepare_host_backend(spec, &plan, &container)?,
             RootBacking::Host,
@@ -575,7 +578,7 @@ fn prepare_with_lease(
         dispatcher.install_observer(observer);
     }
     dispatcher.set_stdio_sink(sink);
-    let interactive_session = if spec.tty {
+    let interactive_session = if spec.process.tty {
         Some(InteractiveSession::start(&mut dispatcher).map_err(|e| {
             RuntimeError::FsBackend(anyhow::anyhow!(
                 "failed to create carrier-local interactive PTY: {e}"
@@ -587,11 +590,12 @@ fn prepare_with_lease(
 
     let ExecutionPlan { env, .. } = plan;
     Ok(PreparedRun {
-        executable: spec.executable.clone(),
-        argv: spec.argv.clone(),
+        executable: spec.process.executable.clone(),
+        argv: spec.process.argv.clone(),
         env,
-        max_traps: spec.max_traps,
+        max_traps: spec.resources.max_traps,
         debug_state_path: spec
+            .resources
             .debug_state_path
             .as_ref()
             .map(|p| PathBuf::from(p.as_std_path())),
@@ -770,27 +774,37 @@ mod tests {
 
     fn hvpatch_run_spec() -> RunSpec {
         RunSpec {
-            cap_add: Vec::new(),
-            executable: "/bin/sh".to_string(),
-            argv: vec!["/bin/sh".to_string()],
-            envp: Vec::new(),
-            cwd: Some(Utf8PathBuf::from("/")),
-            rootfs_layers: Vec::new(),
-            fs_backend: FsBackendKind::Host,
-            mounts: Vec::new(),
-            tty: false,
-            stdio: StdioMode::Inherit,
-            max_traps: 100,
-            debug_state_path: None,
+            process: carrick_spec::ProcessSpec {
+                executable: "/bin/sh".to_string(),
+                argv: vec!["/bin/sh".to_string()],
+                envp: Vec::new(),
+                cwd: Some(Utf8PathBuf::from("/")),
+                tty: false,
+                stdio: StdioMode::Inherit,
+                uid: carrick_abi::NsUid::ROOT,
+                gid: carrick_abi::NsGid::ROOT,
+                pid: PidMode::Host,
+            },
+            mounts: carrick_spec::MountSpec {
+                rootfs_layers: Vec::new(),
+                fs_backend: FsBackendKind::Host,
+                mounts: Vec::new(),
+            },
+            network: carrick_spec::NetworkSpec {
+                namespace: NetworkNamespaceSpec::default(),
+                extra_hosts: Vec::new(),
+                hostname: None,
+            },
+            resources: carrick_spec::ResourceSpec {
+                max_traps: 100,
+                debug_state_path: None,
+            },
+            security: carrick_spec::SecuritySpec {
+                seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
+                cap_add: Vec::new(),
+            },
             platform: Platform::Aarch64,
             exec_backend: ExecBackendRequest::HvPatch,
-            pid: PidMode::Host,
-            hostname: None,
-            network: NetworkNamespaceSpec::default(),
-            extra_hosts: Vec::new(),
-            uid: carrick_abi::NsUid::ROOT,
-            gid: carrick_abi::NsGid::ROOT,
-            seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
         }
     }
 
@@ -818,19 +832,19 @@ mod tests {
     #[test]
     fn stdio_mode_and_extension_must_agree() {
         let mut spec = hvpatch_run_spec();
-        spec.stdio = StdioMode::Captured;
+        spec.process.stdio = StdioMode::Captured;
         assert!(matches!(
             resolve_stdio(&spec, None),
             Ok(StdioSink::Captured)
         ));
-        spec.stdio = StdioMode::Inherit;
+        spec.process.stdio = StdioMode::Inherit;
         assert!(matches!(resolve_stdio(&spec, None), Ok(StdioSink::Inherit)));
         // An extension sink on a non-Piped spec is a contradiction, not a silent override.
         assert!(matches!(
             resolve_stdio(&spec, Some(StdioSink::Captured)),
             Err(RuntimeError::Configuration(_))
         ));
-        spec.stdio = StdioMode::Piped;
+        spec.process.stdio = StdioMode::Piped;
         assert!(matches!(
             resolve_stdio(&spec, None),
             Err(RuntimeError::Configuration(_))
@@ -849,8 +863,8 @@ mod tests {
             ),
             Ok(StdioSink::Piped { .. })
         ));
-        spec.tty = true;
-        spec.stdio = StdioMode::Captured;
+        spec.process.tty = true;
+        spec.process.stdio = StdioMode::Captured;
         assert!(matches!(
             resolve_stdio(&spec, None),
             Err(RuntimeError::Configuration(_))
@@ -861,8 +875,8 @@ mod tests {
     #[test]
     fn prepare_failure_releases_pid_placement() {
         let mut spec = hvpatch_run_spec();
-        spec.pid = PidMode::Private;
-        spec.rootfs_layers = vec![Utf8PathBuf::from(
+        spec.process.pid = PidMode::Private;
+        spec.mounts.rootfs_layers = vec![Utf8PathBuf::from(
             "/nonexistent/carrick-prepare-test/sha256-missing-layer",
         )];
         let err = Runtime::prepare(&spec, test_launch(), RuntimeExtensions::default())
@@ -899,7 +913,7 @@ mod tests {
         );
 
         let mut missing = hvpatch_run_spec();
-        missing.rootfs_layers = vec![Utf8PathBuf::from(
+        missing.mounts.rootfs_layers = vec![Utf8PathBuf::from(
             "/nonexistent/carrick-prepare-on-test/sha256-missing-layer",
         )];
         let lease = carrier
@@ -919,7 +933,7 @@ mod tests {
     #[test]
     fn execute_releases_pid_placement_after_the_run() {
         let mut spec = hvpatch_run_spec();
-        spec.pid = PidMode::Private;
+        spec.process.pid = PidMode::Private;
         let result = Runtime::prepare(&spec, test_launch(), RuntimeExtensions::default())
             .expect("empty rootfs prepares")
             .execute()

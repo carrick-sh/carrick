@@ -2932,11 +2932,14 @@ mod tests {
             .expect("resolve run spec")
             .spec;
         // The CLI's wrapper lowers docker-shaped streaming into the spec.
-        assert_eq!(spec.stdio, carrick_spec::StdioMode::Inherit);
+        assert_eq!(spec.process.stdio, carrick_spec::StdioMode::Inherit);
 
-        assert_eq!(spec.network.mode, carrick_spec::NetworkMode::Bridge);
-        assert_eq!(spec.network.bridge_id.as_str(), "compose_default");
-        assert_eq!(spec.network.aliases, vec!["api".to_string()]);
+        assert_eq!(
+            spec.network.namespace.mode,
+            carrick_spec::NetworkMode::Bridge
+        );
+        assert_eq!(spec.network.namespace.bridge_id.as_str(), "compose_default");
+        assert_eq!(spec.network.namespace.aliases, vec!["api".to_string()]);
     }
 
     #[test]

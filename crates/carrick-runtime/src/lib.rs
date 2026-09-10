@@ -130,6 +130,7 @@ pub(crate) mod exec_helpers;
 pub(crate) mod fanotify;
 pub mod fs_backend;
 pub mod fs_resolve_cache;
+pub mod host_process;
 pub mod host_tty;
 pub(crate) mod inotify;
 pub mod interactive_supervisor;

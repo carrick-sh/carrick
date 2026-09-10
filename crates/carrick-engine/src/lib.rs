@@ -76,9 +76,9 @@ use std::collections::HashMap;
 pub use carrick_image::{ImageStore, ResolvedImage};
 pub use carrick_runtime::runtime::RunResult;
 pub use carrick_spec::{
-    BridgeId, FsBackendKind, ImageConfig, Mount, NetworkAttachmentSpec, NetworkMode,
-    NetworkNamespaceId, NetworkNamespaceSpec, PidMode, Platform, PortMapping, RunSpec,
-    SeccompPolicy, StdioMode,
+    BridgeId, FsBackendKind, ImageConfig, Mount, MountSpec, NetworkAttachmentSpec, NetworkMode,
+    NetworkNamespaceId, NetworkNamespaceSpec, NetworkSpec, PidMode, Platform, PortMapping,
+    ProcessSpec, ResourceSpec, RunSpec, SeccompPolicy, SecuritySpec, StdioMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,27 +531,37 @@ pub fn resolve_run_spec(req: RunRequest, image: ResolvedImage) -> Result<Resolve
     let seccomp_policy = resolve_seccomp_policy(base_seccomp_policy, &req.security_opts)?;
 
     let spec = RunSpec {
-        cap_add: req.cap_add.clone(),
-        executable,
-        argv,
-        envp,
-        cwd,
-        rootfs_layers: image.layers,
-        fs_backend,
-        mounts: req.mounts,
-        tty: req.tty,
-        stdio: req.stdio,
-        max_traps: req.max_traps,
-        debug_state_path,
+        process: ProcessSpec {
+            executable,
+            argv,
+            envp,
+            cwd,
+            tty: req.tty,
+            stdio: req.stdio,
+            uid,
+            gid,
+            pid: req.pid,
+        },
+        mounts: MountSpec {
+            rootfs_layers: image.layers,
+            fs_backend,
+            mounts: req.mounts,
+        },
+        network: NetworkSpec {
+            namespace: network,
+            extra_hosts: req.extra_hosts,
+            hostname: req.hostname,
+        },
+        resources: ResourceSpec {
+            max_traps: req.max_traps,
+            debug_state_path,
+        },
+        security: SecuritySpec {
+            seccomp_policy,
+            cap_add: req.cap_add.clone(),
+        },
         platform,
         exec_backend: req.exec_backend,
-        pid: req.pid,
-        hostname: req.hostname,
-        network,
-        extra_hosts: req.extra_hosts,
-        uid,
-        gid,
-        seccomp_policy,
     };
     Ok(Resolved { spec, warnings })
 }
@@ -789,6 +799,19 @@ impl Engine {
     }
 }
 
+/// Run a single OCI-related future on a short-lived current-thread tokio
+/// runtime. The runtime is dropped before returning, so by the time the
+/// guest issues `clone(2)` and we fork the host process there is no
+/// async runtime alive in the parent to corrupt the child.
+pub fn block_on_oci<F: std::future::Future>(fut: F) -> F::Output {
+    #[allow(clippy::expect_used)]
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build current-thread tokio runtime")
+        .block_on(fut)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,45 +891,55 @@ mod tests {
     /// namespace spec, `seccomp=unconfined` opting out.
     fn parity_expected() -> RunSpec {
         RunSpec {
-            executable: "/bin/ls".to_string(),
-            argv: vec!["/bin/ls".to_string(), "-l".to_string()],
-            envp: vec![
-                "CUSTOM=2".to_string(),
-                "DEBIAN_FRONTEND=noninteractive".to_string(),
-                "HOME=/root".to_string(),
-                "LANG=C.UTF-8".to_string(),
-                "LC_ALL=C.UTF-8".to_string(),
-                "PAGER=cat".to_string(),
-                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-                "TERM=xterm-256color".to_string(),
-            ],
-            cwd: Some(Utf8PathBuf::from("/app")),
-            rootfs_layers: vec![Utf8PathBuf::from("/layer1")],
-            fs_backend: FsBackendKind::Host,
-            mounts: vec![Mount {
-                source: Utf8PathBuf::from("/h"),
-                target: Utf8PathBuf::from("/g"),
-                readonly: true,
-            }],
-            tty: false,
-            stdio: StdioMode::Inherit,
-            max_traps: 100,
-            debug_state_path: Some(Utf8PathBuf::from("/tmp/state")),
+            process: ProcessSpec {
+                executable: "/bin/ls".to_string(),
+                argv: vec!["/bin/ls".to_string(), "-l".to_string()],
+                envp: vec![
+                    "CUSTOM=2".to_string(),
+                    "DEBIAN_FRONTEND=noninteractive".to_string(),
+                    "HOME=/root".to_string(),
+                    "LANG=C.UTF-8".to_string(),
+                    "LC_ALL=C.UTF-8".to_string(),
+                    "PAGER=cat".to_string(),
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                    "TERM=xterm-256color".to_string(),
+                ],
+                cwd: Some(Utf8PathBuf::from("/app")),
+                tty: false,
+                stdio: StdioMode::Inherit,
+                uid: carrick_abi::NsUid::new(1000),
+                gid: carrick_abi::NsGid::new(2000),
+                pid: PidMode::Private,
+            },
+            mounts: MountSpec {
+                rootfs_layers: vec![Utf8PathBuf::from("/layer1")],
+                fs_backend: FsBackendKind::Host,
+                mounts: vec![Mount {
+                    source: Utf8PathBuf::from("/h"),
+                    target: Utf8PathBuf::from("/g"),
+                    readonly: true,
+                }],
+            },
+            network: NetworkSpec {
+                namespace: NetworkNamespaceSpec {
+                    dns_servers: vec!["1.1.1.1".parse::<std::net::IpAddr>().expect("ip")],
+                    dns_search: vec!["example.test".to_string()],
+                    dns_options: vec!["ndots:2".to_string()],
+                    ..NetworkNamespaceSpec::default()
+                },
+                extra_hosts: vec!["db.local:10.12.0.7".to_string()],
+                hostname: Some("api-host".to_string()),
+            },
+            resources: ResourceSpec {
+                max_traps: 100,
+                debug_state_path: Some(Utf8PathBuf::from("/tmp/state")),
+            },
+            security: SecuritySpec {
+                seccomp_policy: SeccompPolicy::Unconfined,
+                cap_add: vec!["SYS_PTRACE".to_string()],
+            },
             platform: Platform::host_native(),
             exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-            pid: PidMode::Private,
-            hostname: Some("api-host".to_string()),
-            network: NetworkNamespaceSpec {
-                dns_servers: vec!["1.1.1.1".parse::<std::net::IpAddr>().expect("ip")],
-                dns_search: vec!["example.test".to_string()],
-                dns_options: vec!["ndots:2".to_string()],
-                ..NetworkNamespaceSpec::default()
-            },
-            extra_hosts: vec!["db.local:10.12.0.7".to_string()],
-            uid: carrick_abi::NsUid::new(1000),
-            gid: carrick_abi::NsGid::new(2000),
-            seccomp_policy: SeccompPolicy::Unconfined,
-            cap_add: vec!["SYS_PTRACE".to_string()],
         }
     }
 
@@ -943,11 +976,17 @@ mod tests {
         }];
 
         let spec = spec_of(req, image).expect("resolve run spec");
-        assert_eq!(spec.network.mode, NetworkMode::Bridge);
-        assert_eq!(spec.network.container_name.as_deref(), Some("web"));
-        assert_eq!(spec.network.aliases, vec!["api"]);
-        assert_eq!(spec.network.bridge_id.as_str(), "carrick0");
-        assert_eq!(spec.network.published_ports[0].host_port, Some(8080));
+        assert_eq!(spec.network.namespace.mode, NetworkMode::Bridge);
+        assert_eq!(
+            spec.network.namespace.container_name.as_deref(),
+            Some("web")
+        );
+        assert_eq!(spec.network.namespace.aliases, vec!["api"]);
+        assert_eq!(spec.network.namespace.bridge_id.as_str(), "carrick0");
+        assert_eq!(
+            spec.network.namespace.published_ports[0].host_port,
+            Some(8080)
+        );
     }
 
     #[test]
@@ -959,8 +998,8 @@ mod tests {
 
         let spec = spec_of(req, image).expect("resolve run spec");
 
-        assert_eq!(spec.network.mode, NetworkMode::Bridge);
-        assert_eq!(spec.network.ipv4.to_string(), "172.31.44.10");
+        assert_eq!(spec.network.namespace.mode, NetworkMode::Bridge);
+        assert_eq!(spec.network.namespace.ipv4.to_string(), "172.31.44.10");
     }
 
     /// `172.31.0.0/24` holds the bridge gateway and the placeholder handed to a
@@ -993,6 +1032,7 @@ mod tests {
             spec_of(req, image)
                 .expect("172.31.1.2 is allocatable")
                 .network
+                .namespace
                 .ipv4
                 .to_string(),
             "172.31.1.2"
@@ -1016,7 +1056,7 @@ mod tests {
         req.extra_hosts = vec!["db.local:10.12.0.7".to_string()];
 
         let spec = spec_of(req, image).expect("resolve run spec");
-        assert_eq!(spec.extra_hosts, vec!["db.local:10.12.0.7"]);
+        assert_eq!(spec.network.extra_hosts, vec!["db.local:10.12.0.7"]);
     }
 
     #[test]
@@ -1026,7 +1066,7 @@ mod tests {
         req.hostname = Some("api-host".to_string());
 
         let spec = spec_of(req, image).expect("resolve run spec");
-        assert_eq!(spec.hostname.as_deref(), Some("api-host"));
+        assert_eq!(spec.network.hostname.as_deref(), Some("api-host"));
     }
 
     #[test]
@@ -1039,14 +1079,14 @@ mod tests {
 
         let spec = spec_of(req, image).expect("resolve run spec");
         assert_eq!(
-            spec.network.dns_servers,
+            spec.network.namespace.dns_servers,
             vec![
                 "1.1.1.1".parse::<std::net::IpAddr>().unwrap(),
                 "9.9.9.9".parse::<std::net::IpAddr>().unwrap(),
             ]
         );
-        assert_eq!(spec.network.dns_search, vec!["example.test"]);
-        assert_eq!(spec.network.dns_options, vec!["ndots:2"]);
+        assert_eq!(spec.network.namespace.dns_search, vec!["example.test"]);
+        assert_eq!(spec.network.namespace.dns_options, vec!["ndots:2"]);
     }
 
     #[test]
@@ -1054,7 +1094,7 @@ mod tests {
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
         let spec = spec_of(base_req(Some("1000:2000")), image).unwrap();
         assert_eq!(
-            (spec.uid, spec.gid),
+            (spec.process.uid, spec.process.gid),
             (carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(2000))
         );
     }
@@ -1065,7 +1105,7 @@ mod tests {
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
         let spec = spec_of(base_req(Some("1000")), image).unwrap();
         assert_eq!(
-            (spec.uid, spec.gid),
+            (spec.process.uid, spec.process.gid),
             (carrick_abi::NsUid::new(1000), carrick_abi::NsGid::ROOT)
         );
     }
@@ -1076,7 +1116,7 @@ mod tests {
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
         let spec = spec_of(base_req(None), image).unwrap();
         assert_eq!(
-            (spec.uid, spec.gid),
+            (spec.process.uid, spec.process.gid),
             (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
         );
     }
@@ -1095,7 +1135,7 @@ mod tests {
         req.entrypoint_override = Some(vec![]);
         req.args = vec![];
         let spec = spec_of(req, image).unwrap();
-        assert_eq!(spec.argv, vec!["echo", "hi"]);
+        assert_eq!(spec.process.argv, vec!["echo", "hi"]);
     }
 
     #[test]
@@ -1109,8 +1149,8 @@ mod tests {
         let mut req = base_req(None);
         req.args = vec![];
         let spec = spec_of(req, image).unwrap();
-        assert_eq!(spec.executable, "/bin/sh");
-        assert_eq!(spec.argv, vec!["/bin/sh", "-c", "echo hi"]);
+        assert_eq!(spec.process.executable, "/bin/sh");
+        assert_eq!(spec.process.argv, vec!["/bin/sh", "-c", "echo hi"]);
     }
 
     #[test]
@@ -1123,7 +1163,7 @@ mod tests {
         );
         let req = base_req(None);
         let spec = spec_of(req, image).unwrap();
-        assert_eq!(spec.argv, vec!["/bin/sh", "/bin/ls"]);
+        assert_eq!(spec.process.argv, vec!["/bin/sh", "/bin/ls"]);
     }
 
     #[test]
@@ -1138,7 +1178,7 @@ mod tests {
         req.args = vec![];
         req.entrypoint_override = Some(vec!["/bin/bash".to_string()]);
         let spec = spec_of(req, image).unwrap();
-        assert_eq!(spec.argv, vec!["/bin/bash", "-c", "echo hi"]);
+        assert_eq!(spec.process.argv, vec!["/bin/bash", "-c", "echo hi"]);
     }
 
     #[test]
@@ -1154,6 +1194,7 @@ mod tests {
         let spec = spec_of(req, image).unwrap();
 
         let env_map: HashMap<String, String> = spec
+            .process
             .envp
             .iter()
             .map(|e| {
@@ -1175,7 +1216,7 @@ mod tests {
         let mut req = base_req(None);
         req.workdir = Some("/user/app".to_string());
         let spec = spec_of(req, image).unwrap();
-        assert_eq!(spec.cwd.unwrap().as_str(), "/user/app");
+        assert_eq!(spec.process.cwd.unwrap().as_str(), "/user/app");
     }
 
     #[test]
@@ -1186,7 +1227,12 @@ mod tests {
             let image = make_test_image(None, None, vec![], img_wd.map(Utf8PathBuf::from));
             let mut req = base_req(None);
             req.workdir = wd.map(|s| s.to_string());
-            spec_of(req, image).unwrap().cwd.unwrap().to_string()
+            spec_of(req, image)
+                .unwrap()
+                .process
+                .cwd
+                .unwrap()
+                .to_string()
         };
         // relative joins onto the image WorkingDir (the go-conformance case)
         assert_eq!(
@@ -1205,7 +1251,10 @@ mod tests {
         // launch-time seccomp profile.
         let image = make_test_image(None, None, vec![], None);
         let spec = spec_of(base_req(None), image).unwrap();
-        assert_eq!(spec.seccomp_policy, SeccompPolicy::ContainerDefault);
+        assert_eq!(
+            spec.security.seccomp_policy,
+            SeccompPolicy::ContainerDefault
+        );
     }
 
     #[test]
@@ -1214,7 +1263,7 @@ mod tests {
         let mut req = base_req(None);
         req.security_opts = vec!["seccomp=unconfined".to_string()];
         let spec = spec_of(req, image).unwrap();
-        assert_eq!(spec.seccomp_policy, SeccompPolicy::Unconfined);
+        assert_eq!(spec.security.seccomp_policy, SeccompPolicy::Unconfined);
     }
 
     #[test]
@@ -1319,7 +1368,7 @@ mod tests {
         let mut req = base_req(None);
         req.stdio = StdioMode::Captured;
         assert_eq!(
-            spec_of(req, image).expect("resolve").stdio,
+            spec_of(req, image).expect("resolve").process.stdio,
             StdioMode::Captured
         );
     }
@@ -1335,11 +1384,12 @@ mod tests {
         )]);
         let spec = spec_of(req, image).expect("resolve");
         assert!(
-            spec.envp
+            spec.process
+                .envp
                 .iter()
                 .any(|e| e == "CARRICK_TEST_IMPORT_XYZ=from-host"),
             "bare `-e KEY` imports from the snapshot; envp={:?}",
-            spec.envp
+            spec.process.envp
         );
     }
 
@@ -1358,11 +1408,12 @@ mod tests {
         unsafe { std::env::remove_var("CARRICK_TEST_NO_IMPORT_XYZ") };
         assert!(
             !spec
+                .process
                 .envp
                 .iter()
                 .any(|e| e.starts_with("CARRICK_TEST_NO_IMPORT_XYZ=")),
             "engine read std::env; envp={:?}",
-            spec.envp
+            spec.process.envp
         );
     }
 
@@ -1382,6 +1433,7 @@ mod tests {
         let spec = spec_of(req, image).expect("explicit id");
         assert_eq!(
             spec.network
+                .namespace
                 .namespace_id
                 .as_ref()
                 .map(NetworkNamespaceId::as_str),
@@ -1424,14 +1476,14 @@ mod tests {
         // root -> (0, 0)
         let spec = spec_of(base_req(Some("root")), image.clone()).expect("root resolve");
         assert_eq!(
-            (spec.uid, spec.gid),
+            (spec.process.uid, spec.process.gid),
             (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
         );
 
         // nobody -> (65534, 65534)
         let spec = spec_of(base_req(Some("nobody")), image.clone()).expect("nobody resolve");
         assert_eq!(
-            (spec.uid, spec.gid),
+            (spec.process.uid, spec.process.gid),
             (
                 carrick_abi::NsUid::new(65534),
                 carrick_abi::NsGid::new(65534)
@@ -1442,7 +1494,7 @@ mod tests {
         let spec =
             spec_of(base_req(Some("alice:developers")), image.clone()).expect("alice:dev resolve");
         assert_eq!(
-            (spec.uid, spec.gid),
+            (spec.process.uid, spec.process.gid),
             (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(1002))
         );
 
@@ -1450,7 +1502,7 @@ mod tests {
         let spec = spec_of(base_req(Some("1001:developers")), image.clone())
             .expect("numeric:group resolve");
         assert_eq!(
-            (spec.uid, spec.gid),
+            (spec.process.uid, spec.process.gid),
             (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(1002))
         );
 
@@ -1458,7 +1510,7 @@ mod tests {
         let spec =
             spec_of(base_req(Some("alice:2000")), image.clone()).expect("user:numeric resolve");
         assert_eq!(
-            (spec.uid, spec.gid),
+            (spec.process.uid, spec.process.gid),
             (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(2000))
         );
 
@@ -1521,9 +1573,9 @@ mod tests {
         let store = ImageStore::new(store_dir.path());
         let engine = Engine::new(store);
         let resolved = engine.resolve(req).await.expect("resolve host elf");
-        assert_eq!(resolved.spec.executable, utf8_elf.as_str());
+        assert_eq!(resolved.spec.process.executable, utf8_elf.as_str());
         assert_eq!(
-            resolved.spec.argv,
+            resolved.spec.process.argv,
             vec![
                 utf8_elf.as_str().to_string(),
                 "--flag".to_string(),
@@ -1531,12 +1583,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolved.spec.seccomp_policy,
+            resolved.spec.security.seccomp_policy,
             carrick_spec::SeccompPolicy::Unconfined
         );
         assert!(
             resolved
                 .spec
+                .mounts
                 .mounts
                 .iter()
                 .any(|m| m.target == utf8_elf && m.readonly)

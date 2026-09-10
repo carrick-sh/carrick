@@ -1027,6 +1027,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-runtime/src/host_process.rs",
+      "symbol": "PREPARE_ONCE",
+      "fingerprint": "922d1157ec5274051d3d7d69c51edb7c04b2dea2e4733fb1c06f98c6ec6f9b0e",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure static PREPARE_ONCE in crates/carrick-runtime/src/host_process.rs ensuring process-wide preparation (SIGPIPE ignore, proctitle, OS_ACTIVITY_MODE) runs idempotently exactly once."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-runtime/src/host_tty.rs",
       "symbol": "SAVED_TERMIOS",
       "fingerprint": "7ae03c7da0b020fa6b340b32b56dcb84d284009df4e6d13b44d40b6c1d539557",

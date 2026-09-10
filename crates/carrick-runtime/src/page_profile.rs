@@ -111,27 +111,37 @@ mod tests {
         exec_backend: ExecBackendRequest,
     ) -> RunSpec {
         RunSpec {
-            cap_add: Vec::new(),
-            executable: "/bin/sh".to_string(),
-            argv: vec!["/bin/sh".to_string()],
-            envp: Vec::new(),
-            cwd: Some(Utf8PathBuf::from("/")),
-            rootfs_layers: Vec::new(),
-            fs_backend: carrick_spec::FsBackendKind::Host,
-            mounts: Vec::new(),
-            tty: false,
-            stdio: carrick_spec::StdioMode::Inherit,
-            max_traps: 100,
-            debug_state_path: None,
+            process: carrick_spec::ProcessSpec {
+                executable: "/bin/sh".to_string(),
+                argv: vec!["/bin/sh".to_string()],
+                envp: Vec::new(),
+                cwd: Some(Utf8PathBuf::from("/")),
+                tty: false,
+                stdio: carrick_spec::StdioMode::Inherit,
+                uid: carrick_abi::NsUid::ROOT,
+                gid: carrick_abi::NsGid::ROOT,
+                pid: carrick_spec::PidMode::Private,
+            },
+            mounts: carrick_spec::MountSpec {
+                rootfs_layers: Vec::new(),
+                fs_backend: carrick_spec::FsBackendKind::Host,
+                mounts: Vec::new(),
+            },
+            network: carrick_spec::NetworkSpec {
+                namespace: carrick_spec::NetworkNamespaceSpec::default(),
+                extra_hosts: Vec::new(),
+                hostname: None,
+            },
+            resources: carrick_spec::ResourceSpec {
+                max_traps: 100,
+                debug_state_path: None,
+            },
+            security: carrick_spec::SecuritySpec {
+                seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
+                cap_add: Vec::new(),
+            },
             platform,
             exec_backend,
-            pid: carrick_spec::PidMode::Private,
-            hostname: None,
-            network: carrick_spec::NetworkNamespaceSpec::default(),
-            extra_hosts: Vec::new(),
-            uid: carrick_abi::NsUid::ROOT,
-            gid: carrick_abi::NsGid::ROOT,
-            seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
         }
     }
 

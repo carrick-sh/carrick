@@ -15,7 +15,7 @@ use carrick_spec::{Mount, Platform, StdioMode};
 use crate::carrier::CarrierBinding;
 use crate::prepared::PreparedCarrierOwnership;
 use crate::result::{CaptureBuffer, CapturedStreams};
-use crate::{ContainerResult, EmbedError, PreparedContainer};
+use crate::{BuildError, ContainerResult, EmbedError, PreparedContainer};
 
 /// Where one guest stdio stream goes.
 pub enum StdioConfig {
@@ -237,32 +237,28 @@ impl ContainerBuilder {
     }
 
     /// Bind-mount an absolute host path at an absolute guest path, read-write.
-    pub fn mount(self, host: impl Into<String>, guest: impl Into<String>) -> Self {
-        self.push_mount(host, guest, false)
+    pub fn mount(mut self, host: impl Into<String>, guest: impl Into<String>) -> Self {
+        self.mounts.push(Mount {
+            source: Utf8PathBuf::from(host.into()),
+            target: Utf8PathBuf::from(guest.into()),
+            readonly: false,
+        });
+        self
     }
 
     /// Bind-mount an absolute host path at an absolute guest path, read-only.
-    pub fn mount_readonly(self, host: impl Into<String>, guest: impl Into<String>) -> Self {
-        self.push_mount(host, guest, true)
+    pub fn mount_readonly(mut self, host: impl Into<String>, guest: impl Into<String>) -> Self {
+        self.mounts.push(Mount {
+            source: Utf8PathBuf::from(host.into()),
+            target: Utf8PathBuf::from(guest.into()),
+            readonly: true,
+        });
+        self
     }
 
     /// Mount a custom [`Vfs`] decorator or in-memory filesystem at an absolute guest path.
     pub fn vfs_mount(mut self, guest: impl Into<String>, vfs: Box<dyn Vfs>) -> Self {
         self.vfs_mounts.push((Utf8PathBuf::from(guest.into()), vfs));
-        self
-    }
-
-    fn push_mount(
-        mut self,
-        host: impl Into<String>,
-        guest: impl Into<String>,
-        readonly: bool,
-    ) -> Self {
-        self.mounts.push(Mount {
-            source: Utf8PathBuf::from(host.into()),
-            target: Utf8PathBuf::from(guest.into()),
-            readonly,
-        });
         self
     }
 
@@ -310,7 +306,8 @@ impl ContainerBuilder {
     /// host process, not this container: a post-mortem describes the kernel,
     /// and a host process owns exactly one carrier and one kernel graph.
     /// `CARRICK_POSTMORTEM_DIR` is the environment spelling of the same knob.
-    pub fn post_mortem_dir(self, dir: impl Into<std::path::PathBuf>) -> Self {
+    pub fn post_mortem_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        let _ = &mut self;
         carrick_runtime::kernel::debug::PostMortem::install_dir(dir.into());
         self
     }
@@ -347,8 +344,9 @@ impl ContainerBuilder {
     }
 
     /// Attach a fault injector to simulate syscall and I/O failures.
-    pub fn fault_injector(self, injector: carrick_runtime::observe::FaultInjector) -> Self {
-        self.observer(std::sync::Arc::new(injector))
+    pub fn fault_injector(mut self, injector: carrick_runtime::observe::FaultInjector) -> Self {
+        self.observers.push(std::sync::Arc::new(injector));
+        self
     }
 
     /// Attach a resource budget quota to the container.
@@ -405,42 +403,89 @@ impl ContainerBuilder {
         self
     }
 
-    /// Lower into the engine's request. Pure: no I/O, no ambient reads.
-    pub fn to_run_request(&self) -> Result<RunRequest, EmbedError> {
+    fn validate(&self) -> Result<(), BuildError> {
         if self.image.trim().is_empty() {
-            return Err(EmbedError::Config("image reference is empty".to_string()));
+            return Err(BuildError::InvalidImageRef {
+                image: self.image.clone(),
+                reason: "image reference cannot be empty".to_string(),
+            });
         }
-        let mut env_overrides = Vec::with_capacity(self.env.len());
-        for (key, value) in &self.env {
-            if key.is_empty() || key.contains('=') {
-                return Err(EmbedError::Config(format!(
-                    "environment key {key:?} must be non-empty and contain no '='"
-                )));
+        if let Err(error) = carrick_spec::ImageReference::parse(&self.image) {
+            return Err(BuildError::InvalidImageRef {
+                image: self.image.clone(),
+                reason: error.to_string(),
+            });
+        }
+        if let Some(workdir) = &self.workdir {
+            if workdir.is_empty() {
+                return Err(BuildError::InvalidWorkdir {
+                    workdir: workdir.clone(),
+                    reason: "working directory cannot be empty".to_string(),
+                });
             }
-            env_overrides.push(format!("{key}={value}"));
+            if workdir.contains('\0') {
+                return Err(BuildError::InvalidWorkdir {
+                    workdir: workdir.clone(),
+                    reason: "working directory cannot contain NUL bytes".to_string(),
+                });
+            }
         }
         if let Some(user) = &self.user
             && !is_numeric_user(user)
         {
-            return Err(EmbedError::Config(format!(
-                "user {user:?} must be numeric `uid[:gid]`: carrick-embed does not resolve \
-                 names against the image's /etc/passwd"
-            )));
+            return Err(BuildError::InvalidUser {
+                user: user.clone(),
+                reason: "user must be numeric `uid[:gid]`: carrick-embed does not resolve \
+                         names against the image's /etc/passwd"
+                    .to_string(),
+            });
+        }
+        for (key, value) in &self.env {
+            if key.is_empty() {
+                return Err(BuildError::InvalidEnv {
+                    key: key.clone(),
+                    reason: "environment variable key cannot be empty".to_string(),
+                });
+            }
+            if key.contains('=') {
+                return Err(BuildError::InvalidEnv {
+                    key: key.clone(),
+                    reason: "environment variable key cannot contain '='".to_string(),
+                });
+            }
+            if key.contains('\0') || value.contains('\0') {
+                return Err(BuildError::InvalidEnv {
+                    key: key.clone(),
+                    reason: "environment variable cannot contain NUL bytes".to_string(),
+                });
+            }
         }
         for mount in &self.mounts {
             if !mount.source.is_absolute() || !mount.target.is_absolute() {
-                return Err(EmbedError::Config(format!(
-                    "mount {} -> {} must use absolute host and guest paths",
-                    mount.source, mount.target
-                )));
+                return Err(BuildError::InvalidMount {
+                    source_path: mount.source.clone(),
+                    target_path: mount.target.clone(),
+                    reason: "mount must use absolute host and guest paths".to_string(),
+                });
             }
         }
         for (target, _) in &self.vfs_mounts {
             if !target.is_absolute() {
-                return Err(EmbedError::Config(format!(
-                    "vfs_mount {target} must use an absolute guest path"
-                )));
+                return Err(BuildError::InvalidVfsMount {
+                    target: target.clone(),
+                    reason: "vfs mount must use an absolute guest path".to_string(),
+                });
             }
+        }
+        Ok(())
+    }
+
+    /// Lower into the engine's request. Pure: no I/O, no ambient reads.
+    pub fn to_run_request(&self) -> Result<RunRequest, EmbedError> {
+        self.validate()?;
+        let mut env_overrides = Vec::with_capacity(self.env.len());
+        for (key, value) in &self.env {
+            env_overrides.push(format!("{key}={value}"));
         }
         Ok(RunRequest {
             image_ref: self.image.clone(),
@@ -469,9 +514,91 @@ impl ContainerBuilder {
         })
     }
 
+    /// Validate configuration and construct a runnable [`Container`].
+    pub fn build(self) -> Result<Container, BuildError> {
+        self.validate()?;
+        Ok(Container {
+            carrier: self.carrier,
+            image: self.image,
+            platform: self.platform,
+            pull: self.pull,
+            store: self.store,
+            command: self.command,
+            entrypoint: self.entrypoint,
+            env: self.env,
+            workdir: self.workdir,
+            user: self.user,
+            hostname: self.hostname,
+            mounts: self.mounts,
+            security_opts: self.security_opts,
+            cap_add: self.cap_add,
+            vfs_mounts: self.vfs_mounts,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            time: self.time,
+            scheduler: self.scheduler,
+            budget: self.budget,
+            max_traps: self.max_traps,
+            observers: self.observers,
+            interceptors: self.interceptors,
+            auditors: self.auditors,
+            network_interposer: self.network_interposer,
+            shared_buffers: self.shared_buffers,
+        })
+    }
+
+    /// Resolve the image (async) and freeze the run. Validates configuration at build time.
+    pub async fn prepare(self) -> Result<PreparedContainer, EmbedError> {
+        self.build()?.prepare().await
+    }
+
+    /// Resolve on the ambient tokio runtime, then execute on its blocking pool.
+    pub async fn run(self) -> Result<ContainerResult, EmbedError> {
+        self.build()?.run().await
+    }
+
+    /// Resolve on a private current-thread runtime (dropped before execution),
+    /// then execute on the calling thread. Refuses to run inside a tokio
+    /// runtime (`block_on` would panic there); use [`Self::run`] instead.
+    pub fn run_blocking(self) -> Result<ContainerResult, EmbedError> {
+        self.build()?.run_blocking()
+    }
+}
+
+impl Container {
+    /// Lower into the engine's request. Pure: no I/O, no ambient reads.
+    pub fn to_run_request(&self) -> RunRequest {
+        let mut env_overrides = Vec::with_capacity(self.env.len());
+        for (key, value) in &self.env {
+            env_overrides.push(format!("{key}={value}"));
+        }
+        RunRequest {
+            image_ref: self.image.clone(),
+            platform: self
+                .platform
+                .map(|platform| format!("linux/{}", platform.oci_arch())),
+            args: self.command.clone(),
+            entrypoint_override: self.entrypoint.clone(),
+            env_overrides,
+            host_env: None,
+            mounts: self.mounts.clone(),
+            workdir: self.workdir.clone(),
+            user: self.user.clone(),
+            hostname: self.hostname.clone(),
+            security_opts: self.security_opts.clone(),
+            cap_add: self.cap_add.clone(),
+            max_traps: self.max_traps,
+            pull: self.pull,
+            stdio: stdio_mode(&self.stdout, &self.stderr),
+            bridge_namespace_id: None,
+            ..RunRequest::default()
+        }
+    }
+
     /// Resolve the image (async) and freeze the run. No guest work happens here.
     pub async fn prepare(self) -> Result<PreparedContainer, EmbedError> {
-        let request = self.to_run_request()?;
+        carrick_runtime::host_process::prepare();
+        let request = self.to_run_request();
         // Reserve identity before image I/O. If resolution fails, the exact
         // prepared lease drops here and removes only this reservation.
         let (carrier, carrier_lease, implicit_carrier) = self.carrier.reserve()?;
@@ -541,11 +668,6 @@ impl ContainerBuilder {
     }
 
     /// Resolve on the ambient tokio runtime, then execute on its blocking pool.
-    ///
-    /// Requires the runtime seam (Task 21/22) to have retired the
-    /// `Handle::try_current().is_err()` debug assertion that guarded the old
-    /// `Runtime::execute` (`execute.rs:197-201`): a `spawn_blocking` thread
-    /// carries a runtime handle by construction.
     pub async fn run(self) -> Result<ContainerResult, EmbedError> {
         let prepared = self.prepare().await?;
         tokio::task::spawn_blocking(move || prepared.execute())
@@ -563,18 +685,48 @@ impl ContainerBuilder {
                     .to_string(),
             ));
         }
-        let prepared = {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| {
-                    EmbedError::Config(format!(
-                        "failed to build the image-resolution tokio runtime: {error}"
-                    ))
-                })?;
-            runtime.block_on(self.prepare())?
-        };
+        let prepared = carrick_engine::block_on_oci(self.prepare())?;
         prepared.execute()
+    }
+}
+
+/// A validated, runnable container configuration.
+pub struct Container {
+    carrier: CarrierBinding,
+    image: String,
+    platform: Option<Platform>,
+    pull: PullPolicy,
+    store: Option<ImageStore>,
+    command: Vec<String>,
+    entrypoint: Option<Vec<String>>,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    user: Option<String>,
+    hostname: Option<String>,
+    mounts: Vec<Mount>,
+    security_opts: Vec<String>,
+    cap_add: Vec<String>,
+    vfs_mounts: Vec<(Utf8PathBuf, Box<dyn Vfs>)>,
+    stdout: StdioConfig,
+    stderr: StdioConfig,
+    time: Option<carrick_runtime::kernel::TimeControl>,
+    scheduler: Option<std::sync::Arc<dyn carrick_hal::SchedulingPolicy>>,
+    budget: Option<carrick_runtime::observe::ResourceBudget>,
+    max_traps: usize,
+    observers: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallObserver>>,
+    interceptors: Vec<std::sync::Arc<dyn carrick_runtime::observe::SyscallInterceptor>>,
+    auditors: Vec<std::sync::Arc<dyn carrick_runtime::observe::KernelAuditor>>,
+    network_interposer: Option<carrick_runtime::network::interposer::NetworkInterposer>,
+    shared_buffers: Vec<(String, crate::SharedBuffer)>,
+}
+
+impl std::fmt::Debug for Container {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Container")
+            .field("image", &self.image)
+            .field("workdir", &self.workdir)
+            .field("user", &self.user)
+            .finish_non_exhaustive()
     }
 }
 
@@ -670,9 +822,9 @@ mod tests {
             .spec;
 
         assert_eq!(from_builder, from_hand);
-        assert!(from_builder.envp.contains(&"A=later".to_string()));
-        assert!(from_builder.envp.contains(&"B=image".to_string()));
-        assert!(!from_builder.envp.contains(&"A=image".to_string()));
+        assert!(from_builder.process.envp.contains(&"A=later".to_string()));
+        assert!(from_builder.process.envp.contains(&"B=image".to_string()));
+        assert!(!from_builder.process.envp.contains(&"A=image".to_string()));
     }
 
     #[test]
@@ -687,7 +839,7 @@ mod tests {
         .unwrap()
         .spec;
         assert_eq!(
-            spec.argv,
+            spec.process.argv,
             strings(&["/bin/sh", "/bin/ls"]),
             "docker: cmd override keeps ENTRYPOINT"
         );
@@ -705,7 +857,7 @@ mod tests {
         )
         .unwrap()
         .spec;
-        assert_eq!(overridden.argv, strings(&["/bin/ls", "-c", "true"]));
+        assert_eq!(overridden.process.argv, strings(&["/bin/ls", "-c", "true"]));
 
         let cleared = resolve_run_spec(
             ContainerBuilder::from_image("alpine")
@@ -717,7 +869,7 @@ mod tests {
         )
         .unwrap()
         .spec;
-        assert_eq!(cleared.argv, strings(&["/bin/true"]));
+        assert_eq!(cleared.process.argv, strings(&["/bin/true"]));
     }
 
     #[test]
@@ -746,21 +898,21 @@ mod tests {
         let spec = resolve_run_spec(request.clone(), image(None, Some(&["/bin/sh"]), &[]))
             .unwrap()
             .spec;
-        assert_eq!(spec.mounts, request.mounts);
+        assert_eq!(spec.mounts.mounts, request.mounts);
     }
 
     #[test]
     fn relative_mount_paths_are_a_config_error() {
         let error = ContainerBuilder::from_image("alpine")
             .mount("data", "/data")
-            .to_run_request()
+            .build()
             .unwrap_err();
-        assert!(matches!(error, EmbedError::Config(_)), "{error}");
+        assert!(matches!(error, BuildError::InvalidMount { .. }), "{error}");
         let error = ContainerBuilder::from_image("alpine")
             .mount("/host", "data")
-            .to_run_request()
+            .build()
             .unwrap_err();
-        assert!(matches!(error, EmbedError::Config(_)), "{error}");
+        assert!(matches!(error, BuildError::InvalidMount { .. }), "{error}");
     }
 
     #[test]
@@ -797,21 +949,62 @@ mod tests {
             .unwrap()
             .spec;
         // `NsUid`/`NsGid` expose `.raw()` (carrick-abi/src/lib.rs:2867-2880, 2987-3000).
-        assert_eq!(spec.uid.raw(), 1000);
-        assert_eq!(spec.gid.raw(), 1000);
-        assert_eq!(spec.hostname.as_deref(), Some("embedded"));
-        assert_eq!(spec.max_traps, 42);
+        assert_eq!(spec.process.uid.raw(), 1000);
+        assert_eq!(spec.process.gid.raw(), 1000);
+        assert_eq!(spec.network.hostname.as_deref(), Some("embedded"));
+        assert_eq!(spec.resources.max_traps, 42);
     }
 
     #[test]
     fn a_named_user_is_a_config_error_not_a_silent_root() {
         let error = ContainerBuilder::from_image("alpine")
             .user("nobody")
-            .to_run_request()
+            .build()
             .unwrap_err();
         match error {
-            EmbedError::Config(message) => assert!(message.contains("numeric"), "{message}"),
-            other => panic!("expected Config, got {other:?}"),
+            BuildError::InvalidUser { reason, .. } => {
+                assert!(reason.contains("numeric"), "{reason}")
+            }
+            other => panic!("expected InvalidUser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_image_ref_fails_at_build_time() {
+        for invalid in ["", "   ", ":::not-an-image", "test@sha256:nothex"] {
+            let error = ContainerBuilder::from_image(invalid).build().unwrap_err();
+            assert!(
+                matches!(error, BuildError::InvalidImageRef { .. }),
+                "{invalid}: expected InvalidImageRef, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_workdir_fails_at_build_time() {
+        for invalid in ["", "bad\0dir"] {
+            let error = ContainerBuilder::from_image("alpine")
+                .workdir(invalid)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(error, BuildError::InvalidWorkdir { .. }),
+                "{invalid:?}: expected InvalidWorkdir, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_user_fails_at_build_time() {
+        for invalid in ["nobody", "root:root", "1000:abc", "-1", "1000:"] {
+            let error = ContainerBuilder::from_image("alpine")
+                .user(invalid)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(error, BuildError::InvalidUser { .. }),
+                "{invalid:?}: expected InvalidUser, got {error:?}"
+            );
         }
     }
 
@@ -820,9 +1013,9 @@ mod tests {
         for (key, value) in [("", "x"), ("A=B", "x")] {
             let error = ContainerBuilder::from_image("alpine")
                 .env(key, value)
-                .to_run_request()
+                .build()
                 .unwrap_err();
-            assert!(matches!(error, EmbedError::Config(_)), "{error}");
+            assert!(matches!(error, BuildError::InvalidEnv { .. }), "{error}");
         }
     }
 
@@ -980,12 +1173,15 @@ mod tests {
             .await
             .expect("resolves from the seeded store");
         let spec = prepared.run_spec();
-        assert_eq!(spec.argv, strings(&["/bin/true"]));
-        assert!(spec.envp.contains(&"FOO=image".to_string()));
-        assert!(spec.envp.contains(&"BAR=builder".to_string()));
-        assert_eq!(spec.cwd.as_deref().map(|p| p.as_str()), Some("/srv"));
-        assert_eq!(spec.rootfs_layers.len(), 1);
-        assert_eq!(spec.stdio, StdioMode::Captured);
+        assert_eq!(spec.process.argv, strings(&["/bin/true"]));
+        assert!(spec.process.envp.contains(&"FOO=image".to_string()));
+        assert!(spec.process.envp.contains(&"BAR=builder".to_string()));
+        assert_eq!(
+            spec.process.cwd.as_deref().map(|p| p.as_str()),
+            Some("/srv")
+        );
+        assert_eq!(spec.mounts.rootfs_layers.len(), 1);
+        assert_eq!(spec.process.stdio, StdioMode::Captured);
     }
 
     #[tokio::test]
@@ -1011,9 +1207,12 @@ mod tests {
         let inmem = crate::vfs::InMemoryFileVfs::new();
         let error = ContainerBuilder::from_image("alpine")
             .vfs_mount("data", Box::new(inmem))
-            .to_run_request()
+            .build()
             .unwrap_err();
-        assert!(matches!(error, EmbedError::Config(_)), "{error}");
+        assert!(
+            matches!(error, BuildError::InvalidVfsMount { .. }),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1037,7 +1236,7 @@ mod tests {
             .await
             .expect("prepares container with vfs mount");
 
-        assert_eq!(prepared.run_spec().argv, strings(&["/bin/true"]));
+        assert_eq!(prepared.run_spec().process.argv, strings(&["/bin/true"]));
     }
 
     #[tokio::test]
@@ -1060,7 +1259,7 @@ mod tests {
             .prepare()
             .await
             .expect("prepare succeeds");
-        assert_eq!(prepared.run_spec().argv, strings(&["/bin/true"]));
+        assert_eq!(prepared.run_spec().process.argv, strings(&["/bin/true"]));
     }
 
     #[tokio::test]
@@ -1086,7 +1285,7 @@ mod tests {
             .prepare()
             .await
             .expect("prepare succeeds with network interposer");
-        assert_eq!(prepared.run_spec().argv, strings(&["/bin/true"]));
+        assert_eq!(prepared.run_spec().process.argv, strings(&["/bin/true"]));
     }
 
     #[tokio::test]
