@@ -102,8 +102,8 @@
 //!   interruptibly, then re-dispatches. These are [`DispatchOutcome::FutexWait`]
 //!   / [`DispatchOutcome::SharedFutexWait`] (futex value matched → park on the
 //!   parking-lot token or, for `MAP_SHARED` inter-process futexes, the host
-//!   `__ulock`), [`DispatchOutcome::WaitOnFds`] / [`DispatchOutcome::WaitOnFdsSelect`]
-//!   / [`DispatchOutcome::WaitOnPollFds`] (poll/select/epoll-style fd readiness,
+//!   `__ulock`), [`DispatchOutcome::WaitOnFds`] with its [`FdWaitCompletion`]
+//!   (poll/select/epoll-style fd readiness,
 //!   serviced by the per-thread kqueue or `poll(2)`), [`DispatchOutcome::WaitOnProcExit`]
 //!   (a blocking `waitid` parks on `EVFILT_PROC`/`NOTE_EXIT`),
 //!   [`DispatchOutcome::WaitOnSignals`] (`rt_sigtimedwait` / `rt_sigsuspend`), and
