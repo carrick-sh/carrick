@@ -27,7 +27,7 @@
 use super::*;
 use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
 use carrick_abi::{NsGid, NsUid};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 #[cfg(not(doctest))]
 pub(crate) mod lock_authority;
@@ -1373,7 +1373,7 @@ struct CachedMsgQueueIdentity {
 
 #[derive(Debug)]
 struct CachedMsgQueueFd {
-    fd: i32,
+    fd: OwnedFd,
     identity: CachedMsgQueueIdentity,
 }
 
@@ -1396,18 +1396,8 @@ impl MsgQueueFdCache {
         if self.host_pid == host_pid {
             return;
         }
-        for (_, entry) in self.entries.drain() {
-            unsafe { libc::close(entry.fd) };
-        }
+        self.entries.clear();
         self.host_pid = host_pid;
-    }
-}
-
-impl Drop for MsgQueueFdCache {
-    fn drop(&mut self) {
-        for (_, entry) in self.entries.drain() {
-            unsafe { libc::close(entry.fd) };
-        }
     }
 }
 
@@ -1422,9 +1412,7 @@ impl SyscallDispatcher {
     /// `SysvWaitState` inside the Kernel continuation and never live in TLS.
     pub(crate) fn reset_sysv_executor_boundary_state() -> bool {
         MSG_QUEUE_FD_CACHE.with(|cache| {
-            for (_, entry) in cache.borrow_mut().entries.drain() {
-                unsafe { libc::close(entry.fd) };
-            }
+            cache.borrow_mut().entries.clear();
         });
         MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty())
     }
@@ -1445,7 +1433,8 @@ impl SyscallDispatcher {
             cache.borrow_mut().entries.insert(
                 PathBuf::from("executor-boundary-fd-test"),
                 CachedMsgQueueFd {
-                    fd: cached_fd,
+                    // SAFETY: transfers ownership of test pipe read end to CachedMsgQueueFd.
+                    fd: unsafe { OwnedFd::from_raw_fd(cached_fd) },
                     identity,
                 },
             );
@@ -1454,7 +1443,8 @@ impl SyscallDispatcher {
             cache.borrow_mut().entries.insert(
                 PathBuf::from("executor-boundary-second-fd-test"),
                 CachedMsgQueueFd {
-                    fd: wait_word_fd,
+                    // SAFETY: transfers ownership of test pipe read end to CachedMsgQueueFd.
+                    fd: unsafe { OwnedFd::from_raw_fd(wait_word_fd) },
                     identity,
                 },
             );
@@ -1486,24 +1476,29 @@ fn cached_msg_queue_fd(path: &Path) -> Result<i32, LinuxErrno> {
         if is_msg_queue_id_path(path)
             && let Some(entry) = cache.entries.get(path)
         {
-            return Ok(entry.fd);
+            return Ok(entry.fd.as_raw_fd());
         }
         let identity = msg_queue_identity(path)?;
         if let Some(entry) = cache.entries.get(path)
             && entry.identity == identity
         {
-            return Ok(entry.fd);
+            return Ok(entry.fd.as_raw_fd());
         }
-        if let Some(entry) = cache.entries.remove(path) {
-            unsafe { libc::close(entry.fd) };
-        }
+        cache.entries.remove(path);
         let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| LINUX_EINVAL)?;
         let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) }.host_syscall_errno()?;
-        cache
-            .entries
-            .insert(path.to_path_buf(), CachedMsgQueueFd { fd, identity });
-        Ok(fd)
+        // SAFETY: `fd` is open and ownership is transferred to CachedMsgQueueFd.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let raw = owned.as_raw_fd();
+        cache.entries.insert(
+            path.to_path_buf(),
+            CachedMsgQueueFd {
+                fd: owned,
+                identity,
+            },
+        );
+        Ok(raw)
     })
 }
 

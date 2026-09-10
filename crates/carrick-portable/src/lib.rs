@@ -26,39 +26,17 @@
 /// constants so the bitwise math matches the live `termios` fields on each OS.
 pub type TcFlag = libc::tcflag_t;
 
-/// Current thread errno. Darwin/FreeBSD use `__error()`, NetBSD `__errno()`,
-/// Linux `__errno_location()`.
+/// Current thread errno via `std::io::Error::last_os_error`.
 #[inline]
 pub fn errno() -> i32 {
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    // SAFETY: `__error()` returns a valid per-thread pointer for the caller.
-    {
-        unsafe { *libc::__error() }
-    }
-    #[cfg(target_os = "netbsd")]
-    // SAFETY: `__errno()` returns a valid per-thread pointer for the caller.
-    {
-        unsafe { *libc::__errno() }
-    }
-    #[cfg(target_os = "linux")]
-    // SAFETY: `__errno_location()` returns a valid per-thread pointer.
-    {
-        unsafe { *libc::__errno_location() }
-    }
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "linux"
-    )))]
-    {
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-    }
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 /// Set the current thread errno (inverse of [`errno`]). Used where carrick
 /// synthesizes a host errno before mapping it to a Linux errno.
+///
+/// `std` does not provide an API to write the current thread's OS error number,
+/// so this writes directly to the platform's thread-local errno location via `libc`.
 #[inline]
 pub fn set_errno(value: i32) {
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
@@ -2020,5 +1998,15 @@ mod pure_transform_tests {
         let file = tempfile::tempfile().expect("temporary file");
         assert!(peer_credentials(file.as_raw_fd()).is_err());
         assert!(peer_credentials(-1).is_err());
+    }
+
+    #[test]
+    fn errno_round_trips_via_std() {
+        let original = super::errno();
+        super::set_errno(libc::ENOENT);
+        assert_eq!(super::errno(), libc::ENOENT);
+        super::set_errno(libc::EINVAL);
+        assert_eq!(super::errno(), libc::EINVAL);
+        super::set_errno(original);
     }
 }

@@ -1410,9 +1410,10 @@ impl SyscallRequest {
     }
 }
 
-#[derive(Eq)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
 struct PinnedHostFd {
-    fd: i32,
+    fd: OwnedFd,
 }
 
 impl PinnedHostFd {
@@ -1424,29 +1425,31 @@ impl PinnedHostFd {
                 .unwrap_or(libc::EMFILE);
             return Err(crate::host_to_linux_errno(host));
         }
-        Ok(Self { fd: duped })
+        // SAFETY: `duped` is a valid open descriptor from a successful `libc::dup`.
+        let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+        Ok(Self { fd: owned })
     }
-}
 
-impl Drop for PinnedHostFd {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
+    fn as_raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
     }
 }
 
 impl std::fmt::Debug for PinnedHostFd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PinnedHostFd").field(&self.fd).finish()
+        f.debug_tuple("PinnedHostFd")
+            .field(&self.as_raw_fd())
+            .finish()
     }
 }
 
 impl PartialEq for PinnedHostFd {
     fn eq(&self, other: &Self) -> bool {
-        self.fd == other.fd
+        self.as_raw_fd() == other.as_raw_fd()
     }
 }
+
+impl Eq for PinnedHostFd {}
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct BlockingHostWrite {
@@ -1477,7 +1480,7 @@ impl BlockingHostWrite {
     }
 
     pub(crate) fn host_fd(&self) -> i32 {
-        self.host_fd.fd
+        self.host_fd.as_raw_fd()
     }
 
     pub(crate) fn offset(&self) -> usize {
@@ -1508,7 +1511,7 @@ impl BlockingHostWrite {
 impl std::fmt::Debug for BlockingHostWrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockingHostWrite")
-            .field("host_fd", &self.host_fd.fd)
+            .field("host_fd", &self.host_fd.as_raw_fd())
             .field("bytes_len", &self.bytes.len())
             .field("offset", &self.offset)
             .field("tid", &self.tid)
@@ -3520,28 +3523,6 @@ pub(crate) enum CorePublicationError {
         remove_error: crate::fs_backend::BackendError,
         artifact_invalidated: bool,
     },
-}
-
-struct AutoCloseFd(i32);
-
-impl AutoCloseFd {
-    fn new(fd: i32) -> Self {
-        Self(fd)
-    }
-
-    fn as_raw_fd(&self) -> i32 {
-        self.0
-    }
-}
-
-impl Drop for AutoCloseFd {
-    fn drop(&mut self) {
-        if self.0 >= 0 {
-            unsafe {
-                libc::close(self.0);
-            }
-        }
-    }
 }
 
 fn pwrite_all_host_fd(
@@ -7122,7 +7103,8 @@ impl SyscallDispatcher {
                 let publication = (|| {
                     match handle {
                         crate::vfs::VfsHandle::HostFd { host_fd, .. } => {
-                            let scoped_fd = AutoCloseFd::new(host_fd);
+                            // SAFETY: transfers ownership of host_fd to scoped_fd so it is closed on scope exit.
+                            let scoped_fd = unsafe { OwnedFd::from_raw_fd(host_fd) };
                             if failpoint == Some("short-write") {
                                 return Err(CorePublicationError::Failpoint("short-write"));
                             }
@@ -7324,7 +7306,8 @@ impl SyscallDispatcher {
                             }
                         })?
                     {
-                        let scoped_fd = AutoCloseFd::new(fd);
+                        // SAFETY: transfers ownership of fd to scoped_fd so it is closed on scope exit.
+                        let scoped_fd = unsafe { OwnedFd::from_raw_fd(fd) };
                         let result = unsafe { libc::fsync(scoped_fd.as_raw_fd()) };
                         if result < 0 {
                             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -7400,7 +7383,8 @@ impl SyscallDispatcher {
                         let ctx = crate::vfs::OpenContext::default();
                         match m.vfs.open(&m.full_path, open_flags, &ctx) {
                             Ok(crate::vfs::VfsHandle::HostFd { host_fd, .. }) => {
-                                let _scoped = AutoCloseFd::new(host_fd);
+                                // SAFETY: transfers ownership of host_fd to _scoped so it is closed on scope exit.
+                                let _scoped = unsafe { OwnedFd::from_raw_fd(host_fd) };
                                 true
                             }
                             Ok(crate::vfs::VfsHandle::InMemoryFile {
