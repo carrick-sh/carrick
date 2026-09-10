@@ -44,7 +44,7 @@
 use crate::linux_abi::LinuxErrno;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1304,8 +1304,11 @@ impl Drop for OpenDescription {
 
 #[derive(Debug)]
 struct HostFdOwner {
-    _fd: Option<OwnedFd>,
-    raw_fd: i32,
+    /// Deliberately a bare per-process close: carrick forks real host
+    /// processes, and each address space independently closes its inherited
+    /// copy of the fd. Fork-correctness depends on this staying a plain
+    /// per-process close (`OwnedFd` drops via `libc::close`) — never anything fancier.
+    fd: OwnedFd,
     private_file_source: carrick_guest_mem::PrivateFileSource,
 }
 
@@ -1326,16 +1329,10 @@ impl HostFdRef {
         fd: i32,
         private_file_source: carrick_guest_mem::PrivateFileSource,
     ) -> Self {
-        let is_valid = unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
-        let owned = if is_valid {
-            // SAFETY: `fd` was verified to be a valid, live open descriptor.
-            Some(unsafe { OwnedFd::from_raw_fd(fd) })
-        } else {
-            None
-        };
+        // SAFETY: `fd` is a host descriptor whose lifetime is owned by this `HostFdRef`.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         Self(Arc::new(HostFdOwner {
-            _fd: owned,
-            raw_fd: fd,
+            fd,
             private_file_source,
         }))
     }
@@ -1348,14 +1345,14 @@ impl HostFdRef {
     /// keep a `HostFdRef` alive for as long as the number is used).
     #[inline]
     pub(crate) fn raw(&self) -> i32 {
-        self.0.raw_fd
+        self.0.fd.as_raw_fd()
     }
 
     /// The Copy borrowed VIEW of this fd (see [`HostFd`]); same liveness
     /// caveat as [`HostFdRef::raw`].
     #[inline]
     pub(super) fn view(&self) -> HostFd {
-        HostFd(self.0.raw_fd)
+        HostFd(self.0.fd.as_raw_fd())
     }
 }
 

@@ -1504,7 +1504,7 @@ fn cached_msg_queue_fd(path: &Path) -> Result<i32, LinuxErrno> {
 
 struct MsgQueueLock {
     fd: i32,
-    close_on_drop: bool,
+    _owned: Option<OwnedFd>,
 }
 
 impl MsgQueueLock {
@@ -1512,15 +1512,17 @@ impl MsgQueueLock {
         let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| LINUX_EINVAL)?;
         let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) }.host_syscall_errno()?;
-        Self::acquire_fd(fd, true)
+        // SAFETY: `fd` is a freshly opened descriptor owned by this call.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        Self::acquire_fd(fd, Some(owned))
     }
 
     fn acquire_cached(path: &Path) -> Result<Self, LinuxErrno> {
         let fd = cached_msg_queue_fd(path)?;
-        Self::acquire_fd(fd, false)
+        Self::acquire_fd(fd, None)
     }
 
-    fn acquire_fd(fd: i32, close_on_drop: bool) -> Result<Self, LinuxErrno> {
+    fn acquire_fd(fd: i32, owned: Option<OwnedFd>) -> Result<Self, LinuxErrno> {
         let mut fl: libc::flock = unsafe { core::mem::zeroed() };
         #[allow(clippy::unnecessary_cast)]
         {
@@ -1536,13 +1538,8 @@ impl MsgQueueLock {
                 &mut fl as *mut libc::flock,
             )
         };
-        if let Err(errno) = rc.host_syscall_errno() {
-            if close_on_drop {
-                unsafe { libc::close(fd) };
-            }
-            return Err(errno);
-        }
-        Ok(Self { fd, close_on_drop })
+        rc.host_syscall_errno()?;
+        Ok(Self { fd, _owned: owned })
     }
 
     fn read_queue(&self) -> Result<MsgQueueFile, LinuxErrno> {
@@ -1778,9 +1775,6 @@ impl Drop for MsgQueueLock {
                 &mut fl as *mut libc::flock,
             )
         };
-        if self.close_on_drop {
-            unsafe { libc::close(self.fd) };
-        }
     }
 }
 
@@ -1788,7 +1782,7 @@ impl Drop for MsgQueueLock {
 struct MsgQueueWaitWord {
     ptr: std::ptr::NonNull<std::sync::atomic::AtomicU32>,
     len: usize,
-    fd: i32,
+    fd: OwnedFd,
     queue_identity: CachedMsgQueueIdentity,
 }
 
@@ -1806,38 +1800,39 @@ impl MsgQueueWaitWord {
             .map_err(|_| LINUX_EINVAL)?;
         let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) }
             .host_syscall_errno()?;
-        if let Err(errno) = unsafe { libc::ftruncate(fd, MSG_QUEUE_WAIT_WORD_BYTES as libc::off_t) }
-            .host_syscall_errno()
-        {
-            unsafe { libc::close(fd) };
-            return Err(errno);
+        // SAFETY: `fd` is a newly opened file descriptor.
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        unsafe {
+            libc::ftruncate(
+                owned_fd.as_raw_fd(),
+                MSG_QUEUE_WAIT_WORD_BYTES as libc::off_t,
+            )
         }
+        .host_syscall_errno()?;
         let mapped = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 MSG_QUEUE_WAIT_WORD_BYTES,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                fd,
+                owned_fd.as_raw_fd(),
                 0,
             )
         };
         if mapped == libc::MAP_FAILED {
-            unsafe { libc::close(fd) };
             return Err(LINUX_EINVAL);
         }
         let Some(ptr) = std::ptr::NonNull::new(mapped.cast::<std::sync::atomic::AtomicU32>())
         else {
             unsafe {
                 libc::munmap(mapped, MSG_QUEUE_WAIT_WORD_BYTES);
-                libc::close(fd);
             }
             return Err(LINUX_EINVAL);
         };
         Ok(Self {
             ptr,
             len: MSG_QUEUE_WAIT_WORD_BYTES,
-            fd,
+            fd: owned_fd,
             queue_identity,
         })
     }
@@ -1860,7 +1855,6 @@ impl Drop for MsgQueueWaitWord {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.ptr.as_ptr().cast(), self.len);
-            libc::close(self.fd);
         }
     }
 }
@@ -1910,7 +1904,7 @@ impl SysvWaitState {
     }
 
     pub(crate) fn wait_word_fd(&self) -> i32 {
-        self.word.fd
+        self.word.fd.as_raw_fd()
     }
 
     pub(crate) fn completion_after_wake(&self) -> Option<DispatchOutcome> {
