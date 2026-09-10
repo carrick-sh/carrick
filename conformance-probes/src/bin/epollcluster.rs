@@ -11,11 +11,19 @@ const F_SETPIPE_SZ: libc::c_int = 1031;
 static RODATA_EVENTS: [u8; 16] = [0; 16];
 
 fn syscall_errno(rc: libc::c_int) -> i32 {
-    if rc < 0 { errno() } else { 0 }
+    if rc < 0 {
+        errno()
+    } else {
+        0
+    }
 }
 
 fn syscall_errno_long(rc: libc::c_long) -> i32 {
-    if rc < 0 { errno() } else { 0 }
+    if rc < 0 {
+        errno()
+    } else {
+        0
+    }
 }
 
 fn close_fd(fd: libc::c_int) {
@@ -327,6 +335,133 @@ fn et_pipe_progression() -> (i32, u32, i32, i32, u32) {
     )
 }
 
+/// A mixed wait must subscribe to synthetic netlink producers as well as the
+/// host-readable eventfd. The eventfd intentionally remains empty. Bounds make a
+/// lost wake a numeric mismatch; no timing ratio is used as an oracle.
+fn mixed_ppoll_netlink_wake() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::{Duration, Instant};
+    let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    let netlink = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    let socket_errno = syscall_errno(netlink);
+    let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    address.nl_family = libc::AF_NETLINK as u16;
+    let bind_rc = unsafe {
+        libc::bind(
+            netlink,
+            (&address as *const libc::sockaddr_nl).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    };
+    let bind_errno = syscall_errno(bind_rc);
+    let duplicate = unsafe { libc::dup(netlink) };
+    let mut spawn_errno = syscall_errno(duplicate);
+    let mut producer = None;
+    if duplicate >= 0 {
+        let socket = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        match std::thread::Builder::new().spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut message = [0u8; 32];
+            message[0..4].copy_from_slice(&32u32.to_le_bytes());
+            message[4..6].copy_from_slice(&18u16.to_le_bytes()); // RTM_GETLINK
+            message[6..8].copy_from_slice(&0x301u16.to_le_bytes()); // request + dump
+            message[8..12].copy_from_slice(&1u32.to_le_bytes());
+            let mut destination: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            destination.nl_family = libc::AF_NETLINK as u16;
+            let rc = unsafe {
+                libc::sendto(
+                    socket.as_raw_fd(),
+                    message.as_ptr().cast(),
+                    message.len(),
+                    libc::MSG_DONTWAIT,
+                    (&destination as *const libc::sockaddr_nl).cast(),
+                    std::mem::size_of_val(&destination) as libc::socklen_t,
+                )
+            };
+            let error = if rc < 0 { errno() } else { 0 };
+            (rc, error)
+        }) {
+            Ok(handle) => producer = Some(handle),
+            Err(error) => spawn_errno = error.raw_os_error().unwrap_or(-1),
+        }
+    }
+    let mut fds = [
+        libc::pollfd {
+            fd: eventfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: netlink,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let timeout = libc::timespec {
+        tv_sec: 5,
+        tv_nsec: 0,
+    };
+    let wait_rc = unsafe { libc::ppoll(fds.as_mut_ptr(), 2, &timeout, std::ptr::null()) };
+    let wait_errno = syscall_errno(wait_rc);
+    let event_mask = fds[0].revents;
+    let netlink_mask = fds[1].revents;
+    let mut joined = false;
+    let mut sent = -1isize;
+    let mut send_errno = -1;
+    if let Some(handle) = producer {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if handle.is_finished() {
+            if let Ok((rc, error)) = handle.join() {
+                joined = true;
+                sent = rc;
+                send_errno = error;
+            }
+        }
+    }
+    // A late readiness sample distinguishes absent reply from lost wait wakeup.
+    fds[0].revents = 0;
+    fds[1].revents = 0;
+    let late_rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
+    let mut bytes = [0u8; 4096];
+    let recv_rc = unsafe {
+        libc::recv(
+            netlink,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    let recv_errno = if recv_rc < 0 { errno() } else { 0 };
+    report!(
+        mixed_netlink_socket_errno = socket_errno,
+        mixed_netlink_bind_rc = bind_rc,
+        mixed_netlink_bind_errno = bind_errno,
+        mixed_netlink_spawn_errno = spawn_errno,
+        mixed_netlink_ppoll_rc = wait_rc,
+        mixed_netlink_ppoll_errno = wait_errno,
+        mixed_netlink_eventfd_mask = event_mask,
+        mixed_netlink_reply_mask = netlink_mask,
+        mixed_netlink_producer_joined = joined,
+        mixed_netlink_sent = sent,
+        mixed_netlink_send_errno = send_errno,
+        mixed_netlink_late_poll_rc = late_rc,
+        mixed_netlink_late_reply_mask = fds[1].revents,
+        mixed_netlink_received_reply = recv_rc > 0,
+        mixed_netlink_recv_errno = recv_errno,
+    );
+    close_fd(netlink);
+    close_fd(eventfd);
+}
+
 fn main() {
     let epollpri_pipe_add_errno = epollpri_pipe_add_errno();
     let (nested_epoll_add_errno, nested_epoll_cycle_errno) = nested_epoll_cycle_errno();
@@ -364,4 +499,5 @@ fn main() {
     );
     epoll_fd_readiness();
     epoll_fd_thread_wake();
+    mixed_ppoll_netlink_wake();
 }
