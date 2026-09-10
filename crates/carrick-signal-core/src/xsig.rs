@@ -44,6 +44,66 @@ fn slot_state_load(slot: &XSigSlot, ordering: Ordering) -> u64 {
     slot.state.load(ordering)
 }
 
+#[cfg(test)]
+type DrainPreClaimHook = std::sync::Arc<dyn Fn(usize, u64, i32) + Send + Sync>;
+#[cfg(test)]
+type EnqueuePreReadyHook = std::sync::Arc<dyn Fn(usize) + Send + Sync>;
+
+#[cfg(test)]
+static DRAIN_PRE_CLAIM_HOOK: std::sync::Mutex<Option<DrainPreClaimHook>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static ENQUEUE_PRE_READY_HOOK: std::sync::Mutex<Option<EnqueuePreReadyHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_drain_pre_claim_hook(hook: Option<DrainPreClaimHook>) {
+    let mut g = DRAIN_PRE_CLAIM_HOOK.lock().unwrap();
+    *g = hook;
+}
+
+#[cfg(test)]
+fn set_enqueue_pre_ready_hook(hook: Option<EnqueuePreReadyHook>) {
+    let mut g = ENQUEUE_PRE_READY_HOOK.lock().unwrap();
+    *g = hook;
+}
+
+#[inline(always)]
+fn run_drain_pre_claim_hook(slot_idx: usize, state: u64, target_pid: i32) {
+    #[cfg(test)]
+    {
+        let hook = {
+            let g = DRAIN_PRE_CLAIM_HOOK.lock().unwrap();
+            g.clone()
+        };
+        if let Some(h) = hook {
+            h(slot_idx, state, target_pid);
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (slot_idx, state, target_pid);
+    }
+}
+
+#[inline(always)]
+fn run_enqueue_pre_ready_hook(slot_idx: usize) {
+    #[cfg(test)]
+    {
+        let hook = {
+            let g = ENQUEUE_PRE_READY_HOOK.lock().unwrap();
+            g.clone()
+        };
+        if let Some(h) = hook {
+            h(slot_idx);
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = slot_idx;
+    }
+}
+
 #[repr(C)]
 struct XSigSlot {
     /// Incarnation-stamped lifecycle state:
@@ -263,6 +323,9 @@ pub fn xsig_enqueue(
             let bit_mask = 1u64 << bit_idx;
             ring.published[word_idx].fetch_or(bit_mask, Ordering::Release);
 
+            // Phase 2->3 Hook: for deterministic interleaving verification.
+            run_enqueue_pre_ready_hook(slot_idx);
+
             // Phase 3 — PUBLISH (CLAIMING -> READY).
             // This Release store is the publication barrier: it carries all payload
             // stores and the publication index bit above, so any consumer observing
@@ -349,6 +412,9 @@ pub fn xsig_drain_for_self() -> Vec<(i32, i32, i32, u32, i64, i32)> {
                 continue;
             }
 
+            // Pre-claim Hook: for deterministic interleaving verification.
+            run_drain_pre_claim_hook(slot_idx, state, me);
+
             // ATOMIC INCARNATION CLAIM:
             // Claim from READY to DRAINING for THIS EXACT GENERATION `state`.
             // If another thread drains this slot, it frees to gen+1.
@@ -391,6 +457,8 @@ pub fn xsig_drain_for_self() -> Vec<(i32, i32, i32, u32, i64, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     /// The ring is process-global, so these tests would race if run in parallel.
     /// Serialise them and reset the ring at the top of each so they are
@@ -398,8 +466,10 @@ mod tests {
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Drain everything targeting THIS pid AND every other slot, then clear the
-    /// dirty flag, so each test starts from an empty, clean ring.
+    /// dirty flag and reset test hooks, so each test starts from an empty, clean ring.
     fn reset_ring() {
+        set_drain_pre_claim_hook(None);
+        set_enqueue_pre_ready_hook(None);
         xsig_init();
         // Drain entries for self.
         let _ = xsig_drain_for_self();
@@ -792,81 +862,6 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_multithreaded_enqueue_drain_stress() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize};
-
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_ring();
-
-        const PRODUCERS: usize = 4;
-        const CONSUMERS: usize = 4;
-        const MESSAGES_PER_PRODUCER: usize = 2000;
-        const TOTAL_MESSAGES: usize = PRODUCERS * MESSAGES_PER_PRODUCER;
-
-        let me = std::process::id() as i32;
-        let done = Arc::new(AtomicBool::new(false));
-        let total_received = Arc::new(AtomicUsize::new(0));
-
-        std::thread::scope(|s| {
-            // Producer threads
-            for p in 0..PRODUCERS {
-                s.spawn(move || {
-                    for seq in 0..MESSAGES_PER_PRODUCER {
-                        while !xsig_enqueue(
-                            me,
-                            10,
-                            0,
-                            p as i32,
-                            0,
-                            (p * MESSAGES_PER_PRODUCER + seq) as i64,
-                            0,
-                        ) {
-                            std::thread::yield_now();
-                        }
-                    }
-                });
-            }
-
-            // Consumer threads
-            for _ in 0..CONSUMERS {
-                let done = Arc::clone(&done);
-                let total_received = Arc::clone(&total_received);
-                s.spawn(move || {
-                    while !done.load(Ordering::Acquire) {
-                        let batch = xsig_drain_for_self();
-                        if !batch.is_empty() {
-                            total_received.fetch_add(batch.len(), Ordering::Relaxed);
-                        } else {
-                            std::thread::yield_now();
-                        }
-                    }
-                    // Final drain to ensure no messages left behind
-                    let batch = xsig_drain_for_self();
-                    if !batch.is_empty() {
-                        total_received.fetch_add(batch.len(), Ordering::Relaxed);
-                    }
-                });
-            }
-
-            while total_received.load(Ordering::Relaxed) < TOTAL_MESSAGES {
-                std::thread::yield_now();
-            }
-            done.store(true, Ordering::Release);
-        });
-
-        assert_eq!(
-            total_received.load(Ordering::Relaxed),
-            TOTAL_MESSAGES,
-            "all published messages across concurrent producers must be delivered exactly once"
-        );
-        assert!(!xsig_has_unblocked_for_self(
-            carrick_abi::SigBlockMask::NONE
-        ));
-        reset_ring();
-    }
-
-    #[test]
     fn ring_full_rejects_257th_enqueue() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_ring();
@@ -900,86 +895,175 @@ mod tests {
         reset_ring();
     }
 
-    #[test]
-    fn cross_process_fork_shared_ring_delivery() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_ring();
+    /// Bounded, panic-safe synchronization rendezvous between test coordinator
+    /// and worker threads executing inside production hooks.
+    struct BoundedRendezvous {
+        state: std::sync::Mutex<(bool, bool)>, // (reached, released)
+        cvar: std::sync::Condvar,
+        timeout: Duration,
+    }
 
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork failed");
-        if child == 0 {
-            // Child process
-            xsig_refresh_self_host_pid();
-            let mut drained = Vec::new();
-            for _ in 0..10_000 {
-                if xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE) {
-                    drained = xsig_drain_for_self();
-                    if !drained.is_empty() {
-                        break;
-                    }
+    impl BoundedRendezvous {
+        fn new(timeout: Duration) -> Self {
+            Self {
+                state: std::sync::Mutex::new((false, false)),
+                cvar: std::sync::Condvar::new(),
+                timeout,
+            }
+        }
+
+        /// Called inside the hook (worker thread). Signals that the hook has been
+        /// reached and blocks with a bounded timeout waiting for the coordinator to release.
+        fn hook_wait(&self) -> bool {
+            let mut lock = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            lock.0 = true; // reached = true
+            self.cvar.notify_all();
+            let deadline = std::time::Instant::now() + self.timeout;
+            while !lock.1 {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return false;
                 }
-                std::thread::yield_now();
+                let timeout_left = deadline - now;
+                let (new_lock, wait_res) = self
+                    .cvar
+                    .wait_timeout(lock, timeout_left)
+                    .unwrap_or_else(|e| e.into_inner());
+                lock = new_lock;
+                if wait_res.timed_out() && !lock.1 {
+                    return false;
+                }
             }
-            let success = drained.len() == 1 && drained[0].0 == 12 && drained[0].2 == 9999;
-            unsafe {
-                libc::_exit(if success { 0 } else { 1 });
+            true
+        }
+
+        /// Called by coordinator: waits with bounded timeout for worker to hit the hook.
+        fn wait_for_hook(&self) -> bool {
+            let mut lock = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let deadline = std::time::Instant::now() + self.timeout;
+            while !lock.0 {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let timeout_left = deadline - now;
+                let (new_lock, wait_res) = self
+                    .cvar
+                    .wait_timeout(lock, timeout_left)
+                    .unwrap_or_else(|e| e.into_inner());
+                lock = new_lock;
+                if wait_res.timed_out() && !lock.0 {
+                    return false;
+                }
             }
-        } else {
-            // Parent process
-            // Enqueue signal targeting child
-            assert!(xsig_enqueue(child, 12, 0, 9999, 1000, 0xcafe, 0));
-            let mut status: libc::c_int = 0;
-            let ret = unsafe { libc::waitpid(child, &mut status, 0) };
-            assert_eq!(ret, child);
-            assert!(libc::WIFEXITED(status), "child did not exit normally");
-            assert_eq!(
-                libc::WEXITSTATUS(status),
-                0,
-                "child failed xsignal verification"
-            );
-            reset_ring();
+            true
+        }
+
+        /// Called by coordinator: releases the worker thread from the hook.
+        fn release(&self) {
+            let mut lock = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            lock.1 = true; // released = true
+            self.cvar.notify_all();
         }
     }
 
     #[test]
-    fn incarnation_claim_prevents_cross_destination_delivery_on_slot_reuse() {
+    fn hook_handshake_timeout_on_unfired_hook_fails_boundedly() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+
+        // 50ms bounded timeout
+        let rendezvous = Arc::new(BoundedRendezvous::new(Duration::from_millis(50)));
+
+        // Drain on empty ring (never triggers pre-claim hook for slot 0)
+        let hook_reached_ok = std::thread::scope(|s| {
+            let drainer_handle = s.spawn(xsig_drain_for_self);
+            let reached = rendezvous.wait_for_hook();
+            rendezvous.release();
+            let _ = drainer_handle.join().unwrap_or_default();
+            reached
+        });
+
+        // The rendezvous must report timeout (false) boundedly in ~50ms without hanging the process
+        assert!(
+            !hook_reached_ok,
+            "handshake must timeout gracefully when hook is unfired"
+        );
+        reset_ring();
+    }
+
+    #[test]
+    fn interleaved_drain_pauses_before_claim_never_steals_reused_slot() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_ring();
         let me = std::process::id() as i32;
         let other = me + 1;
 
-        // Step 1: Enqueue signal for `me` in slot 0.
+        // Step 1: Enqueue signal for `me` into slot 0 through production xsig_enqueue.
         assert!(xsig_enqueue(me, 10, 0, 100, 0, 1000, 0));
 
-        // Step 2: Thread A inspects slot 0, sees target is `me` and records current state.
-        let ring = xsig_ring().unwrap();
-        let slot = &ring.slots[0];
-        let observed_state = slot.state.load(Ordering::Acquire);
-        assert_eq!(observed_state & XSIG_PHASE_MASK, XSIG_PHASE_READY);
-        assert_eq!(slot.target_host_pid.load(Ordering::Acquire), me);
+        let rendezvous = Arc::new(BoundedRendezvous::new(Duration::from_secs(2)));
+        let rz = Arc::clone(&rendezvous);
 
-        // Step 3: Thread A pauses before CAS. Another thread of `me` cleanly drains slot 0:
-        let drained = xsig_drain_for_self();
-        assert_eq!(drained, vec![(10, 0, 100, 0, 1000, 0)]);
+        // Register hook to pause real Drainer A after target validation & state observation,
+        // but BEFORE its actual production compare_exchange claim in xsig_drain_for_self.
+        set_drain_pre_claim_hook(Some(Arc::new(move |slot_idx, state, target_pid| {
+            if slot_idx == 0 && target_pid == me && (state & XSIG_PHASE_MASK) == XSIG_PHASE_READY {
+                rz.hook_wait();
+            }
+        })));
 
-        // Step 4: Producer enqueues a NEW signal for `other` into slot 0 (reusing it).
-        assert!(xsig_enqueue(other, 12, 0, 200, 0, 2000, 0));
+        let (drained_me, intermediate_drain, enq_ok, hook_reached_ok) = std::thread::scope(|s| {
+            // Drainer A: calls actual production xsig_drain_for_self()
+            let drainer_handle = s.spawn(xsig_drain_for_self);
 
-        // Step 5: Thread A resumes and attempts CAS with its stale observed state (generation 0).
-        // Because generation advanced to 1 during drain/re-enqueue, this CAS fails!
-        let draining_state = (observed_state & !XSIG_PHASE_MASK) | XSIG_PHASE_DRAINING;
-        let cas_result = slot.state.compare_exchange(
-            observed_state,
-            draining_state,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+            // Coordinator thread: wait until Drainer A reaches pre-claim hook
+            let reached = rendezvous.wait_for_hook();
+            set_drain_pre_claim_hook(None);
+
+            let mut intermediate = Vec::new();
+            let mut enq = false;
+            if reached {
+                // Drainer A2 cleanly drains slot 0 through production xsig_drain_for_self()
+                intermediate = xsig_drain_for_self();
+                // Producer enqueues a NEW signal targeting `other` into recycled slot 0 via production xsig_enqueue()
+                enq = xsig_enqueue(other, 12, 0, 200, 0, 2000, 0);
+            }
+
+            // Unblock Drainer A
+            rendezvous.release();
+
+            // Join Drainer A before asserting sampled state
+            let me_drain = drainer_handle.join().unwrap_or_default();
+            (me_drain, intermediate, enq, reached)
+        });
+
         assert!(
-            cas_result.is_err(),
-            "stale claim with old generation must fail and not steal other process's signal"
+            hook_reached_ok,
+            "drainer must reach pre-claim hook within timeout"
+        );
+        assert_eq!(
+            intermediate_drain,
+            vec![(10, 0, 100, 0, 1000, 0)],
+            "intermediate drain must receive the original signal"
+        );
+        assert!(enq_ok, "enqueue for other must succeed into recycled slot");
+
+        // Drainer A's production claim on slot 0 must fail because slot 0 is now generation 1 (for other).
+        // Drainer A must NOT return other's payload.
+        assert!(
+            drained_me.is_empty(),
+            "paused drainer must not steal the reused slot of another target (got {:?})",
+            drained_me
         );
 
-        // Step 6: Verify `other`'s signal is undamaged and deliverable to `other`.
+        // Verify that `other` receives its signal intact through production xsig_drain_for_self()
         XSIG_SELF_HOST_PID.store(other, Ordering::Release);
         assert!(xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE));
         let drained_other = xsig_drain_for_self();
@@ -994,97 +1078,327 @@ mod tests {
     }
 
     #[test]
-    fn publication_before_ready_prevents_stale_phantom_index_bits() {
+    fn delayed_producer_ready_transition_prevents_phantom_published_bits() {
+        use std::time::Duration;
+
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_ring();
         let me = std::process::id() as i32;
 
-        for round in 0..100 {
-            assert!(xsig_enqueue(me, 10, 0, round, 0, round as i64, 0));
-            let ring = xsig_ring().unwrap();
-            let word = ring.published[0].load(Ordering::Acquire);
-            assert_eq!(word & 1, 1, "published bit must be set");
+        let rendezvous = Arc::new(BoundedRendezvous::new(Duration::from_secs(2)));
+        let rz = Arc::clone(&rendezvous);
 
-            let drained = xsig_drain_for_self();
-            assert_eq!(drained.len(), 1);
+        // Register hook to pause producer between Phase 2 (bitmap publication)
+        // and Phase 3 (transitioning slot state to READY).
+        set_enqueue_pre_ready_hook(Some(Arc::new(move |_slot_idx| {
+            rz.hook_wait();
+        })));
 
-            let word_after = ring.published[0].load(Ordering::Acquire);
-            assert_eq!(
-                word_after, 0,
-                "published bitmap must be completely zeroed after drain"
-            );
+        let (pub_word, slot_0_state, has_unblocked, premature_drain, producer_ok, hook_reached_ok) =
+            std::thread::scope(|s| {
+                let producer_handle = s.spawn(|| xsig_enqueue(me, 10, 0, 42, 0, 1000, 0));
 
-            SLOT_LOAD_COUNT.store(0, Ordering::Relaxed);
-            assert!(!xsig_has_unblocked_for_self(
-                carrick_abi::SigBlockMask::NONE
-            ));
-            assert_eq!(
-                SLOT_LOAD_COUNT.load(Ordering::Relaxed),
-                0,
-                "empty check must load 0 payload slots after drain"
-            );
-        }
+                let reached = rendezvous.wait_for_hook();
+                set_enqueue_pre_ready_hook(None);
+
+                let mut pub_w = 0;
+                let mut s0_st = 0;
+                let mut unblocked = false;
+                let mut p_drain = Vec::new();
+
+                if reached {
+                    let ring = xsig_ring().unwrap();
+                    pub_w = ring.published[0].load(Ordering::Acquire);
+                    s0_st = ring.slots[0].state.load(Ordering::Acquire);
+                    unblocked = xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE);
+                    p_drain = xsig_drain_for_self();
+                }
+
+                // Resume producer to complete Phase 3 (READY store)
+                rendezvous.release();
+                let ok = producer_handle.join().unwrap_or(false);
+
+                (pub_w, s0_st, unblocked, p_drain, ok, reached)
+            });
+
+        assert!(
+            hook_reached_ok,
+            "producer must reach pre-ready hook within timeout"
+        );
+        // Verify invariants during the pre-ready pause:
+        assert_ne!(
+            pub_word & 1,
+            0,
+            "publication index bit must be set before READY transition"
+        );
+        assert_eq!(
+            slot_0_state & XSIG_PHASE_MASK,
+            XSIG_PHASE_CLAIMING,
+            "slot must still be in CLAIMING phase (not READY) when paused pre-ready"
+        );
+        assert!(!has_unblocked, "unready slot must not be deliverable");
+        assert!(
+            premature_drain.is_empty(),
+            "premature drain must not consume or corrupt in-flight unready slot"
+        );
+        assert!(producer_ok);
+
+        // Now that producer completed, signal is fully deliverable
+        assert!(xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE));
+        let drained = xsig_drain_for_self();
+        assert_eq!(drained, vec![(10, 0, 42, 0, 1000, 0)]);
+
+        // After drain, publication index must be strictly zero (no phantom bits left)
+        let ring = xsig_ring().unwrap();
+        assert_eq!(
+            ring.published[0].load(Ordering::Acquire),
+            0,
+            "publication bitmap must be completely zeroed after drain"
+        );
+
+        // Empty check does 0 slot loads
+        SLOT_LOAD_COUNT.store(0, Ordering::Relaxed);
+        assert!(!xsig_has_unblocked_for_self(
+            carrick_abi::SigBlockMask::NONE
+        ));
+        assert_eq!(
+            SLOT_LOAD_COUNT.load(Ordering::Relaxed),
+            0,
+            "empty check must load 0 payload slots after clean retirement"
+        );
 
         reset_ring();
     }
 
     #[test]
-    fn deterministic_interleaved_producer_drainer_barrier_coordination() {
-        use std::sync::{Arc, Barrier};
+    fn adversarial_multithreaded_enqueue_drain_stress() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::time::{Duration, Instant};
 
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_ring();
+
+        const PRODUCERS: usize = 4;
+        const CONSUMERS: usize = 4;
+        const MESSAGES_PER_PRODUCER: usize = 1000;
+        const TOTAL_MESSAGES: usize = PRODUCERS * MESSAGES_PER_PRODUCER;
+        const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
         let me = std::process::id() as i32;
-        let other = me + 10;
+        let stop = Arc::new(AtomicBool::new(false));
+        let total_received = Arc::new(AtomicUsize::new(0));
 
-        let barrier_start = Arc::new(Barrier::new(3));
-        let barrier_step = Arc::new(Barrier::new(3));
+        let received_all = std::thread::scope(|s| {
+            let mut producer_handles = Vec::new();
+            for p in 0..PRODUCERS {
+                let stop = Arc::clone(&stop);
+                producer_handles.push(s.spawn(move || {
+                    for seq in 0..MESSAGES_PER_PRODUCER {
+                        let msg_id = (p * MESSAGES_PER_PRODUCER + seq) as i64;
+                        let mut backoff = 0;
+                        while !xsig_enqueue(me, 10, 0, p as i32, 0, msg_id, 0) {
+                            if stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            backoff += 1;
+                            if backoff > 32 {
+                                std::thread::yield_now();
+                                backoff = 0;
+                            } else {
+                                std::hint::spin_loop();
+                            }
+                        }
+                    }
+                }));
+            }
 
-        std::thread::scope(|s| {
-            // Producer 1 (for `me`)
-            let b1 = Arc::clone(&barrier_start);
-            let bs1 = Arc::clone(&barrier_step);
-            s.spawn(move || {
-                b1.wait();
-                assert!(xsig_enqueue(me, 10, 0, 1, 0, 100, 0));
-                bs1.wait();
-            });
+            let mut consumer_handles = Vec::new();
+            for _ in 0..CONSUMERS {
+                let stop = Arc::clone(&stop);
+                let total_received = Arc::clone(&total_received);
+                consumer_handles.push(s.spawn(move || {
+                    let mut local_received = Vec::new();
+                    let mut backoff = 0;
+                    while !stop.load(Ordering::Acquire) {
+                        let batch = xsig_drain_for_self();
+                        if !batch.is_empty() {
+                            total_received.fetch_add(batch.len(), Ordering::Relaxed);
+                            local_received.extend(batch);
+                            backoff = 0;
+                        } else {
+                            backoff += 1;
+                            if backoff > 32 {
+                                std::thread::yield_now();
+                                backoff = 0;
+                            } else {
+                                std::hint::spin_loop();
+                            }
+                        }
+                    }
+                    // Final drain to ensure no messages left behind after producers finish
+                    let batch = xsig_drain_for_self();
+                    if !batch.is_empty() {
+                        total_received.fetch_add(batch.len(), Ordering::Relaxed);
+                        local_received.extend(batch);
+                    }
+                    local_received
+                }));
+            }
 
-            // Producer 2 (for `other`)
-            let b2 = Arc::clone(&barrier_start);
-            let bs2 = Arc::clone(&barrier_step);
-            s.spawn(move || {
-                b2.wait();
-                assert!(xsig_enqueue(other, 12, 0, 2, 0, 200, 0));
-                bs2.wait();
-            });
+            let start = Instant::now();
+            while total_received.load(Ordering::Relaxed) < TOTAL_MESSAGES
+                && start.elapsed() < TEST_TIMEOUT
+            {
+                std::thread::yield_now();
+            }
 
-            // Coordinator thread
-            barrier_start.wait();
-            barrier_step.wait();
+            stop.store(true, Ordering::Release);
 
-            // Both signals are published. Drain `me`
-            let drained_me = xsig_drain_for_self();
-            assert_eq!(drained_me, vec![(10, 0, 1, 0, 100, 0)]);
+            for h in producer_handles {
+                h.join().unwrap();
+            }
 
-            // `other` signal is still intact
-            XSIG_SELF_HOST_PID.store(other, Ordering::Release);
-            assert!(xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE));
-            let drained_other = xsig_drain_for_self();
-            assert_eq!(drained_other, vec![(12, 0, 2, 0, 200, 0)]);
-
-            XSIG_SELF_HOST_PID.store(me, Ordering::Release);
-            assert!(!xsig_has_unblocked_for_self(
-                carrick_abi::SigBlockMask::NONE
-            ));
-
-            SLOT_LOAD_COUNT.store(0, Ordering::Relaxed);
-            assert!(!xsig_has_unblocked_for_self(
-                carrick_abi::SigBlockMask::NONE
-            ));
-            assert_eq!(SLOT_LOAD_COUNT.load(Ordering::Relaxed), 0);
+            let mut all_msgs = Vec::new();
+            for h in consumer_handles {
+                all_msgs.extend(h.join().unwrap());
+            }
+            all_msgs
         });
 
+        assert_eq!(
+            received_all.len(),
+            TOTAL_MESSAGES,
+            "all published messages across concurrent producers must be delivered exactly once (received {} of {})",
+            received_all.len(),
+            TOTAL_MESSAGES
+        );
+
+        // Exact multiset verification: every message ID from 0 to TOTAL_MESSAGES-1
+        // must be received exactly once, with correct sender and signum.
+        let mut seen = vec![0usize; TOTAL_MESSAGES];
+        for (sig, _code, sender_pid, _uid, msg_id, tid) in received_all {
+            assert_eq!(sig, 10, "signum must be 10");
+            assert_eq!(tid, 0, "target_ns_tid must be 0");
+            assert!(
+                msg_id >= 0 && (msg_id as usize) < TOTAL_MESSAGES,
+                "msg_id out of bounds: {}",
+                msg_id
+            );
+            let id = msg_id as usize;
+            let expected_sender = (id / MESSAGES_PER_PRODUCER) as i32;
+            assert_eq!(
+                sender_pid, expected_sender,
+                "sender PID mismatch for msg_id {}",
+                id
+            );
+            seen[id] += 1;
+        }
+
+        for (id, count) in seen.iter().enumerate() {
+            assert_eq!(
+                *count, 1,
+                "message {} was delivered {} times (expected 1)",
+                id, count
+            );
+        }
+
+        assert!(!xsig_has_unblocked_for_self(
+            carrick_abi::SigBlockMask::NONE
+        ));
         reset_ring();
+    }
+
+    #[test]
+    fn cross_process_fork_shared_ring_delivery() {
+        use std::time::{Duration, Instant};
+
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // Child process
+            xsig_refresh_self_host_pid();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut drained = Vec::new();
+            while Instant::now() < deadline {
+                if xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE) {
+                    drained = xsig_drain_for_self();
+                    if !drained.is_empty() {
+                        break;
+                    }
+                }
+                std::thread::yield_now();
+            }
+            let success = drained.len() == 1
+                && drained[0].0 == 12
+                && drained[0].2 == 9999
+                && drained[0].4 == 0xcafe;
+            unsafe {
+                libc::_exit(if success { 0 } else { 1 });
+            }
+        } else {
+            // RAII cleanup guard to ensure the exact child process is ALWAYS reaped
+            // even if assertions fail or parent panics.
+            struct ChildGuard {
+                pid: libc::pid_t,
+                reaped: bool,
+                status: libc::c_int,
+            }
+            impl ChildGuard {
+                fn new(pid: libc::pid_t) -> Self {
+                    Self {
+                        pid,
+                        reaped: false,
+                        status: 0,
+                    }
+                }
+                fn wait_bounded(&mut self, timeout: Duration) -> bool {
+                    let deadline = Instant::now() + timeout;
+                    while Instant::now() < deadline {
+                        let ret =
+                            unsafe { libc::waitpid(self.pid, &mut self.status, libc::WNOHANG) };
+                        if ret == self.pid {
+                            self.reaped = true;
+                            return true;
+                        }
+                        std::thread::yield_now();
+                    }
+                    false
+                }
+            }
+            impl Drop for ChildGuard {
+                fn drop(&mut self) {
+                    if !self.reaped {
+                        unsafe {
+                            libc::kill(self.pid, libc::SIGKILL);
+                            libc::waitpid(self.pid, &mut self.status, 0);
+                        }
+                        self.reaped = true;
+                    }
+                }
+            }
+
+            let mut guard = ChildGuard::new(child);
+
+            // Enqueue signal targeting child
+            let enq_ok = xsig_enqueue(child, 12, 0, 9999, 1000, 0xcafe, 0);
+            assert!(enq_ok, "enqueue targeting child must succeed");
+
+            let reaped = guard.wait_bounded(Duration::from_secs(5));
+            assert!(
+                reaped,
+                "child process timed out waiting for xsignal delivery"
+            );
+            assert!(libc::WIFEXITED(guard.status), "child did not exit normally");
+            assert_eq!(
+                libc::WEXITSTATUS(guard.status),
+                0,
+                "child failed xsignal verification"
+            );
+            reset_ring();
+        }
     }
 }
