@@ -474,9 +474,7 @@ impl SyscallDispatcher {
         if memory.write_bytes(address, &bytes).is_err() {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
-        DispatchOutcome::Returned {
-            value: bytes.len() as i64,
-        }
+        DispatchOutcome::returned_len_or_errno(bytes.len())
     }
 
     /// perf event ioctls. Called from the `ioctl` handler once the fd is known

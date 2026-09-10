@@ -1435,9 +1435,7 @@ impl SyscallDispatcher {
             if requested != LINUX_PERSONALITY_QUERY {
                 proc.personality = requested;
             }
-            Ok(DispatchOutcome::Returned {
-                value: previous as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(previous)?)
         }
 
         fn sys_seccomp(this, cx, operation: u64, _flags: u64, args: GuestPtr) {
@@ -1642,9 +1640,9 @@ impl SyscallDispatcher {
                     this.proc.lock().timerslack = slack;
                     DispatchOutcome::Returned { value: 0 }
                 }
-                LINUX_PR_GET_TIMERSLACK => DispatchOutcome::Returned {
-                    value: this.proc.lock().timerslack as i64,
-                },
+                LINUX_PR_GET_TIMERSLACK => {
+                    DispatchOutcome::returned_u64(this.proc.lock().timerslack)?
+                }
                 LINUX_PR_SET_THP_DISABLE => {
                     if arg2 > 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -1735,13 +1733,11 @@ impl SyscallDispatcher {
                 },
                 // PR_GET_SECCOMP: 2 if a filter is installed, else 0 (Linux
                 // reports the filter mode; strict mode would kill on this call).
-                LINUX_PR_GET_SECCOMP => DispatchOutcome::Returned {
-                    value: if this.seccomp.is_active() {
-                        LINUX_SECCOMP_MODE_FILTER as i64
-                    } else {
-                        0
-                    },
-                },
+                LINUX_PR_GET_SECCOMP => DispatchOutcome::returned_u32(if this.seccomp.is_active() {
+                    LINUX_SECCOMP_MODE_FILTER as u32
+                } else {
+                    0
+                }),
                 _ => DispatchOutcome::errno(LINUX_EINVAL),
             })
         }
@@ -1988,7 +1984,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let v = cx.kernel.task().ioprio();
-            Ok(DispatchOutcome::Returned { value: v as i64 })
+            Ok(DispatchOutcome::returned_u32(v))
         }
 
         /// vhangup(): "virtually hang up" the current tty. Requires
@@ -2024,9 +2020,7 @@ impl SyscallDispatcher {
             let mask = cx.kernel.thread().affinity();
             let buf = affinity_to_bytes(mask.words(), kernel_bytes);
             memory.write_bytes(address.0, &buf)?;
-            Ok(DispatchOutcome::Returned {
-                value: kernel_bytes as i64,
-            })
+            Ok(DispatchOutcome::returned_len(kernel_bytes)?)
         }
 
         fn sched_setaffinity(this, cx, pid: u64, size: u64, address: GuestPtr) {
@@ -2089,7 +2083,7 @@ impl SyscallDispatcher {
             if !sched_pid_exists(this, cx, pid) {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            Ok(DispatchOutcome::Returned { value: LINUX_SCHED_OTHER as i64 })
+            Ok(DispatchOutcome::returned_i32(LINUX_SCHED_OTHER))
         }
 
         /// `sched_getparam(pid, &sched_param)`: write the scheduling priority
@@ -2176,7 +2170,7 @@ impl SyscallDispatcher {
             if prio != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            Ok(DispatchOutcome::Returned { value: LINUX_SCHED_OTHER as i64 })
+            Ok(DispatchOutcome::returned_i32(LINUX_SCHED_OTHER))
         }
 
         /// `sched_setparam(pid, &param)`: change just the priority. For our
@@ -2705,9 +2699,7 @@ impl SyscallDispatcher {
                                         match authority.read_foreign(&foreign, range, &mut buf) {
                                             Ok(receipt) if receipt.bytes_read() == 8 => {
                                                 let word = u64::from_le_bytes(buf);
-                                                Ok(DispatchOutcome::Returned {
-                                                    value: word as i64,
-                                                })
+                                                Ok(DispatchOutcome::returned_raw_u64(word))
                                             }
                                             _ => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
                                         }
@@ -2717,9 +2709,7 @@ impl SyscallDispatcher {
                                         match cx.memory.read_into(addr.0, &mut buf) {
                                             Ok(()) => {
                                                 let word = u64::from_le_bytes(buf);
-                                                Ok(DispatchOutcome::Returned {
-                                                    value: word as i64,
-                                                })
+                                                Ok(DispatchOutcome::returned_raw_u64(word))
                                             }
                                             Err(_) => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
                                         }
@@ -4618,9 +4608,7 @@ impl SyscallDispatcher {
                 fill_deterministic_bootstrap_random(&mut bytes);
             }
             memory.write_bytes(address.0, &bytes)?;
-            Ok(DispatchOutcome::Returned {
-                value: length as i64,
-            })
+            Ok(DispatchOutcome::returned_len(length)?)
         }
 
         fn sys_exit(this, cx, code: u64) {
@@ -4999,9 +4987,7 @@ impl SyscallDispatcher {
                     if copied == 0 {
                         Ok(DispatchOutcome::errno(LINUX_EFAULT))
                     } else {
-                        Ok(DispatchOutcome::Returned {
-                            value: copied as i64,
-                        })
+                        Ok(DispatchOutcome::returned_u64(copied)?)
                     }
                 } else {
                     const COMPOUND_SIZE: u64 = 16 * 1024;
@@ -5228,9 +5214,7 @@ impl SyscallDispatcher {
                     if copied == 0 {
                         Ok(DispatchOutcome::errno(LINUX_EFAULT))
                     } else {
-                        Ok(DispatchOutcome::Returned {
-                            value: copied as i64,
-                        })
+                        Ok(DispatchOutcome::returned_u64(copied)?)
                     }
                 }
             }
@@ -7128,9 +7112,7 @@ mod kernel_process_dispatch_tests {
                 [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0,],
                 Some(&lease),
             ),
-            DispatchOutcome::Returned {
-                value: u64::from_le_bytes(*b"PEEKWORD") as i64,
-            },
+            DispatchOutcome::returned_raw_u64(u64::from_le_bytes(*b"PEEKWORD")),
         );
     }
 
@@ -7400,9 +7382,7 @@ mod kernel_process_dispatch_tests {
 
         assert_eq!(
             peektext,
-            DispatchOutcome::Returned {
-                value: u64::from_le_bytes(*b"WORDPAIR") as i64,
-            },
+            DispatchOutcome::returned_raw_u64(u64::from_le_bytes(*b"WORDPAIR")),
         );
         assert_eq!(peektext, peekdata);
     }
@@ -7751,9 +7731,7 @@ mod kernel_process_dispatch_tests {
                 [LINUX_PTRACE_PEEKDATA, target_pid as u64, TARGET_VA, 0, 0, 0],
                 Some(&lease),
             ),
-            DispatchOutcome::Returned {
-                value: u64::from_le_bytes(*b"CONTTEST") as i64,
-            },
+            DispatchOutcome::returned_raw_u64(u64::from_le_bytes(*b"CONTTEST")),
         );
 
         assert_eq!(
@@ -7846,9 +7824,7 @@ mod kernel_process_dispatch_tests {
                 ],
                 Some(&lease),
             ),
-            DispatchOutcome::Returned {
-                value: high_bit_word as i64,
-            },
+            DispatchOutcome::returned_raw_u64(high_bit_word),
             "high-bit word must be preserved as i64",
         );
     }
@@ -7873,9 +7849,7 @@ mod kernel_process_dispatch_tests {
                 [LINUX_PTRACE_PEEKDATA, child_pid as u64, 0x2000, 0, 0, 0],
                 Some(&lease),
             ),
-            DispatchOutcome::Returned {
-                value: u64::from_le_bytes(*b"CLONEVM1") as i64,
-            },
+            DispatchOutcome::returned_raw_u64(u64::from_le_bytes(*b"CLONEVM1")),
             "peek on CLONE_VM shared memory child must read shared bytes",
         );
 

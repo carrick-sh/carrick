@@ -386,7 +386,7 @@ impl SyscallDispatcher {
                         map: Arc::new(map),
                     };
                     let fd = this.install_bpf_fd(description)?;
-                    Ok(DispatchOutcome::Returned { value: fd as i64 })
+                    Ok(DispatchOutcome::returned_i32(fd))
                 }
 
                 BpfCmd::MapLookupElem => {
@@ -473,7 +473,7 @@ impl SyscallDispatcher {
                                 }),
                             };
                             let fd = this.install_bpf_fd(description)?;
-                            Ok(DispatchOutcome::Returned { value: fd as i64 })
+                            Ok(DispatchOutcome::returned_i32(fd))
                         }
                     }
                 }

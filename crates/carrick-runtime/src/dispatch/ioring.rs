@@ -807,7 +807,7 @@ impl SyscallDispatcher {
         let Ok(fd) = self.install_fd_at_or_above(3, OpenFile::new(description, 0)) else {
             return DispatchOutcome::errno(linux_errno::EMFILE);
         };
-        DispatchOutcome::Returned { value: fd as i64 }
+        DispatchOutcome::returned_i32(fd)
     }
 
     pub(in crate::dispatch) fn io_uring_description(
@@ -941,9 +941,7 @@ impl SyscallDispatcher {
         let _ = backing.store_u32(layout.cq_off.tail as u64, cq_tail, Ordering::Release);
         // Number of SQEs this call submitted (bounded by to_submit; correct
         // across a WaitOnFds re-dispatch, which recounts only still-pending SQEs).
-        DispatchOutcome::Returned {
-            value: processed as i64,
-        }
+        DispatchOutcome::returned_u32(processed)
     }
 
     /// Execute one SQE, returning the CQE `res` (bytes transferred or `-errno`).

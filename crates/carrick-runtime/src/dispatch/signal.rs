@@ -1029,9 +1029,7 @@ impl SyscallDispatcher {
         if memory.write_bytes(address, &out).is_err() {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
-        DispatchOutcome::Returned {
-            value: out.len() as i64,
-        }
+        DispatchOutcome::returned_len_or_errno(out.len())
     }
 
     /// Record a PROCESS-directed signal in the SHARED pending set (no thread
@@ -1678,7 +1676,7 @@ impl SyscallDispatcher {
                 match &mut *open {
                     OpenDescription::SignalFd { mask, .. } => {
                         *mask = mask_val;
-                        Ok(DispatchOutcome::Returned { value: fd.0 as i64 })
+                        Ok(DispatchOutcome::returned_fd(fd))
                     }
                     _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                 }
@@ -2496,9 +2494,7 @@ fn rt_sigtimedwait_deliver(
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
     }
-    DispatchOutcome::Returned {
-        value: signum as i64,
-    }
+    DispatchOutcome::returned_i32(signum)
 }
 
 /// Resolve a THREAD-DIRECTED xsig ring entry's guest ns tid to a live local

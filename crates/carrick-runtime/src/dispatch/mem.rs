@@ -4570,9 +4570,7 @@ impl SyscallDispatcher {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
         if command == LINUX_MEMBARRIER_CMD_QUERY {
-            return DispatchOutcome::Returned {
-                value: SUPPORTED as i64,
-            };
+            return DispatchOutcome::returned_u64_or_errno(SUPPORTED);
         }
         match command {
             // A global (or global-expedited) barrier needs no registration.
@@ -4676,21 +4674,15 @@ impl SyscallDispatcher {
             let mut mem = mem_authority_13.lock();
             let current = mem.brk_current;
             if requested == 0 {
-                return Ok(DispatchOutcome::Returned {
-                    value: current as i64,
-                });
+                return Ok(DispatchOutcome::returned_u64(current)?);
             }
             if range_within(requested, 0, mem.layout.heap_base, mem.layout.heap_size) {
                 let page_size = this.linux_page_size();
                 let Some(old_page_end) = align_up_u64(current, page_size) else {
-                    return Ok(DispatchOutcome::Returned {
-                        value: current as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_u64(current)?);
                 };
                 let Some(new_page_end) = align_up_u64(requested, page_size) else {
-                    return Ok(DispatchOutcome::Returned {
-                        value: current as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_u64(current)?);
                 };
 
                 if requested > current {
@@ -4706,9 +4698,7 @@ impl SyscallDispatcher {
                             .check_address_space_limits_locked(&mem, as_limit, data_limit, grow, true)
                             .is_err()
                         {
-                            return Ok(DispatchOutcome::Returned {
-                                value: current as i64,
-                            });
+                            return Ok(DispatchOutcome::returned_u64(current)?);
                         }
                     }
                 }
@@ -4721,9 +4711,7 @@ impl SyscallDispatcher {
                         .checked_sub(old_page_end)
                         .and_then(|len| usize::try_from(len).ok())
                     else {
-                        return Ok(DispatchOutcome::Returned {
-                            value: current as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_u64(current)?);
                     };
                     let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
                     if cx.memory.protect_range(grow_start, grow_len, rw).is_err() {
@@ -4741,9 +4729,7 @@ impl SyscallDispatcher {
                         .checked_sub(new_page_end)
                         .and_then(|len| usize::try_from(len).ok())
                     else {
-                        return Ok(DispatchOutcome::Returned {
-                            value: current as i64,
-                        });
+                        return Ok(DispatchOutcome::returned_u64(current)?);
                     };
                     if cx.memory.protect_range(shrink_start, shrink_len, 0).is_err() {
                         std::process::abort();
@@ -4761,9 +4747,7 @@ impl SyscallDispatcher {
                     host_alias_dispatch.mark_vma_revision(mem_authority_13.revision_publisher());
                 }
             }
-            Ok(DispatchOutcome::Returned {
-                value: mem.brk_current as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(mem.brk_current)?)
         }
 
         mm_mutation fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
@@ -5405,9 +5389,7 @@ impl SyscallDispatcher {
                     ),
                     shared_file_alias: None,
                 });
-                return Ok(DispatchOutcome::Returned {
-                    value: requested.0 as i64,
-                });
+                return Ok(DispatchOutcome::returned_ptr(requested)?);
             }
 
             let hvf_page = crate::trap::HVF_PAGE_SIZE;
@@ -5816,7 +5798,7 @@ impl SyscallDispatcher {
                         this.mark_range_resident(addr, length);
                     }
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
-                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
+                    return Ok(DispatchOutcome::returned_u64(addr)?);
                 }
                 return Ok(request.refused(
                     MmapRefusal::Internal("shared aperture exhausted"),
@@ -6014,9 +5996,7 @@ impl SyscallDispatcher {
                     this.record_growdown_mapping(address, length);
                 }
                 this.mark_vma_dispatch(&mut host_alias_dispatch);
-                return Ok(DispatchOutcome::Returned {
-                    value: address as i64,
-                });
+                return Ok(DispatchOutcome::returned_u64(address)?);
             }
 
             let defer_anonymous = memory.supports_lazy_anonymous_mmap()
@@ -6147,9 +6127,7 @@ impl SyscallDispatcher {
                     this.record_growdown_mapping(address, length);
                 }
                 this.mark_vma_dispatch(&mut host_alias_dispatch);
-                return Ok(DispatchOutcome::Returned {
-                    value: address as i64,
-                });
+                return Ok(DispatchOutcome::returned_u64(address)?);
             }
 
             let mut bus_fault_offset = None;
@@ -6720,9 +6698,7 @@ impl SyscallDispatcher {
                 this.mem().lock().private_file_maps.push(source);
             }
             this.mark_vma_dispatch(&mut host_alias_dispatch);
-            Ok(DispatchOutcome::Returned {
-                value: address as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(address)?)
         }
 
         mm_mutation fn munmap(this, cx, address: GuestPtr, length: u64) {
@@ -7539,9 +7515,7 @@ impl SyscallDispatcher {
                 }
 
                 this.mark_vma_dispatch(&mut host_alias_dispatch);
-                return Ok(DispatchOutcome::Returned {
-                    value: va as i64,
-                });
+                return Ok(DispatchOutcome::returned_u64(va)?);
             }
             let shared_aperture_alloc = this.mem()
                 .lock()
@@ -7864,9 +7838,7 @@ impl SyscallDispatcher {
                         &source_metadata,
                         );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
-                    return Ok(DispatchOutcome::Returned {
-                        value: old_address.0 as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_ptr(old_address)?);
                 }
                 if shared_grow_in_place {
                     // Extend the existing aperture allocation rather than
@@ -7946,9 +7918,7 @@ impl SyscallDispatcher {
                         &source_metadata,
                         );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
-                    return Ok(DispatchOutcome::Returned {
-                        value: old_address.0 as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_ptr(old_address)?);
                 }
                 if !must_relocate && new_size <= old_size {
                     let tail_start = old_address.0.saturating_add(new_size);
@@ -8017,9 +7987,7 @@ impl SyscallDispatcher {
                     if new_size != old_size {
                         this.mark_vma_dispatch(&mut host_alias_dispatch);
                     }
-                    return Ok(DispatchOutcome::Returned {
-                        value: old_address.0 as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_ptr(old_address)?);
                 }
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
@@ -8067,9 +8035,7 @@ impl SyscallDispatcher {
                 if new_size != old_size {
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                 }
-                return Ok(DispatchOutcome::Returned {
-                    value: old_address.0 as i64,
-                });
+                return Ok(DispatchOutcome::returned_ptr(old_address)?);
             }
 
             // A MAP_SHARED file mapping that already ends past its file's EOF,
@@ -8200,9 +8166,7 @@ impl SyscallDispatcher {
                         }
                     }
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
-                    return Ok(DispatchOutcome::Returned {
-                        value: new_addr as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_u64(new_addr)?);
                 }
                 let grow_len_u64 = new_size - old_size;
                 // Deliberately NO page-table work: the tail is above the arena
@@ -8224,9 +8188,7 @@ impl SyscallDispatcher {
                     &source_metadata,
                     );
                 this.mark_vma_dispatch(&mut host_alias_dispatch);
-                return Ok(DispatchOutcome::Returned {
-                    value: old_address.0 as i64,
-                });
+                return Ok(DispatchOutcome::returned_ptr(old_address)?);
             }
             if !must_relocate
                 && old_address.0.checked_add(old_size) == Some(this.mem().lock().mmap_next)
@@ -8275,9 +8237,7 @@ impl SyscallDispatcher {
                         &source_metadata,
                         );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
-                    return Ok(DispatchOutcome::Returned {
-                        value: old_address.0 as i64,
-                    });
+                    return Ok(DispatchOutcome::returned_ptr(old_address)?);
                 }
             }
 
@@ -8461,9 +8421,7 @@ impl SyscallDispatcher {
                     }
                 }
             this.mark_vma_dispatch(&mut host_alias_dispatch);
-            Ok(DispatchOutcome::Returned {
-                value: new_addr as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(new_addr)?)
         }
 
         mm_mutation fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {

@@ -253,9 +253,7 @@ pub(super) fn write_epoll_events<M: CurrentMmMemory>(
             }
         }
     }
-    Ok(DispatchOutcome::Returned {
-        value: ready.len() as i64,
-    })
+    Ok(DispatchOutcome::returned_len(ready.len())?)
 }
 
 /// Translate one multiplexer [`carrick_hal::event::PollEvent`] to Linux epoll event bits.
@@ -714,9 +712,7 @@ pub(in crate::dispatch) fn drain_netlink_queue(
     if memory.write_bytes(address, &chunk).is_err() {
         return DispatchOutcome::errno(LINUX_EFAULT);
     }
-    DispatchOutcome::Returned {
-        value: chunk.len() as i64,
-    }
+    DispatchOutcome::returned_len_or_errno(chunk.len())
 }
 
 /// Append a 4-byte-aligned rtattr (TLV) to `buf`.

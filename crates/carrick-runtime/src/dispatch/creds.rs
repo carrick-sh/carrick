@@ -590,7 +590,7 @@ impl SyscallDispatcher {
         fn umask(this, cx, new: u64) {
             let new = new as u32 & 0o777;
             let previous = this.update_fs_umask(cx.kernel, new);
-            Ok(DispatchOutcome::Returned { value: previous as i64 })
+            Ok(DispatchOutcome::returned_u32(previous))
         }
 
         fn setpriority(this, cx, which: u64, who: Pid, prio: u64) {
@@ -845,9 +845,7 @@ impl SyscallDispatcher {
                 (false, _, Some(min)) => min,
                 (false, _, None) => 0,
             };
-            Ok(DispatchOutcome::Returned {
-                value: (20 - nice) as i64,
-            })
+            Ok(DispatchOutcome::returned_i32(20 - nice))
         }
 
         fn setresuid(this, cx, r: u64, e: u64, s: u64) {
@@ -995,9 +993,7 @@ impl SyscallDispatcher {
             let groups = this.current_groups();
             // size == 0 is a pure query: return the count without writing.
             if size == 0 {
-                return Ok(DispatchOutcome::Returned {
-                    value: groups.len() as i64,
-                });
+                return Ok(DispatchOutcome::returned_len(groups.len())?);
             }
             if (size as usize) < groups.len() {
                 // Buffer too small to hold the whole set (Linux EINVAL).
@@ -1008,9 +1004,7 @@ impl SyscallDispatcher {
                 bytes.extend_from_slice(&g.raw().to_le_bytes());
             }
             cx.memory.write_bytes(list.0, &bytes)?;
-            Ok(DispatchOutcome::Returned {
-                value: groups.len() as i64,
-            })
+            Ok(DispatchOutcome::returned_len(groups.len())?)
         }
 
         fn sys_setfsuid(this, cx, uid: u64) {

@@ -661,7 +661,7 @@ impl SyscallDispatcher {
                 linux_fd_flags_from_open_flags(oflag),
             );
             match this.install_fd_at_or_above(0, open_file) {
-                Ok(fd) => Ok(DispatchOutcome::Returned { value: fd as i64 }),
+                Ok(fd) => Ok(DispatchOutcome::returned_i32(fd)),
                 Err(_) => Ok(DispatchOutcome::errno(crate::dispatch::linux_errno::EMFILE)),
             }
         }
@@ -820,7 +820,7 @@ impl SyscallDispatcher {
                         {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         }
-                        return Ok(DispatchOutcome::Returned { value: n as i64 });
+                        return Ok(DispatchOutcome::returned_len(n)?);
                     }
                     if nonblock {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));

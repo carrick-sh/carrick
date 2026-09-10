@@ -241,7 +241,7 @@ fn write_truncated<M: CurrentMmMemory>(
         let copied = full.min(buffer_len);
         memory.write_bytes(address.0, &bytes[..copied])?;
     }
-    Ok(DispatchOutcome::Returned { value: full as i64 })
+    Ok(DispatchOutcome::returned_len(full)?)
 }
 
 /// A `key_serial_t` argument: the wire value is 32-bit and signed, so the
@@ -289,9 +289,7 @@ impl SyscallDispatcher {
             let serial = scope
                 .service()
                 .add_key(&caller, &type_name, &description, &payload, destination)?;
-            Ok(DispatchOutcome::Returned {
-                value: serial.guest_retval() as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(serial.guest_retval())?)
         }
 
         /// `request_key(2)`.
@@ -358,9 +356,7 @@ impl SyscallDispatcher {
                 callout.as_deref(),
                 destination,
             )?;
-            Ok(DispatchOutcome::Returned {
-                value: serial.guest_retval() as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(serial.guest_retval())?)
         }
 
         /// `keyctl(2)`.
@@ -403,9 +399,7 @@ fn keyctl_op<M: CurrentMmMemory>(
             let resolved = scope.resolve(serial_arg(arg2), arg3 != 0)?;
             // A named key still has to be reachable by the caller.
             service.validate_keyring(&caller, resolved, KeyRight::Search)?;
-            Ok(DispatchOutcome::Returned {
-                value: resolved.guest_retval() as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(resolved.guest_retval())?)
         }
 
         KeyctlOp::JoinSessionKeyring => {
@@ -427,9 +421,7 @@ fn keyctl_op<M: CurrentMmMemory>(
                 service.named_session_keyring(&name, scope.uid, scope.gid)?
             };
             scope.join_session(session);
-            Ok(DispatchOutcome::Returned {
-                value: session.guest_retval() as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(session.guest_retval())?)
         }
 
         KeyctlOp::Update => {
@@ -498,9 +490,7 @@ fn keyctl_op<M: CurrentMmMemory>(
                 let destination = scope.resolve(serial_arg(arg5), false)?;
                 service.link(&caller, found, destination)?;
             }
-            Ok(DispatchOutcome::Returned {
-                value: found.guest_retval() as i64,
-            })
+            Ok(DispatchOutcome::returned_u64(found.guest_retval())?)
         }
 
         KeyctlOp::Read => {

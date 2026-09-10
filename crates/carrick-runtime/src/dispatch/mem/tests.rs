@@ -2895,12 +2895,7 @@ fn exact_partial_granule_replacement_splits_owner_without_reusing_live_storage()
         ),
     );
 
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Returned {
-            value: source as i64
-        }
-    );
+    assert_eq!(Ok(outcome), DispatchOutcome::returned_u64(source));
     assert_eq!(memory.repoint_calls, prior_calls + 1);
     let mem_authority_107 = dispatcher.mem();
     let mut mem = mem_authority_107.lock();
@@ -3223,12 +3218,7 @@ fn shared_anonymous_mremap_shrink_retains_shared_prefix_metadata() {
             SyscallArgs([source, map_len, crate::trap::HVF_PAGE_SIZE, 0, 0, 0]),
         ),
     );
-    assert_eq!(
-        shrunk,
-        DispatchOutcome::Returned {
-            value: source as i64
-        }
-    );
+    assert_eq!(Ok(shrunk), DispatchOutcome::returned_u64(source));
     let mem_authority_109 = dispatcher.mem();
     let mem = mem_authority_109.lock();
     assert!(mem.dynamic_maps.iter().any(|map| {
@@ -3298,16 +3288,14 @@ fn private_overlay_mremap_shrink_carves_source_tail_and_reuses_only_storage() {
     memory.inner.bytes[GRANULE as usize..].fill(0x52);
 
     assert_eq!(
-        threaded_memory_call(
+        Ok(threaded_memory_call(
             &dispatcher,
             &mut memory,
             &registry,
             &reporter,
             SyscallRequest::new(SYS_MREMAP, SyscallArgs([source, LENGTH, GRANULE, 0, 0, 0]),),
-        ),
-        DispatchOutcome::Returned {
-            value: source as i64
-        }
+        )),
+        DispatchOutcome::returned_u64(source)
     );
 
     let mem_authority_110 = dispatcher.mem();
@@ -3461,12 +3449,7 @@ fn mremap_fixed_relocates_to_the_named_destination_and_reclaims_the_source() {
     // MREMAP_FIXED relocates to the address the guest named: the bytes are at
     // the destination, the source is unmapped, and the call returns the
     // destination (Linux never returns the old address for a fixed move).
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Returned {
-            value: destination as i64
-        }
-    );
+    assert_eq!(Ok(outcome), DispatchOutcome::returned_u64(destination));
     assert_eq!(memory.read_bytes(destination, 4).unwrap(), b"move");
     assert!(
         memory
@@ -3728,12 +3711,7 @@ fn mremap_boot_region_metadata_fallback_preserves_exact_properties() {
             &reporter,
         )
         .expect("boot-region shrink dispatch");
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Returned {
-            value: BOOT_VMA as i64
-        }
-    );
+    assert_eq!(Ok(outcome), DispatchOutcome::returned_u64(BOOT_VMA));
     let map = dispatcher
         .dynamic_mapping_for_test(BOOT_VMA)
         .expect("fallback should publish exact boot-region metadata");
@@ -3897,12 +3875,7 @@ fn mremap_boot_heap_fallback_accepts_live_prefix_and_rejects_hidden_suffix() {
             &reporter,
         )
         .expect("live heap-prefix mremap");
-    assert_eq!(
-        live,
-        DispatchOutcome::Returned {
-            value: layout.heap_base as i64
-        }
-    );
+    assert_eq!(Ok(live), DispatchOutcome::returned_u64(layout.heap_base));
 
     let hidden = dispatcher
         .dispatch(
@@ -7831,7 +7804,7 @@ fn alias_window_advisory_hint_is_honored_without_consuming_low_arena() {
         )
         .expect("mmap dispatch should succeed");
 
-    assert_eq!(outcome, DispatchOutcome::Returned { value: va as i64 });
+    assert_eq!(Ok(outcome), DispatchOutcome::returned_u64(va));
     let unmap = SyscallRequest::new(SYS_MUNMAP, SyscallArgs([va, len, 0, 0, 0, 0]));
     let unmap_outcome = dispatcher
         .dispatch(
@@ -8045,12 +8018,7 @@ fn shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily() {
             &reporter,
         )
         .expect("high advisory reservation");
-    assert_eq!(
-        reserve,
-        DispatchOutcome::Returned {
-            value: address as i64
-        }
-    );
+    assert_eq!(Ok(reserve), DispatchOutcome::returned_u64(address));
 
     let commit = dispatcher
         .dispatch(
@@ -8666,7 +8634,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         ),
     );
 
-    assert_eq!(outcome, DispatchOutcome::Returned { value: dst as i64 });
+    assert_eq!(Ok(outcome), DispatchOutcome::returned_u64(dst));
     assert_eq!(
         memory.repointed_shared_leaves,
         vec![(dst, base + PAGE, PAGE as usize)]
@@ -8748,10 +8716,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         ),
     );
 
-    assert_eq!(
-        back_outcome,
-        DispatchOutcome::Returned { value: src as i64 }
-    );
+    assert_eq!(Ok(back_outcome), DispatchOutcome::returned_u64(src));
     assert_eq!(
         memory.repointed_shared_leaves,
         vec![
