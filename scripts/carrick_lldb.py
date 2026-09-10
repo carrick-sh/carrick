@@ -601,6 +601,26 @@ _EVENTRING_KINDS = {
         "HVPBLOCKARGS",
         lambda a, b, c: f"tid={c} arg1={a & 0xffffffff:#x} arg2={b & 0xffffffff}",
     ),
+    50: ("HVPSETTLE", lambda a, b, c: f"tid={a} gen={b} step={c}"),
+    55: (
+        "SYSLOG",
+        lambda a, b, c: (
+            f"owner={(a & 0xffffffff) >> 16} action={(a & 0xffff)} len={b} retval={c}"
+        ),
+    ),
+    56: ("SYSLOG_RECORD", lambda a, b, c: f"owner={a} seq={b} total_bytes={c}"),
+    57: (
+        "SYSLOG_STATE",
+        lambda a, b, c: (
+            f"owner={a} read_seq={(b & 0xffffffff) >> 16} clear_seq={b & 0xffff} unread={c}"
+        ),
+    ),
+    58: (
+        "SYSLOG_WAKE",
+        lambda a, b, c: (
+            f"owner={a} type={(b & 0xffffffff) >> 16} wake_count={b & 0xffff} poll_fd={c}"
+        ),
+    ),
 }
 
 

@@ -104,6 +104,10 @@ impl KernelContext {
         self.task.container()
     }
 
+    pub fn syslog(&self) -> &Arc<crate::syslog::SyslogService> {
+        self.kernel.syslog()
+    }
+
     pub const fn revision(&self) -> TaskRevision {
         self.revision
     }
@@ -440,6 +444,8 @@ pub struct Kernel {
     /// would merge every guest's keys together. Key SERIALS are only meaningful
     /// because this allocator is VM-wide.
     keyrings: crate::keyring::KeyringService,
+    /// The VM-wide kernel syslog log store (`syslog(2)` / `klogctl(3)`).
+    syslog: Arc<crate::syslog::SyslogService>,
     debug_aux_providers: Mutex<DebugAuxProviderRegistry>,
     /// Controlling-terminal authority is isolated by container even though all
     /// tasks share this kernel. Each value retains the exact session/group
@@ -1245,7 +1251,7 @@ impl Kernel {
             dead_leader: None,
             vfork_release: None,
             has_execed: false,
-            diagnostic_name: bootstrap.diagnostic_name,
+            diagnostic_name: bootstrap.diagnostic_name.clone(),
         };
         let registry = Registry {
             state: RegistryLock::new(RegistryState {
@@ -1306,6 +1312,7 @@ impl Kernel {
             pending_file_closes: Mutex::new(Vec::new()),
             reservation_gate: ReservationGate::default(),
             keyrings: crate::keyring::KeyringService::new(),
+            syslog: Arc::new(crate::syslog::SyslogService::new()),
             debug_aux_providers: Mutex::new(DebugAuxProviderRegistry::default()),
             controlling_ttys: Mutex::new(BTreeMap::new()),
             containers: Mutex::new(BTreeMap::from([(container.id(), Arc::clone(&container))])),
@@ -1321,6 +1328,17 @@ impl Kernel {
             unpublished_jobs: AtomicUsize::new(0),
         });
         container.bind_kernel(&kernel);
+        let diag_name = &bootstrap.diagnostic_name;
+        kernel.syslog.append(
+            6,
+            0,
+            0,
+            format!(
+                "{diag_name}: process leader initialized (pid {})\n",
+                bootstrap.task_id.raw()
+            )
+            .into_bytes(),
+        );
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
     }
@@ -1746,6 +1764,11 @@ impl Kernel {
     /// The VM-wide keyring store. See the field docs for why it lives here.
     pub(crate) const fn keyrings(&self) -> &crate::keyring::KeyringService {
         &self.keyrings
+    }
+
+    /// The VM-wide syslog store.
+    pub(crate) fn syslog(&self) -> &Arc<crate::syslog::SyslogService> {
+        &self.syslog
     }
 
     pub(super) fn domain(&self) -> &Arc<KernelDomain> {

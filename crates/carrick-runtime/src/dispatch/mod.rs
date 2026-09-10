@@ -775,6 +775,7 @@ mod bpf;
 pub mod mm_mutation;
 mod mount_api;
 mod mqueue;
+mod syslog;
 #[cfg(not(doctest))]
 mod sysv;
 #[cfg(doctest)]
@@ -5142,6 +5143,7 @@ fn resolve_handler<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>>
         .or_else(|| bpf::dispatch_bpf(number))
         .or_else(|| perf::dispatch_perf(number))
         .or_else(|| mount_api::dispatch_mount_api(number))
+        .or_else(|| syslog::dispatch_syslog(number))
 }
 
 fn resolve_mutation_handler<M: CurrentMmMemory>(number: u64) -> Option<MutationSyscallHandler<M>> {

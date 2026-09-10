@@ -5256,7 +5256,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use carrick_abi::{LinuxCloneFlags, SigBlockMask, SigSet, WaitSigMask};
-    use carrick_guest_mem::{GuestVa, HostVa, SharedFutexLocation};
+    use carrick_guest_mem::{GuestMemory, GuestVa, HostVa, SharedFutexLocation};
     use carrick_hal::ThreadId;
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 
@@ -5299,12 +5299,48 @@ mod tests {
         }
     }
 
+    fn block_on_timeout<F: std::future::Future>(future: F, timeout: Duration) -> Option<F::Output> {
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let start = Instant::now();
+        let mut future = std::pin::pin!(future);
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return Some(value);
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return None;
+            }
+            let remaining = timeout.saturating_sub(elapsed);
+            std::thread::park_timeout(remaining);
+        }
+    }
+
     fn await_event(
         service: &CarrierWaitService,
         token: ContinuationWakeToken,
     ) -> Result<ContinuationEvent, WaitServiceError> {
         let service = service.clone();
         block_on(async move { service.event(token).await })
+    }
+
+    fn await_event_timeout(
+        service: &CarrierWaitService,
+        token: ContinuationWakeToken,
+        timeout: Duration,
+    ) -> Option<Result<ContinuationEvent, WaitServiceError>> {
+        let service = service.clone();
+        block_on_timeout(async move { service.event(token).await }, timeout)
     }
 
     #[test]
@@ -10915,5 +10951,238 @@ mod tests {
 
         service.clear_test_hooks();
         close_pair(pipe);
+    }
+
+    #[test]
+    fn syslog_read_continuation_real_fd_event_and_redispatch() {
+        let (kernel, context) = bootstrap(15_390);
+        context.task().with_caps(|caps| {
+            caps.effective |= 1 << crate::namespace::process::CAP_SYSLOG;
+            caps.permitted |= 1 << crate::namespace::process::CAP_SYSLOG;
+        });
+
+        // Drain any bootstrap records
+        let _ = kernel.syslog().read_consuming(65536);
+        assert_eq!(kernel.syslog().size_unread(), 0);
+
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 1024]);
+        let reporter = crate::compat::CompatReporter::default();
+
+        // 1. Dispatch action 2 (SYSLOG_ACTION_READ) on empty ring -> WaitOnFds
+        let req = crate::dispatch::SyscallRequest::new(
+            116,
+            crate::compat::SyscallArgs([2, 0x4000, 512, 0, 0, 0]),
+        );
+        let outcome = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+        assert!(matches!(&outcome, DispatchOutcome::WaitOnFds { .. }));
+
+        // 2. Convert to BlockedContinuation and enroll in CarrierWaitService
+        let generation = publish(&context, 0x981);
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("syslog blocked continuation");
+
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let mut registration = service.prepare_registration(&continuation);
+        service
+            .enroll(&mut registration)
+            .expect("enroll syslog continuation");
+        let wake_token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
+
+        // 3. Producer thread appends a log record after enrollment
+        let kernel_clone = Arc::clone(&kernel);
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = Arc::clone(&barrier);
+        let producer = thread::spawn(move || {
+            barrier_clone.wait();
+            thread::sleep(Duration::from_millis(20));
+            kernel_clone
+                .syslog()
+                .append(6, 0, 12345, b"continuation log record\n".to_vec());
+        });
+
+        barrier.wait();
+        let event = match await_event_timeout(&service, wake_token, Duration::from_secs(5)) {
+            Some(res) => res.expect("syslog wake event"),
+            None => {
+                let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+                let _ = producer.join();
+                panic!(
+                    "syslog continuation wait timed out: missing producer readiness notification"
+                );
+            }
+        };
+        assert_eq!(event, ContinuationEvent::Ready);
+        producer.join().expect("producer join");
+
+        // 4. Resume continuation to consume registration from service
+        let resume_res = continuation
+            .resume(event, &context)
+            .expect("continuation resume");
+        assert_eq!(resume_res.completion, ContinuationCompletion::Redispatch);
+
+        // 5. Syscall continuation redispatch consumes the record
+        let outcome2 = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+        match outcome2 {
+            DispatchOutcome::Returned { value } => {
+                assert!(value > 0);
+                let bytes = memory.read_bytes(0x4000, value as usize).unwrap();
+                assert_eq!(bytes, b"<6>continuation log record\n");
+            }
+            other => panic!("expected Returned on redispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syslog_read_continuation_cancellation_and_retirement() {
+        let (kernel, context) = bootstrap(15_391);
+        context.task().with_caps(|caps| {
+            caps.effective |= 1 << crate::namespace::process::CAP_SYSLOG;
+            caps.permitted |= 1 << crate::namespace::process::CAP_SYSLOG;
+        });
+
+        let _ = kernel.syslog().read_consuming(65536);
+        assert_eq!(kernel.syslog().size_unread(), 0);
+
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 1024]);
+        let reporter = crate::compat::CompatReporter::default();
+
+        let req = crate::dispatch::SyscallRequest::new(
+            116,
+            crate::compat::SyscallArgs([2, 0x4000, 512, 0, 0, 0]),
+        );
+        let outcome = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+        assert!(matches!(&outcome, DispatchOutcome::WaitOnFds { .. }));
+
+        let generation = publish(&context, 0x982);
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("syslog blocked continuation");
+
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let mut registration = service.prepare_registration(&continuation);
+        service
+            .enroll(&mut registration)
+            .expect("enroll syslog continuation");
+        let wake_token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach registration");
+
+        // 1. Verify active enrollment state in CarrierWaitService
+        {
+            let state = service.inner.state.lock();
+            let entry = state
+                .entries
+                .get(&wake_token.continuation)
+                .expect("enrolled continuation entry");
+            assert_eq!(entry.state, RegistrationState::Enrolled);
+            assert!(
+                state
+                    .reactor_work
+                    .pollable
+                    .contains(&wake_token.continuation),
+                "enrolled syslog continuation must be in reactor pollable set"
+            );
+        }
+
+        // 2. Cancel the continuation before data append
+        let receipt = continuation.cancel(CancellationCause::ProcessExit);
+        assert_eq!(receipt.cause(), CancellationCause::ProcessExit);
+        assert_eq!(receipt.continuation, wake_token.continuation);
+
+        // 3. Exact ownership-state assertions against CarrierWaitService API:
+        // (a) Wake token retirement / subscription removal from reactor work set
+        {
+            let state = service.inner.state.lock();
+            let entry = state
+                .entries
+                .get(&wake_token.continuation)
+                .expect("cancelled continuation entry");
+            assert_eq!(
+                entry.state,
+                RegistrationState::Cancelled(CancellationCause::ProcessExit)
+            );
+            assert!(
+                !state
+                    .reactor_work
+                    .pollable
+                    .contains(&wake_token.continuation),
+                "cancelled continuation must be removed from reactor pollable work set"
+            );
+        }
+
+        // (b) Stale Ready rejection: publishing ready to cancelled token must be rejected
+        let stale_publish_receipt = service.publish_ready(wake_token);
+        assert!(
+            !stale_publish_receipt.accepted(),
+            "stale Ready publish on cancelled token must be rejected"
+        );
+        assert!(
+            !stale_publish_receipt.first_publication(),
+            "stale Ready publish must not be first"
+        );
+
+        // (c) Event future resolution: awaiting event on cancelled token returns Cancelled and purges entry
+        let event_res = await_event(&service, wake_token);
+        assert!(
+            matches!(
+                event_res,
+                Err(WaitServiceError::Cancelled(CancellationCause::ProcessExit))
+            ),
+            "awaiting event on cancelled token must return Cancelled(ProcessExit)"
+        );
+        assert!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&wake_token.continuation)
+                .is_none(),
+            "cancelled entry must be fully purged after event future resolution"
+        );
+        assert!(
+            matches!(
+                service.registration_timing(wake_token),
+                Err(WaitServiceError::StaleRegistration)
+            ),
+            "retired continuation timing must report StaleRegistration"
+        );
+
+        // 4. Producer writes record after old waiter cancellation and retirement
+        kernel
+            .syslog()
+            .append(6, 0, 12346, b"post-cancel record\n".to_vec());
+
+        // 5. Subsequent fresh dispatch consumes the record without issue
+        let outcome2 = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+        match outcome2 {
+            DispatchOutcome::Returned { value } => {
+                assert!(value > 0);
+                let bytes = memory.read_bytes(0x4000, value as usize).unwrap();
+                assert_eq!(bytes, b"<6>post-cancel record\n");
+            }
+            other => panic!("expected Returned on fresh dispatch, got {other:?}"),
+        }
     }
 }

@@ -206,6 +206,18 @@ pub const HVPBLOCK_ARGS: u8 = 49;
 /// unpublished forever. The trailing state names the exact
 /// `ThreadExecutionState` the strand froze at.
 pub const HVPSETTLE: u8 = 50;
+/// Linux syslog(2) operation recorded for diagnostics. `a` is action type and owner,
+/// `b` is requested buffer length, and `c` is the return value / errno / seq.
+pub const SYSLOG_OP: u8 = 55;
+/// Linux syslog(2) record publication. `a` is owner, `b` is sequence number,
+/// and `c` is the ring total stored bytes.
+pub const SYSLOG_RECORD: u8 = 56;
+/// Linux syslog(2) reader cursor and state. `a` is owner, `b` encodes read and clear seq,
+/// and `c` is unread bytes remaining.
+pub const SYSLOG_STATE: u8 = 57;
+/// Linux syslog(2) readiness notification and wait events. `a` is owner, `b` encodes
+/// event class and wake count, and `c` is the raw host poll descriptor.
+pub const SYSLOG_WAKE: u8 = 58;
 
 const HVPWAIT_ID_MASK: u32 = 0x00ff_ffff;
 
@@ -1021,8 +1033,51 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
             "HVPBLOCKARGS tid={c} arg1={:#x} arg2={}",
             a as u32, b as u32
         ),
+        SYSLOG_OP => format!(
+            "SYSLOG owner={} action={} len={} retval={}",
+            (a as u32) >> 16,
+            (a as u32) & 0xffff,
+            b,
+            c
+        ),
+        SYSLOG_RECORD => format!("SYSLOG_RECORD owner={a} seq={b} total_bytes={c}"),
+        SYSLOG_STATE => format!(
+            "SYSLOG_STATE owner={a} read_seq={} clear_seq={} unread={c}",
+            (b as u32) >> 16,
+            (b as u32) & 0xffff
+        ),
+        SYSLOG_WAKE => format!(
+            "SYSLOG_WAKE owner={a} type={} wake_count={} poll_fd={c}",
+            (b as u32) >> 16,
+            (b as u32) & 0xffff
+        ),
         _ => String::new(),
     }
+}
+
+pub fn rec_syslog(owner_id: u32, action: i32, len: i32, retval: i32) {
+    let a = (((owner_id as u16 as u32) << 16) | (action as u16 as u32)) as i32;
+    rec(SYSLOG_OP, a, len, retval);
+}
+
+pub fn rec_syslog_record(owner_id: u32, seq: u64, len: usize, total_bytes: usize) {
+    let _ = len;
+    rec(
+        SYSLOG_RECORD,
+        owner_id as i32,
+        seq as i32,
+        total_bytes as i32,
+    );
+}
+
+pub fn rec_syslog_state(owner_id: u32, read_seq: u64, clear_seq: u64, unread: usize) {
+    let b = (((read_seq as u16 as u32) << 16) | (clear_seq as u16 as u32)) as i32;
+    rec(SYSLOG_STATE, owner_id as i32, b, unread as i32);
+}
+
+pub fn rec_syslog_wake(owner_id: u32, event_type: i32, wake_count: u64, poll_fd: i32) {
+    let b = (((event_type as u16 as u32) << 16) | (wake_count as u16 as u32)) as i32;
+    rec(SYSLOG_WAKE, owner_id as i32, b, poll_fd);
 }
 
 #[cfg(feature = "event-ring-dump")]
@@ -1534,6 +1589,37 @@ mod tests {
                 (DSRFAULT_SP, 0x1234_5678, 0x0000_00ff, 0),
                 (DSRFAULT_LR, 0x00f6_4380, 0x0000_0004, 0),
             ]
+        );
+    }
+
+    #[test]
+    fn syslog_event_ring_encoding_and_decoding() {
+        assert_eq!(SYSLOG_OP, 55);
+        assert_eq!(SYSLOG_RECORD, 56);
+        assert_eq!(SYSLOG_STATE, 57);
+        assert_eq!(SYSLOG_WAKE, 58);
+        let kinds = [SYSLOG_OP, SYSLOG_RECORD, SYSLOG_STATE, SYSLOG_WAKE];
+        let unique: std::collections::BTreeSet<_> = kinds.iter().copied().collect();
+        assert_eq!(unique.len(), kinds.len());
+
+        let a = (((7u16 as u32) << 16) | (10u16 as u32)) as i32;
+        assert_eq!(
+            decode(SYSLOG_OP, a, 1024, 65536),
+            "SYSLOG owner=7 action=10 len=1024 retval=65536"
+        );
+        assert_eq!(
+            decode(SYSLOG_RECORD, 7, 42, 100),
+            "SYSLOG_RECORD owner=7 seq=42 total_bytes=100"
+        );
+        let b_state = (((3u16 as u32) << 16) | (2u16 as u32)) as i32;
+        assert_eq!(
+            decode(SYSLOG_STATE, 7, b_state, 50),
+            "SYSLOG_STATE owner=7 read_seq=3 clear_seq=2 unread=50"
+        );
+        let b_wake = (((1u16 as u32) << 16) | (5u16 as u32)) as i32;
+        assert_eq!(
+            decode(SYSLOG_WAKE, 7, b_wake, 12),
+            "SYSLOG_WAKE owner=7 type=1 wake_count=5 poll_fd=12"
         );
     }
 }
