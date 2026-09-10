@@ -73,6 +73,74 @@ fn nested_epoll_cycle_errno() -> (i32, i32) {
     (add_nested_errno, add_cycle_errno)
 }
 
+/// libuv's backend fd is itself polled and can be watched by another epoll.
+/// An internal control notification must not masquerade as a queued guest event.
+/// Every sample is nonblocking; a missing wake/readiness edge becomes an output
+/// difference, never an unbounded wait in the public embedded probe gate.
+fn epoll_fd_readiness() {
+    fn poll_one(fd: i32) -> (i32, i16) {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        (rc, pfd.revents)
+    }
+
+    let child = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    let outer = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    let nested_add = add_epoll_interest(outer, child, libc::EPOLLIN as u32);
+    let (empty_poll, empty_poll_mask) = poll_one(child);
+    let (empty_outer, empty_outer_mask) = epoll_wait_one(outer);
+    let child_add = add_epoll_interest(child, fd, libc::EPOLLIN as u32);
+    let (registered_poll, registered_poll_mask) = poll_one(child);
+    let (registered_outer, registered_outer_mask) = epoll_wait_one(outer);
+
+    let value = 1u64;
+    let write_rc = unsafe { libc::write(fd, (&value as *const u64).cast(), 8) };
+    let (signalled_poll, signalled_poll_mask) = poll_one(child);
+    let (signalled_outer, signalled_outer_mask) = epoll_wait_one(outer);
+    let (signalled_child, signalled_child_mask) = epoll_wait_one(child);
+    let mut received = 0u64;
+    let read_rc = unsafe { libc::read(fd, (&mut received as *mut u64).cast(), 8) };
+    let (drained_poll, drained_poll_mask) = poll_one(child);
+    let (drained_outer, drained_outer_mask) = epoll_wait_one(outer);
+    let (drained_child, drained_child_mask) = epoll_wait_one(child);
+
+    report!(
+        epollfd_nested_add_errno = nested_add,
+        epollfd_empty_poll = empty_poll,
+        epollfd_empty_poll_mask = empty_poll_mask,
+        epollfd_empty_outer = empty_outer,
+        epollfd_empty_outer_mask = empty_outer_mask,
+        epollfd_child_add_errno = child_add,
+        epollfd_registered_poll = registered_poll,
+        epollfd_registered_poll_mask = registered_poll_mask,
+        epollfd_registered_outer = registered_outer,
+        epollfd_registered_outer_mask = registered_outer_mask,
+        epollfd_write = write_rc,
+        epollfd_signalled_poll = signalled_poll,
+        epollfd_signalled_poll_mask = signalled_poll_mask,
+        epollfd_signalled_outer = signalled_outer,
+        epollfd_signalled_outer_mask = signalled_outer_mask,
+        epollfd_signalled_child = signalled_child,
+        epollfd_signalled_child_mask = signalled_child_mask,
+        epollfd_read = read_rc,
+        epollfd_read_value = received,
+        epollfd_drained_poll = drained_poll,
+        epollfd_drained_poll_mask = drained_poll_mask,
+        epollfd_drained_outer = drained_outer,
+        epollfd_drained_outer_mask = drained_outer_mask,
+        epollfd_drained_child = drained_child,
+        epollfd_drained_child_mask = drained_child_mask,
+    );
+    close_fd(outer);
+    close_fd(child);
+    close_fd(fd);
+}
+
 fn epoll_pwait2_zero_timeout_errno() -> (libc::c_long, i32) {
     let epfd = unsafe { libc::epoll_create1(0) };
     let mut event = libc::epoll_event { events: 0, u64: 0 };
@@ -241,4 +309,5 @@ fn main() {
         et_after_refill_rc = et_after_refill_rc,
         et_after_refill_events = et_after_refill_events,
     );
+    epoll_fd_readiness();
 }
