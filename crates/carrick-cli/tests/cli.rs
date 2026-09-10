@@ -803,6 +803,34 @@ fn logs_unknown_container_errors() {
         .stderr(contains("no such container"));
 }
 
+#[test]
+fn help_output_snapshots() {
+    let check = |subcmd: &str, fixture: &str| {
+        let output = command()
+            .args([subcmd, "--help"])
+            .output()
+            .expect("run carrick help");
+        assert!(output.status.success(), "{subcmd} --help failed");
+        let stdout = String::from_utf8(output.stdout).expect("utf8 help");
+        let expected = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(fixture),
+        )
+        .expect("read fixture");
+        assert_eq!(
+            stdout, expected,
+            "help snapshot mismatch for {subcmd}\nexpected:\n{expected}\ngot:\n{stdout}"
+        );
+    };
+
+    check("run", "help_run.txt");
+    check("create", "help_create.txt");
+    if cfg!(target_os = "macos") {
+        check("run-elf", "help_run_elf.txt");
+    }
+}
+
 fn minimal_aarch64_elf() -> Vec<u8> {
     let mut elf = vec![0_u8; 64];
     elf[0..4].copy_from_slice(b"\x7fELF");
