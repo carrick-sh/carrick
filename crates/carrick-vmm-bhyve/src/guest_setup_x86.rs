@@ -90,6 +90,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
+use carrick_fatal::carrick_fatal;
 use carrick_hal::OsError;
 use carrick_hal::guest_arch::GuestArch;
 use carrick_hal::x8664_arch::{X8664GuestArch, entry_trampoline_bytes};
@@ -1304,8 +1305,13 @@ impl RamInner {
             if range.va < start {
                 kept.push(SharedBackingRange {
                     va: range.va,
-                    len: usize::try_from(start - range.va)
-                        .unwrap_or_else(|_| std::process::abort()),
+                    len: usize::try_from(start - range.va).unwrap_or_else(|_| {
+                        carrick_fatal!(
+                            "vmm_bhyve::shared_backing",
+                            "shared backing prefix length ({start} - {}) exceeded host pointer width during range split",
+                            range.va
+                        );
+                    }),
                     object: range.object,
                     object_offset: range.object_offset,
                 });
@@ -1314,12 +1320,23 @@ impl RamInner {
                 let delta = end - range.va;
                 kept.push(SharedBackingRange {
                     va: end,
-                    len: usize::try_from(range_end - end).unwrap_or_else(|_| std::process::abort()),
+                    len: usize::try_from(range_end - end).unwrap_or_else(|_| {
+                        carrick_fatal!(
+                            "vmm_bhyve::shared_backing",
+                            "shared backing suffix length ({range_end} - {end}) exceeded host pointer width during range split"
+                        );
+                    }),
                     object: range.object,
                     object_offset: range
                         .object_offset
                         .checked_add(delta)
-                        .unwrap_or_else(|| std::process::abort()),
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "vmm_bhyve::shared_backing",
+                                "shared backing object offset {} overflowed by delta {delta} during range split",
+                                range.object_offset
+                            );
+                        }),
                 });
             }
         }
@@ -1333,7 +1350,10 @@ impl RamInner {
         sharing: carrick_guest_mem::MappingSharing,
     ) {
         let Some(end) = va.checked_add(len as u64) else {
-            std::process::abort();
+            carrick_fatal!(
+                "vmm_bhyve::shared_backing",
+                "mapping range end overflowed u64 virtual address space in publish_mapping_sharing: va={va:#x} len={len:#x}"
+            );
         };
         if len == 0 {
             return;
@@ -1428,12 +1448,22 @@ impl RamInner {
                 .min(alias_end)
                 .saturating_sub(alias_start)
                 .try_into()
-                .unwrap_or_else(|_| std::process::abort());
+                .unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "vmm_bhyve::window_split",
+                        "left window split length exceeded host pointer width in remove_windows: start={start:#x} alias_start={alias_start:#x} alias_end={alias_end:#x}"
+                    );
+                });
             let right_start = end.max(alias_start).min(alias_end);
             let right_len: usize = alias_end
                 .saturating_sub(right_start)
                 .try_into()
-                .unwrap_or_else(|_| std::process::abort());
+                .unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "vmm_bhyve::window_split",
+                        "right window split length exceeded host pointer width in remove_windows: right_start={right_start:#x} alias_end={alias_end:#x}"
+                    );
+                });
             match (left_len, right_len) {
                 (0, 0) => {}
                 (left, 0) => {
@@ -1447,9 +1477,20 @@ impl RamInner {
                     alias.offset = alias
                         .offset
                         .checked_add(
-                            libc::off_t::try_from(delta).unwrap_or_else(|_| std::process::abort()),
+                            libc::off_t::try_from(delta).unwrap_or_else(|_| {
+                                carrick_fatal!(
+                                    "vmm_bhyve::window_split",
+                                    "right window split delta {delta:#x} exceeded host off_t range in remove_windows"
+                                );
+                            }),
                         )
-                        .unwrap_or_else(|| std::process::abort());
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "vmm_bhyve::window_split",
+                                "right window split file offset {} overflowed by delta {delta:#x} in remove_windows",
+                                alias.offset
+                            );
+                        });
                     alias.len = right;
                     aliases.push(alias);
                 }
@@ -1463,10 +1504,20 @@ impl RamInner {
                         offset: alias
                             .offset
                             .checked_add(
-                                libc::off_t::try_from(delta)
-                                    .unwrap_or_else(|_| std::process::abort()),
+                                libc::off_t::try_from(delta).unwrap_or_else(|_| {
+                                    carrick_fatal!(
+                                        "vmm_bhyve::window_split",
+                                        "both-window split right delta {delta:#x} exceeded host off_t range in remove_windows"
+                                    );
+                                }),
                             )
-                            .unwrap_or_else(|| std::process::abort()),
+                            .unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "vmm_bhyve::window_split",
+                                    "both-window split right file offset {} overflowed by delta {delta:#x} in remove_windows",
+                                    alias.offset
+                                );
+                            }),
                         file_size: alias.file_size,
                         writable: alias.writable,
                         file_id: alias.file_id,
@@ -1666,7 +1717,12 @@ impl BhyveGuestRam {
             exec: true,
         });
         if let Some((fd, offset, file_size, file_id)) = file {
-            let object_offset = u64::try_from(offset).unwrap_or_else(|_| std::process::abort());
+            let object_offset = u64::try_from(offset).unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "vmm_bhyve::alias_window",
+                    "shared alias window file offset {offset:#x} exceeded u64 range during alias window replacement"
+                );
+            });
             let fork_domain = inner.fork_domain;
             inner.shared_backings.push(SharedBackingRange {
                 va,

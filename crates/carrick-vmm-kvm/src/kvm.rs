@@ -11,6 +11,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
+use carrick_fatal::carrick_fatal;
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
 use carrick_mem::memory::AddressSpace;
 #[cfg(target_arch = "aarch64")]
@@ -680,8 +681,11 @@ impl KvmVcpu {
         // SAME thread, which makes no fd call in that window).
         let opt = unsafe { &*self.slot.fd.get() };
         opt.as_ref().unwrap_or_else(|| {
-            eprintln!("carrick: KvmVcpu fd accessed after drop-park (unreachable)");
-            std::process::abort()
+            carrick_fatal!(
+                "vmm_kvm::vcpu_fd",
+                "KVM vCPU file descriptor accessed after drop-park in slot (borrowed={})",
+                self.borrowed
+            );
         })
     }
 
@@ -691,8 +695,11 @@ impl KvmVcpu {
         // the single-owner invariant guarantees no other access aliases this.
         let opt = unsafe { &mut *self.slot.fd.get() };
         opt.as_mut().unwrap_or_else(|| {
-            eprintln!("carrick: KvmVcpu fd accessed after drop-park (unreachable)");
-            std::process::abort()
+            carrick_fatal!(
+                "vmm_kvm::vcpu_fd",
+                "mutable KVM vCPU file descriptor accessed after drop-park in slot (borrowed={})",
+                self.borrowed
+            );
         })
     }
 

@@ -84,6 +84,8 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+use carrick_fatal::carrick_fatal;
+
 // Imported from the leaf crate (not `crate::dispatch`) — this is the edge that
 // previously closed the `memory ↔ dispatch` cycle (docs/archive/build-decomposition-design.md §3.A-A2).
 use crate::elf::{
@@ -2885,9 +2887,20 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
 
     let mut mgr = crate::page_table::PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
     mgr.set_multi_vcpu(true);
-    let heap_size = usize::try_from(LINUX_HEAP_SIZE).unwrap_or_else(|_| std::process::abort());
+    let heap_size = usize::try_from(LINUX_HEAP_SIZE).unwrap_or_else(|_| {
+        carrick_fatal!(
+            "mem::stage1_tables",
+            "configured Linux heap size {:#x} exceeded host pointer width during stage-1 identity page table initialization",
+            LINUX_HEAP_SIZE
+        );
+    });
     if mgr.set_prot_none(LINUX_HEAP_BASE, heap_size, None).is_err() {
-        std::process::abort();
+        carrick_fatal!(
+            "mem::stage1_tables",
+            "failed to apply PROT_NONE to heap region at {:#x} (size {:#x}) in initial stage-1 page tables",
+            LINUX_HEAP_BASE,
+            heap_size
+        );
     }
     mgr.into_bytes()
 }
@@ -3048,11 +3061,25 @@ pub fn el1_maintenance_bytes() -> Vec<u8> {
         offset += nop.len();
     }
     let asid_offset = usize::try_from(LINUX_EL1_ASID_MAINT_BASE - LINUX_EL1_MAINT_BASE)
-        .unwrap_or_else(|_| std::process::abort());
+        .unwrap_or_else(|_| {
+            carrick_fatal!(
+                "mem::el1_trampoline",
+                "relative offset to EL1 ASID maintenance trampoline ({:#x} - {:#x}) exceeded host pointer width",
+                LINUX_EL1_ASID_MAINT_BASE,
+                LINUX_EL1_MAINT_BASE
+            );
+        });
     let asid = el1_asid_maintenance_bytes();
     bytes[asid_offset..asid_offset + asid.len()].copy_from_slice(&asid);
     let load_offset = usize::try_from(LINUX_EL1_LOAD_BARRIER_BASE - LINUX_EL1_MAINT_BASE)
-        .unwrap_or_else(|_| std::process::abort());
+        .unwrap_or_else(|_| {
+            carrick_fatal!(
+                "mem::el1_trampoline",
+                "relative offset to EL1 load barrier trampoline ({:#x} - {:#x}) exceeded host pointer width",
+                LINUX_EL1_LOAD_BARRIER_BASE,
+                LINUX_EL1_MAINT_BASE
+            );
+        });
     let load = el1_load_barrier_bytes();
     bytes[load_offset..load_offset + load.len()].copy_from_slice(&load);
     bytes

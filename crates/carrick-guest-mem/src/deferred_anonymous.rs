@@ -6,6 +6,8 @@ use std::ops::Range;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
+use carrick_fatal::carrick_fatal;
+
 const PAGE: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -448,8 +450,14 @@ impl DeferredPrivateFileTransition<'_> {
     }
 
     pub fn len(&self) -> usize {
-        usize::try_from(self.view.range.end - self.view.range.start)
-            .unwrap_or_else(|_| std::process::abort())
+        usize::try_from(self.view.range.end - self.view.range.start).unwrap_or_else(|_| {
+            carrick_fatal!(
+                "guest_mem::deferred_anonymous",
+                "deferred private file view byte length exceeded host address space limits: start={:#x} end={:#x}",
+                self.view.range.start,
+                self.view.range.end
+            );
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -494,7 +502,14 @@ impl DeferredPrivateFileTransition<'_> {
                 || current.file_offset != self.view.file_offset
                 || !Arc::ptr_eq(&current.file, &self.view.file)
         }) {
-            std::process::abort();
+            carrick_fatal!(
+                "guest_mem::deferred_anonymous",
+                "deferred private file view mutated or displaced under lock during commit_range: index={} start={:#x} end={:#x} offset={:#x}",
+                self.index,
+                self.view.range.start,
+                self.view.range.end,
+                self.view.file_offset
+            );
         }
         let mut retained = Vec::with_capacity(2);
         if self.view.range.start < published.start {
@@ -521,7 +536,14 @@ impl DeferredPrivateFileTransition<'_> {
                 || current.file_offset != self.view.file_offset
                 || !Arc::ptr_eq(&current.file, &self.view.file)
         }) {
-            std::process::abort();
+            carrick_fatal!(
+                "guest_mem::deferred_anonymous",
+                "deferred private file view mutated or displaced under lock during commit: index={} start={:#x} end={:#x} offset={:#x}",
+                self.index,
+                self.view.range.start,
+                self.view.range.end,
+                self.view.file_offset
+            );
         }
         self.files.views.remove(self.index);
     }

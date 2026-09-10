@@ -22,6 +22,8 @@
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
+use carrick_fatal::carrick_fatal;
+
 #[cfg(test)]
 static USED_SLOT_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
@@ -243,7 +245,11 @@ pub fn arm(pipe_id: u64, owner: FasyncOwner) {
 fn publish_slot(slot: &FasyncSlot, pipe_id: u64, owner: FasyncOwner) {
     let sequence = slot.sequence.fetch_add(1, Ordering::AcqRel);
     if sequence & 1 != 0 {
-        std::process::abort();
+        carrick_fatal!(
+            "signal::fasync",
+            "fasync seqlock sequence {sequence} was odd during slot publication start for pipe_id={pipe_id} registration_id={}",
+            owner.registration_id
+        );
     }
     slot.pipe_id.store(pipe_id, Ordering::Relaxed);
     slot.registration_id
@@ -292,7 +298,10 @@ pub fn disarm(pipe_id: u64, registration_id: u64) {
                 }
                 let sequence = slot.sequence.fetch_add(1, Ordering::AcqRel);
                 if sequence & 1 != 0 {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "signal::fasync",
+                        "fasync seqlock sequence {sequence} was odd during slot disarm for pipe_id={pipe_id} registration_id={registration_id}"
+                    );
                 }
                 slot.pipe_id.store(0, Ordering::Relaxed);
                 slot.registration_id.store(0, Ordering::Relaxed);
@@ -300,7 +309,10 @@ pub fn disarm(pipe_id: u64, registration_id: u64) {
                     .store(sequence.wrapping_add(2), Ordering::Release);
                 slot.used.store(0, Ordering::Release);
                 if t.armed_count.fetch_sub(1, Ordering::AcqRel) == 0 {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "signal::fasync",
+                        "armed fasync registration count underflowed zero during disarm for pipe_id={pipe_id} registration_id={registration_id}"
+                    );
                 }
                 return;
             }

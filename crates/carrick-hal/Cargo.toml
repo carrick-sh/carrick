@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
+carrick-fatal.workspace = true
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
 # Timer-delivery trait return/arg types (`PosixTimerSpec`, `TimerArm`) live in the

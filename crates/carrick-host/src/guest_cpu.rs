@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use carrick_fatal::carrick_fatal;
 use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
@@ -457,8 +458,10 @@ fn claim_child_record(pid: u32, fill: impl FnOnce(&ProcessRecord)) -> ProcessRec
 }
 
 fn abort_on_arena_error(err: ArenaError) -> ! {
-    eprintln!("carrick: child metadata arena publication failed: {err:?}");
-    std::process::abort();
+    carrick_fatal!(
+        "host::process_arena",
+        "child process metadata arena publication failed: err={err:?}"
+    );
 }
 
 /// Claim and fill a child process record before `fork(2)` publishes the child's
@@ -1283,8 +1286,10 @@ pub fn adopted_child_wait(waiter_pid: u32, target_pid: i32) -> Option<AdoptedChi
             return pending.map(AdoptedChildWait::Pending);
         }
         if Instant::now() >= deadline {
-            eprintln!("carrick: adopted-child record transition did not quiesce");
-            std::process::abort();
+            carrick_fatal!(
+                "host::adopted_child",
+                "adopted-child record transition failed to quiesce before deadline during wait scan: waiter_pid={waiter_pid} target_pid={target_pid}"
+            );
         }
         std::thread::yield_now();
     }
@@ -1397,8 +1402,10 @@ fn reap_child_guest_ns_ref(pid: u32, record_ref: ProcessRecordRef) -> u64 {
                 std::thread::yield_now();
             }
             Err(ProcessRecordTransitionError::Busy) => {
-                eprintln!("carrick: guest CPU record transition did not quiesce for pid {pid}");
-                std::process::abort();
+                carrick_fatal!(
+                    "host::adopted_child",
+                    "child process record transition failed to quiesce before deadline while reaping guest CPU metadata for pid={pid}"
+                );
             }
         }
     }

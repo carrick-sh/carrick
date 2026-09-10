@@ -369,6 +369,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
  "carrick-abi",
+ "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
@@ -572,6 +573,7 @@ dependencies = [
 name = "carrick-guest-mem"
 version = "0.1.0"
 dependencies = [
+ "carrick-fatal",
  "libc",
  "parking_lot",
  "serde",
@@ -584,6 +586,7 @@ name = "carrick-hal"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-fatal",
  "carrick-guest-mem",
  "carrick-mem",
  "carrick-signal-core",
@@ -598,6 +601,7 @@ dependencies = [
 name = "carrick-host"
 version = "0.1.0"
 dependencies = [
+ "carrick-fatal",
  "carrick-kernel",
  "libc",
  "mach2",
@@ -655,6 +659,7 @@ name = "carrick-mem"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-fatal",
  "carrick-guest-mem",
  "goblin",
  "libc",
@@ -777,6 +782,7 @@ name = "carrick-signal-core"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-fatal",
  "libc",
  "tempfile",
 ]
@@ -832,6 +838,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
  "carrick-abi",
+ "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
@@ -881,6 +888,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-aarch64",
  "carrick-abi",
+ "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",

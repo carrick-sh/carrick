@@ -7,61 +7,67 @@
       "file": "crates/carrick-aarch64/src/engine.rs",
       "function": "<Aarch64EngineCore<V> as SyscallTrap>::map_host_alias",
       "ordinal_in_function": 1,
-      "fingerprint": "f7aafe0e7f484f3481da8bdd173e5692f0d9e6d6d5eddbeceaaed600afb78a94",
+      "fingerprint": "75337dcf7dd6a03c23908577f01bae86def01c7ff40104694fc8bad970aff24f",
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::alias_cleanup",
       "rationale": "Host alias mapping length exceeded host pointer width during failure cleanup unwinding, violating address size invariants.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "aarch64::alias_cleanup"
     },
     {
       "file": "crates/carrick-aarch64/src/engine.rs",
       "function": "<Aarch64EngineCore<V> as SyscallTrap>::map_host_alias",
       "ordinal_in_function": 2,
-      "fingerprint": "f7aafe0e7f484f3481da8bdd173e5692f0d9e6d6d5eddbeceaaed600afb78a94",
+      "fingerprint": "75337dcf7dd6a03c23908577f01bae86def01c7ff40104694fc8bad970aff24f",
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::alias_cleanup",
       "rationale": "Failure to unmap staged alias range after hypervisor alias mapping failure leaves host address space in an inconsistent state.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "aarch64::alias_cleanup"
     },
     {
       "file": "crates/carrick-aarch64/src/engine.rs",
       "function": "<Aarch64EngineCore<V> as ThreadedEngine>::bind_frame_cow",
       "ordinal_in_function": 1,
-      "fingerprint": "253348381b5ec233584784d445e7aaa0aeeb57361bb1719263bb606d6e2a680e",
+      "fingerprint": "41cbb74aa3c494e93169a8db5b311f5069dc4594e621d197c513d77dbdaa4ceb",
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::cow_identity",
       "rationale": "Bound memory management generation mismatch against frame copy-on-write authority identity would allow cross-mm page corruption.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "aarch64::cow_identity"
     },
     {
       "file": "crates/carrick-aarch64/src/engine.rs",
       "function": "<Aarch64EngineCore<V> as ThreadedEngine>::build_process_spec",
       "ordinal_in_function": 1,
-      "fingerprint": "70acabff8ea3865b8c318d6297f3ae74920ff9106cc65b4764d248ea567bddb2",
+      "fingerprint": "e3ac827b81e412c9a967abc2592a1b90bdeb27ad5c87435225674ce2e067e8a0",
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::fork_cow",
       "rationale": "Failed page table rollback and TLB invalidation during parent fork copy-on-write setup leaves parent memory protections inconsistent.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "aarch64::fork_cow"
     },
     {
       "file": "crates/carrick-aarch64/src/engine.rs",
       "function": "<Aarch64EngineCore<V> as ThreadedEngine>::materialize_process",
       "ordinal_in_function": 1,
-      "fingerprint": "78aaac7a839f7ff3eda04d53e41f7cd2d77edf66e6699d7a0d1723c70f57f4f6",
+      "fingerprint": "49c683098daf1e28469fcb88a7873e45f2b4df4520b9e8fd39162bdfe6ac9d4b",
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::process_materialize",
       "rationale": "Failure to abort and roll back process materialization after thread register restore failure leaves hypervisor carrier in an unrecoverable state.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "aarch64::process_materialize"
     },
     {
       "file": "crates/carrick-aarch64/src/engine.rs",
       "function": "<Aarch64EngineCore<V> as ThreadedEngine>::materialize_process",
       "ordinal_in_function": 2,
-      "fingerprint": "64bbeffe35d40f26f2cba271b6563763fa59d2f612ca6ff2c3dfa8c515c81f7d",
+      "fingerprint": "66130a1cc2b2cf06d86ad9513c4bf0b1479e1c9ed817276bbab432c4cc4cb70b",
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::process_materialize",
       "rationale": "Failure to abort and roll back process materialization after commit failure leaves hypervisor carrier state partially published.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "aarch64::process_materialize"
     },
     {
       "file": "crates/carrick-fatal/src/lib.rs",
@@ -77,211 +83,232 @@
       "file": "crates/carrick-guest-mem/src/deferred_anonymous.rs",
       "function": "DeferredPrivateFileTransition<'_>::len",
       "ordinal_in_function": 1,
-      "fingerprint": "985fb61e7c54c4bede13cf6f96768942e43d8ac157df4fe3351eb785a9e7952e",
+      "fingerprint": "97b3acccead22fbc325447ddd044f1f133a7c85e450b6cc04ccd863bc8cf668e",
       "verdict": "carrier_fault",
       "failure_domain": "guest_mem::deferred_anonymous",
       "rationale": "Deferred private file view byte length exceeded host address space limits during conversion to usize.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "guest_mem::deferred_anonymous"
     },
     {
       "file": "crates/carrick-guest-mem/src/deferred_anonymous.rs",
       "function": "DeferredPrivateFileTransition<'_>::commit_range",
       "ordinal_in_function": 1,
-      "fingerprint": "63b7fd80c13731fa425242f20fa30e0b769ee4813dc2405921d39184436ae90f",
+      "fingerprint": "ff21442ca4474620d49b4f936239eed0287c2820d6b42aaa8dc912c9676d6d66",
       "verdict": "carrier_fault",
       "failure_domain": "guest_mem::deferred_anonymous",
       "rationale": "Deferred private file view mutated or displaced under lock during commit_range subrange publication.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "guest_mem::deferred_anonymous"
     },
     {
       "file": "crates/carrick-guest-mem/src/deferred_anonymous.rs",
       "function": "DeferredPrivateFileTransition<'_>::commit",
       "ordinal_in_function": 1,
-      "fingerprint": "63b7fd80c13731fa425242f20fa30e0b769ee4813dc2405921d39184436ae90f",
+      "fingerprint": "2f21787b24342428f9df2d997dc74afcbfcf3bad4c16c6e2cb5014645e51db6e",
       "verdict": "carrier_fault",
       "failure_domain": "guest_mem::deferred_anonymous",
       "rationale": "Deferred private file view mutated or displaced under lock during commit full publication.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "guest_mem::deferred_anonymous"
     },
     {
       "file": "crates/carrick-hal/src/threaded.rs",
       "function": "VcpuRegistryState::add_listener",
       "ordinal_in_function": 1,
-      "fingerprint": "1d1162ee36c41a38e6723060712ae0d3c4e1692d43d96e1714bb9eba2e271a10",
+      "fingerprint": "e4f290e0fc71c3c9cf392ed98f1d0b34bfc192c39beab8574aad78f887ba5f92",
       "verdict": "carrier_fault",
       "failure_domain": "hal::vcpu_lease",
       "rationale": "Next vCPU lease listener identifier was zero, violating non-zero invariant.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hal::vcpu_lease"
     },
     {
       "file": "crates/carrick-hal/src/threaded.rs",
       "function": "VcpuRegistryState::add_listener",
       "ordinal_in_function": 2,
-      "fingerprint": "148920c07e0916000137bf4ff0bae3e0eb5a8db5c0f2efd12fa7e2d91b23761a",
+      "fingerprint": "94a1c197052b88a8a5133e7ea14966cb5df3965eabfe94acfb9cc90cc301098a",
       "verdict": "carrier_fault",
       "failure_domain": "hal::vcpu_lease",
       "rationale": "Next vCPU lease listener identifier overflowed u64 counter.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hal::vcpu_lease"
     },
     {
       "file": "crates/carrick-hal/src/threaded.rs",
       "function": "VcpuRegistryState::add_listener",
       "ordinal_in_function": 3,
-      "fingerprint": "f7cdca7634b30781950092fdc7e25035c5279a1e33228c8931afdad2cbbf47b8",
+      "fingerprint": "df367e376b78b2d62f59b7307ecdc04450b2be44c10ee4e97889fa63007bdd8e",
       "verdict": "carrier_fault",
       "failure_domain": "hal::vcpu_lease",
       "rationale": "Duplicate listener identifier collided in active vCPU lease listener map.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hal::vcpu_lease"
     },
     {
       "file": "crates/carrick-hal/src/threaded.rs",
       "function": "VcpuRegistryState::next_freeze_generation",
       "ordinal_in_function": 1,
-      "fingerprint": "df976c3b97178af615547c26a4a85e3f91da374ec7cfc4aeca2d2af91c6cb8f2",
+      "fingerprint": "2c817c4c2f9b473cd278cde49d99641d6ca68f2f4b0fa16c3e354c0915db11c6",
       "verdict": "carrier_fault",
       "failure_domain": "hal::vcpu_freeze",
       "rationale": "Next vCPU registry freeze generation was zero, violating non-zero generation invariant.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hal::vcpu_freeze"
     },
     {
       "file": "crates/carrick-hal/src/threaded.rs",
       "function": "VcpuRegistryState::next_freeze_generation",
       "ordinal_in_function": 2,
-      "fingerprint": "95a396dd9793fa7fe93347d1a60ec11aec918fc70cb8f9ce25c90bb9cf2d172e",
+      "fingerprint": "e123108ada8f04f93fd65ac9579ba0b2efc56e23588e61ee1546620c8304872b",
       "verdict": "carrier_fault",
       "failure_domain": "hal::vcpu_freeze",
       "rationale": "Next vCPU registry freeze generation overflowed u64 counter.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hal::vcpu_freeze"
     },
     {
       "file": "crates/carrick-hal/src/threaded.rs",
       "function": "<VcpuLeaseDrainGuard as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "183ae4e2d04a4993575c00682f87b0457c2c731eac308871740e404e75d8dcec",
+      "fingerprint": "090a1730a2d8ad6670e14d40070b4a1e4968dcfc8e2e7942cc65cec72bc2faef",
       "verdict": "carrier_fault",
       "failure_domain": "hal::vcpu_freeze",
       "rationale": "vCPU lease drain guard dropped while registry freeze was missing or owned by another thread or generation.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hal::vcpu_freeze"
     },
     {
       "file": "crates/carrick-hal/src/trap.rs",
       "function": "SyscallTrap::map_host_alias",
       "ordinal_in_function": 1,
-      "fingerprint": "657dd158d7c3d3d2d737fc675dbb8a01f8e0db108c88e248210befa5e3becd91",
+      "fingerprint": "00208ad3a2288b726caa75359776f64f259870ddf5b5314bbb678ba4d13c95fc",
       "verdict": "carrier_fault",
       "failure_domain": "hal::trap",
       "rationale": "Engine reached unimplemented default map_host_alias trait method after emitting MapHostAlias outcome it cannot service.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hal::trap"
     },
     {
       "file": "crates/carrick-hal/src/vcpu_sched.rs",
       "function": "HostCondvarScheduler::take_subscribed_grants",
       "ordinal_in_function": 1,
-      "fingerprint": "3f961c368f8200bd50b56ba267212ed9299508400d6352189ff582725db74a6b",
+      "fingerprint": "8336e3a4767276c161af1158b029b54289dae3e51e2ccbe29518d3c862d72de3",
       "verdict": "carrier_fault",
       "failure_domain": "hal::vcpu_sched",
       "rationale": "Subscribed admission ticket present in scheduler wait queue was missing from subscribed map during grant dispatch.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hal::vcpu_sched"
     },
     {
       "file": "crates/carrick-host/src/guest_cpu.rs",
       "function": "abort_on_arena_error",
       "ordinal_in_function": 1,
-      "fingerprint": "3a4b23afad1253ad29bca3267e99214a4c4f51f5519746b997ae21c70c7e9d84",
+      "fingerprint": "2baffd1bc9a4d8f42d86865b11d57c3a790bc13f6a0679577f36f559a21682d4",
       "verdict": "carrier_fault",
       "failure_domain": "host::process_arena",
       "rationale": "Child process metadata arena publication failed due to corruption or unexpected arena error.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "host::process_arena"
     },
     {
       "file": "crates/carrick-host/src/guest_cpu.rs",
       "function": "adopted_child_wait",
       "ordinal_in_function": 1,
-      "fingerprint": "85ad0bc7c0765f85eb9eefbb4ad766b6ad842be0693e0e60dd0dc80da313dd4d",
+      "fingerprint": "e58372b10dd5265dcc473c2011356868db91a4d37f9c895c90b49638709b7695",
       "verdict": "carrier_fault",
       "failure_domain": "host::adopted_child",
       "rationale": "Adopted-child record transition failed to quiesce before deadline during wait scan.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "host::adopted_child"
     },
     {
       "file": "crates/carrick-host/src/guest_cpu.rs",
       "function": "reap_child_guest_ns_ref",
       "ordinal_in_function": 1,
-      "fingerprint": "5ea83ad9f2df065e6e14637bd4b92612b6d9b25fde3af6b91176133dcac51233",
+      "fingerprint": "049d45da52ad0d6f6d5d59a6801a2b204ac1a3fe794c583bb896a5c312003970",
       "verdict": "carrier_fault",
       "failure_domain": "host::adopted_child",
       "rationale": "Child process record transition failed to quiesce before deadline while reaping guest CPU metadata.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "host::adopted_child"
     },
     {
       "file": "crates/carrick-mem/src/memory.rs",
       "function": "stage1_identity_page_tables",
       "ordinal_in_function": 1,
-      "fingerprint": "e1f0abe79a674e64500e31802247e96212f977c93245d36f854168667bcf3cce",
+      "fingerprint": "f7d80cf1b8a0cc34507e0a874097c86cc52d0212a874ec5bb09a89ea5c2e2d06",
       "verdict": "carrier_fault",
       "failure_domain": "mem::stage1_tables",
       "rationale": "Configured Linux heap size exceeded host pointer width during stage-1 identity page table initialization.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "mem::stage1_tables"
     },
     {
       "file": "crates/carrick-mem/src/memory.rs",
       "function": "stage1_identity_page_tables",
       "ordinal_in_function": 2,
-      "fingerprint": "17b8f0f37df12cb8074c6444f1ce747d9d10667ec007fea6d9529f704fff58bf",
+      "fingerprint": "a24a0d1eb5253aa4370781d74b7d79f0d2ff2cef6205e6cc3345df700f19daaf",
       "verdict": "carrier_fault",
       "failure_domain": "mem::stage1_tables",
       "rationale": "Failure to apply PROT_NONE to heap region in initial stage-1 page tables leaves heap unmapped or unprotected.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "mem::stage1_tables"
     },
     {
       "file": "crates/carrick-mem/src/memory.rs",
       "function": "el1_maintenance_bytes",
       "ordinal_in_function": 1,
-      "fingerprint": "7713feec8d2f14988bb1352e8f8d358e5d912e15d5d6c112ca9b768ee2ec1a79",
+      "fingerprint": "a3d26e5b8a17455def8db217dae07ef2186bb84173b7df4faddc9ee5bb9017f7",
       "verdict": "carrier_fault",
       "failure_domain": "mem::el1_trampoline",
       "rationale": "Relative offset to EL1 ASID maintenance trampoline exceeded host pointer width during buffer layout.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "mem::el1_trampoline"
     },
     {
       "file": "crates/carrick-mem/src/memory.rs",
       "function": "el1_maintenance_bytes",
       "ordinal_in_function": 2,
-      "fingerprint": "072b028314ad1d175086216cf5c5a68d5b529941c7882f305d2fca4762a612ef",
+      "fingerprint": "24a3738a7f2fd8aa183b2a99b22b4c96450c3a81147beac75d7ee100312d61a5",
       "verdict": "carrier_fault",
       "failure_domain": "mem::el1_trampoline",
       "rationale": "Relative offset to EL1 load barrier trampoline exceeded host pointer width during buffer layout.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "mem::el1_trampoline"
     },
     {
       "file": "crates/carrick-signal-core/src/fasync.rs",
       "function": "publish_slot",
       "ordinal_in_function": 1,
-      "fingerprint": "b1f51d8e6811d66c1f6f4cec0a95f4d52042680089205bb18f75ff7e7b9c6de6",
+      "fingerprint": "1eeda924be67eb781915f5d2b4402b523aa789775b61e5b09b3d005e1fb546dc",
       "verdict": "carrier_fault",
       "failure_domain": "signal::fasync",
       "rationale": "Seqlock sequence number was odd during slot publication start, indicating concurrent writer violation.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "signal::fasync"
     },
     {
       "file": "crates/carrick-signal-core/src/fasync.rs",
       "function": "disarm",
       "ordinal_in_function": 1,
-      "fingerprint": "7136d914221d1446b67af64dd3ce0690afd92e6f55ece5b64185833db5c320ef",
+      "fingerprint": "c857591c241df68cbebc229c11ca4faf5d17d6ead35db561d612af358357a18c",
       "verdict": "carrier_fault",
       "failure_domain": "signal::fasync",
       "rationale": "Seqlock sequence number was odd during slot disarm sequence, indicating concurrent writer violation.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "signal::fasync"
     },
     {
       "file": "crates/carrick-signal-core/src/fasync.rs",
       "function": "disarm",
       "ordinal_in_function": 2,
-      "fingerprint": "7136d914221d1446b67af64dd3ce0690afd92e6f55ece5b64185833db5c320ef",
+      "fingerprint": "c857591c241df68cbebc229c11ca4faf5d17d6ead35db561d612af358357a18c",
       "verdict": "carrier_fault",
       "failure_domain": "signal::fasync",
       "rationale": "Armed fasync registration count underflowed zero during disarm.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "signal::fasync"
     },
     {
       "file": "crates/carrick-thread/src/fork_quiesce.rs",
@@ -375,131 +402,144 @@
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_shared_backings",
       "ordinal_in_function": 1,
-      "fingerprint": "531189995ac14277f0bd5208c803786981616f9479ec355a64d09294940655b3",
+      "fingerprint": "2151988e15214c2260320e91b6ca076b1c99665a3e9f7ced38d3bd6688a73c17",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::shared_backing",
       "rationale": "Shared backing range prefix length exceeded host pointer width during range split.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::shared_backing"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_shared_backings",
       "ordinal_in_function": 2,
-      "fingerprint": "531189995ac14277f0bd5208c803786981616f9479ec355a64d09294940655b3",
+      "fingerprint": "2151988e15214c2260320e91b6ca076b1c99665a3e9f7ced38d3bd6688a73c17",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::shared_backing",
       "rationale": "Shared backing range suffix length exceeded host pointer width during range split.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::shared_backing"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_shared_backings",
       "ordinal_in_function": 3,
-      "fingerprint": "531189995ac14277f0bd5208c803786981616f9479ec355a64d09294940655b3",
+      "fingerprint": "2151988e15214c2260320e91b6ca076b1c99665a3e9f7ced38d3bd6688a73c17",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::shared_backing",
       "rationale": "Shared backing range object offset overflowed u64 counter during range split.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::shared_backing"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::publish_mapping_sharing",
       "ordinal_in_function": 1,
-      "fingerprint": "5194604ad10f215f0125bd8b0f3ebbb39cc9920e35b557e5ba466d91ecb9fe2b",
+      "fingerprint": "6895954f74032bd972113d7315f698ac50eace5c55de6c3a37101fda41ec15fe",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::shared_backing",
       "rationale": "Mapping range end overflowed u64 virtual address space in publish_mapping_sharing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::shared_backing"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_windows",
       "ordinal_in_function": 1,
-      "fingerprint": "0fcece346b42b2aac786ac46e2f5a94ff592ce616f753382620d562e4e97d4a2",
+      "fingerprint": "5a7d5aa8fd125b63169f42f6a68b6fc9996be25a5f16ea2e2db504a021116c9c",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::window_split",
       "rationale": "Left window split length exceeded host pointer width in remove_windows.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::window_split"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_windows",
       "ordinal_in_function": 2,
-      "fingerprint": "0fcece346b42b2aac786ac46e2f5a94ff592ce616f753382620d562e4e97d4a2",
+      "fingerprint": "5a7d5aa8fd125b63169f42f6a68b6fc9996be25a5f16ea2e2db504a021116c9c",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::window_split",
       "rationale": "Right window split length exceeded host pointer width in remove_windows.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::window_split"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_windows",
       "ordinal_in_function": 3,
-      "fingerprint": "0fcece346b42b2aac786ac46e2f5a94ff592ce616f753382620d562e4e97d4a2",
+      "fingerprint": "5a7d5aa8fd125b63169f42f6a68b6fc9996be25a5f16ea2e2db504a021116c9c",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::window_split",
       "rationale": "Right window split delta exceeded host off_t range in remove_windows.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::window_split"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_windows",
       "ordinal_in_function": 4,
-      "fingerprint": "0fcece346b42b2aac786ac46e2f5a94ff592ce616f753382620d562e4e97d4a2",
+      "fingerprint": "5a7d5aa8fd125b63169f42f6a68b6fc9996be25a5f16ea2e2db504a021116c9c",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::window_split",
       "rationale": "Right window split file offset overflowed host off_t in remove_windows.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::window_split"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_windows",
       "ordinal_in_function": 5,
-      "fingerprint": "0fcece346b42b2aac786ac46e2f5a94ff592ce616f753382620d562e4e97d4a2",
+      "fingerprint": "5a7d5aa8fd125b63169f42f6a68b6fc9996be25a5f16ea2e2db504a021116c9c",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::window_split",
       "rationale": "Both-window split right delta exceeded host off_t range in remove_windows.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::window_split"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_windows",
       "ordinal_in_function": 6,
-      "fingerprint": "0fcece346b42b2aac786ac46e2f5a94ff592ce616f753382620d562e4e97d4a2",
+      "fingerprint": "5a7d5aa8fd125b63169f42f6a68b6fc9996be25a5f16ea2e2db504a021116c9c",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::window_split",
       "rationale": "Both-window split right file offset overflowed host off_t in remove_windows.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::window_split"
     },
     {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "BhyveGuestRam::replace_alias_window",
       "ordinal_in_function": 1,
-      "fingerprint": "129e3e43fc156bc000bdab316cbb78eccdae15a49ff1fce4c09bcec7b9de054a",
+      "fingerprint": "a83adeb4a1ce9ebd8de4b0aae9191c656a72d666a470d53a13697ae94c867ee6",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_bhyve::alias_window",
       "rationale": "Shared alias window file offset exceeded u64 range during alias window replacement.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_bhyve::alias_window"
     },
     {
       "file": "crates/carrick-vmm-kvm/src/kvm.rs",
       "function": "KvmVcpu::fd",
       "ordinal_in_function": 1,
-      "fingerprint": "821ecf0dcb5e585bd8aea9854365f0904a0fa53056d7a690ab859d3e349ea652",
+      "fingerprint": "df5b97fa8777923029a42859f35224638eaf1a6ac7c26b65de0c0f025ddedba5",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_kvm::vcpu_fd",
       "rationale": "KVM vCPU file descriptor accessed after drop-park in slot.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_kvm::vcpu_fd"
     },
     {
       "file": "crates/carrick-vmm-kvm/src/kvm.rs",
       "function": "KvmVcpu::fd_mut",
       "ordinal_in_function": 1,
-      "fingerprint": "94bc4b81eea175a64012bbad54bc2ddf23a7d17b87cebd783d3017bc66de931d",
+      "fingerprint": "c4c7ae4af1a3f6af82e8091b91d9212685c08d8d98b779952837f5071c718668",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_kvm::vcpu_fd",
       "rationale": "Mutable KVM vCPU file descriptor accessed after drop-park in slot.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vmm_kvm::vcpu_fd"
     }
   ]
 }
