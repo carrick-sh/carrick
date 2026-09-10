@@ -53,6 +53,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use carrick_fatal::carrick_fatal;
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 
 use super::objects::{
@@ -314,7 +315,10 @@ impl Drop for GuestExecutorParticipation {
             .remove(&self.identity)
             .is_none()
         {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::guest_executor_census",
+                "guest executor participation removed an unregistered participant"
+            );
         }
     }
 }

@@ -36,6 +36,7 @@ use std::sync::{Arc, Weak};
 use crate::kernel::container::{CarrierScopeId, Container, ContainerId, LaunchContext, RunId};
 use crate::run_result::RuntimeError;
 use crate::vm_lifecycle::VmRunTerminalOutcome;
+use carrick_fatal::carrick_fatal;
 
 static NEXT_CARRIER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static CARRIER_PROCESS_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -283,13 +284,21 @@ impl CarrierKernelActivation {
         let mut slot = self.carrier.inner.kernel_runtime.lock();
         let previous = std::mem::replace(&mut *slot, CarrierKernelRuntimeSlot::Vacant);
         let CarrierKernelRuntimeSlot::Booting(Some(mut pending)) = previous else {
-            std::process::abort();
+            carrick_fatal!(
+                "carrier::kernel_activation",
+                "first-root activation claim no longer owns carrier provisional kernel slot: root_task={:?}",
+                self.root_task
+            );
         };
         if pending.root_task != self.root_task
             || !pending.activation_claimed
             || !Arc::ptr_eq(&pending.runtime, &self.runtime)
         {
-            std::process::abort();
+            carrick_fatal!(
+                "carrier::kernel_activation",
+                "provisional root task or activation claim changed after validation: root_task={:?}",
+                self.root_task
+            );
         }
         pending.root_rollback.disarm();
         *slot = CarrierKernelRuntimeSlot::Ready(Arc::clone(&pending.runtime));
@@ -1219,7 +1228,12 @@ impl CarrierLease {
                 record.reservation == self.reservation && record.phase == ContainerPhase::Running
             });
         if !exact {
-            std::process::abort();
+            carrick_fatal!(
+                "carrier::lease_ownership",
+                "retirement publication lost exact running reservation: container_id={:?}, reservation={:?}",
+                self.launch.container_id,
+                self.reservation
+            );
         }
         state.containers.remove(&self.launch.container_id);
         let live_containers = state

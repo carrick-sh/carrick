@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
+use carrick_fatal::carrick_fatal;
 
 use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, ThreadId};
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -396,10 +397,12 @@ impl std::fmt::Debug for DebugAuxProviderRegistry {
 
 impl DebugAuxProviderRegistry {
     fn reserve_id(&mut self) -> u64 {
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        self.next_id = self.next_id.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::debug_provider_identity",
+                "debug provider generation exhausted u64"
+            );
+        });
         self.next_id
     }
 }
@@ -572,7 +575,14 @@ impl PreparedContainerRoot {
         let process_group_id = task.process_group();
         let session_id = task.session();
         let namespace_id = pid_identity.as_ref().map_or_else(
-            || u32::try_from(task_id.raw()).unwrap_or_else(|_| std::process::abort()),
+            || {
+                u32::try_from(task_id.raw()).unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "kernel::container_root_publication",
+                        "root without PID namespace had internal task ID outside Linux range"
+                    );
+                })
+            },
             crate::namespace::pid::PreparedNamespaceIdentity::visible_id,
         );
 
@@ -638,7 +648,10 @@ impl PreparedContainerRoot {
                 || state.remove_process_group(process_group_id).is_none()
                 || state.tasks.remove(&task_id).is_none()
             {
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::container_root_publication",
+                    "rollback after PID-root publication failure failed to clean graph edges"
+                );
             }
             return Err(error);
         }
@@ -940,14 +953,21 @@ impl ReservationGate {
             callback();
             return None;
         }
-        let id = self
-            .next_subscriber
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .unwrap_or_else(|_| std::process::abort());
+        let Ok(id) =
+            self.next_subscriber
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                })
+        else {
+            drop(epoch);
+            callback();
+            return None;
+        };
         if id == 0 {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::reservation_gate",
+                "ReservationGate allocated subscriber ID 0; violates non-zero subscriber token invariant"
+            );
         }
         self.subscribers.lock().insert(id, callback);
         drop(epoch);
@@ -1069,10 +1089,16 @@ impl VforkParentWait {
             return VforkReleaseEnrollment::Ready(reason);
         }
         let id = publication.next_subscriber;
-        publication.next_subscriber = publication
-            .next_subscriber
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        publication.next_subscriber =
+            publication
+                .next_subscriber
+                .checked_add(1)
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "kernel::vfork_gate",
+                        "VforkParentWait subscriber ID exhaustion"
+                    );
+                });
         publication.subscribers.insert(id, callback);
         VforkReleaseEnrollment::Subscribed(VforkReleaseSubscription {
             state: Arc::downgrade(&self.state),
@@ -1238,7 +1264,14 @@ impl Kernel {
         let session = Arc::new(Session::new(session_id, &ids, session_claim)?);
         let pid_identity = container.prepare_pid_root(task_key)?;
         let namespace_id = pid_identity.as_ref().map_or_else(
-            || u32::try_from(task_key.id.raw()).unwrap_or_else(|_| std::process::abort()),
+            || {
+                u32::try_from(task_key.id.raw()).unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "kernel::bootstrap_identity",
+                        "bootstrap root without PID namespace had internal task ID outside Linux range"
+                    );
+                })
+            },
             crate::namespace::pid::PreparedNamespaceIdentity::visible_id,
         );
         container.publish_pid_root(task_key, pid_identity)?;
@@ -1671,30 +1704,47 @@ impl Kernel {
                         .is_some_and(|record| record.task.container().id() == container_id)
                 })
             {
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::container_retirement",
+                    "live tasks or reservations reappeared after container retirement closed"
+                );
             }
             let tasks_reaped = retiring_tasks
                 .iter()
                 .map(|key| {
-                    let record = state
-                        .zombies
-                        .remove(&key.id)
-                        .unwrap_or_else(|| std::process::abort());
+                    let record = state.zombies.remove(&key.id).unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "kernel::container_retirement",
+                            "retiring task lost its zombie record"
+                        );
+                    });
                     if record.zombie.key != *key || record.zombie.container != container_id {
-                        std::process::abort();
+                        carrick_fatal!(
+                            "kernel::container_retirement",
+                            "removed zombie did not match retiring task generation and container"
+                        );
                     }
                     record
                 })
                 .count();
             self.controlling_ttys.lock().remove(&container_id);
             if state.container_inits.remove(&container_id) != Some(init) {
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::container_retirement",
+                    "container-init index did not name the root generation being retired"
+                );
             }
-            let removed = containers
-                .remove(&container_id)
-                .unwrap_or_else(|| std::process::abort());
+            let removed = containers.remove(&container_id).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::container_retirement",
+                    "container registry lost the entry selected for retirement"
+                );
+            });
             if !Arc::ptr_eq(&removed, &container) {
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::container_retirement",
+                    "removed container was not the exact object being drained"
+                );
             }
             state.publish_epoch();
             tasks_reaped
@@ -2532,7 +2582,10 @@ fn fail_container_root(
 impl RegistryState {
     fn publish_epoch(&mut self) {
         let Some(next) = self.epoch.checked_add(1) else {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::registry_epoch",
+                "Kernel RegistryState epoch counter overflow"
+            );
         };
         self.epoch = next;
     }
@@ -2542,7 +2595,10 @@ impl RegistryState {
         if self.process_groups.contains_key(&id)
             || self.process_group_by_namespace.contains_key(&namespace_key)
         {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::process_group_index",
+                "process-group publication collided in internal or container namespace index"
+            );
         }
         self.process_group_by_namespace.insert(namespace_key, id);
         self.process_groups.insert(id, record);
@@ -2558,7 +2614,10 @@ impl RegistryState {
             .remove(&(record.container, record.namespace_id))
             != Some(id)
         {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::process_group_index",
+                "removing process-group did not remove matching container namespace index edge"
+            );
         }
         Some(record)
     }
@@ -2567,7 +2626,10 @@ impl RegistryState {
         let namespace_key = (record.container, record.namespace_id);
         if self.sessions.contains_key(&id) || self.session_by_namespace.contains_key(&namespace_key)
         {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::session_index",
+                "session publication collided in internal or container namespace index"
+            );
         }
         self.session_by_namespace.insert(namespace_key, id);
         self.sessions.insert(id, record);
@@ -2580,7 +2642,10 @@ impl RegistryState {
             .remove(&(record.container, record.namespace_id))
             != Some(id)
         {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::session_index",
+                "removing session did not remove matching container namespace index edge"
+            );
         }
         Some(record)
     }

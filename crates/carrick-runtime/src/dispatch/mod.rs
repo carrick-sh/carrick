@@ -633,6 +633,7 @@ use crate::linux_abi::{
 use crate::linux_abi::{LINUX_MAP_PRIVATE, LINUX_MAP_SHARED};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
+use carrick_fatal::carrick_fatal;
 // Canonical-number lookups: carrick's canonical syscall numbering IS the
 // aarch64 numbering. The dispatcher receives canonical numbers (a per-ISA
 // table remaps raw numbers to canonical at the GuestArch seam — Phase 2 for
@@ -2755,7 +2756,10 @@ impl MmExecutorParticipation {
     pub(crate) fn participation_mut(&mut self) -> &mut crate::kernel::GuestExecutorParticipation {
         self.participation.as_mut().unwrap_or_else(|| {
             tracing::error!("MM executor participation used while temporarily released");
-            std::process::abort()
+            carrick_fatal!(
+                "dispatch::mm_executor_participation",
+                "MM executor participation used while temporarily released"
+            )
         })
     }
 
@@ -2797,7 +2801,10 @@ impl MmExecutorParticipation {
     fn reenter_exact(&mut self) -> Result<(), crate::kernel::GuestExecutorCensusError> {
         if self.participation.is_some() {
             tracing::error!("MM executor re-entry attempted while participation is present");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mm_executor_participation",
+                "MM executor re-entry attempted while participation is present"
+            );
         }
         self.participation = Some(self.admission.enter(&self.authority)?);
         Ok(())
@@ -3097,7 +3104,10 @@ impl DispatchMmBinding {
         let mut slot = self.staged_exec.lock();
         if slot.is_some() {
             tracing::error!("dispatcher already has a staged exec MM authority");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mm_binding",
+                "dispatcher already has a staged exec MM authority"
+            );
         }
         *slot = Some(Arc::clone(&staged));
         PreparedDispatchMmExec {
@@ -3112,7 +3122,10 @@ impl DispatchMmBinding {
         let staged = self.staged_exec.lock();
         if staged.is_some() {
             tracing::error!("cannot rebind a prepared root with a staged exec MM");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mm_binding",
+                "cannot rebind a prepared root with a staged exec MM"
+            );
         }
         let current = self.current.load_full();
         if current.mm_id != mm_id {
@@ -3202,7 +3215,10 @@ impl PreparedDispatchMmExec {
             .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.staged))
         {
             tracing::error!("staged dispatcher exec MM authority changed before commit");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mm_exec_commit",
+                "staged dispatcher exec MM authority changed before commit"
+            );
         }
         let predecessor = self
             .predecessor
@@ -3214,7 +3230,10 @@ impl PreparedDispatchMmExec {
             });
         if !Arc::ptr_eq(&predecessor, &self.predecessor) {
             tracing::error!("dispatcher exec MM predecessor changed before commit");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mm_exec_commit",
+                "dispatcher exec MM predecessor changed before commit"
+            );
         }
         *staged = None;
         self.committed = true;
@@ -3298,7 +3317,10 @@ pub(crate) struct HostAliasDispatchGuard<'permit> {
 impl HostAliasDispatchGuard<'_> {
     fn with_authority(mut self, authority: Arc<DispatchMmAuthority>) -> Self {
         if !Arc::ptr_eq(&authority.host_alias_transactions, &self.transactions) {
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::host_alias_transactions",
+                "mismatched HostAliasTransactions reference on DispatchMmAuthority during with_authority"
+            );
         }
         self.authority = Some(authority);
         self
@@ -3334,7 +3356,12 @@ impl HostAliasDispatchGuard<'_> {
                 std::sync::atomic::Ordering::Relaxed,
                 |id| id.checked_add(1),
             )
-            .unwrap_or_else(|_| std::process::abort());
+            .unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "dispatch::host_alias_transactions",
+                    "host-alias transaction id exhaustion"
+                )
+            });
         let id = HostAliasTransactionId(raw);
         let mut phase = self.transactions.phase.lock();
         debug_assert!(matches!(*phase, HostAliasPhase::Dispatching));
@@ -3346,7 +3373,10 @@ impl HostAliasDispatchGuard<'_> {
         self.active = false;
         let authority = self.authority.take().unwrap_or_else(|| {
             tracing::error!("host-alias publication lacks MM authority");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::host_alias_transactions",
+                "host-alias publication lacks MM authority"
+            );
         });
         HostAliasTransaction {
             authority,
@@ -3367,7 +3397,10 @@ impl Drop for HostAliasDispatchGuard<'_> {
             if let Some(revision) = &self.vma_revision
                 && revision.fetch_add(1, std::sync::atomic::Ordering::Release) == u64::MAX
             {
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::mem_revision",
+                    "vma revision atomic generation counter overflow"
+                );
             }
             *phase = HostAliasPhase::Idle;
             self.transactions.idle.notify_all();
@@ -3726,14 +3759,20 @@ fn bootstrap_one_task_binding() -> (crate::kernel::KernelTaskBinding, crate::ker
         Ok(bootstrap) => bootstrap,
         Err(error) => {
             tracing::error!(%error, "cannot build mandatory one-task kernel adapter");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::bootstrap",
+                "cannot build mandatory one-task kernel adapter"
+            );
         }
     };
     let context = match crate::kernel::Kernel::bootstrap_root(bootstrap) {
         Ok((_, context)) => context,
         Err(error) => {
             tracing::error!(%error, "cannot bootstrap mandatory one-task kernel adapter");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::bootstrap",
+                "cannot bootstrap mandatory one-task kernel adapter"
+            );
         }
     };
     let mm_id = context.shared().mm().id();
@@ -5363,13 +5402,19 @@ impl SyscallDispatcher {
             .launch_fs_context_for_hvpatch_bind()
             .unwrap_or_else(|error| {
                 tracing::error!(%error, "cannot capture filesystem context before HVPatch binding");
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::hvpatch_binding",
+                    "cannot capture filesystem context before HVPatch binding"
+                );
             });
         let process_context = process
             .context_for_linux_tid(crate::kernel::LinuxTid::for_task_leader(process.task_id()))
             .unwrap_or_else(|error| {
                 tracing::error!(%error, "cannot capture HVPatch root filesystem context");
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::hvpatch_binding",
+                    "cannot capture HVPatch root filesystem context"
+                );
             });
         self.bind_hvpatch_process_exact(process, &process_context, launch_fs_context);
     }
@@ -5396,7 +5441,10 @@ impl SyscallDispatcher {
         process.bind_vma_source(self.vma_snapshot_source());
         let stage1 = process.stage1_mm_lease().unwrap_or_else(|error| {
             tracing::error!(%error, "cannot bind exact HVPatch stage-1 mutation authority");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::hvpatch_binding",
+                "cannot bind exact HVPatch stage-1 mutation authority"
+            );
         });
         process.bind_mm_mutation_authority(self.foreign_mm_mutation_authority(stage1));
         *self.kernel_binding.write() = process.task_binding();
@@ -5554,7 +5602,8 @@ impl SyscallDispatcher {
         context
             .shared()
             .mm()
-            .copy_io_uring_mappings_for_host_fork(&inherited_mm);
+            .copy_io_uring_mappings_for_host_fork(&inherited_mm)
+            .map_err(|error| error.to_string())?;
         let replacement_fs_context = context.resources().fs_context();
         replacement_fs_context.set_cwd(inherited_fs_context.cwd());
         replacement_fs_context.set_chroot_root(inherited_fs_context.chroot_root());
@@ -6475,7 +6524,10 @@ impl SyscallDispatcher {
                     tracing::error!(
                         "MM executor admission must be anonymous or carry an exact thread pause endpoint"
                     );
-                    std::process::abort()
+                    carrick_fatal!(
+                        "dispatch::mm_executor_admission",
+                        "MM executor admission must be anonymous or carry an exact thread pause endpoint"
+                    )
                 }
             };
             let participation = admission.enter(&authority)?;
@@ -6553,7 +6605,10 @@ impl SyscallDispatcher {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
         if let Err(error) = executor.reenter_exact() {
             tracing::error!(?error, "failed to re-enter exact caller-MM executor census");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mm_executor_reentry",
+                "failed to re-enter exact caller-MM executor census"
+            );
         }
 
         match result {
@@ -6569,7 +6624,10 @@ impl SyscallDispatcher {
                         ?error,
                         "caller-MM executor identity drifted while unwinding released operation"
                     );
-                    std::process::abort();
+                    carrick_fatal!(
+                        "dispatch::mm_executor_reentry",
+                        "caller-MM executor identity drifted while unwinding released operation"
+                    );
                 }
                 std::panic::resume_unwind(payload)
             }
@@ -6579,7 +6637,10 @@ impl SyscallDispatcher {
     pub(crate) fn mark_vma_dispatch(&self, guard: &mut HostAliasDispatchGuard) {
         let authority = guard.authority.as_ref().unwrap_or_else(|| {
             tracing::error!("VMA dispatch guard lacks MM authority");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mm_binding",
+                "VMA dispatch guard lacks MM authority"
+            );
         });
         guard.mark_vma_revision(authority.mem.revision_publisher());
     }
@@ -6623,7 +6684,10 @@ impl SyscallDispatcher {
             if let Some(mm) = commit.io_uring_mm {
                 mm.replace_io_uring_mappings(start, len, commit.io_uring_mapping);
             } else if commit.io_uring_mapping.is_some() {
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::host_alias_commit",
+                    "ring alias commit missing target Mm reference"
+                );
             }
         }
         if let Some(shmat) = commit.shmat {
@@ -7556,7 +7620,10 @@ impl SyscallDispatcher {
     pub fn set_credentials(&self, uid: carrick_abi::NsUid, gid: carrick_abi::NsGid) {
         let context = self.capture_one_task_context().unwrap_or_else(|error| {
             tracing::error!(%error, "cannot capture launch credential context");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::credentials",
+                "cannot capture launch credential context"
+            );
         });
         let credentials = self
             .update_credentials(&context, |credentials| {
@@ -7564,7 +7631,7 @@ impl SyscallDispatcher {
             })
             .unwrap_or_else(|errno| {
                 tracing::error!(errno = errno.get(), "publish launch Kernel credentials");
-                std::process::abort();
+                carrick_fatal!("dispatch::credentials", "publish launch Kernel credentials");
             });
         self.publish_external_credential_projection(&context, &credentials);
     }
@@ -8095,7 +8162,10 @@ impl SyscallDispatcher {
         #[cfg(not(test))]
         {
             tracing::error!("mm access escaped its captured KernelContext scope");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::mm_authority",
+                "mm access escaped its captured KernelContext scope"
+            );
         }
     }
 
@@ -8113,7 +8183,10 @@ impl SyscallDispatcher {
         #[cfg(not(test))]
         {
             tracing::error!("file-table access escaped its captured KernelContext scope");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::file_authority",
+                "file-table access escaped its captured KernelContext scope"
+            );
         }
     }
 
@@ -8146,7 +8219,10 @@ impl SyscallDispatcher {
         #[cfg(not(test))]
         {
             tracing::error!("filesystem-context read escaped its captured KernelContext scope");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::fs_context",
+                "filesystem-context read escaped its captured KernelContext scope"
+            );
         }
     }
 
@@ -8157,7 +8233,10 @@ impl SyscallDispatcher {
         self.capture_one_task_context()
             .unwrap_or_else(|error| {
                 tracing::error!(%error, "cannot capture initial filesystem context");
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::fs_context",
+                    "cannot capture initial filesystem context"
+                );
             })
             .resources()
             .fs_context()
@@ -8204,7 +8283,10 @@ impl SyscallDispatcher {
         }
         let context = self.capture_one_task_context().unwrap_or_else(|error| {
             tracing::error!(%error, "cannot capture initial filesystem context");
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::fs_context",
+                "cannot capture initial filesystem context"
+            );
         });
         context.resources().fs_context().set_cwd(cwd);
     }
@@ -11233,7 +11315,10 @@ impl SyscallDispatcher {
         self.mem_snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(30))
             .unwrap_or_else(|error| {
                 tracing::error!(%error, "synthetic proc MemState snapshot timed out");
-                std::process::abort()
+                carrick_fatal!(
+                    "dispatch::mem_snapshot",
+                    "synthetic proc MemState snapshot timed out"
+                )
             })
     }
 

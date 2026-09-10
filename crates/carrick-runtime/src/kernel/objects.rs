@@ -31,14 +31,19 @@ use super::ids::{
     SighandId, TaskId, TaskSerial, ThreadSerial,
 };
 use super::netns::{NetNs, NsProxy, UtsNs};
+use super::operations::KernelOperationError;
 use super::registry::{IdRegistry, ProcessGroupClaim, SessionClaim};
+use carrick_fatal::carrick_fatal;
 
 static NEXT_FILE_SLOT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_file_slot_generation() -> u64 {
     let generation = NEXT_FILE_SLOT_GENERATION.fetch_add(1, Ordering::Relaxed);
     if generation == 0 || generation == u64::MAX {
-        std::process::abort();
+        carrick_fatal!(
+            "kernel::file_slot_generation",
+            "FileSlot generation atomic counter overflow or zero"
+        );
     }
     generation
 }
@@ -58,7 +63,10 @@ impl ObjectRevision {
     fn publish(&self) -> u64 {
         let prev = self.0.fetch_add(1, Ordering::Release);
         if prev == u64::MAX {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::object_revision",
+                "ObjectRevision atomic counter overflow"
+            );
         }
         prev + 1
     }
@@ -210,7 +218,10 @@ impl Mm {
         replacement: Option<crate::dispatch::ioring::IoUringMapping>,
     ) {
         let Some(end) = start.checked_add(len) else {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::mm_io_uring",
+                "checked addition overflow in replace_io_uring_mappings"
+            );
         };
         let mut mappings = self.io_uring_mappings.write();
         let mut retained = Vec::with_capacity(mappings.len().saturating_add(2));
@@ -246,16 +257,22 @@ impl Mm {
             .any(|mapping| mapping.start < end && start < mapping.end)
     }
 
-    pub(crate) fn copy_io_uring_mappings_for_host_fork(&self, inherited: &Self) {
+    pub(crate) fn copy_io_uring_mappings_for_host_fork(
+        &self,
+        inherited: &Self,
+    ) -> Result<(), KernelOperationError> {
         let mut mappings = self.io_uring_mappings.write();
         if !mappings.is_empty() {
             tracing::error!(mm = ?self.id, "host-fork mm io state replacement was not empty");
-            std::process::abort();
+            return Err(KernelOperationError::ObjectGraph(
+                ObjectGraphError::NonEmptyForkMm,
+            ));
         }
         mappings.clone_from(&inherited.io_uring_mappings.read());
         if !mappings.is_empty() {
             self.revision.publish();
         }
+        Ok(())
     }
 
     pub(super) fn clear_io_uring_mappings(&self) {
@@ -1111,8 +1128,10 @@ impl DescriptionCommon {
     pub(crate) fn release_fd_ref(&self) -> usize {
         let previous = self.fd_refs.fetch_sub(1, Ordering::Relaxed);
         if previous == 0 {
-            tracing::error!("logical fd reference count underflow");
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::file_description_refs",
+                "logical fd reference count underflow"
+            );
         }
         previous - 1
     }
@@ -1212,8 +1231,10 @@ impl Drop for MappedFileReference {
     fn drop(&mut self) {
         let mut lifecycle = self.description.lifecycle_transition.lock();
         lifecycle.mapping_refs = lifecycle.mapping_refs.checked_sub(1).unwrap_or_else(|| {
-            tracing::error!("mapped file reference count underflow");
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::file_description_refs",
+                "mapped file reference count underflow"
+            );
         });
         if lifecycle.mapping_refs == 0 && self.description.common.fd_refs() == 0 {
             if let FileDescriptionKind::Concrete(backing) = &self.description.kind {
@@ -1494,8 +1515,10 @@ impl FileDescription {
             return None;
         }
         lifecycle.mapping_refs = lifecycle.mapping_refs.checked_add(1).unwrap_or_else(|| {
-            tracing::error!("mapped file reference count overflow");
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::file_description_refs",
+                "mapped file reference count overflow"
+            );
         });
         self.revision.publish();
         Some(Arc::new(MappedFileReference {
@@ -1851,8 +1874,10 @@ impl Drop for FileTableFunctionalLease {
     fn drop(&mut self) {
         let mut state = self.gate.state.lock();
         state.active_uses = state.active_uses.checked_sub(1).unwrap_or_else(|| {
-            tracing::error!("FileTable functional lease underflow");
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::file_table_gate",
+                "FileTable active functional lease count underflow"
+            );
         });
         self.gate.changed.notify_all();
     }
@@ -1866,8 +1891,10 @@ impl Drop for FileTableMutationLease {
     fn drop(&mut self) {
         let mut state = self.gate.state.lock();
         state.active_mutations = state.active_mutations.checked_sub(1).unwrap_or_else(|| {
-            tracing::error!("FileTable mutation lease underflow");
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::file_table_gate",
+                "FileTable active mutation lease count underflow"
+            );
         });
         self.gate.changed.notify_all();
     }
@@ -2276,8 +2303,10 @@ impl FileTable {
 
     fn mutation_lease(&self) -> FileTableMutationLease {
         self.functional_gate.acquire_mutation().unwrap_or_else(|| {
-            tracing::error!(file_table = ?self.id, "mutation reached a draining FileTable generation");
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::file_table_gate",
+                "mutation reached a draining FileTable generation"
+            );
         })
     }
 
@@ -2778,11 +2807,10 @@ impl PendingQueue {
 
     pub fn enqueue_standard(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
         if signal.raw() >= 32 {
-            tracing::error!(
-                signal = signal.raw(),
+            carrick_fatal!(
+                "kernel::pending_signals",
                 "real-time signal entered standard queue"
             );
-            std::process::abort();
         }
         let already_pending = self.present.contains(signal.raw());
         self.present = self.present.with(signal.raw());
@@ -2797,11 +2825,10 @@ impl PendingQueue {
 
     pub fn enqueue_realtime(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
         if signal.raw() < 32 {
-            tracing::error!(
-                signal = signal.raw(),
+            carrick_fatal!(
+                "kernel::pending_signals",
                 "standard signal entered real-time queue"
             );
-            std::process::abort();
         }
         self.realtime.entry(signal).or_default().push_back(siginfo);
         self.present = self.present.with(signal.raw());
@@ -2834,7 +2861,10 @@ impl PendingQueue {
                 continue;
             }
             let Ok(signal) = LinuxSignal::for_signal_number(raw) else {
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::pending_signals",
+                    "present bitset contains invalid signal number"
+                );
             };
             if let Some(realtime) = self.realtime.get(&signal) {
                 entries.extend(
@@ -3654,16 +3684,20 @@ pub(crate) struct PtraceSynchronousFault {
 
 fn advance_job_control_stop_invalidation_generation(state: &mut TaskJobControl) {
     let Some(next) = state.stop_invalidation_generation.checked_add(1) else {
-        tracing::error!("job-control stop invalidation generation exhausted");
-        std::process::abort();
+        carrick_fatal!(
+            "kernel::job_control",
+            "job-control stop invalidation generation exhausted"
+        );
     };
     state.stop_invalidation_generation = next;
 }
 
 fn advance_ptrace_stop_generation(state: &mut TaskJobControl) {
     let Some(next) = state.ptrace_stop_generation.checked_add(1) else {
-        tracing::error!("ptrace stop generation exhausted");
-        std::process::abort();
+        carrick_fatal!(
+            "kernel::ptrace_stop_authority",
+            "ptrace stop generation exhausted"
+        );
     };
     state.ptrace_stop_generation = next;
 }
@@ -4412,16 +4446,8 @@ impl Task {
     }
 
     fn publish_wake(&self, wake_vehicle: bool) -> bool {
-        let previous = self
-            .wake_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                generation.checked_add(1)
-            })
-            .unwrap_or_else(|_| {
-                tracing::error!(task = ?self.key, "task wake generation exhausted");
-                std::process::abort();
-            });
-        let generation = previous + 1;
+        let previous = self.wake_generation.fetch_add(1, Ordering::AcqRel);
+        let generation = previous.wrapping_add(1);
         let callbacks = {
             let mut listeners = self.wake_listeners.lock();
             listeners
@@ -4471,7 +4497,7 @@ impl Task {
         }
         let id = self.next_wake_listener.fetch_add(1, Ordering::Relaxed);
         if id == 0 || id == u64::MAX {
-            std::process::abort();
+            return TaskWakeEnrollment::Ready(current);
         }
         listeners.insert(
             id,
@@ -6267,7 +6293,12 @@ impl Drop for CrashSafePointParticipation {
     fn drop(&mut self) {
         match self.thread.release_crash_safe_point_participation(self.id) {
             CrashSafePointRelease::Released | CrashSafePointRelease::AlreadyRevoked => {}
-            CrashSafePointRelease::Superseded => std::process::abort(),
+            CrashSafePointRelease::Superseded => {
+                carrick_fatal!(
+                    "kernel::crash_safe_point_participation",
+                    "crash safe point participation superseded"
+                );
+            }
         }
     }
 }
@@ -7670,10 +7701,12 @@ impl Thread {
             );
             return;
         }
-        let generation = lease
-            .generation
-            .next()
-            .unwrap_or_else(|| std::process::abort());
+        let generation = lease.generation.next().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::execution_lease",
+                "execution generation counter overflow in fail_unsettled_execution_lease"
+            );
+        });
         execution.task_state = None;
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
@@ -7708,7 +7741,12 @@ impl Thread {
             .generation()
             .unwrap_or(ExecutionGeneration::INITIAL)
             .next()
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::execution_lease",
+                    "execution generation counter overflow in invalidate_execution_for_exec"
+                );
+            });
         execution.task_state = None;
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
@@ -8544,7 +8582,10 @@ impl ProcessGroup {
         }
         let generation = NEXT_PROCESS_GROUP_GENERATION.fetch_add(1, Ordering::Relaxed);
         if generation == 0 || generation == u64::MAX {
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::process_group_generation",
+                "monotone process-group generation exhausted"
+            );
         }
         Ok(Self {
             id,
@@ -8666,12 +8707,19 @@ impl Zombie {
     ) -> Self {
         let (children_user_us, children_system_us) = task.children_cpu_us();
         let credentials = task.process_credentials();
-        let internal_pid =
-            u32::try_from(task.key().id.raw()).unwrap_or_else(|_| std::process::abort());
+        let internal_pid = u32::try_from(task.key().id.raw()).unwrap_or_else(|_| {
+            carrick_fatal!(
+                "kernel::zombie_identity",
+                "exiting task internal identity outside PID namespace range"
+            );
+        });
         let namespace_pid = match task.pid_ns_region() {
-            Some(region) => region
-                .host_to_ns(internal_pid)
-                .unwrap_or_else(|| std::process::abort()),
+            Some(region) => region.host_to_ns(internal_pid).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::zombie_identity",
+                    "live namespace member disappeared before zombie captured visible PID"
+                );
+            }),
             None => internal_pid,
         };
         Self {
@@ -8772,6 +8820,8 @@ pub enum ObjectGraphError {
     SelfEpollInterest(FileDescriptionId),
     #[error("nested epoll target {0:?} is rejected by the K1 object model")]
     NestedEpollInterest(FileDescriptionId),
+    #[error("host-fork target Mm already has ring allocations")]
+    NonEmptyForkMm,
 }
 
 #[cfg(test)]

@@ -8,6 +8,8 @@ use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use carrick_fatal::carrick_fatal;
+
 use crate::dispatch::SyscallDispatcher;
 use crate::pty_relay::{PtyPair, PtyRelay};
 
@@ -62,10 +64,12 @@ impl InteractiveSession {
         dispatcher.register_controlling_pty(slave_name);
         setup.committed = true;
         Ok(Self {
-            _admission: setup
-                .admission
-                .take()
-                .unwrap_or_else(|| std::process::abort()),
+            _admission: setup.admission.take().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "interactive::session_ownership",
+                    "interactive session admission missing during commit"
+                );
+            }),
             saved_stdio: setup.saved_stdio,
             relay: setup.relay.take(),
         })
@@ -116,7 +120,10 @@ impl InteractiveSessionAdmission {
 impl Drop for InteractiveSessionAdmission {
     fn drop(&mut self) {
         if !INTERACTIVE_SESSION_ACTIVE.swap(false, Ordering::AcqRel) {
-            std::process::abort();
+            carrick_fatal!(
+                "interactive::session_ownership",
+                "interactive session active state already cleared on drop"
+            );
         }
     }
 }

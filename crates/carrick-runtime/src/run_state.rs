@@ -42,6 +42,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use carrick_fatal::carrick_fatal;
 use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 #[cfg(test)]
@@ -346,7 +347,10 @@ pub fn clear_guest_process(pid: i32) {
                 }
                 Err(ProcessRecordTransitionError::Busy) => {
                     eprintln!("carrick: process record transition did not quiesce for pid {pid}");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "run_state::process_section",
+                        "process record transition did not quiesce"
+                    );
                 }
             }
         }
@@ -460,7 +464,10 @@ fn claim_record(section: &ProcessSection, id: u32, want: u64, want_tid: bool) ->
 
 fn abort_on_arena_error(err: ArenaError) -> ! {
     eprintln!("carrick: run-state arena publication failed: {err:?}");
-    std::process::abort();
+    carrick_fatal!(
+        "run_state::kernel_arena",
+        "run-state arena publication failed"
+    );
 }
 
 /// Reset THIS (freshly-forked child) process's published state to `Booting`.

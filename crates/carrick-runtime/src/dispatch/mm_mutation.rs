@@ -2,6 +2,7 @@
 //! page-table exclusion first, then a host-alias phase for the same MM.
 
 use crate::kernel::MmId;
+use carrick_fatal::carrick_fatal;
 use parking_lot::{Condvar, Mutex};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -225,9 +226,12 @@ pub(crate) enum ForeignMmMutationError {
 pub(crate) fn from_pt_pause<'authority>(
     authority: &'authority mut crate::vcpu_loop::quiesce::PtPauseGuard,
 ) -> MmMutationGuard<'authority> {
-    let (coordinator, mm) = authority
-        .mutation_identity()
-        .unwrap_or_else(|| std::process::abort());
+    let (coordinator, mm) = authority.mutation_identity().unwrap_or_else(|| {
+        carrick_fatal!(
+            "dispatch::mm_mutation",
+            "missing mutation identity in from_pt_pause"
+        );
+    });
     MmMutationGuard {
         coordinator,
         mm,
@@ -257,9 +261,12 @@ pub(crate) fn from_sole_executor<'authority>(
 pub(crate) fn from_frame_cow<'authority>(
     authority: &'authority mut crate::vcpu_loop::quiesce::FrameCowExactMmGuard,
 ) -> MmMutationGuard<'authority> {
-    let (coordinator, mm) = authority
-        .mutation_identity()
-        .unwrap_or_else(|| std::process::abort());
+    let (coordinator, mm) = authority.mutation_identity().unwrap_or_else(|| {
+        carrick_fatal!(
+            "dispatch::mm_mutation",
+            "missing mutation identity in from_frame_cow"
+        );
+    });
     MmMutationGuard {
         coordinator,
         mm,
@@ -305,10 +312,12 @@ pub(crate) struct MmSnapshotGuard {
 impl Drop for MmSnapshotGuard {
     fn drop(&mut self) {
         let mut state = self.coordinator.state.lock();
-        state.snapshot_readers = state
-            .snapshot_readers
-            .checked_sub(1)
-            .unwrap_or_else(|| std::process::abort());
+        state.snapshot_readers = state.snapshot_readers.checked_sub(1).unwrap_or_else(|| {
+            carrick_fatal!(
+                "dispatch::mm_mutation",
+                "snapshot readers underflow in MmSnapshotGuard drop"
+            );
+        });
         if state.snapshot_readers == 0 {
             self.coordinator.idle.notify_all();
         }

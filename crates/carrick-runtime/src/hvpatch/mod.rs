@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
+use carrick_fatal::carrick_fatal;
+
 use crate::dispatch::SyscallDispatcher;
 use crate::memory::{AddressSpace, AddressSpaceError};
 #[cfg(all(
@@ -91,10 +93,12 @@ pub(crate) struct PreparedRootInitialization {
 
 impl PreparedRootInitialization {
     fn process(&self) -> ProcessContext {
-        self.process
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| std::process::abort())
+        self.process.as_ref().cloned().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::root_initialization",
+                "missing process in PreparedRootInitialization"
+            );
+        })
     }
 
     pub(crate) fn commit_publications(mut self) {
@@ -752,9 +756,11 @@ impl ProcessContext {
         mut self,
         endpoint: carrick_hal::ForeignMmEndpoint,
         context: &crate::kernel::KernelContext,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
         if context.task().key() != self.binding.task_key() {
-            std::process::abort();
+            return Err(RuntimeError::Configuration(
+                "foreign MM endpoint binding task key mismatch".to_owned(),
+            ));
         }
         context
             .shared()
@@ -762,7 +768,7 @@ impl ProcessContext {
             .install_foreign_mm_endpoint(endpoint.clone(), &ForeignMmInstallPermit::new());
         self.foreign_mm_endpoint = Some(endpoint);
         self.mm_access = Some(crate::kernel::MmAccessAuthority::new());
-        self
+        Ok(self)
     }
 
     pub(crate) fn mm_access_authority(&self) -> Option<&crate::kernel::MmAccessAuthority> {
@@ -897,7 +903,12 @@ impl ProcessContext {
     ) {
         let context = self
             .context_for_linux_tid(crate::kernel::LinuxTid::for_task_leader(self.task_id()))
-            .unwrap_or_else(|_| std::process::abort());
+            .unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "hvpatch::process_context",
+                    "cannot resolve context_for_linux_tid in bind_mm_mutation_authority"
+                );
+            });
         context
             .shared()
             .mm()
@@ -1153,7 +1164,10 @@ impl ProcessContext {
                 let error = error.to_string();
                 reservation.abort().unwrap_or_else(|abort_error| {
                     tracing::error!(%abort_error, "failed to abort exec MM after Kernel preparation failure");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::exec_rollback",
+                        "failed to abort exec MM after Kernel preparation failure"
+                    );
                 });
                 return Err(error);
             }
@@ -1175,7 +1189,10 @@ impl ProcessContext {
                         let error = error.to_string();
                         reservation.abort().unwrap_or_else(|abort_error| {
                             tracing::error!(%abort_error, "failed to abort exec MM after VMA freeze preparation failure");
-                            std::process::abort();
+                            carrick_fatal!(
+                                "hvpatch::exec_rollback",
+                                "failed to abort exec MM after VMA freeze preparation failure"
+                            );
                         });
                         return Err(error);
                     }
@@ -1212,7 +1229,10 @@ impl ProcessContext {
         if !std::sync::Arc::ptr_eq(&current_backend, &predecessor_backend) {
             reservation.abort().unwrap_or_else(|abort_error| {
                 tracing::error!(%abort_error, "failed to abort exec MM after predecessor backend mismatch");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::exec_rollback",
+                    "failed to abort exec MM after predecessor backend mismatch"
+                );
             });
             return Err("exec predecessor backend changed after MM reservation".to_owned());
         }
@@ -1224,7 +1244,10 @@ impl ProcessContext {
                 let error = error.to_string();
                 reservation.abort().unwrap_or_else(|abort_error| {
                     tracing::error!(%abort_error, "failed to abort exec MM after predecessor VMA validation failure");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::exec_rollback",
+                        "failed to abort exec MM after predecessor VMA validation failure"
+                    );
                 });
                 return Err(error);
             }
@@ -1235,7 +1258,10 @@ impl ProcessContext {
                 let error = error.to_string();
                 reservation.abort().unwrap_or_else(|abort_error| {
                     tracing::error!(%abort_error, "failed to abort exec MM after predecessor VMA freeze failure");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::exec_rollback",
+                        "failed to abort exec MM after predecessor VMA freeze failure"
+                    );
                 });
                 return Err(error);
             }
@@ -1244,14 +1270,20 @@ impl ProcessContext {
             .replacement_root_slot()
             .unwrap_or_else(|| {
                 tracing::error!("exec MM reservation lost its replacement root slot");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::stage1_mm",
+                    "exec MM reservation lost its replacement root slot"
+                );
             })
             .base();
         let receipt = reservation.commit(stage1_root).unwrap_or_else(|error| {
             // A final-owner VMA freeze may already be published. There is no
             // safe predecessor resume beyond this exact point.
             tracing::error!(%error, "exec MM reservation commit failed after predecessor freeze");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::exec_commit",
+                "exec MM reservation commit failed after predecessor freeze"
+            );
         });
         let replacement_lease = match &receipt {
             mm_resources::ExecMmCommitReceipt::Retained { replacement, .. }
@@ -1519,7 +1551,10 @@ impl ProcessContext {
         match outcome {
             Ok(crate::kernel::WaitOutcome::Exited(zombie)) => {
                 let Ok(visible_pid) = i32::try_from(zombie.namespace_pid) else {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::wait_identity",
+                        "zombie namespace_pid exceeds i32 in wait_result"
+                    );
                 };
                 WaitResult::Exited(ChildExit {
                     pid: zombie.key.id,
@@ -1710,7 +1745,7 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
             );
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let prepared = match engine.foreign_mm_endpoint() {
-                Some(endpoint) => prepared.with_foreign_mm_endpoint(endpoint, root_context),
+                Some(endpoint) => prepared.with_foreign_mm_endpoint(endpoint, root_context)?,
                 None => prepared,
             };
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU64;
 use std::time::Instant;
 
+use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::Gpa;
 use carrick_hal::{
     FrameEventCapacity, FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch,
@@ -330,7 +331,12 @@ impl FrameInventoryAuthority {
         }
         let mm_id = mm;
         let (outcome, revision, _) = self.apply_inner(mm_id, commit, None)?;
-        let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| std::process::abort());
+        let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::frame_inventory",
+                "zero mm ID encountered in apply_with_receipt"
+            );
+        });
         Ok((
             outcome,
             FrameInventoryApplyReceipt::from_kernel_authority(
@@ -432,7 +438,12 @@ impl FrameInventoryAuthority {
         drop(state);
         let mm_id = mm;
         let (outcome, revision, mm_empty_at_revision) = self.apply_inner(mm_id, commit, None)?;
-        let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| std::process::abort());
+        let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::frame_inventory",
+                "zero mm ID encountered in apply_retirement_with_receipt"
+            );
+        });
         let receipt = FrameInventoryApplyReceipt::from_kernel_authority(
             provenance,
             transaction,

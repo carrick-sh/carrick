@@ -52,6 +52,7 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
+use carrick_fatal::carrick_fatal;
 
 syscall_table! {
     /// Per-module syscall routing for the `signal` subsystem (Task A1).
@@ -203,7 +204,10 @@ impl SyscallDispatcher {
         let signal =
             crate::kernel::LinuxSignal::for_signal_number(signum).unwrap_or_else(|error| {
                 tracing::error!(%error, signum, "invalid signal reached Kernel Sighand install");
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::signal_disposition",
+                    "invalid signal reached Kernel Sighand install"
+                );
             });
         context.shared().sighand().install_action(signal, action);
     }
@@ -235,7 +239,10 @@ impl SyscallDispatcher {
                 task = ?context.task().key(),
                 "signal operation escaped its captured KernelContext"
             );
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::signal_authority",
+                "signal operation escaped its captured KernelContext"
+            );
         })
     }
 
@@ -2614,7 +2621,10 @@ pub(crate) fn ns_visible_sender_pid(context: &crate::kernel::KernelContext) -> i
                 internal_id = raw,
                 "signal sender is missing visible identity"
             );
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::signal_identity",
+                "signal sender is missing visible identity"
+            );
         })
 }
 

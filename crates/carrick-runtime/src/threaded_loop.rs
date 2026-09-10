@@ -5,6 +5,7 @@
 
 use crate::dispatch::SyscallDispatcher;
 use crate::run_result::{RunResult, RuntimeError};
+use carrick_fatal::carrick_fatal;
 
 /// The host-OS seam for the shared threaded vCPU loop ([`run_threaded_loop`]).
 ///
@@ -133,7 +134,10 @@ impl Drop for PreparedInitialFrameInventory {
             .rollback_unpublished_apply(&receipt)
             .is_err()
         {
-            std::process::abort();
+            carrick_fatal!(
+                "threaded_loop::initial_frame_inventory",
+                "failed to rollback unpublished initial frame inventory"
+            );
         }
     }
 }
@@ -180,7 +184,12 @@ where
         .apply_with_receipt(context.shared().mm().id(), commit)
     {
         Ok(((), receipt)) => receipt,
-        Err(_) => std::process::abort(),
+        Err(_) => {
+            carrick_fatal!(
+                "threaded_loop::initial_frame_inventory",
+                "apply initial frame inventory failed"
+            );
+        }
     };
     Ok(Some(PreparedInitialFrameInventory {
         kernel: std::sync::Arc::clone(context.kernel()),
@@ -531,7 +540,12 @@ where
         activation.commit_with_services(|runtime| {
             first_root_publications
                 .take()
-                .unwrap_or_else(|| std::process::abort())
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "threaded_loop::root_activation",
+                        "first root publications missing during activation commit"
+                    );
+                })
                 .commit_publications();
             // The relay route and debug endpoint must never point at a root
             // that the carrier still reports as provisional. TTY authority
@@ -546,7 +560,10 @@ where
                         .capture_kernel_context(root_linux_tid)
                         .unwrap_or_else(|error| {
                             tracing::error!(%error, "cannot capture activated HVPatch root tty context");
-                            std::process::abort();
+                            carrick_fatal!(
+                                "threaded_loop::root_activation",
+                                "cannot capture activated HVPatch root tty context"
+                            );
                         }),
                 );
             crate::kernel::KernelDebugServer::install(

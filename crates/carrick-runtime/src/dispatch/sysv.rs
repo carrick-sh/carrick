@@ -27,6 +27,7 @@
 use super::*;
 use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
 use carrick_abi::{NsGid, NsUid};
+use carrick_fatal::carrick_fatal;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 #[cfg(not(doctest))]
@@ -700,7 +701,10 @@ impl Drop for PendingShmat {
         self.namespace.with_state_mut(|state| {
             let should_remove = state.segments.get_mut(&self.shmid).is_some_and(|segment| {
                 if segment.path != self.path || segment.pending_attaches == 0 {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "dispatch::sysv_shm",
+                        "pending attach bookkeeping corrupted for shared memory segment"
+                    );
                 }
                 segment.pending_attaches -= 1;
                 segment.removed && segment.pending_attaches == 0 && segment.nattch == 0
@@ -2696,7 +2700,10 @@ impl SyscallDispatcher {
                 // A backend error may follow a partial page-table/stage-2
                 // mutation. Returning ENOMEM would let the guest continue with
                 // attachment and backend ownership in an unknowable split state.
-                std::process::abort();
+                carrick_fatal!(
+                    "dispatch::sysv_shmdt",
+                    "ambiguous unmap failure leaving split shared memory backend ownership"
+                );
             }
             cx.memory.set_unmapped(addr, len, true);
             this.remove_mapping_metadata(addr, len as u64);

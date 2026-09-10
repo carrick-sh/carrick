@@ -7,6 +7,8 @@
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
+use carrick_fatal::carrick_fatal;
+
 #[derive(Clone)]
 pub(super) struct CapturedResources {
     credentials: Arc<crate::kernel::Credentials>,
@@ -190,7 +192,10 @@ fn with_resource_scope<R>(
                 file_table = ?resources.files.id(),
                 "captured operation reached a draining FileTable generation"
             );
-            std::process::abort();
+            carrick_fatal!(
+                "dispatch::file_table_lease",
+                "captured operation reached a draining FileTable generation"
+            );
         });
     struct Restore {
         context: *const crate::kernel::KernelContext,

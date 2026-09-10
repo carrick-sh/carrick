@@ -3,6 +3,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use carrick_abi::LinuxEpollEvents;
+use carrick_fatal::carrick_fatal;
 
 use crate::kernel::ObjectIdRegistry;
 
@@ -4379,5 +4380,8 @@ fn ensure_cloexec(fd: i32) -> Result<(), AuthorityFatal> {
 
 fn abort_fatal(error: AuthorityFatal) -> ! {
     tracing::error!(%error, "FileAuthority encountered a run-fatal invariant");
-    std::process::abort();
+    carrick_fatal!(
+        "file_authority::core",
+        "FileAuthority encountered a run-fatal invariant"
+    );
 }
