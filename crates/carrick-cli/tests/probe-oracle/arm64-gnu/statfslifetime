@@ -1,4 +1,4 @@
-0a9a2712400de674
+d66bdd55f8bf87d5
 create_ok=true
 statfs_path_ok=true
 fstatfs_fd_ok=true
@@ -68,3 +68,11 @@ scm_recv_errno=0
 scm_fstatfs_errno=0
 scm_magic_match=true
 scm_blocks_match=true
+reopen_access_create_errno=0
+reopen_access_linked_errno=0
+reopen_access_linked_written=1
+reopen_access_linked_write_errno=0
+reopen_access_unlink_errno=0
+reopen_access_unlinked_errno=0
+reopen_access_unlinked_written=1
+reopen_access_unlinked_write_errno=0
