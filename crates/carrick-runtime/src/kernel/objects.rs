@@ -1644,6 +1644,7 @@ impl FileSlot {
             .contains(carrick_abi::LinuxFdFlags::CLOEXEC)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn wait_queue(&self) -> Option<Arc<super::wait_set::WaitQueue>> {
         self.description.wait_queue()
     }

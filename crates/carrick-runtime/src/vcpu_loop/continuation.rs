@@ -2483,6 +2483,7 @@ enum ProducerSubscription {
     Task(crate::kernel::objects::TaskWakeSubscription),
     Vfork(crate::kernel::core::VforkReleaseSubscription),
     FileSlot(crate::kernel::objects::FileSlotSubscription),
+    WaitQueue(crate::kernel::WaitCallbackEnrollment),
 }
 
 impl std::fmt::Debug for ProducerSubscription {
@@ -2492,6 +2493,7 @@ impl std::fmt::Debug for ProducerSubscription {
             Self::Task(_) => formatter.write_str("TaskWakeSubscription"),
             Self::Vfork(_) => formatter.write_str("VforkReleaseSubscription"),
             Self::FileSlot(_) => formatter.write_str("FileSlotSubscription"),
+            Self::WaitQueue(_) => formatter.write_str("WaitQueueSubscription"),
         }
     }
 }
@@ -3353,6 +3355,7 @@ impl CarrierWaitServiceInner {
                 entry.operation_gate.close_admission_cancelled();
                 entry.state = RegistrationState::Cancelled(cause);
                 let _ = entry.event.take();
+                entry.subscriptions.clear();
             }
             let task_waker = entry.task_waker.take();
             (gate, task_waker, was_active)
@@ -3967,6 +3970,19 @@ impl CarrierWaitService {
                 };
                 self.inner
                     .attach_subscription(token, ProducerSubscription::FileSlot(subscription));
+
+                if let Some(description) = file_table.resolve_slot_authority(*authority)
+                    && let Some(wq) = description.wait_queue()
+                {
+                    let callback_weak = weak.clone();
+                    let enrollment = wq.enroll_callback(move |_| {
+                        if let Some(inner) = callback_weak.upgrade() {
+                            inner.publish_event(token, ContinuationEvent::Ready);
+                        }
+                    });
+                    self.inner
+                        .attach_subscription(token, ProducerSubscription::WaitQueue(enrollment));
+                }
             }
         }
         if let ReadinessProbe::Vfork { wait } = &probe {
@@ -11184,5 +11200,823 @@ mod tests {
             }
             other => panic!("expected Returned on fresh dispatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn controller_mixed_ppoll_netlink_real_service_wake() {
+        use carrick_guest_mem::GuestMemory;
+        use std::future::Future;
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let kernel = Arc::clone(context.kernel());
+        let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        fn returned(outcome: DispatchOutcome) -> i64 {
+            match outcome {
+                DispatchOutcome::Returned { value } => value,
+                other => panic!("fixture syscall: {other:?}"),
+            }
+        }
+        let efd = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(19, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let nlfd = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(198, SyscallArgs([16, 3, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let mut pollfds = [0u8; 16];
+        pollfds[0..4].copy_from_slice(&(efd as i32).to_le_bytes());
+        pollfds[4..6].copy_from_slice(&1i16.to_le_bytes());
+        pollfds[8..12].copy_from_slice(&(nlfd as i32).to_le_bytes());
+        pollfds[12..14].copy_from_slice(&1i16.to_le_bytes());
+        memory.write_bytes(0x4000, &pollfds).unwrap();
+        let req = SyscallRequest::new(73, SyscallArgs([0x4000, 2, 0, 0, 0, 0]));
+        let outcome = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+        assert!(
+            matches!(&outcome, DispatchOutcome::WaitOnPollFds { .. }),
+            "mixed ppoll must yield: {outcome:?}"
+        );
+        let generation = publish(&context, 0x982);
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("actual mixed ppoll continuation");
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let mut registration = service.prepare_registration(&continuation);
+        service
+            .enroll(&mut registration)
+            .expect("enroll real mixed ppoll");
+        let token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach real registration");
+
+        // Produce a real synthetic netlink reply after enrollment; eventfd stays empty.
+        let mut header = [0u8; 16];
+        header[0..4].copy_from_slice(&16u32.to_le_bytes());
+        header[4..6].copy_from_slice(&18u16.to_le_bytes());
+        header[6..8].copy_from_slice(&0x301u16.to_le_bytes());
+        header[8..12].copy_from_slice(&1u32.to_le_bytes());
+        memory.write_bytes(0x4100, &header).unwrap();
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(206, SyscallArgs([nlfd as u64, 0x4100, 16, 0, 0, 0])),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap()
+            ),
+            16
+        );
+
+        struct ThreadWake(std::thread::Thread);
+        impl std::task::Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(service.event(token));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            if let Poll::Ready(event) = future.as_mut().poll(&mut cx) {
+                break Some(event);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            std::thread::park_timeout(remaining);
+        };
+        if event.is_none() {
+            let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+            let observed = dispatcher
+                .dispatch(&context, req, &mut memory, &reporter)
+                .unwrap();
+            panic!(
+                "real mixed ppoll lost synthetic producer wake; fresh logical recheck={observed:?}"
+            );
+        }
+        let event = event.unwrap().expect("real producer wake");
+        assert_eq!(event, ContinuationEvent::Ready);
+        assert_eq!(
+            continuation.resume(event, &context).unwrap().completion,
+            ContinuationCompletion::Redispatch
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, req, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 1 }
+        );
+    }
+
+    #[test]
+    fn controller_nested_epoll_real_service_wake() {
+        use carrick_guest_mem::GuestMemory;
+        use std::future::Future;
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let kernel = Arc::clone(context.kernel());
+        let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        fn returned(outcome: DispatchOutcome) -> i64 {
+            match outcome {
+                DispatchOutcome::Returned { value } => value,
+                other => panic!("fixture syscall: {other:?}"),
+            }
+        }
+        let efd = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(19, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let inner = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(20, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let outer = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(20, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        // inner epoll watches efd (EPOLLIN, data=101)
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&(carrick_abi::LINUX_EPOLLIN as u32).to_le_bytes());
+        ev[8..16].copy_from_slice(&101u64.to_le_bytes());
+        memory.write_bytes(0x4000, &ev).unwrap();
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(
+                            21,
+                            SyscallArgs([
+                                inner as u64,
+                                carrick_abi::LINUX_EPOLL_CTL_ADD as u64,
+                                efd as u64,
+                                0x4000,
+                                0,
+                                0
+                            ])
+                        ),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap()
+            ),
+            0
+        );
+        // outer epoll watches inner (EPOLLIN, data=202)
+        ev[8..16].copy_from_slice(&202u64.to_le_bytes());
+        memory.write_bytes(0x4020, &ev).unwrap();
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(
+                            21,
+                            SyscallArgs([
+                                outer as u64,
+                                carrick_abi::LINUX_EPOLL_CTL_ADD as u64,
+                                inner as u64,
+                                0x4020,
+                                0,
+                                0
+                            ])
+                        ),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap()
+            ),
+            0
+        );
+
+        // epoll_pwait on outer with no timeout (yields continuation)
+        let req = SyscallRequest::new(22, SyscallArgs([outer as u64, 0x4040, 1, !0u64, 0, 0]));
+        let outcome = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+        assert!(
+            matches!(&outcome, DispatchOutcome::WaitOnPollFds { .. }),
+            "nested epoll wait must yield: {outcome:?}"
+        );
+        let generation = publish(&context, 0x983);
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("actual nested epoll continuation");
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let mut registration = service.prepare_registration(&continuation);
+        service
+            .enroll(&mut registration)
+            .expect("enroll nested epoll");
+        let token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach nested epoll registration");
+
+        // Write 1 to efd
+        memory.write_bytes(0x4100, &1u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(64, SyscallArgs([efd as u64, 0x4100, 8, 0, 0, 0])),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap()
+            ),
+            8
+        );
+
+        struct ThreadWake(std::thread::Thread);
+        impl std::task::Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(service.event(token));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            if let Poll::Ready(event) = future.as_mut().poll(&mut cx) {
+                break Some(event);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            std::thread::park_timeout(remaining);
+        };
+        if event.is_none() {
+            let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+            let observed = dispatcher
+                .dispatch(&context, req, &mut memory, &reporter)
+                .unwrap();
+            panic!("nested epoll lost synthetic producer wake; fresh logical recheck={observed:?}");
+        }
+        let event = event.unwrap().expect("nested epoll wake");
+        assert_eq!(event, ContinuationEvent::Ready);
+        assert_eq!(
+            continuation.resume(event, &context).unwrap().completion,
+            ContinuationCompletion::Redispatch
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, req, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 1 }
+        );
+    }
+
+    #[test]
+    fn controller_carrier_wait_service_cancellation_and_retirement() {
+        use carrick_guest_mem::GuestMemory;
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let kernel = Arc::clone(context.kernel());
+        let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        fn returned(outcome: DispatchOutcome) -> i64 {
+            match outcome {
+                DispatchOutcome::Returned { value } => value,
+                other => panic!("fixture syscall: {other:?}"),
+            }
+        }
+        let efd = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(19, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let files = context.resources().files();
+        let slot = crate::kernel::FileSlotNumber::for_open_fd(efd as i32).unwrap();
+        let slot_authority = files.capture_slot_or_stdio_authority(slot).unwrap();
+        let efd_desc = files.resolve_slot_authority(slot_authority).unwrap();
+        let efd_wq = efd_desc.wait_queue().unwrap();
+        assert_eq!(efd_wq.callback_count(), 0, "initial callback count is 0");
+
+        let mut pollfds = [0u8; 8];
+        pollfds[0..4].copy_from_slice(&(efd as i32).to_le_bytes());
+        pollfds[4..6].copy_from_slice(&1i16.to_le_bytes());
+        memory.write_bytes(0x4000, &pollfds).unwrap();
+        let req = SyscallRequest::new(73, SyscallArgs([0x4000, 1, 0, 0, 0, 0]));
+        let outcome = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+        assert!(matches!(
+            &outcome,
+            DispatchOutcome::WaitOnFds { .. } | DispatchOutcome::WaitOnPollFds { .. }
+        ));
+
+        let generation = publish(&context, 0x984);
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("continuation");
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).expect("enroll");
+        let token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach");
+
+        // While enrolled, wait_queue has 1 callback
+        assert_eq!(efd_wq.callback_count(), 1, "callback enrolled while active");
+
+        // Cancel continuation
+        let receipt = continuation.cancel(CancellationCause::ThreadExit);
+        assert_eq!(receipt.cleanup_count(), 1);
+
+        // After cancellation, callback is immediately removed
+        assert_eq!(
+            efd_wq.callback_count(),
+            0,
+            "callback removed upon cancellation"
+        );
+
+        // A producer write after cancellation must NOT publish to cancelled token
+        let publish_receipt = service.publish_ready(token);
+        assert!(
+            !publish_receipt.accepted(),
+            "publication to cancelled token must be rejected"
+        );
+
+        // Close efd and reinstall another descriptor at the same slot
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(57, SyscallArgs([efd as u64, 0, 0, 0, 0, 0])),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap()
+            ),
+            0
+        );
+        let new_efd = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(19, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        assert_eq!(new_efd, efd, "reused fd slot");
+
+        // Write to new descriptor
+        memory.write_bytes(0x4100, &5u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(64, SyscallArgs([new_efd as u64, 0x4100, 8, 0, 0, 0])),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap()
+            ),
+            8
+        );
+        // Stale token still rejected
+        assert!(
+            !service.publish_ready(token).accepted(),
+            "stale token publication rejected after slot reuse"
+        );
+    }
+
+    #[test]
+    fn controller_in_flight_callback_rejected_on_retired_or_recycled_registration() {
+        use carrick_guest_mem::GuestMemory;
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let kernel = Arc::clone(context.kernel());
+        let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        fn returned(outcome: DispatchOutcome) -> i64 {
+            match outcome {
+                DispatchOutcome::Returned { value } => value,
+                other => panic!("fixture syscall: {other:?}"),
+            }
+        }
+        let efd = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(19, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let mut pollfds = [0u8; 8];
+        pollfds[0..4].copy_from_slice(&(efd as i32).to_le_bytes());
+        pollfds[4..6].copy_from_slice(&1i16.to_le_bytes());
+        memory.write_bytes(0x4000, &pollfds).unwrap();
+        let req = SyscallRequest::new(73, SyscallArgs([0x4000, 1, 0, 0, 0, 0]));
+        let outcome = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+
+        let generation = publish(&context, 0x985);
+        let mut continuation1 = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("continuation1");
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let mut registration1 = service.prepare_registration(&continuation1);
+        service.enroll(&mut registration1).expect("enroll1");
+        let token1 = registration1.wake_token();
+        continuation1
+            .attach_registration(registration1)
+            .expect("attach1");
+
+        let files = context.resources().files();
+        let slot = crate::kernel::FileSlotNumber::for_open_fd(efd as i32).unwrap();
+        let authority = files.capture_slot_or_stdio_authority(slot).unwrap();
+        let description = files.resolve_slot_authority(authority).unwrap();
+        let callbacks = description
+            .wait_queue()
+            .unwrap()
+            .controller_callback_snapshot();
+        assert_eq!(
+            callbacks.len(),
+            1,
+            "capture the actual installed service closure"
+        );
+
+        // Simulate wake event on continuation1 and resume (consuming it)
+        let receipt1 = service.publish_ready(token1);
+        assert!(receipt1.accepted(), "first publish accepted");
+        let outcome1 = continuation1
+            .resume(ContinuationEvent::Ready, &context)
+            .unwrap();
+        assert_eq!(outcome1.completion, ContinuationCompletion::Redispatch);
+
+        // Now token1 is completely retired and consumed.
+        // Any in-flight callback for token1 must be rejected:
+        let in_flight_receipt = service.publish_ready(token1);
+        assert!(
+            !in_flight_receipt.accepted(),
+            "in-flight callback on consumed registration must be rejected"
+        );
+
+        // Now create continuation2 on the same thread/slot with a fresh registration generation
+        let outcome_fresh = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+        let mut continuation2 = BlockedContinuation::from_dispatch_outcome(
+            outcome_fresh,
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("continuation2");
+        let mut registration2 = service.prepare_registration(&continuation2);
+        service.enroll(&mut registration2).expect("enroll2");
+        let token2 = registration2.wake_token();
+        assert_ne!(
+            token1, token2,
+            "new registration has distinct monotonic token"
+        );
+        continuation2
+            .attach_registration(registration2)
+            .expect("attach2");
+
+        // Stale in-flight callback for token1 must NOT wake token2
+        let stale_receipt = service.publish_ready(token1);
+        assert!(
+            !stale_receipt.accepted(),
+            "stale token1 publication rejected even after new registration token2 exists"
+        );
+
+        assert!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token2.continuation)
+                .unwrap()
+                .event
+                .is_none(),
+            "new registration starts without a queued event"
+        );
+        // Invoke the actual producer closure captured before retirement, not publish_ready directly.
+        callbacks[0](0);
+        assert!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token2.continuation)
+                .unwrap()
+                .event
+                .is_none(),
+            "retired producer closure must not queue an event for the new registration"
+        );
+
+        // Proper token2 publication succeeds
+        let valid_receipt = service.publish_ready(token2);
+        assert!(
+            valid_receipt.accepted(),
+            "valid token2 publication accepted"
+        );
+        let outcome2 = continuation2
+            .resume(ContinuationEvent::Ready, &context)
+            .unwrap();
+        assert_eq!(outcome2.completion, ContinuationCompletion::Redispatch);
+    }
+
+    #[test]
+    fn controller_nested_epoll_5_levels_deep_real_service_wake() {
+        use carrick_guest_mem::GuestMemory;
+        use std::future::Future;
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let kernel = Arc::clone(context.kernel());
+        let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 8192]);
+        let reporter = crate::compat::CompatReporter::default();
+        fn returned(outcome: DispatchOutcome) -> i64 {
+            match outcome {
+                DispatchOutcome::Returned { value } => value,
+                other => panic!("fixture syscall: {other:?}"),
+            }
+        }
+        let efd = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(19, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let ep1 = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(20, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let ep2 = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(20, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let ep3 = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(20, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let ep4 = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(20, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let ep5 = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(20, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+        let ep6 = returned(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(20, SyscallArgs([0; 6])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+        );
+
+        let mut add = |dispatcher: &mut crate::dispatch::SyscallDispatcher,
+                       ep: i64,
+                       target: i64,
+                       data: u64,
+                       addr: u64| {
+            let mut ev = [0u8; 16];
+            ev[0..4].copy_from_slice(&(carrick_abi::LINUX_EPOLLIN as u32).to_le_bytes());
+            ev[8..16].copy_from_slice(&data.to_le_bytes());
+            memory.write_bytes(addr, &ev).unwrap();
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        21,
+                        SyscallArgs([
+                            ep as u64,
+                            carrick_abi::LINUX_EPOLL_CTL_ADD as u64,
+                            target as u64,
+                            addr,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap()
+        };
+
+        // ep1 watches efd
+        assert_eq!(returned(add(&mut dispatcher, ep1, efd, 101, 0x4000)), 0);
+        // ep2 watches ep1
+        assert_eq!(returned(add(&mut dispatcher, ep2, ep1, 202, 0x4020)), 0);
+        // ep3 watches ep2
+        assert_eq!(returned(add(&mut dispatcher, ep3, ep2, 303, 0x4040)), 0);
+        // ep4 watches ep3
+        assert_eq!(returned(add(&mut dispatcher, ep4, ep3, 404, 0x4060)), 0);
+        // ep5 watches ep4 (depth 5)
+        assert_eq!(returned(add(&mut dispatcher, ep5, ep4, 505, 0x4080)), 0);
+
+        // 6th level ep6 watches ep5 -> must be rejected with ELOOP (exceeds max nesting depth of 5)
+        let eloop_outcome = add(&mut dispatcher, ep6, ep5, 606, 0x40A0);
+        assert!(
+            matches!(eloop_outcome, DispatchOutcome::Errno { errno } if errno == carrick_abi::LINUX_ELOOP),
+            "6th nesting level must be rejected with ELOOP: {eloop_outcome:?}"
+        );
+
+        // epoll_pwait on outermost admitted epoll (ep5) with no timeout
+        let req = SyscallRequest::new(22, SyscallArgs([ep5 as u64, 0x4100, 1, !0u64, 0, 0]));
+        let outcome = dispatcher
+            .dispatch(&context, req, &mut memory, &reporter)
+            .unwrap();
+        assert!(
+            matches!(&outcome, DispatchOutcome::WaitOnPollFds { .. }),
+            "nested 5-level epoll wait must yield: {outcome:?}"
+        );
+        let generation = publish(&context, 0x986);
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("actual 5-level nested epoll continuation");
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+        let mut registration = service.prepare_registration(&continuation);
+        service
+            .enroll(&mut registration)
+            .expect("enroll 5-level nested epoll");
+        let token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach 5-level nested epoll registration");
+
+        // Write 1 to leaf efd
+        memory.write_bytes(0x4200, &1u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(64, SyscallArgs([efd as u64, 0x4200, 8, 0, 0, 0])),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap()
+            ),
+            8
+        );
+
+        struct ThreadWake(std::thread::Thread);
+        impl std::task::Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(service.event(token));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            if let Poll::Ready(event) = future.as_mut().poll(&mut cx) {
+                break Some(event);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            std::thread::park_timeout(remaining);
+        };
+        if event.is_none() {
+            let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+            let observed = dispatcher
+                .dispatch(&context, req, &mut memory, &reporter)
+                .unwrap();
+            panic!(
+                "5-level nested epoll lost synthetic producer wake; fresh logical recheck={observed:?}"
+            );
+        }
+        let event = event.unwrap().expect("5-level nested epoll wake");
+        assert_eq!(event, ContinuationEvent::Ready);
+        assert_eq!(
+            continuation.resume(event, &context).unwrap().completion,
+            ContinuationCompletion::Redispatch
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, req, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        let out_bytes = memory.read_bytes(0x4100, 16).unwrap();
+        let out_event =
+            <carrick_abi::LinuxEpollEvent as zerocopy::FromBytes>::read_from_bytes(&out_bytes)
+                .unwrap();
+        let events = out_event.events;
+        let data = out_event.data;
+        assert_eq!(
+            events & (carrick_abi::LINUX_EPOLLIN as u32),
+            carrick_abi::LINUX_EPOLLIN as u32
+        );
+        assert_eq!(data, 505);
     }
 }

@@ -204,12 +204,19 @@ pub const HVPBLOCK_ARGS: u8 = 49;
 /// `RunnableThread`'s `Drop` released a live claim, which leaves the thread in
 /// whatever state `begin_switch_out` last published and its process job
 /// unpublished forever. The trailing state names the exact
-/// `ThreadExecutionState` the strand froze at.
 pub const HVPSETTLE: u8 = 50;
+/// Multiplex owner registration established. `a` is owner description ID, `b` target description ID, `c` registration fd.
+pub const EPOWNER: u8 = 51;
+/// Multiplex wake published across description hierarchy. `a` is owner description ID, `b` source description ID, `c` propagation depth.
+pub const EPWAKE: u8 = 52;
+/// Multiplex / IO edge consumption. `a` is guest fd, `b` io generation, `c` cleared readiness bits.
+pub const EPCMSUM: u8 = 53;
+/// Multiplex registration retired / unlinked. `a` is owner fd / desc ID, `b` guest fd, `c` registration generation.
+pub const EPRETIRE: u8 = 54;
 /// Linux syslog(2) operation recorded for diagnostics. `a` is action type and owner,
 /// `b` is requested buffer length, and `c` is the return value / errno / seq.
 pub const SYSLOG_OP: u8 = 55;
-/// Linux syslog(2) record publication. `a` is owner, `b` is sequence number,
+/// Linux syslog(2) record publication. `a` is owner, `b` sequence number,
 /// and `c` is the ring total stored bytes.
 pub const SYSLOG_RECORD: u8 = 56;
 /// Linux syslog(2) reader cursor and state. `a` is owner, `b` encodes read and clear seq,
@@ -589,7 +596,7 @@ pub enum RingReadError {
 }
 
 const fn known_kind(kind: u8) -> bool {
-    kind >= BIND && kind <= HVPSETTLE
+    kind >= BIND && kind <= EPRETIRE
 }
 
 fn read_slot_after(
@@ -1033,6 +1040,10 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
             "HVPBLOCKARGS tid={c} arg1={:#x} arg2={}",
             a as u32, b as u32
         ),
+        EPOWNER => format!("EPOWNER  owner={a} target={b} reg_fd={c}"),
+        EPWAKE => format!("EPWAKE   owner={a} source={b} depth={c}"),
+        EPCMSUM => format!("EPCMSUM  gfd={a} io_gen={b} cleared={:#x}", c as u32),
+        EPRETIRE => format!("EPRETIRE epfd={a} gfd={b} reg_gen={}", c as u32),
         SYSLOG_OP => format!(
             "SYSLOG owner={} action={} len={} retval={}",
             (a as u32) >> 16,

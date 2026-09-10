@@ -131,6 +131,7 @@ pub(super) struct EpollInterest {
     /// require its `reg_gen` to match, so a stale event for a recycled fd is
     /// rejected instead of mis-delivered. (epoll_et_pipe_eof_not_lost.)
     pub(super) reg_gen: u32,
+    pub(super) _callback_enrollment: Option<Arc<crate::kernel::WaitCallbackEnrollment>>,
 }
 
 #[derive(Debug)]
@@ -1069,6 +1070,9 @@ pub(super) enum OpenDescription {
         /// process-wide in-memory broadcast (`notify_inmem_epoll`) firing this
         /// kqueue's `EVFILT_USER(0)`. See `docs/archive/epoll-kqueue-plan.md`.
         kqueue: Arc<EpollKqueue>,
+        /// Wait queue embedded in this epoll instance so that waiters (via poll/ppoll WaitSet)
+        /// and nested parent epoll instances are notified when any registered target becomes ready.
+        wait_queue: Arc<crate::kernel::WaitQueue>,
     },
     /// A Linux pidfd referring to a process. Mirrored-process backends watch a
     /// host process through `EVFILT_PROC`/native pidfd. HvPatch instead arms an
@@ -1246,6 +1250,8 @@ pub(super) enum OpenDescription {
         groups: u32,
         /// Bytes queued by a dump request, drained by recvmsg/recvfrom.
         recv_queue: VecDeque<u8>,
+        /// Wait queue for synthetic Netlink readiness events.
+        wait_queue: Arc<crate::kernel::WaitQueue>,
     },
     /// A POSIX message-queue descriptor (`mq_open(3)`). macOS has no POSIX
     /// mqueue, so carrick emulates it on a real host file under
@@ -1434,6 +1440,8 @@ impl OpenDescription {
             Self::EventFd { state, .. } => Some(Arc::clone(&state.wait_queue)),
             Self::TimerFd { state, .. } => Some(Arc::clone(&state.wait_queue)),
             Self::InMemorySocket { socket, .. } => Some(Arc::clone(&socket.wait_queue)),
+            Self::Epoll { wait_queue, .. } => Some(Arc::clone(wait_queue)),
+            Self::Netlink { wait_queue, .. } => Some(Arc::clone(wait_queue)),
             _ => None,
         }
     }
@@ -1767,56 +1775,76 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 kqueue,
                 ..
             } => {
-                let mut ready = LinuxEpollEvents::empty();
-                if interest.contains(LinuxEpollEvents::IN) {
-                    if !pending_ready.is_empty() {
-                        ready |= LinuxEpollEvents::IN;
-                    } else {
-                        let mut pfd = libc::pollfd {
-                            fd: kqueue.poll_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                        if rc > 0
-                            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
-                        {
-                            ready |= LinuxEpollEvents::IN;
-                        } else if *synthetic_interest_count != 0 {
-                            // Snapshot synthetic child registrations under the lock so we don't
-                            // hold the parent description lock while recursively checking child readiness!
-                            let synthetic_children: Vec<(
-                                std::sync::Arc<crate::kernel::FileDescription>,
-                                LinuxEpollEvents,
-                            )> = epoll_interest
-                                .values()
-                                .filter_map(|reg| {
-                                    let target = reg.target.as_ref()?;
-                                    if !reg.host_poll_source {
-                                        Some((
-                                            std::sync::Arc::clone(target),
-                                            LinuxEpollEvents::from_bits_retain(reg.event.events),
-                                        ))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            drop(open);
-                            let synthetic_child_ready =
-                                synthetic_children
-                                    .into_iter()
-                                    .any(|(target, child_interest)| {
-                                        !cx.description_readiness(&target, child_interest)
-                                            .is_empty()
-                                    });
-                            if synthetic_child_ready {
-                                ready |= LinuxEpollEvents::IN;
+                if !interest.intersects(
+                    LinuxEpollEvents::IN | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP,
+                ) {
+                    return LinuxEpollEvents::empty();
+                }
+                if !pending_ready.is_empty() {
+                    return LinuxEpollEvents::IN
+                        & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP);
+                }
+                if epoll_interest.is_empty() {
+                    return LinuxEpollEvents::empty();
+                }
+                let mut pfd = libc::pollfd {
+                    fd: kqueue.poll_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                let kq_ready =
+                    rc > 0 && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+                if !kq_ready && *synthetic_interest_count == 0 {
+                    return LinuxEpollEvents::empty();
+                }
+
+                // Snapshot registrations under the lock so we don't hold the parent description
+                // lock while recursively querying child readiness.
+                let snapshot: Vec<(Arc<crate::kernel::FileDescription>, u32, u32, bool)> =
+                    epoll_interest
+                        .values()
+                        .filter_map(|reg| {
+                            let req_events = reg.event.events;
+                            if req_events == 0 {
+                                return None;
                             }
-                            return ready
-                                & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP);
-                        }
+                            if !kq_ready && reg.host_poll_source {
+                                return None;
+                            }
+                            let target = reg.target.as_ref()?;
+                            Some((
+                                Arc::clone(target),
+                                req_events,
+                                reg.last_ready,
+                                reg.host_poll_source,
+                            ))
+                        })
+                        .collect();
+                drop(open);
+
+                let mut has_ready = false;
+                for (target, req_events, last_ready, _host_source) in snapshot {
+                    let child_interest = LinuxEpollEvents::from_bits_retain(req_events);
+                    let child_ready = cx.description_readiness(&target, child_interest);
+                    let raw_bits = child_ready.bits();
+                    if raw_bits == 0 {
+                        continue;
                     }
+                    let deliverable = if child_interest.contains(LinuxEpollEvents::ET) {
+                        (raw_bits & !last_ready) != 0
+                            || child_ready.intersects(LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
+                    } else {
+                        true
+                    };
+                    if deliverable {
+                        has_ready = true;
+                        break;
+                    }
+                }
+                let mut ready = LinuxEpollEvents::empty();
+                if has_ready {
+                    ready |= LinuxEpollEvents::IN;
                 }
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }

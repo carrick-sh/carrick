@@ -602,6 +602,10 @@ _EVENTRING_KINDS = {
         lambda a, b, c: f"tid={c} arg1={a & 0xffffffff:#x} arg2={b & 0xffffffff}",
     ),
     50: ("HVPSETTLE", lambda a, b, c: f"tid={a} gen={b} step={c}"),
+    51: ("EPOWNER", lambda a, b, c: f"owner={a} target={b} reg_fd={c}"),
+    52: ("EPWAKE", lambda a, b, c: f"owner={a} source={b} depth={c}"),
+    53: ("EPCMSUM", lambda a, b, c: f"gfd={a} io_gen={b} cleared={c & 0xffffffff:#x}"),
+    54: ("EPRETIRE", lambda a, b, c: f"epfd={a} gfd={b} reg_gen={c & 0xffffffff}"),
     55: (
         "SYSLOG",
         lambda a, b, c: (
