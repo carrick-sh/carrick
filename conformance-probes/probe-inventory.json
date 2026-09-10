@@ -2319,6 +2319,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "statfslifetime": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "streamdestmatrix": {
     "class": "conformance",
     "excluded": false,
