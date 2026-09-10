@@ -268,6 +268,21 @@ This receipt closes populations and lifecycle only. `MmToken` plus structural
 `CurrentMm`/`ForeignMm` authority and the mintable page-table/host-alias lock
 order remain open; the full runtime abstraction audit is not complete here.
 
+### Line-pinned inventories and file moves (`--rehome`)
+
+When decomposing monolith files into submodules by pure code moves, line-pinned
+inventories (`runtime-aborts`, `host-authority-transition-inventory.json`,
+`dispatch-lock-authority.json`, and the K1 taxonomy) must follow functions across
+files without losing human review classifications or permitting unreviewed drift.
+`just reconcile-inventories --rehome` matches reviewed rows to their moved
+counterparts across files when exactly one site elsewhere matches identity:
+same function (module-path-insensitive), ordinal, and fingerprint for runtime aborts;
+same catalog ID, operation, and enclosing function for host authority;
+same item, category, expression, and ordinal for dispatch locks; and
+same categories, text, scope kind, and enclosing function for K1 taxonomy.
+Ambiguities (1:N or N:1) or vanished/edited sites are refused, ensuring reviewed
+rationales are preserved without laundering unreviewed additions.
+
 ### 5. Lock order made structural
 
 The page-table pause and the host-alias phase must be taken in one order. The
