@@ -4,6 +4,32 @@ rules:
   # ERROR severity: the typed replacements exist, so a new raw instance is a
   # regression of the baseline, not a style nit.
 
+  # Direct DispatchOutcome::Returned construction with a raw cast risks
+  # truncation or negative overflow into the Linux errno range. Handlers
+  # must use the typed constructors in `dispatch::retval` instead.
+  - id: carrick-no-raw-returned-as-i64
+    languages: [rust]
+    severity: ERROR
+    message: |
+      Constructing `DispatchOutcome::Returned { value: ... as i64 }` directly
+      risks silent truncation or overflow into the Linux errno range. Use the
+      typed return constructors in `dispatch::retval` (e.g. `returned_len`,
+      `returned_u64`, `returned_i32`, `returned_fd`, `returned_offset`).
+    paths:
+      include:
+        - "crates/carrick-runtime/src/dispatch/**"
+      exclude:
+        - "crates/carrick-runtime/src/dispatch/retval.rs"
+        - "crates/carrick-runtime/src/dispatch/mod.rs" # pending migration in task T4a
+        - "**/tests/**"
+        - "**/*_test.rs"
+        - "**/test_*.rs"
+        - "**/tests.rs"
+    patterns:
+      - pattern-either:
+          - pattern: "DispatchOutcome::Returned { value: $X as i64 }"
+          - pattern: "Returned { value: $X as i64 }"
+
   # rt_sigtimedwait wedged forever because a wait SET was complemented into a
   # block MASK (`!wait_set`). SigSet/SigBlockMask now make that unrepresentable;
   # a fresh raw complement of a wait-set is the old bug reappearing.

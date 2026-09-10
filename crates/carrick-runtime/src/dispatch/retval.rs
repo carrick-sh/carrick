@@ -5,7 +5,7 @@
 //! positive counts or pointers above `i64::MAX` to be misread as Linux errnos.
 //! These constructors enforce checked domain conversions.
 
-use carrick_abi::{LINUX_EOVERFLOW, LinuxErrno};
+use carrick_abi::{LINUX_EINVAL, LINUX_EOVERFLOW, LinuxErrno};
 
 use super::{DispatchOutcome, Fd, GuestPtr};
 
@@ -88,6 +88,50 @@ impl DispatchOutcome {
     #[inline]
     pub fn returned_raw_u64(val: u64) -> Self {
         Self::Returned { value: val as i64 }
+    }
+
+    /// Return a file offset (e.g. from `lseek`).
+    ///
+    /// Fails with `LINUX_EINVAL` if the offset is negative.
+    #[inline]
+    pub fn returned_offset(off: i64) -> Result<Self, LinuxErrno> {
+        if off < 0 {
+            return Err(LINUX_EINVAL);
+        }
+        Ok(Self::Returned { value: off })
+    }
+
+    /// Return an infallible `DispatchOutcome` from a file offset, converting a
+    /// negative offset to `LINUX_EINVAL`. Useful in functions returning
+    /// `DispatchOutcome` directly rather than `Result<DispatchOutcome, _>`.
+    #[inline]
+    pub fn returned_offset_or_errno(off: i64) -> Self {
+        match Self::returned_offset(off) {
+            Ok(outcome) => outcome,
+            Err(errno) => Self::errno(errno),
+        }
+    }
+
+    /// Return a signed length or byte count (e.g. from `libc::readv`, `libc::pread`, `libc::pwrite`).
+    ///
+    /// Fails with `LINUX_EINVAL` if negative, or `LINUX_EOVERFLOW` if it exceeds `i64::MAX`.
+    #[inline]
+    pub fn returned_isize(val: isize) -> Result<Self, LinuxErrno> {
+        if val < 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let value = i64::try_from(val).map_err(|_| LINUX_EOVERFLOW)?;
+        Ok(Self::Returned { value })
+    }
+
+    /// Return an infallible `DispatchOutcome` from an `isize`, converting an error
+    /// (negative -> `LINUX_EINVAL`, overflow -> `LINUX_EOVERFLOW`) to errno.
+    #[inline]
+    pub fn returned_isize_or_errno(val: isize) -> Self {
+        match Self::returned_isize(val) {
+            Ok(outcome) => outcome,
+            Err(errno) => Self::errno(errno),
+        }
     }
 }
 
@@ -214,6 +258,44 @@ mod tests {
             DispatchOutcome::Returned {
                 value: -9223372036854775808
             }
+        );
+    }
+
+    #[test]
+    fn returned_offset_validation() {
+        assert_eq!(DispatchOutcome::returned_offset(-1), Err(LINUX_EINVAL));
+        assert_eq!(
+            DispatchOutcome::returned_offset(1024),
+            Ok(DispatchOutcome::Returned { value: 1024 })
+        );
+        assert_eq!(
+            DispatchOutcome::returned_offset_or_errno(-5),
+            DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            }
+        );
+        assert_eq!(
+            DispatchOutcome::returned_offset_or_errno(0),
+            DispatchOutcome::Returned { value: 0 }
+        );
+    }
+
+    #[test]
+    fn returned_isize_validation() {
+        assert_eq!(DispatchOutcome::returned_isize(-1), Err(LINUX_EINVAL));
+        assert_eq!(
+            DispatchOutcome::returned_isize(42),
+            Ok(DispatchOutcome::Returned { value: 42 })
+        );
+        assert_eq!(
+            DispatchOutcome::returned_isize_or_errno(-1),
+            DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            }
+        );
+        assert_eq!(
+            DispatchOutcome::returned_isize_or_errno(100),
+            DispatchOutcome::Returned { value: 100 }
         );
     }
 }

@@ -219,9 +219,7 @@ pub(crate) fn read_pipe<M: CurrentMmMemory>(
         if memory.write_bytes(address, &bytes).is_err() {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
-        return DispatchOutcome::Returned {
-            value: read_len as i64,
-        };
+        return DispatchOutcome::returned_len_or_errno(read_len);
     }
     if state.writers == 0 {
         // EOF: all writers closed and buffer empty
@@ -513,9 +511,7 @@ pub(crate) fn write_pipe(
     if written == 0 {
         DispatchOutcome::errno(LINUX_EINTR)
     } else {
-        DispatchOutcome::Returned {
-            value: written as i64,
-        }
+        DispatchOutcome::returned_len_or_errno(written)
     }
 }
 
@@ -548,12 +544,7 @@ mod tests {
             WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
             || false,
         );
-        assert_eq!(
-            out,
-            DispatchOutcome::Returned {
-                value: data.len() as i64
-            }
-        );
+        assert_eq!(out, DispatchOutcome::returned_len_or_errno(data.len()));
 
         let mut buf = vec![0u8; data.len()];
         let read_n = read_pipe_bytes(&mut buf, &pipe, 0, tid).expect("read");
@@ -571,9 +562,7 @@ mod tests {
         assert!(write_readiness_is_signaled(&pipe));
         assert_eq!(
             write_pipe(&payload, &pipe, LINUX_O_NONBLOCK, 4, authority, || false),
-            DispatchOutcome::Returned {
-                value: PIPE_BUF as i64
-            }
+            DispatchOutcome::returned_len_or_errno(PIPE_BUF)
         );
         assert!(!write_readiness_is_signaled(&pipe));
 
