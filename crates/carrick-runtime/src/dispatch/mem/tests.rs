@@ -10063,6 +10063,7 @@ fn large_vma_mmap_reserve_fresh_error_rollback() {
     // - reserve_fresh(base, len) succeeds and publishes pristine deferred range.
     // - commit_mmap_locked_range -> populate_resident_range -> protect_range(base, len, RW) fails.
     // - The rollback path executes mark_range_unmapped and deferred_anonymous.retire.
+    let protect_calls_before = memory.protect_calls.get();
     let fail_outcome = dispatcher
         .dispatch(
             &context,
@@ -10089,6 +10090,18 @@ fn large_vma_mmap_reserve_fresh_error_rollback() {
         fail_outcome,
         DispatchOutcome::errno(carrick_abi::LINUX_ENOMEM),
         "populate_resident_range error must return LINUX_ENOMEM"
+    );
+    assert!(
+        memory.protect_calls.get() > protect_calls_before,
+        "protect_range must be invoked during commit_mmap_locked_range populate"
+    );
+    assert!(
+        memory
+            .protect_log
+            .borrow()
+            .iter()
+            .any(|&(addr, len, prot)| addr == base && len == LINUX_PAGE_SIZE as usize && prot != 0),
+        "failed reservation must have attempted non-zero protection publication during commit_mmap_locked_range"
     );
 
     // Verify complete rollback of deferred anonymous interval, locked ranges, and metadata.

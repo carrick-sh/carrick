@@ -1311,6 +1311,51 @@ mod tests {
         bytes[vaddr..vaddr + 8].copy_from_slice(&0x1800_u64.to_le_bytes());
         assert!(validate_serialized_core(&bytes, 2, 10).is_err());
     }
+
+    #[test]
+    fn large_sparse_vma_core_dump_emits_sparse_pt_load_without_memory_amplification() {
+        let page = [0x42_u8; GUEST_PAGE];
+        let sparse_64gib = 64 * 1024 * 1024 * 1024_u64;
+        let sparse_16tib = 16 * 1024 * 1024 * 1024 * 1024_u64;
+
+        let regions = vec![
+            // Populated stack page
+            MemoryRegion {
+                start: 0x0000_7fff_0000_0000,
+                flags: region_flags(true, true, false),
+                bytes: &page,
+                size: GUEST_PAGE as u64,
+            },
+            // Unpopulated 64 GiB sparse VMA (filesz = 0, memsz = 64 GiB)
+            MemoryRegion {
+                start: 0x0000_1000_0000_0000,
+                flags: region_flags(true, true, false),
+                bytes: &[],
+                size: sparse_64gib,
+            },
+            // Unpopulated 16 TiB sparse VMA (filesz = 0, memsz = 16 TiB)
+            MemoryRegion {
+                start: 0x0000_2000_0000_0000,
+                flags: region_flags(true, true, false),
+                bytes: &[],
+                size: sparse_16tib,
+            },
+        ];
+
+        let mut dump = sample();
+        dump.regions = regions;
+
+        let bytes = dump
+            .to_bytes_bounded(u64::MAX)
+            .expect("large sparse core must serialize");
+
+        // The serialized ELF artifact must remain small (only header, notes, and the 1 populated page).
+        assert!(
+            bytes.len() < 32 * 1024,
+            "core dump containing large sparse VMAs must not amplify byte size (len={})",
+            bytes.len()
+        );
+    }
 }
 
 #[cfg(test)]

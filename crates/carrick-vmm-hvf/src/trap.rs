@@ -40410,7 +40410,9 @@ impl HvfVmState {
         let requested_end = va
             .checked_add(len as u64)
             .ok_or_else(|| TrapError::Hypervisor("sparse mmap range overflow".to_owned()))?;
-        if va < arena_start || requested_end > arena_end {
+        let in_low_arena = va >= arena_start && requested_end <= arena_end;
+        let in_high_va = crate::memory::is_high_va(va) && requested_end <= (1u64 << 48);
+        if !in_low_arena && !in_high_va {
             return Ok(());
         }
         if let Some(state) = self.deferred_anonymous_state()
@@ -40484,10 +40486,16 @@ impl HvfVmState {
                         return Ok(());
                     }
                 } else {
+                    let range_end_limit = if in_high_va { 1u64 << 48 } else { arena_end };
+                    let range_start_limit = if in_high_va {
+                        crate::memory::LINUX_HIGH_VA_THRESHOLD
+                    } else {
+                        arena_start
+                    };
                     let w_end = align_up(current.saturating_add(1), w)?;
                     let next_2mb = align_down(current, TWO_MIB).saturating_add(TWO_MIB);
                     let vma_end = p_end;
-                    let mut window_end = vma_end.min(next_2mb).min(w_end).min(arena_end);
+                    let mut window_end = vma_end.min(next_2mb).min(w_end).min(range_end_limit);
                     window_end = window_end.max(end);
 
                     // Sorted by construction (`TaskMappingIndex`), so this
@@ -40520,7 +40528,7 @@ impl HvfVmState {
 
                     let compound_start = align_down(current, COMPOUND);
                     let window_start = if compound_start >= p_start
-                        && compound_start >= arena_start
+                        && compound_start >= range_start_limit
                         && !alias_registry().lock().has_live_process_alias_overlapping(
                             compound_start,
                             current,
@@ -40644,11 +40652,13 @@ impl HvfVmState {
         let end = va
             .checked_add(len as u64)
             .ok_or_else(|| TrapError::Hypervisor("private file view range overflow".to_owned()))?;
+        let in_low_arena = va >= arena_start && end <= arena_end;
+        let in_high_va = crate::memory::is_high_va(va) && end <= (1u64 << 48);
         // A private mapping may be moved into the shared aperture. Its VA
         // does not decide ownership: the live alias/mapping checks below still
         // refuse shared or non-dynamic backing before any retirement.
-        let eligible_range = (va >= arena_start && end <= arena_end)
-            || crate::memory::va_in_shared_aperture(va, len as u64);
+        let eligible_range =
+            in_low_arena || in_high_va || crate::memory::va_in_shared_aperture(va, len as u64);
         if !eligible_range
             || !va.is_multiple_of(PAGE_SIZE)
             || !end.is_multiple_of(PAGE_SIZE)
