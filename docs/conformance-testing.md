@@ -445,3 +445,15 @@ failure loudly rather than degrading into a silent `HV_DENIED`.
 * [syscalls-emulation-map.md](syscalls-emulation-map.md) — the per-syscall
   support map behind `AARCH64_SYSCALLS`.
 * [../README.md](../README.md) — quickstart and the `just` recipe index.
+
+
+The `packetv3state` cached embed probe uses native-arm64 Linux with `CAP_NET_RAW`
+and loopback in an isolated network namespace (`docker run --network none
+--cap-add NET_RAW`). It sends a 64-byte private experimental EtherType `0x88b5`
+frame only on loopback. Its 33 observations cover TPACKET version negotiation,
+RX-ring mapping, duplicate descriptor lifetime, bounded block-level readiness,
+exact frame bytes and bounds, ownership return, and mapping lifetime after the
+last descriptor closes. No external network endpoint is involved. The initial
+native musl/GNU qualification and exact image/binary identities are recorded in
+`target/conformance/fix-forward-20260909/packet-v3-review/`. Missing packet socket
+privilege is a fixture error, never a reason to bless a skipped or failing oracle.
