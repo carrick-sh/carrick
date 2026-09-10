@@ -621,15 +621,36 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             }
-            if target_tid.is_none() {
-                if clock_id == crate::linux_abi::LINUX_CLOCK_THREAD_CPUTIME_ID {
+            // Thread-CPU clock timers (CLOCK_THREAD_CPUTIME_ID or dynamic per-thread
+            // clocks) measure CPU time consumed by a specific thread. When SIGEV_THREAD_ID
+            // targets a specific thread, Linux requires that the target be a live thread
+            // of the calling process (thread group). When unset, default target_tid to the
+            // clock's thread.
+            let is_thread_cpu_clock = clock_id
+                == crate::linux_abi::LINUX_CLOCK_THREAD_CPUTIME_ID
+                || matches!(
+                    super::dynamic_cpu_clock(clock_id),
+                    Some(super::DynamicCpuClock::PerThread)
+                );
+            if is_thread_cpu_clock {
+                if let Some(target) = target_tid {
+                    let is_live_member = crate::namespace::pid::guest_tid_to_kernel_for(cx.kernel, target)
+                        .and_then(|tid| crate::kernel::LinuxTid::from_abi_positive(tid).ok())
+                        .is_some_and(|kernel_tid| {
+                            cx.kernel
+                                .kernel()
+                                .live_keys_for_thread(Some(cx.kernel.task().key().id), kernel_tid)
+                                .is_some()
+                        });
+                    if !is_live_member {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                } else if clock_id == crate::linux_abi::LINUX_CLOCK_THREAD_CPUTIME_ID {
                     let tid = cx.kernel.thread().key().tid.raw();
                     if tid > 0 {
                         target_tid = Some(tid);
                     }
-                } else if let Some(super::DynamicCpuClock::PerThread) =
-                    super::dynamic_cpu_clock(clock_id)
-                {
+                } else {
                     let raw = clock_id as i32;
                     let encoded_tid = if raw < 0 { !(raw >> 3) } else { 0 };
                     let tid = if encoded_tid > 0 {

@@ -613,6 +613,55 @@ fn timer_create_rejects_thread_cpu_sigev_thread_id() {
 }
 
 #[test]
+fn timer_create_accepts_thread_cpu_sigev_thread_id_for_same_process_thread() {
+    const LINUX_SIGEV_THREAD_ID: i32 = 4;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let root_ctx = dispatcher.capture_one_task_context().unwrap();
+    let second_reg_id = test_tid(2);
+    let second_tid = dispatcher
+        .register_one_task_thread(&root_ctx, second_reg_id)
+        .unwrap();
+
+    let mut sev = [0u8; 64];
+    sev[8..12].copy_from_slice(&LINUX_SIGPROF.to_le_bytes());
+    sev[12..16].copy_from_slice(&LINUX_SIGEV_THREAD_ID.to_le_bytes());
+    sev[16..20].copy_from_slice(&second_tid.raw().to_le_bytes());
+    memory.write_bytes(0x4000, &sev).unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root_ctx,
+                SyscallRequest::new(
+                    107,
+                    SyscallArgs::from([LINUX_CLOCK_THREAD_CPUTIME_ID, 0x4000, 0x4080, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let id = u64::from_le_bytes(memory.read_bytes(0x4080, 8).unwrap().try_into().unwrap());
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root_ctx,
+                SyscallRequest::new(111, SyscallArgs::from([id, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn adjtimex_and_clock_adjtime_return_eperm() {
     const LINUX_CLOCK_REALTIME: u64 = 0;
     const LINUX_CLOCK_MONOTONIC: u64 = 1;
