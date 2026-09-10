@@ -47,6 +47,7 @@ pub const CAP_FSETID: u32 = 4;
 pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
 pub const CAP_NET_RAW: u32 = 13;
+pub const CAP_IPC_OWNER: u32 = 15;
 pub const CAP_SYS_PTRACE: u32 = 19;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
@@ -54,6 +55,7 @@ pub const CAP_SYS_RESOURCE: u32 = 24;
 pub const CAP_SYS_TIME: u32 = 25;
 pub const CAP_MKNOD: u32 = 27;
 pub const CAP_MAC_OVERRIDE: u32 = 32;
+pub const CAP_SYSLOG: u32 = 34;
 pub const CAP_WAKE_ALARM: u32 = 35;
 
 /// The file-related capabilities `fsuid` transitions raise and lower in the
@@ -85,6 +87,7 @@ pub fn capability_by_name(name: &str) -> Option<u32> {
         "SETPCAP" => CAP_SETPCAP,
         "LINUX_IMMUTABLE" => CAP_LINUX_IMMUTABLE,
         "NET_RAW" => CAP_NET_RAW,
+        "IPC_OWNER" => CAP_IPC_OWNER,
         "SYS_ADMIN" => CAP_SYS_ADMIN,
         "SYS_PTRACE" => CAP_SYS_PTRACE,
         "SYS_NICE" => CAP_SYS_NICE,
@@ -92,6 +95,7 @@ pub fn capability_by_name(name: &str) -> Option<u32> {
         "SYS_TIME" => CAP_SYS_TIME,
         "MKNOD" => CAP_MKNOD,
         "MAC_OVERRIDE" => CAP_MAC_OVERRIDE,
+        "SYSLOG" => CAP_SYSLOG,
         "WAKE_ALARM" => CAP_WAKE_ALARM,
         _ => return None,
     })
@@ -398,6 +402,7 @@ mod tests {
             ("SETPCAP", CAP_SETPCAP),
             ("LINUX_IMMUTABLE", CAP_LINUX_IMMUTABLE),
             ("NET_RAW", CAP_NET_RAW),
+            ("IPC_OWNER", CAP_IPC_OWNER),
             ("SYS_ADMIN", CAP_SYS_ADMIN),
             ("SYS_PTRACE", CAP_SYS_PTRACE),
             ("SYS_NICE", CAP_SYS_NICE),
@@ -405,6 +410,7 @@ mod tests {
             ("SYS_TIME", CAP_SYS_TIME),
             ("MKNOD", CAP_MKNOD),
             ("MAC_OVERRIDE", CAP_MAC_OVERRIDE),
+            ("SYSLOG", CAP_SYSLOG),
             ("WAKE_ALARM", CAP_WAKE_ALARM),
         ];
         for (name, bit) in modelled {
@@ -420,5 +426,22 @@ mod tests {
         let (mask, unknown) = capability_mask_for_names(&["SYS_TIME".to_owned()]);
         assert!(unknown.is_empty(), "SYS_TIME must not be reported unknown");
         assert_eq!(mask, 1u64 << CAP_SYS_TIME);
+        let (mask, unknown) =
+            capability_mask_for_names(&["SYSLOG".to_owned(), "IPC_OWNER".to_owned()]);
+        assert!(
+            unknown.is_empty(),
+            "SYSLOG and IPC_OWNER must not be reported unknown"
+        );
+        assert_eq!(mask, (1u64 << CAP_SYSLOG) | (1u64 << CAP_IPC_OWNER));
+    }
+
+    #[test]
+    fn docker_default_excludes_syslog_and_ipc_owner() {
+        let syslog_bit = 1u64 << CAP_SYSLOG;
+        let ipc_owner_bit = 1u64 << CAP_IPC_OWNER;
+        assert_eq!(CapabilitySet::docker_default().effective & syslog_bit, 0);
+        assert_eq!(CapabilitySet::docker_default().effective & ipc_owner_bit, 0);
+        assert_ne!(CapabilitySet::full().effective & syslog_bit, 0);
+        assert_ne!(CapabilitySet::full().effective & ipc_owner_bit, 0);
     }
 }

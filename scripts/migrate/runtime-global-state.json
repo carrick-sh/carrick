@@ -1418,6 +1418,14 @@
       "rationale": "Environment variable CARRICK_CONTAINER_ID read in run_threaded_loop_inner::CARRICK_CONTAINER_ID (crates/carrick-runtime/src/threaded_loop.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/syslog.rs",
+      "symbol": "NEXT_SYSLOG_SERVICE_ID",
+      "fingerprint": "03ae493f3c7763b300e227eebc3769f64d978c0d2bfe003576e06ec35b9aabac",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator NEXT_SYSLOG_SERVICE_ID in crates/carrick-runtime/src/syslog.rs generating unique IDs across the host process."
+    },
+    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/threaded_loop.rs",
       "symbol": "run_threaded_loop_inner::CARRICK_LAUNCH_AUTHORIZATION",

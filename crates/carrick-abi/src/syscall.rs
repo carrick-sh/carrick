@@ -386,7 +386,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(113, "clock_gettime", "time", SupportLevel::BringUp),
     syscall(114, "clock_getres", "time", SupportLevel::BringUp),
     syscall(115, "clock_nanosleep", "time", SupportLevel::BringUp),
-    syscall(116, "syslog", "process", SupportLevel::Deferred),
+    syscall(116, "syslog", "process", SupportLevel::BringUp),
     syscall(117, "ptrace", "process", SupportLevel::BringUp),
     syscall(118, "sched_setparam", "sched", SupportLevel::Deferred),
     syscall(119, "sched_setscheduler", "sched", SupportLevel::Deferred),

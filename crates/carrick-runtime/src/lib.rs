@@ -336,6 +336,7 @@ pub mod rootfs;
 #[cfg(feature = "platform-macos")]
 pub mod runtime;
 pub(crate) mod seccomp;
+pub mod syslog;
 pub(crate) mod vdso_policy;
 pub mod vfs;
 pub use prepare::{
