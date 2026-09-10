@@ -5,6 +5,7 @@
 //! fork quiesce remains the separate process-topology protocol below.
 
 use super::*;
+use carrick_fatal::carrick_fatal;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 enum PreparedHvpatchProcessMm {
@@ -291,9 +292,20 @@ impl Drop for ExactMmStage1Scope {
     fn drop(&mut self) {
         EXACT_MM_STAGE1.with(|stack| {
             let mut stack = stack.borrow_mut();
-            let (mm, lease) = stack.pop().unwrap_or_else(|| std::process::abort());
+            let (mm, lease) = stack.pop().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "vcpu_loop::exact_mm_stage1_scope",
+                    "ExactMmStage1Scope stack underflow on drop: mm={:?}",
+                    self.mm
+                )
+            });
             if mm != self.mm || !std::rc::Weak::ptr_eq(&lease, &self.lease) {
-                std::process::abort();
+                carrick_fatal!(
+                    "vcpu_loop::exact_mm_stage1_scope",
+                    "ExactMmStage1Scope mismatched MM ID or lease pointer on drop: expected_mm={:?}, found_mm={:?}",
+                    self.mm,
+                    mm
+                );
             }
         });
     }
@@ -1045,16 +1057,27 @@ impl ProcessForkCoordinator {
         let release = ProcessForkRelease::new(
             Arc::clone(&self.barrier),
             self.quiesced,
-            self.drain.take().unwrap_or_else(|| std::process::abort()),
+            self.drain.take().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "vcpu_loop::quiesce_coordinator",
+                    "ProcessForkCoordinator missing unique vCPU lease-drain guard during decomposition"
+                )
+            }),
         );
         self.active = false;
         (
-            self.process_admission
-                .take()
-                .unwrap_or_else(|| std::process::abort()),
-            self.clone_admission
-                .take()
-                .unwrap_or_else(|| std::process::abort()),
+            self.process_admission.take().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "vcpu_loop::quiesce_coordinator",
+                    "ProcessForkCoordinator missing process admission token during decomposition"
+                )
+            }),
+            self.clone_admission.take().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "vcpu_loop::quiesce_coordinator",
+                    "ProcessForkCoordinator missing clone admission token during decomposition"
+                )
+            }),
             release,
         )
     }
@@ -1124,7 +1147,13 @@ where
         let scheduler = kernel
             .hvpatch_runtime
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::runtime_binding",
+                    "KernelState missing HVPatch runtime reference during fork barrier subscription setup: task_key={:?}",
+                    parent_context.task().key()
+                )
+            })
             .continuation_services(parent_context.kernel())
             .0;
         let wake_thread = parent_context.thread().key();
@@ -1227,10 +1256,13 @@ where
                 }
             },
         };
-        let process_fork_admission = coordinator
-            .process_admission
-            .as_ref()
-            .unwrap_or_else(|| std::process::abort());
+        let process_fork_admission = coordinator.process_admission.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "vcpu_loop::quiesce_coordinator",
+                "ProcessForkCoordinator missing process admission token during cancellation check: task_key={:?}",
+                parent_context.task().key()
+            )
+        });
         if kernel.process_exiting() || process_fork_admission.is_cancelled() {
             return Ok(PreparedInProcessFork::Complete(Some(
                 crate::linux_abi::LINUX_EAGAIN.guest_retval(),
@@ -1345,7 +1377,11 @@ where
         ) {
             carrick_hal::VcpuLeaseDrainEnrollment::Frozen(guard) => {
                 if coordinator.drain.is_some() {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "vcpu_loop::quiesce_coordinator",
+                        "publishing a second unique vCPU lease-drain guard into one ProcessForkCoordinator: task_key={:?}",
+                        parent_context.task().key()
+                    );
                 }
                 coordinator.drain = Some(guard);
             }
@@ -1600,7 +1636,10 @@ where
             reservation.prepare_shared_mm(child_tid)
         } else {
             let PreparedHvpatchProcessMm::Copied(prepared) = &prepared_mm else {
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::mm_preparation",
+                    "PreparedHvpatchProcessMm variant mismatch: expected Copied MM preparation for unshared child MM, child_tid={child_tid}"
+                );
             };
             reservation.prepare_with_mm_backend(prepared.backend(), child_tid)
         };
@@ -1953,7 +1992,10 @@ where
                 child_pid,
                 "parent fork copyout diverged from successful preflight after child materialization"
             );
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::quiesce_copyout",
+                "parent fork copyout diverged from preflight after child process was materialized: parent_pid={parent_pid}, child_pid={child_pid}"
+            );
         }
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::ParentCopyout)
         {
@@ -1961,12 +2003,20 @@ where
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
                 memory.write_bytes(address, bytes).unwrap_or_else(|_| {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "vcpu_loop::quiesce_rollback",
+                        "failed to restore original parent_tid memory bytes during fork copyout rollback: address={:?}",
+                        address
+                    );
                 });
             }
             if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
                 memory.write_bytes(address, bytes).unwrap_or_else(|_| {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "vcpu_loop::quiesce_rollback",
+                        "failed to restore original pidfd memory bytes during fork copyout rollback: address={:?}",
+                        address
+                    );
                 });
             }
             if let Err(cleanup_error) =
@@ -1982,14 +2032,22 @@ where
             if let (Some(address), Some(bytes)) =
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
-                memory
-                    .write_bytes(address, bytes)
-                    .unwrap_or_else(|_| std::process::abort());
+                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "vcpu_loop::quiesce_rollback",
+                        "failed to restore parent_tid bytes on failpoint rollback: address={:?}",
+                        address
+                    );
+                });
             }
             if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
-                memory
-                    .write_bytes(address, bytes)
-                    .unwrap_or_else(|_| std::process::abort());
+                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "vcpu_loop::quiesce_rollback",
+                        "failed to restore pidfd bytes on failpoint rollback: address={:?}",
+                        address
+                    );
+                });
             }
             if let Err(cleanup_error) =
                 ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
@@ -2003,14 +2061,22 @@ where
             if let (Some(address), Some(bytes)) =
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
-                memory
-                    .write_bytes(address, bytes)
-                    .unwrap_or_else(|_| std::process::abort());
+                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "vcpu_loop::quiesce_rollback",
+                        "failed to restore parent_tid memory on child materialization failure: address={:?}",
+                        address
+                    );
+                });
             }
             if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
-                memory
-                    .write_bytes(address, bytes)
-                    .unwrap_or_else(|_| std::process::abort());
+                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "vcpu_loop::quiesce_rollback",
+                        "failed to restore pidfd memory on child materialization failure: address={:?}",
+                        address
+                    );
+                });
             }
             if let Err(cleanup_error) =
                 ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
@@ -2023,7 +2089,10 @@ where
         if !shares_mm {
             ops.commit_parent(memory).unwrap_or_else(|error| {
                 tracing::error!(%error, "commit parent HVPatch fork transaction");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::fork_parent_commit",
+                    "failed to commit parent HVPatch fork transaction: parent_pid={parent_pid}, error={error}"
+                );
             });
         }
         drop(topology);
@@ -2037,12 +2106,20 @@ where
                     %error,
                     "authoritative child publication failed after frame inventory commit"
                 );
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::fork_publication",
+                    "authoritative child publication failed after frame inventory commit: child_pid={child_pid}, error={error}"
+                );
             }
         };
         let child_context = published
             .context()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::fork_publication",
+                    "published child process missing execution context after authoritative publication: child_pid={child_pid}"
+                )
+            })
             .retain_exact();
         let child_key = child_context.task().key();
         if let Some(chain) = kernel.dispatcher.observers() {
@@ -2073,7 +2150,10 @@ where
                 // collision now means internal generation accounting is corrupt
                 // and cannot be represented as a failed guest fork.
                 tracing::error!(child_pid, %error, "publish hvpatch child root slot failed");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::backend_root_slot",
+                    "child root slot collision after authoritative kernel publication: child_pid={child_pid}, error={error}"
+                );
             }
         };
         let child_process = parent_process.published_child_context(&child_context, child_backend);
@@ -2099,12 +2179,17 @@ where
             .publish_initial_task_state(task_state.clone())
             .unwrap_or_else(|error| {
                 tracing::error!(child_pid, %error, "publish process child task state");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::thread_initialization",
+                    "failed to publish initial task state to child thread after process publication: child_pid={child_pid}, error={error}"
+                );
             });
-        let runtime = child_kernel
-            .hvpatch_runtime
-            .as_ref()
-            .unwrap_or_else(|| std::process::abort());
+        let runtime = child_kernel.hvpatch_runtime.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::runtime_binding",
+                "child KernelState missing HVPatch runtime binding during task backend initialization: child_pid={child_pid}"
+            )
+        });
         let mut task_backend = ops
             .commit(
                 prepared_backend,
@@ -2112,7 +2197,10 @@ where
             )
             .unwrap_or_else(|error| {
                 tracing::error!(child_pid, %error, "commit process child task backend");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::task_backend_commit",
+                    "committing child task backend failed after parent committed: child_pid={child_pid}, error={error}"
+                );
             });
         let cow_identity = carrick_hal::FrameCowIdentity {
             linux_pid: child_pid,
@@ -2136,12 +2224,18 @@ where
             .issue_hvpatch_child_token(&child_context)
             .unwrap_or_else(|error| {
                 tracing::error!(child_pid, %error, "issue exact process child token");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::cow_token",
+                    "COW authority failed to issue child token after backend commit: child_pid={child_pid}, error={error}"
+                );
             });
         ops.bind_child_kernel(&mut task_backend, child_token)
             .unwrap_or_else(|error| {
                 tracing::error!(child_pid, %error, "bind exact process child token");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::cow_token",
+                    "failed to bind COW child token to task backend: child_pid={child_pid}, error={error}"
+                );
             });
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::TokenBind) {
             return Err(ops.fail_stop(error));
@@ -2150,13 +2244,20 @@ where
             ops.apply_inventory(&task_backend, child_context.kernel(), child_mm_id)
                 .unwrap_or_else(|error| {
                     tracing::error!(child_pid, %error, "apply process child frame inventory");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "failed to apply frame inventory to child task backend: child_pid={child_pid}, mm={:?}, error={error}",
+                        child_mm_id
+                    );
                 });
         }
         ops.activate_child(&mut task_backend)
             .unwrap_or_else(|error| {
                 tracing::error!(child_pid, %error, "activate process child task state");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::task_activation",
+                    "failed to activate child task backend after frame inventory publication: child_pid={child_pid}, error={error}"
+                );
             });
 
         let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
@@ -2189,7 +2290,10 @@ where
                         %error,
                         "process child publication lost parent completion token"
                     );
-                    std::process::abort();
+                    carrick_fatal!(
+                        "vcpu_loop::syscall_completion",
+                        "process child publication lost parent completion token: child_pid={child_pid}, error={error}"
+                    );
                 })
                 .syscall();
             child_state.syscall_completion =
@@ -2203,7 +2307,10 @@ where
                 .begin_internal_control_exec()
                 .unwrap_or_else(|error| {
                     tracing::error!(child_pid, %error, "type external control exec ownership");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "vcpu_loop::syscall_completion",
+                        "type external control exec ownership failed: child_pid={child_pid}, error={error}"
+                    );
                 });
         }
         let mut logical = prepare_hvpatch_logical_job(HvpatchLogicalJobInput {
@@ -2228,12 +2335,18 @@ where
         })
         .unwrap_or_else(|error| {
             tracing::error!(child_pid, %error, "prepare process child logical job");
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::logical_job",
+                "prepare process child logical job failed: child_pid={child_pid}, error={error}"
+            );
         });
         let (grant_thread, grant_generation) =
             control.current_submission_key().unwrap_or_else(|error| {
                 tracing::error!(child_pid, %error, "capture process-fork worker grant");
-                std::process::abort();
+                carrick_fatal!(
+                    "vcpu_loop::executor_grant",
+                    "capture process-fork worker grant failed: child_pid={child_pid}, error={error}"
+                );
             });
         let shape = if is_external_exec || request.clone_parent {
             executor::HvpatchSubmissionShape::PeerRoot {
@@ -2254,7 +2367,10 @@ where
             )
             .unwrap_or_else(|error| {
                 tracing::error!(child_pid, %error, "prepare dormant process child");
-                std::process::abort();
+                carrick_fatal!(
+                    "vcpu_loop::dormant_child",
+                    "prepare dormant process child failed: child_pid={child_pid}, error={error}"
+                );
             });
         child_kernel
             .register_hvpatch_runtime_endpoint(Arc::clone(&child_futex), Arc::clone(&child_kicker));
@@ -2267,22 +2383,36 @@ where
         }
         let started = published.start_child().unwrap_or_else(|error| {
             tracing::error!(child_pid, %error, "open process child start gate");
-            std::process::abort();
+            carrick_fatal!(
+                "kernel::start_gate",
+                "open process child start gate failed: child_pid={child_pid}, error={error}"
+            );
         });
         let start_gate = started
             .context()
             .thread()
             .take_opened_start_gate(generation)
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::start_gate",
+                    "opened start gate missing from child thread: child_pid={child_pid}, gen={generation:?}"
+                )
+            });
         logical
             .install_start_gate(start_gate)
             .unwrap_or_else(|error| {
                 tracing::error!(child_pid, %error, "install process child start proof");
-                std::process::abort();
+                carrick_fatal!(
+                    "vcpu_loop::logical_job",
+                    "install process child start proof failed: child_pid={child_pid}, error={error}"
+                );
             });
         let proof = logical.activation_proof().unwrap_or_else(|error| {
             tracing::error!(child_pid, %error, "validate process child activation proof");
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::logical_job",
+                "validate process child activation proof failed: child_pid={child_pid}, error={error}"
+            );
         });
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::StartProof) {
             return Err(ops.fail_stop(error));
@@ -2321,7 +2451,10 @@ where
                 .activate(&scheduler, Arc::clone(child_context.thread()), proof)
                 .unwrap_or_else(|error| {
                     tracing::error!(child_pid, %error, "activate process child logical job");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "kernel::scheduler",
+                        "activate process child logical job failed: child_pid={child_pid}, error={error}"
+                    );
                 });
             member_publication.commit();
             process_job_reservation.activate_with_process_retirement(
@@ -2372,7 +2505,12 @@ where
             )
             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
             .with_current_guest_sp(ops.guest_sp(memory));
-            let activation = activation.unwrap_or_else(|| std::process::abort());
+            let activation = activation.unwrap_or_else(|| {
+                carrick_fatal!(
+                    "vcpu_loop::vfork_suspension",
+                    "missing child thread activation proof when constructing PreparedVforkSuspension: child_pid={child_pid}"
+                )
+            });
             return Ok(PreparedInProcessFork::SuspendVfork(
                 PreparedVforkSuspension {
                     child_pid: guest_child_pid,

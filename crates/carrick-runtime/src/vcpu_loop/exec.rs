@@ -5,6 +5,8 @@
 
 use super::*;
 
+use carrick_fatal::carrick_fatal;
+
 fn first_byte_mismatch(expected: &[u8], observed: &[u8]) -> Option<usize> {
     expected
         .iter()
@@ -129,14 +131,18 @@ impl PreparedExecve {
     fn take_terminal_authority(
         &mut self,
     ) -> (crate::kernel::KernelContext, super::ExecTerminalHandoff) {
-        let context = self
-            .terminal_context
-            .take()
-            .unwrap_or_else(|| std::process::abort());
-        let clone_admission = self
-            .clone_admission
-            .take()
-            .unwrap_or_else(|| std::process::abort());
+        let context = self.terminal_context.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::exec_terminal",
+                "prepared exec terminal context was consumed before paired clone-admission handoff"
+            );
+        });
+        let clone_admission = self.clone_admission.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::exec_terminal",
+                "prepared exec clone-admission token was consumed before paired terminal context"
+            );
+        });
         (context, super::ExecTerminalHandoff { clone_admission })
     }
 
@@ -1199,8 +1205,12 @@ where
             sibling_drain_started,
         } = prepared;
         if terminal_context.is_some() || clone_admission.is_some() {
-            tracing::error!("prepared exec suffix retained duplicate terminal authority");
-            std::process::abort();
+            carrick_fatal!(
+                "hvpatch::exec_terminal",
+                "destructive exec suffix retained duplicate terminal authority: terminal_context_is_some={}, clone_admission_is_some={}",
+                terminal_context.is_some(),
+                clone_admission.is_some()
+            );
         }
         let emit_runtime_stage =
             |phase: carrick_observability::probes::HvpatchExecRuntimeStagePhase,
@@ -1232,8 +1242,11 @@ where
         let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
             Some(process) => {
                 let reservation = hvpatch_mm_reservation.take().unwrap_or_else(|| {
-                    tracing::error!("prepared HVPatch exec lost MM-generation admission");
-                    std::process::abort();
+                    carrick_fatal!(
+                        "hvpatch::mm_authority",
+                        "prepared HVPatch exec lost MM-generation admission for tid={:?}",
+                        self.linux_tid
+                    );
                 });
                 process
                     .prepare_exec_for_linux_tid_with_mm_reservation(self.linux_tid, reservation)
@@ -1273,7 +1286,12 @@ where
             // authority before any later topology mutation. Never recount it.
             let disposition = prepared_kernel_exec
                 .hvpatch_disposition()
-                .unwrap_or_else(|| std::process::abort());
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::exec_topology",
+                        "HVPatch prepared exec missing disposition metadata during transaction routing"
+                    );
+                });
             let routing = route_exec_disposition(disposition);
             let retires_old_mm = routing.retirement_inventory;
             let predecessor_shared = routing.predecessor_shared;
@@ -1540,8 +1558,10 @@ where
             }
             (None, RuntimePreparedExec::Other(prepared)) => RuntimePublishedExec::Other(*prepared),
             _ => {
-                tracing::error!("exec preparation/backend authority mismatch");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::exec_backend",
+                    "prepared Kernel exec variant disagrees with configured HVPatch backend before destructive image replacement"
+                );
             }
         };
         if let Err(error) =
@@ -1682,8 +1702,10 @@ where
                     .map_err(crate::hvpatch::CompleteExecError::before_commit)
             }
             _ => {
-                tracing::error!("exec preparation/backend authority mismatch");
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::exec_commit",
+                    "published Kernel exec variant disagrees with configured HVPatch backend after destructive image replacement"
+                );
             }
         };
         let (committed_context, committed_transition) = match committed {
@@ -1792,7 +1814,10 @@ where
                 retired_mm,
             };
             if self.pending_exec_replacement.replace(replacement).is_some() {
-                std::process::abort();
+                carrick_fatal!(
+                    "hvpatch::exec_replacement",
+                    "duplicate pending exec replacement would overwrite Kernel transition and MM retirement authority"
+                );
             }
         }
         // `exec` publishes a new Mm generation while keeping this host
@@ -1983,8 +2008,11 @@ where
             .fatal_signal
             .rebind_after_exec(self.fatal_image_generation)
             .unwrap_or_else(|| {
-                tracing::error!("committed exec could not rebind fatal-signal image authority");
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::fatal_signal_authority",
+                    "fatal-signal image generation could not rebind to committed exec successor: fatal_image_generation={:?}",
+                    self.fatal_image_generation
+                );
             });
         emit_runtime_stage(
             carrick_observability::probes::HvpatchExecRuntimeStagePhase::Publication,

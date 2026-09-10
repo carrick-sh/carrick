@@ -7,1644 +7,1808 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "next_nonzero",
       "ordinal_in_function": 1,
-      "fingerprint": "0def4498494e6543c98e20fab0dde0cba22d668a3f47761c5c1ecccddd524b43",
+      "fingerprint": "4a402066f73b17402b452e03015e87017d0f1b5671b1b05822a014d7324688ff",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::continuation_identity",
       "rationale": "Atomic generation counter overflow would cause ID collision and misroute asynchronous continuation wake tokens across carrier threads.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::continuation_identity"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "make_control_pipe",
       "ordinal_in_function": 1,
-      "fingerprint": "6e9c20b0881ddcd6272f9470000c23353b33d7d0662539c13373d158048be2d7",
+      "fingerprint": "d422b9046b58569d8c99fb4f05bdbe6e2e6abc41e995c2e388fec6621c454884",
       "verdict": "typed_error_debt",
       "failure_domain": "vcpu_loop::continuation_reactor",
       "rationale": "Host pipe creation failure when initializing the wait reactor should return a typed RuntimeError from service startup instead of aborting.",
       "typed_error": "Result<CarrierWaitService, RuntimeError>",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::continuation_reactor"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "make_control_pipe",
       "ordinal_in_function": 2,
-      "fingerprint": "65bb932366a83782b197ae636b83145cdbdcc44142edfa8b88d5b19f66ae587a",
+      "fingerprint": "6824c617e61c94bccb41d7a37088648120efec444436c1b0173b02691eb8f3e1",
       "verdict": "typed_error_debt",
       "failure_domain": "vcpu_loop::continuation_reactor",
       "rationale": "Host fcntl configuration failure on reactor control pipe should be returned as a typed initialization error.",
       "typed_error": "Result<CarrierWaitService, RuntimeError>",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::continuation_reactor"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "CarrierWaitService::new",
       "ordinal_in_function": 1,
-      "fingerprint": "205c92349355ab2253814aab14758fcdc1dcdf06f26206d29fd2aa2e5c63078e",
+      "fingerprint": "2261e16546e7e674aad0089570cf1dd9d77f21942039068f6ef2e187f8374368",
       "verdict": "typed_error_debt",
       "failure_domain": "vcpu_loop::continuation_reactor",
       "rationale": "Host thread spawn failure for the carrier wait reactor should return a typed RuntimeError from CarrierWaitService::new.",
       "typed_error": "Result<CarrierWaitService, RuntimeError>",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::continuation_reactor"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "CarrierWaitService::prepare_registration",
       "ordinal_in_function": 1,
-      "fingerprint": "f7cdca7634b30781950092fdc7e25035c5279a1e33228c8931afdad2cbbf47b8",
+      "fingerprint": "ce0040fcb03c714fb31cbbfb642f3db4dad07ffbfbe631137241527358b6dd5b",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::continuation_registry",
       "rationale": "Duplicate continuation token in active registration table indicates corrupted continuation lifecycle state or stolen wait token.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::continuation_registry"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "HvpatchTaskBinding::service_pending_cow_invalidation",
       "ordinal_in_function": 1,
-      "fingerprint": "bc9f21186c38e583b855c7272dc818a1553bfdbe48ec69c7841ffb0f9dde1657",
+      "fingerprint": "94389326d92b882169f44bc69c90601e71cbb9e73e092c0b415b7bcf6f5a47e2",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "HvpatchTaskBinding missing stage-1 MM lease when servicing pending COW invalidations; cannot verify or flush desynchronized ASID generations.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "HvpatchTaskBinding::cow_invalidation_observer",
       "ordinal_in_function": 1,
-      "fingerprint": "b7f857326dd5a7269348f1dc6d6eb43b99d78dcd3f5cced5675162af13b55365",
+      "fingerprint": "3f9954a5ba7531f8e5492994d8ad43f44ec2c048987c9ad525a9c0aeaef12798",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "HvpatchTaskBinding missing stage-1 MM lease when obtaining COW invalidation observer; executing without an observer would miss cross-vCPU page invalidations.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "HvpatchTaskBinding::foreign_stage1_identity",
       "ordinal_in_function": 1,
-      "fingerprint": "f3d8e6ad30db7bc2164a0ad7967517501a4456b4a4a575d2bea30a4d7645e662",
+      "fingerprint": "d961a718d6878003aecd345c85f5bf5ffa1c743e5206894817eab65157904e0f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "HvpatchTaskBinding missing stage-1 MM lease when extracting foreign stage-1 identity; cannot authenticate cross-process memory authority.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "ProcessDrain::excluding",
       "ordinal_in_function": 1,
-      "fingerprint": "0fbd216d4fd702b4c2d8dc4d38eac590b074acce1812f0f45e6fc801870ed2d2",
+      "fingerprint": "bcf50e9b0120bb3418c554d8d77003bd756a9a3a42cad44534318b2dd8882860",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::process_drain",
       "rationale": "Underflow in job completion subscription count indicates double-completion or corrupted drain synchronization state.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::process_drain"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "function": "ProcessDrain::for_scheduler",
       "ordinal_in_function": 1,
-      "fingerprint": "b6c4679b42095337e9ca80770869b8bde92a6f242a763e412abbbf0d93aad85f",
+      "fingerprint": "3f202964f75001d557b06c9260fce0307b3316a6715434a97be975728524609d",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::process_drain",
       "rationale": "Underflow in scheduler job completion subscription count indicates double-completion or corrupted drain synchronization state.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::process_drain"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "function": "PreparedExecve::take_terminal_authority",
       "ordinal_in_function": 1,
-      "fingerprint": "ad1da792db43196a1fe5e3ccb16df7ed409c231b8e3b4bc8ea0a8531bc76028b",
+      "fingerprint": "6b78b4c912b199fe9b2e15fa5becc0acbcdc89c66f7b9390832fcfb30a722bdc",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_terminal",
       "rationale": "Prepared exec terminal context was consumed before its paired clone-admission handoff; reconstructing the exact terminal authority is impossible.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::exec_terminal"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "function": "PreparedExecve::take_terminal_authority",
       "ordinal_in_function": 2,
-      "fingerprint": "ddd43d50130c2d8f0a2d9bada9b28815c58c10d5e5fe9dca77d6b6912a7feb9a",
+      "fingerprint": "277989a5f6aba78ddf384c887ef3a2f87bc6977ab551f1e6aa1f31a109b44271",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_terminal",
       "rationale": "Prepared exec clone-admission token was consumed before its paired terminal context; reconstructing exact ownership would reopen or split terminal authority.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::exec_terminal"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "function": "ThreadRuntimeState<E>::drive_execve",
       "ordinal_in_function": 1,
-      "fingerprint": "a1ea5b31cec981fef90a910755a5fbb0eac1723c642065e270a12589348add53",
+      "fingerprint": "3cfe26f57b9b6d09de5350953546578b704fcd529e79d03ee056464e5923b433",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_terminal",
       "rationale": "Destructive exec suffix retained a second terminal-context or clone-admission value after the exact pair was moved into the typed handoff; continuing would duplicate terminal authority.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::exec_terminal"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "function": "ThreadRuntimeState<E>::drive_execve",
       "ordinal_in_function": 2,
-      "fingerprint": "022eba31ade5099c481a8ef6c9835143a11d5bab3b92343f0edaa45f8d18028d",
+      "fingerprint": "0e2fa9877a31d6b9877a1d00696683df9c235f7cbdcacfb5711e2e1d4a32136f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_authority",
       "rationale": "Prepared HVPatch exec lost MM-generation admission; continuing without valid reservation would break memory space isolation.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::mm_authority"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "function": "ThreadRuntimeState<E>::drive_execve",
       "ordinal_in_function": 3,
-      "fingerprint": "04a95e61fe933168e78cae7e56eddf7adac8b69d75660dd8601aba161ca3be44",
+      "fingerprint": "604e4efda8fc91476ea9ce3839d24cadb048505e8b3e342234014d24a50dd45f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_topology",
       "rationale": "HVPatch prepared exec missing disposition metadata during transaction routing; continuing would corrupt predecessor retirement inventory.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::exec_topology"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "function": "ThreadRuntimeState<E>::drive_execve",
       "ordinal_in_function": 4,
-      "fingerprint": "2e38a0b9dd102d3f58a4b11ac01c5e884b5307886cefe74c45c3eabcea0a2288",
+      "fingerprint": "3c3d20afc472c44c4dc261441417cdfaba594bb46a3a0bc1e3b02ffb904e7c9b",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_backend",
       "rationale": "Prepared Kernel exec variant disagrees with the configured HVPatch backend before destructive image replacement; choosing either variant would cross the no-return boundary with mismatched authority.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::exec_backend"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "function": "ThreadRuntimeState<E>::drive_execve",
       "ordinal_in_function": 5,
-      "fingerprint": "c9e3a7082d3db9af78fd346be209cfdc10531869d09ca6890c2f5713f1583d01",
+      "fingerprint": "7ec6ddd224a29ce593fccdfb934b15e1bfc89f3a4e112c0ab3850e81df367420",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_commit",
       "rationale": "Published Kernel exec variant disagrees with the configured HVPatch backend after destructive image replacement; no predecessor return or alternate commit is safe.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::exec_commit"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "function": "ThreadRuntimeState<E>::drive_execve",
       "ordinal_in_function": 6,
-      "fingerprint": "0f9346bddeaa5b33e09a2e5c0dc3a3fe31a498f3339e7807b2d663da31bcb9f9",
+      "fingerprint": "6c71ed704aa8b598bb123c790ebde9b6e75d80e2d3a69ff0b61d0b28a69cc2ce",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_replacement",
       "rationale": "A second pending exec replacement would overwrite the exact Kernel transition and MM retirement authority before executor publication.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::exec_replacement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "function": "ThreadRuntimeState<E>::drive_execve",
       "ordinal_in_function": 7,
-      "fingerprint": "6b29742b7ea5040d747c36f81d3e4713c931fd1101d8d3fad6b77345a7df88fe",
+      "fingerprint": "5c7139a76e76c895ac89a5fb35eea633e607c5bf81640a03b471d916b645cdf0",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::fatal_signal_authority",
       "rationale": "Fatal-signal image generation could not rebind to the committed exec successor; continuing would publish fatal state against the retired image.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::fatal_signal_authority"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "restore_worker_vcpu_before_binding_publication",
       "ordinal_in_function": 1,
-      "fingerprint": "d54c8d02d2c405056879bf7e2e05455cf2179d92b72f733031097f2c15f23a5f",
+      "fingerprint": "be79d3763f7154dd24931cff4d94607ae8cc60572cec2822bc00f79e55e24ab9",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "Worker vCPU slot unexpectedly occupied prior to binding publication; indicates conflicting vCPU ownership on worker thread.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_lease"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::run_until_boundary",
       "ordinal_in_function": 1,
-      "fingerprint": "078a9c77b9993aa9c1b4b43f774c959b1881e6d9db1ddc35414d9573357e86f2",
+      "fingerprint": "3437d0ab6b3b257afc71ffab0ec6983527a4bec4d52d68b9993e3eb5d198a7b8",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor task binding disappeared between quantum setup and control construction; running quantum without binding would execute hardware vCPU without task identity.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_lease"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::save",
       "ordinal_in_function": 1,
-      "fingerprint": "ac2a3adc1bfec2fe7030e34507210cf828c69cc6eed1b4d2c87b2d6870bb8811",
+      "fingerprint": "c8a0c1ab0f4aefe07182325d1c643bcb9ab4168f138d5c0440477ff4c2a7af64",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor missing active engine during save transition.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_lease"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::save",
       "ordinal_in_function": 2,
-      "fingerprint": "e394f44dc6273128ff10b99dd9b5a61fefdd953bf255e8242842e9fcd7911934",
+      "fingerprint": "a1e7b4c96f22278b16292b91831e98a356d45358748d27e353d57974d884a62c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor lifecycle slot unexpectedly occupied during engine detachment in save; indicates duplicate detachment or corrupted lease.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_lease"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::save",
       "ordinal_in_function": 3,
-      "fingerprint": "b0b35d79680d6d037e722f9e52dbd50e406a61944a4b0ac863c089353defcfa0",
+      "fingerprint": "2930176e8b78b4300e07e1e75f547269487399d7f7ef3df27eedfc6c0c6f45e1",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor missing lifecycle state during engine detachment in save.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_lease"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::audit_boundary",
       "ordinal_in_function": 1,
-      "fingerprint": "00060e9e872b769f7e30f080fdcbe5469da9d80df8d18671a520de117f22a19e",
+      "fingerprint": "1461649c412092c5afc4c56a959edbdf2ac5d95ee47e304f4e08edb005cbd8f7",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor missing vCPU handle during boundary audit.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_lease"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::audit_boundary",
       "ordinal_in_function": 2,
-      "fingerprint": "45db4a3639bffcf65aaabbb7890643c760ddd787b9fe735ab8989c5480d28962",
+      "fingerprint": "8da631ed73bdd3adcbe86ca469288f850a69e3358662a7004001a5ab3abc365f",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor missing active engine during boundary audit.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_lease"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::destroy",
       "ordinal_in_function": 1,
-      "fingerprint": "8ded1dca87246a4d987ff8283702368adcfc3b97bc55c25dbdf05bbddb083772",
+      "fingerprint": "6d381be811434c4642794c44a58ea2f97380b813f2981690de2242eb51604b7c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor lifecycle slot unexpectedly occupied during engine detachment in destroy; indicates duplicate detachment or corrupted lease.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_lease"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::destroy",
       "ordinal_in_function": 2,
-      "fingerprint": "8ded1dca87246a4d987ff8283702368adcfc3b97bc55c25dbdf05bbddb083772",
+      "fingerprint": "6d381be811434c4642794c44a58ea2f97380b813f2981690de2242eb51604b7c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_lease",
       "rationale": "HvpatchPersistentExecutor missing lifecycle state during engine detachment in destroy.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_lease"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "PreparedVforkChildActivation::activate",
       "ordinal_in_function": 1,
-      "fingerprint": "8b07c62b6e851e166e862101cf698e3d79550314cebc174db8800899a080fffc",
+      "fingerprint": "b8f6c9aa5b85b3883f53b06c7b20457cbf1245adbdc2bf8dee04223e0183797c",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::scheduler_rollback",
       "rationale": "Scheduler fail_runnable_exact rollback failed during vfork child activation failure cleanup; runnable thread state is desynchronized.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::scheduler_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "ReceiptLog::record",
       "ordinal_in_function": 1,
-      "fingerprint": "2a8846770b6e01554c09d52957910ded08ed951598c63986b798e6fa29526451",
+      "fingerprint": "6894ee4c88d68d4bcb330966ef120859d95272d0a0e73703729c50ac43eb58d4",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_receipt_log",
       "rationale": "Executor receipt log sequence counter overflow would corrupt audit trail ordering.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_receipt_log"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "PoolControl::register_worker",
       "ordinal_in_function": 1,
-      "fingerprint": "36d62354a7b489e9e4bdcde6a32c53f87323318e18fe267fdeb1eebd0ade8c91",
+      "fingerprint": "29d1e3cafc3d59a226b4c81f11991e218d2edcf3c41ece8f5c857f95537aad59",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_control",
       "rationale": "Duplicate worker registration in PoolControl indicates overlapping executor IDs or worker identity reuse.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_control"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "ExecutorPool<F,R>::start",
       "ordinal_in_function": 1,
-      "fingerprint": "6c672cac34813a0dc08c3543d4b2c07846711becabdfad3d29cd4cf344a3019f",
+      "fingerprint": "a4b1a52e0c626ea46c224aad932a35e4a9fe6fbeb3576d04e803f491d9b9056f",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_pool",
       "rationale": "Worker handle missing assigned ExecutorId during pool initialization.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_pool"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "ExecutorPool<F,R>::start",
       "ordinal_in_function": 2,
-      "fingerprint": "6c672cac34813a0dc08c3543d4b2c07846711becabdfad3d29cd4cf344a3019f",
+      "fingerprint": "a4b1a52e0c626ea46c224aad932a35e4a9fe6fbeb3576d04e803f491d9b9056f",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_pool",
       "rationale": "Worker handle missing kick synchronization handle during pool initialization.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_pool"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "ExecutorPool<F,R>::shutdown",
       "ordinal_in_function": 1,
-      "fingerprint": "85f63228955ab286590b061862880b6332102fa9409a1cc7a935bf149847a801",
+      "fingerprint": "e38c4f8de9647042579fa22def9a7b0b8541313ec5048de748101bfcd56c0ffc",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_pool",
       "rationale": "Post-join cancellation of dormant tasks failed during pool shutdown; remaining tasks cannot be safely drained.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_pool"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "run_executor_loop",
       "ordinal_in_function": 1,
-      "fingerprint": "4f24372a5548da82bac09aca5bfaca19d5dc4dfdbb95de19a2b04b9edc53a416",
+      "fingerprint": "c1e0b6150cc4cd2d3d54609ca26b3f6636d3835fb3ffe817478b06253315a80c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_exec_transfer",
       "rationale": "Backend task retarget failed during exec transfer; allowing old binding to receive state would split MM/ASID identity. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited by the hot-path work (process retirement, fork overlay indexing, alias registry partitioning), which is what moved the fingerprint.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_exec_transfer"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "run_executor_loop",
       "ordinal_in_function": 2,
-      "fingerprint": "4f24372a5548da82bac09aca5bfaca19d5dc4dfdbb95de19a2b04b9edc53a416",
+      "fingerprint": "c1e0b6150cc4cd2d3d54609ca26b3f6636d3835fb3ffe817478b06253315a80c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_exec_transfer",
       "rationale": "Worker-owned exec retarget failed after kernel published successor image; returning would orphan active successor. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited by the hot-path work (process retirement, fork overlay indexing, alias registry partitioning), which is what moved the fingerprint.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_exec_transfer"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "run_executor_loop",
       "ordinal_in_function": 3,
-      "fingerprint": "4f24372a5548da82bac09aca5bfaca19d5dc4dfdbb95de19a2b04b9edc53a416",
+      "fingerprint": "c1e0b6150cc4cd2d3d54609ca26b3f6636d3835fb3ffe817478b06253315a80c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_retirement",
       "rationale": "Conflicting address space retirement state encountered during exec cleanup; MM lifecycle state is inconsistent. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited by the hot-path work (process retirement, fork overlay indexing, alias registry partitioning), which is what moved the fingerprint.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::mm_retirement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "run_executor_loop",
       "ordinal_in_function": 4,
-      "fingerprint": "4f24372a5548da82bac09aca5bfaca19d5dc4dfdbb95de19a2b04b9edc53a416",
+      "fingerprint": "c1e0b6150cc4cd2d3d54609ca26b3f6636d3835fb3ffe817478b06253315a80c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_boundary",
       "rationale": "Kick handle remains bound after settlement transaction; kick target is inconsistent with successor state. Re-reviewed 2026-08-31: the abort itself is unchanged; the surrounding function was edited by the hot-path work (process retirement, fork overlay indexing, alias registry partitioning), which is what moved the fingerprint.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_boundary"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<KernelFrameCowAuthority as carrick_hal::FrameCowAuthority>::apply_foreign_cow",
       "ordinal_in_function": 1,
-      "fingerprint": "8c7178e46b833afca1d619358213a3c9365255976a3112ed73345197a7a943f9",
+      "fingerprint": "b109eb1f5d4e6577c26b7d9e0dc65fc138545b1137ebfad14a1f2c4b0bb3c649",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::mm_identity",
       "rationale": "KernelFrameCowAuthority target MmId is zero; foreign COW authority cannot operate on an invalid MM identity.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::mm_identity"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<KernelFrameCowAuthority as carrick_hal::FrameCowAuthority>::apply_foreign_cow",
       "ordinal_in_function": 2,
-      "fingerprint": "6423d85336de02451e6bb59f7b0a7f60abb09c30197d088f543ef09fbf010a73",
+      "fingerprint": "ab032d4936ccb7125fef9949f35fb08905c29069febd958860e219c2db0a35fc",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Applied foreign COW frame inventory receipt failed authorization, revision, or owner generation verification; continuing would mint an unauthenticated foreign COW proof.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::frame_inventory"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "HvpatchRuntimeDirectory::carrier_tasks",
       "ordinal_in_function": 1,
-      "fingerprint": "f1b64e5035137e713beda678c940e8996445c15b42ab57406fbbfd249f525a30",
+      "fingerprint": "a77b7b3e01fbf256177361b2f241f29492798010e92bb6089a8f0ebaeb539494",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::process_identity",
       "rationale": "Parsing hexadecimal HVPatch process instance ID string failed; carrier process identity is unparseable.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::process_identity"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "HvpatchRuntimeDirectory::carrier_tasks",
       "ordinal_in_function": 2,
-      "fingerprint": "f1b64e5035137e713beda678c940e8996445c15b42ab57406fbbfd249f525a30",
+      "fingerprint": "a77b7b3e01fbf256177361b2f241f29492798010e92bb6089a8f0ebaeb539494",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::process_identity",
       "rationale": "Parsed HVPatch process instance ID evaluated to zero; NonZeroU64 invariant violated for process identity.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::process_identity"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "CloneAdmissionGate::subscribe_change",
       "ordinal_in_function": 1,
-      "fingerprint": "f24ae28d1b2bbf76061955a2b3fc3fb7f81d89aaf67778b05144bbf4ff79be61",
+      "fingerprint": "bbb540a54cd00bee5e6c3cd83760d74af8985e9fd1e3929f51b78fe04b0f7bb4",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::vfork_wait",
       "rationale": "Missing VforkParentWait barrier on thread context during clone admission status change subscription.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::vfork_wait"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<CloneAdmissionPermit as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "316dc6a91e350be815dcdcad6a57f7db081abc4454af9fbfdcb19fcba9611ce3",
+      "fingerprint": "adeba2e95ebd43023dc72c83db1438a2cbbc1ce28c1420e2a1c8bc9a3ec008b0",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::task_backend_lifecycle",
       "rationale": "HVPatch task backend destruction failed during permit teardown; host hypervisor task resources were orphaned.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::task_backend_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "KernelState::register_hvpatch_runtime_endpoint",
       "ordinal_in_function": 1,
-      "fingerprint": "5135aed6e2617cf1ab5ed89aa0bab45fabb442dfaae012aff19393e36f7da50e",
+      "fingerprint": "877750c52c2d6e597a1b0120807b2bc531efa40249c5619539219a00b199abce",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "Duplicate registration of HVPatch runtime endpoint on KernelState indicates overlapping kernel initialization.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "dispatch_with_panic_backstop",
       "ordinal_in_function": 1,
-      "fingerprint": "0ced325647b7f4beffa49c69f044d511fc078c2bfaaa0219bb42e18c59d3e38c",
+      "fingerprint": "8bc5799e7e72436bad444a40986b66f5973b5c219b3c2b78daef9058cda0003d",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::panic_backstop",
       "rationale": "Uncaught panic may occur after partially mutating or poisoning shared dispatcher authority, making resumption or unwinding back into guest execution unsafe.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::panic_backstop"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "InjectedExecutionLeaseSlot::install",
       "ordinal_in_function": 1,
-      "fingerprint": "f63447f7c78a26090df3bb51bd0863a277e69d9e2fad319ac93ba4762f9ce964",
+      "fingerprint": "4c6be0dc36ee7c9028ad8629ea49726a2b7a2dab977561d003352b34a2b99c18",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::runtime_context",
       "rationale": "Duplicate installation of thread-local VcpuRuntimeContext indicates nested or concurrent vCPU execution on one host thread.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::runtime_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<InjectedExecutionLeasePublication<'_> as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "cd536ce829b5b796e0dac8c12c9632bf3c594e0f61f0e79a1aed85e702aa18d3",
+      "fingerprint": "306e2a699851c505ee11d5fefac8096a7fd18a73d16a758eba2f408c728ebbf3",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::runtime_context",
       "rationale": "Thread-local VcpuRuntimeContext missing on teardown indicates corrupt TLS lifecycle.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::runtime_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ExecutionLeaseCell::lock",
       "ordinal_in_function": 1,
-      "fingerprint": "436cf1521389ed0e735030d1aeb5f7430bb020db58b41a50832e3c2f521d6b8f",
+      "fingerprint": "ccfae7710b7b253023f63154b4e16d94fc9e1da11914a4833c9dcc13a92e629b",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::runtime_context",
       "rationale": "Thread-local VcpuRuntimeContext missing when entering direct dispatch lock.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::runtime_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "HvpatchLoopResult::publish",
       "ordinal_in_function": 1,
-      "fingerprint": "5487d5566ceb5853a1e323c9004c65bca45ba7b54b71c26b99337137fae706de",
+      "fingerprint": "e7092e186d49104d57aae1bc7a3da757495116f9595aeb91d8671d1f165e9c1a",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::task_activation",
       "rationale": "TaskActivationProof was published more than once, violating single-activation guarantee.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::task_activation"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<ProductionHvpatchProcessBackendOps as HvpatchProcessBackendOps<E,E>>::fail_stop",
       "ordinal_in_function": 1,
-      "fingerprint": "554241378c2bd9fbf6b2378a097892ac7011a49236395a19cc11aac4ecf1ff84",
+      "fingerprint": "2ca36fd6d42f7785e8e1a32cb1307fdc42afb7660ab50ae54ca2ec57a09393d7",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::fail_stop",
       "rationale": "Failure during prepared-process rollback or publication leaves process inventory and MM authority indeterminate, requiring immediate carrier termination.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::fail_stop"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::external_exec_failure",
       "ordinal_in_function": 1,
-      "fingerprint": "ad6a8b37155dfca349f3e8843ffddac3af5948ccf551bb05b04ab9e5acee8a61",
+      "fingerprint": "5c221d1c5951ce60deff5ffb8bc1ffbbea6fefb1cafe0d9ae941a05126caf7d4",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during external exec failure transition.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::complete_persistent_process_fork",
       "ordinal_in_function": 1,
-      "fingerprint": "f59f3a796300956e703da20493ee52a89c2ceed9e4558126cfa242bf2e5651d2",
+      "fingerprint": "d04d3cf2dddb3fc526c3e21fe575de3c812f0a58807de4ccc269879afa51ef6f",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during persistent fork completion.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 1,
-      "fingerprint": "65005be6b4c88b984265f99ece7178b56eae8a88cddc46097e43e2f4ee631b62",
+      "fingerprint": "78268e8683d8cd0eb9f294fee34286b0679f7e723793f637cdf98c8a5adeba47",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Terminal process missing execution context during terminal finalization.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 2,
-      "fingerprint": "d790da189ea83882a7455f4d85544225f8ca745450b8a22f24526922d490e5cb",
+      "fingerprint": "b8d5be8e3d193868a2ff7f3b548c6db405bc543f82924d64b54828fc5d1e9692",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::task_backend_lifecycle",
       "rationale": "Missing HVPatch runtime reference when constructing the terminal-retire wake callback.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::task_backend_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 3,
-      "fingerprint": "817d49405a6d39408411425ba046e1719d2d93f4e6d466249ce509795d4d7d82",
+      "fingerprint": "886992eca82bdf5cee9be53409256795fdda2ab4ec8fae6db6814f65867badde",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_reservation",
       "rationale": "Admitting the exiting task's owner-set edit failed for a reason other than an unknown task or a sibling exec reservation; the MM lease table no longer describes a live task the kernel graph is retiring.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::mm_reservation"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 4,
-      "fingerprint": "045fb400c1247181d37c3a57b003f6513de9c1b51805b36cb9c902caf3320201",
+      "fingerprint": "7298a47efc115882ec9b99ce277566034b01aeed9f21d15fa7325f02551f5bf0",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Failed to claim terminal ownership for sibling thread during process termination.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 5,
-      "fingerprint": "c0af55bee658cd661c5d1e82a5d7bfa97b2923273996a5c3da03a6d229d83b1c",
+      "fingerprint": "aaab67d87f0acf9090e6b1e0e061cc30de567308bda8c2b07d24f0944574546f",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Missing sibling execution context during terminal settlement.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 6,
-      "fingerprint": "c0af55bee658cd661c5d1e82a5d7bfa97b2923273996a5c3da03a6d229d83b1c",
+      "fingerprint": "aaab67d87f0acf9090e6b1e0e061cc30de567308bda8c2b07d24f0944574546f",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Settling sibling terminal state failed during process exit.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 7,
-      "fingerprint": "c0af55bee658cd661c5d1e82a5d7bfa97b2923273996a5c3da03a6d229d83b1c",
+      "fingerprint": "aaab67d87f0acf9090e6b1e0e061cc30de567308bda8c2b07d24f0944574546f",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::container_scope",
       "rationale": "Missing container root token during process terminal settlement.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::container_scope"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 8,
-      "fingerprint": "aa26192f3926f7982d6db20779f864a85ffa6d8bfdf28e5e621bb74ce5266e7e",
+      "fingerprint": "ee88ef521c0d6d321ecc57351f4262c52b244ed436add9e04eb528cd639edbac",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Unexpected terminal settlement disposition encountered during process teardown.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 9,
-      "fingerprint": "353b3bcc1f71de8575a93ede2daef1184d6948ef80aab48912681f71007f4bdf",
+      "fingerprint": "e1c899c669319b9c7cd4c44d4cbd832e815891f26a1640be9cee9a4249196b82",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Failed to reserve failure inventory during persistent terminal teardown.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 10,
-      "fingerprint": "3e769b7946d9dd9a96cbe4e496a6faee87fef30e5ba1914e07178337fa7ec9c3",
+      "fingerprint": "d1a399bae70e4148a675ef447a87990f22cd0ca49858fd5f55b3326765a139f1",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Failed to register sibling thread in terminal settlement table.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 11,
-      "fingerprint": "bbe8fbc5c49d99a7680c6585e557a7653d703c3ae01a3814ef633ff2accd2e90",
+      "fingerprint": "df71cd7859f1dfe8aaa6587c06cba6ddea4e62dfc526e3faf0c3630179256cce",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Failed to claim persistent process terminal owner role.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 12,
-      "fingerprint": "a50fbdb73d7cae09396e37b568943805c6e6c02dca3be82b1b9f833ec04e9395",
+      "fingerprint": "285df17da9ee6db0c7eea1daf4abd51afde16a3ed8f0378849b7f96b46da2bfc",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Failed to initialize sibling thread drain during terminal process exit.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::settle_persistent_thread_exit",
       "ordinal_in_function": 1,
-      "fingerprint": "55b01bbd4412189eb2eacc35b387dcd9bea4eb10c539549decde3fcbe93a3650",
+      "fingerprint": "48279ff9f401a234c075afebc06ffb040633b231f9db920b2a8a1a207bb796c6",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::thread_settlement",
       "rationale": "Unhandled thread exit disposition during persistent thread settlement.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::thread_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::park_thread_exit_retry",
       "ordinal_in_function": 1,
-      "fingerprint": "6c7a801c00a10f6e7e823ee1808ae6d7681bc39332982f40b27ab5f4d6d010fc",
+      "fingerprint": "6fa9c7eca6d43b5bde86cd064660810c044a7f45367921222faab252356b0c92",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during thread exit retry park.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal",
       "ordinal_in_function": 1,
-      "fingerprint": "b387ac8454f20e377ec4b9f5bfb38309e2f8a1e77f194103a211b0d31fdc50ff",
+      "fingerprint": "3f55eea0ec01013c4b468af584c881ac2990ed9a0b03adbe205ecb6f9ce828ac",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Clone-admission gate rejected the generic persistent terminal ownership claim; terminal teardown cannot continue without an authenticated owner receipt.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_from_exec",
       "ordinal_in_function": 1,
-      "fingerprint": "9d43275afec630bcc45a8a5d9c9c63afcdf12ef9a70677efefbeaf4532ab6cf8",
+      "fingerprint": "2cf58904b686baa94851caad73951ba9564795ab522cb1c0456f78ebf65c2198",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_terminal",
       "rationale": "The retained exec clone-admission handoff failed its exact-generation owner transition; generic claiming cannot safely replace the lost terminal authority.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::exec_terminal"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 1,
-      "fingerprint": "1df227952f822281f60ae92864bf0e2d3a297b5535224a2519e0bf33ae8376ee",
+      "fingerprint": "43ca4472aa3e8813dba020fad0962a677d74e675acf8fbc9f2af75562b679006",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "A pending terminal claim cannot subscribe its exact thread without the Kernel HVPatch runtime; parking without that wake authority would strand terminal ownership.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 2,
-      "fingerprint": "1df227952f822281f60ae92864bf0e2d3a297b5535224a2519e0bf33ae8376ee",
+      "fingerprint": "43ca4472aa3e8813dba020fad0962a677d74e675acf8fbc9f2af75562b679006",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Failed to arm the authenticated process-terminal result owner; continuing could publish or settle the terminal result more than once.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 3,
-      "fingerprint": "f4fe56a3f52cb08d9d5bbf88d0fd54e72bb1db3b25cf450987d6c2a06fa62c99",
+      "fingerprint": "05c8e8c3b2bdadd3b2e5595c487ad729d86945d5133bb8ba3b37c1cb84c31b89",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Failed to initialize the authenticated terminal owner's sibling drain; terminal teardown cannot proceed without exact process membership retirement.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 4,
-      "fingerprint": "0fbba0749242089029414e5c87a62bab702768c2c70ce2c519fe88160eaac571",
+      "fingerprint": "c024bf5a11ce35a0f0d274c6f44576eacc1ec1ca9bb2d9f39b6e7056fa3b76be",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Failed to finish the authenticated terminal owner's ready sibling drain; finalization cannot safely publish before every sibling settlement is accounted for.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::suspend_for_process_quiesce",
       "ordinal_in_function": 1,
-      "fingerprint": "6c7a801c00a10f6e7e823ee1808ae6d7681bc39332982f40b27ab5f4d6d010fc",
+      "fingerprint": "9d3516bf1e789152a414870414d79181d6ba8a0acc992806f838f5260e54d28a",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_barrier",
       "rationale": "Missing quiesce barrier reference when suspending for process quiesce.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_barrier"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::suspend_for_job_control",
       "ordinal_in_function": 1,
-      "fingerprint": "6c7a801c00a10f6e7e823ee1808ae6d7681bc39332982f40b27ab5f4d6d010fc",
+      "fingerprint": "69b35f6fb785de358bc1d64d6981dfd36d37b66f995b8eb042e2619cfec7612a",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during job control suspension.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::rollback_published_hvpatch_clone",
       "ordinal_in_function": 1,
-      "fingerprint": "7699f77bc29a9b76401faec0e55e708ccd9c6f7b16bbc4c90d81dc00a347c96c",
+      "fingerprint": "75ca3530a052599b721c33bf3e2ef4b5ef5afdf1e33d6e238fe74a498e3cbbd4",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_rollback",
       "rationale": "Missing parent execution context during clone publication rollback.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::rollback_published_hvpatch_clone",
       "ordinal_in_function": 2,
-      "fingerprint": "65005be6b4c88b984265f99ece7178b56eae8a88cddc46097e43e2f4ee631b62",
+      "fingerprint": "2355330533945effdff44f6ba8488b378a81a82b08abdad0842cd3e4212b3c0b",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "Missing HVPatch runtime binding on KernelState during clone rollback.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::rollback_published_hvpatch_clone",
       "ordinal_in_function": 3,
-      "fingerprint": "c75e52094babb7d2db0b784c76f49b7720d1b706ea983e7a9b44514c6bb15d1e",
+      "fingerprint": "103af3822dc29a4d0a7cd6683690c849d9bf33fa4b874e531337c4f27e917d30",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_rollback",
       "rationale": "Failed to retire clone authority during clone rollback; an already-settled child generation is classified and tolerated, so this arm is reached only when the retirement itself is impossible.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::rollback_published_hvpatch_clone",
       "ordinal_in_function": 4,
-      "fingerprint": "2b8e24f972dfc0c5a037026cf030cfa9079d4d0aa1445c21a0092103b97d2682",
+      "fingerprint": "ef8f8b0b9fedd3612a020336dfc4c8291323db8cca2856a86124f89fefcb9b77",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_rollback",
       "rationale": "Failed to restore parent memory bytes during clone rollback.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 1,
-      "fingerprint": "8c167c3030cf8214892303ca330f8206b7a75791926ab5eb932e9da54220ca6f",
+      "fingerprint": "b10d38ed844c4ea049720b58c4490e4893557ee94dc9513219aae16a913301e2",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "Missing HVPatch runtime reference when constructing the clone-admission deferral wake callback.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 2,
-      "fingerprint": "ed3ca7adeb15d8f38ec82cf3f3a14208f4df54908e7ae7a40ed1f9a0b86a521c",
+      "fingerprint": "de17893e989a8e1e34f6342141769e16c2641dd480a9c05d04de0313265621fb",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::task_backend_lifecycle",
       "rationale": "Missing HVPatch runtime reference when constructing the reservation-change wake callback for a deferred thread clone.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::task_backend_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 3,
-      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
+      "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to abort task backend when clone execution generation drifted.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 4,
-      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
+      "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "Missing HVPatch runtime binding during generation drift clone retirement.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 5,
-      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
+      "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to retire generation-drifted clone thread in scheduler.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 6,
-      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
+      "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to restore memory bytes when aborting generation-drifted clone.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 7,
-      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
+      "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to abort task backend for unpublished clone thread.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 8,
-      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
+      "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to retire unpublished clone thread in process graph.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 9,
-      "fingerprint": "8bf2d172ea1903347c466dc0d312d5feef9f801ede32e9f7bc3f5e83669c9a65",
+      "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to restore memory bytes when aborting unpublished clone.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 10,
-      "fingerprint": "0791415caae29a575e3c644fdb570d70a37e360ea3983e8bd781caae80884f90",
+      "fingerprint": "ab885957795106d97d43cf6a4dc09edf183d574503370a66252d281715f39aab",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "Missing HVPatch runtime binding when committing clone task backend.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 11,
-      "fingerprint": "ad3e7367cdbf3f97efc908d39bf7b447a5f31ac50ab9bb1cafff5211cbb3dc37",
+      "fingerprint": "14f60ad9d48f99e0c2f512c4d891648830590b365d56ede7112fef14ff5df9c8",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to retire clone thread following carrier task commit failure.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 12,
-      "fingerprint": "ad3e7367cdbf3f97efc908d39bf7b447a5f31ac50ab9bb1cafff5211cbb3dc37",
+      "fingerprint": "14f60ad9d48f99e0c2f512c4d891648830590b365d56ede7112fef14ff5df9c8",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::clone_lifecycle",
       "rationale": "Failed to restore memory bytes following carrier task commit failure.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::clone_lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::finish",
       "ordinal_in_function": 1,
-      "fingerprint": "4ff78e2f398c6c07a0cb2622755c38478605fe42a69997392d0f3ca2d05985e7",
+      "fingerprint": "294d25badc6d402f03978468b21181f54894070e35a9dd473f48b94e33b7b6a5",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::lifecycle",
       "rationale": "Duplicate terminal outcome recorded on completed thread run loop.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::lifecycle"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 1,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 2,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 3,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 4,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 5,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 6,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 7,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 8,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 9,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 10,
-      "fingerprint": "bea25a7baf1a2dc80f8996836a483e072176f0b660410a2825ef4ecc2f6a7f34",
+      "fingerprint": "cee9e5d4f8aa661a027632eb4d8fc8900da46127d9cc25fb7525451221c04387",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::enter_terminal_with_outcome",
       "ordinal_in_function": 1,
-      "fingerprint": "ad6a8b37155dfca349f3e8843ffddac3af5948ccf551bb05b04ab9e5acee8a61",
+      "fingerprint": "ee62fd99ae3bc1acc78e75e590a49bed484ccc679fa029b0d8d97723a1a5d197",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context when entering terminal state.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 1,
-      "fingerprint": "a52bb3df0251493ecdef50b25a19a85ac80f1c2e0b2d6c337faab994f8538665",
+      "fingerprint": "9bab859303753b232f6aab25397b8801f9b652938e2e4f4bd826826272cfbd81",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context on trap limit outcome assembly.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::poll",
       "ordinal_in_function": 1,
-      "fingerprint": "0b8ee6939c630d3032ab3b6c6e127420aacf32a314d743d572f76985271d5251",
+      "fingerprint": "cccfa7988489990ae04cef0d0182fde995ee65fc0e6958e370108f9af9d6616b",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context on engine error terminal transition.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::service_context"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::redispatch_threaded_syscall_for_executor",
       "ordinal_in_function": 1,
-      "fingerprint": "e986bf02e6e29bf4d64fa631f1045cbb831ba3a2d7d79fb480d35b6474f61e04",
+      "fingerprint": "0feedb695dd3d20d50272b8116824c11915f9aacdfc2527e8e5632532490885d",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::mm_stage1_authority",
       "rationale": "Syscall requiring MM mutation dispatch lacks outer stage-1 authority phase; proceeding would mutate page tables without exclusive stage-1 pause or sole lease.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::mm_stage1_authority"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::redispatch_threaded_syscall_for_executor",
       "ordinal_in_function": 2,
-      "fingerprint": "e986bf02e6e29bf4d64fa631f1045cbb831ba3a2d7d79fb480d35b6474f61e04",
+      "fingerprint": "0feedb695dd3d20d50272b8116824c11915f9aacdfc2527e8e5632532490885d",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::mm_stage1_authority",
       "rationale": "Ordinary syscall dispatch unexpectedly holds stage-1 mutation authority; indicates phase desynchronization between syscall classifier and MM executor.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::mm_stage1_authority"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ThreadRuntimeState<E>::redispatch_threaded_syscall_for_executor",
       "ordinal_in_function": 3,
-      "fingerprint": "e986bf02e6e29bf4d64fa631f1045cbb831ba3a2d7d79fb480d35b6474f61e04",
+      "fingerprint": "0feedb695dd3d20d50272b8116824c11915f9aacdfc2527e8e5632532490885d",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::mm_stage1_authority",
       "rationale": "Host-alias installation phase lacks outer stage-1 authority; proceeding would install host alias without stage-1 mutation permit.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::mm_stage1_authority"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "enroll_persistent_process_member",
       "ordinal_in_function": 1,
-      "fingerprint": "8c2c565b84896b237903a490c49ee4f189459f06c264cc1e297b494fe02bed93",
+      "fingerprint": "a147591a582e9749529e82433944ccecf08fffe5ead940f8414e065e2bc43f69",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::process_membership",
       "rationale": "Duplicate terminal settlement registration in persistent process handle list.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::process_membership"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "launch_persistent_hvpatch_job",
       "ordinal_in_function": 1,
-      "fingerprint": "109de392158dbcb05ba324663d36ff5c4c2afb9b8ab5225504be564a991ed69e",
+      "fingerprint": "7c080768c81f2ecd9af59d0f6fc0ea87c7a1279014a7e090a6616b3440301a4e",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::job_launch",
       "rationale": "Prepared persistent job missing task context during job launch.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::job_launch"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "launch_persistent_hvpatch_job",
       "ordinal_in_function": 2,
-      "fingerprint": "109de392158dbcb05ba324663d36ff5c4c2afb9b8ab5225504be564a991ed69e",
+      "fingerprint": "7c080768c81f2ecd9af59d0f6fc0ea87c7a1279014a7e090a6616b3440301a4e",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "KernelState missing HVPatch runtime reference during persistent job launch.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "<ExactMmStage1Scope as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "d7cf1a294d7c4992c6a3b53b4536430616cd3c651fd7e6cde726e5f45cbbee70",
+      "fingerprint": "b388e60e6c4ea862591f376091a9bfc282092c212c16ce3c8bdb78d892aadb0e",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::exact_mm_stage1_scope",
       "rationale": "ExactMmStage1Scope stack underflow on drop; indicates unbalanced thread-local stage-1 scope entry and exit.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::exact_mm_stage1_scope"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "<ExactMmStage1Scope as Drop>::drop",
       "ordinal_in_function": 2,
-      "fingerprint": "d7cf1a294d7c4992c6a3b53b4536430616cd3c651fd7e6cde726e5f45cbbee70",
+      "fingerprint": "b388e60e6c4ea862591f376091a9bfc282092c212c16ce3c8bdb78d892aadb0e",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::exact_mm_stage1_scope",
       "rationale": "ExactMmStage1Scope mismatched MM ID or lease pointer on drop; indicates out-of-order stage-1 scope nesting or corrupted thread-local stack.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::exact_mm_stage1_scope"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ProcessForkCoordinator::into_parts",
       "ordinal_in_function": 1,
-      "fingerprint": "1ab9b1e2b6f3cb9b77c48172b80e51d0f0ea7eb7e206fd4af971817724662574",
+      "fingerprint": "1df9451f1f73485d929f317a944670c8cc1134ca0398594ebe0ce8b437f41f41",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_coordinator",
       "rationale": "ProcessForkCoordinator missing its unique vCPU lease-drain guard during decomposition indicates an impossible transition into protected fork work without frozen registration authority.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_coordinator"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ProcessForkCoordinator::into_parts",
       "ordinal_in_function": 2,
-      "fingerprint": "469eb85bd180e9708e99fe60ba61ce9a89c278f364c74313f947d902671e8605",
+      "fingerprint": "8e338d64d1e5622f931cb2f62d5c134ce658c930b1714ff47008cdeb040449d9",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_coordinator",
       "rationale": "ProcessForkCoordinator missing process admission token during decomposition indicates double-consume or corrupt coordinator.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_coordinator"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ProcessForkCoordinator::into_parts",
       "ordinal_in_function": 3,
-      "fingerprint": "469eb85bd180e9708e99fe60ba61ce9a89c278f364c74313f947d902671e8605",
+      "fingerprint": "94c235555c120a078c53cc0596b7ff6e3244902578ff9b82db7d5ca4639edb7f",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_coordinator",
       "rationale": "ProcessForkCoordinator missing clone admission token during decomposition indicates double-consume or corrupt coordinator.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_coordinator"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 1,
-      "fingerprint": "cf842be33c5b219091442d7dfa6e919f7868d5d0e83e1d1c6da5b3c27160a9c6",
+      "fingerprint": "9ea65810befbd347f3d07b40d7a6edcee8bce92df679083acca48aca8510724d",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "KernelState missing HVPatch runtime reference during fork barrier subscription setup.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 2,
-      "fingerprint": "dc21e97f23058fc90cbcbf6b33263cc79762cd9e762d656db7c082d286990d96",
+      "fingerprint": "33e6bf593702228b0f4e2d7a326c49310cb861678a54f6e55e4006aa2a0390e2",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_coordinator",
       "rationale": "ProcessForkCoordinator missing process admission token during cancellation check.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_coordinator"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 3,
-      "fingerprint": "85419b6a3a0b3e3d6864915357c4aed6011c507b28f78bb5671727018011cee5",
+      "fingerprint": "c70401373788556fe3b6fbf8dbf37379967209ecb794ee25e2a2fe0a6f821af5",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_coordinator",
       "rationale": "Publishing a second unique vCPU lease-drain guard into one ProcessForkCoordinator indicates a corrupt fork state transition and would lose one registration freeze authority.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_coordinator"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 4,
-      "fingerprint": "182d1324682a0a0cdcea7dc82811550a95e71c6b18aaed00644d125b3d59f127",
+      "fingerprint": "774781259b71dfe3e5c4e22fffc9868632ccddcd9aa536c42e2421b1e22797ac",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::mm_preparation",
       "rationale": "PreparedHvpatchProcessMm variant mismatch: expected Copied MM preparation for unshared child MM.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::mm_preparation"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 5,
-      "fingerprint": "b46819b916d503826f34fa719cdd5cd59e7a28d3dfde06b8f25b9c1d9ebc1fd3",
+      "fingerprint": "8d94501995c506a06811c6ff6501c7a70987cf10c27b84b40c2011c17a41d991",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_copyout",
       "rationale": "Parent fork copyout diverged from preflight after child process was materialized; parent and child memory state are desynchronized.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_copyout"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 6,
-      "fingerprint": "f465dcd20c71185dd9b96d907eb49384058da781135ca9df2aea4e08bf16d23b",
+      "fingerprint": "1066c1f1ac2aa38be9d6c0745548920b045ffbb862ba3ab2583d85a91043109c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore original parent_tid memory bytes during fork copyout rollback; parent memory is corrupted.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 7,
-      "fingerprint": "f465dcd20c71185dd9b96d907eb49384058da781135ca9df2aea4e08bf16d23b",
+      "fingerprint": "1066c1f1ac2aa38be9d6c0745548920b045ffbb862ba3ab2583d85a91043109c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore original pidfd memory bytes during fork copyout rollback; parent memory is corrupted.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 8,
-      "fingerprint": "9b465d0f54e60f9852ed3091d69163f6e7f76c0946f4a03d5dddba8c09b00235",
+      "fingerprint": "bafa2bcc08671b2c56824e1f4e90235a2a57f1857eaf62c5ec98688ad464eeeb",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore parent_tid bytes on failpoint rollback; parent memory is corrupted.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 9,
-      "fingerprint": "9b465d0f54e60f9852ed3091d69163f6e7f76c0946f4a03d5dddba8c09b00235",
+      "fingerprint": "bafa2bcc08671b2c56824e1f4e90235a2a57f1857eaf62c5ec98688ad464eeeb",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore pidfd bytes on failpoint rollback; parent memory is corrupted.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 10,
-      "fingerprint": "0ed9c9bb5fe6c06cd3bcd3d824f745e87ff6874a40230d5d6ae14c73e472d9af",
+      "fingerprint": "825948262029ef99ef5cd0829971d86cfd636914913b96f273731b5d8bfc18a6",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore parent_tid memory on child materialization failure; parent memory is corrupted.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 11,
-      "fingerprint": "0ed9c9bb5fe6c06cd3bcd3d824f745e87ff6874a40230d5d6ae14c73e472d9af",
+      "fingerprint": "825948262029ef99ef5cd0829971d86cfd636914913b96f273731b5d8bfc18a6",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore pidfd memory on child materialization failure; parent memory is corrupted.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::quiesce_rollback"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 12,
-      "fingerprint": "b8ef467e926fb00e53cb01c2123ebe8b16a1863ffe541100c527f6882e001927",
+      "fingerprint": "3466cda4bc639661def82de4c209c38e122d71498d6495a89d1a72278496999f",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::fork_parent_commit",
       "rationale": "Failed to commit parent HVPatch fork transaction; parent stage-1 translation state is inconsistent.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::fork_parent_commit"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 13,
-      "fingerprint": "ed3389c4575719b77ea2e6813d6ac9e555a36334cd0609ea4229bbeaa015c9a1",
+      "fingerprint": "183b7caa6c12dde1bea71c01e7f0f1cd005701d031411076062ff69847f08788",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::fork_publication",
       "rationale": "Authoritative child publication failed after frame inventory was committed; global frame allocation cannot be rolled back.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::fork_publication"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 14,
-      "fingerprint": "c99076e282942870361be7bf284712bdc1ed219ece2774a428bf7529076af62b",
+      "fingerprint": "70464e39bbec1f6a22d234ad2177271c1be7883113d78de520d1d1b63734f46e",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::fork_publication",
       "rationale": "Published child process missing execution context after authoritative publication.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::fork_publication"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 15,
-      "fingerprint": "e727ebb855106e5c05e1ea9b4cef1323ddba61946d92f566ceda7fc6cbd53f3f",
+      "fingerprint": "7a1c08b8346bd3ef729762f2d03ccc5d30d3ed3dd2f8383980e6f1c86b20c9a0",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::backend_root_slot",
       "rationale": "Child root slot collision after authoritative kernel publication indicates internal generation accounting corruption.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::backend_root_slot"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 16,
-      "fingerprint": "800ec088d7896494fcf2071ea407b2d2d76c00cd447727adcbfea577a8bf3fe7",
+      "fingerprint": "5b8d90c0b882ceb7e65e21045cdecc1775234024f639b3c792f895c55bb33180",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::thread_initialization",
       "rationale": "Failed to publish initial task state to child thread after process publication.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::thread_initialization"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 17,
-      "fingerprint": "682e26a2cc449c5de6a976134f4274c9229f7cadd19fb73d571f4ba32f728895",
+      "fingerprint": "8f77b5725667c9a8f365c5ef1aaa5c0884d02b3be49c0926dbcd867f158e48c0",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::runtime_binding",
       "rationale": "Child KernelState missing HVPatch runtime binding during task backend initialization.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 18,
-      "fingerprint": "03a52a0221899eeae1f669dc9f1437236145d875b97e02a7ea98223becca2d6e",
+      "fingerprint": "82c9648b03b37eb873815f2bdc2dffe6dd442537e8386709360923e5b2dd34e9",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::task_backend_commit",
       "rationale": "Committing child task backend failed after parent committed; child hardware resources cannot be bound.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::task_backend_commit"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 19,
-      "fingerprint": "a3e41b9dc59f2be77dc396b0d2660a2792cfc9e5f00f74e9bb85b3e7ac01283b",
+      "fingerprint": "18aefd908f7945cfb183e5d4146bb986ad1671c3735e51e3fd5edb6cf622f376",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::cow_token",
       "rationale": "COW authority failed to issue child token after backend commit; child has no valid memory authority.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::cow_token"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 20,
-      "fingerprint": "13a4f922003f54dee8d1ece970233cc6ff0ed873d4b6465f0047aa177ce7de50",
+      "fingerprint": "5e0f8c7584e89012552dfcbe4b7b077eaab0d3bbca1569dad03df1a28e9d6c5d",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::cow_token",
       "rationale": "Failed to bind COW child token to task backend; stage-1 fault handler cannot authenticate child access.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::cow_token"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 21,
-      "fingerprint": "a658b0605682e204948880e69343f3ea0cd1ed745b090054742247aa442c66c8",
+      "fingerprint": "23ec789a8a0881bc150ff47747ae667b9d5d819d4240c926a797ed668e692bbb",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::frame_inventory",
       "rationale": "Failed to apply frame inventory to child task backend; stage-2 page tables desynchronized from frame ownership.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::frame_inventory"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 22,
-      "fingerprint": "59e9cbe8841c92876bbb6d979e7af59d3c93f9dbbc2892a54048ea16f3a7e1a1",
+      "fingerprint": "b3cee2ca1fd6b054395f28e1b50c7c280c121eec177aa94fcd5cc19717723555",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::task_activation",
       "rationale": "Failed to activate child task backend after frame inventory publication.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::task_activation"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 23,
-      "fingerprint": "3ea7a77c83b3aa9f667761060477b16df7bbebc2aa9f84d943061e32280e9fd1",
+      "fingerprint": "eee1c051a8a2b00dcb1ba74c90e9a0a1c40c528958ea41eca6b6243859dbc188",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::syscall_completion",
       "rationale": "Externally initiated exec child lost the exact parent syscall-completion token during publication; continuing would fabricate or replay a guest syscall return. Re-reviewed 2026-09-03: the abort is unchanged; the completion token moved from unconditional Box ownership to its allocation-free inline representation.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::syscall_completion"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 24,
-      "fingerprint": "2c95e59aca2e171b85ee07ae2c0467e71b11cfd94f72ac4222d2223481ac4586",
+      "fingerprint": "976af10f29a1625e76fe67655617a83f46337affbb14b06d1c8c0630929b0dee",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::syscall_completion",
       "rationale": "Externally initiated exec child could not establish typed internal-control completion ownership; running it would permit an unauthorized guest or compatibility return. Re-reviewed 2026-09-03: the abort is unchanged; its fingerprint context now contains the allocation-free inline guest completion token.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::syscall_completion"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 25,
-      "fingerprint": "1f5882b10508a6a0e742124d75ff916136345b281f7dacb30d7699ce14d8db6d",
+      "fingerprint": "951d77eb7f9d2097213f84660be67f39766adf420da16e0e26dc2870e055eece",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::logical_job",
       "rationale": "Failed to prepare child logical job in executor after task backend activation.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::logical_job"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 26,
-      "fingerprint": "937eaca2f4259384184d7f2265b325f175285ac313ff007d18b2cc8e55a3f62a",
+      "fingerprint": "8317dcdff2e37a240439c5ed60edc7e8852ddcb26e0d26910311e8e255605bb7",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_grant",
       "rationale": "ExecutorControl failed to provide valid submission grant key for child process worker.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_grant"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 27,
-      "fingerprint": "fd9f81024163392df1ebbc6a34b4d5251074fa7f6e8dde8ba8f718eecd07bb5a",
+      "fingerprint": "f2b6de39b30c5255a1682b62b88f7ef9254f88a6c945377c63e587dfa9b46e86",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::dormant_child",
       "rationale": "Failed to prepare dormant child task structure after logical job creation.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::dormant_child"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 28,
-      "fingerprint": "4e891f387f1aaa2118a454f966aef2fe131b15569958b7f920e934c4f01d7a46",
+      "fingerprint": "78d3432cd023988f3438e5c0acc95e65c582f06ef0015b3bf670a4f35c08d397",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::start_gate",
       "rationale": "Failed to open child process start gate after publication; child cannot transition to runnable.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::start_gate"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 29,
-      "fingerprint": "91db5e10e214180954bebf41ae1a6c2d08192bd7dc2ba0820351f99c242252e7",
+      "fingerprint": "0e6edb9888d4ab230358a1d65227a9d2051b87705e48c9500b3e4b3108eb8a96",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::start_gate",
       "rationale": "Opened start gate missing from child thread after start gate transition.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::start_gate"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 30,
-      "fingerprint": "95265be40e8ba8be0681fbeac58b2b27fb9f83e5842c69692f190e67a1423bdf",
+      "fingerprint": "1d79477ace338bafe5fed0ebb7724c6a417ee7daaada8c8a537987a53aae325c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::logical_job",
       "rationale": "Failed to install start gate proof into child logical job.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::logical_job"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 31,
-      "fingerprint": "82acbffb0cba683cc91b4c982b6b1a9aa7a7d61997c9a4325760aa4e77558de8",
+      "fingerprint": "46f8b94e2dfa68bad6805b4acea8ca5912a57a7863265726a190b5d4cb105fe1",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::logical_job",
       "rationale": "Activation proof validation failed on child logical job; start gate token is invalid.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::logical_job"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 32,
-      "fingerprint": "819aef33bae422594ab7f55321ce86076fec8872de828f8f16d3bdd6334c171e",
+      "fingerprint": "114257ed8ca3c89f05d61dcce47d147a3ec191c6b81be44ee0fc3157ea8b4010",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::scheduler",
       "rationale": "Scheduler failed to activate dormant child logical job with verified proof.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::scheduler"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "DebugAuxProviderPublication::commit",
       "ordinal_in_function": 1,
-      "fingerprint": "f16a8ff567c31b0ae4d38d23569a59f2abb62955f623b5a4970f80eae89f9692",
+      "fingerprint": "e55468c605481c9a0d26df043ae6b983f6cc84dabdbd602d397c3c6bff0c440e",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::debug_aux_publication",
       "rationale": "Committing a debug-provider publication after its exact registration was already consumed would lose carrier debug ownership and make later unregistration unauthenticated.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::debug_aux_publication"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ContainerJobGroup::join",
       "ordinal_in_function": 1,
-      "fingerprint": "2e0b7455592a576aea11c7fcba35dfef1ff8f198b49fa10b63fe889542bf1d3a",
+      "fingerprint": "3ce12f73b70c10da1468e533ec27610c967111befd946ccf6de7ec67091cf63e",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::container_job_group",
       "rationale": "A container job group disappeared after the closer claimed it and drained all reservations; continuing would publish false per-container retirement.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::container_job_group"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ContainerJobGroup::join",
       "ordinal_in_function": 2,
-      "fingerprint": "2e0b7455592a576aea11c7fcba35dfef1ff8f198b49fa10b63fe889542bf1d3a",
+      "fingerprint": "3ce12f73b70c10da1468e533ec27610c967111befd946ccf6de7ec67091cf63e",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::container_job_group",
       "rationale": "The carrier active-drain counter overflowed while establishing exclusive container job-group drainage; its ownership ledger can no longer be trusted.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::container_job_group"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ContainerJobGroup::join",
       "ordinal_in_function": 3,
-      "fingerprint": "b0385d184d671e90c15aab2cc0db10d69f07f3e9863f63f2ae673b0fdbd5cbd4",
+      "fingerprint": "a61e8e4d9c56f1852b56bd54492e1f3ff88653e12fb4a3a4b1cc4fcf84f3aab9",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::container_job_group",
       "rationale": "A drained container job group no longer has the exact closing, draining, reservation-free state, or the carrier lost its active-drain claim; retirement cannot safely continue.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::container_job_group"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<ContainerJobReservation as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "beb1294691ba74bd93e8867ac348a36a38d8bb5583dd0717e36d96e516717eda",
+      "fingerprint": "3911a368368bf0d3e290b68d0963c26f4838b79b1fe796e71c9630d3899b7cc3",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::container_job_group",
       "rationale": "Dropping an armed container-job reservation with a zero reservation count proves the exact admission token was already consumed.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::container_job_group"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "HvpatchRuntimeDirectory::prepare_persistent_services",
       "ordinal_in_function": 1,
-      "fingerprint": "120e14431655c6c50edf137fb3d1b7aed58f8e984c3b03e30b6a028f62d7286d",
+      "fingerprint": "56f95103ee1633938be41b1d51008231025e8056f4285cb8557a5f7f00d701a2",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::persistent_services",
       "rationale": "A published carrier scheduler without its paired continuation wait service is a torn persistent-service transaction.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::persistent_services"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "HvpatchRuntimeDirectory::publish_persistent_services",
       "ordinal_in_function": 1,
-      "fingerprint": "7194733cd3a50593074822965760602ec7f13e13c35e4b5fb343857a80bfc6b9",
+      "fingerprint": "397a6977a7db65200738531f9ac5ec182493488b71c62f3a2b78e6bcaaa9caab",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::persistent_services",
       "rationale": "Publishing prepared persistent services over a partial or identity-mismatched scheduler/wait-service pair would split carrier service authority.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::persistent_services"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 33,
-      "fingerprint": "d478d177ec59622a61ab4ed7ccec43976f37e43c9f12cf648cacbea724bbe809",
+      "fingerprint": "61f7495b1d5d09b0ebef15a47141dfb49e57ebe6b85ecec3afca29a52d0b43a3",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::vfork_suspension",
       "rationale": "Missing child thread activation proof when constructing PreparedVforkSuspension.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::vfork_suspension"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "function": "run_executor_loop",
       "ordinal_in_function": 5,
-      "fingerprint": "4f24372a5548da82bac09aca5bfaca19d5dc4dfdbb95de19a2b04b9edc53a416",
+      "fingerprint": "c1e0b6150cc4cd2d3d54609ca26b3f6636d3835fb3ffe817478b06253315a80c",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_boundary",
       "rationale": "The executor kick remains bound after terminal settlement; continuing would let a retired task receive a later kick.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "vcpu_loop::executor_boundary"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProcessPhysicalRetirement::wait_with_publication_timeout",
       "ordinal_in_function": 1,
-      "fingerprint": "8552733a6ad590fbce8f935a56d344c0f5bcad1341f87eb190eb570331b8e68c",
+      "fingerprint": "47fadcb201fe171abec52a84a5e2ce9ced795af24cc63f305522e602a33dcc8d",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "A notified physical-retirement wait without its completion receipt is a torn terminal publication.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 5,
-      "fingerprint": "0fbba0749242089029414e5c87a62bab702768c2c70ce2c519fe88160eaac571",
+      "fingerprint": "c024bf5a11ce35a0f0d274c6f44576eacc1ec1ca9bb2d9f39b6e7056fa3b76be",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "The terminal owner lacks its exact service-kernel context; parking the claim would strand process-exit settlement.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 1,
-      "fingerprint": "61e96cd69c30625242f6ecb5953f137019608c9f0b4e49d285bff63c88bd0247",
+      "fingerprint": "27ee7a30c57c3e0a8198282c940c55396b10ba1cddb60bc44607f69d91e799dc",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::exec_terminal",
       "rationale": "The retained exec handoff rejected its exact process-exit claim; generic recovery would split terminal ownership.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "hvpatch::exec_terminal"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 2,
-      "fingerprint": "61e96cd69c30625242f6ecb5953f137019608c9f0b4e49d285bff63c88bd0247",
+      "fingerprint": "27ee7a30c57c3e0a8198282c940c55396b10ba1cddb60bc44607f69d91e799dc",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Unexpected executor failure could not claim the exact persistent process exit; continuing would leave terminal ownership unknown.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 3,
-      "fingerprint": "2f8055ab0c68d27a16888d99fdce5cf839954eebbf6bb753989ec13610d25189",
+      "fingerprint": "7fb595d6e7a15cd3b901f5e5156a00b9a46ecb15125a24822219733a0d47cfcc",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Executor-failure recovery could not retain exact sibling-stop authority, so complete process retirement cannot be proven.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 4,
-      "fingerprint": "ca55c968d2b869e14211f86bb019a77bf995990a9c881a6b8a29f5d67dd7d3b8",
+      "fingerprint": "6c3ecf487f7e642b41e4107aefdf061943e0635285bcbd582e86dce969e750c9",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "Publishing sibling stop after unexpected executor failure failed; leaving live siblings would violate process-terminal ownership.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 5,
-      "fingerprint": "f84a85c34bd6b8c626c2bb7267a3cf61eba9e4f91b487201d0aa877a63a77398",
+      "fingerprint": "960a7f81e74866622e620f27a76c59542bd3302a33d46955204569e885ab0114",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::terminal_settlement",
       "rationale": "The exact process owner failed to publish unexpected executor-failure retirement; returning would expose an incomplete terminal receipt.",
-      "sink": "raw"
+      "sink": "fatal",
+      "domain": "kernel::terminal_settlement"
     }
   ]
 }

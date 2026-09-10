@@ -15,6 +15,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use carrick_abi::{SigBlockMask, SigSet, WaitSigMask};
+use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{GuestVa, SharedFutexLocation};
 use parking_lot::{Condvar, Mutex};
 
@@ -46,7 +47,10 @@ impl std::fmt::Debug for FutexSource {
 fn next_nonzero(source: &AtomicU64) -> u64 {
     let value = source.fetch_add(1, Ordering::Relaxed);
     if value == 0 || value == u64::MAX {
-        std::process::abort();
+        carrick_fatal!(
+            "vcpu_loop::continuation_identity",
+            "atomic generation counter overflow: value={value}"
+        );
     }
     value
 }
@@ -54,7 +58,11 @@ fn next_nonzero(source: &AtomicU64) -> u64 {
 fn make_control_pipe() -> (OwnedFd, OwnedFd) {
     let mut fds = [-1; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        std::process::abort();
+        carrick_fatal!(
+            "vcpu_loop::continuation_reactor",
+            "host pipe creation failed when initializing wait reactor: errno={}",
+            std::io::Error::last_os_error()
+        );
     }
     for fd in fds {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -64,7 +72,11 @@ fn make_control_pipe() -> (OwnedFd, OwnedFd) {
             || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
             || unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0
         {
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::continuation_reactor",
+                "host fcntl configuration failed on reactor control pipe fd={fd}: errno={}",
+                std::io::Error::last_os_error()
+            );
         }
     }
     (unsafe { OwnedFd::from_raw_fd(fds[0]) }, unsafe {
@@ -3781,7 +3793,12 @@ impl CarrierWaitService {
         let handle = std::thread::Builder::new()
             .name("carrick-carrier-wait".to_owned())
             .spawn(move || CarrierWaitServiceInner::run_reactor(weak))
-            .unwrap_or_else(|_| std::process::abort());
+            .unwrap_or_else(|e| {
+                carrick_fatal!(
+                    "vcpu_loop::continuation_reactor",
+                    "host thread spawn failure for carrier wait reactor: error={e}"
+                );
+            });
         *inner.reactor.lock() = Some(handle);
         Self { inner }
     }
@@ -3822,7 +3839,11 @@ impl CarrierWaitService {
             },
         );
         if replaced.is_some() {
-            std::process::abort();
+            carrick_fatal!(
+                "vcpu_loop::continuation_registry",
+                "duplicate continuation token in active registration table: token={:?}",
+                token
+            );
         }
         #[cfg(test)]
         {
@@ -4662,7 +4683,13 @@ impl HvpatchTaskBinding {
     ) -> Result<(), E> {
         self.stage1_mm
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "HvpatchTaskBinding missing stage-1 MM lease when servicing pending COW invalidations: mm={:?}",
+                    self.identity.mm
+                );
+            })
             .service_pending_cow_invalidation(observer, invalidate)
     }
 
@@ -4672,14 +4699,27 @@ impl HvpatchTaskBinding {
     ) -> crate::hvpatch::CowInvalidationObserver {
         self.stage1_mm
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "HvpatchTaskBinding missing stage-1 MM lease when obtaining COW invalidation observer: mm={:?}, executor={:?}",
+                    self.identity.mm,
+                    executor
+                );
+            })
             .cow_invalidation_observer(executor)
     }
 
     pub(crate) fn foreign_stage1_identity(&self) -> carrick_hal::ForeignStage1Identity {
         self.stage1_mm
             .as_ref()
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "HvpatchTaskBinding missing stage-1 MM lease when extracting foreign stage-1 identity: mm={:?}",
+                    self.identity.mm
+                );
+            })
             .foreign_stage1_identity(self.identity.mm)
     }
 
@@ -5157,7 +5197,10 @@ impl ProcessDrain {
             match job.subscribe(Arc::new(move |_| {
                 let previous = callback_state.remaining.fetch_sub(1, Ordering::AcqRel);
                 if previous == 0 {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "vcpu_loop::process_drain",
+                        "underflow in job completion subscription count indicates double-completion"
+                    );
                 }
                 let waker = if previous == 1 {
                     callback_state.waker.lock().take()
@@ -5210,7 +5253,10 @@ impl ProcessDrain {
             match job.subscribe(Arc::new(move |_| {
                 let previous = callback_state.remaining.fetch_sub(1, Ordering::AcqRel);
                 if previous == 0 {
-                    std::process::abort();
+                    carrick_fatal!(
+                        "vcpu_loop::process_drain",
+                        "underflow in scheduler job completion subscription count indicates double-completion"
+                    );
                 }
                 if previous == 1
                     && let Some((scheduler, thread)) = &callback_state.scheduler_wake
@@ -6278,7 +6324,7 @@ mod tests {
         assert!(poll.contains("VcpuLoopOutcome::TrapLimit"));
         let exec_source = include_str!("exec.rs");
         assert!(exec_source.contains("pending_exec_replacement.replace"));
-        assert!(exec_source.contains("std::process::abort"));
+        assert!(exec_source.contains("carrick_fatal"));
         let exec_resume = production
             .split_once("fn finish_exec_suffix(")
             .expect("post-exec suffix boundary")
