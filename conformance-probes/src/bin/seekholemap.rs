@@ -80,6 +80,31 @@ fn main() {
         let phole = libc::lseek(pfd[0], 0, LINUX_SEEK_HOLE);
         let phole_err = if phole == -1 { errno() } else { 0 };
 
+        // LTP lseek11 discovers allocation granularity by repeatedly shrinking
+        // and writing one byte beyond EOF. Pre-sizing a sparse file above does
+        // not exercise this growth path. Report values, not guessed extents.
+        let cycle_offsets = [256i64, 512, 1024, 2048, 4096, 8192, 16384];
+        let mut cycle_results = Vec::new();
+        for offset in cycle_offsets {
+            let truncate_rc = libc::ftruncate(fd, 0);
+            let write_rc = libc::pwrite(fd, b"a".as_ptr().cast(), 1, offset);
+            let sync_rc = libc::fsync(fd);
+            let data = libc::lseek(fd, 0, LINUX_SEEK_DATA);
+            let data_errno = if data < 0 { errno() } else { 0 };
+            let hole = libc::lseek(fd, 0, LINUX_SEEK_HOLE);
+            let hole_errno = if hole < 0 { errno() } else { 0 };
+            cycle_results.push((
+                offset,
+                truncate_rc,
+                write_rc,
+                sync_rc,
+                data,
+                data_errno,
+                hole,
+                hole_errno,
+            ));
+        }
+
         libc::close(pfd[0]);
         libc::close(pfd[1]);
         libc::close(fd);
@@ -107,5 +132,16 @@ fn main() {
             pipe_seek_data_espipe = pdata == -1 && pdata_err == libc::ESPIPE,
             pipe_seek_hole_espipe = phole == -1 && phole_err == libc::ESPIPE,
         );
+        for (offset, truncate_rc, write_rc, sync_rc, data, data_errno, hole, hole_errno) in
+            cycle_results
+        {
+            println!("seek_cycle_{offset}_truncate_rc={truncate_rc}");
+            println!("seek_cycle_{offset}_write_rc={write_rc}");
+            println!("seek_cycle_{offset}_sync_rc={sync_rc}");
+            println!("seek_cycle_{offset}_data={data}");
+            println!("seek_cycle_{offset}_data_errno={data_errno}");
+            println!("seek_cycle_{offset}_hole={hole}");
+            println!("seek_cycle_{offset}_hole_errno={hole_errno}");
+        }
     }
 }
