@@ -18955,11 +18955,7 @@ pub(crate) fn current_thread_vcpu_created_total() -> u64 {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn vcpu_created(vcpu_id: u64) {
-    let lease = vcpu_census()
-        .admit()
-        .unwrap_or_else(|_| vcpu_census().adopt_lease());
-    vcpu_census().store_lease(vcpu_id, lease);
+fn vcpu_created() {
     VCPU_CREATED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     THREAD_VCPU_CREATED_TOTAL.set(THREAD_VCPU_CREATED_TOTAL.get().saturating_add(1));
 }
@@ -20019,7 +20015,7 @@ fn create_vcpu_with_permit(
             if let Some(permit) = permit {
                 register_admission_permit(vcpu.id(), permit.into_inner());
             }
-            vcpu_created(vcpu.id());
+            vcpu_created();
             Ok(vcpu)
         }
         Err(e) => {
@@ -20038,7 +20034,7 @@ fn create_vcpu(
     // that scheduler's bounded vCPU accounting.
     match vm.vcpu_create() {
         Ok(vcpu) => {
-            vcpu_created(vcpu.id());
+            vcpu_created();
             Ok(vcpu)
         }
         Err(e) => Err(TrapError::Hypervisor(format!(
@@ -20456,7 +20452,6 @@ fn enable_el0_counter_access(vcpu_id: applevisor_sys::hv_vcpu_t) {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn vcpu_destroyed(vcpu_id: u64) {
     release_admission_permit_for_vcpu(vcpu_id);
-    let _ = vcpu_census().remove_lease(vcpu_id);
     // A slot freed: wake a sibling thread blocked in the admission gate.
     vcpu_gate::notify();
 }
@@ -21505,6 +21500,7 @@ pub(crate) struct HvfVmState {
     vcpu_id: applevisor_sys::hv_vcpu_t,
     /// Cloneable worker-local handle for `hv_vcpus_exit`.
     vcpu_handle: applevisor::vcpu::VcpuHandle,
+    _vcpu_guard: Option<carrick_hal::VcpuLiveGuard>,
 }
 
 /// Carrier-owned index of live HVPatch address spaces available to foreign-MM
@@ -39860,6 +39856,7 @@ impl HvfVmState {
             syscall_transport,
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
+            _vcpu_guard: Some(vcpu_census().created()),
         };
         state.publish_live_vcpu();
         state.seed_readonly_spans_from_plan(plan);
@@ -43732,6 +43729,7 @@ impl HvfVmState {
         enable_el0_counter_access(vcpu.id());
         self.vcpu_id = vcpu.id();
         self.vcpu_handle = vcpu.get_handle();
+        self._vcpu_guard = Some(vcpu_census().created());
         self.publish_live_vcpu();
         let mailbox = self.allocate_mailbox_for_vcpu(&vcpu)?;
         Ok((vcpu, mailbox))
@@ -45734,6 +45732,7 @@ impl HvfVmState {
         let vcpu_id = vcpu.id();
         let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
         if rc == 0 {
+            self._vcpu_guard = None;
             vcpu_destroyed(vcpu_id);
         }
         if rc != 0 {
@@ -45763,6 +45762,7 @@ impl HvfVmState {
         let vcpu_id = vcpu.id();
         let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
         if rc == 0 {
+            self._vcpu_guard = None;
             vcpu_destroyed(vcpu_id);
         }
         if rc != 0 {
@@ -45791,6 +45791,7 @@ impl HvfVmState {
         Self::configure_executor_invariants(&new_vcpu)?;
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
+        self._vcpu_guard = Some(vcpu_census().created());
         self.publish_live_vcpu();
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
         self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox, None)?;
@@ -45842,6 +45843,7 @@ impl HvfVmState {
         Self::configure_executor_invariants(&new_vcpu)?;
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
+        self._vcpu_guard = Some(vcpu_census().created());
         self.publish_live_vcpu();
         // Replace the destroyed handle WITHOUT running applevisor's panicky Drop on
         // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
@@ -45862,6 +45864,7 @@ impl HvfVmState {
         let vcpu_id = vcpu.id();
         let vcpu_rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
         if vcpu_rc == 0 {
+            self._vcpu_guard = None;
             vcpu_destroyed(vcpu_id);
         }
         if vcpu_rc != 0 {
@@ -46139,6 +46142,7 @@ impl HvfVmState {
         let vcpu_id = vcpu.id();
         let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
         if rc == 0 {
+            self._vcpu_guard = None;
             vcpu_destroyed(vcpu_id);
         }
     }
@@ -46241,6 +46245,7 @@ impl HvfVmState {
             syscall_transport: spec.syscall_transport,
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
+            _vcpu_guard: Some(vcpu_census().created()),
         };
         state.publish_live_vcpu();
         Self::configure_executor_invariants(&vcpu)?;
@@ -46442,6 +46447,7 @@ impl HvfVmState {
             syscall_transport,
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
+            _vcpu_guard: Some(vcpu_census().created()),
         };
         state.publish_live_vcpu();
 
@@ -48380,6 +48386,7 @@ impl HvfVmState {
             syscall_transport: plan.syscall_transport,
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
+            _vcpu_guard: Some(vcpu_census().created()),
         };
         state.publish_live_vcpu();
         let mailbox = match state.allocate_mailbox_for_vcpu(&vcpu) {
@@ -48816,6 +48823,7 @@ impl HvfVmState {
             let inherited_vcpu_id = vcpu.id();
             let vcpu_destroy_rc = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
             if vcpu_destroy_rc == 0 {
+                self._vcpu_guard = None;
                 vcpu_destroyed(inherited_vcpu_id);
             }
             destroy_vm_with_custody(&self.carrier_foreign_mm_transport.custody, "execve_rebuild")?;
@@ -49365,6 +49373,7 @@ impl HvfVmState {
                 )
             })?;
             commit_pending_creation_before_vcpu_handoff(pending_creation)?;
+            self._vcpu_guard = Some(vcpu_census().created());
             self.vcpu_id = new_vcpu.id();
             self.vcpu_handle = new_vcpu.get_handle();
             self.publish_live_vcpu();
