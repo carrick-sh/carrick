@@ -12,6 +12,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+carrick-fatal.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 parking_lot.workspace = true

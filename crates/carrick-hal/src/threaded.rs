@@ -13,6 +13,8 @@ pub use carrick_guest_mem::{HostVa, SharedFutexLocation};
 use crate::error::{OsError, Reg, SysReg};
 use crate::trap::{SyscallTrap, TrapError};
 
+use carrick_fatal::carrick_fatal;
+
 /// The process-local thread/vCPU **registry key**.
 ///
 /// This is the key a guest thread is filed under in every per-process table:
@@ -376,29 +378,53 @@ impl VcpuRegistryState {
         callback: VcpuLeaseChangeCallback,
     ) -> u64 {
         let listener_id = NonZeroU64::new(self.next_listener)
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hal::vcpu_lease",
+                    "next vCPU lease listener identifier was zero: next_listener={}",
+                    self.next_listener
+                );
+            })
             .get();
-        self.next_listener = self
-            .next_listener
-            .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+        self.next_listener = self.next_listener.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hal::vcpu_lease",
+                "next vCPU lease listener identifier overflowed u64 counter: next_listener={}",
+                self.next_listener
+            );
+        });
         let replaced = self
             .listeners
             .insert(listener_id, VcpuLeaseListener { kind, callback });
         if replaced.is_some() {
-            std::process::abort();
+            carrick_fatal!(
+                "hal::vcpu_lease",
+                "duplicate listener identifier collided in active vCPU lease listener map: listener_id={listener_id}"
+            );
         }
         listener_id
     }
 
     fn next_freeze_generation(&mut self) -> u64 {
         let generation = NonZeroU64::new(self.next_freeze_generation)
-            .unwrap_or_else(|| std::process::abort())
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hal::vcpu_freeze",
+                    "next vCPU registry freeze generation was zero: next_freeze_generation={}",
+                    self.next_freeze_generation
+                );
+            })
             .get();
         self.next_freeze_generation = self
             .next_freeze_generation
             .checked_add(1)
-            .unwrap_or_else(|| std::process::abort());
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hal::vcpu_freeze",
+                    "next vCPU registry freeze generation overflowed u64 counter: next_freeze_generation={}",
+                    self.next_freeze_generation
+                );
+            });
         generation
     }
 
@@ -443,7 +469,14 @@ impl Drop for VcpuLeaseDrainGuard {
                     state.freeze = None;
                     state.take_listeners(VcpuLeaseListenerKind::Thaw)
                 }
-                Some(_) | None => std::process::abort(),
+                Some(_) | None => {
+                    carrick_fatal!(
+                        "hal::vcpu_freeze",
+                        "vCPU lease drain guard dropped while registry freeze was missing or owned by another thread or generation: expected_owner={:?} expected_gen={}",
+                        self.owner,
+                        self.generation
+                    );
+                }
             }
         };
         for callback in callbacks {

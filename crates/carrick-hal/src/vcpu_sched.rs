@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
+use carrick_fatal::carrick_fatal;
+
 pub type SlotId = u32;
 
 /// Why a thread is giving its slot back.
@@ -257,7 +259,12 @@ impl HostCondvarScheduler {
             let request = st
                 .subscribed
                 .remove(&ticket)
-                .unwrap_or_else(|| std::process::abort());
+                .unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hal::vcpu_sched",
+                        "subscribed admission ticket {ticket} present in wait queue was missing from subscribed map during grant dispatch"
+                    );
+                });
             grants.push((request.ready, lease));
         }
         grants

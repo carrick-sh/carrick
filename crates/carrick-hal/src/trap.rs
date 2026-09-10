@@ -12,6 +12,7 @@
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use carrick_abi::{CanonicalNr, LinuxSiginfo, NativeNr};
+use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{Gpa, GuestVa};
 use carrick_mem::memory::AddressSpace;
 use serde::Serialize;
@@ -276,12 +277,10 @@ pub trait SyscallTrap {
         // away and surface as a generic "unsupported platform" at process exit,
         // masking the real cause. Aborting here names the offending va/ipa/len at
         // the exact call site.
-        eprintln!(
-            "carrick: FATAL: SyscallTrap::map_host_alias reached the trait default \
-             (va={va:#x} ipa={ipa:#x} len={len:#x}) — this engine emitted a MapHostAlias \
-             outcome it cannot service. Implement map_host_alias for this platform."
+        carrick_fatal!(
+            "hal::trap",
+            "SyscallTrap::map_host_alias reached trait default: unserviced MapHostAlias outcome for va={va:#x} ipa={ipa:#x} len={len:#x}"
         );
-        std::process::abort()
     }
 }
 

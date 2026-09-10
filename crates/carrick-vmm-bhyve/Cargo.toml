@@ -20,6 +20,7 @@ workspace = true
 # to the system `libvmmapi` (linked via `#[link(name = "vmmapi")]`) and depends
 # on the shared leaf crates plus x86 engine, not on carrick-runtime.
 [dependencies]
+carrick-fatal.workspace = true
 carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }

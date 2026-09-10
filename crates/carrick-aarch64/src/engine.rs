@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use carrick_abi::LinuxSiginfo;
+use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{
     CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
@@ -2497,9 +2498,19 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             // deterministically. It is also the crash that killed
             // `cpython-multiprocessing_spawn`.
             self.vm.abandon_alias_inventory();
-            let cleanup_len = usize::try_from(len).unwrap_or_else(|_| std::process::abort());
-            if self.unmap_alias_range(va.raw(), cleanup_len).is_err() {
-                std::process::abort();
+            let cleanup_len = usize::try_from(len).unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "aarch64::alias_cleanup",
+                    "host alias mapping length {len:#x} exceeded host pointer width during failure cleanup unwinding"
+                );
+            });
+            if let Err(unmap_error) = self.unmap_alias_range(va.raw(), cleanup_len) {
+                carrick_fatal!(
+                    "aarch64::alias_cleanup",
+                    "failed to unmap staged alias range at {:#x} (len {:#x}) after hypervisor alias mapping failure: {unmap_error}",
+                    va.raw(),
+                    cleanup_len
+                );
             }
             return Err(TrapError::Hypervisor(error.to_string()));
         }
@@ -2775,7 +2786,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         identity: carrick_hal::FrameCowIdentity,
     ) {
         if self.mm_generation != identity.mm {
-            std::process::abort();
+            carrick_fatal!(
+                "aarch64::cow_identity",
+                "bound memory management generation mismatch against frame COW identity: expected mm={} vs actual mm={}",
+                self.mm_generation,
+                identity.mm
+            );
         }
         // FrameCowIdentity carries the numeric hardware ASID, not the strong
         // allocation generation. `bind_task_snapshot_identity` installed that
@@ -3443,10 +3459,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     Ok(PageTableApplyOutcome::new(true, true))
                 });
                 if let Err(rollback_error) = rollback_result {
-                    eprintln!(
-                        "carrick: FATAL: HVPatch parent fork-COW rollback TLBI failed after {error}: {rollback_error}"
+                    carrick_fatal!(
+                        "aarch64::fork_cow",
+                        "failed page table rollback and TLBI invalidation during parent fork COW setup after error {error}: {rollback_error}"
                     );
-                    std::process::abort();
                 }
                 self.vm
                     .restore_frame_cow_arm_snapshot(parent_armed_snapshot);
@@ -3467,20 +3483,20 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         if let Err(error) = vcpu.restore_thread_start(&spec.snapshot) {
             vm.abort_process_materialization(&mut vcpu)
                 .unwrap_or_else(|rollback_error| {
-                    eprintln!(
-                        "carrick: FATAL: abort process materialization after register restore failure {error}: {rollback_error}"
+                    carrick_fatal!(
+                        "aarch64::process_materialize",
+                        "failed to abort and roll back process materialization after thread register restore failure {error}: {rollback_error}"
                     );
-                    std::process::abort();
                 });
             return Err(error);
         }
         if let Err(error) = vm.commit_process_materialization() {
             vm.abort_process_materialization(&mut vcpu)
                 .unwrap_or_else(|rollback_error| {
-                    eprintln!(
-                        "carrick: FATAL: abort process materialization after commit failure {error}: {rollback_error}"
+                    carrick_fatal!(
+                        "aarch64::process_materialize",
+                        "failed to abort and roll back process materialization after commit failure {error}: {rollback_error}"
                     );
-                    std::process::abort();
                 });
             return Err(error);
         }
