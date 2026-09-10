@@ -854,3 +854,6 @@ pub(crate) fn final_exec_physical_extents(
     }
     Ok(physical)
 }
+
+#[cfg(test)]
+pub(crate) mod tests;
