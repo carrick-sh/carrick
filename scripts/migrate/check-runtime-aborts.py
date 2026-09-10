@@ -16,6 +16,7 @@ REQUIRED_SHARDS = frozenset(SHARD_NAMES)
 
 EXCLUDED_CRATE_PREFIXES = (
     "crates/carrick-conformance",
+    "crates/carrick-fatal",  # the sink itself: the one legitimate raw abort
     "crates/carrick-dsr",
     "crates/carrick-native-darwin",
 )
