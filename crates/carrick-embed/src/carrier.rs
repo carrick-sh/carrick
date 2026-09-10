@@ -101,6 +101,7 @@ pub struct Carrier {
 impl Carrier {
     /// Start an explicit carrier. A process may own only one at a time.
     pub fn new() -> Result<Self, EmbedError> {
+        carrick_runtime::host_process::prepare();
         let runtime = CarrierRuntime::new_explicit()
             .map_err(|error| EmbedError::from_runtime(error, crate::error::Phase::Prepare))?;
         let finalizer = Arc::new(Finalizer {

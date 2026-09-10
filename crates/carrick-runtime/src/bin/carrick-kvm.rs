@@ -55,32 +55,42 @@ fn main() {
             let mut argv = vec![entrypoint.clone()];
             argv.extend(rest);
             let spec = carrick_spec::RunSpec {
-                cap_add: Vec::new(),
-                executable: entrypoint,
-                argv,
-                envp: vec![
-                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-                    "HOME=/root".to_string(),
-                    "HOSTNAME=carrick".to_string(),
-                ],
-                cwd: None,
-                rootfs_layers: layers,
-                fs_backend: carrick_spec::FsBackendKind::Host,
-                mounts: Vec::new(),
-                tty: false,
-                stdio: carrick_spec::StdioMode::Captured,
-                max_traps: carrick_runtime::runtime::DEFAULT_MAX_TRAPS,
-                debug_state_path: None,
+                process: carrick_spec::ProcessSpec {
+                    executable: entrypoint,
+                    argv,
+                    envp: vec![
+                        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                            .to_string(),
+                        "HOME=/root".to_string(),
+                        "HOSTNAME=carrick".to_string(),
+                    ],
+                    cwd: None,
+                    tty: false,
+                    stdio: carrick_spec::StdioMode::Captured,
+                    uid: carrick_abi::NsUid::ROOT,
+                    gid: carrick_abi::NsGid::ROOT,
+                    pid: carrick_spec::PidMode::default(),
+                },
+                mounts: carrick_spec::MountSpec {
+                    rootfs_layers: layers,
+                    fs_backend: carrick_spec::FsBackendKind::Host,
+                    mounts: Vec::new(),
+                },
+                network: carrick_spec::NetworkSpec {
+                    namespace: carrick_spec::NetworkNamespaceSpec::default(),
+                    extra_hosts: Vec::new(),
+                    hostname: None,
+                },
+                resources: carrick_spec::ResourceSpec {
+                    max_traps: carrick_runtime::runtime::DEFAULT_MAX_TRAPS,
+                    debug_state_path: None,
+                },
+                security: carrick_spec::SecuritySpec {
+                    seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
+                    cap_add: Vec::new(),
+                },
                 platform: carrick_spec::Platform::default(),
-                pid: carrick_spec::PidMode::default(),
-                hostname: None,
-                network: carrick_spec::NetworkNamespaceSpec::default(),
-                extra_hosts: Vec::new(),
-                uid: 0,
-                gid: 0,
-                // run-oci is a container-shaped dev driver: model docker's
-                // launch-time default seccomp policy like `carrick run`.
-                seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
+                exec_backend: carrick_spec::ExecBackendRequest::default(),
             };
             match carrick_runtime::runtime::run_oci(&spec) {
                 Ok(result) => {

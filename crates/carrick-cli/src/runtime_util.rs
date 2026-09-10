@@ -247,21 +247,7 @@ pub(crate) fn parse_env_file(path: &std::path::Path) -> anyhow::Result<Vec<Strin
     Ok(envs)
 }
 
-/// Run a single OCI-related future on a short-lived current-thread tokio
-/// runtime. The runtime is dropped before returning, so by the time the
-/// guest issues `clone(2)` and we fork the host process there is no
-/// async runtime alive in the parent to corrupt the child.
-pub(crate) fn block_on_oci<F: std::future::Future>(fut: F) -> F::Output {
-    // INVARIANT: fatal at startup - if the host cannot even build a
-    // current-thread tokio runtime there is nothing to recover to; aborting
-    // here (before any guest forks) is the correct, safe failure mode.
-    #[allow(clippy::expect_used)]
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build current-thread tokio runtime")
-        .block_on(fut)
-}
+pub(crate) use carrick_engine::block_on_oci;
 
 #[cfg(test)]
 mod fork_isolation_tests {

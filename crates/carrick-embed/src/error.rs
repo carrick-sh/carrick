@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use camino::Utf8PathBuf;
 use carrick_runtime::dispatch::DispatchError;
 use carrick_runtime::kernel::debug::PostMortem;
 use carrick_runtime::runtime::RuntimeError;
@@ -15,6 +16,34 @@ use crate::{ContainerId, Signal};
 /// [`TrapError::Hypervisor`]. There is no typed variant to match on today.
 const HV_DENIED_HEX: &str = "0xfae94007";
 
+/// A configuration error discovered when building a container description.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BuildError {
+    /// The container's image reference is empty or cannot be parsed.
+    #[error("invalid image reference {image:?}: {reason}")]
+    InvalidImageRef { image: String, reason: String },
+    /// The working directory is empty or contains invalid characters.
+    #[error("invalid working directory {workdir:?}: {reason}")]
+    InvalidWorkdir { workdir: String, reason: String },
+    /// The user specification is not numeric `uid[:gid]`.
+    #[error("invalid user {user:?}: {reason}")]
+    InvalidUser { user: String, reason: String },
+    /// An environment variable key is empty, contains `=`, or contains invalid characters.
+    #[error("invalid environment variable {key:?}: {reason}")]
+    InvalidEnv { key: String, reason: String },
+    /// A host or guest mount path is not absolute.
+    #[error("invalid mount {source_path} -> {target_path}: {reason}")]
+    InvalidMount {
+        source_path: Utf8PathBuf,
+        target_path: Utf8PathBuf,
+        reason: String,
+    },
+    /// A custom VFS mount target path is not absolute.
+    #[error("invalid vfs mount at {target}: {reason}")]
+    InvalidVfsMount { target: Utf8PathBuf, reason: String },
+}
+
 /// Why an embedded run did not produce a [`crate::ContainerResult`].
 ///
 /// Linux outcomes delivered to the guest (errno denials, faults) are never an
@@ -24,6 +53,9 @@ const HV_DENIED_HEX: &str = "0xfae94007";
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EmbedError {
+    /// A configuration error discovered when building the container.
+    #[error(transparent)]
+    Build(#[from] BuildError),
     /// Another explicit or implicit carrier still owns this host process.
     #[error("an independent Carrick carrier is already active in this host process")]
     CarrierAlreadyActive,

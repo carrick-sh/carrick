@@ -250,7 +250,8 @@ pub fn guest_hostname() -> String {
 }
 
 pub(crate) fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {
-    spec.hostname
+    spec.network
+        .hostname
         .as_deref()
         .filter(|hostname| !hostname.is_empty())
         .map(Cow::Borrowed)
