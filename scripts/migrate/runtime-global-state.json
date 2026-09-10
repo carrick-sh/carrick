@@ -1684,7 +1684,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
       "symbol": "tests::clone_admission_terminal_claim_cost_receipt::CARRICK_HANDOFF_PERF_ITERATIONS",
       "fingerprint": "d8c13a13ecbc912d8eefc2783675658f04dbc51fedcbe50a5e580828ae136b35",
       "classification": "test_only",
@@ -1692,7 +1692,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
       "symbol": "tests::clone_admission_terminal_claim_cost_receipt::CARRICK_HANDOFF_PERF_SAMPLES",
       "fingerprint": "2344175e9c90df709feedc32257de58f569ac5546fb850762c7c8143d893aa45",
       "classification": "test_only",
@@ -1700,7 +1700,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
       "symbol": "tests::clone_admission_terminal_claim_cost_receipt::CARRICK_HANDOFF_PERF_WARMUPS",
       "fingerprint": "64dadf48c6448d74008a80ff8c4b1187583cbac313db5f6762ef7a045db4eeef",
       "classification": "test_only",
