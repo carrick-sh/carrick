@@ -7464,7 +7464,7 @@
       "categories": [
         "epoll"
       ],
-      "text": "//!   / [`DispatchOutcome::WaitOnPollFds`] (poll/select/epoll-style fd readiness,",
+      "text": "//!   (poll/select/epoll-style fd readiness,",
       "scope_kind": "production_callsite"
     },
     {
