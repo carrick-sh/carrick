@@ -628,7 +628,6 @@ pub const LIVE_ORACLE_PROBES: &[&str] = &[
     "posixtimers",
     "ppollsig",
     "ppollwaitset",
-    "procselffdfail",
     "pselecteintr",
     "ptyjobcontrol",
     "selecttimeout",
