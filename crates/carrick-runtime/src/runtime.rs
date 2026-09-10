@@ -3099,6 +3099,10 @@ mod tests {
             ("kernel/mm_access.rs", [0, 0, 1]),
             ("network/socket_namespace.rs", [7, 0, 0]),
             ("run_state.rs", [1, 0, 0]),
+            // One cfg(test)-only helper self-spawns the exact lock-order or
+            // terminal-retirement regression, bounds it, and reaps its child.
+            // No production process creation is added by this test containment.
+            ("vcpu_loop/continuation.rs", [0, 0, 1]),
             // This unit test self-spawns to isolate a process-global abort
             // boundary while proving pending exec error preservation. It is
             // not production host-process-per-guest architecture.

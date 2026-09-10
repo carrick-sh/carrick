@@ -5263,8 +5263,7 @@ mod tests {
     use super::*;
 
     fn spawn_contained_test_child(test_name: &str, marker: &str) -> std::process::Child {
-        let spawn_cmd = std::process::Command::new;
-        spawn_cmd(std::env::current_exe().expect("test executable"))
+        std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .env(marker, "1")
             .stdin(std::process::Stdio::null())
