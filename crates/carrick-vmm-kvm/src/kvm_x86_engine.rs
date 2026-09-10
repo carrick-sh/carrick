@@ -105,7 +105,7 @@ impl KvmVmm {
     fn adopt_child_vm(&mut self, vcpu: &mut KvmVcpu, new_vm: KvmVm, new_vcpu: KvmVcpu) {
         self.vm = new_vm;
         *vcpu = new_vcpu;
-        crate::kvm::VCPU_LIVE.store(1, std::sync::atomic::Ordering::SeqCst);
+        crate::kvm::vcpu_census().reset(1);
         let page_tables = self
             .page_tables
             .lock()

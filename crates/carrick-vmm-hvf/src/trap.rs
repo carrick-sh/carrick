@@ -18936,11 +18936,11 @@ impl AliasRemapLimiter {
     }
 }
 
-/// Process-global count of live HVF vCPUs (created minus destroyed). Pure
-/// diagnostic: reported in the fork__quiesce phase-2 probe so a `carrick trace`
-/// shows exactly how many vCPUs are alive when the forker calls hv_vm_destroy.
+/// Process-global count of live HVF vCPUs, managed via [`carrick_hal::VcpuCensus`].
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub static VCPU_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub fn vcpu_census() -> &'static carrick_hal::VcpuCensus {
+    carrick_hal::vcpu_census::global()
+}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) static VCPU_CREATED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -18955,8 +18955,11 @@ pub(crate) fn current_thread_vcpu_created_total() -> u64 {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn vcpu_created() {
-    VCPU_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+fn vcpu_created(vcpu_id: u64) {
+    let lease = vcpu_census()
+        .admit()
+        .unwrap_or_else(|_| vcpu_census().adopt_lease());
+    vcpu_census().store_lease(vcpu_id, lease);
     VCPU_CREATED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     THREAD_VCPU_CREATED_TOTAL.set(THREAD_VCPU_CREATED_TOTAL.get().saturating_add(1));
 }
@@ -20016,7 +20019,7 @@ fn create_vcpu_with_permit(
             if let Some(permit) = permit {
                 register_admission_permit(vcpu.id(), permit.into_inner());
             }
-            vcpu_created();
+            vcpu_created(vcpu.id());
             Ok(vcpu)
         }
         Err(e) => {
@@ -20035,7 +20038,7 @@ fn create_vcpu(
     // that scheduler's bounded vCPU accounting.
     match vm.vcpu_create() {
         Ok(vcpu) => {
-            vcpu_created();
+            vcpu_created(vcpu.id());
             Ok(vcpu)
         }
         Err(e) => Err(TrapError::Hypervisor(format!(
@@ -20453,7 +20456,7 @@ fn enable_el0_counter_access(vcpu_id: applevisor_sys::hv_vcpu_t) {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn vcpu_destroyed(vcpu_id: u64) {
     release_admission_permit_for_vcpu(vcpu_id);
-    VCPU_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    let _ = vcpu_census().remove_lease(vcpu_id);
     // A slot freed: wake a sibling thread blocked in the admission gate.
     vcpu_gate::notify();
 }
