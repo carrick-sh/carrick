@@ -7887,6 +7887,30 @@ where
         )
     }
 
+    fn step_trap_watchdog<C, W>(&mut self, clock: C, max_wall: W) -> TrapWatchdog
+    where
+        C: FnOnce(&Instant) -> Duration,
+        W: FnOnce() -> Duration,
+    {
+        let signal_progress = signal_progress_count();
+        if signal_progress != self.seen_signal_progress {
+            self.seen_signal_progress = signal_progress;
+            self.budget_floor = self.traps;
+            self.last_signal_progress = Instant::now();
+        }
+        let decision = trap_watchdog_decision(
+            self.traps.saturating_sub(self.budget_floor),
+            self.state.max_traps,
+            || clock(&self.last_signal_progress),
+            max_wall,
+        );
+        if decision == TrapWatchdog::ResetBudget {
+            self.budget_floor = self.traps;
+            self.last_signal_progress = Instant::now();
+        }
+        decision
+    }
+
     fn poll_with_engine(
         &mut self,
         engine: &mut E,
@@ -8318,23 +8342,8 @@ where
                 executor::ExecutorExit::Preempted,
             ));
         }
-        let signal_progress = signal_progress_count();
-        if signal_progress != self.seen_signal_progress {
-            self.seen_signal_progress = signal_progress;
-            self.budget_floor = self.traps;
-            self.last_signal_progress = Instant::now();
-        }
-        match trap_watchdog_decision(
-            self.traps.saturating_sub(self.budget_floor),
-            self.state.max_traps,
-            self.last_signal_progress.elapsed(),
-            trap_watchdog_wall_window(),
-        ) {
-            TrapWatchdog::KeepRunning => {}
-            TrapWatchdog::ResetBudget => {
-                self.budget_floor = self.traps;
-                self.last_signal_progress = Instant::now();
-            }
+        match self.step_trap_watchdog(Instant::elapsed, trap_watchdog_wall_window) {
+            TrapWatchdog::KeepRunning | TrapWatchdog::ResetBudget => {}
             TrapWatchdog::Trip => {
                 let context = self
                     .state
@@ -11718,15 +11727,19 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
 /// delivered-signal progress for `elapsed >= max_wall`; otherwise the count
 /// budget is reset and the guest keeps running. Pure so the trip / no-trip
 /// boundaries are unit-testable without a live vCPU.
-fn trap_watchdog_decision(
+fn trap_watchdog_decision<E, W>(
     traps_since_signal: usize,
     max_traps: usize,
-    elapsed: std::time::Duration,
-    max_wall: std::time::Duration,
-) -> TrapWatchdog {
+    elapsed: E,
+    max_wall: W,
+) -> TrapWatchdog
+where
+    E: FnOnce() -> std::time::Duration,
+    W: FnOnce() -> std::time::Duration,
+{
     if traps_since_signal <= max_traps {
         TrapWatchdog::KeepRunning
-    } else if elapsed >= max_wall {
+    } else if elapsed() >= max_wall() {
         TrapWatchdog::Trip
     } else {
         TrapWatchdog::ResetBudget
@@ -15417,12 +15430,22 @@ mod tests {
         // Below the count pre-filter, the wall clock is irrelevant — never trip,
         // even after a long elapsed window.
         assert_eq!(
-            trap_watchdog_decision(100, 1000, Duration::from_secs(60), Duration::from_secs(30)),
+            trap_watchdog_decision(
+                100,
+                1000,
+                || Duration::from_secs(60),
+                || Duration::from_secs(30)
+            ),
             TrapWatchdog::KeepRunning
         );
         // Exactly AT the count threshold is still under (the guard uses `>`).
         assert_eq!(
-            trap_watchdog_decision(1000, 1000, Duration::from_secs(60), Duration::from_secs(30)),
+            trap_watchdog_decision(
+                1000,
+                1000,
+                || Duration::from_secs(60),
+                || Duration::from_secs(30)
+            ),
             TrapWatchdog::KeepRunning
         );
     }
@@ -15435,8 +15458,8 @@ mod tests {
             trap_watchdog_decision(
                 1001,
                 1000,
-                Duration::from_millis(100),
-                Duration::from_secs(30)
+                || Duration::from_millis(100),
+                || Duration::from_secs(30)
             ),
             TrapWatchdog::ResetBudget
         );
@@ -15445,8 +15468,8 @@ mod tests {
             trap_watchdog_decision(
                 2_000_000,
                 1000,
-                Duration::from_millis(29_999),
-                Duration::from_millis(30_000)
+                || Duration::from_millis(29_999),
+                || Duration::from_millis(30_000)
             ),
             TrapWatchdog::ResetBudget
         );
@@ -15457,18 +15480,255 @@ mod tests {
         // Over the count pre-filter AND no progress for >= max_wall → abort.
         // The boundary is inclusive (`>=`): exactly max_wall trips.
         assert_eq!(
-            trap_watchdog_decision(1001, 1000, Duration::from_secs(30), Duration::from_secs(30)),
+            trap_watchdog_decision(
+                1001,
+                1000,
+                || Duration::from_secs(30),
+                || Duration::from_secs(30)
+            ),
             TrapWatchdog::Trip
         );
         assert_eq!(
             trap_watchdog_decision(
                 1_000_000,
                 1000,
-                Duration::from_secs(45),
-                Duration::from_secs(30)
+                || Duration::from_secs(45),
+                || Duration::from_secs(30)
             ),
             TrapWatchdog::Trip
         );
+    }
+
+    #[test]
+    fn trap_watchdog_decision_gates_clock_and_window_reads() {
+        use std::cell::Cell;
+
+        let clock_reads = Cell::new(0_usize);
+        let window_reads = Cell::new(0_usize);
+        let clock = || {
+            clock_reads.set(clock_reads.get() + 1);
+            Duration::from_secs(10)
+        };
+        let window = || {
+            window_reads.set(window_reads.get() + 1);
+            Duration::from_secs(30)
+        };
+
+        // 1. Below threshold: zero clock/window reads.
+        let decision = trap_watchdog_decision(500, 1000, clock, window);
+        assert_eq!(decision, TrapWatchdog::KeepRunning);
+        assert_eq!(
+            clock_reads.get(),
+            0,
+            "below count prefilter must perform 0 clock reads"
+        );
+        assert_eq!(
+            window_reads.get(),
+            0,
+            "below count prefilter must perform 0 window reads"
+        );
+
+        // 2. Exactly at threshold: zero clock/window reads.
+        let decision = trap_watchdog_decision(1000, 1000, clock, window);
+        assert_eq!(decision, TrapWatchdog::KeepRunning);
+        assert_eq!(
+            clock_reads.get(),
+            0,
+            "exact count threshold must perform 0 clock reads"
+        );
+        assert_eq!(
+            window_reads.get(),
+            0,
+            "exact count threshold must perform 0 window reads"
+        );
+
+        // 3. usize::MAX threshold (ecosystem invocation): zero clock/window reads.
+        let decision = trap_watchdog_decision(10_000_000, usize::MAX, clock, window);
+        assert_eq!(decision, TrapWatchdog::KeepRunning);
+        assert_eq!(
+            clock_reads.get(),
+            0,
+            "usize::MAX threshold must perform 0 clock reads"
+        );
+        assert_eq!(
+            window_reads.get(),
+            0,
+            "usize::MAX threshold must perform 0 window reads"
+        );
+
+        // 4. Above threshold: exactly 1 clock read and 1 window read.
+        let decision = trap_watchdog_decision(1001, 1000, clock, window);
+        assert_eq!(decision, TrapWatchdog::ResetBudget);
+        assert_eq!(
+            clock_reads.get(),
+            1,
+            "above count threshold must perform 1 clock read"
+        );
+        assert_eq!(
+            window_reads.get(),
+            1,
+            "above count threshold must perform 1 window read"
+        );
+    }
+
+    #[test]
+    fn trap_watchdog_step_seam_proves_call_path_zero_reads_and_signal_reset() {
+        use std::cell::Cell;
+
+        let (process, root) = crate::hvpatch::process_context_for_tests(70_222);
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.bind_hvpatch_process(process.clone());
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            Some(process.clone()),
+            None,
+            None,
+        ));
+        let this_tid = ThreadId::synthetic_for_tests(70_222);
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+
+        let clock_reads = Cell::new(0_usize);
+        let window_reads = Cell::new(0_usize);
+        let clock = |_last: &Instant| {
+            clock_reads.set(clock_reads.get() + 1);
+            Duration::from_millis(100)
+        };
+        let window = || {
+            window_reads.set(window_reads.get() + 1);
+            Duration::from_secs(30)
+        };
+
+        // Below threshold (traps = 500, max_traps = 1000): 0 clock reads, 0 window reads.
+        job.traps = 500;
+        let decision = job.step_trap_watchdog(clock, window);
+        assert_eq!(decision, TrapWatchdog::KeepRunning);
+        assert_eq!(
+            clock_reads.get(),
+            0,
+            "call path below count threshold must perform 0 clock reads"
+        );
+        assert_eq!(
+            window_reads.get(),
+            0,
+            "call path below count threshold must perform 0 window reads"
+        );
+
+        // Exactly at threshold (traps = 1000, max_traps = 1000): 0 clock reads, 0 window reads.
+        job.traps = 1000;
+        let decision = job.step_trap_watchdog(clock, window);
+        assert_eq!(decision, TrapWatchdog::KeepRunning);
+        assert_eq!(
+            clock_reads.get(),
+            0,
+            "call path at exact count threshold must perform 0 clock reads"
+        );
+        assert_eq!(
+            window_reads.get(),
+            0,
+            "call path at exact count threshold must perform 0 window reads"
+        );
+
+        // Above threshold (traps = 1001, max_traps = 1000): 1 clock read, 1 window read -> ResetBudget.
+        job.traps = 1001;
+        let decision = job.step_trap_watchdog(clock, window);
+        assert_eq!(decision, TrapWatchdog::ResetBudget);
+        assert_eq!(
+            clock_reads.get(),
+            1,
+            "call path above count threshold must read clock"
+        );
+        assert_eq!(
+            window_reads.get(),
+            1,
+            "call path above count threshold must read window"
+        );
+        assert_eq!(
+            job.budget_floor, 1001,
+            "budget floor must reset to current traps on ResetBudget"
+        );
+
+        // Next step after budget reset (traps = 1002, budget_floor = 1001, delta = 1 <= 1000): 0 reads.
+        job.traps = 1002;
+        let decision = job.step_trap_watchdog(clock, window);
+        assert_eq!(decision, TrapWatchdog::KeepRunning);
+        assert_eq!(
+            clock_reads.get(),
+            1,
+            "call path after budget reset must perform 0 new clock reads"
+        );
+        assert_eq!(
+            window_reads.get(),
+            1,
+            "call path after budget reset must perform 0 new window reads"
+        );
+
+        // Now test max_traps = usize::MAX (ecosystem workload pattern)
+        job.state.max_traps = usize::MAX;
+        job.traps = 50_000_000;
+        let decision = job.step_trap_watchdog(clock, window);
+        assert_eq!(decision, TrapWatchdog::KeepRunning);
+        assert_eq!(
+            clock_reads.get(),
+            1,
+            "usize::MAX max_traps must perform 0 new clock reads"
+        );
+        assert_eq!(
+            window_reads.get(),
+            1,
+            "usize::MAX max_traps must perform 0 new window reads"
+        );
+
+        // Now test signal progress independently resets budget floor without reading clock
+        job.state.max_traps = 1000;
+        job.traps = 2000; // traps_since_signal would be 2000 - 1001 = 999 <= 1000
+        // Simulate a new signal progress event by modifying seen_signal_progress
+        job.seen_signal_progress = signal_progress_count().wrapping_sub(1);
+        let decision = job.step_trap_watchdog(clock, window);
+        assert_eq!(decision, TrapWatchdog::KeepRunning);
+        assert_eq!(
+            job.budget_floor, 2000,
+            "signal progress must update budget floor to traps"
+        );
+        assert_eq!(job.seen_signal_progress, signal_progress_count());
+        assert_eq!(
+            clock_reads.get(),
+            1,
+            "signal progress reset must not require clock read if delta <= max_traps"
+        );
+
+        // Now test Trip condition: traps above threshold and elapsed >= max_wall
+        job.traps = 3500; // delta = 3500 - 2000 = 1500 > 1000
+        let trip_clock = |_last: &Instant| {
+            clock_reads.set(clock_reads.get() + 1);
+            Duration::from_secs(35)
+        };
+        let decision = job.step_trap_watchdog(trip_clock, window);
+        assert_eq!(decision, TrapWatchdog::Trip);
+        assert_eq!(clock_reads.get(), 2);
+        assert_eq!(window_reads.get(), 2);
     }
 
     /// Editing stage-1 and NEEDING A PAUSE are different questions, and the
