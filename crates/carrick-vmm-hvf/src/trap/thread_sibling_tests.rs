@@ -818,14 +818,17 @@ fn persistent_worker_invariant_configuration_is_complete_and_audited() {
         );
     }
 
-    let factory = include_str!("../trap.rs")
-        .split("pub(crate) fn from_persistent_executor_spec")
-        .nth(1)
-        .and_then(|tail| {
-            tail.split("pub(crate) fn audit_persistent_executor_idle")
-                .next()
-        })
-        .expect("persistent factory body");
+    let factory = concat!(
+        include_str!("../trap.rs"),
+        include_str!("persistent_executor.rs")
+    )
+    .split("pub(crate) fn from_persistent_executor_spec")
+    .nth(1)
+    .and_then(|tail| {
+        tail.split("pub(crate) fn audit_persistent_executor_idle")
+            .next()
+    })
+    .expect("persistent factory body");
     let configure = factory
         .find("Self::configure_executor_invariants(&vcpu)")
         .expect("factory configures the fresh owner-thread vCPU");
