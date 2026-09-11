@@ -130,7 +130,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::FsView::fd_is_controlling_tty::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "line": 205,
+      "line": 216,
       "item": "FsView::fd_is_controlling_tty",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -139,7 +139,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::FsView::pty_is_controlling::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "line": 402,
+      "line": 414,
       "item": "FsView::pty_is_controlling",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -148,7 +148,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::FsView::ioctl::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "line": 503,
+      "line": 579,
       "item": "FsView::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -157,7 +157,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::FsView::ioctl::pty_table#2",
       "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "line": 1107,
+      "line": 1183,
       "item": "FsView::ioctl",
       "category": "pty_table",
       "expression": ".pty_table.lock()",

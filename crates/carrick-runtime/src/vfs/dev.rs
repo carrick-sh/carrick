@@ -33,11 +33,19 @@ const SYNTHETIC_DEVICES: &[(&str, SyntheticDeviceKind)] = &[
 
 pub struct DevVfs {
     pty_table: Arc<Mutex<PtyTable>>,
+    virtual_console: Arc<VirtualConsole>,
 }
 
 impl DevVfs {
     pub fn new(pty_table: Arc<Mutex<PtyTable>>) -> Self {
-        Self { pty_table }
+        Self {
+            virtual_console: Arc::new(VirtualConsole::new(Arc::clone(&pty_table))),
+            pty_table,
+        }
+    }
+
+    pub fn virtual_console(&self) -> Arc<VirtualConsole> {
+        Arc::clone(&self.virtual_console)
     }
 
     fn synthetic_kind(guest: &str) -> Option<SyntheticDeviceKind> {
@@ -61,7 +69,7 @@ impl Vfs for DevVfs {
                 mtime_nanos: 0,
             });
         }
-        if path == "/dev/ptmx" || path == "/dev/tty" {
+        if path == "/dev/ptmx" || path == "/dev/tty" || path == "/dev/tty0" {
             return Ok(Metadata {
                 kind: EntryKind::CharDevice,
                 mode: 0o666,
@@ -111,6 +119,11 @@ impl Vfs for DevVfs {
         // open() rather than as a synthetic device.
         entries.push(DirEnt {
             name: "tty".to_string(),
+            kind: EntryKind::CharDevice,
+        });
+        // /dev/tty0 is the active virtual console, handled in open() and ioctl().
+        entries.push(DirEnt {
+            name: "tty0".to_string(),
             kind: EntryKind::CharDevice,
         });
         entries.push(DirEnt {
@@ -206,6 +219,24 @@ impl Vfs for DevVfs {
             });
         }
 
+        if path == "/dev/tty0" {
+            let acc_mode = if flags.read && flags.write {
+                crate::linux_abi::LINUX_O_RDWR as u32
+            } else if flags.write {
+                crate::linux_abi::LINUX_O_WRONLY as u32
+            } else {
+                crate::linux_abi::LINUX_O_RDONLY as u32
+            };
+            let mut status_flags = acc_mode;
+            if flags.nonblock {
+                status_flags |= crate::linux_abi::LINUX_O_NONBLOCK as u32;
+            }
+            return Ok(VfsHandle::VirtualConsole {
+                console: Arc::clone(&self.virtual_console),
+                status_flags,
+            });
+        }
+
         if let Some(kind) = Self::synthetic_kind(path) {
             let status_flags = if flags.nonblock {
                 crate::linux_abi::LINUX_O_NONBLOCK as u32
@@ -236,6 +267,57 @@ pub(crate) fn host_open_errno() -> crate::linux_abi::LinuxErrno {
         // Defer to the dispatcher's full translation table for
         // anything else.
         crate::host_to_linux_errno(raw)
+    }
+}
+
+/// Virtual console state (/dev/tty0) shared by all opens of the device.
+pub struct VirtualConsole {
+    termios: Mutex<carrick_abi::LinuxTermios>,
+    winsize: Mutex<carrick_abi::LinuxWinsize>,
+    pty_table: Arc<Mutex<PtyTable>>,
+}
+
+impl std::fmt::Debug for VirtualConsole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualConsole")
+            .field("termios", &self.termios)
+            .field("winsize", &self.winsize)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VirtualConsole {
+    pub fn new(pty_table: Arc<Mutex<PtyTable>>) -> Self {
+        Self {
+            termios: Mutex::new(carrick_abi::LinuxTermios::default_cooked()),
+            winsize: Mutex::new(carrick_abi::LinuxWinsize::terminal_80x24()),
+            pty_table,
+        }
+    }
+
+    pub fn write(&self, bytes: &[u8]) {
+        let has_terminal = self.pty_table.lock().controlling().is_some();
+        if has_terminal {
+            unsafe {
+                libc::write(1, bytes.as_ptr().cast(), bytes.len());
+            }
+        }
+    }
+
+    pub fn get_termios(&self) -> carrick_abi::LinuxTermios {
+        *self.termios.lock()
+    }
+
+    pub fn set_termios(&self, t: carrick_abi::LinuxTermios) {
+        *self.termios.lock() = t;
+    }
+
+    pub fn get_winsize(&self) -> carrick_abi::LinuxWinsize {
+        *self.winsize.lock()
+    }
+
+    pub fn set_winsize(&self, w: carrick_abi::LinuxWinsize) {
+        *self.winsize.lock() = w;
     }
 }
 
@@ -281,7 +363,7 @@ mod tests {
         let entries = v.readdir("/dev").unwrap();
         let names: std::collections::BTreeSet<_> = entries.iter().map(|e| e.name.clone()).collect();
         let expected: std::collections::BTreeSet<_> = [
-            "null", "zero", "random", "urandom", "full", "tty", "ptmx", "pts",
+            "null", "zero", "random", "urandom", "full", "tty", "tty0", "ptmx", "pts",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -405,5 +487,87 @@ mod tests {
             }
             other => panic!("expected Pty, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn lookup_and_open_tty0() {
+        let v = make_dev();
+        let md = v.lookup("/dev/tty0").unwrap();
+        assert_eq!(md.kind, EntryKind::CharDevice);
+        assert_eq!(md.mode, 0o666);
+
+        let h = v
+            .open(
+                "/dev/tty0",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+                &OpenContext::default(),
+            )
+            .unwrap();
+        match h {
+            VfsHandle::VirtualConsole {
+                console,
+                status_flags,
+            } => {
+                assert_eq!(status_flags, crate::linux_abi::LINUX_O_RDWR as u32);
+                assert_eq!(
+                    console.get_winsize(),
+                    carrick_abi::LinuxWinsize::terminal_80x24()
+                );
+            }
+            other => panic!("expected VirtualConsole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tty0_independent_opens_share_termios_and_winsize() {
+        let v = make_dev();
+        let h1 = v
+            .open(
+                "/dev/tty0",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+                &OpenContext::default(),
+            )
+            .unwrap();
+        let h2 = v
+            .open(
+                "/dev/tty0",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+                &OpenContext::default(),
+            )
+            .unwrap();
+        let (c1, c2) = match (h1, h2) {
+            (
+                VfsHandle::VirtualConsole { console: c1, .. },
+                VfsHandle::VirtualConsole { console: c2, .. },
+            ) => (c1, c2),
+            _ => panic!("expected VirtualConsole"),
+        };
+        assert!(Arc::ptr_eq(&c1, &c2));
+        let mut custom = carrick_abi::LinuxTermios::default_cooked();
+        custom.c_iflag = 0x5a5a;
+        c1.set_termios(custom);
+        let iflag = c2.get_termios().c_iflag;
+        assert_eq!(iflag, 0x5a5a);
+
+        let mut custom_win = carrick_abi::LinuxWinsize::terminal_80x24();
+        custom_win.ws_row = 42;
+        custom_win.ws_col = 120;
+        c1.set_winsize(custom_win);
+        let ws = c2.get_winsize();
+        let (row, col) = (ws.ws_row, ws.ws_col);
+        assert_eq!(row, 42);
+        assert_eq!(col, 120);
     }
 }

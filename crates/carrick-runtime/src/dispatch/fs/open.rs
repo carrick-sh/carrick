@@ -1511,6 +1511,8 @@ impl<'a> FsView<'a> {
                     HostWriteKind::Other
                 };
                 let is_regular = write_kind == HostWriteKind::RegularFile;
+                let base =
+                    OpenDescriptionBase::new(status_flags as u64).with_fs_identity(mount_fs_id);
                 let description = if is_regular {
                     OpenDescription::HostFile {
                         host_fd: HostFdRef::new(host_fd),
@@ -1520,8 +1522,7 @@ impl<'a> FsView<'a> {
                             mode: (st.st_mode & 0o7777) as u32,
                             size: st.st_size.max(0) as usize,
                         },
-                        base: OpenDescriptionBase::new(status_flags as u64)
-                            .with_fs_identity(mount_fs_id),
+                        base,
                         writable: !is_read_end,
                     }
                 } else {
@@ -1531,8 +1532,7 @@ impl<'a> FsView<'a> {
                         pipe_id: host_inode_pipe_id(host_fd),
                         host_fd: HostFdRef::new(host_fd),
                         is_read_end,
-                        base: OpenDescriptionBase::new(status_flags as u64)
-                            .with_fs_identity(mount_fs_id),
+                        base,
                         pty: None,
                         // A VFS stream opened O_RDWR must serve BOTH directions
                         // (mirrors the O_RDWR FIFO open above). DevVfs encodes
@@ -1574,6 +1574,26 @@ impl<'a> FsView<'a> {
                     Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
                 };
                 self.record_fd_open_path(new_fd, kind.as_str().to_string());
+                VfsOpenAttempt::Installed(new_fd)
+            }
+            crate::vfs::VfsHandle::VirtualConsole {
+                console,
+                status_flags,
+            } => {
+                let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
+                let open_file = OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::VirtualConsole {
+                        base: OpenDescriptionBase::new(status),
+                        console,
+                    })),
+                    status,
+                    linux_fd_flags_from_open_flags(flags),
+                );
+                let new_fd = match self.install_fd_at_or_above(0, open_file) {
+                    Ok(fd) => fd,
+                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
+                };
+                self.record_fd_open_path(new_fd, "/dev/tty0".to_string());
                 VfsOpenAttempt::Installed(new_fd)
             }
             crate::vfs::VfsHandle::Bytes {

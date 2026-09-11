@@ -89,7 +89,8 @@ impl<'a> FsView<'a> {
             OpenDescription::File { .. }
             | OpenDescription::SyntheticFile { .. }
             | OpenDescription::HostFile { .. }
-            | OpenDescription::SyntheticDevice { .. } => {
+            | OpenDescription::SyntheticDevice { .. }
+            | OpenDescription::VirtualConsole { .. } => {
                 open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             }
             OpenDescription::PipeWriter { .. } => true,

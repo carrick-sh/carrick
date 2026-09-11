@@ -470,6 +470,7 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
+                | OpenDescription::VirtualConsole { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Packet { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
@@ -523,6 +524,7 @@ impl<'a> FsView<'a> {
                 | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::SyntheticDevice { .. }
+                | OpenDescription::VirtualConsole { .. }
                 | OpenDescription::PerfEvent { .. }
                 | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
@@ -753,6 +755,7 @@ impl<'a> FsView<'a> {
                     };
                     (read_len, bytes)
                 }
+                OpenDescription::VirtualConsole { .. } => (0, Vec::new()),
                 OpenDescription::EventFd {
                     state,
                     semaphore,
@@ -1253,6 +1256,7 @@ impl<'a> FsView<'a> {
                 OpenDescription::SyntheticDevice { kind, .. } => {
                     read_from_synthetic_device_iovecs(memory, *kind, &iovecs)?
                 }
+                OpenDescription::VirtualConsole { .. } => 0,
                 OpenDescription::HostFile { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
@@ -1408,6 +1412,7 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
+                | OpenDescription::VirtualConsole { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::Packet { .. } => {
@@ -1579,6 +1584,7 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
+                | OpenDescription::VirtualConsole { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::Packet { .. } => {
@@ -1826,6 +1832,7 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::SyntheticDevice { .. }
+                | OpenDescription::VirtualConsole { .. }
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::Packet { .. } => LINUX_ESPIPE,
@@ -2122,6 +2129,7 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::SyntheticDevice { .. }
+                | OpenDescription::VirtualConsole { .. }
                 | OpenDescription::Fanotify { .. }
                 | OpenDescription::InMemorySocket { .. }
                 | OpenDescription::Packet { .. } => LINUX_ESPIPE,
@@ -2252,6 +2260,10 @@ impl<'a> FsView<'a> {
                                     ));
                                 }
                             }
+                        }
+                        OpenDescription::VirtualConsole { console, .. } => {
+                            console.write(&bytes);
+                            return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
                         }
                         OpenDescription::EventFd { state, .. } => {
                             return Ok(write_eventfd(this, &bytes, state));
@@ -2951,6 +2963,11 @@ impl<'a> FsView<'a> {
                                         writeback = None;
                                     }
                                 }
+                            }
+                            OpenDescription::VirtualConsole { console, .. } => {
+                                console.write(&bytes);
+                                outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
+                                writeback = None;
                             }
                             OpenDescription::PipeWriter { pipe, .. } => {
                                 let Some(wait_authority) = this

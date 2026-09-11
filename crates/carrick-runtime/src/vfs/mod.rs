@@ -97,7 +97,7 @@ pub mod sys;
 
 pub use bind::BindVfs;
 pub use dentry::{DentryCache, InodeIdentity};
-pub use dev::DevVfs;
+pub use dev::{DevVfs, VirtualConsole};
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use etc_services::EtcServicesVfs;
 pub use mount::VfsMounts;
@@ -479,6 +479,11 @@ pub enum VfsHandle {
         entries: Vec<DirEnt>,
         status_flags: u32,
     },
+    /// A virtual console device (/dev/tty0) backed by in-memory terminal state.
+    VirtualConsole {
+        console: std::sync::Arc<dev::VirtualConsole>,
+        status_flags: u32,
+    },
     /// A writable or read-only in-memory regular file backed by a shared buffer.
     /// The dispatcher routes reads, writes, truncates and memory-mapping directly
     /// to `contents`.
@@ -554,6 +559,16 @@ impl PartialEq for VfsHandle {
                     status_flags: s2,
                 },
             ) => p1 == p2 && e1 == e2 && s1 == s2,
+            (
+                Self::VirtualConsole {
+                    console: c1,
+                    status_flags: s1,
+                },
+                Self::VirtualConsole {
+                    console: c2,
+                    status_flags: s2,
+                },
+            ) => std::sync::Arc::ptr_eq(c1, c2) && s1 == s2,
             (
                 Self::InMemoryFile {
                     path: p1,

@@ -201,6 +201,7 @@ impl<'a> FsView<'a> {
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
             | OpenDescription::SyntheticDevice { .. }
+            | OpenDescription::VirtualConsole { .. }
             | OpenDescription::Netlink { .. }
             | OpenDescription::InMemorySocket { .. }
             | OpenDescription::Packet { .. } => Ok(Err(LINUX_EINVAL)),
@@ -283,6 +284,7 @@ impl<'a> FsView<'a> {
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
             | OpenDescription::SyntheticDevice { .. }
+            | OpenDescription::VirtualConsole { .. }
             | OpenDescription::Netlink { .. }
             | OpenDescription::InMemorySocket { .. }
             | OpenDescription::Packet { .. } => return Err(LINUX_EINVAL),
