@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 20,
+  "typed_error_debt_ceiling": 18,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -790,30 +790,6 @@
       "rationale": "Dispatcher, MM, thread, or running-lease identity drifted while unwinding a released operation; continuing the unwind after failed exact re-entry authentication could leave a live executor outside its authoritative census.",
       "sink": "fatal",
       "domain": "dispatch::mm_executor_reentry"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
-      "function": "bootstrap_one_task_binding",
-      "ordinal_in_function": 1,
-      "fingerprint": "3239ded76804a37de5ef832a91b27e4a139de9d42720bdb72a57eac4428df889",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::bootstrap",
-      "rationale": "RootBootstrap construction failure occurs during one-task kernel adapter initialization and should return a typed RuntimeError.",
-      "typed_error": "RuntimeError",
-      "sink": "fatal",
-      "domain": "dispatch::bootstrap"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
-      "function": "bootstrap_one_task_binding",
-      "ordinal_in_function": 2,
-      "fingerprint": "010a47e7eebe05f879084d50e4eb83411e27b066d92625a9244c34403e5759fc",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::bootstrap",
-      "rationale": "Kernel root bootstrap failure occurs during initial execution graph setup and should return a typed RuntimeError.",
-      "typed_error": "RuntimeError",
-      "sink": "fatal",
-      "domain": "dispatch::bootstrap"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/resources.rs",
