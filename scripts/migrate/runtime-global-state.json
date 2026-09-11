@@ -2491,7 +2491,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "symbol": "private_backing_identity::NEXT",
       "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
       "classification": "monotonic_allocator",
@@ -2499,7 +2499,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "symbol": "private_file_view_backing_identity::NEXT",
       "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
       "classification": "monotonic_allocator",
@@ -2523,7 +2523,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "symbol": "shared_anon_backing_identity::NEXT",
       "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
       "classification": "monotonic_allocator",
