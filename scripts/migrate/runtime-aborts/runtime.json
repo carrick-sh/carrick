@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 13,
+  "typed_error_debt_ceiling": 12,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -2279,18 +2279,6 @@
       "rationale": "The activated root could not recapture its exact kernel context before terminal-route publication; continuing could bind carrier-wide TTY service to the wrong task generation.",
       "sink": "fatal",
       "domain": "threaded_loop::root_activation"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
-      "function": "FsState::rootfs_vfs_mut",
-      "ordinal_in_function": 1,
-      "fingerprint": "241a6fe549fdb3713979a021dc339682e3960e107cb55adb4cbcdfe91853dbec",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_mounts",
-      "rationale": "Mutating shared rootfs VFS after fork occurs before execution and should return a typed configuration error instead of aborting.",
-      "typed_error": "RuntimeError",
-      "sink": "fatal",
-      "domain": "dispatch::fs_mounts"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
