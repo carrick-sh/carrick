@@ -146,3 +146,9 @@ from sibling branches.
   patch, reset to the green prefix, rebase, merge the global-state rows,
   reconcile --rehome, gate) then the gated `land()`; a doc link to a
   now-private helper was the only fix needed after the moves.
+- 2026-09-10 wave 3 round 4 LANDED: trap.rs → 7,548 (target ≤8K met),
+  vcpu_loop/mod.rs → 3,468 (≤5K met), dispatch/fs.rs → 1,470 (≤3K met),
+  dispatch/mod.rs 4,773, dispatch/net.rs → 8,905 (first net moves). Round 5
+  dispatched for net.rs; T16 dispatcher subsystem views dispatched starting
+  with the fs subsystem. CI green after round 3 (ci-wave3d); round 4 CI
+  running (ci-wave3e).
