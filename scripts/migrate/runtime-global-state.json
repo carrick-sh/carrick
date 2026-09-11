@@ -1434,6 +1434,22 @@
       "rationale": "Environment variable CARRICK_LAUNCH_AUTHORIZATION read in run_threaded_loop_inner::CARRICK_LAUNCH_AUTHORIZATION (crates/carrick-runtime/src/threaded_loop.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "env_var",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
+      "symbol": "trap_watchdog_wall_window::CARRICK_MAX_WALL_MS",
+      "fingerprint": "2b16120d75fc0b213af7e4ea5d07d3b8e9ee2f9912e6f35a1b0b60901a0cd0a5",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_MAX_WALL_MS read in trap_watchdog_wall_window::CARRICK_MAX_WALL_MS (crates/carrick-runtime/src/vcpu_loop/binding.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
+      "symbol": "trap_watchdog_wall_window::WINDOW",
+      "fingerprint": "41b96aede58f03f548e9e8c79858298de1322c6f615ee07f8e5ea1dae5227f3e",
+      "classification": "config_debug",
+      "rationale": "OnceLock cache of the CARRICK_MAX_WALL_MS trap-watchdog wall window in trap_watchdog_wall_window (crates/carrick-runtime/src/vcpu_loop/binding.rs); carrier-wide configuration read once."
+    },
+    {
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "symbol": "tests::event_future_cancelled_observation_drains_inflight_operation_safely::CHILD_MARKER",
@@ -1658,14 +1674,6 @@
       "rationale": "Carrier-wide monotonic allocator issue_hvpatch_child_token::NEXT_AUTHORITY_ID in crates/carrick-runtime/src/vcpu_loop/memory.rs generating unique IDs across the host process."
     },
     {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "symbol": "trap_watchdog_wall_window::CARRICK_MAX_WALL_MS",
-      "fingerprint": "2b16120d75fc0b213af7e4ea5d07d3b8e9ee2f9912e6f35a1b0b60901a0cd0a5",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_MAX_WALL_MS read in trap_watchdog_wall_window::CARRICK_MAX_WALL_MS (crates/carrick-runtime/src/vcpu_loop/binding.rs) configuring carrier behavior or debug logging."
-    },
-    {
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
       "symbol": "macos_helper_stubs::execve_trace_filter::CARRICK_EXECVE_TRACE",
@@ -1712,14 +1720,6 @@
       "fingerprint": "8f561fa7f46f8336b60e37897fe253a69245320364c3abfb867389253efcdde7",
       "classification": "config_debug",
       "rationale": "Process-global configuration or failpoint cache macos_helper_stubs::execve_trace_filter::FILTER in crates/carrick-runtime/src/vcpu_loop/mod.rs initialized from environment flags."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "symbol": "trap_watchdog_wall_window::WINDOW",
-      "fingerprint": "41b96aede58f03f548e9e8c79858298de1322c6f615ee07f8e5ea1dae5227f3e",
-      "classification": "config_debug",
-      "rationale": "OnceLock cache of the CARRICK_MAX_WALL_MS trap-watchdog wall window in trap_watchdog_wall_window (crates/carrick-runtime/src/vcpu_loop/binding.rs); carrier-wide configuration read once."
     },
     {
       "kind": "env_var",
