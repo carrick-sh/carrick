@@ -181,3 +181,15 @@ from sibling branches.
   at 3.1K vs the 2K target; 101 `too_many_arguments` allows; 24 + 3
   `typed_error_debt` ledger rows still `sink: fatal`; the load-sensitive
   `coredumpfile` thread census; four pre-recorded probe reds.
+- 2026-09-11 final gates: `just ci` green (ci-final-sep11); the probe gate
+  caught one real regression from the dispatcher-views landing — FsView
+  had header-only copies of the `/proc/sysvipc/*` renderers shadowing the
+  live ones (`sysvmsg` DIFF, deterministic) — fixed forward in de31e8ef5
+  by routing them through `FsCrossSubsystem`; `coredumpfile` MATCHed this
+  time (load-sensitive as recorded). Final CI + probes re-running with the
+  fix (`*final2-sep11`).
+- Carry-forward added: FsView carries its own copies of five signal-state
+  helpers (`signal_blocked`, `signal_is_ignored`, `signal_mask_for`,
+  `mark_signal_pending`, `proc_status_signal_masks`) that also exist on
+  SyscallDispatcher in dispatch/signal.rs; they take no dispatcher state
+  and should become shared free functions (duplication class 5).
