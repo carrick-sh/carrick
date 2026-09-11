@@ -697,7 +697,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "function": "HvfVmState::inventory_generation",
       "ordinal_in_function": 1,
       "fingerprint": "5b511830d74b42e89df1e9d8de29e7f56361a92919aeb181dd8bb3bed1e574ea",
@@ -818,7 +818,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "function": "HvfVmState::private_backing_identity",
       "ordinal_in_function": 1,
       "fingerprint": "7bcd7a3b041df7318ac95633c24bc965963a5f9dcc9568e8d6c6bccf4c91a726",
@@ -829,7 +829,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "function": "HvfVmState::retire_task_state_process_mappings_inner",
       "ordinal_in_function": 1,
       "fingerprint": "83e391851becc33e3812eaa7ddb7286355d693b595f2854f8054ff0224354404",
@@ -840,7 +840,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "function": "HvfVmState::private_file_view_backing_identity",
       "ordinal_in_function": 1,
       "fingerprint": "3dcaf0d696a48f7a212373a7a7f305e3c68c41b37a5b6a525780d4ec1bedca96",
@@ -851,7 +851,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
       "function": "HvfVmState::shared_anon_backing_identity",
       "ordinal_in_function": 1,
       "fingerprint": "09693e8645cded6819b97e8a847cf28006b773eda295a3150a75d59a85017b32",
