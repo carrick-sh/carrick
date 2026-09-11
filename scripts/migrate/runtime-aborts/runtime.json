@@ -921,7 +921,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "function": "SyscallDispatcher::shmdt",
+      "function": "IpcView<'a>::shmdt",
       "ordinal_in_function": 1,
       "fingerprint": "53f882d9518a7ab87f0e324f7a598547a0466dde63d9aecb789c0d4856462342",
       "verdict": "carrier_fault",

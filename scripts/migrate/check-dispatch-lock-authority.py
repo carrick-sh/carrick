@@ -52,7 +52,7 @@ MAX_CATEGORY_CEILINGS: dict[str, int] = {
 MAX_TOTAL_CEILING: int = 107
 
 EXPECTED_TRUSTED_BOUNDARIES: dict[str, str] = {
-    "crates/carrick-runtime/src/dispatch/sysv.rs::SyscallDispatcher::lock_sysv_process::sysv_process#1": "trusted_minting_boundary",
+    "crates/carrick-runtime/src/dispatch/sysv.rs::IpcView::lock_sysv_process::sysv_process#1": "trusted_minting_boundary",
     "crates/carrick-runtime/src/dispatch/sysv/lock_authority.rs::SysvNamespacePermit::lock_paired::sysv_namespace#1": "trusted_paired_boundary",
 }
 

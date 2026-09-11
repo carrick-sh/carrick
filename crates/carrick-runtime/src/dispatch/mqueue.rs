@@ -7,6 +7,7 @@
 //! POSIX message queue semantics without creating host files under `/tmp` or
 //! acquiring host OFD locks.
 
+pub(crate) use super::dispatcher::IpcView;
 use super::*;
 use crate::linux_abi::LinuxErrno;
 use std::collections::HashMap;
@@ -336,7 +337,7 @@ struct MqDescription {
     queue: Arc<MqueueInner>,
 }
 
-impl SyscallDispatcher {
+impl<'a> IpcView<'a> {
     fn mqueue_notify_target(&self, context: &crate::kernel::KernelContext) -> MqueueNotifyTarget {
         if self.hvpatch_process().is_some() {
             MqueueNotifyTarget::Kernel(context.task().key(), ())
@@ -1041,7 +1042,7 @@ impl SyscallDispatcher {
 }
 
 fn deliver_notify(
-    this: &SyscallDispatcher,
+    this: &IpcView<'_>,
     context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
     delivery: MqueueNotify,
@@ -1115,8 +1116,95 @@ fn deliver_notify(
     }
 }
 
+macro_rules! forward_mqueue_handlers {
+    ($( $handler:ident ),* $(,)?) => {
+        impl SyscallDispatcher {
+            $(
+                #[inline]
+                pub(crate) fn $handler<M: CurrentMmMemory>(
+                    &self,
+                    cx: &mut SyscallCtx<M>,
+                ) -> Result<DispatchOutcome, DispatchError> {
+                    self.ipc_view().$handler(cx)
+                }
+            )*
+        }
+    };
+}
+
+forward_mqueue_handlers! {
+    mq_open,
+    mq_unlink,
+    mq_timedsend,
+    mq_timedreceive,
+    mq_notify,
+    mq_getsetattr,
+}
+
+impl SyscallDispatcher {
+    #[inline]
+    pub(in crate::dispatch) fn mqueue_owner_alias_closed(
+        &self,
+        files: &Arc<crate::kernel::FileTable>,
+        open_file: &OpenFile,
+    ) {
+        self.ipc_view().mqueue_owner_alias_closed(files, open_file);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn close_needs_mqueue_alias_scan(open_file: &OpenFile) -> bool {
+        IpcView::close_needs_mqueue_alias_scan(open_file)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn mqueue_owner_alias_closed_known(
+        &self,
+        file_table: crate::kernel::FileTableId,
+        open_file: &OpenFile,
+        alias_remains: bool,
+    ) {
+        self.ipc_view()
+            .mqueue_owner_alias_closed_known(file_table, open_file, alias_remains);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn mqueue_retire_file_table_registration(
+        &self,
+        file_table: crate::kernel::FileTableId,
+        open_file: &OpenFile,
+    ) {
+        self.ipc_view()
+            .mqueue_retire_file_table_registration(file_table, open_file);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn mqueue_retire_task_owner(
+        &self,
+        owner: crate::kernel::TaskKey,
+        files: &Arc<crate::kernel::FileTable>,
+    ) {
+        self.ipc_view().mqueue_retire_task_owner(owner, files);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn mqueue_rebind_exec_file_table(
+        &self,
+        owner: crate::kernel::TaskKey,
+        old: &Arc<crate::kernel::FileTable>,
+        successor: &Arc<crate::kernel::FileTable>,
+    ) {
+        self.ipc_view()
+            .mqueue_rebind_exec_file_table(owner, old, successor);
+    }
+
+    #[cfg(test)]
+    fn mq_description(&self, fd: i32) -> Result<MqDescription, LinuxErrno> {
+        self.ipc_view().mq_description(fd)
+    }
+}
+
 fn mq_wait_interrupted(
-    this: &SyscallDispatcher,
+    this: &IpcView<'_>,
     context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
 ) -> bool {

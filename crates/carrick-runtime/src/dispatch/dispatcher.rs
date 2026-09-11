@@ -1443,13 +1443,267 @@ pub struct SignalView<'a> {
     pub(in crate::dispatch) cross: &'a (dyn SignalCrossSubsystem + 'a),
 }
 
+pub(in crate::dispatch) trait IpcCrossSubsystem {
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
+    fn identity_pid(&self) -> u32;
+    fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext>;
+    fn is_forked_guest_process(&self) -> bool;
+    fn begin_host_alias_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit>;
+    fn guest_vma_overlaps(&self, va: u64, len: u64) -> bool;
+    fn begin_conditional_vma_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit>;
+    fn remove_mapping_metadata(&self, addr: u64, len: u64);
+    fn mark_vma_dispatch(&self, guard: &mut crate::dispatch::HostAliasDispatchGuard<'_>);
+    fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: carrick_abi::WaitSigMask,
+    ) -> bool;
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable>;
+    fn open_file(&self, fd: i32) -> Option<OpenFile>;
+    fn install_fd_at_or_above(&self, min_fd: i32, file: OpenFile) -> Result<i32, OpenFile>;
+    fn fd_is_netlink(&self, fd: i32) -> bool;
+    fn enqueue_netlink_message(
+        &self,
+        fd: i32,
+        message: &[u8],
+    ) -> Result<(), carrick_abi::LinuxErrno>;
+    fn record_pending_siginfo(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signo: i32,
+        info: carrick_abi::LinuxSiginfo,
+    );
+    fn mark_signal_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signo: i32,
+    );
+}
+
+impl IpcCrossSubsystem for SyscallDispatcher {
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cred_snapshot()
+    }
+    fn identity_pid(&self) -> u32 {
+        self.identity_pid()
+    }
+    fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+        self.hvpatch_process()
+    }
+    fn is_forked_guest_process(&self) -> bool {
+        self.is_forked_guest_process()
+    }
+    fn begin_host_alias_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit> {
+        self.begin_host_alias_dispatch(permit)
+    }
+    fn guest_vma_overlaps(&self, va: u64, len: u64) -> bool {
+        self.guest_vma_overlaps(va, len)
+    }
+    fn begin_conditional_vma_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit> {
+        self.begin_conditional_vma_dispatch(permit)
+    }
+    fn remove_mapping_metadata(&self, addr: u64, len: u64) {
+        self.remove_mapping_metadata(addr, len);
+    }
+    fn mark_vma_dispatch(&self, guard: &mut crate::dispatch::HostAliasDispatchGuard<'_>) {
+        self.mark_vma_dispatch(guard);
+    }
+    fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.has_deliverable_dispatch_pending_for_wait(context, tid, mask)
+    }
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        self.captured_file_table()
+    }
+    fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.open_file(fd)
+    }
+    fn install_fd_at_or_above(&self, min_fd: i32, file: OpenFile) -> Result<i32, OpenFile> {
+        self.install_fd_at_or_above(min_fd, file)
+    }
+    fn fd_is_netlink(&self, fd: i32) -> bool {
+        self.fd_is_netlink(fd)
+    }
+    fn enqueue_netlink_message(
+        &self,
+        fd: i32,
+        message: &[u8],
+    ) -> Result<(), carrick_abi::LinuxErrno> {
+        self.enqueue_netlink_message(fd, message)
+    }
+    fn record_pending_siginfo(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signo: i32,
+        info: carrick_abi::LinuxSiginfo,
+    ) {
+        self.record_pending_siginfo(context, tid, signo, info);
+    }
+    fn mark_signal_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signo: i32,
+    ) {
+        self.mark_signal_pending(context, tid, signo);
+    }
+}
+
 /// Subsystem view for IPC operations.
-#[allow(dead_code)]
 pub struct IpcView<'a> {
     pub(in crate::dispatch) sysv: &'a Arc<sysv::SysvIpcNamespace>,
     pub(in crate::dispatch) sysv_process: &'a Mutex<sysv::SysvProcessAttachments>,
     pub(in crate::dispatch) mqueue: &'a Arc<mqueue::MqueueRegistry>,
+    #[allow(dead_code)]
     pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+    pub(in crate::dispatch) page_geometry: crate::page_profile::PageGeometry,
+    pub(in crate::dispatch) cross: &'a (dyn IpcCrossSubsystem + 'a),
+}
+
+impl<'a> IpcView<'a> {
+    #[inline]
+    pub(in crate::dispatch) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cross.cred_snapshot()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn identity_pid(&self) -> u32 {
+        self.cross.identity_pid()
+    }
+
+    #[inline]
+    pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+        self.cross.hvpatch_process()
+    }
+
+    #[inline]
+    pub(crate) fn is_forked_guest_process(&self) -> bool {
+        self.cross.is_forked_guest_process()
+    }
+
+    #[inline]
+    pub(crate) fn begin_host_alias_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit> {
+        self.cross.begin_host_alias_dispatch(permit)
+    }
+
+    #[inline]
+    pub(crate) fn guest_vma_overlaps(&self, va: u64, len: u64) -> bool {
+        self.cross.guest_vma_overlaps(va, len)
+    }
+
+    #[inline]
+    pub(crate) fn begin_conditional_vma_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit> {
+        self.cross.begin_conditional_vma_dispatch(permit)
+    }
+
+    #[inline]
+    pub(crate) fn remove_mapping_metadata(&self, addr: u64, len: u64) {
+        self.cross.remove_mapping_metadata(addr, len);
+    }
+
+    #[inline]
+    pub(crate) fn mark_vma_dispatch(
+        &self,
+        guard: &mut crate::dispatch::HostAliasDispatchGuard<'_>,
+    ) {
+        self.cross.mark_vma_dispatch(guard);
+    }
+
+    #[inline]
+    pub(crate) fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.cross
+            .has_deliverable_dispatch_pending_for_wait(context, tid, mask)
+    }
+
+    #[inline]
+    pub(super) fn linux_page_size(&self) -> u64 {
+        self.page_geometry.linux_page_size
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        self.cross.captured_file_table()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.cross.open_file(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd_at_or_above(
+        &self,
+        min_fd: i32,
+        file: OpenFile,
+    ) -> Result<i32, OpenFile> {
+        self.cross.install_fd_at_or_above(min_fd, file)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn fd_is_netlink(&self, fd: i32) -> bool {
+        self.cross.fd_is_netlink(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn enqueue_netlink_message(
+        &self,
+        fd: i32,
+        message: &[u8],
+    ) -> Result<(), carrick_abi::LinuxErrno> {
+        self.cross.enqueue_netlink_message(fd, message)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn record_pending_siginfo(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signo: i32,
+        info: carrick_abi::LinuxSiginfo,
+    ) {
+        self.cross.record_pending_siginfo(context, tid, signo, info);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn mark_signal_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signo: i32,
+    ) {
+        self.cross.mark_signal_pending(context, tid, signo);
+    }
 }
 
 /// Subsystem view for memory operations.
@@ -1517,6 +1771,8 @@ impl SyscallDispatcher {
             sysv_process: &self.sysv_process,
             mqueue: &self.mqueue,
             kernel_binding: &self.kernel_binding,
+            page_geometry: self.page_geometry,
+            cross: self,
         }
     }
 

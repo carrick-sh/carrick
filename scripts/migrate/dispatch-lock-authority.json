@@ -562,7 +562,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/sysv.rs::SysvIpcNamespace::with_state::sysv_namespace#1",
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 809,
+      "line": 810,
       "item": "SysvIpcNamespace::with_state",
       "category": "sysv_namespace",
       "expression": ".state.lock()",
@@ -571,17 +571,17 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/sysv.rs::SysvIpcNamespace::with_state_mut::sysv_namespace#1",
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 818,
+      "line": 819,
       "item": "SysvIpcNamespace::with_state_mut",
       "category": "sysv_namespace",
       "expression": ".state.lock()",
       "ordinal": 1
     },
     {
-      "id": "crates/carrick-runtime/src/dispatch/sysv.rs::SyscallDispatcher::lock_sysv_process::sysv_process#1",
+      "id": "crates/carrick-runtime/src/dispatch/sysv.rs::IpcView::lock_sysv_process::sysv_process#1",
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2325,
-      "item": "SyscallDispatcher::lock_sysv_process",
+      "line": 2326,
+      "item": "IpcView::lock_sysv_process",
       "category": "sysv_process",
       "expression": ".sysv_process.lock()",
       "ordinal": 1,
