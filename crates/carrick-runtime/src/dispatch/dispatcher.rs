@@ -23,7 +23,7 @@ use super::normalize_abs_path;
 use super::proc;
 use super::sysv;
 use crate::fs_backend::FsBackend;
-use crate::rootfs::RootFs;
+use crate::rootfs::{RootFs, RootFsMetadata};
 
 pub struct SyscallDispatcher {
     /// Generation-safe task adapter used to capture the mandatory kernel
@@ -994,6 +994,181 @@ impl FsCrossSubsystem for SyscallDispatcher {
     }
 }
 
+/// Cross-subsystem capabilities required during network operations (such as fd lifecycle and signal suspend).
+pub(in crate::dispatch) trait NetCrossSubsystem: Send + Sync {
+    fn caller_net_ns(&self, context: &crate::kernel::KernelContext) -> Arc<crate::kernel::NetNs>;
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable>;
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
+    fn identity_pid(&self) -> u32;
+    fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool;
+    fn begin_sigsuspend(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        suspend_mask: carrick_abi::SigSet,
+    ) -> carrick_abi::SigSet;
+    fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, carrick_abi::LinuxErrno>;
+    fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, carrick_abi::LinuxErrno>;
+    fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, carrick_abi::LinuxErrno>;
+    fn stamp_new_node_owner(&self, path: &str, node_mode: u32);
+    fn nofile_limit(&self) -> i32;
+    fn staged_splice_pipe_bytes(&self, fd: i32) -> usize;
+    fn staged_splice_description_bytes(&self, id: crate::kernel::FileDescriptionId) -> usize;
+    fn host_pipe_capacity_room(
+        &self,
+        pipe_capacity: i64,
+        pipe_id: u64,
+        is_read_end: bool,
+        bidirectional: bool,
+        host_fd: i32,
+    ) -> Option<usize>;
+    fn note_fd_closed(&self, fd: i32);
+    fn close_open_file_and_free_pty(&self, open_file: &OpenFile);
+    fn notify_inmem_epoll(&self);
+    fn open_file(&self, fd: i32) -> Option<OpenFile>;
+    fn fd_is_valid(&self, fd: i32) -> bool;
+    fn stdio_is_closed(&self, fd: i32) -> bool;
+    fn bare_stdio_description(
+        &self,
+        fd: i32,
+    ) -> Result<Arc<crate::kernel::FileDescription>, carrick_abi::LinuxErrno>;
+    fn install_fd(
+        &self,
+        description: super::OpenDescription,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome;
+    fn install_fd_at_or_above(&self, min_fd: i32, open_file: OpenFile) -> Result<i32, OpenFile>;
+    fn install_fd_pair_at_or_above(
+        &self,
+        min_fd: i32,
+        first: OpenFile,
+        second: OpenFile,
+    ) -> Result<(i32, i32), (OpenFile, OpenFile)>;
+    fn install_fd_with_status_flags(
+        &self,
+        description: super::OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome;
+}
+
+impl NetCrossSubsystem for SyscallDispatcher {
+    fn caller_net_ns(&self, context: &crate::kernel::KernelContext) -> Arc<crate::kernel::NetNs> {
+        self.caller_net_ns(context)
+    }
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        self.captured_file_table()
+    }
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cred_snapshot()
+    }
+    fn identity_pid(&self) -> u32 {
+        self.identity_pid()
+    }
+    fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask)
+    }
+    fn begin_sigsuspend(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        suspend_mask: carrick_abi::SigSet,
+    ) -> carrick_abi::SigSet {
+        self.begin_sigsuspend(context, tid, suspend_mask)
+    }
+    fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, carrick_abi::LinuxErrno> {
+        self.resolve_at_path(dirfd, path)
+    }
+    fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, carrick_abi::LinuxErrno> {
+        self.layered_metadata(path)
+    }
+    fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, carrick_abi::LinuxErrno> {
+        self.layered_lstat(path)
+    }
+    fn stamp_new_node_owner(&self, path: &str, node_mode: u32) {
+        self.stamp_new_node_owner(path, node_mode);
+    }
+    fn nofile_limit(&self) -> i32 {
+        self.nofile_limit()
+    }
+    fn staged_splice_pipe_bytes(&self, fd: i32) -> usize {
+        self.staged_splice_pipe_bytes(fd)
+    }
+    fn staged_splice_description_bytes(&self, id: crate::kernel::FileDescriptionId) -> usize {
+        self.staged_splice_description_bytes(id)
+    }
+    fn host_pipe_capacity_room(
+        &self,
+        pipe_capacity: i64,
+        pipe_id: u64,
+        is_read_end: bool,
+        bidirectional: bool,
+        host_fd: i32,
+    ) -> Option<usize> {
+        self.host_pipe_capacity_room(pipe_capacity, pipe_id, is_read_end, bidirectional, host_fd)
+    }
+    fn note_fd_closed(&self, fd: i32) {
+        self.note_fd_closed(fd);
+    }
+    fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
+        self.close_open_file_and_free_pty(open_file);
+    }
+    fn notify_inmem_epoll(&self) {
+        self.notify_inmem_epoll();
+    }
+    fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.open_file(fd)
+    }
+    fn fd_is_valid(&self, fd: i32) -> bool {
+        self.fd_is_valid(fd)
+    }
+    fn stdio_is_closed(&self, fd: i32) -> bool {
+        self.stdio_is_closed(fd)
+    }
+    fn bare_stdio_description(
+        &self,
+        fd: i32,
+    ) -> Result<Arc<crate::kernel::FileDescription>, carrick_abi::LinuxErrno> {
+        self.bare_stdio_description(fd)
+    }
+    fn install_fd(
+        &self,
+        description: super::OpenDescription,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome {
+        self.install_fd(description, fd_flags)
+    }
+    fn install_fd_at_or_above(&self, min_fd: i32, open_file: OpenFile) -> Result<i32, OpenFile> {
+        self.install_fd_at_or_above(min_fd, open_file)
+    }
+    fn install_fd_pair_at_or_above(
+        &self,
+        min_fd: i32,
+        first: OpenFile,
+        second: OpenFile,
+    ) -> Result<(i32, i32), (OpenFile, OpenFile)> {
+        self.install_fd_pair_at_or_above(min_fd, first, second)
+    }
+    fn install_fd_with_status_flags(
+        &self,
+        description: super::OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome {
+        self.install_fd_with_status_flags(description, status_flags, fd_flags)
+    }
+}
+
 /// Subsystem view for filesystem operations.
 pub struct FsView<'a> {
     pub(in crate::dispatch) fs: &'a fs::FsState,
@@ -1013,14 +1188,17 @@ pub struct FsView<'a> {
 }
 
 /// Subsystem view for network operations.
-#[allow(dead_code)]
 pub struct NetView<'a> {
     pub(in crate::dispatch) network: &'a Arc<crate::network::RuntimeNetwork>,
+    #[allow(dead_code)]
     pub(in crate::dispatch) file_authority:
         &'a RwLock<Option<Arc<crate::file_authority::FileAuthorityRun>>>,
+    #[allow(dead_code)]
     pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+    #[allow(dead_code)]
     pub(in crate::dispatch) io: &'a fs::RuntimeIo,
     pub(in crate::dispatch) fs: &'a fs::FsState,
+    pub(in crate::dispatch) cross: &'a (dyn NetCrossSubsystem + 'a),
 }
 
 /// Subsystem view for process operations.
@@ -1083,6 +1261,7 @@ impl SyscallDispatcher {
             kernel_binding: &self.kernel_binding,
             io: &self.io,
             fs: &self.fs,
+            cross: self,
         }
     }
 

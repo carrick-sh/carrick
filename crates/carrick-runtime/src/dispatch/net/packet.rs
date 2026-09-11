@@ -530,7 +530,7 @@ pub(crate) fn broadcast_frame<M: CurrentMmMemory>(
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
     pub(in crate::dispatch) fn packet_socket(
         &self,
         kernel: &crate::kernel::KernelContext,

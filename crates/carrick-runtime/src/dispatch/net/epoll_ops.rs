@@ -178,7 +178,7 @@ mod epoll_edge_sample_tests {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
     fn fd_is_epollable(&self, fd: i32) -> bool {
         let Some(open_file) = self.open_file(fd) else {
             return false;
@@ -262,7 +262,7 @@ impl SyscallDispatcher {
         self.epoll_path_reaches_desc(target_desc, epoll_id, 0, &mut seen)
     }
 
-    fn epoll_effective_interest(
+    pub(in crate::dispatch) fn epoll_effective_interest(
         &self,
         fd: i32,
         events: u32,
@@ -412,7 +412,7 @@ impl SyscallDispatcher {
         open_file.description.readiness(interest, self).bits()
     }
 
-    fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
+    pub(super) fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
         // Bytes carrick queued on a socket outside the host kernel
         // (`synthetic_recv`). Counted into the ET read-growth baseline so a
         // gateway reply is a visible arrival, exactly as `pipe.buffered_bytes()`
@@ -2931,7 +2931,7 @@ mod nested_epoll_readiness_tests {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
     define_syscall! {
         fn epoll_create1(this, cx, flags: u64) {
 

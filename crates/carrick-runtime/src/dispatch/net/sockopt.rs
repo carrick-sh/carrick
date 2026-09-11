@@ -79,7 +79,7 @@ fn mcast_setsockopt_outcome(
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
     define_syscall! {
         fn setsockopt(this, cx, fd: Fd, level: u64, optname: u64, optval: GuestPtr, optlen: u64) {
 
