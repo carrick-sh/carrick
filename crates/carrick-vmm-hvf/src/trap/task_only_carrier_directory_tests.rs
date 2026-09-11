@@ -372,7 +372,7 @@ fn bind_frame_cow_authenticates_and_drains_pending_receipts() {
 /// below reads the source rather than building one.
 #[test]
 fn an_unmap_supersedes_the_cow_receipts_naming_its_range_first() {
-    let source = include_str!("../trap.rs");
+    let source = concat!(include_str!("../trap.rs"), include_str!("cow_engine.rs"));
     // `rsplit_once`, not `split_once`: this test's own string literal is
     // the FIRST occurrence in the file, and matching it makes the test
     // inspect itself and pass unconditionally.
