@@ -604,6 +604,21 @@ impl SyscallDispatcher {
         }
         None
     }
+
+    define_syscall! {
+        fn faccessat(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64) {
+            // Linux's `faccessat` (syscall 48) takes only (dirfd, pathname, mode).
+            // The 4-arg form with flags is `faccessat2` (syscall 439). We were
+            // erroneously reading x3 as flags here, which is whatever uninit
+            // register state the caller had — making glibc see EINVAL for normal
+            // access(F_OK)-style calls and abort with "stack smashing detected".
+            this.access_at(cx.kernel, dirfd, pathname.0, mode, 0, &*cx.memory)
+        }
+
+        fn faccessat2(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64, flags: u64) {
+            this.access_at(cx.kernel, dirfd, pathname.0, mode, flags, &*cx.memory)
+        }
+    }
 }
 
 fn dac_search_directory_with_supplementary_groups(
