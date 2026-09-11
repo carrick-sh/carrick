@@ -795,6 +795,11 @@ pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
     fn cwd(&self) -> String;
     fn mem_snapshot(&self) -> super::mem::MemState;
     fn identity_pid(&self) -> u32;
+    /// Live `/proc/sysvipc/{shm,sem,msg}` tables (header plus one row per
+    /// object); the SysV IPC state lives outside the fs subsystem.
+    fn sysvipc_shm_table(&self) -> String;
+    fn sysvipc_sem_table(&self) -> String;
+    fn sysvipc_msg_table(&self) -> String;
     fn captured_slot_authority(
         &self,
         _fd: i32,
@@ -942,6 +947,15 @@ impl FsCrossSubsystem for SyscallDispatcher {
     }
     fn identity_pid(&self) -> u32 {
         self.identity_pid()
+    }
+    fn sysvipc_shm_table(&self) -> String {
+        SyscallDispatcher::sysvipc_shm_table(self)
+    }
+    fn sysvipc_sem_table(&self) -> String {
+        SyscallDispatcher::sysvipc_sem_table(self)
+    }
+    fn sysvipc_msg_table(&self) -> String {
+        SyscallDispatcher::sysvipc_msg_table(self)
     }
     fn captured_slot_authority(
         &self,
