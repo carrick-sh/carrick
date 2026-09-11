@@ -20,12 +20,12 @@
     "lifecycle": 6
   },
   "files": {
-    "table_guard": 17,
+    "table_guard": 18,
     "description_guard": 28,
     "description_backing": 7,
     "epoll": 33,
     "stream": 14,
-    "mapping": 70,
+    "mapping": 71,
     "lifecycle": 5
   },
   "entries": [
@@ -217,6 +217,15 @@
       ],
       "text": "// the exact task binding was live rather than consulting a mapping the",
       "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
+      "line": 57,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Serializes mapping syscalls across the dispatcher/runtime split. A",
+      "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/epoll_shim.rs",
@@ -4263,6 +4272,42 @@
       "scope_kind": "test_or_definition"
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "line": 272,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "let context = kernel.copy_file_table_for_host_fork(&context, &inherited_files)?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "line": 671,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".write_fd_open_paths()",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "line": 714,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".read_open_files()",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "line": 722,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".read_fd_open_paths()",
+      "scope_kind": "test_or_definition"
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
       "line": 109,
       "categories": [
@@ -7658,16 +7703,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1730,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Serializes mapping syscalls across the dispatcher/runtime split. A",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1798,
+      "line": 900,
       "categories": [
         "epoll"
       ],
@@ -7676,7 +7712,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1800,
+      "line": 902,
       "categories": [
         "epoll"
       ],
@@ -7685,7 +7721,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1805,
+      "line": 907,
       "categories": [
         "stream"
       ],
@@ -7694,7 +7730,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1816,
+      "line": 918,
       "categories": [
         "epoll"
       ],
@@ -7703,7 +7739,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1819,
+      "line": 921,
       "categories": [
         "epoll"
       ],
@@ -7712,7 +7748,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1822,
+      "line": 924,
       "categories": [
         "epoll"
       ],
@@ -7721,7 +7757,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1830,
+      "line": 932,
       "categories": [
         "epoll"
       ],
@@ -7730,7 +7766,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1863,
+      "line": 965,
       "categories": [
         "epoll"
       ],
@@ -7739,7 +7775,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1870,
+      "line": 972,
       "categories": [
         "epoll"
       ],
@@ -7748,7 +7784,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1881,
+      "line": 983,
       "categories": [
         "epoll"
       ],
@@ -7757,7 +7793,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1882,
+      "line": 984,
       "categories": [
         "epoll"
       ],
@@ -7766,7 +7802,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1923,
+      "line": 1025,
       "categories": [
         "epoll"
       ],
@@ -7775,7 +7811,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1925,
+      "line": 1027,
       "categories": [
         "epoll"
       ],
@@ -7784,7 +7820,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1928,
+      "line": 1030,
       "categories": [
         "epoll"
       ],
@@ -7793,7 +7829,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1933,
+      "line": 1035,
       "categories": [
         "epoll"
       ],
@@ -7802,43 +7838,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2125,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".write_fd_open_paths()",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2168,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".read_open_files()",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2176,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".read_fd_open_paths()",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2799,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "let context = kernel.copy_file_table_for_host_fork(&context, &inherited_files)?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3950,
+      "line": 1719,
       "categories": [
         "table_guard"
       ],
@@ -7847,7 +7847,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4080,
+      "line": 1829,
       "categories": [
         "mapping"
       ],
@@ -7856,7 +7856,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4085,
+      "line": 1834,
       "categories": [
         "mapping"
       ],
@@ -7865,7 +7865,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4575,
+      "line": 2185,
       "categories": [
         "description_guard"
       ],
@@ -7874,7 +7874,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4603,
+      "line": 2213,
       "categories": [
         "description_guard"
       ],
@@ -7883,7 +7883,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4676,
+      "line": 2286,
       "categories": [
         "description_guard"
       ],
@@ -7892,7 +7892,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4705,
+      "line": 2315,
       "categories": [
         "epoll"
       ],
@@ -7901,7 +7901,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5046,
+      "line": 2656,
       "categories": [
         "mapping"
       ],
@@ -7910,7 +7910,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6361,
+      "line": 3971,
       "categories": [
         "mapping"
       ],
@@ -7919,7 +7919,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 8341,
+      "line": 5951,
       "categories": [
         "mapping"
       ],
