@@ -21,6 +21,7 @@ use super::objects::{
     Sighand, Task, TaskIdentity, TaskKey, TaskLifecycle, TaskRef, TaskShared, Thread, ThreadKey,
     ThreadRef, ThreadResources, Zombie,
 };
+use super::operations::KernelOperationError;
 use super::registry::{IdError, IdRegistry, TaskClaim, TaskReservation, ThreadClaim};
 
 /// Complete syscall identity snapshot. Each context keeps the exact shared
@@ -1083,27 +1084,32 @@ impl VforkParentWait {
         self.state.publication.lock().release
     }
 
-    pub fn subscribe_release(&self, callback: VforkReleaseCallback) -> VforkReleaseEnrollment {
+    pub fn try_subscribe_release(
+        &self,
+        callback: VforkReleaseCallback,
+    ) -> Result<VforkReleaseEnrollment, KernelOperationError> {
         let mut publication = self.state.publication.lock();
         if let Some(reason) = publication.release {
-            return VforkReleaseEnrollment::Ready(reason);
+            return Ok(VforkReleaseEnrollment::Ready(reason));
         }
         let id = publication.next_subscriber;
-        publication.next_subscriber =
-            publication
-                .next_subscriber
-                .checked_add(1)
-                .unwrap_or_else(|| {
-                    carrick_fatal!(
-                        "kernel::vfork_gate",
-                        "VforkParentWait subscriber ID exhaustion"
-                    );
-                });
+        publication.next_subscriber = publication
+            .next_subscriber
+            .checked_add(1)
+            .ok_or(KernelOperationError::ObjectId(ObjectIdError::Exhausted))?;
         publication.subscribers.insert(id, callback);
-        VforkReleaseEnrollment::Subscribed(VforkReleaseSubscription {
-            state: Arc::downgrade(&self.state),
-            id,
-        })
+        Ok(VforkReleaseEnrollment::Subscribed(
+            VforkReleaseSubscription {
+                state: Arc::downgrade(&self.state),
+                id,
+            },
+        ))
+    }
+
+    #[allow(clippy::expect_used)]
+    pub fn subscribe_release(&self, callback: VforkReleaseCallback) -> VforkReleaseEnrollment {
+        self.try_subscribe_release(callback)
+            .expect("VforkParentWait subscriber ID exhaustion")
     }
 
     pub fn wait(&self) -> VforkReleaseReason {
@@ -2961,6 +2967,14 @@ mod tests {
         drop(subscription);
         release.release(VforkReleaseReason::Exit);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn vfork_parent_wait_try_subscribe_release_exhaustion() {
+        let (wait, _release) = VforkChildRelease::pair();
+        wait.state.publication.lock().next_subscriber = u64::MAX;
+        let res = wait.try_subscribe_release(Arc::new(|_| {}));
+        assert!(matches!(res, Err(KernelOperationError::ObjectId(_))));
     }
 
     #[test]
