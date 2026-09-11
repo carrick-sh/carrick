@@ -4,6 +4,7 @@
 //! `impl SyscallDispatcher` move.
 use super::*;
 use crate::linux_abi::LinuxErrno;
+use std::path::Path;
 
 /// Recursion budget shared by `canonicalize_following` and the symlink-aware
 /// `..` walk it calls.
@@ -329,5 +330,463 @@ impl SyscallDispatcher {
             base = cur;
         }
         false
+    }
+
+    pub(in crate::dispatch) fn resolve_at_path(
+        &self,
+        dirfd: u64,
+        path: &str,
+    ) -> Result<String, LinuxErrno> {
+        // Cache only AT_FDCWD absolute paths: their resolution is independent of
+        // the cwd and of any dirfd, so the guest path string alone is a complete
+        // key. (Relative / dirfd-anchored paths would need those in the key; they
+        // are rare in the syscall-bound hot loops this targets.) The cache is
+        // validated against a fork-coherent generation bumped on structural fs
+        // mutations, so a create/delete/rename/symlink correctly invalidates it.
+        // Only successful resolutions are cached; errors re-resolve.
+        // Build a cache key when the resolution is fully determined by the
+        // guest path plus (for a relative path) the cwd:
+        //   - absolute path      -> the path itself (cwd/dirfd irrelevant)
+        //   - AT_FDCWD + relative -> cwd + '\0' + path, so a later chdir keys a
+        //     different entry rather than serving a stale one (LTP fuzzy-sync
+        //     tests chdir into their tmpdir and pass a relative name).
+        // A relative path through a REAL dirfd depends on that fd's directory,
+        // so it is not keyed here.
+        let is_atfdcwd = (dirfd as i32) as i64 as u64 == LINUX_AT_FDCWD;
+        let fs_context = self.captured_fs_context();
+        let cache_key: Option<String> = if std::path::Path::new(path).is_absolute() {
+            match fs_context.chroot_root().as_deref() {
+                Some(root) if root != "/" => Some(format!("{root}\u{0}{path}")),
+                _ => Some(path.to_owned()),
+            }
+        } else if is_atfdcwd {
+            Some(format!("{}\u{0}{}", fs_context.cwd(), path))
+        } else {
+            None
+        };
+        // Sample the generation at ENTRY, before reading any fs state: a new
+        // entry is stamped with this, so a mutation racing our resolve (which
+        // bumps to a higher generation) leaves the entry born stale.
+        let gen_at_entry = crate::fs_resolve_cache::current_generation();
+        if let Some(ref key) = cache_key {
+            // Validate the lookup against the FRESH current generation (read
+            // now, not `gen_at_entry`) so a mutation between entry and here also
+            // invalidates.
+            if let Some(hit) = self
+                .fs
+                .resolve_cache
+                .get(key, crate::fs_resolve_cache::current_generation())
+            {
+                // Still enforce DAC search permission per call — it depends on
+                // live creds, not the path structure (a no-op for root, the hot
+                // case). The resolution itself is what the cache elides.
+                self.check_search_access(&hit)?;
+                return Ok(hit);
+            }
+        }
+        let resolved = match self.resolve_at_path_inner(dirfd, path) {
+            Ok(resolved) => resolved,
+            Err(errno) => {
+                // Linux checks search (x) permission on EACH directory as it
+                // descends, so a no-search-permission prefix reports EACCES
+                // BEFORE a deeper ENOTDIR/ENOENT is discovered. carrick resolves
+                // the whole path as host-root first (finding the deeper error),
+                // so re-run the guest DAC search check on the input's directory
+                // prefix and let an EACCES there take precedence (pathconf02:
+                // abs_path = <mode-0 tmpdir>/testfile/testfile_1). No-op for root.
+                if (errno == LINUX_ENOTDIR || errno == LINUX_ENOENT)
+                    && let Some(abs) = self.absolute_input_path(dirfd, path)
+                {
+                    self.check_search_access(&abs)?;
+                }
+                return Err(errno);
+            }
+        };
+        self.check_search_access(&resolved)?;
+        if let Some(key) = cache_key {
+            self.fs
+                .resolve_cache
+                .put(key, resolved.clone(), gen_at_entry);
+        }
+        Ok(resolved)
+    }
+
+    /// The lexical absolute form of a guest input path (anchor + path, ".."
+    /// collapsed), WITHOUT existence/symlink resolution — used to run the DAC
+    /// search-permission walk on a path whose full resolution already failed.
+    /// `None` when the dirfd anchor can't be determined (not a directory fd).
+    fn absolute_input_path(&self, dirfd: u64, path: &str) -> Option<String> {
+        let dirfd = (dirfd as i32) as i64 as u64;
+        let fs_context = self.captured_fs_context();
+        let (anchor, path) = if Path::new(path).is_absolute() {
+            match fs_context.chroot_root().as_deref() {
+                Some(root) if root != "/" => (root.to_owned(), path.trim_start_matches('/')),
+                _ => ("/".to_string(), path),
+            }
+        } else if dirfd == LINUX_AT_FDCWD {
+            (fs_context.cwd(), path)
+        } else {
+            match self.open_file(dirfd as i32)?.description.read().as_deref() {
+                Some(OpenDescription::Directory { path: dir, .. }) => (dir.clone(), path),
+                _ => return None,
+            }
+        };
+        Some(join_rootfs_path(&anchor, path))
+    }
+
+    /// Linux DAC search-permission check: resolving a path requires search
+    /// (execute) permission on EVERY directory component leading to the final
+    /// name. carrick runs every guest op as host-root, so the host kernel never
+    /// enforces this — but when the guest has dropped to a non-root euid we
+    /// must, or a no-search-permission component wrongly succeeds (lstat02,
+    /// stat03, truncate03, readlink03, … all assert EACCES here). Root (euid 0)
+    /// holds CAP_DAC_OVERRIDE and is exempt, which is also the hot path: the
+    /// overwhelming majority of guests run as root, so this returns immediately.
+    pub(super) fn check_search_access(&self, abs: &str) -> Result<(), LinuxErrno> {
+        let creds = self.cred_snapshot();
+        // fsuid, not euid: setfsuid(2) moves every file-access check onto the
+        // fsuid, and capabilities(7) drops CAP_DAC_READ_SEARCH on an fsuid
+        // 0 -> nonzero transition. This function already selected its
+        // permission class from `creds.fsuid` below while bypassing on
+        // `creds.euid` — two identities in one check, so a process that had
+        // dropped only its fsuid searched as root.
+        if creds.fsuid.is_root() {
+            return Ok(());
+        }
+        let trimmed = abs.trim_end_matches('/');
+        let parent = match trimmed.rsplit_once('/') {
+            Some((p, _)) if !p.is_empty() => p,
+            _ => return Ok(()),
+        };
+        let mut prefix = String::new();
+        for comp in parent.split('/').filter(|c| !c.is_empty()) {
+            prefix.push('/');
+            prefix.push_str(comp);
+            // A missing or non-directory component is ENOENT/ENOTDIR, surfaced
+            // by the existence checks elsewhere — not our concern here.
+            let Ok(md) = self.layered_metadata(&prefix) else {
+                return Ok(());
+            };
+            if md.kind != RootFsEntryKind::Directory {
+                return Ok(());
+            }
+            let (uid, gid) = self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .get_owner(&prefix)
+                .unwrap_or((carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT));
+            // Pick the permission class: owner, then group, else other. (carrick
+            // tracks the primary fsgid, not the full supplementary set — a close
+            // approximation that the LTP search-permission cases exercise.)
+            let x_bit = if creds.fsuid == uid {
+                0o100
+            } else if creds.fsgid == gid {
+                0o010
+            } else {
+                0o001
+            };
+            if md.mode & x_bit == 0 {
+                return Err(LINUX_EACCES);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_directory_search_access(&self, abs: &str) -> Result<(), LinuxErrno> {
+        let creds = self.cred_snapshot();
+        // fsuid — same rule as `check_search_access`.
+        if creds.fsuid.is_root() {
+            return Ok(());
+        }
+        let md = self.layered_metadata(abs)?;
+        if md.kind != RootFsEntryKind::Directory {
+            return Ok(());
+        }
+        let (uid, gid) = self
+            .fs
+            .rootfs_vfs
+            .overlay
+            .get_owner(abs)
+            .unwrap_or((carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT));
+        let x_bit = if creds.fsuid == uid {
+            0o100
+        } else if creds.fsgid == gid {
+            0o010
+        } else {
+            0o001
+        };
+        if md.mode & x_bit == 0 {
+            return Err(LINUX_EACCES);
+        }
+        Ok(())
+    }
+
+    fn resolve_at_path_inner(&self, dirfd: u64, path: &str) -> Result<String, LinuxErrno> {
+        // dirfd is an `int` in the kernel ABI: only the low 32 bits are
+        // meaningful, and AT_FDCWD (-100) may arrive zero-extended (0xFFFFFF9C)
+        // or sign-extended (0xFFFF..FF9C) depending on how the guest libc
+        // widened it. Canonicalise via i32 so AT_FDCWD is recognised either
+        // way (coreutils `ln` passed the zero-extended form → symlinkat/linkat
+        // wrongly treated it as a real fd → EBADF).
+        let dirfd = (dirfd as i32) as i64 as u64;
+        if path.is_empty() {
+            return Ok(path.to_owned());
+        }
+        // `/dev/fd/N` and `/dev/std{in,out,err}` are Linux symlinks into
+        // `/proc/self/fd`; rewrite to that so the magic-fd machinery (open → dup
+        // N) serves them. The rewritten path is absolute, so it re-resolves
+        // independently of `dirfd`. (Fixes bash process substitution `<(...)`.)
+        if let Some(rewritten) = rewrite_dev_fd_alias(path) {
+            return self.resolve_at_path(dirfd, &rewritten);
+        }
+        // ENAMETOOLONG: Linux rejects any single component > NAME_MAX (255) and
+        // any total path > PATH_MAX (4096) at resolution time. carrick lacked
+        // these limits, so a too-long path SUCCEEDED instead of failing
+        // (LTP lstat02/stat03/truncate03/open13/… "returned 0, expected -1").
+        check_path_length(path)?;
+        // The anchor directory a relative path resolves against (already a real,
+        // symlink-free path): "/" for an absolute path, the cwd for AT_FDCWD, else
+        // the dirfd's directory.
+        let fs_context = self.captured_fs_context();
+        let (anchor, path) = if Path::new(path).is_absolute() {
+            match fs_context.chroot_root().as_deref() {
+                Some(root) if root != "/" => (root.to_owned(), path.trim_start_matches('/')),
+                _ => ("/".to_string(), path),
+            }
+        } else if dirfd == LINUX_AT_FDCWD {
+            (fs_context.cwd(), path)
+        } else {
+            match self.open_file(dirfd as i32).as_ref() {
+                Some(open_file) => match open_file.description.read().as_deref() {
+                    Some(OpenDescription::Directory { path: dir, .. }) => {
+                        // A relative *at op through a dirfd whose directory has
+                        // since been removed (rmdir) resolves to ENOENT on Linux:
+                        // the open fd persists but its path no longer exists.
+                        // carrick keeps the Directory description cached, so
+                        // re-verify the anchor still exists in the layered view
+                        // (symlinkat01/linkat01 deldirfd cases → ENOENT).
+                        if self.layered_metadata(dir).is_err() {
+                            return Err(LINUX_ENOENT);
+                        }
+                        (dir.clone(), path)
+                    }
+                    _ => return Err(LINUX_ENOTDIR),
+                },
+                // A valid fd that isn't in the table (e.g. a stdio fd) is still a
+                // non-directory, so a relative path can't be anchored to it →
+                // ENOTDIR; only a genuinely-invalid fd is EBADF (statx03 uses
+                // dfd=1 → ENOTDIR, dfd=-1 → EBADF).
+                None if self.fd_is_valid(dirfd as i32) => return Err(LINUX_ENOTDIR),
+                None => return Err(LINUX_EBADF),
+            }
+        };
+        // A ".." component must be applied AFTER following any preceding symlink
+        // (Linux: "a/.." with a -> b/c lands in b, not lexically at the parent of
+        // a). join_rootfs_path collapses ".." LEXICALLY, before symlink
+        // resolution, so it gets this wrong. Take a symlink-aware walk only when a
+        // ".." is present; the (overwhelmingly common) no-".." path keeps the
+        // cheap lexical join + the existing intermediate-symlink rewrite, so the
+        // hot path is unchanged. (Go os TestRootConsistency*/dotdot_in_path_after_symlink.)
+        if path.split('/').any(|c| c == "..") || anchor.split('/').any(|c| c == "..") {
+            return self.resolve_dotdot_symlink_aware(&anchor, path);
+        }
+        let abs = join_rootfs_path(&anchor, path);
+        // Fast path: ONE kernel-walked openat+F_GETPATH of the PARENT chain
+        // replaces both per-component O(K²) passes below (validate_intermediate_
+        // dirs + resolve_intermediate_symlinks) for the common case — every
+        // intermediate exists, is a directory, and involves no symlink or
+        // Unicode-alias redirection. Anything non-trivial → the exact slow path.
+        match self.fs.rootfs_vfs.overlay.validate_parents_fast(&abs) {
+            crate::fs_backend::ParentResolve::AllDirsNoSymlink => return Ok(abs),
+            crate::fs_backend::ParentResolve::NotDir => return Err(LINUX_ENOTDIR),
+            crate::fs_backend::ParentResolve::Slow => {}
+        }
+        // ELOOP: Linux caps the CUMULATIVE symlinks followed across the whole path
+        // at MAXSYMLINKS (40). carrick's per-component resolvers each cap at 40 but
+        // don't share a budget, so a path stacking many shallow intermediate
+        // symlinks (LTP stat03/lstat02/truncate03 build `test_eloop -> ../test_eloop`
+        // repeated ~43×) would otherwise resolve to a directory instead of failing.
+        // Surface the overflow here, on the slow (symlink-bearing) path only.
+        if self.symlink_follow_budget_exceeded(&abs) {
+            return Err(crate::linux_abi::LINUX_ELOOP);
+        }
+        // ENOTDIR: an existing intermediate component that is not a directory
+        // can't be traversed. carrick previously let the final lookup return
+        // ENOENT (or leniently resolved through it). Synthesize ENOTDIR here so
+        // `stat("/etc/passwd/foo")` & co match Linux (lstat02/stat03/…).
+        self.validate_intermediate_dirs(&abs)?;
+        // Collapse intermediate (non-final) directory symlinks so the returned
+        // path is symlink-free in its parent chain. Downstream consumers
+        // (real_stat via cap-std, layered_metadata, canonicalize_following's
+        // final-component follow) cannot traverse an intermediate symlink whose
+        // target is absolute (cap-std treats an absolute target as a sandbox
+        // escape), so `stat("/link/f")` where `/link -> /realdir` would wrongly
+        // return ENOENT. Rewriting to `/realdir/f` matches Linux path
+        // resolution. The final component is intentionally NOT followed here —
+        // each caller decides lstat-vs-stat semantics (AT_SYMLINK_NOFOLLOW).
+        Ok(self.resolve_intermediate_symlinks(&abs))
+    }
+
+    /// Resolve a path containing ".." components symlink-AWARE: walk left to
+    /// right, FOLLOWING each intermediate symlink before applying "..", so
+    /// "a/../c" with `a -> b/c` lands in `b` (then `b/c`), matching Linux — not
+    /// the lexical `/c` that `join_rootfs_path` would produce. The FINAL component
+    /// is NOT followed (the caller decides lstat-vs-stat). A non-directory
+    /// intermediate is ENOTDIR; a symlink cycle propagates ELOOP; a missing
+    /// intermediate propagates ENOENT before any later `..` can collapse it.
+    /// Only invoked when a ".." is actually present.
+    pub(super) fn resolve_dotdot_symlink_aware(
+        &self,
+        anchor: &str,
+        path: &str,
+    ) -> Result<String, LinuxErrno> {
+        let mut all: Vec<&str> = Vec::new();
+        if !Path::new(path).is_absolute() {
+            all.extend(anchor.split('/').filter(|c| !c.is_empty() && *c != "."));
+        }
+        all.extend(path.split('/').filter(|c| !c.is_empty() && *c != "."));
+
+        // `base` is the resolved, symlink-free prefix so far (no trailing slash;
+        // empty string == root).
+        let mut base = String::new();
+        let last = all.len().saturating_sub(1);
+        for (i, comp) in all.iter().enumerate() {
+            if *comp == ".." {
+                // Climb one resolved component (never above root).
+                match base.rfind('/') {
+                    Some(pos) => base.truncate(pos),
+                    None => base.clear(),
+                }
+                continue;
+            }
+            let mut candidate = base.clone();
+            candidate.push('/');
+            candidate.push_str(comp);
+            if i == last {
+                // Final component: leave it unfollowed for the caller.
+                base = candidate;
+                break;
+            }
+            match self.layered_lstat(&candidate) {
+                Ok(md) if md.kind == RootFsEntryKind::Symlink => {
+                    match self.canonicalize_following(&candidate) {
+                        Ok(target) if self.path_is_directory(&target) => {
+                            base = target.trim_end_matches('/').to_owned();
+                        }
+                        // Symlink to a non-directory can't be traversed as an
+                        // intermediate; ELOOP/other errors propagate.
+                        Ok(_) => return Err(LINUX_ENOTDIR),
+                        Err(e) => return Err(e),
+                    }
+                }
+                // A real directory intermediate: descend.
+                Ok(md) if md.kind == RootFsEntryKind::Directory => base = candidate,
+                // An existing non-directory intermediate (regular file, device,
+                // FIFO) can't be traversed → ENOTDIR.
+                Ok(_) => return Err(LINUX_ENOTDIR),
+                // A missing or otherwise inaccessible intermediate stops path
+                // resolution immediately. In particular, `missing/..` is ENOENT
+                // on Linux; it must not collapse back to the parent.
+                Err(errno) => return Err(errno),
+            }
+        }
+        Ok(if base.is_empty() {
+            "/".to_owned()
+        } else {
+            base
+        })
+    }
+
+    /// Rewrite `abs` so every intermediate (non-final) directory-symlink
+    /// component is replaced by its resolved target, leaving the final
+    /// component untouched. Best-effort: a component that doesn't resolve to a
+    /// directory (dangling/non-dir symlink, ELOOP) leaves the path from that
+    /// point unchanged, so the downstream lookup surfaces the correct
+    /// ENOENT/ENOTDIR. Bounded by `canonicalize_following`'s own ELOOP guard.
+    pub(super) fn resolve_intermediate_symlinks(&self, abs: &str) -> String {
+        let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.len() < 2 {
+            return abs.to_owned();
+        }
+        let mut base = String::new();
+        for comp in &comps[..comps.len() - 1] {
+            let mut candidate = base.clone();
+            candidate.push('/');
+            candidate.push_str(comp);
+            match self.layered_lstat(&candidate) {
+                Ok(md) if md.kind == RootFsEntryKind::Symlink => {
+                    match self.canonicalize_following(&candidate) {
+                        Ok(target) if self.path_is_directory(&target) => {
+                            base = target.trim_end_matches('/').to_owned();
+                        }
+                        // Unresolvable/non-dir symlink intermediate: stop
+                        // rewriting; leave the rest for the downstream lookup.
+                        _ => return abs.to_owned(),
+                    }
+                }
+                // Plain directory (or not-yet-statable): keep walking.
+                _ => {
+                    base = candidate;
+                }
+            }
+        }
+        if let Some(name) = comps.last() {
+            base.push('/');
+            base.push_str(name);
+        }
+        if base.is_empty() {
+            "/".to_owned()
+        } else {
+            base
+        }
+    }
+
+    /// Walk the intermediate (non-final) components of an already-joined
+    /// absolute guest path; if any EXISTING intermediate is a non-directory
+    /// (regular file / char device), traversing it is ENOTDIR. A missing
+    /// intermediate is left alone — the final lookup surfaces ENOENT, which is
+    /// correct. Symlink intermediates are followed by the downstream resolver,
+    /// so they're not flagged here. Cheap: short-circuits at the first missing
+    /// component (so a fresh deep path costs one lookup).
+    fn validate_intermediate_dirs(&self, abs: &str) -> Result<(), LinuxErrno> {
+        let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.len() < 2 {
+            return Ok(()); // no intermediates
+        }
+        let mut prefix = String::new();
+        for comp in &comps[..comps.len() - 1] {
+            prefix.push('/');
+            prefix.push_str(comp);
+            match self.layered_lstat(&prefix) {
+                Ok(md) => match md.kind {
+                    RootFsEntryKind::Directory => {}
+                    // A symlink intermediate is traversable IFF it resolves to a
+                    // directory (Linux follows it). Resolve through the layered
+                    // VFS — this handles an absolute in-rootfs target (e.g.
+                    // `/tmp/sm_link -> /tmp/sm_real`) that a single-backend
+                    // cap-std follow can't (it treats absolute as a sandbox
+                    // escape). A symlink to a non-directory (or a dangling one)
+                    // is ENOTDIR, matching Linux.
+                    RootFsEntryKind::Symlink => match self.canonicalize_following(&prefix) {
+                        Ok(target) if self.path_is_directory(&target) => {}
+                        // A self-referential / over-deep intermediate symlink is
+                        // a CYCLE → ELOOP, not ENOTDIR. canonicalize_following
+                        // caps at 40 hops and returns ELOOP; propagate it rather
+                        // than collapsing to the non-dir ENOTDIR below
+                        // (lstat02/stat03/truncate03/readlink03 assert ELOOP on
+                        // an intermediate self-linking component).
+                        Err(e) if e == crate::linux_abi::LINUX_ELOOP => return Err(e),
+                        _ => return Err(LINUX_ENOTDIR),
+                    },
+                    // A regular file / char device can't be a path component.
+                    _ => return Err(LINUX_ENOTDIR),
+                },
+                // Intermediate doesn't exist (or isn't statable) → stop; the
+                // final resolution returns ENOENT as Linux does.
+                Err(_) => return Ok(()),
+            }
+        }
+        Ok(())
     }
 }
