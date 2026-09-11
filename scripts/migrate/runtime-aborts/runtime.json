@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 12,
+  "typed_error_debt_ceiling": 11,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -1501,18 +1501,6 @@
       "rationale": "ReservationGate allocated subscriber ID 0; violates non-zero subscriber token invariant.",
       "sink": "fatal",
       "domain": "kernel::reservation_gate"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/core.rs",
-      "function": "VforkParentWait::subscribe_release",
-      "ordinal_in_function": 1,
-      "fingerprint": "1574a5b5acf5780c8cc1510e340526a774e303dc561c43fdc230345060187697",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::vfork_gate",
-      "rationale": "VforkParentWait subscriber ID exhaustion during release subscription should return a local typed error instead of aborting.",
-      "typed_error": "KernelOperationError",
-      "sink": "fatal",
-      "domain": "kernel::vfork_gate"
     },
     {
       "file": "crates/carrick-runtime/src/kernel/frame_inventory.rs",
