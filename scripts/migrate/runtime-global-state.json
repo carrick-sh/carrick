@@ -1659,7 +1659,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
       "symbol": "tests::pending_exec_completion_ownership_survives_control_context_failure_without_abort::CHILD",
       "fingerprint": "aff99ea176e234e486ad57820720ef9f768be471aa94e729627b0f8b49a0cd9d",
       "classification": "test_only",
