@@ -257,6 +257,7 @@ use epoll_ops::epoll_kqueue_for_wake_test;
 pub(super) mod lifecycle;
 pub(super) use lifecycle::host_stream_socket_rdhup;
 pub(super) mod netlink;
+pub(crate) mod packet;
 pub(super) mod recverr;
 pub(super) mod reuseport;
 pub(super) mod scm_rights;

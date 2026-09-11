@@ -3343,6 +3343,15 @@ impl SyscallDispatcher {
                     return Err(linux_errno::ENODEV);
                 }
             }
+            OpenDescription::Packet { socket, .. } => {
+                let init = socket.initial_ring_bytes().ok_or(linux_errno::EINVAL)?;
+                if offset_usize < init.len() {
+                    let available = &init[offset_usize..];
+                    let copy_len = available.len().min(length);
+                    bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+                }
+                None
+            }
             _ => return Err(LINUX_EBADF),
         };
         Ok(PrivateMmapSnapshot {
@@ -4876,6 +4885,7 @@ impl SyscallDispatcher {
                                     crate::vfs::SyntheticDeviceKind::Urandom => "/dev/urandom".to_string(),
                                 }
                             }
+                            OpenDescription::Packet { .. } => "[packet_ring]".to_string(),
                             _ => String::new(),
                         }
                     })
@@ -6212,6 +6222,7 @@ impl SyscallDispatcher {
             // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can
             // EBUSY while it is mapped.
             let mut writable_memfd_desc: Option<Arc<crate::kernel::FileDescription>> = None;
+            let mut packet_socket_desc: Option<Arc<super::net::packet::PacketSocket>> = None;
             let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) || lowering_candidate {
                 Vec::new()
             } else {
@@ -6387,6 +6398,32 @@ impl SyscallDispatcher {
                         }
                         // /dev/zero zero-fill: keep `bytes` zeroed (no read).
                     }
+                    OpenDescription::Packet { socket, .. } => {
+                        if offset != 0 {
+                            return Ok(request.refused(
+                                MmapRefusal::Spec("mmap of packet ring with non-zero offset"),
+                                LINUX_EINVAL,
+                            ));
+                        }
+                        let init = match socket.initial_ring_bytes() {
+                            Some(b) => b,
+                            None => {
+                                return Ok(request.refused(
+                                    MmapRefusal::Spec("mmap of packet socket without ring"),
+                                    LINUX_EBUSY,
+                                ));
+                            }
+                        };
+                        if length_usize != init.len() {
+                            return Ok(request.refused(
+                                MmapRefusal::Spec("mmap size does not match packet ring size"),
+                                LINUX_EINVAL,
+                            ));
+                        }
+                        let copy_len = init.len().min(bytes.len());
+                        bytes[..copy_len].copy_from_slice(&init[..copy_len]);
+                        packet_socket_desc = Some(Arc::clone(socket));
+                    }
                     _ => {
                         return Ok(request.refused(
                             MmapRefusal::Spec("mmap of a descriptor with no mappable backing"),
@@ -6488,6 +6525,9 @@ impl SyscallDispatcher {
                         shared_file_alias: None,
                     },
                 ));
+                if let Some(socket) = &packet_socket_desc {
+                    socket.set_mapped_va(GuestVa(address));
+                }
                 return Ok(DispatchOutcome::MapHostAlias {
                     success_retval: address as i64,
                     transaction,
@@ -6769,6 +6809,9 @@ impl SyscallDispatcher {
                 &private_file_description, address, length, offset,
             ) {
                 this.mem().lock().private_file_maps.push(source);
+            }
+            if let Some(socket) = &packet_socket_desc {
+                socket.set_mapped_va(GuestVa(address));
             }
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::returned_u64(address)?)

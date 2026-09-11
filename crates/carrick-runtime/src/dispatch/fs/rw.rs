@@ -470,7 +470,8 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
-                | OpenDescription::Netlink { .. } => {
+                | OpenDescription::Netlink { .. }
+                | OpenDescription::Packet { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
                 }
                 // HostFile is handled by the early libc::lseek above.
@@ -527,7 +528,8 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
-                | OpenDescription::Netlink { .. } => {}
+                | OpenDescription::Netlink { .. }
+                | OpenDescription::Packet { .. } => {}
             }
             // A rewind drops a read-time snapshot so the next getdents64
             // lists a FRESH view (Linux re-reads the directory after
@@ -976,6 +978,11 @@ impl<'a> FsView<'a> {
                         memory, address, length, recv_queue,
                     ));
                 }
+                OpenDescription::Packet { socket, .. } => {
+                    let socket = Arc::clone(socket);
+                    drop(open);
+                    return Ok(socket.recvfrom(memory, address, length, 0, 0, 0));
+                }
                 // Real host file: libc::read advances the kernel offset
                 // (shared across fork). read_host_pipe is just a
                 // memory-into-guest read(2) wrapper.
@@ -1274,7 +1281,8 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
-                | OpenDescription::Netlink { .. } => {
+                | OpenDescription::Netlink { .. }
+                | OpenDescription::Packet { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             };
@@ -1401,7 +1409,8 @@ impl<'a> FsView<'a> {
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. }
-                | OpenDescription::InMemorySocket { .. } => {
+                | OpenDescription::InMemorySocket { .. }
+                | OpenDescription::Packet { .. } => {
                     // Positional read on a non-seekable fd (pipe/socket/anon) is
                     // ESPIPE on Linux; a directory is EISDIR (above). pread02.
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
@@ -1571,7 +1580,8 @@ impl<'a> FsView<'a> {
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. }
-                | OpenDescription::InMemorySocket { .. } => {
+                | OpenDescription::InMemorySocket { .. }
+                | OpenDescription::Packet { .. } => {
                     // Positional read on a non-seekable fd → ESPIPE; directory →
                     // EISDIR (above). preadv02.
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
@@ -1817,7 +1827,8 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::SyntheticDevice { .. }
                 | OpenDescription::Fanotify { .. }
-                | OpenDescription::InMemorySocket { .. } => LINUX_ESPIPE,
+                | OpenDescription::InMemorySocket { .. }
+                | OpenDescription::Packet { .. } => LINUX_ESPIPE,
             };
             Ok(DispatchOutcome::errno(errno))
 
@@ -2112,7 +2123,8 @@ impl<'a> FsView<'a> {
                 | OpenDescription::Inotify { .. }
                 | OpenDescription::SyntheticDevice { .. }
                 | OpenDescription::Fanotify { .. }
-                | OpenDescription::InMemorySocket { .. } => LINUX_ESPIPE,
+                | OpenDescription::InMemorySocket { .. }
+                | OpenDescription::Packet { .. } => LINUX_ESPIPE,
             };
             Ok(DispatchOutcome::errno(errno))
 
@@ -2434,6 +2446,11 @@ impl<'a> FsView<'a> {
                                 }
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             }
+                        }
+                        OpenDescription::Packet { socket, .. } => {
+                            let socket = Arc::clone(socket);
+                            drop(open);
+                            return Ok(socket.sendto(cx.memory, &bytes, 0, 0, 0));
                         }
                         OpenDescription::HostFile {
                             host_fd, writable, ..

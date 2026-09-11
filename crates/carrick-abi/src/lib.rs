@@ -5833,6 +5833,151 @@ pub const LINUX_SO_DOMAIN: i32 = 39;
 /// (three u32s). What `getsockopt(SOL_SOCKET, SO_PEERCRED)` returns.
 pub const LINUX_UCRED_SIZE: usize = 12;
 
+// ===== AF_PACKET (packet(7)) =====
+pub const LINUX_SOL_PACKET: i32 = 263;
+pub const LINUX_PACKET_ADD_MEMBERSHIP: i32 = 1;
+pub const LINUX_PACKET_DROP_MEMBERSHIP: i32 = 2;
+pub const LINUX_PACKET_RECV_OUTPUT: i32 = 3;
+pub const LINUX_PACKET_RX_RING: i32 = 5;
+pub const LINUX_PACKET_STATISTICS: i32 = 6;
+pub const LINUX_PACKET_COPY_THRESH: i32 = 7;
+pub const LINUX_PACKET_AUXDATA: i32 = 8;
+pub const LINUX_PACKET_ORIGDEV: i32 = 9;
+pub const LINUX_PACKET_VERSION: i32 = 10;
+pub const LINUX_PACKET_HDRLEN: i32 = 11;
+pub const LINUX_PACKET_RESERVE: i32 = 12;
+pub const LINUX_PACKET_TX_RING: i32 = 13;
+pub const LINUX_PACKET_LOSS: i32 = 14;
+pub const LINUX_PACKET_VNET_HDR: i32 = 15;
+pub const LINUX_PACKET_TX_TIMESTAMP: i32 = 16;
+pub const LINUX_PACKET_TIMESTAMP: i32 = 17;
+pub const LINUX_PACKET_FANOUT: i32 = 18;
+pub const LINUX_PACKET_TX_HAS_OFF: i32 = 19;
+pub const LINUX_PACKET_QDISC_BYPASS: i32 = 20;
+pub const LINUX_PACKET_ROLLOVER_STATS: i32 = 21;
+pub const LINUX_PACKET_FANOUT_DATA: i32 = 22;
+pub const LINUX_PACKET_IGNORE_OUTGOING: i32 = 23;
+
+pub const LINUX_TPACKET_V1: i32 = 0;
+pub const LINUX_TPACKET_V2: i32 = 1;
+pub const LINUX_TPACKET_V3: i32 = 2;
+
+pub const LINUX_TP_STATUS_KERNEL: u32 = 0;
+pub const LINUX_TP_STATUS_USER: u32 = 1 << 0;
+pub const LINUX_TP_STATUS_COPY: u32 = 1 << 1;
+pub const LINUX_TP_STATUS_LOSING: u32 = 1 << 2;
+pub const LINUX_TP_STATUS_CSUMNOTREADY: u32 = 1 << 3;
+pub const LINUX_TP_STATUS_VNET_HDR: u32 = 1 << 4;
+pub const LINUX_TP_STATUS_BLK_TMO: u32 = 1 << 5;
+
+/// `struct sockaddr_ll` (`linux/if_packet.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LinuxSockaddrLl {
+    pub sll_family: u16,
+    pub sll_protocol: u16,
+    pub sll_ifindex: i32,
+    pub sll_hatype: u16,
+    pub sll_pkttype: u8,
+    pub sll_halen: u8,
+    pub sll_addr: [u8; 8],
+}
+
+/// `struct tpacket_req` (`linux/if_packet.h`) for TPACKET_V1 and TPACKET_V2.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LinuxTpacketReq {
+    pub tp_block_size: u32,
+    pub tp_block_nr: u32,
+    pub tp_frame_size: u32,
+    pub tp_frame_nr: u32,
+}
+
+/// `struct tpacket_req3` (`linux/if_packet.h`) for TPACKET_V3.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LinuxTpacketReq3 {
+    pub tp_block_size: u32,
+    pub tp_block_nr: u32,
+    pub tp_frame_size: u32,
+    pub tp_frame_nr: u32,
+    pub tp_retire_blk_tov: u32,
+    pub tp_sizeof_priv: u32,
+    pub tp_feature_req_word: u32,
+}
+
+/// `struct tpacket_bd_ts` (`linux/if_packet.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LinuxTpacketBdTs {
+    pub ts_sec: u32,
+    pub ts_usec: u32,
+}
+
+/// `struct tpacket_hdr_v1` (`linux/if_packet.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LinuxTpacketHdrV1 {
+    pub block_status: u32,
+    pub num_pkts: u32,
+    pub offset_to_first_pkt: u32,
+    pub blk_len: u32,
+    pub seq_num: u64,
+    pub ts_first_pkt: LinuxTpacketBdTs,
+    pub ts_last_pkt: LinuxTpacketBdTs,
+}
+
+/// `struct tpacket_block_desc` (`linux/if_packet.h`) for TPACKET_V3.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LinuxTpacketBlockDesc {
+    pub version: u32,
+    pub offset_to_priv: u32,
+    pub hdr: LinuxTpacketHdrV1,
+}
+
+/// `struct tpacket_hdr_variant1` (`linux/if_packet.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LinuxTpacketHdrVariant1 {
+    pub rxhash: u32,
+    pub vlan_tci: u32,
+    pub vlan_tpid: u16,
+    pub padding: u16,
+}
+
+/// `struct tpacket3_hdr` (`linux/if_packet.h`) for TPACKET_V3 packet header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LinuxTpacket3Hdr {
+    pub tp_next_offset: u32,
+    pub tp_sec: u32,
+    pub tp_nsec: u32,
+    pub tp_snaplen: u32,
+    pub tp_len: u32,
+    pub tp_status: u32,
+    pub tp_mac: u16,
+    pub tp_net: u16,
+    pub hv1: LinuxTpacketHdrVariant1,
+    pub tp_padding: [u8; 8],
+}
+
+/// `struct tpacket2_hdr` (`linux/if_packet.h`) for TPACKET_V2 packet header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LinuxTpacket2Hdr {
+    pub tp_status: u32,
+    pub tp_len: u32,
+    pub tp_snaplen: u32,
+    pub tp_mac: u16,
+    pub tp_net: u16,
+    pub tp_sec: u32,
+    pub tp_nsec: u32,
+    pub tp_vlan_tci: u16,
+    pub tp_vlan_tpid: u16,
+    pub tp_padding: [u8; 4],
+}
+
 // ===== io_uring (WS-H4-B1) =====
 // The submission/completion-queue-entry ABI is fixed (the guest fills SQEs and
 // reads CQEs), so these structs must match the kernel byte-for-byte. The ring
@@ -6023,6 +6168,27 @@ assert_layout!(LinuxIoUringCqe, size = 16);
 assert_layout!(LinuxIoSqringOffsets, size = 40);
 assert_layout!(LinuxIoCqringOffsets, size = 40);
 assert_layout!(LinuxIoUringParams, size = 120);
+
+// ----- AF_PACKET wire structs -----
+kernel_abi!(LinuxSockaddrLl, 20, "struct sockaddr_ll is 20 bytes");
+assert_layout!(LinuxSockaddrLl, size = 20, sll_family @ 0, sll_protocol @ 2, sll_ifindex @ 4, sll_hatype @ 8, sll_pkttype @ 10, sll_halen @ 11, sll_addr @ 12);
+kernel_abi!(LinuxTpacketReq, 16, "struct tpacket_req is 16 bytes");
+assert_layout!(LinuxTpacketReq, size = 16, tp_block_size @ 0, tp_block_nr @ 4, tp_frame_size @ 8, tp_frame_nr @ 12);
+kernel_abi!(LinuxTpacketReq3, 28, "struct tpacket_req3 is 28 bytes");
+assert_layout!(LinuxTpacketReq3, size = 28, tp_block_size @ 0, tp_block_nr @ 4, tp_frame_size @ 8, tp_frame_nr @ 12, tp_retire_blk_tov @ 16, tp_sizeof_priv @ 20, tp_feature_req_word @ 24);
+assert_layout!(LinuxTpacketBdTs, size = 8, ts_sec @ 0, ts_usec @ 4);
+assert_layout!(LinuxTpacketHdrV1, size = 40, block_status @ 0, num_pkts @ 4, offset_to_first_pkt @ 8, blk_len @ 12, seq_num @ 16, ts_first_pkt @ 24, ts_last_pkt @ 32);
+kernel_abi!(
+    LinuxTpacketBlockDesc,
+    48,
+    "struct tpacket_block_desc is 48 bytes"
+);
+assert_layout!(LinuxTpacketBlockDesc, size = 48, version @ 0, offset_to_priv @ 4, hdr @ 8);
+assert_layout!(LinuxTpacketHdrVariant1, size = 12, rxhash @ 0, vlan_tci @ 4, vlan_tpid @ 8, padding @ 10);
+kernel_abi!(LinuxTpacket3Hdr, 48, "struct tpacket3_hdr is 48 bytes");
+assert_layout!(LinuxTpacket3Hdr, size = 48, tp_next_offset @ 0, tp_sec @ 4, tp_nsec @ 8, tp_snaplen @ 12, tp_len @ 16, tp_status @ 20, tp_mac @ 24, tp_net @ 26, hv1 @ 28, tp_padding @ 40);
+kernel_abi!(LinuxTpacket2Hdr, 32, "struct tpacket2_hdr is 32 bytes");
+assert_layout!(LinuxTpacket2Hdr, size = 32, tp_status @ 0, tp_len @ 4, tp_snaplen @ 8, tp_mac @ 12, tp_net @ 14, tp_sec @ 16, tp_nsec @ 20, tp_vlan_tci @ 24, tp_vlan_tpid @ 26, tp_padding @ 28);
 
 // ----- constant uniqueness / disjointness / boundary checks -----
 //
