@@ -142,7 +142,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::brk",
+      "function": "MemView<'a>::brk",
       "ordinal_in_function": 1,
       "fingerprint": "c3af1011b19cfbfbc57dccb894cf9f12f148f1ec12a538a6df6e608e845bb6a0",
       "verdict": "carrier_fault",
@@ -153,7 +153,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::brk",
+      "function": "MemView<'a>::brk",
       "ordinal_in_function": 2,
       "fingerprint": "c3af1011b19cfbfbc57dccb894cf9f12f148f1ec12a538a6df6e608e845bb6a0",
       "verdict": "carrier_fault",
@@ -164,7 +164,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::brk",
+      "function": "MemView<'a>::brk",
       "ordinal_in_function": 3,
       "fingerprint": "c3af1011b19cfbfbc57dccb894cf9f12f148f1ec12a538a6df6e608e845bb6a0",
       "verdict": "carrier_fault",
@@ -175,7 +175,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::commit_host_alias_mmap_on",
+      "function": "MemView<'a>::commit_host_alias_mmap_on",
       "ordinal_in_function": 1,
       "fingerprint": "4107c843f6ad5b842514cadbe28694837bd72313ebea8273f3f342d931b5fe6a",
       "verdict": "carrier_fault",
@@ -186,7 +186,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::commit_host_alias_mmap_on",
+      "function": "MemView<'a>::commit_host_alias_mmap_on",
       "ordinal_in_function": 2,
       "fingerprint": "83b042b52d9c953e3f91ed421d1d493af80a4cfc014066c0be1f464c6e5ce483",
       "verdict": "carrier_fault",
@@ -197,7 +197,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::commit_host_alias_mmap_on",
+      "function": "MemView<'a>::commit_host_alias_mmap_on",
       "ordinal_in_function": 3,
       "fingerprint": "c4458d4389f84a4af3f486070c68d91aaa40fee697b80e8f61f63c4f131bd9b2",
       "verdict": "carrier_fault",
@@ -208,7 +208,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::commit_mmap_growdown",
+      "function": "MemView<'a>::commit_mmap_growdown",
       "ordinal_in_function": 1,
       "fingerprint": "c4aea678c7339eddb29b575dc610fe1fdefdacc38c9009b78c4519df38144ab1",
       "verdict": "carrier_fault",
@@ -219,7 +219,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::commit_resident_fault",
+      "function": "MemView<'a>::commit_resident_fault",
       "ordinal_in_function": 1,
       "fingerprint": "8ef51523a78b2acdc6d56763f5b12cea108ab4d90518b2c34508cb6d09ed1e09",
       "verdict": "carrier_fault",
@@ -230,7 +230,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
+      "function": "MemView<'a>::mmap",
       "ordinal_in_function": 1,
       "fingerprint": "4f36df731c70158d96408647cf360e0dd1dcb121cae52f37e7abb194168d9c10",
       "verdict": "carrier_fault",
@@ -241,7 +241,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
+      "function": "MemView<'a>::mmap",
       "ordinal_in_function": 2,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
       "verdict": "carrier_fault",
@@ -252,7 +252,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
+      "function": "MemView<'a>::mmap",
       "ordinal_in_function": 3,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
       "verdict": "carrier_fault",
@@ -263,7 +263,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
+      "function": "MemView<'a>::mmap",
       "ordinal_in_function": 4,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
       "verdict": "carrier_fault",
@@ -274,7 +274,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
+      "function": "MemView<'a>::mmap",
       "ordinal_in_function": 5,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
       "verdict": "carrier_fault",
@@ -285,7 +285,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
+      "function": "MemView<'a>::mmap",
       "ordinal_in_function": 6,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
       "verdict": "carrier_fault",
@@ -296,7 +296,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
+      "function": "MemView<'a>::mmap",
       "ordinal_in_function": 7,
       "fingerprint": "000d844e0bdeea234feda2f75d363ea04a12d0bb7f371e0bcc40675406c8cd9c",
       "verdict": "carrier_fault",
@@ -307,7 +307,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
+      "function": "MemView<'a>::mmap",
       "ordinal_in_function": 8,
       "fingerprint": "b5c86b392f2f73af35786f1719719810dd2815681d8c95bc576fd921c9aa390f",
       "verdict": "carrier_fault",
@@ -318,7 +318,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mmap",
+      "function": "MemView<'a>::mmap",
       "ordinal_in_function": 9,
       "fingerprint": "b5c86b392f2f73af35786f1719719810dd2815681d8c95bc576fd921c9aa390f",
       "verdict": "carrier_fault",
@@ -329,7 +329,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mprotect",
+      "function": "MemView<'a>::mprotect",
       "ordinal_in_function": 1,
       "fingerprint": "f131bae9e5cd8de3a4f2816c472d65fedd62cf011f55e316286500b1d7f3aa2e",
       "verdict": "carrier_fault",
@@ -340,7 +340,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mremap",
+      "function": "MemView<'a>::mremap",
       "ordinal_in_function": 1,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
       "verdict": "carrier_fault",
@@ -351,7 +351,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mremap",
+      "function": "MemView<'a>::mremap",
       "ordinal_in_function": 2,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
       "verdict": "carrier_fault",
@@ -362,7 +362,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mremap",
+      "function": "MemView<'a>::mremap",
       "ordinal_in_function": 3,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
       "verdict": "carrier_fault",
@@ -373,7 +373,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mremap",
+      "function": "MemView<'a>::mremap",
       "ordinal_in_function": 4,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
       "verdict": "carrier_fault",
@@ -384,7 +384,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mremap",
+      "function": "MemView<'a>::mremap",
       "ordinal_in_function": 5,
       "fingerprint": "970391625205832e8731dd95c0d2562497c16d85c25c0c01751e25b87d7abbfd",
       "verdict": "carrier_fault",
@@ -395,7 +395,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::mremap",
+      "function": "MemView<'a>::mremap",
       "ordinal_in_function": 6,
       "fingerprint": "7cba672ac67165f0d2ebfff0216d65d133bea8f175d5f3a36584452d80e4036c",
       "verdict": "carrier_fault",
@@ -406,7 +406,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::munmap",
+      "function": "MemView<'a>::munmap",
       "ordinal_in_function": 1,
       "fingerprint": "933aaec15cd75057d6e7476df26088e40b213c53fabfa91eb85199a1bea4445e",
       "verdict": "carrier_fault",
@@ -417,7 +417,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::munmap",
+      "function": "MemView<'a>::munmap",
       "ordinal_in_function": 2,
       "fingerprint": "b0d6b7a417eaf049fd0fdfffe4964052aea2087e1e3dfd1632340a959539d7cc",
       "verdict": "carrier_fault",
@@ -428,7 +428,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::munmap",
+      "function": "MemView<'a>::munmap",
       "ordinal_in_function": 3,
       "fingerprint": "b0d6b7a417eaf049fd0fdfffe4964052aea2087e1e3dfd1632340a959539d7cc",
       "verdict": "carrier_fault",
@@ -439,7 +439,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::munmap",
+      "function": "MemView<'a>::munmap",
       "ordinal_in_function": 4,
       "fingerprint": "65662c9baa2211e57ce9b728bceb5060db399fbb769cb8f702e786d2341d657c",
       "verdict": "carrier_fault",
@@ -450,7 +450,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::record_alias_vma",
+      "function": "MemView<'a>::record_alias_vma",
       "ordinal_in_function": 1,
       "fingerprint": "938caa465e5fc4b9e3f3334c00995087b235db5ad7b88487ecb79fe1d47253ee",
       "verdict": "carrier_fault",
@@ -461,7 +461,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::record_alias_vma",
+      "function": "MemView<'a>::record_alias_vma",
       "ordinal_in_function": 2,
       "fingerprint": "19becf537e18101262341c997bfbf6b124ca3e202fdf7d6f93f082377ed726dd",
       "verdict": "carrier_fault",
@@ -472,7 +472,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::record_remapped_dynamic_mapping",
+      "function": "MemView<'a>::record_remapped_dynamic_mapping",
       "ordinal_in_function": 1,
       "fingerprint": "d7c4fdc15b406c800b9fc43712459f885d98549db0d31a93e14853b9a7f459a5",
       "verdict": "carrier_fault",
@@ -483,7 +483,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::recover_private_repoint_failure",
+      "function": "MemView<'a>::recover_private_repoint_failure",
       "ordinal_in_function": 1,
       "fingerprint": "cab94f646104e2486883eed7c7302a59a0f4af683d185266a50a016afd7fc03e",
       "verdict": "carrier_fault",
@@ -494,7 +494,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::rollback_fresh_arena_mapping",
+      "function": "MemView<'a>::rollback_fresh_arena_mapping",
       "ordinal_in_function": 1,
       "fingerprint": "54058893df635b231863c780f13fa93aabebe7813c3633288b43a629ba7a58be",
       "verdict": "carrier_fault",
@@ -505,7 +505,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "function": "SyscallDispatcher::rollback_shared_anon_mapping",
+      "function": "MemView<'a>::rollback_shared_anon_mapping",
       "ordinal_in_function": 1,
       "fingerprint": "0caaebadaef70ce0aaa09c88c0a6b8b61a2e5f84f39ca059ed4b12f200403149",
       "verdict": "carrier_fault",
