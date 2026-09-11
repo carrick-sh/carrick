@@ -2805,12 +2805,13 @@ impl PendingQueue {
         distinct.saturating_sub(realtime_signals) + realtime
     }
 
-    pub fn enqueue_standard(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+    pub fn enqueue_standard(
+        &mut self,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> Result<(), KernelOperationError> {
         if signal.raw() >= 32 {
-            carrick_fatal!(
-                "kernel::pending_signals",
-                "real-time signal entered standard queue"
-            );
+            return Err(KernelOperationError::RealtimeSignalInStandardQueue(signal));
         }
         let already_pending = self.present.contains(signal.raw());
         self.present = self.present.with(signal.raw());
@@ -2821,18 +2822,21 @@ impl PendingQueue {
             self.standard_siginfos.insert(signal, siginfo);
         }
         self.assert_invariants();
+        Ok(())
     }
 
-    pub fn enqueue_realtime(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+    pub fn enqueue_realtime(
+        &mut self,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> Result<(), KernelOperationError> {
         if signal.raw() < 32 {
-            carrick_fatal!(
-                "kernel::pending_signals",
-                "standard signal entered real-time queue"
-            );
+            return Err(KernelOperationError::StandardSignalInRealtimeQueue(signal));
         }
         self.realtime.entry(signal).or_default().push_back(siginfo);
         self.present = self.present.with(signal.raw());
         self.assert_invariants();
+        Ok(())
     }
 
     /// Discard every pending instance whose signal is in `signals`.
@@ -2887,9 +2891,9 @@ impl PendingQueue {
         let mut queue = Self::default();
         for entry in entries {
             if entry.signal.raw() >= 32 {
-                queue.enqueue_realtime(entry.signal, entry.siginfo);
+                let _ = queue.enqueue_realtime(entry.signal, entry.siginfo);
             } else {
-                queue.enqueue_standard(entry.signal, entry.siginfo);
+                let _ = queue.enqueue_standard(entry.signal, entry.siginfo);
             }
         }
         queue
@@ -2982,13 +2986,13 @@ impl TaskPendingSignals {
 
     pub fn enqueue_standard(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
         let mut queue = self.queue.lock();
-        queue.enqueue_standard(signal, siginfo);
+        let _ = queue.enqueue_standard(signal, siginfo);
         self.publish_queue(&queue);
     }
 
     pub fn enqueue_realtime(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
         let mut queue = self.queue.lock();
-        queue.enqueue_realtime(signal, siginfo);
+        let _ = queue.enqueue_realtime(signal, siginfo);
         self.publish_queue(&queue);
     }
 
@@ -3150,9 +3154,9 @@ impl ThreadSignalState {
                 && let Ok(signal) = LinuxSignal::for_signal_number(raw)
             {
                 if raw >= 32 {
-                    pending_queue.enqueue_realtime(signal, None);
+                    let _ = pending_queue.enqueue_realtime(signal, None);
                 } else {
-                    pending_queue.enqueue_standard(signal, None);
+                    let _ = pending_queue.enqueue_standard(signal, None);
                 }
             }
         }
@@ -3234,11 +3238,11 @@ impl ThreadSignalState {
     }
 
     pub fn enqueue_standard(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
-        self.pending.enqueue_standard(signal, siginfo);
+        let _ = self.pending.enqueue_standard(signal, siginfo);
     }
 
     pub fn enqueue_realtime(&mut self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
-        self.pending.enqueue_realtime(signal, siginfo);
+        let _ = self.pending.enqueue_realtime(signal, siginfo);
     }
 
     pub fn take_lowest_in(&mut self, wanted: SigSet) -> Option<PendingSignal> {
@@ -5794,6 +5798,10 @@ impl ExecutionGeneration {
         self.0.checked_add(1).map(Self)
     }
 
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -6254,7 +6262,7 @@ impl Drop for ThreadExecutionLease {
             return;
         }
         if let Some(owner) = self.owner.upgrade() {
-            owner.fail_unsettled_execution_lease(self);
+            let _ = owner.fail_unsettled_execution_lease(self);
         }
     }
 }
@@ -7685,7 +7693,10 @@ impl Thread {
         }
     }
 
-    fn fail_unsettled_execution_lease(&self, lease: &ThreadExecutionLease) {
+    fn fail_unsettled_execution_lease(
+        &self,
+        lease: &ThreadExecutionLease,
+    ) -> Result<(), ThreadExecutionError> {
         let mut execution = self.execution.lock();
         if !Self::execution_state_matches_lease(execution.state, lease) {
             // FAIL LOUD instead of silently skipping: an unsettled lease
@@ -7699,14 +7710,11 @@ impl Thread {
                 "carrick: WARN: unsettled execution lease dropped for thread                  {:?} but state {:?} does not match lease (executor={:?}                  epoch={} generation={:?}) — thread left unowned",
                 self.key, execution.state, lease.executor, lease.executor_epoch, lease.generation
             );
-            return;
+            return Ok(());
         }
-        let generation = lease.generation.next().unwrap_or_else(|| {
-            carrick_fatal!(
-                "kernel::execution_lease",
-                "execution generation counter overflow in fail_unsettled_execution_lease"
-            );
-        });
+        let Some(generation) = lease.generation.next() else {
+            return Err(ThreadExecutionError::GenerationExhausted);
+        };
         execution.task_state = None;
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
@@ -7723,30 +7731,28 @@ impl Thread {
         };
         drop(execution);
         self.revision.publish();
+        Ok(())
     }
 
     /// Invalidate the old image at exec publication. The replacement starts
     /// independently at `Uninitialized` and must receive freshly materialized
     /// entry state before it can be claimed.
-    pub(super) fn invalidate_execution_for_exec(&self) {
+    pub(super) fn invalidate_execution_for_exec(&self) -> Result<(), ThreadExecutionError> {
         let mut execution = self.execution.lock();
         if matches!(execution.state, ThreadExecutionState::SwitchingOut { .. }) {
             execution.exec_invalidation_pending = true;
             drop(execution);
             self.revision.publish();
-            return;
+            return Ok(());
         }
-        let generation = execution
+        let Some(generation) = execution
             .state
             .generation()
             .unwrap_or(ExecutionGeneration::INITIAL)
             .next()
-            .unwrap_or_else(|| {
-                carrick_fatal!(
-                    "kernel::execution_lease",
-                    "execution generation counter overflow in invalidate_execution_for_exec"
-                );
-            });
+        else {
+            return Err(ThreadExecutionError::GenerationExhausted);
+        };
         execution.task_state = None;
         cancel_continuation_slot(
             &mut execution.blocked_continuation,
@@ -7757,6 +7763,7 @@ impl Thread {
         execution.state = ThreadExecutionState::Exited { generation };
         drop(execution);
         self.revision.publish();
+        Ok(())
     }
 
     /// This thread's `KEY_SPEC_THREAD_KEYRING`, or `None` if it has never
@@ -8076,10 +8083,14 @@ impl Thread {
         self.runner_gate.bind(self.key, Arc::clone(self))
     }
 
-    pub(super) fn transfer_runner_to(&self, replacement: &ThreadRef) {
+    pub(super) fn transfer_runner_to(
+        &self,
+        replacement: &ThreadRef,
+    ) -> Result<(), ThreadExecutionError> {
         debug_assert!(Arc::ptr_eq(&self.runner_gate, &replacement.runner_gate));
-        self.invalidate_execution_for_exec();
+        self.invalidate_execution_for_exec()?;
         self.runner_gate.transfer_owner(self.key, replacement.key);
+        Ok(())
     }
 
     pub fn task(&self) -> Option<TaskRef> {
@@ -9284,10 +9295,18 @@ mod tests {
         let second_rt = siginfo(realtime, 4);
         let mut queue = PendingQueue::default();
 
-        queue.enqueue_standard(standard, Some(first_standard));
-        queue.enqueue_standard(standard, Some(coalesced_standard));
-        queue.enqueue_realtime(realtime, Some(first_rt));
-        queue.enqueue_realtime(realtime, Some(second_rt));
+        queue
+            .enqueue_standard(standard, Some(first_standard))
+            .expect("standard signal");
+        queue
+            .enqueue_standard(standard, Some(coalesced_standard))
+            .expect("standard signal");
+        queue
+            .enqueue_realtime(realtime, Some(first_rt))
+            .expect("realtime signal");
+        queue
+            .enqueue_realtime(realtime, Some(second_rt))
+            .expect("realtime signal");
 
         assert_eq!(queue.pending_count(), 3);
         assert_eq!(
@@ -10107,5 +10126,62 @@ mod tests {
         assert!(common.cork().has_pending());
         let taken = common.cork().take().expect("taken");
         assert_eq!(taken.0, b"data");
+    }
+
+    #[test]
+    fn pending_queue_mismatched_signal_returns_typed_error() {
+        let standard = LinuxSignal::for_signal_number(10).expect("standard signal");
+        let realtime = LinuxSignal::for_signal_number(34).expect("realtime signal");
+        let mut queue = PendingQueue::default();
+
+        assert!(matches!(
+            queue.enqueue_standard(realtime, None),
+            Err(KernelOperationError::RealtimeSignalInStandardQueue(s)) if s == realtime
+        ));
+        assert!(matches!(
+            queue.enqueue_realtime(standard, None),
+            Err(KernelOperationError::StandardSignalInRealtimeQueue(s)) if s == standard
+        ));
+    }
+
+    #[test]
+    fn thread_invalidate_execution_for_exec_exhausted_generation() {
+        let fixture = Fixture::new();
+        {
+            let mut exec = fixture.leader.execution.lock();
+            exec.state = ThreadExecutionState::Runnable {
+                generation: ExecutionGeneration::from_raw(u64::MAX),
+            };
+        }
+        let res = fixture.leader.invalidate_execution_for_exec();
+        assert_eq!(res, Err(ThreadExecutionError::GenerationExhausted));
+    }
+
+    #[test]
+    fn thread_fail_unsettled_execution_lease_exhausted_generation() {
+        let fixture = Fixture::new();
+        let executor = ExecutorId::synthetic_for_tests(77);
+        let generation = ExecutionGeneration::from_raw(u64::MAX);
+        {
+            let mut exec = fixture.leader.execution.lock();
+            exec.state = ThreadExecutionState::Running {
+                generation,
+                executor,
+                executor_epoch: 1,
+                wake_pending: false,
+            };
+        }
+        let lease = ThreadExecutionLease {
+            owner: Arc::downgrade(&fixture.leader),
+            owner_key: fixture.leader.key(),
+            generation,
+            executor,
+            executor_epoch: 1,
+            task_state: None,
+            blocked_continuation: None,
+            settled: true,
+        };
+        let res = fixture.leader.fail_unsettled_execution_lease(&lease);
+        assert_eq!(res, Err(ThreadExecutionError::GenerationExhausted));
     }
 }
