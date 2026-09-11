@@ -51,6 +51,7 @@
 //!
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
+pub(crate) use super::dispatcher::ProcView;
 use super::*;
 use crate::linux_abi::LinuxErrno;
 
@@ -307,7 +308,7 @@ pub(super) enum SchedTarget {
 /// sharing the numeric value (over-inclusive), and a valid sibling's ns-pid
 /// would never be recognised as a peer guest (under-inclusive).
 pub(super) fn resolve_sched_target<M: CurrentMmMemory>(
-    this: &SyscallDispatcher,
+    this: &ProcView<'_>,
     cx: &SyscallCtx<'_, M>,
     pid: u64,
 ) -> SchedTarget {
@@ -318,10 +319,10 @@ pub(super) fn resolve_sched_target<M: CurrentMmMemory>(
         return SchedTarget::NotFound;
     }
     if let Some(target) = this.guest_process_target(cx.kernel, pid as i32) {
-        return match target.euid() {
-            Some(euid) => SchedTarget::OtherGuest { euid },
-            None => SchedTarget::NotFound,
-        };
+        if let Some(euid) = target.euid() {
+            return SchedTarget::OtherGuest { euid };
+        }
+        return SchedTarget::NotFound;
     }
     SchedTarget::NotFound
 }
@@ -331,7 +332,7 @@ pub(super) fn resolve_sched_target<M: CurrentMmMemory>(
 /// same for every valid pid under our uniform SCHED_OTHER + prio 0 model; only
 /// the "does it exist?" check varies. Backed by [`resolve_sched_target`].
 fn sched_pid_exists<M: CurrentMmMemory>(
-    this: &SyscallDispatcher,
+    this: &ProcView<'_>,
     cx: &SyscallCtx<'_, M>,
     pid: u64,
 ) -> bool {
@@ -891,7 +892,194 @@ impl ProcState {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> ProcView<'a> {
+    #[inline]
+    pub(in crate::dispatch) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cross.cred_snapshot()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn identity_pid(&self) -> u32 {
+        self.cross.identity_pid()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn getpid(&self) -> super::DispatchOutcome {
+        self.cross.getpid()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        self.cross.captured_file_table()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.cross.open_file(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd_with_status_flags(
+        &self,
+        description: super::OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome {
+        self.cross
+            .install_fd_with_status_flags(description, status_flags, fd_flags)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
+        self.cross.detach_fd_from_epolls(fd);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
+        self.cross.close_open_file_and_free_pty(open_file);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn note_fd_closed(&self, fd: i32) {
+        self.cross.note_fd_closed(fd);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn resolve_at_path(
+        &self,
+        dirfd: u64,
+        path: &str,
+    ) -> Result<String, carrick_abi::LinuxErrno> {
+        self.cross.resolve_at_path(dirfd, path)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch) fn drain_xsignals_process_directed(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) {
+        self.cross.drain_xsignals_process_directed(context);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn hvpatch_exact_process_signal(
+        &self,
+        context: &crate::kernel::KernelContext,
+        target_key: crate::kernel::TaskKey,
+        signum: u64,
+        siginfo: Option<crate::linux_abi::LinuxSiginfo>,
+    ) -> super::DispatchOutcome {
+        self.cross
+            .hvpatch_exact_process_signal(context, target_key, signum, siginfo)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn non_interrupting_signal_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> carrick_abi::SigSet {
+        self.cross.non_interrupting_signal_mask(context, tid)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.cross
+            .has_deliverable_dispatch_pending_for_wait(context, tid, mask)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch) fn host_fd_for_poll(&self, fd: i32) -> Option<super::HostFd> {
+        self.cross.host_fd_for_poll(fd)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch) fn task_rlimits(&self) -> crate::kernel::RlimitSet {
+        self.cross.task_rlimits()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn with_current_mm_executor_released<M: CurrentMmMemory, T>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        op: impl FnOnce() -> T,
+    ) -> Result<T, super::outcome::DispatchError> {
+        let mut result = None;
+        let mut op_opt = Some(op);
+        self.cross.with_current_mm_executor_released(cx, &mut || {
+            if let Some(f) = op_opt.take() {
+                result = Some(f());
+            }
+        })?;
+        result.ok_or(super::outcome::DispatchError::MmExecutorParticipationUnavailable)
+    }
+
+    #[inline]
+    pub(crate) fn ctx_tid<M: CurrentMmMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
+        SyscallDispatcher::ctx_tid(ctx)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn layered_lstat(
+        &self,
+        path: &str,
+    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
+        self.cross.layered_lstat(path)
+    }
+
+    #[inline]
+    pub(super) fn page_geometry(&self) -> crate::page_profile::PageGeometry {
+        self.page_geometry
+    }
+
+    #[inline]
+    pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+        self.proc.lock().hvpatch_process.clone()
+    }
+
+    #[inline]
+    pub(crate) fn guest_process_target(
+        &self,
+        context: &crate::kernel::KernelContext,
+        pid: i32,
+    ) -> Option<GuestProcessTarget> {
+        let process = self.hvpatch_process()?;
+        let namespace_id = u32::try_from(pid).ok()?;
+        let pid = crate::namespace::pid::ns_to_kernel_for(context, namespace_id)
+            .and_then(|pid| i32::try_from(pid).ok())?;
+        let Ok(task) = crate::kernel::TaskId::from_abi_positive(pid) else {
+            return None;
+        };
+        let kernel = process.kernel_graph();
+        if let Some(target) = kernel.live_task(task) {
+            return (target.container().id() == context.container().id()).then(|| {
+                GuestProcessTarget::Live {
+                    euid: target.process_credentials().euid(),
+                }
+            });
+        }
+        Some(match kernel.registry().zombie(task) {
+            Some(zombie) if zombie.container == context.container().id() => {
+                GuestProcessTarget::Zombie { euid: zombie.euid }
+            }
+            None => GuestProcessTarget::Missing,
+            Some(_) => GuestProcessTarget::Missing,
+        })
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn guest_pid_is_live(&self, pid: i32) -> Option<bool> {
+        self.cross.guest_pid_is_live(pid)
+    }
     /// True once this dispatcher is running in a real host child created for a
     /// guest `fork`/fork-like `clone`. Such descendants inherited the original
     /// CLI process state and must use `_exit` on guest process exit instead of
@@ -1416,7 +1604,7 @@ impl SyscallDispatcher {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> ProcView<'a> {
     define_syscall! {
         fn personality(this, cx, requested: u64) {
             // PER_LINUX32 (0x8) and PER_LINUX32_3GB (0x20008) name a 32-bit
@@ -4729,7 +4917,7 @@ fn process_vm_copy_self<M: CurrentMmMemory>(
     Ok(copied as i64)
 }
 
-impl SyscallDispatcher {
+impl<'a> ProcView<'a> {
     /// Shared body of `process_vm_readv` (270, `is_read=true`) and
     /// `process_vm_writev` (271, `is_read=false`): transfer between the caller's
     /// `local_iov` and the target process's `remote_iov`. readv copies
@@ -5424,7 +5612,7 @@ fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: LinuxWait
 }
 
 #[cfg(test)]
-impl SyscallDispatcher {
+impl<'a> ProcView<'a> {
     /// Promote a `waitid` `CLD_KILLED` to `CLD_DUMPED` when the child died by a
     /// core-dumping signal AND core dumps are enabled (RLIMIT_CORE soft > 0).
     /// macOS's `waitid` never sets CLD_DUMPED (the host doesn't dump core), but
@@ -5452,6 +5640,185 @@ impl SyscallDispatcher {
             Some(limit) => limit.rlim_cur != 0,
             None => true,
         }
+    }
+}
+
+macro_rules! forward_proc_handlers {
+    ($( $handler:ident ),* $(,)?) => {
+        impl SyscallDispatcher {
+            $(
+                #[inline]
+                pub(crate) fn $handler<M: CurrentMmMemory>(
+                    &self,
+                    cx: &mut SyscallCtx<M>,
+                ) -> Result<DispatchOutcome, DispatchError> {
+                    self.proc_view().$handler(cx)
+                }
+            )*
+        }
+    };
+}
+
+forward_proc_handlers! {
+    ioprio_set,
+    ioprio_get,
+    vhangup,
+    personality,
+    waitid,
+    set_tid_address,
+    unshare,
+    futex,
+    set_robust_list,
+    get_robust_list,
+    ptrace,
+    sched_setparam,
+    sched_setscheduler,
+    sched_getscheduler,
+    sched_getparam,
+    sched_setaffinity,
+    sched_getaffinity,
+    sched_yield,
+    sched_get_priority_max,
+    sched_get_priority_min,
+    sched_rr_get_interval,
+    reboot,
+    setpgid,
+    getpgid,
+    getsid,
+    setsid,
+    uname,
+    sethostname,
+    setdomainname,
+    prctl,
+    getcpu,
+    clone,
+    execve,
+    futex_waitv,
+    execveat,
+    wait4,
+    process_vm_readv,
+    process_vm_writev,
+    sys_seccomp,
+    sched_getattr,
+    getrandom,
+    pidfd_send_signal,
+    pidfd_open,
+    pidfd_getfd,
+    sys_exit,
+    gettid,
+    sys_clone3,
+    sys_rseq,
+}
+
+#[allow(dead_code)]
+impl SyscallDispatcher {
+    #[inline]
+    pub(crate) fn is_forked_guest_process(&self) -> bool {
+        self.proc_view().is_forked_guest_process()
+    }
+
+    #[inline]
+    pub(crate) fn bootstrap_host_pid(&self) -> u32 {
+        self.proc_view().bootstrap_host_pid()
+    }
+
+    #[inline]
+    pub(crate) fn is_ptrace_traceme(&self) -> bool {
+        self.proc_view().is_ptrace_traceme()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    #[inline]
+    pub(crate) fn set_ptrace_traceme_for_test(&self) {
+        self.proc_view().set_ptrace_traceme_for_test();
+    }
+
+    #[cfg(all(test, target_os = "freebsd", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn hold_proc_mutex_for_native_fork_test(
+        &self,
+        on_locked: impl FnOnce(),
+        wait_for_release: impl FnOnce(),
+    ) {
+        self.proc_view()
+            .hold_proc_mutex_for_native_fork_test(on_locked, wait_for_release);
+    }
+
+    #[inline]
+    pub(crate) fn hvpatch_orphan_adopter(&self) -> Option<crate::kernel::TaskKey> {
+        self.proc_view().hvpatch_orphan_adopter()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn mark_child_subreaper_for_test(&self) {
+        self.proc_view().mark_child_subreaper_for_test();
+    }
+
+    #[inline]
+    pub fn install_child_pidfd(
+        &self,
+        context: &crate::kernel::KernelContext,
+        child_pid: i32,
+    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
+        self.proc_view().install_child_pidfd(context, child_pid)
+    }
+
+    #[inline]
+    pub(crate) fn install_reserved_hvpatch_child_pidfd(
+        &self,
+        context: &crate::kernel::KernelContext,
+        prepared: &mut crate::kernel::PreparedFork,
+    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
+        self.proc_view()
+            .install_reserved_hvpatch_child_pidfd(context, prepared)
+    }
+
+    #[inline]
+    pub fn remove_installed_child_pidfd(&self, fd: i32, child_pid: i32) -> bool {
+        self.proc_view().remove_installed_child_pidfd(fd, child_pid)
+    }
+
+    #[inline]
+    pub(crate) fn remove_installed_hvpatch_child_pidfd(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        child: crate::kernel::TaskKey,
+    ) -> bool {
+        self.proc_view()
+            .remove_installed_hvpatch_child_pidfd(context, fd, child)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn open_pidfd(&self, host_pid: i32, status_flags: u64) -> DispatchOutcome {
+        self.proc_view().open_pidfd(host_pid, status_flags)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn pidfd_host_pid(&self, fd: i32) -> Option<i32> {
+        self.proc_view().pidfd_host_pid(fd)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn pidfd_is_nonblocking(&self, fd: i32) -> bool {
+        self.proc_view().pidfd_is_nonblocking(fd)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn core_dumped_si_code(&self, si_code: i32, host_si_status: i32) -> i32 {
+        self.proc_view()
+            .core_dumped_si_code(si_code, host_si_status)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn rlimit_core_enabled(&self) -> bool {
+        self.proc_view().rlimit_core_enabled()
     }
 }
 

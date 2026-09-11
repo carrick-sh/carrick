@@ -1201,13 +1201,180 @@ pub struct NetView<'a> {
     pub(in crate::dispatch) cross: &'a (dyn NetCrossSubsystem + 'a),
 }
 
+pub(in crate::dispatch) trait MmExecutorReleaser {
+    fn release_and_run(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError>;
+}
+
+impl<M: carrick_guest_mem::CurrentMmMemory> MmExecutorReleaser for super::SyscallCtx<'_, M> {
+    fn release_and_run(
+        &mut self,
+        dispatcher: &SyscallDispatcher,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError> {
+        let mut f = Some(op);
+        dispatcher.with_current_mm_executor_released(self, || {
+            if let Some(run) = f.take() {
+                run();
+            }
+        })
+    }
+}
+
+/// Cross-subsystem capabilities required during process operations.
+pub(in crate::dispatch) trait ProcCrossSubsystem: Send + Sync {
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
+    fn identity_pid(&self) -> u32;
+    fn getpid(&self) -> super::DispatchOutcome;
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable>;
+    fn open_file(&self, fd: i32) -> Option<OpenFile>;
+    fn install_fd_with_status_flags(
+        &self,
+        description: super::OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome;
+    fn detach_fd_from_epolls(&self, fd: i32);
+    fn close_open_file_and_free_pty(&self, open_file: &OpenFile);
+    fn note_fd_closed(&self, fd: i32);
+    fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, carrick_abi::LinuxErrno>;
+    fn layered_lstat(
+        &self,
+        path: &str,
+    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno>;
+    #[cfg(test)]
+    fn drain_xsignals_process_directed(&self, context: &crate::kernel::KernelContext);
+    fn hvpatch_exact_process_signal(
+        &self,
+        context: &crate::kernel::KernelContext,
+        target_key: crate::kernel::TaskKey,
+        signum: u64,
+        siginfo: Option<crate::linux_abi::LinuxSiginfo>,
+    ) -> super::DispatchOutcome;
+    fn non_interrupting_signal_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> carrick_abi::SigSet;
+    fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: carrick_abi::WaitSigMask,
+    ) -> bool;
+    #[cfg(test)]
+    fn host_fd_for_poll(&self, fd: i32) -> Option<super::HostFd>;
+    #[cfg(test)]
+    fn task_rlimits(&self) -> crate::kernel::RlimitSet;
+    #[cfg(test)]
+    fn guest_pid_is_live(&self, pid: i32) -> Option<bool>;
+    fn with_current_mm_executor_released(
+        &self,
+        ctx: &mut dyn MmExecutorReleaser,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError>;
+}
+
+impl ProcCrossSubsystem for SyscallDispatcher {
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cred_snapshot()
+    }
+    fn identity_pid(&self) -> u32 {
+        self.identity_pid()
+    }
+    fn getpid(&self) -> super::DispatchOutcome {
+        self.getpid()
+    }
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        self.captured_file_table()
+    }
+    fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.open_file(fd)
+    }
+    fn install_fd_with_status_flags(
+        &self,
+        description: super::OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome {
+        self.install_fd_with_status_flags(description, status_flags, fd_flags)
+    }
+    fn detach_fd_from_epolls(&self, fd: i32) {
+        self.detach_fd_from_epolls(fd);
+    }
+    fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
+        self.close_open_file_and_free_pty(open_file);
+    }
+    fn note_fd_closed(&self, fd: i32) {
+        self.note_fd_closed(fd);
+    }
+    fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, carrick_abi::LinuxErrno> {
+        self.resolve_at_path(dirfd, path)
+    }
+    fn layered_lstat(
+        &self,
+        path: &str,
+    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
+        self.layered_lstat(path)
+    }
+    #[cfg(test)]
+    fn drain_xsignals_process_directed(&self, context: &crate::kernel::KernelContext) {
+        self.drain_xsignals_process_directed(context);
+    }
+    fn hvpatch_exact_process_signal(
+        &self,
+        context: &crate::kernel::KernelContext,
+        target_key: crate::kernel::TaskKey,
+        signum: u64,
+        siginfo: Option<crate::linux_abi::LinuxSiginfo>,
+    ) -> super::DispatchOutcome {
+        self.hvpatch_exact_process_signal(context, target_key, signum, siginfo)
+    }
+    fn non_interrupting_signal_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> carrick_abi::SigSet {
+        self.non_interrupting_signal_mask(context, tid)
+    }
+    fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.has_deliverable_dispatch_pending_for_wait(context, tid, mask)
+    }
+    #[cfg(test)]
+    fn host_fd_for_poll(&self, fd: i32) -> Option<super::HostFd> {
+        self.host_fd_for_poll(fd)
+    }
+    #[cfg(test)]
+    fn task_rlimits(&self) -> crate::kernel::RlimitSet {
+        self.task_rlimits()
+    }
+    #[cfg(test)]
+    fn guest_pid_is_live(&self, pid: i32) -> Option<bool> {
+        self.guest_pid_is_live(pid)
+    }
+    fn with_current_mm_executor_released(
+        &self,
+        ctx: &mut dyn MmExecutorReleaser,
+        op: &mut dyn FnMut(),
+    ) -> Result<(), super::outcome::DispatchError> {
+        ctx.release_and_run(self, op)
+    }
+}
+
 /// Subsystem view for process operations.
-#[allow(dead_code)]
 pub struct ProcView<'a> {
     pub(in crate::dispatch) proc: &'a Mutex<proc::ProcState>,
-    pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
-    pub(in crate::dispatch) container: &'a RwLock<Option<Arc<crate::kernel::Container>>>,
-    pub(in crate::dispatch) exec_host_fs_fallback: bool,
+    pub(in crate::dispatch) seccomp: &'a crate::seccomp::SeccompState,
+    pub(in crate::dispatch) page_geometry: crate::page_profile::PageGeometry,
+    pub(in crate::dispatch) cross: &'a (dyn ProcCrossSubsystem + 'a),
 }
 
 /// Cross-subsystem capabilities required during signal operations.
@@ -1327,9 +1494,9 @@ impl SyscallDispatcher {
     pub fn proc_view(&self) -> ProcView<'_> {
         ProcView {
             proc: &self.proc,
-            kernel_binding: &self.kernel_binding,
-            container: &self.container,
-            exec_host_fs_fallback: self.exec_host_fs_fallback,
+            seccomp: &self.seccomp,
+            page_geometry: self.page_geometry,
+            cross: self,
         }
     }
 
