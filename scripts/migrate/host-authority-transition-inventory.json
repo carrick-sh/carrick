@@ -7401,18 +7401,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7025 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:1505 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000328",
     "source": {
-      "byte_end": 314235,
-      "byte_start": 314215,
+      "byte_end": 63947,
+      "byte_start": 63927,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7025,
-      "line_end": 7025,
-      "line_start": 7025
+      "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
+      "line": 1505,
+      "line_end": 1505,
+      "line_start": 1505
     }
   },
   {
@@ -7428,18 +7428,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7126 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:1606 in `bind`, `std::fs::remove_file` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000329",
     "source": {
-      "byte_end": 319569,
-      "byte_start": 319549,
+      "byte_end": 69281,
+      "byte_start": 69261,
       "column": 33,
       "column_end": 53,
       "column_start": 33,
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7126,
-      "line_end": 7126,
-      "line_start": 7126
+      "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
+      "line": 1606,
+      "line_end": 1606,
+      "line_start": 1606
     }
   },
   {
@@ -8914,18 +8914,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7022 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:1502 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000390",
     "source": {
-      "byte_end": 314067,
-      "byte_start": 314042,
+      "byte_end": 63779,
+      "byte_start": 63754,
       "column": 33,
       "column_end": 58,
       "column_start": 33,
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7022,
-      "line_end": 7022,
-      "line_start": 7022
+      "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
+      "line": 1502,
+      "line_end": 1502,
+      "line_start": 1502
     }
   },
   {
@@ -8941,18 +8941,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:7122 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:1602 in `bind`, `std::fs::symlink_metadata` accesses only the registered AF_UNIX backing path used by `bind`.",
     "review_id": "HA-000391",
     "source": {
-      "byte_end": 319384,
-      "byte_start": 319359,
+      "byte_end": 69096,
+      "byte_start": 69071,
       "column": 37,
       "column_end": 62,
       "column_start": 37,
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 7122,
-      "line_end": 7122,
-      "line_start": 7122
+      "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
+      "line": 1602,
+      "line_end": 1602,
+      "line_start": 1602
     }
   },
   {
@@ -11877,18 +11877,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/net.rs:6998 in `bind`, the host result from `std::process::id` determines the guest-visible synthetic netlink bind PID used by `bind`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/net/lifecycle.rs:1478 in `bind`, the host result from `std::process::id` determines the guest-visible synthetic netlink bind PID used by `bind`.",
     "review_id": "HA-000504",
     "source": {
-      "byte_end": 312686,
-      "byte_start": 312670,
+      "byte_end": 62398,
+      "byte_start": 62382,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 6998,
-      "line_end": 6998,
-      "line_start": 6998
+      "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
+      "line": 1478,
+      "line_end": 1478,
+      "line_start": 1478
     }
   },
   {
