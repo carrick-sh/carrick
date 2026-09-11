@@ -705,7 +705,7 @@ fn sched_pid_names_live_task<M: CurrentMmMemory>(
 ) -> bool {
     super::proc::sched_pid_is_live_guest_thread(cx, pid)
         || matches!(
-            super::proc::resolve_sched_target(this, cx, pid),
+            super::proc::resolve_sched_target(&this.proc_view(), cx, pid),
             super::proc::SchedTarget::OtherGuest { .. }
         )
 }
