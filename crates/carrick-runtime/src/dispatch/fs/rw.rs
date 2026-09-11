@@ -355,7 +355,7 @@ impl<'a> FsView<'a> {
                                 *file_offset = r as usize;
                                 return Ok(DispatchOutcome::returned_offset_or_errno(r));
                             }
-                            FileContents::Dense(_) | FileContents::RootFsBacked { .. } => {
+                            FileContents::Dense(_) | FileContents::RootFsBacked(_) => {
                                 if offset < 0 {
                                     return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                                 }
