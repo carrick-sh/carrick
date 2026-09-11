@@ -213,6 +213,68 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.remove_xattr(&resolved, &name, follow)?;
         Ok(DispatchOutcome::Returned { value: 0 })
     }
+
+    define_syscall! {
+        fn sys_setxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64, flags: u64) {
+            this.setxattr(cx.memory, XattrTarget::Path { path, follow: true }, name, value, size, flags)
+        }
+
+        fn sys_lsetxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64, flags: u64) {
+            this.setxattr(cx.memory, XattrTarget::Path { path, follow: false }, name, value, size, flags)
+        }
+
+        fn sys_setxattr_fd(this, cx, fd: Fd, name: GuestPtr, value: GuestPtr, size: u64, flags: u64) {
+            if this.fd_is_o_path(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            this.setxattr(cx.memory, XattrTarget::Fd(fd), name, value, size, flags)
+        }
+
+        fn sys_getxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64) {
+            this.getxattr(cx.memory, XattrTarget::Path { path, follow: true }, name, value, size)
+        }
+
+        fn sys_lgetxattr_path(this, cx, path: GuestPtr, name: GuestPtr, value: GuestPtr, size: u64) {
+            this.getxattr(cx.memory, XattrTarget::Path { path, follow: false }, name, value, size)
+        }
+
+        fn sys_getxattr_fd(this, cx, fd: Fd, name: GuestPtr, value: GuestPtr, size: u64) {
+            if this.fd_is_o_path(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            this.getxattr(cx.memory, XattrTarget::Fd(fd), name, value, size)
+        }
+
+        fn sys_listxattr_path(this, cx, path: GuestPtr, list: GuestPtr, size: u64) {
+            this.listxattr(cx.memory, XattrTarget::Path { path, follow: true }, list, size)
+        }
+
+        fn sys_llistxattr_path(this, cx, path: GuestPtr, list: GuestPtr, size: u64) {
+            this.listxattr(cx.memory, XattrTarget::Path { path, follow: false }, list, size)
+        }
+
+        fn sys_listxattr_fd(this, cx, fd: Fd, list: GuestPtr, size: u64) {
+            if this.fd_is_o_path(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            this.listxattr(cx.memory, XattrTarget::Fd(fd), list, size)
+        }
+
+        fn sys_removexattr_path(this, cx, path: GuestPtr, name: GuestPtr) {
+            this.removexattr(cx.memory, XattrTarget::Path { path, follow: true }, name)
+        }
+
+        fn sys_lremovexattr_path(this, cx, path: GuestPtr, name: GuestPtr) {
+            this.removexattr(cx.memory, XattrTarget::Path { path, follow: false }, name)
+        }
+
+        fn sys_removexattr_fd(this, cx, fd: Fd, name: GuestPtr) {
+            if this.fd_is_o_path(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            this.removexattr(cx.memory, XattrTarget::Fd(fd), name)
+        }
+    }
 }
 
 impl XattrTarget {
