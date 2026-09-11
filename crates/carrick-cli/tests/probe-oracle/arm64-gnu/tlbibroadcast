@@ -1,0 +1,5 @@
+9edba2ca12ed72f5
+broadcast_mprotect_observed=true
+broadcast_munmap_observed=true
+no_stale_fault=true
+B_OBSERVED_ITERS: mprotect=1694193, munmap=1881404

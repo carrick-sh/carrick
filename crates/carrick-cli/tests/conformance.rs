@@ -2889,10 +2889,14 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// inherited COW pages; `fifoopenmatrix` adds the FIFO open
 /// handshake/EINTR/SA_RESTART matrix.
 /// `mmapanonreuse` proves that partial and whole anonymous arena reuse never
-/// exposes stale bytes. It is `generic`, moving the authoritative inventory to
-/// 527 probe sources: 500 conformance sources (477 generic, 23 dedicated), 26
-/// performance sources, and one helper. Both libc lanes gate 1000 rows.
-const PROBE_SOURCE_COUNT: usize = 527;
+/// exposes stale bytes.
+/// `statfslifetime`, `syslogstate`, `tty0state`, and `packetv3state` add
+/// filesystem ownership, syslog capability and argument semantics, console
+/// descriptor semantics, and TPACKET_V3 packet socket state coverage. They are
+/// `generic`, moving the authoritative inventory to 531 probe sources: 504
+/// conformance sources (481 generic, 23 dedicated), 26 performance sources,
+/// and one helper. Both libc lanes gate 1008 rows.
+const PROBE_SOURCE_COUNT: usize = 531;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4648,9 +4652,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 477);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 500);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1000);
+    assert_eq!(generic.len(), 481);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 504);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1008);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
