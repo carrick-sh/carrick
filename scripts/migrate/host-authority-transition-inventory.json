@@ -468,18 +468,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1393 in `MsgQueueFdCache::new`, `libc::getpid` authenticates only the current carrier that owns the message-queue descriptor cache fork ownership sentinel; no guest identity selects a host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1394 in `MsgQueueFdCache::new`, `libc::getpid` authenticates only the current carrier that owns the message-queue descriptor cache fork ownership sentinel; no guest identity selects a host target.",
     "review_id": "HA-000028",
     "source": {
-      "byte_end": 45040,
-      "byte_start": 45028,
+      "byte_end": 45077,
+      "byte_start": 45065,
       "column": 32,
       "column_end": 44,
       "column_start": 32,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1393,
-      "line_end": 1393,
-      "line_start": 1393
+      "line": 1394,
+      "line_end": 1394,
+      "line_start": 1394
     }
   },
   {
@@ -495,18 +495,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1399 in `MsgQueueFdCache::refresh_for_current_process`, `libc::getpid` authenticates the current carrier so inherited message-queue descriptors are drained after a host fork; it does not answer guest process identity.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1400 in `MsgQueueFdCache::refresh_for_current_process`, `libc::getpid` authenticates the current carrier so inherited message-queue descriptors are drained after a host fork; it does not answer guest process identity.",
     "review_id": "HA-000029",
     "source": {
-      "byte_end": 45192,
-      "byte_start": 45180,
+      "byte_end": 45229,
+      "byte_start": 45217,
       "column": 33,
       "column_end": 45,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1399,
-      "line_end": 1399,
-      "line_start": 1399
+      "line": 1400,
+      "line_end": 1400,
+      "line_start": 1400
     }
   },
   {
@@ -2329,18 +2329,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1990 in `with_shm_nattch_file`, `std::fs::OpenOptions::new` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1991 in `with_shm_nattch_file`, `std::fs::OpenOptions::new` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
     "review_id": "HA-000108",
     "source": {
-      "byte_end": 65856,
-      "byte_start": 65831,
+      "byte_end": 65893,
+      "byte_start": 65868,
       "column": 20,
       "column_end": 45,
       "column_start": 20,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1990,
-      "line_end": 1990,
-      "line_start": 1990
+      "line": 1991,
+      "line_end": 1991,
+      "line_start": 1991
     }
   },
   {
@@ -2891,18 +2891,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1995 in `with_shm_nattch_file`, `std::fs::OpenOptions::open` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1996 in `with_shm_nattch_file`, `std::fs::OpenOptions::open` accesses only the run-scoped SysV IPC backing object used by `with_shm_nattch_file`.",
     "review_id": "HA-000131",
     "source": {
-      "byte_end": 65960,
-      "byte_start": 65956,
+      "byte_end": 65997,
+      "byte_start": 65993,
       "column": 10,
       "column_end": 14,
       "column_start": 10,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1995,
-      "line_end": 1995,
-      "line_start": 1995
+      "line": 1996,
+      "line_end": 1996,
+      "line_start": 1996
     }
   },
   {
@@ -3874,18 +3874,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:767 in `ensure_dir`, `std::fs::create_dir_all` accesses only the run-scoped SysV IPC backing object used by `ensure_dir`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:768 in `ensure_dir`, `std::fs::create_dir_all` accesses only the run-scoped SysV IPC backing object used by `ensure_dir`.",
     "review_id": "HA-000174",
     "source": {
-      "byte_end": 25173,
-      "byte_start": 25150,
+      "byte_end": 25216,
+      "byte_start": 25193,
       "column": 17,
       "column_end": 40,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 767,
-      "line_end": 767,
-      "line_start": 767
+      "line": 768,
+      "line_end": 768,
+      "line_start": 768
     }
   },
   {
@@ -5716,18 +5716,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1340 in `lookup_msg_queue_path`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `lookup_msg_queue_path`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1341 in `lookup_msg_queue_path`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `lookup_msg_queue_path`.",
     "review_id": "HA-000254",
     "source": {
-      "byte_end": 43664,
-      "byte_start": 43647,
+      "byte_end": 43701,
+      "byte_start": 43684,
       "column": 19,
       "column_end": 36,
       "column_start": 19,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1340,
-      "line_end": 1340,
-      "line_start": 1340
+      "line": 1341,
+      "line_end": 1341,
+      "line_start": 1341
     }
   },
   {
@@ -5743,18 +5743,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1362 in `cleanup_msg_queue_files_for_scope`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1363 in `cleanup_msg_queue_files_for_scope`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
     "review_id": "HA-000255",
     "source": {
-      "byte_end": 44364,
-      "byte_start": 44347,
+      "byte_end": 44401,
+      "byte_start": 44384,
       "column": 26,
       "column_end": 43,
       "column_start": 26,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1362,
-      "line_end": 1362,
-      "line_start": 1362
+      "line": 1363,
+      "line_end": 1363,
+      "line_start": 1363
     }
   },
   {
@@ -5770,18 +5770,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3458 in `sorted_msg_queue_ids`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `sorted_msg_queue_ids`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3604 in `sorted_msg_queue_ids`, `std::fs::read_dir` accesses only the run-scoped SysV IPC backing object used by `sorted_msg_queue_ids`.",
     "review_id": "HA-000256",
     "source": {
-      "byte_end": 129349,
-      "byte_start": 129332,
+      "byte_end": 133205,
+      "byte_start": 133188,
       "column": 26,
       "column_end": 43,
       "column_start": 26,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3458,
-      "line_end": 3458,
-      "line_start": 3458
+      "line": 3604,
+      "line_end": 3604,
+      "line_start": 3604
     }
   },
   {
@@ -7455,18 +7455,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:714 in `PendingShmat::drop`, `std::fs::remove_file` accesses only the run-scoped SysV IPC attachment-count backing object used by `PendingShmat::drop`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:715 in `PendingShmat::drop`, `std::fs::remove_file` accesses only the run-scoped SysV IPC attachment-count backing object used by `PendingShmat::drop`.",
     "review_id": "HA-000330",
     "source": {
-      "byte_end": 22950,
-      "byte_start": 22930,
+      "byte_end": 22993,
+      "byte_start": 22973,
       "column": 29,
       "column_end": 49,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 714,
-      "line_end": 714,
-      "line_start": 714
+      "line": 715,
+      "line_end": 715,
+      "line_start": 715
     }
   },
   {
@@ -7482,18 +7482,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1366 in `cleanup_msg_queue_files_for_scope`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1367 in `cleanup_msg_queue_files_for_scope`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_msg_queue_files_for_scope`.",
     "review_id": "HA-000331",
     "source": {
-      "byte_end": 44549,
-      "byte_start": 44529,
+      "byte_end": 44586,
+      "byte_start": 44566,
       "column": 25,
       "column_end": 45,
       "column_start": 25,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 1366,
-      "line_end": 1366,
-      "line_start": 1366
+      "line": 1367,
+      "line_end": 1367,
+      "line_start": 1367
     }
   },
   {
@@ -7509,18 +7509,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2054 in `decrement_shm_attachment`, `std::fs::remove_file` accesses only the run-scoped SysV IPC attachment-count backing object used by `decrement_shm_attachment`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2055 in `decrement_shm_attachment`, `std::fs::remove_file` accesses only the run-scoped SysV IPC attachment-count backing object used by `decrement_shm_attachment`.",
     "review_id": "HA-000332",
     "source": {
-      "byte_end": 67775,
-      "byte_start": 67755,
+      "byte_end": 67812,
+      "byte_start": 67792,
       "column": 17,
       "column_end": 37,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2054,
-      "line_end": 2054,
-      "line_start": 2054
+      "line": 2055,
+      "line_end": 2055,
+      "line_start": 2055
     }
   },
   {
@@ -7536,45 +7536,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2244 in `shmctl_rmid`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `shmctl_rmid`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2245 in `shmctl_rmid`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `shmctl_rmid`.",
     "review_id": "HA-000333",
     "source": {
-      "byte_end": 75480,
-      "byte_start": 75460,
+      "byte_end": 75517,
+      "byte_start": 75497,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2244,
-      "line_end": 2244,
-      "line_start": 2244
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-REMOVE-FILE",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`"
-    },
-    "expansion": null,
-    "operation": "std::fs::remove_file",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2511 in `cleanup_sysv_ipc_on_process_exit`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`.",
-    "review_id": "HA-000334",
-    "source": {
-      "byte_end": 85063,
-      "byte_start": 85043,
-      "column": 21,
-      "column_end": 41,
-      "column_start": 21,
-      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2511,
-      "line_end": 2511,
-      "line_start": 2511
+      "line": 2245,
+      "line_end": 2245,
+      "line_start": 2245
     }
   },
   {
@@ -7591,10 +7564,10 @@
       "macos-runtime-default"
     ],
     "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2512 in `cleanup_sysv_ipc_on_process_exit`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`.",
-    "review_id": "HA-000335",
+    "review_id": "HA-000334",
     "source": {
-      "byte_end": 85120,
-      "byte_start": 85100,
+      "byte_end": 85100,
+      "byte_start": 85080,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
@@ -7609,7 +7582,7 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "run-scoped SysV IPC backing object used by `sysv_msgctl`"
+      "resource": "run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`"
     },
     "expansion": null,
     "operation": "std::fs::remove_file",
@@ -7617,18 +7590,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3595 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
-    "review_id": "HA-000336",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2513 in `cleanup_sysv_ipc_on_process_exit`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `cleanup_sysv_ipc_on_process_exit`.",
+    "review_id": "HA-000335",
     "source": {
-      "byte_end": 133741,
-      "byte_start": 133721,
+      "byte_end": 85157,
+      "byte_start": 85137,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3595,
-      "line_end": 3595,
-      "line_start": 3595
+      "line": 2513,
+      "line_end": 2513,
+      "line_start": 2513
     }
   },
   {
@@ -7644,18 +7617,45 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3596 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
-    "review_id": "HA-000337",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3741 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
+    "review_id": "HA-000336",
     "source": {
-      "byte_end": 133790,
-      "byte_start": 133770,
+      "byte_end": 137591,
+      "byte_start": 137571,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3596,
-      "line_end": 3596,
-      "line_start": 3596
+      "line": 3741,
+      "line_end": 3741,
+      "line_start": 3741
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-REMOVE-FILE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "run-scoped SysV IPC backing object used by `sysv_msgctl`"
+    },
+    "expansion": null,
+    "operation": "std::fs::remove_file",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3742 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
+    "review_id": "HA-000337",
+    "source": {
+      "byte_end": 137640,
+      "byte_start": 137620,
+      "column": 21,
+      "column_end": 41,
+      "column_start": 21,
+      "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+      "line": 3742,
+      "line_end": 3742,
+      "line_start": 3742
     }
   },
   {
@@ -8104,18 +8104,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3272 in `msgget_open`, `std::fs::rename` accesses only the run-scoped SysV IPC backing object used by `msgget_open`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3418 in `msgget_open`, `std::fs::rename` accesses only the run-scoped SysV IPC backing object used by `msgget_open`.",
     "review_id": "HA-000354",
     "source": {
-      "byte_end": 123268,
-      "byte_start": 123253,
+      "byte_end": 127124,
+      "byte_start": 127109,
       "column": 13,
       "column_end": 28,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3272,
-      "line_end": 3272,
-      "line_start": 3272
+      "line": 3418,
+      "line_end": 3418,
+      "line_start": 3418
     }
   },
   {
@@ -8536,18 +8536,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:769 in `ensure_dir`, `std::fs::set_permissions` accesses only the run-scoped SysV IPC backing object used by `ensure_dir`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:770 in `ensure_dir`, `std::fs::set_permissions` accesses only the run-scoped SysV IPC backing object used by `ensure_dir`.",
     "review_id": "HA-000370",
     "source": {
-      "byte_end": 25271,
-      "byte_start": 25247,
+      "byte_end": 25314,
+      "byte_start": 25290,
       "column": 17,
       "column_end": 41,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 769,
-      "line_end": 769,
-      "line_start": 769
+      "line": 770,
+      "line_end": 770,
+      "line_start": 770
     }
   },
   {
@@ -11796,18 +11796,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mqueue.rs:344 in `mqueue_notify_target`, the host result from `std::process::id` determines the legacy host-fallback message-queue registration owner selected by `mqueue_notify_target`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mqueue.rs:345 in `mqueue_notify_target`, the host result from `std::process::id` determines the legacy host-fallback message-queue registration owner selected by `mqueue_notify_target`.",
     "review_id": "HA-000500",
     "source": {
-      "byte_end": 10612,
-      "byte_start": 10596,
+      "byte_end": 10653,
+      "byte_start": 10637,
       "column": 38,
       "column_end": 54,
       "column_start": 38,
       "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
-      "line": 344,
-      "line_end": 344,
-      "line_start": 344
+      "line": 345,
+      "line_end": 345,
+      "line_start": 345
     }
   },
   {
@@ -11823,18 +11823,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mqueue.rs:1081 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue thread recipient used by `deliver_notify`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mqueue.rs:1082 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue thread recipient used by `deliver_notify`.",
     "review_id": "HA-000501",
     "source": {
-      "byte_end": 42712,
-      "byte_start": 42696,
+      "byte_end": 42747,
+      "byte_start": 42731,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
-      "line": 1081,
-      "line_end": 1081,
-      "line_start": 1081
+      "line": 1082,
+      "line_end": 1082,
+      "line_start": 1082
     }
   },
   {
@@ -11850,18 +11850,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/mqueue.rs:1109 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue signal recipient used by `deliver_notify`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/mqueue.rs:1110 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue signal recipient used by `deliver_notify`.",
     "review_id": "HA-000502",
     "source": {
-      "byte_end": 43961,
-      "byte_start": 43945,
+      "byte_end": 43996,
+      "byte_start": 43980,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
-      "line": 1109,
-      "line_end": 1109,
-      "line_start": 1109
+      "line": 1110,
+      "line_end": 1110,
+      "line_start": 1110
     }
   },
   {
@@ -12093,18 +12093,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:777 in `private_name`, `std::process::id` accesses only the run-scoped SysV IPC backing object used by `private_name`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:778 in `private_name`, `std::process::id` accesses only the run-scoped SysV IPC backing object used by `private_name`.",
     "review_id": "HA-000513",
     "source": {
-      "byte_end": 25548,
-      "byte_start": 25532,
+      "byte_end": 25591,
+      "byte_start": 25575,
       "column": 13,
       "column_end": 29,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 777,
-      "line_end": 777,
-      "line_start": 777
+      "line": 778,
+      "line_end": 778,
+      "line_start": 778
     }
   },
   {
@@ -15152,18 +15152,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2984 in `msgsnd`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgsnd`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:2985 in `msgsnd`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgsnd`; no guest identity selects its host target.",
     "review_id": "HA-000631",
     "source": {
-      "byte_end": 109540,
-      "byte_start": 109518,
+      "byte_end": 109576,
+      "byte_start": 109554,
       "column": 29,
       "column_end": 51,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 2984,
-      "line_end": 2984,
-      "line_start": 2984
+      "line": 2985,
+      "line_end": 2985,
+      "line_start": 2985
     }
   },
   {
@@ -15179,18 +15179,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3063 in `msgrcv`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgrcv`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:3064 in `msgrcv`, `std::thread::yield_now` acts only on the current SysV dispatch retry worker used by `msgrcv`; no guest identity selects its host target.",
     "review_id": "HA-000632",
     "source": {
-      "byte_end": 113578,
-      "byte_start": 113556,
+      "byte_end": 113614,
+      "byte_start": 113592,
       "column": 29,
       "column_end": 51,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
-      "line": 3063,
-      "line_end": 3063,
-      "line_start": 3063
+      "line": 3064,
+      "line_end": 3064,
+      "line_start": 3064
     }
   },
   {
