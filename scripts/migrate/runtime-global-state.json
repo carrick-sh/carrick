@@ -1602,6 +1602,14 @@
       "rationale": "Environment variable CARRICK_HVPATCH_VERIFY_EXEC_CODE read in drive_execve::CARRICK_HVPATCH_VERIFY_EXEC_CODE (crates/carrick-runtime/src/vcpu_loop/exec.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
+      "symbol": "tests::pending_exec_completion_ownership_survives_control_context_failure_without_abort::CHILD",
+      "fingerprint": "aff99ea176e234e486ad57820720ef9f768be471aa94e729627b0f8b49a0cd9d",
+      "classification": "test_only",
+      "rationale": "Test-only child sentinel owned by the pending-exec regression's self-spawn; it selects the isolated child half because the tested abort is process-global, prevents recursive spawning, and is absent from production builds."
+    },
+    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
       "symbol": "configured_bound_executors::CARRICK_BOUND_EXECUTORS",
@@ -1624,6 +1632,22 @@
       "fingerprint": "fbba5cbdfd1fe6923542b013fe8828c2b3a6774ecdf07765037c1b61e2c8a642",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock VFORK_ACTIVATION_HOOK in crates/carrick-runtime/src/vcpu_loop/executor.rs scoped strictly to test harness execution."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
+      "symbol": "HVPATCH_CLONE_FAILPOINT",
+      "fingerprint": "caba41a511d201e06b2a61a9355203b4d243401d256fba1fb280c6807818e097",
+      "classification": "config_debug",
+      "rationale": "Process-global configuration or failpoint cache HVPATCH_CLONE_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/lifecycle.rs initialized from environment flags."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
+      "symbol": "HVPATCH_PROCESS_FAILPOINT",
+      "fingerprint": "0d9de7352b8882bd355ab2e7281ecc5a77a1d3653aaa55f91d6ab260b150b585",
+      "classification": "config_debug",
+      "rationale": "Process-global configuration or failpoint cache HVPATCH_PROCESS_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/lifecycle.rs initialized from environment flags."
     },
     {
       "kind": "static",
@@ -1656,30 +1680,6 @@
       "fingerprint": "32eac70bf993d040c3eacedbffa49fd74f7077a8bf566fe086a309d83c6fc598",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_TRACE_TRAPS read in new::CARRICK_TRACE_TRAPS (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "symbol": "tests::pending_exec_completion_ownership_survives_control_context_failure_without_abort::CHILD",
-      "fingerprint": "aff99ea176e234e486ad57820720ef9f768be471aa94e729627b0f8b49a0cd9d",
-      "classification": "test_only",
-      "rationale": "Test-only child sentinel owned by the pending-exec regression's self-spawn; it selects the isolated child half because the tested abort is process-global, prevents recursive spawning, and is absent from production builds."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
-      "symbol": "HVPATCH_CLONE_FAILPOINT",
-      "fingerprint": "caba41a511d201e06b2a61a9355203b4d243401d256fba1fb280c6807818e097",
-      "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache HVPATCH_CLONE_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/lifecycle.rs initialized from environment flags."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
-      "symbol": "HVPATCH_PROCESS_FAILPOINT",
-      "fingerprint": "0d9de7352b8882bd355ab2e7281ecc5a77a1d3653aaa55f91d6ab260b150b585",
-      "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache HVPATCH_PROCESS_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/lifecycle.rs initialized from environment flags."
     },
     {
       "kind": "static",
