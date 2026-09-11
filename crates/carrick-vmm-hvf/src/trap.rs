@@ -23,7 +23,7 @@
 //!    `hv_vcpu_run`. (Plain EL0 memory aborts HVF cannot satisfy — a stack
 //!    overflow running SP off the mapped stack — surface directly as an
 //!    `EXCEPTION` exit with `EC=0x20/0x24` instead; see
-//!    [`is_aarch64_el0_abort_exception`].) The reason we trampoline through EL1
+//!    `is_aarch64_el0_abort_exception`.) The reason we trampoline through EL1
 //!    rather than letting HVF trap the `svc` directly is that the EL1 stage
 //!    gives us a place to do stage-1 TLB maintenance (`hvc #1`, see
 //!    `HvfInner::run_el1_maintenance`) on a platform whose public HVF has no
