@@ -1060,7 +1060,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
       "function": "emit_global_frame_stage2",
       "ordinal_in_function": 1,
       "fingerprint": "99d5d207046491ac7d8fdfa99fab8dde7b46010d7e7cb69d6ba2d6087c0f2f6f",
