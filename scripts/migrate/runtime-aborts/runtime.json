@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 7,
+  "typed_error_debt_ceiling": 5,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -2087,30 +2087,6 @@
       "rationale": "A live task was absent from its exact container PID region; returning zero or the carrier-global ID would violate Linux self-PID identity.",
       "sink": "fatal",
       "domain": "namespace::self_identity"
-    },
-    {
-      "file": "crates/carrick-runtime/src/run_state.rs",
-      "function": "abort_on_arena_error",
-      "ordinal_in_function": 1,
-      "fingerprint": "d871f5dc818b43a81c4d7311c3f9e943e4dff4ec1c849d2119658b110d7d462d",
-      "verdict": "typed_error_debt",
-      "failure_domain": "run_state::kernel_arena",
-      "rationale": "Kernel arena errors like ArenaError::Exhausted explicitly translate to Linux errno and should be returned as typed errors instead of aborting.",
-      "typed_error": "ArenaError",
-      "sink": "fatal",
-      "domain": "run_state::kernel_arena"
-    },
-    {
-      "file": "crates/carrick-runtime/src/run_state.rs",
-      "function": "clear_guest_process",
-      "ordinal_in_function": 1,
-      "fingerprint": "d227ac65d7e02fb2948511146322652f040dd238f1f6d3db23cea239edd51585",
-      "verdict": "typed_error_debt",
-      "failure_domain": "run_state::process_section",
-      "rationale": "Process record transition timeout in clear_guest_process indicates temporary lock contention that should be retryable or returned as ArenaError::Busy instead of aborting.",
-      "typed_error": "ArenaError",
-      "sink": "fatal",
-      "domain": "run_state::process_section"
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
