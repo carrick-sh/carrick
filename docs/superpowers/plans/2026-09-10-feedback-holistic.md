@@ -152,3 +152,13 @@ from sibling branches.
   dispatched for net.rs; T16 dispatcher subsystem views dispatched starting
   with the fs subsystem. CI green after round 3 (ci-wave3d); round 4 CI
   running (ci-wave3e).
+- 2026-09-11 probe gate on main after split round 4
+  (`target/perf/probes-wave3-sep10.log`): the four pre-recorded reds plus a
+  fifth, `coredumpfile` (three_threads_captured=false and the three
+  per-thread fields). Re-run alone on the SAME binary it MATCHes
+  (`coredump-main-sep11.log`); the gate run overlapped six workspace builds.
+  Classified load-sensitive per AGENTS.md ("anything flaky is an
+  architectural flaw"): the crash-capture thread census under host load is
+  an open defect class (it was root-caused once already on 2026-09-08,
+  cea7eecad), not a campaign regression. Not excused; recorded for the
+  next fix cycle.
