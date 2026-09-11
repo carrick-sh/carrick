@@ -103,6 +103,81 @@ fn write_eventfd(this: &FsView<'_>, bytes: &[u8], state: &EventFdState) -> Dispa
     this.cross.write_eventfd(bytes, state)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn punch_host_file_hole(
+    raw_fd: libc::c_int,
+    offset: u64,
+    length: u64,
+) -> Result<(), LinuxErrno> {
+    if length == 0 {
+        return Ok(());
+    }
+    let punch = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset as libc::off_t,
+        fp_length: length as libc::off_t,
+    };
+    let rc = unsafe { libc::fcntl(raw_fd, libc::F_PUNCHHOLE, &punch) };
+    if rc < 0 {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        Err(crate::host_to_linux_errno(errno))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+pub(crate) fn punch_host_file_hole(
+    _raw_fd: std::os::raw::c_int,
+    _offset: u64,
+    _length: u64,
+) -> Result<(), LinuxErrno> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn punch_unwritten_host_blocks(
+    raw_fd: libc::c_int,
+    old_len: u64,
+    write_offset: u64,
+) -> Result<(), LinuxErrno> {
+    if write_offset <= old_len {
+        return Ok(());
+    }
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    let blksize = if unsafe { libc::fstat(raw_fd, &mut st) } == 0 && st.st_blksize > 0 {
+        st.st_blksize as u64
+    } else {
+        4096
+    };
+    // Whole-block alignment: filesystems allocate and punch in discrete
+    // block units (clusters/pages). Sub-block ranges cannot be unallocated
+    // independently without deallocating data belonging to neighboring bytes.
+    // Only full unwritten blocks strictly between old_len and write_offset
+    // are punched: punch_start rounds up past old_len, punch_end rounds down
+    // before write_offset.
+    let punch_start = old_len.saturating_add(blksize - 1) / blksize * blksize;
+    let punch_end = (write_offset / blksize) * blksize;
+    if punch_end > punch_start {
+        punch_host_file_hole(raw_fd, punch_start, punch_end - punch_start)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+pub(crate) fn punch_unwritten_host_blocks(
+    _raw_fd: std::os::raw::c_int,
+    _old_len: u64,
+    _write_offset: u64,
+) -> Result<(), LinuxErrno> {
+    Ok(())
+}
+
 impl<'a> FsView<'a> {
     /// The RLIMIT_FSIZE soft cap the guest set via setrlimit/prlimit64, or
     /// `None` when unset / RLIM_INFINITY. A write whose bytes would land past
@@ -339,17 +414,17 @@ impl<'a> FsView<'a> {
                         if offset < 0 {
                             return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                         }
-                        let file_size = contents.read().len();
-                        if (offset as usize) >= file_size {
-                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                        }
-                        let next = if whence == LINUX_SEEK_DATA {
-                            offset
-                        } else {
-                            file_size as i64
+                        let offset_usize = offset as usize;
+                        let next = match whence {
+                            LINUX_SEEK_DATA => contents.read().seek_data(offset_usize),
+                            LINUX_SEEK_HOLE => contents.read().seek_hole(offset_usize),
+                            _ => unreachable!(),
                         };
-                        *file_offset = next as usize;
-                        return Ok(DispatchOutcome::returned_offset_or_errno(next));
+                        let Some(next) = next else {
+                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
+                        };
+                        *file_offset = next;
+                        return Ok(DispatchOutcome::returned_offset_or_errno(next as i64));
                     }
                     (*file_offset as i64, contents.read().len() as i64)
                 }
@@ -1573,6 +1648,17 @@ impl<'a> FsView<'a> {
                 if !*writable {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
+                let raw_fd = host_fd.raw();
+                let old_len = if !is_append {
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+                        Some(st.st_size as u64)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let n = unsafe {
                     if is_append {
                         // O_APPEND writes at EOF regardless of the offset, but
@@ -1581,18 +1667,18 @@ impl<'a> FsView<'a> {
                         // seek to EOF, write, then restore. (The write goes
                         // through write(), not pwrite(), which macOS rejects with
                         // EINVAL on an O_APPEND fd.)
-                        let saved = libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR);
-                        libc::lseek(host_fd.raw(), 0, libc::SEEK_END);
+                        let saved = libc::lseek(raw_fd, 0, libc::SEEK_CUR);
+                        libc::lseek(raw_fd, 0, libc::SEEK_END);
                         // BLOCKING-IO-OK: HostFile fds are adopted O_NONBLOCK;
                         // regular-file writes do not park on pipe/socket wait.
-                        let w = libc::write(host_fd.raw(), bytes.as_ptr() as *const _, length);
+                        let w = libc::write(raw_fd, bytes.as_ptr() as *const _, length);
                         if saved >= 0 {
-                            libc::lseek(host_fd.raw(), saved, libc::SEEK_SET);
+                            libc::lseek(raw_fd, saved, libc::SEEK_SET);
                         }
                         w
                     } else {
                         libc::pwrite(
-                            host_fd.raw(),
+                            raw_fd,
                             bytes.as_ptr() as *const _,
                             length,
                             offset as libc::off_t,
@@ -1601,7 +1687,10 @@ impl<'a> FsView<'a> {
                 };
                 let n = n.host_syscall_errno()?;
                 if n > 0 {
-                    this.invalidate_dentry_host_fd(host_fd.raw());
+                    if let Some(old_len) = old_len {
+                        punch_unwritten_host_blocks(raw_fd, old_len, offset as u64)?;
+                    }
+                    this.invalidate_dentry_host_fd(raw_fd);
                 }
                 return Ok(DispatchOutcome::returned_isize_or_errno(n));
             }
@@ -1920,6 +2009,16 @@ impl<'a> FsView<'a> {
                     }
                 };
                 let at_current = write_at_current || is_append;
+                let old_len = if !at_current {
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    if unsafe { libc::fstat(hfd, &mut st) } == 0 {
+                        Some(st.st_size as u64)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
                     if borrowed_iovecs.is_empty() {
                         return Ok(DispatchOutcome::Returned { value: 0 });
@@ -1941,6 +2040,9 @@ impl<'a> FsView<'a> {
                     restore_offset(saved_offset);
                     let n = n.host_syscall_errno()?;
                     if n > 0 {
+                        if let Some(old_len) = old_len {
+                            punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
+                        }
                         this.invalidate_dentry_host_fd(hfd);
                     }
                     return Ok(DispatchOutcome::returned_isize_or_errno(n));
@@ -1975,6 +2077,9 @@ impl<'a> FsView<'a> {
                 }
                 restore_offset(saved_offset);
                 if total > 0 {
+                    if let Some(old_len) = old_len {
+                        punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
+                    }
                     this.invalidate_dentry_host_fd(hfd);
                 }
                 return Ok(DispatchOutcome::Returned { value: total });
@@ -2336,18 +2441,34 @@ impl<'a> FsView<'a> {
                             if !*writable {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             }
+                            let is_append = LinuxOpenFlags::from_bits_truncate(
+                                open_file.description.common().status_flags(),
+                            )
+                            .contains(LinuxOpenFlags::APPEND);
                             // O_APPEND: seek to EOF before writing so `>>` and
                             // log appends don't overwrite from offset 0. (The
                             // host fd isn't opened O_APPEND, so we emulate the
                             // seek-then-write; single-writer, which covers the
                             // shell/dpkg append cases.)
-                            if LinuxOpenFlags::from_bits_truncate(
-                                open_file.description.common().status_flags(),
-                            )
-                            .contains(LinuxOpenFlags::APPEND)
-                            {
+                            if is_append {
                                 unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                             }
+                            let cur_pos = if !is_append {
+                                let pos = unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) };
+                                (pos >= 0).then_some(pos as u64)
+                            } else {
+                                None
+                            };
+                            let old_len = if let Some(pos) = cur_pos {
+                                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                                if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0 && pos > st.st_size as u64 {
+                                    Some((st.st_size as u64, pos))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
                             // The offset lives in the host kernel; read it back
                             // (post-append reposition) before applying the
                             // guest's RLIMIT_FSIZE cap.
@@ -2369,10 +2490,11 @@ impl<'a> FsView<'a> {
                                 drop(open);
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             };
+                            let raw_fd = host_fd.raw();
                             let out = write_host_pipe_owned(
                                 bytes,
                                 HostPipeWriteTarget {
-                                    host_fd: host_fd.raw(),
+                                    host_fd: raw_fd,
                                     host_fd_owner: Some(host_fd.clone()),
                                     nonblocking,
                                     write_kind: HostWriteKind::RegularFile,
@@ -2383,7 +2505,10 @@ impl<'a> FsView<'a> {
                                 },
                             );
                             if let DispatchOutcome::Returned { value } = out && value > 0 {
-                                this.invalidate_dentry_host_fd(host_fd.raw());
+                                if let Some((old_len, pos)) = old_len {
+                                    punch_unwritten_host_blocks(raw_fd, old_len, pos)?;
+                                }
+                                this.invalidate_dentry_host_fd(raw_fd);
                             }
                             return Ok(out);
                         }
@@ -2705,6 +2830,21 @@ impl<'a> FsView<'a> {
                 if target.append {
                     unsafe { libc::lseek(target.host_fd, 0, libc::SEEK_END) };
                 }
+                let old_len = if target.write_kind == HostWriteKind::RegularFile && !target.append {
+                    let pos = unsafe { libc::lseek(target.host_fd, 0, libc::SEEK_CUR) };
+                    if pos >= 0 {
+                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                        if unsafe { libc::fstat(target.host_fd, &mut st) } == 0 && (pos as u64) > st.st_size as u64 {
+                            Some((st.st_size as u64, pos as u64))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let Some(wait_authority) = this
                     .captured_slot_authority(fd)
                     .map(WaitFdAuthority::logical)
@@ -2725,6 +2865,9 @@ impl<'a> FsView<'a> {
                     },
                 );
                 if let DispatchOutcome::Returned { value } = outcome && value > 0 {
+                    if let Some((old_len, pos)) = old_len {
+                        punch_unwritten_host_blocks(target.host_fd, old_len, pos)?;
+                    }
                     this.invalidate_dentry_host_fd(target.host_fd);
                 }
                 return if target.sigpipe_on_epipe {

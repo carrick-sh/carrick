@@ -229,7 +229,7 @@ mod pathres;
 pub(crate) mod pipe;
 pub(crate) mod proc_synthetic;
 pub(crate) use proc_synthetic::*;
-mod rw;
+pub(crate) mod rw;
 mod sendfile;
 mod stat;
 mod state;
@@ -1828,9 +1828,13 @@ impl<'a> FsView<'a> {
                         if !*writable {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
-                        // Real fd into the cap-std scratch: grow with ftruncate
-                        // (the change is visible across fork). KEEP_SIZE → no-op.
-                        if grow {
+                        if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
+                            if let Err(errno) =
+                                rw::punch_host_file_hole(host_fd.raw(), offset as u64, length as u64)
+                            {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                        } else if grow {
                             let mut st: libc::stat = unsafe { core::mem::zeroed() };
                             if let Err(errno) =
                                 (unsafe { libc::fstat(host_fd.raw(), &mut st) }).host_syscall_errno()
@@ -1864,13 +1868,19 @@ impl<'a> FsView<'a> {
                         if !*writable {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
-                        if new_size as usize > *max_size {
-                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                        }
-                        let mut data = contents.write();
-                        if (new_size as usize) > data.len() {
-                            data.set_len(new_size as usize);
+                        if mode & LINUX_FALLOC_FL_PUNCH_HOLE != 0 {
+                            let mut data = contents.write();
+                            data.punch_hole(offset as usize, length as usize);
                             this.fs.rootfs_vfs.notify_inode_changed(path, None);
+                        } else {
+                            if new_size as usize > *max_size {
+                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                            }
+                            let mut data = contents.write();
+                            if (new_size as usize) > data.len() {
+                                data.set_len(new_size as usize);
+                                this.fs.rootfs_vfs.notify_inode_changed(path, None);
+                            }
                         }
                         writeback = None;
                         outcome = DispatchOutcome::Returned { value: 0 };
