@@ -2300,10 +2300,10 @@
     {
       "kind": "env_var_os",
       "file": "crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs",
-      "symbol": "tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
-      "fingerprint": "fdb935da923d0387bd758fc1663b763193697ffd32ef5be9644304ce07758269",
+      "symbol": "guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
+      "fingerprint": "1357cf78f5861bad30288ff0d2aab454e3d90331512adf0ba53a1d44b9dcd505",
       "classification": "test_only",
-      "rationale": "Test-only fixture or lock tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
+      "rationale": "Test-only fixture or lock tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD in crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs scoped strictly to test harness execution."
     },
     {
       "kind": "env_var_os",
@@ -2580,10 +2580,10 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs",
-      "symbol": "tag_strip_tests::EXEC_PAYLOAD_ENV_LOCK",
-      "fingerprint": "d1cfca7c8c7f11866ce66352f586e9263280a936d4d32c0bbe2a5684dcf74d9d",
+      "symbol": "EXEC_PAYLOAD_ENV_LOCK",
+      "fingerprint": "42bf125b1a2036c1901bd98b788faff5653ebe534424c4863eea3ab7f676ee54",
       "classification": "test_only",
-      "rationale": "Test-only fixture or lock tag_strip_tests::EXEC_PAYLOAD_ENV_LOCK in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
+      "rationale": "Test-only fixture or lock tag_strip_tests::EXEC_PAYLOAD_ENV_LOCK in crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs scoped strictly to test harness execution."
     },
     {
       "kind": "static",
