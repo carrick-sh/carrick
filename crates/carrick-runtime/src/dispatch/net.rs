@@ -256,7 +256,7 @@ pub(super) mod epoll_ops;
 #[cfg(test)]
 use epoll_ops::epoll_kqueue_for_wake_test;
 pub(super) mod lifecycle;
-pub(super) use lifecycle::host_stream_socket_rdhup;
+pub(super) use lifecycle::{host_stream_socket_is_connected, host_stream_socket_rdhup};
 pub(super) mod netlink;
 pub(crate) mod packet;
 pub(super) mod recverr;
@@ -569,11 +569,35 @@ impl<'a> NetView<'a> {
             return match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
                 | OpenDescription::HostFile { host_fd, .. } => direct(host_fd.raw()),
-                OpenDescription::HostSocket { host_fd, base, .. } => {
-                    if base.pending_socket_error().is_some() {
+                OpenDescription::HostSocket {
+                    host_fd,
+                    base,
+                    type_,
+                    ..
+                } => {
+                    let is_stream_like =
+                        *type_ == LINUX_SOCK_STREAM || *type_ == LINUX_SOCK_SEQPACKET;
+                    let unconnected_stream = is_stream_like
+                        && !base.listening()
+                        && !base.connect_in_progress()
+                        && !base.connected()
+                        && !lifecycle::host_stream_socket_is_connected(host_fd.raw());
+                    if base.pending_socket_error().is_some()
+                        || unconnected_stream
+                        || (base.listening() && (events & LINUX_POLLOUT != 0))
+                    {
                         None
                     } else {
-                        direct(host_fd.raw())
+                        let host_events = if base.listening() {
+                            events & !libc::POLLOUT
+                        } else {
+                            events
+                        };
+                        Some(HostPollTarget {
+                            host_fd: host_fd.raw(),
+                            host_events,
+                            readiness_pipe: false,
+                        })
                     }
                 }
                 OpenDescription::PipeReader { pipe, .. } => {
@@ -1934,9 +1958,11 @@ mod netlink_readiness_tests {
                 0
             );
             let _peer_ref = HostFdRef::new(pair[1]);
+            let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+            base.set_connected(true);
             fixtures.push(OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
-                    base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                    base,
                     host_fd: HostFdRef::new(pair[0]),
                     family: LINUX_AF_UNIX,
                     type_: LINUX_SOCK_STREAM,
@@ -2083,6 +2109,125 @@ mod netlink_readiness_tests {
         assert_eq!(
             dispatcher.epoll_ready_events(99, LINUX_EPOLLIN | LINUX_EPOLLOUT),
             0
+        );
+    }
+
+    #[test]
+    fn unconnected_stream_socket_reports_pollhup_and_epollhup_immediately() {
+        let dispatcher = SyscallDispatcher::new();
+        let sock_outcome = dispatcher.host_socket_install(LINUX_AF_INET, LINUX_SOCK_STREAM, 0);
+        let fd = match sock_outcome {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("expected returned fd, got {other:?}"),
+        };
+
+        // poll on unconnected stream socket must report POLLHUP even if only POLLIN was requested
+        let revents = dispatcher.poll_ready_events(fd, LINUX_POLLIN);
+        assert_eq!(
+            revents & LINUX_POLLHUP,
+            LINUX_POLLHUP,
+            "poll on freshly created unconnected stream socket must report POLLHUP"
+        );
+        assert_eq!(
+            revents & (LINUX_POLLIN | LINUX_POLLOUT),
+            0,
+            "unconnected stream socket must not report POLLIN or POLLOUT"
+        );
+
+        // 2. readiness query on unconnected stream socket must report LINUX_EPOLLHUP
+        let erevents = dispatcher.epoll_ready_events(fd, LINUX_EPOLLIN);
+        assert_eq!(
+            erevents & LINUX_EPOLLHUP,
+            LINUX_EPOLLHUP,
+            "readiness on freshly created unconnected stream socket must report LINUX_EPOLLHUP"
+        );
+        assert_eq!(
+            erevents & (LINUX_EPOLLIN | LINUX_EPOLLOUT),
+            0,
+            "unconnected stream socket must not report EPOLLIN or EPOLLOUT"
+        );
+
+        // 3. Datagram socket is connectionless: freshly created DGRAM socket does not report POLLHUP and is writable
+        let dgram_outcome = dispatcher.host_socket_install(LINUX_AF_INET, LINUX_SOCK_DGRAM, 0);
+        let dgram_fd = match dgram_outcome {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("expected returned fd, got {other:?}"),
+        };
+        let dgram_revents = dispatcher.poll_ready_events(dgram_fd, LINUX_POLLIN | LINUX_POLLOUT);
+        assert_eq!(
+            dgram_revents & LINUX_POLLHUP,
+            0,
+            "fresh datagram socket must not report POLLHUP"
+        );
+        assert_eq!(
+            dgram_revents & LINUX_POLLOUT,
+            LINUX_POLLOUT,
+            "fresh datagram socket must report POLLOUT"
+        );
+
+        // 4. Connected stream socket (via socketpair) does not report POLLHUP and is writable
+        let mut pair = [-1i32; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+            0
+        );
+        let _peer = HostFdRef::new(pair[1]);
+        let mut conn_base = OpenDescriptionBase::new(LINUX_O_RDWR);
+        conn_base.set_connected(true);
+        let conn_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostSocket {
+                base: conn_base,
+                host_fd: HostFdRef::new(pair[0]),
+                family: LINUX_AF_UNIX,
+                type_: LINUX_SOCK_STREAM,
+                protocol: 0,
+                mcast_memberships: Vec::new(),
+                synthetic_recv: VecDeque::new(),
+            })),
+            LINUX_O_RDWR,
+            0,
+        );
+        let conn_fd = dispatcher
+            .install_fd_at_or_above(3, conn_file)
+            .expect("install conn fd");
+        let conn_revents = dispatcher.poll_ready_events(conn_fd, LINUX_POLLIN | LINUX_POLLOUT);
+        assert_eq!(
+            conn_revents & LINUX_POLLHUP,
+            0,
+            "connected socket must not report POLLHUP"
+        );
+        assert_eq!(
+            conn_revents & LINUX_POLLOUT,
+            LINUX_POLLOUT,
+            "connected socket must report POLLOUT"
+        );
+
+        // 5. Listening socket does not report POLLHUP or POLLOUT
+        let mut listen_base = OpenDescriptionBase::new(LINUX_O_RDWR);
+        listen_base.set_listening(true);
+        let listen_socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(listen_socket >= 0);
+        let listen_file = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostSocket {
+                base: listen_base,
+                host_fd: HostFdRef::new(listen_socket),
+                family: LINUX_AF_INET,
+                type_: LINUX_SOCK_STREAM,
+                protocol: 0,
+                mcast_memberships: Vec::new(),
+                synthetic_recv: VecDeque::new(),
+            })),
+            LINUX_O_RDWR,
+            0,
+        );
+        let listen_fd = dispatcher
+            .install_fd_at_or_above(3, listen_file)
+            .expect("install listen fd");
+        let listen_revents = dispatcher.poll_ready_events(listen_fd, LINUX_POLLIN | LINUX_POLLOUT);
+        assert_eq!(
+            listen_revents & (LINUX_POLLHUP | LINUX_POLLOUT),
+            0,
+            "listening socket must not report POLLHUP or POLLOUT"
         );
     }
 
@@ -3114,6 +3259,11 @@ impl<'a> NetView<'a> {
                     // requested on a regular file must return POLLIN|POLLOUT).
                     if pollfd.revents & libc::POLLPRI != 0 && !this.fd_supports_epoll_oob(pollfd.fd) {
                         pollfd.revents &= !libc::POLLPRI;
+                    }
+                    if pollfd.revents & (libc::POLLOUT | libc::POLLHUP) != 0
+                        && this.fd_is_listening_socket(pollfd.fd)
+                    {
+                        pollfd.revents &= !(libc::POLLOUT | libc::POLLHUP);
                     }
                     if pollfd.revents != 0 {
                         ready += 1;

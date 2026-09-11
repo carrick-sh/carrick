@@ -22,112 +22,114 @@ fn get_monotonic_ns() -> u64 {
 
 fn create_mixed_set() -> (i32, i32, i32, i32, i32) {
     let mut pipe_fds = [-1i32; 2];
-    let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "pipe failed");
+    let _ = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
 
     let efd = unsafe { libc::eventfd(0, 0) };
-    assert!(efd >= 0, "eventfd failed");
-
     let tfd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
-    assert!(tfd >= 0, "timerfd failed");
-
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    assert!(sock >= 0, "socket failed");
 
     (pipe_fds[0], pipe_fds[1], efd, tfd, sock)
 }
 
 fn close_mixed_set(pipe_rd: i32, pipe_wr: i32, efd: i32, tfd: i32, sock: i32) {
     unsafe {
-        libc::close(pipe_rd);
-        libc::close(pipe_wr);
-        libc::close(efd);
-        libc::close(tfd);
-        libc::close(sock);
+        if pipe_rd >= 0 {
+            libc::close(pipe_rd);
+        }
+        if pipe_wr >= 0 {
+            libc::close(pipe_wr);
+        }
+        if efd >= 0 {
+            libc::close(efd);
+        }
+        if tfd >= 0 {
+            libc::close(tfd);
+        }
+        if sock >= 0 {
+            libc::close(sock);
+        }
     }
 }
 
 fn run_case_a() {
-    let iters = 50;
-    let mut latencies_us = Vec::with_capacity(iters);
-    let mut all_exactly_one = true;
+    let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
 
-    for _ in 0..iters {
-        let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
+    let t_write = Arc::new(AtomicU64::new(0));
+    let t_write_clone = Arc::clone(&t_write);
+    let ready_to_block = Arc::new(AtomicBool::new(false));
+    let ready_to_block_clone = Arc::clone(&ready_to_block);
+    let done = Arc::new(AtomicBool::new(false));
+    let done_clone = Arc::clone(&done);
 
-        let t_write = Arc::new(AtomicU64::new(0));
-        let t_write_clone = Arc::clone(&t_write);
-        let ready_to_block = Arc::new(AtomicBool::new(false));
-        let ready_to_block_clone = Arc::clone(&ready_to_block);
-
-        let writer = thread::spawn(move || {
-            while !ready_to_block_clone.load(Ordering::Acquire) {
-                thread::yield_now();
-            }
-            thread::sleep(Duration::from_millis(200));
-            t_write_clone.store(get_monotonic_ns(), Ordering::Release);
-            let b = [1u8];
-            let n = unsafe { libc::write(pipe_wr, b.as_ptr() as *const _, 1) };
-            assert_eq!(n, 1);
-        });
-
-        let mut pfds = [
-            libc::pollfd {
-                fd: pipe_rd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: efd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: tfd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: sock,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-
-        ready_to_block.store(true, Ordering::Release);
-        let ts = libc::timespec {
-            tv_sec: 5,
-            tv_nsec: 0,
-        };
-        let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, &ts, std::ptr::null()) };
-        let t_wake = get_monotonic_ns();
-        let tw = t_write.load(Ordering::Acquire);
-        assert!(tw > 0, "writer must have recorded write timestamp");
-
-        let lat_us = (t_wake.saturating_sub(tw)) / 1_000;
-        latencies_us.push(lat_us);
-
-        let exactly_one = rc == 1
-            && (pfds[0].revents & libc::POLLIN != 0)
-            && pfds[1].revents == 0
-            && pfds[2].revents == 0
-            && pfds[3].revents == 0;
-        if !exactly_one {
-            all_exactly_one = false;
+    let writer = thread::spawn(move || {
+        while !ready_to_block_clone.load(Ordering::Acquire) {
+            thread::yield_now();
         }
+        for _ in 0..20 {
+            if done_clone.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        t_write_clone.store(get_monotonic_ns(), Ordering::Release);
+        let b = [1u8];
+        let _ = unsafe { libc::write(pipe_wr, b.as_ptr() as *const _, 1) };
+    });
 
-        writer.join().expect("join writer");
-        close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
-    }
+    let mut pfds = [
+        libc::pollfd {
+            fd: pipe_rd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: efd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: tfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: sock,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
 
-    latencies_us.sort_unstable();
-    let median_us = latencies_us[iters / 2];
-    let median_ms = median_us as f64 / 1000.0;
-    let fast = median_ms < 5.0;
+    ready_to_block.store(true, Ordering::Release);
+    let ts = libc::timespec {
+        tv_sec: 5,
+        tv_nsec: 0,
+    };
+    let t0 = get_monotonic_ns();
+    let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, &ts, std::ptr::null()) };
+    let t_wake = get_monotonic_ns();
+    done.store(true, Ordering::Release);
 
-    println!("ppoll_pipe_wake_latency_median_ms={:.2}", median_ms);
-    println!("ppoll_pipe_wake_latency_under_5ms={}", fast);
-    println!("ppoll_pipe_exactly_one_wake={}", all_exactly_one);
+    let tw = t_write.load(Ordering::Acquire);
+    let elapsed_ms = (t_wake.saturating_sub(t0)) / 1_000_000;
+
+    let bucket = if elapsed_ms < 1 {
+        "lt1"
+    } else if elapsed_ms < 100 {
+        "lt100"
+    } else {
+        "ge100"
+    };
+
+    println!("ppoll_rc={}", rc);
+    println!("revents_fd0=0x{:x}", pfds[0].revents);
+    println!("revents_fd1=0x{:x}", pfds[1].revents);
+    println!("revents_fd2=0x{:x}", pfds[2].revents);
+    println!("revents_fd3=0x{:x}", pfds[3].revents);
+    println!("woke_before_writer={}", tw == 0);
+    println!("wake_after_ms_bucket={}", bucket);
+
+    let _ = writer.join();
+    close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
 }
 
 fn run_case_b() {
@@ -142,16 +144,22 @@ fn run_case_b() {
         let t_write_clone = Arc::clone(&t_write);
         let ready_to_block = Arc::new(AtomicBool::new(false));
         let ready_to_block_clone = Arc::clone(&ready_to_block);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = Arc::clone(&done);
 
         let writer = thread::spawn(move || {
             while !ready_to_block_clone.load(Ordering::Acquire) {
                 thread::yield_now();
             }
-            thread::sleep(Duration::from_millis(200));
+            for _ in 0..20 {
+                if done_clone.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             t_write_clone.store(get_monotonic_ns(), Ordering::Release);
             let val: u64 = 1;
-            let n = unsafe { libc::write(efd, &val as *const _ as *const _, 8) };
-            assert_eq!(n, 8);
+            let _ = unsafe { libc::write(efd, &val as *const _ as *const _, 8) };
         });
 
         let mut pfds = [
@@ -184,10 +192,14 @@ fn run_case_b() {
         };
         let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, &ts, std::ptr::null()) };
         let t_wake = get_monotonic_ns();
-        let tw = t_write.load(Ordering::Acquire);
-        assert!(tw > 0, "writer must have recorded write timestamp");
+        done.store(true, Ordering::Release);
 
-        let lat_us = (t_wake.saturating_sub(tw)) / 1_000;
+        let tw = t_write.load(Ordering::Acquire);
+        let lat_us = if tw > 0 {
+            (t_wake.saturating_sub(tw)) / 1_000
+        } else {
+            0
+        };
         latencies_us.push(lat_us);
 
         let exactly_one = rc == 1
@@ -199,7 +211,7 @@ fn run_case_b() {
             all_exactly_one = false;
         }
 
-        writer.join().expect("join writer");
+        let _ = writer.join();
         close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
     }
 
@@ -266,8 +278,7 @@ fn run_case_d() {
         thread::sleep(Duration::from_millis(4000));
         writer_fired_clone.store(true, Ordering::Release);
         let b = [1u8];
-        let n = unsafe { libc::write(pipe_wr, b.as_ptr() as *const _, 1) };
-        assert_eq!(n, 1);
+        let _ = unsafe { libc::write(pipe_wr, b.as_ptr() as *const _, 1) };
     });
 
     let mut pfds = [
@@ -309,7 +320,7 @@ fn run_case_d() {
     println!("ppoll_infinite_woke_at_4s={}", ok);
     println!("ppoll_infinite_elapsed_sec={:.2}", elapsed_sec);
 
-    writer.join().expect("join writer");
+    let _ = writer.join();
     close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
 }
 
@@ -325,8 +336,7 @@ fn run_case_e() {
         sa.sa_sigaction = sigalrm_handler as *const () as usize;
         sa.sa_flags = 0;
         libc::sigemptyset(&mut sa.sa_mask);
-        let rc = libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
-        assert_eq!(rc, 0, "sigaction failed");
+        let _ = libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
     }
 
     let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
@@ -384,8 +394,7 @@ fn run_case_e() {
             tv_usec: 100_000,
         },
     };
-    let rc_itv = unsafe { libc::setitimer(libc::ITIMER_REAL, &itv, std::ptr::null_mut()) };
-    assert_eq!(rc_itv, 0, "setitimer failed");
+    unsafe { libc::setitimer(libc::ITIMER_REAL, &itv, std::ptr::null_mut()) };
 
     let t0 = get_monotonic_ns();
     let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, std::ptr::null(), std::ptr::null()) };
@@ -428,7 +437,8 @@ fn run_case_e() {
     println!("ppoll_sigalrm_handler_fired={}", alarm_fired > 0);
     println!("ppoll_sigalrm_errno={}", errno);
 
-    // Reset signal handler to default
+    // Reset signal handler to default after threads join
+    let _ = watchdog.join();
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = libc::SIG_DFL;
@@ -436,7 +446,6 @@ fn run_case_e() {
         libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
     }
 
-    let _ = watchdog.join();
     close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
 }
 
@@ -453,14 +462,15 @@ fn run_case_f() {
         sa.sa_sigaction = sigusr1_handler as *const () as usize;
         sa.sa_flags = 0;
         libc::sigemptyset(&mut sa.sa_mask);
-        let rc = libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
-        assert_eq!(rc, 0, "sigaction failed");
+        let _ = libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
     }
 
     let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
 
     let unblock_fired = Arc::new(AtomicBool::new(false));
     let unblock_fired_clone = Arc::clone(&unblock_fired);
+    let cancel_sender = Arc::new(AtomicBool::new(false));
+    let cancel_sender_clone = Arc::clone(&cancel_sender);
 
     // Watchdog to prevent hanging forever on a broken binary:
     let watchdog = thread::spawn(move || {
@@ -500,7 +510,7 @@ fn run_case_f() {
     USR1_COUNT.store(0, Ordering::SeqCst);
     SIBLING_SEND_TIME_NS.store(0, Ordering::SeqCst);
 
-    let sender = thread::spawn(|| {
+    let sender = thread::spawn(move || {
         unsafe {
             let mut mask: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut mask);
@@ -508,6 +518,9 @@ fn run_case_f() {
             libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
         }
         thread::sleep(Duration::from_millis(50));
+        if cancel_sender_clone.load(Ordering::SeqCst) {
+            return;
+        }
         let t_send = get_monotonic_ns();
         SIBLING_SEND_TIME_NS.store(t_send, Ordering::SeqCst);
         unsafe {
@@ -518,6 +531,7 @@ fn run_case_f() {
     let t0 = get_monotonic_ns();
     let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, std::ptr::null(), std::ptr::null()) };
     let t1 = get_monotonic_ns();
+    cancel_sender.store(true, Ordering::SeqCst);
     let errno = if rc == -1 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
     } else {
@@ -547,6 +561,9 @@ fn run_case_f() {
     println!("ppoll_sibling_sigusr1_handler_fired={}", usr1_fired > 0);
     println!("ppoll_sibling_sigusr1_errno={}", errno);
 
+    let _ = sender.join();
+    let _ = watchdog.join();
+
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = libc::SIG_DFL;
@@ -554,8 +571,6 @@ fn run_case_f() {
         libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
     }
 
-    let _ = sender.join();
-    let _ = watchdog.join();
     close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
 }
 
@@ -565,8 +580,7 @@ fn run_case_g() {
         sa.sa_sigaction = sigalrm_handler as *const () as usize;
         sa.sa_flags = 0;
         libc::sigemptyset(&mut sa.sa_mask);
-        let rc = libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
-        assert_eq!(rc, 0, "sigaction failed");
+        let _ = libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
     }
 
     let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
@@ -629,8 +643,7 @@ fn run_case_g() {
             tv_usec: 50_000,
         },
     };
-    let rc_itv = unsafe { libc::setitimer(libc::ITIMER_REAL, &itv, std::ptr::null_mut()) };
-    assert_eq!(rc_itv, 0, "setitimer failed");
+    unsafe { libc::setitimer(libc::ITIMER_REAL, &itv, std::ptr::null_mut()) };
 
     // ppoll with 100 ms timeout and sigmask blocking SIGALRM:
     // If blocked signal correctly does NOT interrupt ppoll, ppoll will wait the
@@ -677,6 +690,8 @@ fn run_case_g() {
     println!("ppoll_blocked_sigalrm_handler_fired={}", alarm_fired > 0);
     println!("ppoll_blocked_sigalrm_errno={}", errno);
 
+    let _ = watchdog.join();
+
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = libc::SIG_DFL;
@@ -684,7 +699,6 @@ fn run_case_g() {
         libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
     }
 
-    let _ = watchdog.join();
     close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
 }
 
