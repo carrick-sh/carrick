@@ -3106,7 +3106,7 @@ mod tests {
             // 2. watchdog kills and reaps on deadlock timeout
             // 3. same-shmid remapped shmat deadlock watchdog regression
             ("dispatch/sysv.rs", [1, 0, 3]),
-            ("dispatch/tests.rs", [3, 0, 0]),
+            ("dispatch/tests.rs", [2, 0, 0]),
             ("exec_stamps.rs", [1, 0, 0]),
             ("fs_backend.rs", [1, 0, 0]),
             // Task 7's budget-one proof self-spawns this exact unit test in an
