@@ -1634,7 +1634,6 @@
       "rationale": "ObjectRevision atomic counter overflow would wrap revision numbers and corrupt kernel object change observation.",
       "sink": "fatal",
       "domain": "kernel::object_revision"
-
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
@@ -1657,7 +1656,6 @@
       "rationale": "The monotone process-group object generation exhausted u64; wrapping would let stale group authority authenticate as a new object.",
       "sink": "fatal",
       "domain": "kernel::process_group_generation"
-
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
