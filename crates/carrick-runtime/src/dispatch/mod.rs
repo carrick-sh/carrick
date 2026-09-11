@@ -239,15 +239,9 @@ use crate::linux_abi::{
     LINUX_EOPNOTSUPP,
     LINUX_EPERM,
     LINUX_EPIPE,
-    LINUX_EPOLL_CLOEXEC,
-    LINUX_EPOLL_CTL_ADD,
-    LINUX_EPOLL_CTL_DEL,
-    LINUX_EPOLL_CTL_MOD,
     LINUX_EPOLLERR,
-    LINUX_EPOLLET,
     LINUX_EPOLLHUP,
     LINUX_EPOLLIN,
-    LINUX_EPOLLONESHOT,
     LINUX_EPOLLOUT,
     LINUX_EPOLLPRI,
     LINUX_EPOLLRDHUP,
@@ -625,6 +619,8 @@ use crate::linux_abi::{
 use crate::linux_abi::{LINUX_MAP_PRIVATE, LINUX_MAP_SHARED};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
+#[cfg(test)]
+use carrick_abi::{LINUX_EPOLL_CTL_ADD, LINUX_EPOLL_CTL_DEL, LINUX_EPOLLET};
 use carrick_fatal::carrick_fatal;
 // Canonical-number lookups: carrick's canonical syscall numbering IS the
 // aarch64 numbering. The dispatcher receives canonical numbers (a per-ISA
