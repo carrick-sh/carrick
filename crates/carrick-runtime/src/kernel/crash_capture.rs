@@ -28,7 +28,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::ids::LinuxTid;
-use super::objects::{TaskRef, ThreadExecutionState, ThreadRef};
+use super::objects::{TaskRef, ThreadRef};
 
 /// One task-local crash-capture attempt.
 ///
@@ -147,10 +147,9 @@ pub enum CrashQuorumPoll {
 ///
 /// Membership is snapshotted at [`open`](Self::open) over the task's live
 /// census at the crash generation. The quorum blocks (interruptibly, no
-/// deadline) until every member in the census has published registers or been
-/// proven exited.
+/// deadline) until every member in the census has published registers,
+/// published parked registers on withdrawal, or dropped participation.
 pub struct CrashQuorum {
-    task: TaskRef,
     generation: CrashCaptureGeneration,
     census: Vec<ThreadRef>,
 }
@@ -159,11 +158,7 @@ impl CrashQuorum {
     /// Open the quorum for `generation` over `task`'s live membership.
     pub fn open(task: TaskRef, generation: CrashCaptureGeneration) -> Self {
         let census: Vec<ThreadRef> = task.crash_capture_participants().into_threads().collect();
-        Self {
-            task,
-            generation,
-            census,
-        }
+        Self { generation, census }
     }
 
     pub const fn generation(&self) -> CrashCaptureGeneration {
@@ -193,29 +188,15 @@ impl CrashQuorum {
                         });
                     }
                 }
+                None if thread.is_crash_safe_point_participant() => {
+                    return CrashQuorumPoll::Waiting(thread.key().tid);
+                }
                 None => {
-                    if self.task.thread(thread.key().tid).is_none()
-                        || matches!(
-                            thread.execution_state(),
-                            ThreadExecutionState::Exited { .. }
-                                | ThreadExecutionState::Failed { .. }
-                        )
-                    {
-                        if let Some(registers) = thread.parked_registers() {
-                            collected.push(CrashRegisterFile {
-                                tid: thread.key().tid,
-                                registers,
-                            });
-                        }
-                    } else if thread.is_crash_safe_point_participant() {
-                        return CrashQuorumPoll::Waiting(thread.key().tid);
-                    } else if let Some(registers) = thread.parked_registers() {
+                    if let Some(registers) = thread.parked_registers() {
                         collected.push(CrashRegisterFile {
                             tid: thread.key().tid,
                             registers,
                         });
-                    } else {
-                        return CrashQuorumPoll::Waiting(thread.key().tid);
                     }
                 }
             }
@@ -384,6 +365,10 @@ mod tests {
         let (kernel, leader) = bootstrap(19_470);
         let sibling = clone_sibling(&kernel, &leader, 19_471);
         let sibling_tid = sibling.thread().key().tid;
+        let _participation = sibling
+            .thread()
+            .enter_crash_safe_point_participation()
+            .expect("crash safe-point participation");
 
         let authority = CrashCaptureAuthority::default();
         let generation = authority.issue().expect("capture generation");
