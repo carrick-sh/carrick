@@ -9411,7 +9411,7 @@ mod tests {
         let source = include_str!("mod.rs");
         let threads_source = include_str!("threads.rs");
         let finish = threads_source
-            .split("fn finish_completed(self, current")
+            .split("fn finish_completed(")
             .nth(1)
             .and_then(|tail| tail.split("fn enroll_persistent_process_member").next())
             .expect("persistent handle settlement body");
