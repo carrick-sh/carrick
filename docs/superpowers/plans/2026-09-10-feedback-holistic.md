@@ -312,3 +312,32 @@ rows, (4) resume the perf2x campaign.
   shows a stale ppollwaitset oracle carrying the old probe's panic text
   (non-gating, no native amd64 bless host here; root@carrick-x86 and
   willow VM 210 are candidates for a native amd64 oracle later).
+
+## Phase 3 — the reviewer's 2026-09-11 progress vet (feedback.md v2)
+
+The updated feedback.md scores phase 1: god files 60K→12K, DSR removed,
+`carrick_fatal!` landed, wait variants unified, CLI/exec duplication gone,
+LOC −88K. Its "next tier" list, mapped to workers (one worktree each,
+`.worktrees/agy-<name>-sep11`, model 3.8 flash high), all file-disjoint so
+they run in parallel with the perf2x clusters:
+
+| feedback item | worker | fence |
+|---|---|---|
+| continuation.rs 12.1K | `split-continuation` | vcpu_loop/continuation{.rs,/} |
+| kernel/operations.rs 11.8K | `split-operations` | kernel/operations{.rs,/} |
+| kernel/objects.rs 10.2K | `split-objects` | kernel/objects{.rs,/} |
+| fs_backend.rs 10.8K | `split-fs-backend` | fs_backend{.rs,/} |
+| vcpu_loop/executor.rs 10.8K | `split-executor` | vcpu_loop/executor{.rs,/} |
+| dispatch/mem.rs 10.3K (+10.3K tests) | `split-mem` | dispatch/mem{.rs,/} |
+| 98–101 `too_many_arguments` | `tma` | every allow outside the split files |
+| syscall tables keyed by bare numbers | `syscall-names` | carrick-abi + `syscall_table!` arms (mem.rs deferred) |
+| 32 residual `process::abort()` (27 outside carrick-fatal; most are test-only `unwrap_or_else`) | `fatal-residue` | site files outside the split files |
+
+Deferred to a second round (needs the splits landed first): the ~6K raw
+`as` casts (typed conversions per file, starting with mem/net/continuation/
+executor), `RunSpec` grab-bag and embed builder consistency, the second
+`SyscallDispatcher` decomposition step (19 fields → per-view state), and the
+remaining `SharedFutex*` outcome grouping. Item 10 (macOS anti-patterns) as
+listed in v1 was `tokio`/env hacks in the CLI (T17 landed) and named-user→
+root (T6 landed); the v2 "unchanged" verdict predates re-reading those
+commits and is re-checked at the next vet.
