@@ -204,6 +204,145 @@ impl SparseBuffer {
     pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), SparseBufferError> {
         self.write_range(self.len, bytes)
     }
+
+    /// Returns the offset of the first data byte >= `offset`, or `None` if `offset >= self.len`
+    /// or there is no data in `[offset, self.len)`. Extents are aligned to 4096-byte blocks.
+    #[must_use]
+    pub fn seek_data(&self, offset: usize) -> Option<usize> {
+        if offset >= self.len {
+            return None;
+        }
+        let block_idx = offset / CHUNK_SIZE;
+        let block_start = block_idx * CHUNK_SIZE;
+        let block_end = block_start.saturating_add(CHUNK_SIZE).min(self.len);
+
+        if self.range_has_chunks(block_start, block_end) {
+            return Some(offset);
+        }
+
+        let next_search_start = block_start.saturating_add(CHUNK_SIZE);
+        if next_search_start >= self.len {
+            return None;
+        }
+
+        let (&next_chunk_offset, _) = self.chunks.range(next_search_start..).next()?;
+        if next_chunk_offset >= self.len {
+            return None;
+        }
+
+        let next_data_block = next_chunk_offset / CHUNK_SIZE;
+        let data_start = next_data_block * CHUNK_SIZE;
+        if data_start < self.len {
+            Some(data_start)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the offset of the first hole >= `offset`, or `None` if `offset >= self.len`.
+    /// If there is no hole within `[offset, self.len)`, returns `Some(self.len)`.
+    /// Extents are aligned to 4096-byte blocks.
+    #[must_use]
+    pub fn seek_hole(&self, offset: usize) -> Option<usize> {
+        if offset >= self.len {
+            return None;
+        }
+        let block_idx = offset / CHUNK_SIZE;
+        let block_start = block_idx * CHUNK_SIZE;
+        let block_end = block_start.saturating_add(CHUNK_SIZE).min(self.len);
+
+        if !self.range_has_chunks(block_start, block_end) {
+            return Some(offset);
+        }
+
+        let cur_pos = block_start;
+        let pred = self
+            .chunks
+            .range(..=cur_pos)
+            .next_back()
+            .filter(|(k, v)| k.saturating_add(v.len()) > cur_pos);
+        let next_chunks = self.chunks.range(cur_pos..);
+
+        let mut data_end_block = if let Some((&k, v)) = pred {
+            k.saturating_add(v.len()).div_ceil(CHUNK_SIZE)
+        } else {
+            block_idx + 1
+        };
+
+        for (&k, v) in next_chunks {
+            let chunk_start_block = k / CHUNK_SIZE;
+            if chunk_start_block > data_end_block {
+                break;
+            }
+            let chunk_end_block = k.saturating_add(v.len()).div_ceil(CHUNK_SIZE);
+            if chunk_end_block > data_end_block {
+                data_end_block = chunk_end_block;
+            }
+        }
+
+        let hole_start = data_end_block * CHUNK_SIZE;
+        if hole_start < self.len {
+            Some(hole_start)
+        } else {
+            Some(self.len)
+        }
+    }
+
+    /// Deallocate data in `[offset, offset + length)` without changing logical length.
+    pub fn punch_hole(&mut self, offset: usize, length: usize) {
+        if length == 0 || offset >= self.len {
+            return;
+        }
+        let end = offset.saturating_add(length).min(self.len);
+
+        // 1. Inspect predecessor chunk starting before `offset`
+        if let Some((&pred_start, pred_chunk)) = self.chunks.range_mut(..offset).next_back() {
+            let pred_end = pred_start.saturating_add(pred_chunk.len());
+            if pred_end > offset {
+                if pred_end > end {
+                    let mut suffix = pred_chunk[end - pred_start..].to_vec();
+                    suffix.shrink_to_fit();
+                    pred_chunk.truncate(offset - pred_start);
+                    pred_chunk.shrink_to_fit();
+                    self.chunks.insert(end, suffix);
+                } else {
+                    pred_chunk.truncate(offset - pred_start);
+                    pred_chunk.shrink_to_fit();
+                }
+            }
+        }
+
+        // 2. Remove or split chunks starting in `offset..end`
+        let keys_in_range: Vec<usize> = self.chunks.range(offset..end).map(|(&k, _)| k).collect();
+        for k in keys_in_range {
+            if let Some(chunk) = self.chunks.remove(&k) {
+                let chunk_end = k.saturating_add(chunk.len());
+                if chunk_end > end {
+                    let mut suffix = chunk[end - k..].to_vec();
+                    suffix.shrink_to_fit();
+                    self.chunks.insert(end, suffix);
+                }
+            }
+        }
+    }
+
+    /// Helper to check if any chunk intersects `[start, end)`.
+    fn range_has_chunks(&self, start: usize, end: usize) -> bool {
+        if start >= end {
+            return false;
+        }
+        if let Some((&k, chunk)) = self.chunks.range(..start).next_back() {
+            if k.saturating_add(chunk.len()) > start {
+                return true;
+            }
+        }
+        if let Some((&k, _)) = self.chunks.range(start..end).next() {
+            if k < end {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl From<Vec<u8>> for SparseBuffer {
@@ -506,6 +645,69 @@ mod tests {
             left, right,
             "different trailing byte must make buffers unequal"
         );
+    }
+
+    #[test]
+    fn sparse_buffer_seek_data_and_seek_hole_preserves_extents() {
+        let mut buf = SparseBuffer::new();
+        buf.set_len(1048576);
+        let data = [0xAAu8; 4096];
+        buf.write_range(0, &data).unwrap();
+        buf.write_range(524288, &data).unwrap();
+
+        assert_eq!(buf.seek_data(0), Some(0));
+        assert_eq!(buf.seek_hole(0), Some(4096));
+
+        assert_eq!(buf.seek_data(100), Some(100));
+        assert_eq!(buf.seek_hole(100), Some(4096));
+
+        assert_eq!(buf.seek_data(4096), Some(524288));
+        assert_eq!(buf.seek_hole(4096), Some(4096));
+
+        assert_eq!(buf.seek_data(524288), Some(524288));
+        assert_eq!(buf.seek_hole(524288), Some(528384));
+
+        assert_eq!(buf.seek_data(528384), None);
+        assert_eq!(buf.seek_hole(528384), Some(528384));
+
+        assert_eq!(buf.seek_data(1048576), None);
+        assert_eq!(buf.seek_hole(1048576), None);
+
+        assert_eq!(buf.seek_data(1048577), None);
+        assert_eq!(buf.seek_hole(1048577), None);
+    }
+
+    #[test]
+    fn sparse_buffer_truncate_cycle_offsets() {
+        let mut buf = SparseBuffer::new();
+        let cycle_offsets = [256usize, 512, 1024, 2048, 4096, 8192, 16384];
+        for offset in cycle_offsets {
+            buf.truncate(0);
+            buf.write_range(offset, b"a").unwrap();
+            let data = buf.seek_data(0);
+            let hole = buf.seek_hole(0);
+            if offset < 4096 {
+                assert_eq!(data, Some(0), "offset {offset} data");
+                assert_eq!(hole, Some(offset + 1), "offset {offset} hole");
+            } else {
+                assert_eq!(data, Some(offset), "offset {offset} data");
+                assert_eq!(hole, Some(0), "offset {offset} hole");
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_buffer_punch_hole_releases_extents() {
+        let mut buf = SparseBuffer::from_vec(vec![0x7fu8; 16384]);
+        assert_eq!(buf.seek_data(0), Some(0));
+        assert_eq!(buf.seek_hole(0), Some(16384));
+
+        buf.punch_hole(4096, 4096);
+        assert_eq!(buf.read_range(4096, 4096), vec![0u8; 4096]);
+        assert_eq!(buf.seek_data(0), Some(0));
+        assert_eq!(buf.seek_hole(0), Some(4096));
+        assert_eq!(buf.seek_data(4096), Some(8192));
+        assert_eq!(buf.seek_hole(4096), Some(4096));
     }
 }
 

@@ -7051,6 +7051,66 @@ fn lseek_data_and_hole_across_backends() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn test_seekholemap_truncate_write_cycle() {
+    let scratch = tempfile::tempdir().unwrap();
+    let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    memory.write_bytes(0x4000, b"/test_sparse.bin\0").unwrap();
+    memory.write_bytes(0x5000, b"x\0").unwrap();
+
+    let fd = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        56, // openat
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            LINUX_O_CREAT | LINUX_O_RDWR | LINUX_O_TRUNC,
+            0o644,
+            0,
+            0,
+        ],
+    );
+    assert!(fd >= 0, "openat failed: {fd}");
+
+    for offset in [4096u64, 8192, 16384] {
+        let rc_trunc = lane_syscall(&mut dispatcher, &mut memory, 46, [fd as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(rc_trunc, 0, "ftruncate(0) failed");
+
+        let rc_pwrite = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            68, // pwrite64
+            [fd as u64, 0x5000, 1, offset, 0, 0],
+        );
+        assert_eq!(rc_pwrite, 1, "pwrite64 failed");
+
+        let rc_sync = lane_syscall(&mut dispatcher, &mut memory, 82, [fd as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(rc_sync, 0, "fsync failed");
+
+        let d0 = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            62, // lseek
+            [fd as u64, 0, LINUX_SEEK_DATA as u64, 0, 0, 0],
+        );
+        assert_eq!(d0, offset as i64, "SEEK_DATA at 0 must find {offset}");
+
+        let h0 = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            62, // lseek
+            [fd as u64, 0, LINUX_SEEK_HOLE as u64, 0, 0, 0],
+        );
+        assert_eq!(h0, 0, "SEEK_HOLE at 0 must find 0");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn test_creat_through_guest_created_symlink_to_dir() {
     let scratch = tempfile::tempdir().unwrap();
     let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();

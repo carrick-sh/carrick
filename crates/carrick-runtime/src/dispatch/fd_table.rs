@@ -725,12 +725,19 @@ impl FileContents {
         match self {
             Self::HostBacked { fd } => {
                 use std::os::fd::AsRawFd;
+                let raw_fd = fd.as_raw_fd();
                 let start = libc::off_t::try_from(offset).map_err(|_| LINUX_EFBIG)?;
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                let old_len = if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+                    Some(st.st_size as u64)
+                } else {
+                    None
+                };
                 let mut written = 0usize;
                 while written < data.len() {
                     let n = unsafe {
                         libc::pwrite(
-                            fd.as_raw_fd(),
+                            raw_fd,
                             data[written..].as_ptr().cast(),
                             data.len() - written,
                             start.saturating_add(written as libc::off_t),
@@ -744,6 +751,11 @@ impl FileContents {
                             continue;
                         }
                         if written > 0 {
+                            if let Some(old_len) = old_len {
+                                crate::dispatch::fs::rw::punch_unwritten_host_blocks(
+                                    raw_fd, old_len, offset,
+                                )?;
+                            }
                             return Ok(written);
                         }
                         return Err(crate::host_to_linux_errno(errno));
@@ -752,6 +764,13 @@ impl FileContents {
                         break;
                     }
                     written += n as usize;
+                }
+                if written > 0 {
+                    if let Some(old_len) = old_len {
+                        crate::dispatch::fs::rw::punch_unwritten_host_blocks(
+                            raw_fd, old_len, offset,
+                        )?;
+                    }
                 }
                 Ok(written)
             }
