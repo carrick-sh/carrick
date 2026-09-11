@@ -431,11 +431,13 @@ pub(crate) use wait_wake::{
 };
 
 pub(crate) mod terminal;
+#[cfg(test)]
+pub(crate) use terminal::ProcessExitClaim;
 pub(crate) use terminal::{
     CloneAdmissionChangeSubscription, CloneAdmissionGate, CloneAdmissionPermit, CloneEnrollment,
     ExecCloneAdmission, ExecTerminalHandoff, FatalSignalAuthority, FatalSignalRecord,
-    ForkCloneAdmission, ProcessExitClaim, ProcessExitClaimReceipt, VcpuLoopOutcome,
-    core_note_resume_pair, try_claim_persistent_process_exit_with,
+    ForkCloneAdmission, ProcessExitClaimReceipt, VcpuLoopOutcome, core_note_resume_pair,
+    try_claim_persistent_process_exit_with,
 };
 
 pub(crate) mod outcome;
@@ -751,11 +753,7 @@ impl KernelState {
         &self,
         owner: ThreadId,
     ) -> Result<ProcessExitClaimReceipt, RuntimeError> {
-        let receipt = try_claim_persistent_process_exit_with(&self.clone_admission, owner)?;
-        if receipt.claim == ProcessExitClaim::Owner {
-            self.begin_process_exit();
-        }
-        Ok(receipt)
+        try_claim_persistent_process_exit_with(&self.clone_admission, owner)
     }
 
     pub(crate) fn process_exiting(&self) -> bool {
