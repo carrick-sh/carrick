@@ -48,21 +48,6 @@ pub(super) fn linux_mode(metadata: &RootFsMetadata) -> u32 {
     kind | (metadata.mode & 0o7777)
 }
 
-/// Parse `CARRICK_WATCH_ADDR` (hex, optional `0x`) once. `None` disables the
-/// guest-memory watchpoint. Compile-gated behind `watchpoint`; the whole
-/// facility (env read + per-syscall probe) is absent from a stock build.
-#[cfg(feature = "watchpoint")]
-pub(crate) fn watch_addr() -> Option<u64> {
-    static WATCH_ADDR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *WATCH_ADDR.get_or_init(|| {
-        std::env::var("CARRICK_WATCH_ADDR").ok().and_then(|s| {
-            let s = s.trim();
-            let s = s.strip_prefix("0x").unwrap_or(s);
-            u64::from_str_radix(s, 16).ok()
-        })
-    })
-}
-
 pub(super) fn access_metadata(metadata: &RootFsMetadata, mode: u64) -> DispatchOutcome {
     // carrick runs the guest as uid 0 (root), and the overlay/host backend is
     // writable (read-only rootfs files copy up on write). Root bypasses DAC
