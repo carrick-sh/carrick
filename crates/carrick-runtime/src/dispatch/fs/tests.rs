@@ -8232,6 +8232,21 @@ impl FsCrossSubsystem for FsViewFixture {
     fn identity_pid(&self) -> u32 {
         1
     }
+    fn sysvipc_shm_table(&self) -> String {
+        String::from(
+            "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
+        )
+    }
+    fn sysvipc_sem_table(&self) -> String {
+        String::from(
+            "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
+        )
+    }
+    fn sysvipc_msg_table(&self) -> String {
+        String::from(
+            "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
+        )
+    }
     fn captured_slot_authority(
         &self,
         fd: i32,

@@ -1113,21 +1113,15 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn sysvipc_shm_table(&self) -> String {
-        String::from(
-            "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
-        )
+        self.cross.sysvipc_shm_table()
     }
 
     pub(super) fn sysvipc_sem_table(&self) -> String {
-        String::from(
-            "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
-        )
+        self.cross.sysvipc_sem_table()
     }
 
     pub(super) fn sysvipc_msg_table(&self) -> String {
-        String::from(
-            "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
-        )
+        self.cross.sysvipc_msg_table()
     }
 
     #[inline]
