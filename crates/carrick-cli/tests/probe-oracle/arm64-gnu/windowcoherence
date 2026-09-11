@@ -1,4 +1,4 @@
-f23123095768a646
+ecc5516d346fa1be
 sibling_handoff_spawns=1500
 sibling_handoff_touch_mismatches=0
 compound_retirement_local_keep0_after_unmap_xor=0x0
@@ -30,5 +30,3 @@ pattern_mismatches=0
 nonzero_after_dontneed=0
 nonzero_pristine=0
 child_mismatches=0
-test_sibling_handoff_first_touch: touches = 26382
-test_cross_thread_window: ptr = 0xffff98600000

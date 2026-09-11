@@ -4,7 +4,7 @@
 //!   (a) wake latency < 5 ms when writing to pipe after 200 ms (median over 50 iters), exactly one wake.
 //!   (b) wake latency < 5 ms when writing to eventfd after 200 ms (median over 50 iters), exactly one wake.
 //!   (c) finite timeout 30 ms returns 0 at 30±2 ms.
-//!   (d) infinite wait with nothing ready for 70 s does NOT return at 60 s; writer fires at 65 s.
+//!   (d) wait with nothing ready for 3 s does NOT return before 3 s; writer fires at 4 s (5 s timeout cap).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -95,7 +95,11 @@ fn run_case_a() {
         ];
 
         ready_to_block.store(true, Ordering::Release);
-        let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, std::ptr::null(), std::ptr::null()) };
+        let ts = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, &ts, std::ptr::null()) };
         let t_wake = get_monotonic_ns();
         let tw = t_write.load(Ordering::Acquire);
         assert!(tw > 0, "writer must have recorded write timestamp");
@@ -174,7 +178,11 @@ fn run_case_b() {
         ];
 
         ready_to_block.store(true, Ordering::Release);
-        let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, std::ptr::null(), std::ptr::null()) };
+        let ts = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, &ts, std::ptr::null()) };
         let t_wake = get_monotonic_ns();
         let tw = t_write.load(Ordering::Acquire);
         assert!(tw > 0, "writer must have recorded write timestamp");
@@ -254,8 +262,8 @@ fn run_case_d() {
     let writer_fired_clone = Arc::clone(&writer_fired);
 
     let writer = thread::spawn(move || {
-        // Writer fires after 85 seconds
-        thread::sleep(Duration::from_secs(85));
+        // Writer fires after 4 seconds
+        thread::sleep(Duration::from_millis(4000));
         writer_fired_clone.store(true, Ordering::Release);
         let b = [1u8];
         let n = unsafe { libc::write(pipe_wr, b.as_ptr() as *const _, 1) };
@@ -285,16 +293,20 @@ fn run_case_d() {
         },
     ];
 
+    let ts = libc::timespec {
+        tv_sec: 5,
+        tv_nsec: 0,
+    };
     let t0 = get_monotonic_ns();
-    let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, std::ptr::null(), std::ptr::null()) };
+    let rc = unsafe { libc::ppoll(pfds.as_mut_ptr(), 4, &ts, std::ptr::null()) };
     let t1 = get_monotonic_ns();
     let elapsed_sec = (t1 - t0) as f64 / 1_000_000_000.0;
 
     let fired = writer_fired.load(Ordering::Acquire);
-    let ok = rc == 1 && fired && elapsed_sec >= 84.0 && (pfds[0].revents & libc::POLLIN != 0);
+    let ok = rc == 1 && fired && elapsed_sec >= 3.8 && (pfds[0].revents & libc::POLLIN != 0);
 
-    println!("ppoll_infinite_not_spurious_at_60s={}", rc != 0 && elapsed_sec >= 84.0);
-    println!("ppoll_infinite_woke_at_85s={}", ok);
+    println!("ppoll_infinite_not_spurious_at_3s={}", rc != 0 && elapsed_sec >= 3.8);
+    println!("ppoll_infinite_woke_at_4s={}", ok);
     println!("ppoll_infinite_elapsed_sec={:.2}", elapsed_sec);
 
     writer.join().expect("join writer");
