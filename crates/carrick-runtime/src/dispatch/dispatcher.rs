@@ -707,65 +707,87 @@ pub(crate) fn resolv_conf_contents_for_network(
 
 /// Cross-subsystem capabilities required during filesystem operations (such as fd close lifecycle).
 pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
-    fn detach_fd_from_epolls(&self, fd: i32);
-    fn close_open_file_and_free_pty(&self, open_file: &OpenFile);
+    fn detach_fd_from_epolls(&self, _fd: i32) {}
+    fn close_open_file_and_free_pty(&self, _open_file: &OpenFile) {}
     fn mqueue_owner_alias_closed(
         &self,
-        files: &Arc<crate::kernel::FileTable>,
-        open_file: &OpenFile,
-    );
+        _files: &Arc<crate::kernel::FileTable>,
+        _open_file: &OpenFile,
+    ) {
+    }
     fn mqueue_owner_alias_closed_known(
         &self,
-        file_table: crate::kernel::FileTableId,
-        open_file: &OpenFile,
-        alias_remains: bool,
-    );
+        _file_table: crate::kernel::FileTableId,
+        _open_file: &OpenFile,
+        _alias_remains: bool,
+    ) {
+    }
     fn close_draining_file_table(
         &self,
-        kernel: &Arc<crate::kernel::Kernel>,
-        files: &Arc<crate::kernel::FileTable>,
-        owner: Option<crate::kernel::TaskKey>,
-        exec_successor: Option<&Arc<crate::kernel::FileTable>>,
-    );
+        _kernel: &Arc<crate::kernel::Kernel>,
+        _files: &Arc<crate::kernel::FileTable>,
+        _owner: Option<crate::kernel::TaskKey>,
+        _exec_successor: Option<&Arc<crate::kernel::FileTable>>,
+    ) {
+    }
     fn has_deliverable_dispatch_pending_for_wait(
         &self,
-        context: &crate::kernel::KernelContext,
-        tid: crate::thread::ThreadId,
-        sig_mask: carrick_abi::WaitSigMask,
-    ) -> bool;
+        _context: &crate::kernel::KernelContext,
+        _tid: crate::thread::ThreadId,
+        _sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        false
+    }
     fn take_signalfd_bytes(
         &self,
-        context: &crate::kernel::KernelContext,
-        tid: crate::thread::ThreadId,
-        mask: carrick_abi::SigSet,
-        max: usize,
-    ) -> Vec<u8>;
+        _context: &crate::kernel::KernelContext,
+        _tid: crate::thread::ThreadId,
+        _mask: carrick_abi::SigSet,
+        _max: usize,
+    ) -> Vec<u8> {
+        Vec::new()
+    }
     fn perf_event_read_bytes(
         &self,
-        state: &Arc<crate::dispatch::perf::PerfEventState>,
-        length: usize,
-    ) -> Result<Vec<u8>, carrick_abi::LinuxErrno>;
+        _state: &Arc<crate::dispatch::perf::PerfEventState>,
+        _length: usize,
+    ) -> Result<Vec<u8>, carrick_abi::LinuxErrno> {
+        Err(carrick_abi::LINUX_EINVAL)
+    }
     fn perf_event_ioctl_out(
         &self,
-        reporter: &carrick_observability::compat::CompatReporter,
-        fd: i32,
-        state: &Arc<crate::dispatch::perf::PerfEventState>,
-        request: u64,
-        arg: u64,
-    ) -> Result<Option<[u8; 8]>, carrick_abi::LinuxErrno>;
+        _reporter: &carrick_observability::compat::CompatReporter,
+        _fd: i32,
+        _state: &Arc<crate::dispatch::perf::PerfEventState>,
+        _request: u64,
+        _arg: u64,
+    ) -> Result<Option<[u8; 8]>, carrick_abi::LinuxErrno> {
+        Err(carrick_abi::LINUX_ENOTTY)
+    }
     fn memfd_has_writable_shared_map(
         &self,
-        description: &Arc<crate::kernel::FileDescription>,
-    ) -> bool;
-    fn range_touches_secretmem(&self, start: u64, len: u64) -> bool;
-    fn is_synthetic_virtual_path(&self, context: &crate::kernel::KernelContext, path: &str)
-    -> bool;
+        _description: &Arc<crate::kernel::FileDescription>,
+    ) -> bool {
+        false
+    }
+    fn range_touches_secretmem(&self, _start: u64, _len: u64) -> bool {
+        false
+    }
+    fn is_synthetic_virtual_path(
+        &self,
+        _context: &crate::kernel::KernelContext,
+        _path: &str,
+    ) -> bool {
+        false
+    }
     fn complete_wait_fd_authority(
         &self,
         outcome: super::DispatchOutcome,
-        files: &crate::kernel::objects::FileTable,
-        wait_fds: &[i32],
-    ) -> super::DispatchOutcome;
+        _files: &crate::kernel::objects::FileTable,
+        _wait_fds: &[i32],
+    ) -> super::DispatchOutcome {
+        outcome
+    }
     fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext>;
     fn captured_file_table(&self) -> Arc<crate::kernel::FileTable>;
     fn captured_mm(&self) -> Arc<crate::kernel::Mm>;
@@ -773,21 +795,42 @@ pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
     fn cwd(&self) -> String;
     fn mem_snapshot(&self) -> super::mem::MemState;
     fn identity_pid(&self) -> u32;
-    fn captured_slot_authority(&self, fd: i32)
-    -> Option<crate::kernel::objects::FileSlotAuthority>;
-    fn rename_open_paths(&self, resolved_old: &str, resolved_new: &str);
+    fn captured_slot_authority(
+        &self,
+        _fd: i32,
+    ) -> Option<crate::kernel::objects::FileSlotAuthority> {
+        None
+    }
+    fn rename_open_paths(&self, _resolved_old: &str, _resolved_new: &str) {}
     fn authority_call(
         &self,
-        table: Arc<crate::kernel::FileTable>,
-        slot: crate::kernel::objects::FileSlotAuthority,
-        command: crate::file_authority::Command,
-    ) -> Result<crate::file_authority::Outcome, super::AuthorityCallError>;
-    fn io_uring_description(&self, fd: i32) -> Option<Arc<crate::kernel::FileDescription>>;
-    fn notify_inmem_epoll(&self);
-    fn host_socket_lookup(&self, fd: i32) -> Result<(super::HostFd, i32), carrick_abi::LinuxErrno>;
-    fn socket_guest_type(&self, fd: i32) -> Option<i32>;
-    fn perf_event_state(&self, fd: i32) -> Option<Arc<super::perf::PerfEventState>>;
-    fn write_eventfd(&self, bytes: &[u8], state: &super::EventFdState) -> super::DispatchOutcome;
+        _table: Arc<crate::kernel::FileTable>,
+        _slot: crate::kernel::objects::FileSlotAuthority,
+        _command: crate::file_authority::Command,
+    ) -> Result<crate::file_authority::Outcome, super::AuthorityCallError> {
+        Err(super::AuthorityCallError::Fatal(
+            crate::file_authority::AuthorityFatal::TransportUnavailable,
+        ))
+    }
+    fn io_uring_description(&self, _fd: i32) -> Option<Arc<crate::kernel::FileDescription>> {
+        None
+    }
+    fn notify_inmem_epoll(&self) {}
+    fn host_socket_lookup(
+        &self,
+        _fd: i32,
+    ) -> Result<(super::HostFd, i32), carrick_abi::LinuxErrno> {
+        Err(carrick_abi::LINUX_EBADF)
+    }
+    fn socket_guest_type(&self, _fd: i32) -> Option<i32> {
+        None
+    }
+    fn perf_event_state(&self, _fd: i32) -> Option<Arc<super::perf::PerfEventState>> {
+        None
+    }
+    fn write_eventfd(&self, _bytes: &[u8], _state: &super::EventFdState) -> super::DispatchOutcome {
+        super::DispatchOutcome::errno(carrick_abi::LINUX_EINVAL)
+    }
 }
 
 impl FsCrossSubsystem for SyscallDispatcher {
@@ -940,6 +983,7 @@ impl FsCrossSubsystem for SyscallDispatcher {
 /// Subsystem view for filesystem operations.
 pub struct FsView<'a> {
     pub(in crate::dispatch) fs: &'a fs::FsState,
+    #[allow(dead_code)]
     pub(in crate::dispatch) file_authority:
         &'a RwLock<Option<Arc<crate::file_authority::FileAuthorityRun>>>,
     pub(in crate::dispatch) io: &'a fs::RuntimeIo,
@@ -951,7 +995,7 @@ pub struct FsView<'a> {
     #[allow(dead_code)]
     pub(in crate::dispatch) sysv: Option<&'a Arc<sysv::SysvIpcNamespace>>,
     pub(in crate::dispatch) exec_host_fs_fallback: bool,
-    pub(in crate::dispatch) cross: Option<&'a (dyn FsCrossSubsystem + 'a)>,
+    pub(in crate::dispatch) cross: &'a (dyn FsCrossSubsystem + 'a),
 }
 
 /// Subsystem view for network operations.
@@ -1013,7 +1057,7 @@ impl SyscallDispatcher {
             page_geometry: self.page_geometry,
             sysv: Some(&self.sysv),
             exec_host_fs_fallback: self.exec_host_fs_fallback,
-            cross: Some(self),
+            cross: self,
         }
     }
 
