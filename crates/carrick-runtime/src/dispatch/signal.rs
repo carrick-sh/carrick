@@ -174,6 +174,71 @@ pub(super) fn sanitize_signal_mask(mask: SigSet) -> SigSet {
     mask.without(LINUX_SIGKILL).without(LINUX_SIGSTOP)
 }
 
+pub(crate) fn signal_is_ignored(context: &crate::kernel::KernelContext, signum: i32) -> bool {
+    SyscallDispatcher::signal_action_entry(context, signum)
+        .is_some_and(|action| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
+}
+
+pub(crate) fn proc_status_signal_masks(
+    context: &crate::kernel::KernelContext,
+) -> (SigSet, SigSet, SigSet) {
+    let mut ignored = SigSet::EMPTY;
+    let mut caught = SigSet::EMPTY;
+    for (signum, action) in SyscallDispatcher::signal_actions(context) {
+        if sigmask_bit(signum).is_none() {
+            continue;
+        }
+        let handler = action.sa_handler;
+        if handler == crate::linux_abi::LINUX_SIG_IGN {
+            ignored = ignored.with(signum);
+        } else if handler != crate::linux_abi::LINUX_SIG_DFL {
+            caught = caught.with(signum);
+        }
+    }
+    (
+        ignored,
+        caught,
+        context.shared().pending_signals().present(),
+    )
+}
+
+pub(crate) fn signal_mask_for(
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+) -> SigSet {
+    SyscallDispatcher::signal_thread(context, tid)
+        .map(|thread| thread.signal_state().blocked())
+        .unwrap_or(SigSet::EMPTY)
+}
+
+pub(crate) fn signal_blocked(
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+    signum: i32,
+) -> bool {
+    if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
+        return false;
+    }
+    signal_mask_for(context, tid).contains(signum)
+}
+
+pub(crate) fn mark_signal_pending(
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+    signum: i32,
+) {
+    let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+        return;
+    };
+    let authority = SyscallDispatcher::signal_authority_for(context, tid);
+    if is_rt_signal(signum) {
+        authority.enqueue_thread_realtime(signal, None);
+    } else {
+        authority.enqueue_thread_standard(signal, None);
+    }
+    context.task().wake();
+}
+
 impl SyscallDispatcher {
     #[cfg(test)]
     pub(crate) fn exact_signal_context_for_test(&self) -> crate::kernel::KernelContext {
@@ -299,33 +364,17 @@ impl SyscallDispatcher {
             .map(|altstack| (altstack.ss_sp, altstack.ss_size))
     }
 
+    #[inline]
     pub fn signal_is_ignored(&self, context: &crate::kernel::KernelContext, signum: i32) -> bool {
-        Self::signal_action_entry(context, signum)
-            .is_some_and(|action| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
+        signal_is_ignored(context, signum)
     }
 
+    #[inline]
     pub fn proc_status_signal_masks(
         &self,
         context: &crate::kernel::KernelContext,
     ) -> (SigSet, SigSet, SigSet) {
-        let mut ignored = SigSet::EMPTY;
-        let mut caught = SigSet::EMPTY;
-        for (signum, action) in Self::signal_actions(context) {
-            if sigmask_bit(signum).is_none() {
-                continue;
-            }
-            let handler = action.sa_handler;
-            if handler == crate::linux_abi::LINUX_SIG_IGN {
-                ignored = ignored.with(signum);
-            } else if handler != crate::linux_abi::LINUX_SIG_DFL {
-                caught = caught.with(signum);
-            }
-        }
-        (
-            ignored,
-            caught,
-            context.shared().pending_signals().present(),
-        )
+        proc_status_signal_masks(context)
     }
 
     pub fn child_exit_signal_needs_pump(
@@ -429,44 +478,33 @@ impl SyscallDispatcher {
         mask
     }
 
+    #[inline]
     pub fn signal_blocked(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: i32,
     ) -> bool {
-        if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
-            return false;
-        }
-        self.signal_mask_for(context, tid).contains(signum)
+        signal_blocked(context, tid, signum)
     }
 
+    #[inline]
     pub fn signal_mask_for(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
     ) -> SigSet {
-        Self::signal_thread(context, tid)
-            .map(|thread| thread.signal_state().blocked())
-            .unwrap_or(SigSet::EMPTY)
+        signal_mask_for(context, tid)
     }
 
+    #[inline]
     pub fn mark_signal_pending(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: i32,
     ) {
-        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
-            return;
-        };
-        let authority = Self::signal_authority_for(context, tid);
-        if is_rt_signal(signum) {
-            authority.enqueue_thread_realtime(signal, None);
-        } else {
-            authority.enqueue_thread_standard(signal, None);
-        }
-        context.task().wake();
+        mark_signal_pending(context, tid, signum);
     }
 
     fn signal_dispatch_pending_possible(
