@@ -271,3 +271,9 @@ rows, (4) resume the perf2x campaign.
   telemetry (probe defect, being fixed) and `ppollwaitset` exposes a real
   runtime bug — poll on an unconnected stream socket must be POLLHUP
   immediately (worker dispatched).
+- Legacy lane LANDED (eddeef6b7): denominator 531 with the four new sources
+  classified; `tlbibroadcast`/`windowcoherence` no longer print
+  non-deterministic telemetry and MATCH on both arm64 lanes with freshly
+  blessed oracles; `ppollwaitset` is bounded (5 s caps, 4 s writer) and
+  blessed, and stays red until the POLLHUP runtime fix lands (worker
+  running). No known-gap excuse was added anywhere.
