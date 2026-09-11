@@ -504,14 +504,17 @@ impl HostWriteKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RootFsBackedData {
+    pub(super) base: Arc<[u8]>,
+    pub(super) dirty: BTreeMap<usize, Vec<u8>>,
+    pub(super) len: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum FileContents {
-    Dense(Vec<u8>),
-    RootFsBacked {
-        base: Arc<[u8]>,
-        dirty: BTreeMap<usize, Vec<u8>>,
-        len: usize,
-    },
+    Dense(Arc<parking_lot::RwLock<Vec<u8>>>),
+    RootFsBacked(Arc<parking_lot::RwLock<RootFsBackedData>>),
     /// An unlinked host regular file owns the bytes (`memfd_create`). The
     /// host inode is the single authority every view reads and writes: fd
     /// I/O goes through `pread`/`pwrite`, a guest `MAP_SHARED`/`MAP_PRIVATE`
@@ -557,7 +560,7 @@ pub(super) fn create_unlinked_host_file(prefix: &str) -> Option<std::os::fd::Own
 
 impl FileContents {
     pub(super) fn dense(bytes: Vec<u8>) -> Self {
-        Self::Dense(bytes)
+        Self::Dense(Arc::new(parking_lot::RwLock::new(bytes)))
     }
 
     pub(super) fn host_backed(fd: std::os::fd::OwnedFd) -> Self {
@@ -570,7 +573,7 @@ impl FileContents {
         use std::os::fd::AsRawFd;
         match self {
             Self::HostBacked { fd } => Some(fd.as_raw_fd()),
-            Self::Dense(_) | Self::RootFsBacked { .. } => None,
+            Self::Dense(_) | Self::RootFsBacked(_) => None,
         }
     }
 
@@ -580,9 +583,7 @@ impl FileContents {
     pub(super) fn accepts_len(&self, len: u64) -> bool {
         match self {
             Self::HostBacked { .. } => true,
-            Self::Dense(_) | Self::RootFsBacked { .. } => {
-                len <= crate::vfs::MAX_IN_MEMORY_FILE_SIZE
-            }
+            Self::Dense(_) | Self::RootFsBacked(_) => len <= crate::vfs::MAX_IN_MEMORY_FILE_SIZE,
         }
     }
 
@@ -591,13 +592,17 @@ impl FileContents {
         dirty: BTreeMap<usize, Vec<u8>>,
         len: usize,
     ) -> Self {
-        Self::RootFsBacked { base, dirty, len }
+        Self::RootFsBacked(Arc::new(parking_lot::RwLock::new(RootFsBackedData {
+            base,
+            dirty,
+            len,
+        })))
     }
 
     pub(super) fn len(&self) -> Result<u64, LinuxErrno> {
         match self {
-            Self::Dense(bytes) => Ok(bytes.len() as u64),
-            Self::RootFsBacked { len, .. } => Ok(*len as u64),
+            Self::Dense(bytes) => Ok(bytes.read().len() as u64),
+            Self::RootFsBacked(data) => Ok(data.read().len as u64),
             Self::HostBacked { fd } => {
                 use std::os::fd::AsRawFd;
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
@@ -657,26 +662,29 @@ impl FileContents {
                 let Ok(offset_usize) = usize::try_from(offset) else {
                     return Ok(0);
                 };
+                let bytes = bytes.read();
                 let available = bytes.get(offset_usize..).unwrap_or(&[]);
                 let copy_len = available.len().min(buf.len());
                 buf[..copy_len].copy_from_slice(&available[..copy_len]);
                 Ok(copy_len)
             }
-            Self::RootFsBacked { base, dirty, len } => {
+            Self::RootFsBacked(data) => {
                 let Ok(offset_usize) = usize::try_from(offset) else {
                     return Ok(0);
                 };
-                if offset_usize >= *len {
+                let data = data.read();
+                if offset_usize >= data.len {
                     return Ok(0);
                 }
-                let read_len = buf.len().min(*len - offset_usize);
+                let read_len = buf.len().min(data.len - offset_usize);
                 buf[..read_len].fill(0);
-                if offset_usize < base.len() {
-                    let base_len = read_len.min(base.len() - offset_usize);
-                    buf[..base_len].copy_from_slice(&base[offset_usize..offset_usize + base_len]);
+                if offset_usize < data.base.len() {
+                    let base_len = read_len.min(data.base.len() - offset_usize);
+                    buf[..base_len]
+                        .copy_from_slice(&data.base[offset_usize..offset_usize + base_len]);
                 }
                 let end = offset_usize + read_len;
-                for (&start, bytes) in dirty.range(..end) {
+                for (&start, bytes) in data.dirty.range(..end) {
                     let dirty_end = start.saturating_add(bytes.len());
                     if dirty_end <= offset_usize {
                         continue;
@@ -701,12 +709,13 @@ impl FileContents {
         }
         match self {
             Self::Dense(bytes) => {
-                bytes.resize(new_len_usize, 0);
+                bytes.write().resize(new_len_usize, 0);
                 Ok(())
             }
-            Self::RootFsBacked { dirty, len, .. } => {
-                *len = new_len_usize;
-                prune_dirty_ranges(dirty, new_len_usize);
+            Self::RootFsBacked(data) => {
+                let mut data = data.write();
+                data.len = new_len_usize;
+                prune_dirty_ranges(&mut data.dirty, new_len_usize);
                 Ok(())
             }
             Self::HostBacked { fd } => {
@@ -786,17 +795,19 @@ impl FileContents {
                 Ok(written)
             }
             Self::Dense(contents) => {
+                let mut contents = contents.write();
                 if end > contents.len() {
                     contents.resize(end, 0);
                 }
                 contents[offset_usize..end].copy_from_slice(data);
                 Ok(data.len())
             }
-            Self::RootFsBacked { dirty, len, .. } => {
-                if end > *len {
-                    *len = end;
+            Self::RootFsBacked(inner) => {
+                let mut inner = inner.write();
+                if end > inner.len {
+                    inner.len = end;
                 }
-                insert_dirty_range(dirty, offset_usize, data)?;
+                insert_dirty_range(&mut inner.dirty, offset_usize, data)?;
                 Ok(data.len())
             }
         }
@@ -2559,11 +2570,34 @@ impl OpenDescription {
                     "closed file description escaped into fstat"
                 );
             }
-            OpenDescription::File { path, metadata, .. } if is_anon_overlay_path(path) => {
-                OpenStatSource::Record(StatRecord::from_metadata(metadata))
+            OpenDescription::File {
+                path,
+                metadata,
+                contents,
+                ..
+            } if is_anon_overlay_path(path) => {
+                let mut record = StatRecord::from_metadata(metadata);
+                if let Ok(len) = contents.len() {
+                    record.size = len;
+                }
+                OpenStatSource::Record(record)
             }
-            OpenDescription::File { path, metadata, .. }
-            | OpenDescription::Directory { path, metadata, .. } => OpenStatSource::PathRecord {
+            OpenDescription::File {
+                path,
+                metadata,
+                contents,
+                ..
+            } => {
+                let mut record = StatRecord::from_metadata(metadata);
+                if let Ok(len) = contents.len() {
+                    record.size = len;
+                }
+                OpenStatSource::PathRecord {
+                    path: path.clone(),
+                    fallback: record,
+                }
+            }
+            OpenDescription::Directory { path, metadata, .. } => OpenStatSource::PathRecord {
                 path: path.clone(),
                 fallback: StatRecord::from_metadata(metadata),
             },

@@ -6099,6 +6099,157 @@ fn memfd_proc_self_fd_reopen_access_mode_and_seals() {
 }
 
 #[test]
+fn memfd_proc_self_fd_reopen_trunc_shares_inode() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0xab; 0x10000]);
+    let reporter = CompatReporter::default();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    const SYS_MEMFD_CREATE: u64 = 279;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_MEMFD_CREATE: u64 = 319;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const SYS_MEMFD_CREATE: u64 = 279;
+
+    #[cfg(target_arch = "aarch64")]
+    const SYS_OPENAT: u64 = 56;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_OPENAT: u64 = 257;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const SYS_OPENAT: u64 = 56;
+
+    #[cfg(target_arch = "aarch64")]
+    const SYS_WRITE: u64 = 64;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_WRITE: u64 = 1;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const SYS_WRITE: u64 = 64;
+
+    #[cfg(target_arch = "aarch64")]
+    const SYS_READ: u64 = 63;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_READ: u64 = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const SYS_READ: u64 = 63;
+
+    #[cfg(target_arch = "aarch64")]
+    const SYS_LSEEK: u64 = 62;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_LSEEK: u64 = 8;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const SYS_LSEEK: u64 = 62;
+
+    #[cfg(target_arch = "aarch64")]
+    const SYS_FSTAT: u64 = 80;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_FSTAT: u64 = 5;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const SYS_FSTAT: u64 = 80;
+
+    memory.write_bytes(0x4000, b"test_trunc\0").unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MEMFD_CREATE,
+        [0x4000, 0, 0, 0, 0, 0],
+    );
+    let orig_fd = match outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("memfd_create failed: {other:?}"),
+    };
+    assert!(orig_fd >= 0);
+
+    // Write 8192 bytes
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_WRITE,
+        [orig_fd as u64, 0x6000, 8192, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 8192 });
+
+    let st = dispatcher.fd_stat_record(orig_fd).expect("stat on orig_fd");
+    assert_eq!(st.size, 8192);
+
+    // Reopen through /proc/self/fd/N with O_TRUNC
+    let trunc_path = format!("/proc/self/fd/{orig_fd}\0");
+    memory.write_bytes(0x4100, trunc_path.as_bytes()).unwrap();
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_OPENAT,
+        [
+            (-100_i64) as u64,
+            0x4100,
+            LINUX_O_RDWR | LINUX_O_TRUNC,
+            0o600,
+            0,
+            0,
+        ],
+    );
+    let trunc_fd = match outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("openat /proc/self/fd/N O_TRUNC failed: {other:?}"),
+    };
+    assert!(trunc_fd >= 0);
+
+    // fstat on original fd must report st_size == 0
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_FSTAT,
+        [orig_fd as u64, 0x5000, 0, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    let st_size = i64::from_ne_bytes(
+        memory
+            .read_bytes(0x5000 + 48, 8)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(st_size, 0, "fstat on original fd must report st_size == 0");
+
+    let st_orig = dispatcher
+        .fd_stat_record(orig_fd)
+        .expect("stat on orig_fd after trunc");
+    assert_eq!(
+        st_orig.size, 0,
+        "fd_stat_record on original fd must report size 0"
+    );
+
+    // Seek to 0 and read on original fd must return 0 bytes
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_LSEEK,
+        [orig_fd as u64, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+
+    let outcome = run(
+        &mut dispatcher,
+        &mut memory,
+        SYS_READ,
+        [orig_fd as u64, 0x6000, 100, 0, 0, 0],
+    );
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned { value: 0 },
+        "read on original fd must return 0 bytes"
+    );
+}
+
+#[test]
 fn proc_self_fd_reopen_overlay_file_write_after_reopen_visible_in_reopened() {
     let scratch = tempfile::tempdir().unwrap();
     let backend = crate::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
@@ -6512,7 +6663,7 @@ fn lseek_data_and_hole_across_backends() {
             mode: 0o644,
             size: 100,
         },
-        contents: FileContents::Dense(vec![0xAA; 100]),
+        contents: FileContents::dense(vec![0xAA; 100]),
         offset: 0,
         writable: true,
     };
