@@ -1667,19 +1667,19 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
       "symbol": "HVPATCH_CLONE_FAILPOINT",
       "fingerprint": "caba41a511d201e06b2a61a9355203b4d243401d256fba1fb280c6807818e097",
       "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache HVPATCH_CLONE_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/mod.rs initialized from environment flags."
+      "rationale": "Process-global configuration or failpoint cache HVPATCH_CLONE_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/lifecycle.rs initialized from environment flags."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
       "symbol": "HVPATCH_PROCESS_FAILPOINT",
       "fingerprint": "0d9de7352b8882bd355ab2e7281ecc5a77a1d3653aaa55f91d6ab260b150b585",
       "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache HVPATCH_PROCESS_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/mod.rs initialized from environment flags."
+      "rationale": "Process-global configuration or failpoint cache HVPATCH_PROCESS_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/lifecycle.rs initialized from environment flags."
     },
     {
       "kind": "static",

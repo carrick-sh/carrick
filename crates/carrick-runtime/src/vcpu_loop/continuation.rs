@@ -6138,11 +6138,12 @@ mod tests {
             .split_once("fn leave_executor")
             .expect("end of production task-only clone helper")
             .0;
-        let backend_ops = source
+        let lifecycle = include_str!("lifecycle.rs");
+        let backend_ops = lifecycle
             .split_once("for ProductionHvpatchCloneBackendOps")
             .expect("production clone backend ops")
             .1
-            .split_once("trait ProductionHvpatchLoopPoll")
+            .split_once("enum HvpatchCloneFailpoint")
             .expect("end of production clone backend ops")
             .0;
         assert!(clone_arm.contains("spawn_persistent_hvpatch_clone_thread"));
@@ -6194,12 +6195,13 @@ mod tests {
     #[test]
     fn production_hvpatch_process_fork_never_reaches_host_thread_or_vcpu_materialization() {
         let quiesce = include_str!("quiesce.rs");
+        let lifecycle = include_str!("lifecycle.rs");
         let production = include_str!("mod.rs");
-        let backend_ops = production
+        let backend_ops = lifecycle
             .split_once("for ProductionHvpatchProcessBackendOps")
             .expect("production HVPatch process backend ops")
             .1
-            .split_once("struct ProductionHvpatchLoopJob")
+            .split_once("struct ProductionHvpatchCloneBackendOps")
             .expect("end of production HVPatch process backend ops")
             .0;
         let terminal_finalizer = production
@@ -6265,10 +6267,14 @@ mod tests {
             "production HVPatch process ops omitted task-only materialization"
         );
         assert!(
-            production.contains("bootstrap_hvpatch_process_child(")
-                && production.contains("refresh_fork_process_state")
-                && production.contains("stamp_identity_page")
-                && production.contains("stamp_ns_visible_guest_tid"),
+            (production.contains("bootstrap_hvpatch_process_child(")
+                || lifecycle.contains("bootstrap_hvpatch_process_child("))
+                && (production.contains("refresh_fork_process_state")
+                    || lifecycle.contains("refresh_fork_process_state"))
+                && (production.contains("stamp_identity_page")
+                    || lifecycle.contains("stamp_identity_page"))
+                && (production.contains("stamp_ns_visible_guest_tid")
+                    || lifecycle.contains("stamp_ns_visible_guest_tid")),
             "process child refresh/identity/tid bootstrap is not mandatory on first load"
         );
         for required in [
