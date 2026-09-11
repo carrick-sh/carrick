@@ -2619,7 +2619,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
       "symbol": "STAGE2_AUDIT_STATE",
       "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
       "classification": "test_only",
