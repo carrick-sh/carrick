@@ -557,7 +557,7 @@
       "domain": "kernel::task_activation"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
       "function": "<ProductionHvpatchProcessBackendOps as HvpatchProcessBackendOps<E,E>>::fail_stop",
       "ordinal_in_function": 1,
       "fingerprint": "2ca36fd6d42f7785e8e1a32cb1307fdc42afb7660ab50ae54ca2ec57a09393d7",
