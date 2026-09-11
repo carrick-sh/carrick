@@ -2427,11 +2427,11 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "task_only_carrier_directory_tests::ALIAS_TEST_LOCK",
-      "fingerprint": "6e73fe1ad661028967b85b68196dc9280f1b90ea8d5f98f0ebaee1145ee4803e",
+      "file": "crates/carrick-vmm-hvf/src/trap/task_only_carrier_directory_tests.rs",
+      "symbol": "ALIAS_TEST_LOCK",
+      "fingerprint": "c741dcb695fc184418519e560da921139a25e5c2f67062f61249121b041d414b",
       "classification": "test_only",
-      "rationale": "Test-only fixture or lock task_only_carrier_directory_tests::ALIAS_TEST_LOCK in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
+      "rationale": "Test-only fixture or lock ALIAS_TEST_LOCK in crates/carrick-vmm-hvf/src/trap/task_only_carrier_directory_tests.rs scoped strictly to test harness execution."
     },
     {
       "kind": "static",
