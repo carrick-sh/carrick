@@ -346,3 +346,28 @@ commits and is re-checked at the next vet.
   0.69), net_http 1.06; 3/11 rows ≤2x unchanged. Profiles of compile,
   multiprocessing, tarfile, importlib on the candidate binary follow, then
   the perf workers are dispatched alongside Phase 3.
+- Profiles on the candidate binary (carrier user-CPU ranking, quiet host,
+  `target/perf/perf2x-sep11/*.rank`, aggregator `rank-agg.py`):
+  - compile (17.4 s): 86% under `munmap` → `commit_process_alias_retirement`
+    → `TaskMappingIndex::retain` full walk + `Vec::from_iter` per unmap
+    (O(rows) per munmap → O(n²)). Worker `alias-retain-index`.
+  - tarfile (22.4 s, sys 7.2 s): host `openat` is the leaf of 48.5% of
+    samples; unlinkat/rmdir 37.5%, mkdirat 23.6%; `HashMap::retain`
+    prefix-scan cache eviction 12.5%; `std::path::Components` 17%. Worker
+    `hostfs-amplification` (dentry parent dirfd = one `*at` per op; ordered
+    cache; no re-normalize). `split-fs-backend` deferred behind it.
+  - importlib (5.9 s): `dispatch_threaded_futex` → guest read →
+    `AliasRegistry::newest_containing` 18.5% (window bounded by the widest
+    row, not by the answer); poll/psynch waits 22%. Worker
+    `alias-newest-index` (width-class containment index).
+  - multiprocessing (8.1 s, user 10.3 s): 73% of carrier user CPU is guest
+    execution (`hv_trap` leaf), syscall service 15% (openat 5.8, fault 4.7,
+    getdents 3.7). Not a carrier-CPU cluster; a Docker-side CPU comparison
+    of the same row is running to separate "guest does more work" (spinning)
+    from "carrier adds work" before a worker is briefed.
+- Dispatched 2026-09-11 16:30 (AGY_RUN_ID=feedback-sep11, 90 min budgets):
+  split-continuation, split-operations, split-objects, split-executor,
+  split-mem, tma, syscall-names, fatal-residue, alias-retain-index,
+  alias-newest-index, hostfs-amplification. Director verification for the
+  perf three = paired interleaved A/B of the row on a quiet host after the
+  Phase 3 landings.
