@@ -244,6 +244,22 @@ pub(in crate::dispatch) fn host_stream_socket_rdhup(host_fd: i32) -> bool {
     host_stream_socket_read_eof(host_fd)
 }
 
+pub(in crate::dispatch) fn host_stream_socket_is_connected(host_fd: i32) -> bool {
+    if host_fd < 0 {
+        return false;
+    }
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len: libc::socklen_t = std::mem::size_of_val(&storage) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getpeername(
+            host_fd,
+            &mut storage as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    rc == 0
+}
+
 #[cfg(test)]
 mod host_stream_socket_read_eof_tests {
     use super::host_stream_socket_rdhup;
@@ -513,12 +529,17 @@ impl<'a> NetView<'a> {
             // SOCK_STREAM/DGRAM/RAW/SEQPACKET are numerically identical on
             // macOS and Linux (1/2/3/5), so the host SO_TYPE value is already a
             // valid Linux socket type.
+            let is_stream = so_type == LINUX_SOCK_STREAM || so_type == LINUX_SOCK_SEQPACKET;
+            let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+            if is_stream && host_stream_socket_is_connected(host_fd) {
+                base.set_connected(true);
+            }
             OpenDescription::HostSocket {
                 host_fd: HostFdRef::new(host_fd),
                 family: libc::AF_UNIX,
                 type_: so_type,
                 protocol: 0,
-                base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                base,
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
             }
@@ -596,13 +617,23 @@ impl<'a> NetView<'a> {
         })
     }
 
-    /// Set/clear the per-description `connect_in_progress` flag for `fd`.
-    fn set_socket_connect_in_progress(&self, fd: i32, on: bool) {
+    /// Update the per-description `connect_in_progress` and/or `connected` flags for `fd`.
+    fn update_socket_connection_state(
+        &self,
+        fd: i32,
+        connect_in_progress: Option<bool>,
+        connected: Option<bool>,
+    ) {
         if let Some(open_file) = self.open_file(fd)
             && let Some(mut open) = open_file.description.write()
             && let OpenDescription::HostSocket { base, .. } = &mut *open
         {
-            base.set_connect_in_progress(on);
+            if let Some(on) = connect_in_progress {
+                base.set_connect_in_progress(on);
+            }
+            if let Some(on) = connected {
+                base.set_connected(on);
+            }
         }
     }
 
@@ -678,6 +709,7 @@ impl<'a> NetView<'a> {
         *host_fd = HostFdRef::new(new_host);
         synthetic_recv.clear();
         base.set_connect_in_progress(false);
+        base.set_connected(false);
         base.clear_socket_error_after_send();
         let _ = base.take_pending_socket_error();
         Ok(())
@@ -1173,13 +1205,15 @@ impl<'a> NetView<'a> {
         } else {
             None
         };
+        let mut base = OpenDescriptionBase::new(status_flags);
+        base.set_connected(true);
         let open_file = OpenFile::from_open_description_with_status_flags(
             Arc::new(RwLock::new(OpenDescription::HostSocket {
                 host_fd: HostFdRef::new(new_host),
                 family,
                 type_,
                 protocol,
-                base: OpenDescriptionBase::new(status_flags),
+                base,
                 mcast_memberships: Vec::new(),
                 synthetic_recv: std::collections::VecDeque::new(),
             })),
@@ -1250,19 +1284,25 @@ impl<'a> NetView<'a> {
             )
         };
         if rc == 0 {
-            return connect_success_or_pending_error(host_fd.get());
+            let outcome = connect_success_or_pending_error(host_fd.get());
+            if matches!(outcome, DispatchOutcome::Returned { value: 0 }) {
+                self.update_socket_connection_state(fd, Some(false), Some(true));
+            }
+            return outcome;
         }
         let e = HostSyscallError::last().linux_errno();
         // See `fn connect` for why EISCONN is split on connect_in_progress.
         if e == LINUX_EISCONN {
             if self.socket_connect_in_progress(fd) {
-                self.set_socket_connect_in_progress(fd, false);
-                return connect_success_or_pending_error(host_fd.get());
+                let outcome = connect_success_or_pending_error(host_fd.get());
+                let connected = matches!(outcome, DispatchOutcome::Returned { value: 0 });
+                self.update_socket_connection_state(fd, Some(false), Some(connected));
+                return outcome;
             }
             return DispatchOutcome::errno(LINUX_EISCONN);
         }
         if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
-            self.set_socket_connect_in_progress(fd, true);
+            self.update_socket_connection_state(fd, Some(true), None);
             let files = self.captured_file_table();
             let fds = match WaitFds::raw_one(host_fd.get(), libc::POLLOUT)
                 .with_guest_slots(&files, [fd])
@@ -1419,13 +1459,15 @@ impl<'a> NetView<'a> {
                     gid: creds.egid,
                 }
             };
+            let mut base_first = OpenDescriptionBase::new(status_flags);
+            base_first.set_connected(true);
             let first = OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: HostFdRef::new(host_fds[0]),
                     family,
                     type_: base_type,
                     protocol,
-                    base: OpenDescriptionBase::new(status_flags),
+                    base: base_first,
                     mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
                 })),
@@ -1433,13 +1475,15 @@ impl<'a> NetView<'a> {
                 fd_flags,
             );
             first.description.common().set_peer_cred(Some(my_cred));
+            let mut base_second = OpenDescriptionBase::new(status_flags);
+            base_second.set_connected(true);
             let second = OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: HostFdRef::new(host_fds[1]),
                     family,
                     type_: base_type,
                     protocol,
-                    base: OpenDescriptionBase::new(status_flags),
+                    base: base_second,
                     mcast_memberships: Vec::new(),
                     synthetic_recv: std::collections::VecDeque::new(),
                 })),
@@ -2121,16 +2165,17 @@ impl<'a> NetView<'a> {
                 // connection completed — consult SO_ERROR (see
                 // connect_success_or_pending_error).
                 let outcome = connect_success_or_pending_error(host_fd.get());
-                if matches!(outcome, DispatchOutcome::Returned { value: 0 })
-                    && let Some((guest_peer, host_peer, protocol)) = rewritten_connect
-                {
-                    this.record_rewritten_connect_addresses(
-                        family,
-                        host_fd.get(),
-                        guest_peer,
-                        host_peer,
-                        protocol,
-                    );
+                if matches!(outcome, DispatchOutcome::Returned { value: 0 }) {
+                    this.update_socket_connection_state(fd, Some(false), Some(true));
+                    if let Some((guest_peer, host_peer, protocol)) = rewritten_connect {
+                        this.record_rewritten_connect_addresses(
+                            family,
+                            host_fd.get(),
+                            guest_peer,
+                            host_peer,
+                            protocol,
+                        );
+                    }
                 }
                 return Ok(outcome);
             }
@@ -2148,18 +2193,19 @@ impl<'a> NetView<'a> {
             //     surface EISCONN to the guest (Linux connect01 "already connected").
             if e == LINUX_EISCONN {
                 if this.socket_connect_in_progress(fd) {
-                    this.set_socket_connect_in_progress(fd, false);
                     let outcome = connect_success_or_pending_error(host_fd.get());
-                    if matches!(outcome, DispatchOutcome::Returned { value: 0 })
-                        && let Some((guest_peer, host_peer, protocol)) = rewritten_connect
-                    {
-                        this.record_rewritten_connect_addresses(
-                            family,
-                            host_fd.get(),
-                            guest_peer,
-                            host_peer,
-                            protocol,
-                        );
+                    let connected = matches!(outcome, DispatchOutcome::Returned { value: 0 });
+                    this.update_socket_connection_state(fd, Some(false), Some(connected));
+                    if connected {
+                        if let Some((guest_peer, host_peer, protocol)) = rewritten_connect {
+                            this.record_rewritten_connect_addresses(
+                                family,
+                                host_fd.get(),
+                                guest_peer,
+                                host_peer,
+                                protocol,
+                            );
+                        }
                     }
                     return Ok(outcome);
                 }
@@ -2175,6 +2221,7 @@ impl<'a> NetView<'a> {
                         protocol,
                     );
                 }
+                this.update_socket_connection_state(fd, Some(true), None);
                 if nonblocking {
                     // Non-blocking guest: hand EINPROGRESS/EALREADY straight back.
                     return Ok(DispatchOutcome::errno(e));
@@ -2183,7 +2230,6 @@ impl<'a> NetView<'a> {
                 // writable, then re-dispatch — connect then returns EISCONN or the
                 // real connect error. Mark the connect as deferred so the EISCONN
                 // we expect on re-dispatch is recognised as async-completion above.
-                this.set_socket_connect_in_progress(fd, true);
                 let files = this.captured_file_table();
                 let fds = match WaitFds::raw_one(host_fd.get(), libc::POLLOUT)
                     .with_guest_slots(&files, [fd])

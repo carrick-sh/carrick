@@ -315,6 +315,8 @@ pub(super) struct OpenDescriptionBase {
     /// (surface EISCONN to the guest, matching Linux connect01 case "already
     /// connected").
     connect_in_progress: bool,
+    /// True once a stream socket is connected (via connect, accept, or socketpair).
+    connected: bool,
     /// Linux-visible pending socket error for synthetic networking paths whose
     /// failure is not backed by the host socket's SO_ERROR state.
     pending_socket_error: Option<i32>,
@@ -343,6 +345,7 @@ impl OpenDescriptionBase {
             so_passcred: false,
             listening: false,
             connect_in_progress: false,
+            connected: false,
             pending_socket_error: None,
             socket_error_after_send: None,
             recv_timeout: None,
@@ -455,6 +458,12 @@ impl OpenDescriptionBase {
     }
     pub(super) fn set_connect_in_progress(&mut self, on: bool) {
         self.connect_in_progress = on;
+    }
+    pub(super) fn connected(&self) -> bool {
+        self.connected
+    }
+    pub(super) fn set_connected(&mut self, on: bool) {
+        self.connected = on;
     }
     pub(super) fn pending_socket_error(&self) -> Option<i32> {
         self.pending_socket_error
@@ -2043,6 +2052,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 host_fd,
                 base,
                 synthetic_recv,
+                type_,
                 ..
             } => {
                 if base.pending_socket_error().is_some() {
@@ -2051,6 +2061,36 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                         ready |= LinuxEpollEvents::OUT;
                     }
                     return ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP);
+                }
+                let is_stream_like = *type_ == carrick_abi::LINUX_SOCK_STREAM
+                    || *type_ == carrick_abi::LINUX_SOCK_SEQPACKET;
+                if is_stream_like {
+                    if base.listening() {
+                        let mut pfd = libc::pollfd {
+                            fd: host_fd.raw(),
+                            events: 0,
+                            revents: 0,
+                        };
+                        if interest.contains(LinuxEpollEvents::IN) {
+                            pfd.events |= libc::POLLIN;
+                        }
+                        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                        let mut ready = LinuxEpollEvents::empty();
+                        if rc > 0 {
+                            if pfd.revents & libc::POLLIN != 0 {
+                                ready |= LinuxEpollEvents::IN;
+                            }
+                            if pfd.revents & libc::POLLERR != 0 {
+                                ready |= LinuxEpollEvents::ERR;
+                            }
+                        }
+                        return ready & (interest | LinuxEpollEvents::ERR);
+                    }
+                    let is_connected = base.connected()
+                        || super::net::host_stream_socket_is_connected(host_fd.raw());
+                    if !is_connected && !base.connect_in_progress() {
+                        return LinuxEpollEvents::HUP;
+                    }
                 }
                 let synthetic_datagram_ready = !synthetic_recv.is_empty();
                 let mut pfd = libc::pollfd {

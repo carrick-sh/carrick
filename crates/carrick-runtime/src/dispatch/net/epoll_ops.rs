@@ -225,7 +225,7 @@ impl<'a> NetView<'a> {
         )
     }
 
-    fn fd_is_listening_socket(&self, fd: i32) -> bool {
+    pub(super) fn fd_is_listening_socket(&self, fd: i32) -> bool {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
