@@ -2243,7 +2243,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "symbol": "fault_window_bytes::CARRICK_FAULT_WINDOW_BYTES",
       "fingerprint": "d65ad01b7ba81d1b0a9121f3ea237b8bc22533fd63dc95b2b2c796bf63dfe2ca",
       "classification": "config_debug",
@@ -2307,7 +2307,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "symbol": "zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP",
       "fingerprint": "71305498cda28a62a37368e8985d314746d4eb66e989ed11a3142a11e5e54b18",
       "classification": "config_debug",
@@ -2315,7 +2315,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "symbol": "zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP#2",
       "fingerprint": "71305498cda28a62a37368e8985d314746d4eb66e989ed11a3142a11e5e54b18",
       "classification": "config_debug",
@@ -2451,7 +2451,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "symbol": "fault_window_bytes::WINDOW",
       "fingerprint": "0623d2cbce0e61f080c5fccc451aa8bc1ba2283f9cd07e1a7dca3ea71ae1127a",
       "classification": "config_debug",
@@ -2595,7 +2595,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "symbol": "zero_anonymous_remap_enabled::ENABLED",
       "fingerprint": "36833e7b8d81b0acafe43de2e53df551a8c2c019b1582a9dc718da51ee441c9b",
       "classification": "config_debug",
