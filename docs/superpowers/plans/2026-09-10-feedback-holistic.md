@@ -341,3 +341,8 @@ remaining `SharedFutex*` outcome grouping. Item 10 (macOS anti-patterns) as
 listed in v1 was `tokio`/env hacks in the CLI (T17 landed) and named-user→
 root (T6 landed); the v2 "unchanged" verdict predates re-reading those
 commits and is re-checked at the next vet.
+- Item 4 re-baseline DONE (ecosystem doc "2026-09-11 16:20"): 88/88 MATCH,
+  candidate ≤ base on 10/11 rows paired (multiprocessing 0.63, importlib
+  0.69), net_http 1.06; 3/11 rows ≤2x unchanged. Profiles of compile,
+  multiprocessing, tarfile, importlib on the candidate binary follow, then
+  the perf workers are dispatched alongside Phase 3.

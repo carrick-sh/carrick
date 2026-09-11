@@ -3544,3 +3544,43 @@ separate runs — including the three "MET" rows, which are far enough from
 2.0 to be safe — should be re-read with that in mind, and the next
 measurement round must interleave base and candidate rather than compare to
 a stored column.
+
+### 2026-09-11 16:20 — paired re-baseline after the feedback.md campaign
+
+First scorecard measured the way the 03:33 caveat demands: base and
+candidate INTERLEAVED on one quiet host (quiet-gated before every phase,
+no other agent on the machine), w4 three reps with alternating order, then
+w1 once each. Base = pinned `62c63d979` binary `afccec0cc339993c`;
+candidate = pinned main `541a575ff` binary `3c8dbee5b686c49d` (the tree
+after DSR removal, the god-file splits, `carrick_fatal!`, typed returns,
+the dispatcher views, and the five probe fixes). Driver
+`target/conformance/eco-load/paired-sep11.sh`, rows
+`paired-sep11-{base,cand}-w{4,1}-r*.jsonl`, summary `paired-summary.py`.
+**88/88 MATCH, zero crash/regression/timeout.** Medians:
+
+| row | base w4 | cand w4 | cand/base (paired, median of 3) | base w1 | cand w1 |
+|---|---|---|---|---|---|
+| cpython-asyncio | 1.09 | 1.01 | 0.93 | 1.00 | 0.99 |
+| cpython-subprocess | 3.26 | 2.88 | 0.88 | 2.88 | 2.70 |
+| go-runtime_pprof | 1.78 | 1.53 | 0.86 | 1.33 | 1.29 |
+| cpython-tarfile | 5.48 | 5.23 | 0.95 | 4.74 | 4.65 |
+| cpython-compile | 8.90 | 8.13 | 0.99 | 5.15 | 5.30 |
+| go-net_http | 3.62 | 3.72 | 1.06 | 3.63 | 3.97 |
+| go-go_types | 2.52 | 2.39 | 0.93 | 2.61 | 2.87 |
+| cpython-threading | 1.17 | 1.07 | 0.91 | 1.17 | 1.08 |
+| cpython-multiprocessing_main_handling | 7.12 | 4.52 | 0.63 | 3.49 | 2.64 |
+| cpython-importlib | 4.33 | 2.98 | 0.69 | 2.39 | 2.07 |
+| cpython-itertools | 2.63 | 2.43 | 0.93 | 1.83 | 1.85 |
+
+Reading: the restructuring campaign is perf-neutral or better on 10 of 11
+rows at the goal condition; `multiprocessing_main_handling` (0.63) and
+`importlib` (0.69) moved most, which is where the ppoll/readiness and
+fd-description work landed. `go-net_http` is the one row that reads
+worse (1.06 at w4, 3.63 → 3.97 at w1) and is the first thing the fresh
+profile has to explain. Still **3/11 at ≤2x** (asyncio, threading,
+runtime_pprof). Ranking by candidate w4 for the next clusters: compile
+8.13, tarfile 5.23, multiprocessing 4.52, net_http 3.72, importlib 2.98,
+subprocess 2.88, itertools 2.43, go_types 2.39. Load coupling (w4/w1) on
+the candidate: compile 1.53, multiprocessing 1.71, importlib 1.44,
+itertools 1.31, tarfile 1.12 — compile and multiprocessing remain the two
+load-coupled rows the 02:23 entry named.
