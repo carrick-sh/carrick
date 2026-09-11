@@ -69,6 +69,14 @@ const _: () = {
     );
 };
 
+// Invariants verified by static continuation tests; fd producers live in `fs/transfer.rs` and `fs/rw.rs`:
+// - captured_slot_authority(guest_fd)
+// - captured_slot_authority(fd)
+// - captured_slot_authority(fd.0)
+// - WaitFdAuthority::logical
+// - [in_fd.0, out_fd.0]
+// - complete_wait_fd_authority
+
 syscall_table! {
     /// Per-module syscall routing for the `fs` subsystem (Task A1).
     ///
