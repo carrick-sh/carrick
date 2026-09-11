@@ -202,3 +202,24 @@ signed probe gate shows only the four reds recorded before the campaign
 carry-forward items above are the honest remainder; none is a regression
 introduced by this campaign (the one regression the gate caught, sysvmsg,
 was fixed forward the same day).
+
+## Phase 2 — 2026-09-11 (AGY_RUN_ID=feedback-sep11)
+
+Order: (1) the five open probe reds, (2) route every subsystem through its
+view + dedupe the FsView signal helpers, (3) retire the typed_error_debt
+rows, (4) resume the perf2x campaign.
+
+- (1) LANDED: `seekholemap` (748724945: F_PUNCHHOLE via libc on beyond-EOF
+  writes, block size from fstat, SparseBuffer seek), `statfslifetime`
+  (161ead9a2: typed `FsIdentity` per description, unlinked /proc/self/fd
+  reopen), `packetv3state` (1c3751ff2: in-zone AF_PACKET with a TPACKET
+  ring; `linux_to_host_af` now refuses unknown families instead of passing
+  them through), `tty0state` (c8650ee77: kernel-owned `VirtualConsole`,
+  per-tty termios shared across opens, no host fd). `just ci` green
+  (ci-phase2a-sep11). `coredumpfile` in review round 2: root cause found
+  (premature begin_process_exit + a 10 s quorum deadline); round-1 branch
+  waited forever for a departed participant — the census must shrink on
+  participation drop, not only on register publication.
+- (2) dispatched (`views-routing`).
+- rerere is now disabled for this clone (`git config rerere.enabled false`)
+  after it replayed a wrong inventory resolution onto a later rebase.
