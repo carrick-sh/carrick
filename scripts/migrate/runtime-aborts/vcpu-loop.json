@@ -425,7 +425,7 @@
       "domain": "vcpu_loop::executor_boundary"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
       "function": "<KernelFrameCowAuthority as carrick_hal::FrameCowAuthority>::apply_foreign_cow",
       "ordinal_in_function": 1,
       "fingerprint": "b109eb1f5d4e6577c26b7d9e0dc65fc138545b1137ebfad14a1f2c4b0bb3c649",
@@ -436,7 +436,7 @@
       "domain": "kernel::mm_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
       "function": "<KernelFrameCowAuthority as carrick_hal::FrameCowAuthority>::apply_foreign_cow",
       "ordinal_in_function": 2,
       "fingerprint": "ab032d4936ccb7125fef9949f35fb08905c29069febd958860e219c2db0a35fc",
