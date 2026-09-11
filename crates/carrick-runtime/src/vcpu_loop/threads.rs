@@ -727,22 +727,13 @@ where
                 self.withdraw_from_crash_capture();
             }
         }
-        // Runtime withdrawal (registry exit, kick unregister, host-signal
-        // forget) runs EXACTLY ONCE across Busy retries: it is not
-        // re-entrant, and the registry census it returns is only
-        // meaningful on the first pass.
-        let mut last = if self.thread_exit_withdrawn {
-            false
-        } else {
-            self.trace_hvpatch_thread_terminal(
-                carrick_observability::probes::HvpatchThreadTerminalReason::GuestThreadExit,
-                code,
-            );
-            let last = self.withdraw_persistent_terminal_owner_runtime(kernel, engine);
-            self.thread_exit_withdrawn = true;
-            last
-        };
-        if !last && let Some(process) = kernel.hvpatch_process.as_ref() {
+        // Sibling signals (e.g. glibc setxid tgkill) must see this thread as
+        // undeliverable (ESRCH) BEFORE clear_child_tid wakes futex / stack
+        // allocators or runtime state is withdrawn. In HVPatch, retiring the
+        // thread from the authoritative task graph first closes the window
+        // where a signal could be posted to or delivered on a torn-down stack.
+        let mut last = false;
+        if let Some(process) = kernel.hvpatch_process.as_ref() {
             match process.exit_thread(self.linux_tid) {
                 Ok(crate::hvpatch::ProcessThreadExit::Retired(retired)) => {
                     kernel.dispatcher.close_draining_file_table(
@@ -757,6 +748,21 @@ where
                     return PersistentThreadExitDisposition::Busy { observed_epoch };
                 }
                 Ok(crate::hvpatch::ProcessThreadExit::LastThread) | Err(_) => last = true,
+            }
+        }
+        // Runtime withdrawal (registry exit, kick unregister, host-signal
+        // forget) runs EXACTLY ONCE after the thread is retired (or across
+        // Busy retries): it is not re-entrant, and the registry census it
+        // returns is only meaningful on the first pass.
+        if !self.thread_exit_withdrawn {
+            self.trace_hvpatch_thread_terminal(
+                carrick_observability::probes::HvpatchThreadTerminalReason::GuestThreadExit,
+                code,
+            );
+            let registry_last = self.withdraw_persistent_terminal_owner_runtime(kernel, engine);
+            self.thread_exit_withdrawn = true;
+            if kernel.hvpatch_process.is_none() {
+                last = registry_last;
             }
         }
         PersistentThreadExitDisposition::Done(if last {
