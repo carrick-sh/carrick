@@ -49,6 +49,7 @@
 //!
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
+pub(crate) use super::dispatcher::MemView;
 use super::*;
 use carrick_fatal::carrick_fatal;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -3123,8 +3124,8 @@ impl ResidentFaultPlan<'_> {
     }
 }
 
-impl SyscallDispatcher {
-    fn recover_private_repoint_failure(
+impl<'a> MemView<'a> {
+    pub(in crate::dispatch::mem) fn recover_private_repoint_failure(
         &self,
         candidate: u64,
         failure: carrick_guest_mem::RepointPrivateError,
@@ -3277,7 +3278,7 @@ impl SyscallDispatcher {
     /// bytes. The destination starts zeroed, so EOF supplies the Linux mapping's
     /// zero tail. Every fallible file/device operation completes before a fixed
     /// replacement can touch the prior VMA.
-    fn snapshot_private_mmap_file(
+    pub(in crate::dispatch::mem) fn snapshot_private_mmap_file(
         &self,
         fd: Fd,
         offset: u64,
@@ -3499,7 +3500,11 @@ impl SyscallDispatcher {
 
     /// Derive `madvise` range validity + properties from carrick's mapping
     /// metadata (`semantic_vmas`), never by probing a page.
-    fn madvise_range_meta(&self, start: u64, end: u64) -> MadviseRangeMeta {
+    pub(in crate::dispatch::mem) fn madvise_range_meta(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> MadviseRangeMeta {
         let mem_authority_2 = self.mem();
         let mem = mem_authority_2.lock();
         let mut covered_to = start;
@@ -3772,7 +3777,7 @@ impl SyscallDispatcher {
             .any(|r| ranges_overlap(start, len, r.start().raw(), r.end().raw()))
     }
 
-    fn record_secretmem_map(&self, start: u64, len: u64) {
+    pub(in crate::dispatch::mem) fn record_secretmem_map(&self, start: u64, len: u64) {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
@@ -3792,7 +3797,7 @@ impl SyscallDispatcher {
     }
 
     #[cfg(test)]
-    fn remove_secretmem_map(&self, start: u64, len: u64) {
+    pub(in crate::dispatch::mem) fn remove_secretmem_map(&self, start: u64, len: u64) {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
@@ -3865,7 +3870,7 @@ impl SyscallDispatcher {
         );
     }
 
-    fn record_dynamic_mapping_with_file_offset(
+    pub(in crate::dispatch::mem) fn record_dynamic_mapping_with_file_offset(
         &self,
         start: u64,
         len: u64,
@@ -3976,7 +3981,11 @@ impl SyscallDispatcher {
     /// Whether one committed host-alias extent fully backs this guest-VA range.
     /// VMA presence alone is insufficient: lazy anonymous `PROT_NONE` reserves
     /// the address now and installs physical backing only on first commit.
-    fn range_has_host_alias_backing(&self, start: u64, len: u64) -> bool {
+    pub(in crate::dispatch::mem) fn range_has_host_alias_backing(
+        &self,
+        start: u64,
+        len: u64,
+    ) -> bool {
         let Some(end) = start.checked_add(len) else {
             return false;
         };
@@ -4189,7 +4198,7 @@ impl SyscallDispatcher {
         tracked
     }
 
-    fn record_growdown_mapping(&self, start: u64, len: u64) {
+    pub(in crate::dispatch::mem) fn record_growdown_mapping(&self, start: u64, len: u64) {
         let Some(end) = start.checked_add(len) else {
             return;
         };
@@ -4647,7 +4656,7 @@ impl SyscallDispatcher {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> MemView<'a> {
     define_syscall! {
         fn readahead(this, cx, fd: Fd, _offset: u64, _count: u64) {
             // Linux readahead(2): fd must be a valid open descriptor; EBADF is
@@ -9174,8 +9183,13 @@ impl SyscallDispatcher {
     }
 }
 
-impl SyscallDispatcher {
-    fn track_resident_fault_range(&self, address: u64, length: u64, prot: LinuxProtFlags) {
+impl<'a> MemView<'a> {
+    pub(in crate::dispatch::mem) fn track_resident_fault_range(
+        &self,
+        address: u64,
+        length: u64,
+        prot: LinuxProtFlags,
+    ) {
         let Some(range) = crate::vfs::GuestMemoryRange::new(
             GuestVa(address),
             GuestVa(address.saturating_add(length)),
@@ -9250,7 +9264,7 @@ impl SyscallDispatcher {
     /// (mincore02/04). Pages outside every post-exec VMA belong to loader-
     /// populated initial regions (ELF text/data, heap, stack, trampolines) and
     /// stay resident, matching the prior conservative default.
-    fn mincore_residency_vector(
+    pub(in crate::dispatch::mem) fn mincore_residency_vector(
         &self,
         memory: &impl CurrentMmMemory,
         address: u64,
@@ -9328,7 +9342,7 @@ impl SyscallDispatcher {
             || mem.alias_vma_ranges.iter().any(overlaps)
     }
 
-    fn mark_range_resident(&self, start: u64, len: u64) {
+    pub(in crate::dispatch::mem) fn mark_range_resident(&self, start: u64, len: u64) {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
@@ -9555,7 +9569,7 @@ impl SyscallDispatcher {
         Ok(())
     }
 
-    fn commit_mmap_locked_range(
+    pub(in crate::dispatch::mem) fn commit_mmap_locked_range(
         &self,
         memory: &mut impl CurrentMmMemory,
         range: Option<crate::vfs::GuestMemoryRange>,
@@ -9569,8 +9583,10 @@ impl SyscallDispatcher {
     }
 
     #[cfg(test)]
-    #[cfg(test)]
-    fn commit_eager_locked_range(&self, range: Option<crate::vfs::GuestMemoryRange>) {
+    pub(in crate::dispatch::mem) fn commit_eager_locked_range(
+        &self,
+        range: Option<crate::vfs::GuestMemoryRange>,
+    ) {
         let Some(range) = range else {
             return;
         };
@@ -9669,7 +9685,7 @@ impl SyscallDispatcher {
         locked_ranges_remove(&mut self.mem().lock().locked_ranges, range);
     }
 
-    fn lock_current_mappings(
+    pub(in crate::dispatch::mem) fn lock_current_mappings(
         &self,
         memory: &mut impl CurrentMmMemory,
         onfault: bool,
@@ -9712,6 +9728,385 @@ impl SyscallDispatcher {
         }
         self.mem().lock().locked_ranges = ranges;
         Ok(())
+    }
+}
+
+macro_rules! forward_mem_handlers {
+    ($( $handler:ident ),* $(,)?) => {
+        impl SyscallDispatcher {
+            $(
+                #[inline]
+                pub(crate) fn $handler<M: CurrentMmMemory>(
+                    &self,
+                    cx: &mut SyscallCtx<M>,
+                ) -> Result<DispatchOutcome, DispatchError> {
+                    self.mem_view().$handler(cx)
+                }
+            )*
+        }
+    };
+}
+
+forward_mem_handlers! {
+    readahead,
+    fadvise64,
+    io_uring_setup,
+    io_uring_enter,
+    io_uring_register,
+    sys_membarrier,
+    userfaultfd,
+}
+
+macro_rules! forward_mem_mutation_handlers {
+    ($( $handler:ident ),* $(,)?) => {
+        impl SyscallDispatcher {
+            $(
+                #[inline]
+                pub(crate) fn $handler<M: CurrentMmMemory>(
+                    &self,
+                    cx: &mut MutationSyscallCtx<M>,
+                ) -> Result<DispatchOutcome, DispatchError> {
+                    self.mem_view().$handler(cx)
+                }
+            )*
+        }
+    };
+}
+
+forward_mem_mutation_handlers! {
+    brk,
+    munmap,
+    mremap,
+    mmap,
+    mprotect,
+    msync,
+    mlock,
+    munlock,
+    mlockall,
+    munlockall,
+    mincore,
+    madvise,
+    remap_file_pages,
+    mlock2,
+}
+
+impl SyscallDispatcher {
+    #[inline]
+    pub(super) fn commit_host_alias_mmap_observed(
+        &self,
+        authority: &super::DispatchMmAuthority,
+        commit: HostAliasMmapCommit,
+    ) {
+        self.mem_view()
+            .commit_host_alias_mmap_observed(authority, commit);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn commit_host_alias_mmap(&self, commit: HostAliasMmapCommit) {
+        self.mem_view().commit_host_alias_mmap(commit);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn update_madvise_vma_policy(
+        &self,
+        start: u64,
+        len: u64,
+        copy_update: Option<carrick_abi::VmaForkCopyPolicy>,
+        child_update: Option<carrick_abi::VmaForkChildPolicy>,
+        dump_update: Option<carrick_abi::VmaDumpPolicy>,
+    ) {
+        self.mem_view().update_madvise_vma_policy(
+            start,
+            len,
+            copy_update,
+            child_update,
+            dump_update,
+        );
+    }
+
+    #[inline]
+    pub fn vma_dump_omitted_for_test(&self, start: u64, len: u64) -> bool {
+        self.mem_view().vma_dump_omitted_for_test(start, len)
+    }
+
+    #[inline]
+    pub(super) fn guest_vma_overlaps(&self, start: u64, len: u64) -> bool {
+        self.mem_view().guest_vma_overlaps(start, len)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn range_touches_secretmem(&self, start: u64, len: u64) -> bool {
+        self.mem_view().range_touches_secretmem(start, len)
+    }
+
+    #[inline]
+    pub(super) fn remove_mapping_metadata(&self, start: u64, len: u64) {
+        self.mem_view().remove_mapping_metadata(start, len);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn memfd_has_writable_shared_map(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+    ) -> bool {
+        self.mem_view().memfd_has_writable_shared_map(description)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn record_dynamic_mapping(
+        &self,
+        start: u64,
+        len: u64,
+        prot: LinuxProtFlags,
+        sharing: ProcMapSharing,
+        path: String,
+    ) {
+        self.mem_view()
+            .record_dynamic_mapping(start, len, prot, sharing, path);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn record_dynamic_mapping_with_file_offset(
+        &self,
+        start: u64,
+        len: u64,
+        prot: LinuxProtFlags,
+        sharing: ProcMapSharing,
+        path: String,
+        semantics: DynamicMappingSemantics,
+    ) {
+        self.mem_view()
+            .record_dynamic_mapping_with_file_offset(start, len, prot, sharing, path, semantics);
+    }
+
+    #[inline]
+    pub(crate) fn mmap_fault_is_sigbus(&self, addr: u64) -> bool {
+        self.mem_view().mmap_fault_is_sigbus(addr)
+    }
+
+    #[inline]
+    pub(crate) fn fault_requires_mm_mutation(&self, addr: u64) -> bool {
+        self.mem_view().fault_requires_mm_mutation(addr)
+    }
+
+    #[inline]
+    pub(crate) fn mmap_growdown_fault_plan<'permit>(
+        &self,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        addr: u64,
+    ) -> Option<MmapGrowdownFaultPlan<'permit>> {
+        self.mem_view().mmap_growdown_fault_plan(permit, addr)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn with_mmap_growdown_fault_plan_for_test<T>(
+        &self,
+        addr: u64,
+        use_plan: impl FnOnce(MmapGrowdownFaultPlan<'_>) -> T,
+    ) -> Option<T> {
+        self.mem_view()
+            .with_mmap_growdown_fault_plan_for_test(addr, use_plan)
+    }
+
+    #[inline]
+    pub(crate) fn commit_mmap_growdown(&self, plan: MmapGrowdownFaultPlan) {
+        self.mem_view().commit_mmap_growdown(plan);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn reset_memory_state_on_execve(&self) {
+        self.mem_view().reset_memory_state_on_execve();
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch) fn next_mmap_address(
+        &self,
+        requested: u64,
+        length: u64,
+        prot: u64,
+        flags: u64,
+        congruence: MmapGrantCongruence,
+    ) -> Option<(u64, bool)> {
+        self.mem_view()
+            .next_mmap_address(requested, length, prot, flags, congruence)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn dynamic_mapping_for_test(&self, start: u64) -> Option<ProcMapsEntry> {
+        self.mem_view().dynamic_mapping_for_test(start)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn range_has_mapping_metadata_for_test(&self, start: u64, len: u64) -> bool {
+        self.mem_view()
+            .range_has_mapping_metadata_for_test(start, len)
+    }
+
+    #[inline]
+    pub(crate) fn resident_fault_plan<'permit>(
+        &self,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        address: u64,
+    ) -> Option<ResidentFaultPlan<'permit>> {
+        self.mem_view().resident_fault_plan(permit, address)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn seed_resident_fault_for_test(&self, page: u64, prot: u64) {
+        self.mem_view().seed_resident_fault_for_test(page, prot);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn with_resident_fault_plan_for_test<T>(
+        &self,
+        page: u64,
+        use_plan: impl FnOnce(ResidentFaultPlan<'_>) -> T,
+    ) -> Option<T> {
+        self.mem_view()
+            .with_resident_fault_plan_for_test(page, use_plan)
+    }
+
+    #[inline]
+    pub(crate) fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
+        self.mem_view().commit_resident_fault(plan);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn address_space_limits_apply(&self, data: bool) -> Option<(u64, u64)> {
+        self.mem_view().address_space_limits_apply(data)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn recover_private_repoint_failure(
+        &self,
+        candidate: u64,
+        failure: carrick_guest_mem::RepointPrivateError,
+    ) -> PrivateRepointRecovery {
+        self.mem_view()
+            .recover_private_repoint_failure(candidate, failure)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn madvise_range_meta(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> MadviseRangeMeta {
+        self.mem_view().madvise_range_meta(start, end)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn mark_range_resident(&self, start: u64, len: u64) {
+        self.mem_view().mark_range_resident(start, len);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn mincore_residency_vector(
+        &self,
+        memory: &impl CurrentMmMemory,
+        address: u64,
+        pages: u64,
+        page_size: u64,
+    ) -> Option<Vec<u8>> {
+        self.mem_view()
+            .mincore_residency_vector(memory, address, pages, page_size)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn range_has_host_alias_backing(
+        &self,
+        start: u64,
+        len: u64,
+    ) -> bool {
+        self.mem_view().range_has_host_alias_backing(start, len)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn record_growdown_mapping(&self, start: u64, len: u64) {
+        self.mem_view().record_growdown_mapping(start, len);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn record_secretmem_map(&self, start: u64, len: u64) {
+        self.mem_view().record_secretmem_map(start, len);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn remove_secretmem_map(&self, start: u64, len: u64) {
+        self.mem_view().remove_secretmem_map(start, len);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn track_resident_fault_range(
+        &self,
+        address: u64,
+        length: u64,
+        prot: LinuxProtFlags,
+    ) {
+        self.mem_view()
+            .track_resident_fault_range(address, length, prot);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn snapshot_private_mmap_file(
+        &self,
+        fd: Fd,
+        offset: u64,
+        length: usize,
+    ) -> Result<PrivateMmapSnapshot, LinuxErrno> {
+        self.mem_view()
+            .snapshot_private_mmap_file(fd, offset, length)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn commit_mmap_locked_range(
+        &self,
+        memory: &mut impl CurrentMmMemory,
+        range: Option<crate::vfs::GuestMemoryRange>,
+    ) -> Result<(), LinuxErrno> {
+        self.mem_view().commit_mmap_locked_range(memory, range)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn commit_eager_locked_range(
+        &self,
+        range: Option<crate::vfs::GuestMemoryRange>,
+    ) {
+        self.mem_view().commit_eager_locked_range(range);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch::mem) fn lock_current_mappings(
+        &self,
+        memory: &mut impl CurrentMmMemory,
+        onfault: bool,
+    ) -> Result<(), LinuxErrno> {
+        self.mem_view().lock_current_mappings(memory, onfault)
     }
 }
 

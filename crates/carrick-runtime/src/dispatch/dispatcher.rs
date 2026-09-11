@@ -1706,12 +1706,261 @@ impl<'a> IpcView<'a> {
     }
 }
 
+/// Cross-subsystem dependencies required by memory operations.
+pub(in crate::dispatch) trait MemCrossSubsystem {
+    fn open_file(&self, fd: i32) -> Option<OpenFile>;
+    fn fd_is_valid(&self, fd: i32) -> bool;
+    fn io_uring_description(&self, fd: i32) -> Option<Arc<crate::kernel::FileDescription>>;
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
+    fn identity_pid(&self) -> u32;
+    fn effective_resource_limit(&self, resource: u64) -> carrick_abi::LinuxRlimit;
+    fn note_sysv_remap_file_pages(
+        &self,
+        addr: u64,
+        end: u64,
+    ) -> Result<bool, carrick_abi::LinuxErrno>;
+    fn begin_host_alias_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit>;
+    fn begin_conditional_vma_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit>;
+    fn mark_vma_dispatch(&self, guard: &mut crate::dispatch::HostAliasDispatchGuard<'_>);
+    fn owns_host_alias_dispatch(&self, guard: &crate::dispatch::HostAliasDispatchGuard<'_>)
+    -> bool;
+    fn io_uring_setup(
+        &self,
+        call: &mut dyn FnMut(&SyscallDispatcher) -> super::DispatchOutcome,
+    ) -> super::DispatchOutcome;
+    fn io_uring_enter(
+        &self,
+        call: &mut dyn FnMut(&SyscallDispatcher) -> super::DispatchOutcome,
+    ) -> super::DispatchOutcome;
+    fn captured_mm(&self) -> Arc<crate::kernel::Mm>;
+}
+
+impl MemCrossSubsystem for SyscallDispatcher {
+    fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.open_file(fd)
+    }
+    fn fd_is_valid(&self, fd: i32) -> bool {
+        self.fd_is_valid(fd)
+    }
+    fn io_uring_description(&self, fd: i32) -> Option<Arc<crate::kernel::FileDescription>> {
+        self.io_uring_description(fd)
+    }
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cred_snapshot()
+    }
+    fn identity_pid(&self) -> u32 {
+        self.identity_pid()
+    }
+    fn effective_resource_limit(&self, resource: u64) -> carrick_abi::LinuxRlimit {
+        self.effective_resource_limit(resource)
+    }
+    fn note_sysv_remap_file_pages(
+        &self,
+        addr: u64,
+        end: u64,
+    ) -> Result<bool, carrick_abi::LinuxErrno> {
+        self.note_sysv_remap_file_pages(addr, end)
+    }
+    fn begin_host_alias_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit> {
+        self.begin_host_alias_dispatch(permit)
+    }
+    fn begin_conditional_vma_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit> {
+        self.begin_conditional_vma_dispatch(permit)
+    }
+    fn mark_vma_dispatch(&self, guard: &mut crate::dispatch::HostAliasDispatchGuard<'_>) {
+        self.mark_vma_dispatch(guard);
+    }
+    fn owns_host_alias_dispatch(
+        &self,
+        guard: &crate::dispatch::HostAliasDispatchGuard<'_>,
+    ) -> bool {
+        self.owns_host_alias_dispatch(guard)
+    }
+    fn io_uring_setup(
+        &self,
+        call: &mut dyn FnMut(&SyscallDispatcher) -> super::DispatchOutcome,
+    ) -> super::DispatchOutcome {
+        call(self)
+    }
+    fn io_uring_enter(
+        &self,
+        call: &mut dyn FnMut(&SyscallDispatcher) -> super::DispatchOutcome,
+    ) -> super::DispatchOutcome {
+        call(self)
+    }
+    fn captured_mm(&self) -> Arc<crate::kernel::Mm> {
+        self.captured_mm()
+    }
+}
+
 /// Subsystem view for memory operations.
-#[allow(dead_code)]
 pub struct MemView<'a> {
     pub(in crate::dispatch) mm_binding: &'a Arc<DispatchMmBinding>,
     pub(in crate::dispatch) page_geometry: crate::page_profile::PageGeometry,
-    pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+    pub(in crate::dispatch) proc: &'a Mutex<proc::ProcState>,
+    pub(in crate::dispatch) fs: &'a fs::FsState,
+    pub(in crate::dispatch) cross: &'a (dyn MemCrossSubsystem + 'a),
+}
+
+impl<'a> MemView<'a> {
+    #[inline]
+    pub(crate) fn mem(&self) -> arc_swap::Guard<Arc<DispatchMmAuthority>> {
+        self.mm_binding.current.load()
+    }
+
+    #[inline]
+    pub(crate) fn mm_authority(&self) -> Arc<DispatchMmAuthority> {
+        self.mm_binding.current.load_full()
+    }
+
+    #[inline]
+    pub(crate) fn linux_page_size(&self) -> u64 {
+        self.page_geometry.linux_page_size
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.cross.open_file(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn fd_is_valid(&self, fd: i32) -> bool {
+        self.cross.fd_is_valid(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn io_uring_description(
+        &self,
+        fd: i32,
+    ) -> Option<Arc<crate::kernel::FileDescription>> {
+        self.cross.io_uring_description(fd)
+    }
+
+    #[inline]
+    pub(super) fn captured_mm(&self) -> Arc<crate::kernel::Mm> {
+        self.cross.captured_mm()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cross.cred_snapshot()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn identity_pid(&self) -> u32 {
+        self.cross.identity_pid()
+    }
+
+    #[inline]
+    pub(super) fn effective_resource_limit(&self, resource: u64) -> carrick_abi::LinuxRlimit {
+        self.cross.effective_resource_limit(resource)
+    }
+
+    #[inline]
+    pub(crate) fn note_sysv_remap_file_pages(
+        &self,
+        addr: u64,
+        end: u64,
+    ) -> Result<bool, carrick_abi::LinuxErrno> {
+        self.cross.note_sysv_remap_file_pages(addr, end)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn begin_host_alias_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit> {
+        self.cross.begin_host_alias_dispatch(permit)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn begin_conditional_vma_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit> {
+        self.cross.begin_conditional_vma_dispatch(permit)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn mark_vma_dispatch(
+        &self,
+        guard: &mut crate::dispatch::HostAliasDispatchGuard<'_>,
+    ) {
+        self.cross.mark_vma_dispatch(guard);
+    }
+
+    #[inline]
+    pub(super) fn owns_host_alias_dispatch(
+        &self,
+        guard: &crate::dispatch::HostAliasDispatchGuard<'_>,
+    ) -> bool {
+        self.cross.owns_host_alias_dispatch(guard)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn mm_mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
+        Arc::clone(&self.mm_authority().mutation_coordinator)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn begin_vma_dispatch<'permit>(
+        &self,
+        permit: &'permit crate::dispatch::mm_mutation::HostAliasPermit<'_>,
+    ) -> crate::dispatch::HostAliasDispatchGuard<'permit> {
+        self.mm_binding.begin_dispatch(permit, true)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn with_vma_dispatch_for_test<T>(
+        &self,
+        use_guard: impl FnOnce(crate::dispatch::HostAliasDispatchGuard<'_>) -> T,
+    ) -> T {
+        mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            use_guard(self.begin_vma_dispatch(permit))
+        })
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn io_uring_setup_impl<M: super::CurrentMmMemory>(
+        &self,
+        memory: &mut M,
+        entries: u32,
+        params_ptr: u64,
+    ) -> super::DispatchOutcome {
+        self.cross.io_uring_setup(&mut |dispatcher| {
+            dispatcher.io_uring_setup_impl(memory, entries, params_ptr)
+        })
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn io_uring_enter_impl<M: super::CurrentMmMemory>(
+        &self,
+        memory: &mut M,
+        fd: i32,
+        to_submit: u32,
+        flags: u32,
+        argp: u64,
+        argsz: u64,
+    ) -> super::DispatchOutcome {
+        self.cross.io_uring_enter(&mut |dispatcher| {
+            dispatcher.io_uring_enter_impl(memory, fd, to_submit, flags, argp, argsz)
+        })
+    }
 }
 
 impl SyscallDispatcher {
@@ -1781,7 +2030,9 @@ impl SyscallDispatcher {
         MemView {
             mm_binding: &self.mm_binding,
             page_geometry: self.page_geometry,
-            kernel_binding: &self.kernel_binding,
+            proc: &self.proc,
+            fs: &self.fs,
+            cross: self,
         }
     }
 }
