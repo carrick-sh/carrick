@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 24,
+  "typed_error_debt_ceiling": 23,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -57,18 +57,6 @@
       "rationale": "An HVPatch dispatcher retained an internal PID without the namespace-local identity captured from its exact live task binding; continuing would expose carrier-global identity through a container-scoped Linux PID surface.",
       "sink": "fatal",
       "domain": "dispatch::pid_identity"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/creds.rs",
-      "function": "SyscallDispatcher::update_fs_umask",
-      "ordinal_in_function": 1,
-      "fingerprint": "db5f386c0cba89ce517c36455fa9213d3b2c637adf127a1eba5a5ed02d034beb",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::credentials",
-      "rationale": "Umask publication failure occurs before guest publication and should unwind as a typed kernel operation error instead of aborting.",
-      "typed_error": "KernelOperationError",
-      "sink": "fatal",
-      "domain": "dispatch::credentials"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
