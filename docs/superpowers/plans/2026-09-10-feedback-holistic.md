@@ -231,3 +231,14 @@ rows, (4) resume the perf2x campaign.
   (the round-1 branch hung one of them for 44 minutes); probe 3/3 alone and
   10/10 under `cargo clippy` load per the worker. Item 1 is complete; a
   full probe gate + CI on main is running to confirm (phase2b logs).
+- Gate after item 1: `fdsemantics` regressed (the statfslifetime reopen
+  copied the inode instead of sharing it, so an O_TRUNC through
+  /proc/self/fd/N was invisible to the original fd); fixed forward in
+  8caf30c2c (shared `FileContents` authority, size read from the bytes).
+  Next full gate: every prior red MATCH; one new load-only red,
+  `setidthreadchurn` (gnu lane, guest SIGSEGV, 0 observations; passes
+  alone 2/2) — root-cause worker dispatched with a load reproduction and
+  a bisect across the day's thread-lifecycle landings.
+- (2) round 1 LANDED (9b3055d11): FsView signal helpers are shared free
+  functions; net and signal route through NetView/SignalView. Round 2
+  (proc, ipc, mem) in flight.
