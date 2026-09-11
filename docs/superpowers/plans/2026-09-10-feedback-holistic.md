@@ -242,3 +242,17 @@ rows, (4) resume the perf2x campaign.
 - (2) round 1 LANDED (9b3055d11): FsView signal helpers are shared free
   functions; net and signal route through NetView/SignalView. Round 2
   (proc, ipc, mem) in flight.
+- `setidthreadchurn` LANDED (66fe4d7af): an exiting thread is retired from
+  the task graph (peer tgkill → ESRCH) BEFORE its child-tid futex wake and
+  runtime withdrawal; glibc's setxid signal could previously land on a
+  stack the guest had already reclaimed (SignalDeliveryFault → SIGSEGV).
+  3/3 alone, 10/10 under load per the worker; deterministic integration
+  test pins the order.
+- (2) COMPLETE (ad248a618): proc, ipc and mem route through ProcView /
+  IpcView / MemView. Landing note: the abort ledger and the dispatch-lock
+  and K1 inventories key rows by qualified function name, so a handler
+  moving from `SyscallDispatcher::x` to `MemView<'a>::x` needs its rows
+  re-keyed (done by fingerprint + ordinal at landing). `too_many_arguments`
+  allows are still 101 — the workers routed handlers but did not use the
+  views to delete the allows; that is a bounded follow-up.
+- (3) dispatched (`typed-error-debt`).
