@@ -196,6 +196,17 @@ impl<'a> FsView<'a> {
             })
     }
 
+    pub(super) fn tty0_console(&self, fd: i32) -> Option<Arc<crate::vfs::VirtualConsole>> {
+        let of = self.open_file(fd)?;
+        let desc = &of.description;
+        match desc.read().as_deref() {
+            Some(crate::dispatch::fd_table::OpenDescription::VirtualConsole {
+                console, ..
+            }) => Some(Arc::clone(console)),
+            _ => None,
+        }
+    }
+
     pub(super) fn fd_is_controlling_tty(
         &self,
         cx_kernel: &crate::kernel::KernelContext,
@@ -282,6 +293,7 @@ impl<'a> FsView<'a> {
             OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 FicloneFs::Pipe
             }
+            OpenDescription::VirtualConsole { .. } => FicloneFs::Dev,
             OpenDescription::HostPipe { pty: None, .. } => FicloneFs::Pipe,
             OpenDescription::HostSocket { .. } | OpenDescription::InMemorySocket { .. } => {
                 FicloneFs::Sock
@@ -473,6 +485,70 @@ impl<'a> FsView<'a> {
                 rosetta_handshake_ioctl(&mut *cx.memory, ioctl_request, arg)
             {
                 return Ok(outcome);
+            }
+
+            // ── /dev/tty0 virtual console ioctls ──────────────────────────────────
+            if let Some(console) = this.tty0_console(fd.0) {
+                return Ok(match ioctl_request {
+                    LINUX_TCGETA | LINUX_TCGETS | LINUX_TCGETS2 => {
+                        let termios = console.get_termios();
+                        if ioctl_request == LINUX_TCGETS2 {
+                            write_termios2(&mut *cx.memory, arg, &termios)
+                        } else if ioctl_request == LINUX_TCGETA {
+                            write_linux_termio(&mut *cx.memory, arg, &termios)
+                        } else {
+                            write_kernel_struct(&mut *cx.memory, arg, &termios)
+                        }
+                    }
+                    LINUX_TCSETS
+                    | LINUX_TCSETSW
+                    | LINUX_TCSETSF
+                    | LINUX_TCSETS2
+                    | LINUX_TCSETSW2
+                    | LINUX_TCSETSF2 => {
+                        let want = if matches!(
+                            ioctl_request,
+                            LINUX_TCSETS2 | LINUX_TCSETSW2 | LINUX_TCSETSF2
+                        ) {
+                            LINUX_TERMIOS2_SIZE
+                        } else {
+                            LINUX_TERMIOS_KERNEL_SIZE
+                        };
+                        match cx.memory.read_bytes(arg, want) {
+                            Ok(bytes) => {
+                                let mut padded = [0u8; core::mem::size_of::<LinuxTermios>()];
+                                padded[..want].copy_from_slice(&bytes);
+                                match LinuxTermios::read_from_bytes(&padded) {
+                                    Ok(t) => {
+                                        console.set_termios(t);
+                                        DispatchOutcome::Returned { value: 0 }
+                                    }
+                                    Err(_) => DispatchOutcome::errno(LINUX_EINVAL),
+                                }
+                            }
+                            Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
+                        }
+                    }
+                    LINUX_TIOCGWINSZ => {
+                        let winsize = console.get_winsize();
+                        write_kernel_struct(&mut *cx.memory, arg, &winsize)
+                    }
+                    LINUX_TIOCSWINSZ => match cx.memory.read_bytes(arg, 8) {
+                        Ok(b) => match LinuxWinsize::read_from_bytes(&b) {
+                            Ok(ws) => {
+                                console.set_winsize(ws);
+                                DispatchOutcome::Returned { value: 0 }
+                            }
+                            Err(_) => DispatchOutcome::errno(LINUX_EINVAL),
+                        },
+                        Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
+                    },
+                    _ => {
+                        cx.reporter
+                            .record(CompatEvent::unhandled_ioctl(fd.0, ioctl_request, arg));
+                        DispatchOutcome::errno(LINUX_ENOTTY)
+                    }
+                });
             }
 
             // ── PTY ioctls ────────────────────────────────────────────────────────

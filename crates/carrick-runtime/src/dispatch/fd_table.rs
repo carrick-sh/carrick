@@ -1067,6 +1067,10 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         kind: crate::vfs::SyntheticDeviceKind,
     },
+    VirtualConsole {
+        base: OpenDescriptionBase,
+        console: Arc<crate::vfs::VirtualConsole>,
+    },
     EventFd {
         base: OpenDescriptionBase,
         state: Arc<EventFdState>,
@@ -1514,6 +1518,7 @@ impl OpenDescription {
             Self::BpfMap { .. } => "bpf_map",
             Self::BpfProg { .. } => "bpf_prog",
             Self::InMemorySocket { .. } => "in_memory_socket",
+            Self::VirtualConsole { .. } => "virtual_console",
         }
     }
 
@@ -1527,6 +1532,7 @@ impl OpenDescription {
             | OpenDescription::SyntheticFile { path, .. }
             | OpenDescription::InMemoryFile { path, .. } => Some(path.as_str()),
             OpenDescription::SyntheticDevice { kind, .. } => Some(kind.as_str()),
+            OpenDescription::VirtualConsole { .. } => Some("/dev/tty0"),
             // A host-fd-backed regular file (e.g. `--fs host`) carries the guest
             // path it was opened at in its metadata — surface it so
             // readlink(/proc/self/fd/N) and fexecve (execveat AT_EMPTY_PATH)
@@ -1552,6 +1558,7 @@ impl OpenDescription {
             | OpenDescription::SyntheticFile { .. }
             | OpenDescription::InMemoryFile { .. }
             | OpenDescription::SyntheticDevice { .. }
+            | OpenDescription::VirtualConsole { .. }
             | OpenDescription::HostFile { .. } => return None,
             OpenDescription::EventFd { .. } => "anon_inode:[eventfd]".to_owned(),
             OpenDescription::TimerFd { .. } => "anon_inode:[timerfd]".to_owned(),
@@ -1694,7 +1701,9 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. } => Kind::File,
             OpenDescription::Directory { .. } => Kind::Directory,
             OpenDescription::SyntheticFile { .. } => Kind::SyntheticFile,
-            OpenDescription::SyntheticDevice { .. } => Kind::SyntheticDevice,
+            OpenDescription::SyntheticDevice { .. } | OpenDescription::VirtualConsole { .. } => {
+                Kind::SyntheticDevice
+            }
             OpenDescription::EventFd { .. } => Kind::EventFd,
             OpenDescription::TimerFd { .. } => Kind::TimerFd,
             OpenDescription::Epoll { .. } => Kind::Epoll,
@@ -1736,6 +1745,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             | OpenDescription::SyntheticFile { path, .. }
             | OpenDescription::InMemoryFile { path, .. } => Some(path.clone()),
             OpenDescription::SyntheticDevice { kind, .. } => Some(kind.as_str().to_string()),
+            OpenDescription::VirtualConsole { .. } => Some("/dev/tty0".to_string()),
             OpenDescription::HostFile { metadata, .. } => {
                 Some(metadata.path.to_string_lossy().into_owned())
             }
@@ -1784,7 +1794,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::File { .. }
             | OpenDescription::InMemoryFile { .. }
             | OpenDescription::SyntheticFile { .. } => interest & LinuxEpollEvents::IN,
-            OpenDescription::SyntheticDevice { .. } => {
+            OpenDescription::SyntheticDevice { .. } | OpenDescription::VirtualConsole { .. } => {
                 interest & (LinuxEpollEvents::IN | LinuxEpollEvents::OUT)
             }
             OpenDescription::HostFile { .. } => {
@@ -2585,6 +2595,11 @@ impl OpenDescription {
             OpenDescription::SyntheticDevice { kind, .. } => {
                 let mut record = StatRecord::synthetic(kind.as_str(), 0, LINUX_S_IFCHR | 0o666);
                 record.rdev = kind.rdev();
+                OpenStatSource::Record(record)
+            }
+            OpenDescription::VirtualConsole { .. } => {
+                let mut record = StatRecord::synthetic("/dev/tty0", 0, LINUX_S_IFCHR | 0o666);
+                record.rdev = 4 << 8;
                 OpenStatSource::Record(record)
             }
             OpenDescription::EventFd { .. } => {

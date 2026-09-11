@@ -8405,3 +8405,120 @@ fn fs_view_direct_construction_and_operations() {
     );
     assert!(!view.fd_table_contains(new_fd3));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn tty0_two_opens_share_termios_and_winsize() {
+    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    // Open /dev/tty0 twice
+    let fd1 = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/dev/tty0",
+        LINUX_O_RDWR,
+    );
+    assert!(fd1 >= 0, "first open of /dev/tty0 should succeed: {fd1}");
+
+    let fd2 = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/dev/tty0",
+        LINUX_O_RDWR,
+    );
+    assert!(fd2 >= 0, "second open of /dev/tty0 should succeed: {fd2}");
+    assert_ne!(fd1, fd2, "independent opens should yield different fds");
+
+    // Check fstat reports character device with major 4 minor 0
+    let stat_buf = [0u8; core::mem::size_of::<carrick_abi::LinuxStat>()];
+    memory.write_bytes(0x5000, &stat_buf).unwrap();
+    let fstat_rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        80, // fstat
+        [fd1 as u64, 0x5000, 0, 0, 0, 0],
+    );
+    assert_eq!(fstat_rc, 0);
+    let stat = carrick_abi::LinuxStat::read_from_bytes(
+        &memory.read_bytes(0x5000, stat_buf.len()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        stat.st_mode & carrick_abi::LINUX_S_IFMT,
+        carrick_abi::LINUX_S_IFCHR
+    );
+    let rdev = stat.st_rdev;
+    assert_eq!(rdev, 4 << 8);
+
+    // Write a customized termios struct to memory at 0x6000
+    let mut custom = carrick_abi::LinuxTermios::default_cooked();
+    custom.c_iflag = 0x1234_5678;
+    custom.c_oflag = 0x8765_4321;
+    let custom_bytes = zerocopy::IntoBytes::as_bytes(&custom);
+    memory.write_bytes(0x6000, custom_bytes).unwrap();
+
+    // TCSETS via fd1
+    let set_rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        29, // ioctl
+        [fd1 as u64, carrick_abi::LINUX_TCSETS, 0x6000, 0, 0, 0],
+    );
+    assert_eq!(set_rc, 0, "TCSETS via fd1 should return 0");
+
+    // TCGETS via fd2 into 0x7000
+    let get_rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        29, // ioctl
+        [fd2 as u64, carrick_abi::LINUX_TCGETS, 0x7000, 0, 0, 0],
+    );
+    assert_eq!(get_rc, 0, "TCGETS via fd2 should return 0");
+
+    let read_termios = carrick_abi::LinuxTermios::read_from_bytes(
+        &memory
+            .read_bytes(0x7000, core::mem::size_of::<carrick_abi::LinuxTermios>())
+            .unwrap(),
+    )
+    .unwrap();
+    let (iflag, oflag) = (read_termios.c_iflag, read_termios.c_oflag);
+    assert_eq!(iflag, 0x1234_5678, "fd2 should observe termios set by fd1");
+    assert_eq!(oflag, 0x8765_4321, "fd2 should observe termios set by fd1");
+
+    // TIOCSWINSZ via fd1 into 0x8000
+    let mut custom_ws = carrick_abi::LinuxWinsize::terminal_80x24();
+    custom_ws.ws_row = 50;
+    custom_ws.ws_col = 132;
+    let ws_bytes = zerocopy::IntoBytes::as_bytes(&custom_ws);
+    memory.write_bytes(0x8000, ws_bytes).unwrap();
+
+    let set_ws_rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        29, // ioctl
+        [fd1 as u64, carrick_abi::LINUX_TIOCSWINSZ, 0x8000, 0, 0, 0],
+    );
+    assert_eq!(set_ws_rc, 0, "TIOCSWINSZ via fd1 should return 0");
+
+    // TIOCGWINSZ via fd2 into 0x9000
+    let get_ws_rc = lane_syscall(
+        &mut dispatcher,
+        &mut memory,
+        29, // ioctl
+        [fd2 as u64, carrick_abi::LINUX_TIOCGWINSZ, 0x9000, 0, 0, 0],
+    );
+    assert_eq!(get_ws_rc, 0, "TIOCGWINSZ via fd2 should return 0");
+
+    let read_ws = carrick_abi::LinuxWinsize::read_from_bytes(
+        &memory
+            .read_bytes(0x9000, core::mem::size_of::<carrick_abi::LinuxWinsize>())
+            .unwrap(),
+    )
+    .unwrap();
+    let (ws_row, ws_col) = (read_ws.ws_row, read_ws.ws_col);
+    assert_eq!(ws_row, 50, "fd2 should observe winsize set by fd1");
+    assert_eq!(ws_col, 132, "fd2 should observe winsize set by fd1");
+}

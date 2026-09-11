@@ -1473,6 +1473,7 @@ pub enum VfsHandleKind {
     Pty,
     Directory,
     InMemoryFile,
+    VirtualConsole,
 }
 
 impl From<&VfsHandle> for VfsHandleKind {
@@ -1484,6 +1485,7 @@ impl From<&VfsHandle> for VfsHandleKind {
             VfsHandle::Pty { .. } => Self::Pty,
             VfsHandle::Directory { .. } => Self::Directory,
             VfsHandle::InMemoryFile { .. } => Self::InMemoryFile,
+            VfsHandle::VirtualConsole { .. } => Self::VirtualConsole,
         }
     }
 }

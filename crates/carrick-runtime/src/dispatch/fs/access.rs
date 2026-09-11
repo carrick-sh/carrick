@@ -569,6 +569,7 @@ impl<'a> FsView<'a> {
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
             | OpenDescription::SyntheticDevice { .. }
+            | OpenDescription::VirtualConsole { .. }
             | OpenDescription::Netlink { .. }
             | OpenDescription::InMemorySocket { .. }
             | OpenDescription::Packet { .. } => synthetic_readonly_access(mode),
