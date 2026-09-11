@@ -659,7 +659,7 @@
       "domain": "dispatch::mm_exec_commit"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
       "function": "SyscallDispatcher::bind_hvpatch_process",
       "ordinal_in_function": 1,
       "fingerprint": "30945dc9120382d67851b68c0f55f4273fb85dfe7da40b17fd2b1487cb5ccac2",
@@ -670,7 +670,7 @@
       "domain": "dispatch::hvpatch_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
       "function": "SyscallDispatcher::bind_hvpatch_process",
       "ordinal_in_function": 2,
       "fingerprint": "7339858a121b1fe9d5102dcf64ebbc7b7c04cd8a2b7f4c27205e20e159793a02",
@@ -681,7 +681,7 @@
       "domain": "dispatch::hvpatch_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
       "function": "SyscallDispatcher::bind_hvpatch_process_exact",
       "ordinal_in_function": 1,
       "fingerprint": "ea1da6cb52668d771ea77d1e6540644c3d58a1655c28c65677a3cf87ffd2182f",
@@ -840,7 +840,7 @@
       "domain": "dispatch::mm_executor_reentry"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
       "function": "bootstrap_one_task_binding",
       "ordinal_in_function": 1,
       "fingerprint": "3239ded76804a37de5ef832a91b27e4a139de9d42720bdb72a57eac4428df889",
@@ -852,7 +852,7 @@
       "domain": "dispatch::bootstrap"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
       "function": "bootstrap_one_task_binding",
       "ordinal_in_function": 2,
       "fingerprint": "010a47e7eebe05f879084d50e4eb83411e27b066d92625a9244c34403e5759fc",

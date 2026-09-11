@@ -1841,6 +1841,39 @@
       "migration_family": "lifecycle"
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "line": 671,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".write_fd_open_paths()",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "one_task_rebind_copies_complete_credential_values",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "line": 714,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".read_open_files()",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "one_task_rebind_copies_complete_credential_values",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "line": 722,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".read_fd_open_paths()",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "one_task_rebind_copies_complete_credential_values",
+      "migration_family": "inspect_misc"
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "line": 4656,
       "categories": [
@@ -2030,40 +2063,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2125,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".write_fd_open_paths()",
-      "scope_kind": "test_or_definition",
-      "enclosing_function": "one_task_rebind_copies_complete_credential_values",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2168,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".read_open_files()",
-      "scope_kind": "test_or_definition",
-      "enclosing_function": "one_task_rebind_copies_complete_credential_values",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2176,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".read_fd_open_paths()",
-      "scope_kind": "test_or_definition",
-      "enclosing_function": "one_task_rebind_copies_complete_credential_values",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3950,
+      "line": 3030,
       "categories": [
         "table_guard"
       ],
@@ -2074,7 +2074,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4575,
+      "line": 3655,
       "categories": [
         "description_guard"
       ],
@@ -2085,7 +2085,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4603,
+      "line": 3683,
       "categories": [
         "description_guard"
       ],
@@ -2096,7 +2096,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4676,
+      "line": 3756,
       "categories": [
         "description_guard"
       ],
