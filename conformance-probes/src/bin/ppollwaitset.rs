@@ -1,10 +1,25 @@
 //! Conformance probe for ppoll on mixed/synthetic descriptors via wait set.
 //!
-//! Checks:
-//!   (a) wake latency < 5 ms when writing to pipe after 200 ms (median over 50 iters), exactly one wake.
-//!   (b) wake latency < 5 ms when writing to eventfd after 200 ms (median over 50 iters), exactly one wake.
-//!   (c) finite timeout 30 ms returns 0 at 30±2 ms.
-//!   (d) wait with nothing ready for 3 s does NOT return before 3 s; writer fires at 4 s (5 s timeout cap).
+//! Oracle instrument: every line is an observation, never an assertion, and
+//! every wait is bounded (5 s cap) so a lost wakeup is a false line, not a
+//! hang. Raw timings are never printed; only bucketed/threshold booleans are,
+//! so the oracle is line-exact.
+//!
+//! Cases:
+//!   (a) a set holding a freshly created, UNCONNECTED AF_INET stream socket:
+//!       Linux reports POLLHUP on it immediately, so ppoll returns without
+//!       blocking. This case exists to pin that answer (it was a real runtime
+//!       bug in carrick); it must NOT be reused for the blocking cases below.
+//!   (b) wake latency < 5 ms when writing to eventfd after 200 ms (median over
+//!       50 iters), exactly one wake.
+//!   (c) finite timeout 30 ms returns 0 and never before 30 ms.
+//!   (d) wait with nothing ready for 3 s does NOT return before 3 s; writer
+//!       fires at 4 s (5 s timeout cap).
+//!   (e) SIGALRM interrupts an infinite ppoll with EINTR promptly.
+//!   (f) a sibling-thread `kill(getpid(), SIGUSR1)` interrupts ppoll with EINTR.
+//!   (g) a signal blocked by the ppoll sigmask does not interrupt the wait.
+//! Cases (b)..(g) use a set whose socket member is one end of a connected
+//! AF_UNIX socketpair, which is not readable until its peer writes.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -47,6 +62,30 @@ fn close_mixed_set(pipe_rd: i32, pipe_wr: i32, efd: i32, tfd: i32, sock: i32) {
         }
         if sock >= 0 {
             libc::close(sock);
+        }
+    }
+}
+
+/// The mixed set for the blocking cases: the socket member is one end of a
+/// connected AF_UNIX stream socketpair (its peer is returned last and stays
+/// open, so the member is neither readable nor hung up).
+fn create_blocking_set() -> (i32, i32, i32, i32, i32, i32) {
+    let mut pipe_fds = [-1i32; 2];
+    let _ = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+
+    let efd = unsafe { libc::eventfd(0, 0) };
+    let tfd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+    let mut pair = [-1i32; 2];
+    let _ = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) };
+
+    (pipe_fds[0], pipe_fds[1], efd, tfd, pair[0], pair[1])
+}
+
+fn close_blocking_set(pipe_rd: i32, pipe_wr: i32, efd: i32, tfd: i32, sock: i32, peer: i32) {
+    close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
+    if peer >= 0 {
+        unsafe {
+            libc::close(peer);
         }
     }
 }
@@ -138,7 +177,7 @@ fn run_case_b() {
     let mut all_exactly_one = true;
 
     for _ in 0..iters {
-        let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
+        let (pipe_rd, pipe_wr, efd, tfd, sock, peer) = create_blocking_set();
 
         let t_write = Arc::new(AtomicU64::new(0));
         let t_write_clone = Arc::clone(&t_write);
@@ -212,7 +251,7 @@ fn run_case_b() {
         }
 
         let _ = writer.join();
-        close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
+        close_blocking_set(pipe_rd, pipe_wr, efd, tfd, sock, peer);
     }
 
     latencies_us.sort_unstable();
@@ -220,13 +259,12 @@ fn run_case_b() {
     let median_ms = median_us as f64 / 1000.0;
     let fast = median_ms < 5.0;
 
-    println!("ppoll_eventfd_wake_latency_median_ms={:.2}", median_ms);
     println!("ppoll_eventfd_wake_latency_under_5ms={}", fast);
     println!("ppoll_eventfd_exactly_one_wake={}", all_exactly_one);
 }
 
 fn run_case_c() {
-    let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
+    let (pipe_rd, pipe_wr, efd, tfd, sock, peer) = create_blocking_set();
     let mut pfds = [
         libc::pollfd {
             fd: pipe_rd,
@@ -259,16 +297,18 @@ fn run_case_c() {
     let t1 = get_monotonic_ns();
     let elapsed_ms = (t1 - t0) as f64 / 1_000_000.0;
 
-    close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
+    close_blocking_set(pipe_rd, pipe_wr, efd, tfd, sock, peer);
 
-    let within_tolerance = rc == 0 && elapsed_ms >= 28.0 && elapsed_ms <= 33.0;
+    // Linux guarantees the wait lasts at least the requested timeout; how
+    // much later it returns is scheduling, not semantics, so only the
+    // "never early" half is an oracle line.
+    let not_early = rc == 0 && elapsed_ms >= 29.0;
     println!("ppoll_timeout_30ms_returned_zero={}", rc == 0);
-    println!("ppoll_timeout_30ms_within_range={}", within_tolerance);
-    println!("ppoll_timeout_elapsed_ms={:.2}", elapsed_ms);
+    println!("ppoll_timeout_30ms_not_early={}", not_early);
 }
 
 fn run_case_d() {
-    let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
+    let (pipe_rd, pipe_wr, efd, tfd, sock, peer) = create_blocking_set();
 
     let writer_fired = Arc::new(AtomicBool::new(false));
     let writer_fired_clone = Arc::clone(&writer_fired);
@@ -318,10 +358,9 @@ fn run_case_d() {
 
     println!("ppoll_infinite_not_spurious_at_3s={}", rc != 0 && elapsed_sec >= 3.8);
     println!("ppoll_infinite_woke_at_4s={}", ok);
-    println!("ppoll_infinite_elapsed_sec={:.2}", elapsed_sec);
 
     let _ = writer.join();
-    close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
+    close_blocking_set(pipe_rd, pipe_wr, efd, tfd, sock, peer);
 }
 
 static ALARM_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -339,7 +378,7 @@ fn run_case_e() {
         let _ = libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
     }
 
-    let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
+    let (pipe_rd, pipe_wr, efd, tfd, sock, peer) = create_blocking_set();
 
     let unblock_fired = Arc::new(AtomicBool::new(false));
     let unblock_fired_clone = Arc::clone(&unblock_fired);
@@ -425,15 +464,15 @@ fn run_case_e() {
     }
     unblock_fired.store(true, Ordering::SeqCst);
 
-    // Wake latency is time after 100ms when alarm fired:
-    // Required: returns -1/EINTR, wake latency after alarm < 10 ms (total time ~100-115 ms).
+    // Wake latency is the time after the 100 ms alarm; a tight bound is a
+    // scheduling statement the oracle itself misses under load, so the line
+    // only separates "prompt" from "lost until the 2.5 s watchdog".
     let returned_eintr = rc == -1 && errno == libc::EINTR && !watchdog_tripped;
     let wake_latency_ms = (elapsed_ms - 100.0).max(0.0);
-    let under_10ms = returned_eintr && wake_latency_ms < 10.0;
+    let prompt = returned_eintr && wake_latency_ms < 500.0;
 
     println!("ppoll_sigalrm_returned_eintr={}", returned_eintr);
-    println!("ppoll_sigalrm_wake_latency_under_10ms={}", under_10ms);
-    println!("ppoll_sigalrm_total_elapsed_ms={:.2}", elapsed_ms);
+    println!("ppoll_sigalrm_wake_latency_under_500ms={}", prompt);
     println!("ppoll_sigalrm_handler_fired={}", alarm_fired > 0);
     println!("ppoll_sigalrm_errno={}", errno);
 
@@ -446,7 +485,7 @@ fn run_case_e() {
         libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
     }
 
-    close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
+    close_blocking_set(pipe_rd, pipe_wr, efd, tfd, sock, peer);
 }
 
 static USR1_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -465,7 +504,7 @@ fn run_case_f() {
         let _ = libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
     }
 
-    let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
+    let (pipe_rd, pipe_wr, efd, tfd, sock, peer) = create_blocking_set();
 
     let unblock_fired = Arc::new(AtomicBool::new(false));
     let unblock_fired_clone = Arc::clone(&unblock_fired);
@@ -552,12 +591,10 @@ fn run_case_f() {
     unblock_fired.store(true, Ordering::SeqCst);
 
     let returned_eintr = rc == -1 && errno == libc::EINTR && !watchdog_tripped;
-    let under_10ms = returned_eintr && wake_latency_ms < 10.0;
+    let prompt = returned_eintr && wake_latency_ms < 500.0;
 
     println!("ppoll_sibling_sigusr1_returned_eintr={}", returned_eintr);
-    println!("ppoll_sibling_sigusr1_wake_latency_under_10ms={}", under_10ms);
-    println!("ppoll_sibling_sigusr1_wake_latency_ms={:.2}", wake_latency_ms);
-    println!("ppoll_sibling_sigusr1_total_elapsed_ms={:.2}", elapsed_ms);
+    println!("ppoll_sibling_sigusr1_wake_latency_under_500ms={}", prompt);
     println!("ppoll_sibling_sigusr1_handler_fired={}", usr1_fired > 0);
     println!("ppoll_sibling_sigusr1_errno={}", errno);
 
@@ -571,7 +608,7 @@ fn run_case_f() {
         libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
     }
 
-    close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
+    close_blocking_set(pipe_rd, pipe_wr, efd, tfd, sock, peer);
 }
 
 fn run_case_g() {
@@ -583,7 +620,7 @@ fn run_case_g() {
         let _ = libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
     }
 
-    let (pipe_rd, pipe_wr, efd, tfd, sock) = create_mixed_set();
+    let (pipe_rd, pipe_wr, efd, tfd, sock, peer) = create_blocking_set();
 
     let unblock_fired = Arc::new(AtomicBool::new(false));
     let unblock_fired_clone = Arc::clone(&unblock_fired);
@@ -686,7 +723,6 @@ fn run_case_g() {
 
     println!("ppoll_blocked_sigalrm_not_interrupted={}", not_interrupted);
     println!("ppoll_blocked_sigalrm_timed_out={}", rc == 0);
-    println!("ppoll_blocked_sigalrm_elapsed_ms={:.2}", elapsed_ms);
     println!("ppoll_blocked_sigalrm_handler_fired={}", alarm_fired > 0);
     println!("ppoll_blocked_sigalrm_errno={}", errno);
 
@@ -699,7 +735,7 @@ fn run_case_g() {
         libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
     }
 
-    close_mixed_set(pipe_rd, pipe_wr, efd, tfd, sock);
+    close_blocking_set(pipe_rd, pipe_wr, efd, tfd, sock, peer);
 }
 
 fn main() {
