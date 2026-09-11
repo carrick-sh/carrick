@@ -14041,18 +14041,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:5225 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:5230 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 223367,
-      "byte_start": 223342,
+      "byte_end": 223588,
+      "byte_start": 223563,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 5225,
-      "line_end": 5225,
-      "line_start": 5225
+      "line": 5230,
+      "line_end": 5230,
+      "line_start": 5230
     }
   },
   {

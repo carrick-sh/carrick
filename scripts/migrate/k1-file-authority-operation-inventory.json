@@ -17868,7 +17868,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 6135,
+      "line": 6140,
       "categories": [
         "mapping"
       ],
@@ -17877,7 +17877,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 6193,
+      "line": 6198,
       "categories": [
         "mapping"
       ],
@@ -17886,7 +17886,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 6385,
+      "line": 6390,
       "categories": [
         "mapping"
       ],
@@ -17895,7 +17895,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 6388,
+      "line": 6393,
       "categories": [
         "mapping"
       ],
@@ -17904,7 +17904,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 6395,
+      "line": 6400,
       "categories": [
         "mapping"
       ],
@@ -17913,7 +17913,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 6399,
+      "line": 6404,
       "categories": [
         "mapping"
       ],
@@ -17922,7 +17922,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 6413,
+      "line": 6418,
       "categories": [
         "mapping"
       ],
@@ -17931,7 +17931,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 7879,
+      "line": 7753,
       "categories": [
         "mapping"
       ],
@@ -17940,7 +17940,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 7887,
+      "line": 7761,
       "categories": [
         "mapping"
       ],
@@ -17949,7 +17949,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 7903,
+      "line": 7777,
       "categories": [
         "mapping"
       ],
@@ -17958,7 +17958,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9839,
+      "line": 9714,
       "categories": [
         "mapping"
       ],
@@ -17967,7 +17967,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9841,
+      "line": 9716,
       "categories": [
         "mapping"
       ],
@@ -17976,7 +17976,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9849,
+      "line": 9724,
       "categories": [
         "mapping"
       ],
@@ -17985,7 +17985,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9861,
+      "line": 9736,
       "categories": [
         "mapping"
       ],
@@ -17994,7 +17994,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9865,
+      "line": 9740,
       "categories": [
         "mapping"
       ],
@@ -18003,7 +18003,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9868,
+      "line": 9743,
       "categories": [
         "mapping"
       ],
