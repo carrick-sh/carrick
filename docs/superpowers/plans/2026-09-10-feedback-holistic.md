@@ -162,3 +162,9 @@ from sibling branches.
   an open defect class (it was root-caused once already on 2026-09-08,
   cea7eecad), not a campaign regression. Not excused; recorded for the
   next fix cycle.
+- 2026-09-11 wave 3 round 5 LANDED: dispatch/net.rs 8,905 → 2,975 and
+  dispatch/mod.rs → 3,081 (9a04404c9). Every god file from feedback item 1
+  is now at or below its brief target except dispatch/mod.rs (3.1K vs
+  2K, the remaining lines are `mod` declarations and re-exports). `just ci`
+  green on main (ci-wave3f). Remaining: T16 dispatcher subsystem views
+  (FsView landed in review), then the final probe run.
