@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "vcpu-loop.json",
-  "typed_error_debt_ceiling": 3,
+  "typed_error_debt_ceiling": 0,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
@@ -13,42 +13,6 @@
       "rationale": "Atomic generation counter overflow would cause ID collision and misroute asynchronous continuation wake tokens across carrier threads.",
       "sink": "fatal",
       "domain": "vcpu_loop::continuation_identity"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "function": "make_control_pipe",
-      "ordinal_in_function": 1,
-      "fingerprint": "d422b9046b58569d8c99fb4f05bdbe6e2e6abc41e995c2e388fec6621c454884",
-      "verdict": "typed_error_debt",
-      "failure_domain": "vcpu_loop::continuation_reactor",
-      "rationale": "Host pipe creation failure when initializing the wait reactor should return a typed RuntimeError from service startup instead of aborting.",
-      "typed_error": "Result<CarrierWaitService, RuntimeError>",
-      "sink": "fatal",
-      "domain": "vcpu_loop::continuation_reactor"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "function": "make_control_pipe",
-      "ordinal_in_function": 2,
-      "fingerprint": "6824c617e61c94bccb41d7a37088648120efec444436c1b0173b02691eb8f3e1",
-      "verdict": "typed_error_debt",
-      "failure_domain": "vcpu_loop::continuation_reactor",
-      "rationale": "Host fcntl configuration failure on reactor control pipe should be returned as a typed initialization error.",
-      "typed_error": "Result<CarrierWaitService, RuntimeError>",
-      "sink": "fatal",
-      "domain": "vcpu_loop::continuation_reactor"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "function": "CarrierWaitService::new",
-      "ordinal_in_function": 1,
-      "fingerprint": "2261e16546e7e674aad0089570cf1dd9d77f21942039068f6ef2e187f8374368",
-      "verdict": "typed_error_debt",
-      "failure_domain": "vcpu_loop::continuation_reactor",
-      "rationale": "Host thread spawn failure for the carrier wait reactor should return a typed RuntimeError from CarrierWaitService::new.",
-      "typed_error": "Result<CarrierWaitService, RuntimeError>",
-      "sink": "fatal",
-      "domain": "vcpu_loop::continuation_reactor"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
