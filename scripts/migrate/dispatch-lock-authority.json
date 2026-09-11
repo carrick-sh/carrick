@@ -22,7 +22,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/creds.rs::LinuxErrno::identity_pid::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/creds.rs",
-      "line": 384,
+      "line": 380,
       "item": "LinuxErrno::identity_pid",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -247,7 +247,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mem.rs::MemView::mmap::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5255,
+      "line": 5257,
       "item": "MemView::mmap",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -256,7 +256,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::E::close_open_file_and_free_pty::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2066,
+      "line": 2080,
       "item": "E::close_open_file_and_free_pty",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -265,7 +265,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::E::register_controlling_pty::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2279,
+      "line": 2295,
       "item": "E::register_controlling_pty",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -274,7 +274,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::E::initialize_controlling_tty_for::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2284,
+      "line": 2300,
       "item": "E::initialize_controlling_tty_for",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -283,7 +283,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mod.rs::SyntheticProcContext::synthetic_proc_context_observed::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2825,
+      "line": 2847,
       "item": "SyntheticProcContext::synthetic_proc_context_observed",
       "category": "proc",
       "expression": ".proc.lock()",
