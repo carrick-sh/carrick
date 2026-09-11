@@ -1434,11 +1434,8 @@ impl crate::kernel::FileSlot {
         status_flags: u64,
         fd_flags: u64,
     ) -> Self {
-        Self::from_open_description_with_common(
-            description,
-            Arc::new(crate::kernel::DescriptionCommon::new(status_flags)),
-            fd_flags,
-        )
+        let file_desc = kernel_file_description(description, status_flags);
+        Self::new(file_desc, fd_flags)
     }
 
     pub(super) fn from_open_description_with_common(
@@ -1446,16 +1443,13 @@ impl crate::kernel::FileSlot {
         common: Arc<crate::kernel::DescriptionCommon>,
         fd_flags: u64,
     ) -> Self {
-        let file_desc = Arc::new(
-            crate::kernel::FileDescription::concrete_with_common(description, common)
-                .unwrap_or_else(|error| {
-                    tracing::error!(%error, "file-description identity allocation failed");
-                    carrick_fatal!(
-                        "dispatch::fd_table",
-                        "file-description identity allocation failed"
-                    );
-                }),
-        );
+        let file_desc = match crate::kernel::FileDescription::concrete_with_common(
+            Arc::clone(&description),
+            Arc::clone(&common),
+        ) {
+            Ok(file_desc) => Arc::new(file_desc),
+            Err(_) => kernel_file_description(description, common.status_flags()),
+        };
         Self::new(file_desc, fd_flags)
     }
 }

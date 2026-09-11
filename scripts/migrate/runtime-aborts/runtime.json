@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 23,
+  "typed_error_debt_ceiling": 22,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -67,18 +67,6 @@
       "failure_domain": "dispatch::fd_table",
       "rationale": "Closed file description encountered in stat_source represents a normal close observation and should lower to EBADF instead of aborting.",
       "typed_error": "LinuxErrno",
-      "sink": "fatal",
-      "domain": "dispatch::fd_table"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "function": "crate::kernel::FileSlot::from_open_description_with_common",
-      "ordinal_in_function": 1,
-      "fingerprint": "4569c456d49a80c93cc3739f8a747e42484a2f455d980ed2094e026d65b54400",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fd_table",
-      "rationale": "FileSlot identity allocation occurs before publication and should return a typed allocation error instead of aborting.",
-      "typed_error": "KernelOperationError",
       "sink": "fatal",
       "domain": "dispatch::fd_table"
     },
