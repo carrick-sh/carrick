@@ -7520,7 +7520,22 @@ mod scm_rights_tests {
             crate::kernel::KernelOperationError::ParentExited
         ));
     }
+
+    #[test]
+    fn file_slot_from_open_description_with_common_preserves_common() {
+        let state = Arc::new(EventFdState::new(0));
+        let desc = Arc::new(RwLock::new(OpenDescription::EventFd {
+            state,
+            semaphore: false,
+            base: OpenDescriptionBase::new(0),
+        }));
+        let common = Arc::new(crate::kernel::DescriptionCommon::new(0));
+        let slot = crate::kernel::FileSlot::from_open_description_with_common(desc, Arc::clone(&common), 42);
+        assert_eq!(slot.fd_flags, 42);
+        assert!(std::ptr::eq(slot.description.common(), &*common));
+    }
 }
+
 
 
 
