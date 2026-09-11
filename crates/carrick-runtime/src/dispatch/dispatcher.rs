@@ -1210,12 +1210,70 @@ pub struct ProcView<'a> {
     pub(in crate::dispatch) exec_host_fs_fallback: bool,
 }
 
+/// Cross-subsystem capabilities required during signal operations.
+pub(in crate::dispatch) trait SignalCrossSubsystem: Send + Sync {
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
+    fn identity_pid(&self) -> u32;
+    #[cfg(test)]
+    fn capture_one_task_context(
+        &self,
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError>;
+    fn open_file(&self, fd: i32) -> Option<OpenFile>;
+    fn install_fd_with_status_flags(
+        &self,
+        description: super::OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome;
+    fn effective_resource_limit(&self, resource: u64) -> carrick_abi::LinuxRlimit;
+    fn stop_for_ptrace_signal(&self, signum: i32) -> bool;
+    fn request_signal_pump(&self);
+}
+
+impl SignalCrossSubsystem for SyscallDispatcher {
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cred_snapshot()
+    }
+    fn identity_pid(&self) -> u32 {
+        self.identity_pid()
+    }
+    #[cfg(test)]
+    fn capture_one_task_context(
+        &self,
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
+        self.capture_one_task_context()
+    }
+    fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.open_file(fd)
+    }
+    fn install_fd_with_status_flags(
+        &self,
+        description: super::OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome {
+        self.install_fd_with_status_flags(description, status_flags, fd_flags)
+    }
+    fn effective_resource_limit(&self, resource: u64) -> carrick_abi::LinuxRlimit {
+        self.effective_resource_limit(resource)
+    }
+    fn stop_for_ptrace_signal(&self, signum: i32) -> bool {
+        crate::exec_helpers::stop_for_ptrace_signal(self, signum)
+    }
+    fn request_signal_pump(&self) {
+        self.request_signal_pump();
+    }
+}
+
 /// Subsystem view for signal operations.
-#[allow(dead_code)]
 pub struct SignalView<'a> {
+    #[allow(dead_code)]
     pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+    #[allow(dead_code)]
     pub(in crate::dispatch) signal_pump_requested: &'a std::sync::atomic::AtomicBool,
+    #[allow(dead_code)]
     pub(in crate::dispatch) async_signal_wake_owner: AsyncSignalWakeOwner,
+    pub(in crate::dispatch) cross: &'a (dyn SignalCrossSubsystem + 'a),
 }
 
 /// Subsystem view for IPC operations.
@@ -1281,6 +1339,7 @@ impl SyscallDispatcher {
             kernel_binding: &self.kernel_binding,
             signal_pump_requested: &self.signal_pump_requested,
             async_signal_wake_owner: self.async_signal_wake_owner,
+            cross: self,
         }
     }
 

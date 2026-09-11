@@ -174,8 +174,76 @@ pub(super) fn sanitize_signal_mask(mask: SigSet) -> SigSet {
     mask.without(LINUX_SIGKILL).without(LINUX_SIGSTOP)
 }
 
+pub(crate) fn signal_action_entry(
+    context: &crate::kernel::KernelContext,
+    signum: i32,
+) -> Option<LinuxSigaction> {
+    let signal = crate::kernel::LinuxSignal::for_signal_number(signum).ok()?;
+    context.shared().sighand().action_entry(signal)
+}
+
+pub(crate) fn signal_action_static(
+    context: &crate::kernel::KernelContext,
+    signum: i32,
+) -> LinuxSigaction {
+    crate::kernel::LinuxSignal::for_signal_number(signum)
+        .ok()
+        .map(|signal| context.shared().sighand().action(signal))
+        .unwrap_or_else(LinuxSigaction::empty)
+}
+
+pub(crate) fn install_signal_action(
+    context: &crate::kernel::KernelContext,
+    signum: i32,
+    action: LinuxSigaction,
+) {
+    SyscallDispatcher::install_signal_action(context, signum, action);
+}
+
+pub(crate) fn signal_actions(context: &crate::kernel::KernelContext) -> Vec<(i32, LinuxSigaction)> {
+    context
+        .shared()
+        .sighand()
+        .actions()
+        .into_iter()
+        .map(|(signal, action)| (signal.raw(), action))
+        .collect()
+}
+
+pub(crate) fn signal_thread(
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+) -> Option<crate::kernel::ThreadRef> {
+    context.task().thread_by_registry_id(tid)
+}
+
+pub(crate) fn required_signal_thread(
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+) -> crate::kernel::ThreadRef {
+    SyscallDispatcher::required_signal_thread(context, tid)
+}
+
+pub(crate) fn signal_authority_for(
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+) -> crate::kernel::SignalAuthority {
+    crate::kernel::SignalAuthority::new(
+        context.shared().sighand(),
+        context.shared().pending_signals(),
+        Arc::clone(context.task()),
+        required_signal_thread(context, tid),
+    )
+}
+
+pub(crate) fn any_thread_blocks(threads: &[crate::kernel::ThreadRef], signum: i32) -> bool {
+    threads
+        .iter()
+        .any(|thread| thread.signal_state().blocked().contains(signum))
+}
+
 pub(crate) fn signal_is_ignored(context: &crate::kernel::KernelContext, signum: i32) -> bool {
-    SyscallDispatcher::signal_action_entry(context, signum)
+    signal_action_entry(context, signum)
         .is_some_and(|action| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
 }
 
@@ -184,7 +252,7 @@ pub(crate) fn proc_status_signal_masks(
 ) -> (SigSet, SigSet, SigSet) {
     let mut ignored = SigSet::EMPTY;
     let mut caught = SigSet::EMPTY;
-    for (signum, action) in SyscallDispatcher::signal_actions(context) {
+    for (signum, action) in signal_actions(context) {
         if sigmask_bit(signum).is_none() {
             continue;
         }
@@ -206,7 +274,7 @@ pub(crate) fn signal_mask_for(
     context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
 ) -> SigSet {
-    SyscallDispatcher::signal_thread(context, tid)
+    signal_thread(context, tid)
         .map(|thread| thread.signal_state().blocked())
         .unwrap_or(SigSet::EMPTY)
 }
@@ -230,7 +298,7 @@ pub(crate) fn mark_signal_pending(
     let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
         return;
     };
-    let authority = SyscallDispatcher::signal_authority_for(context, tid);
+    let authority = signal_authority_for(context, tid);
     if is_rt_signal(signum) {
         authority.enqueue_thread_realtime(signal, None);
     } else {
@@ -239,94 +307,128 @@ pub(crate) fn mark_signal_pending(
     context.task().wake();
 }
 
-impl SyscallDispatcher {
+pub(crate) fn ctx_tid<M: CurrentMmMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
+    ctx.thread
+        .as_ref()
+        .map(|thread| thread.tid)
+        .unwrap_or_else(|| ctx.kernel.thread().registry_id())
+}
+
+impl<'a> SignalView<'a> {
+    #[inline]
+    pub(in crate::dispatch) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cross.cred_snapshot()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn identity_pid(&self) -> u32 {
+        self.cross.identity_pid()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(in crate::dispatch) fn capture_one_task_context(
+        &self,
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
+        self.cross.capture_one_task_context()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.cross.open_file(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd_with_status_flags(
+        &self,
+        description: super::OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> super::DispatchOutcome {
+        self.cross
+            .install_fd_with_status_flags(description, status_flags, fd_flags)
+    }
+
+    #[inline]
+    pub(crate) fn effective_resource_limit(&self, resource: u64) -> carrick_abi::LinuxRlimit {
+        self.cross.effective_resource_limit(resource)
+    }
+
+    #[inline]
+    pub(crate) fn request_signal_pump(&self) {
+        self.cross.request_signal_pump();
+    }
+
     #[cfg(test)]
     pub(crate) fn exact_signal_context_for_test(&self) -> crate::kernel::KernelContext {
         self.capture_one_task_context()
             .expect("capture exact test signal context")
     }
 
-    fn signal_action_entry(
+    #[inline]
+    pub(crate) fn signal_action_entry(
         context: &crate::kernel::KernelContext,
         signum: i32,
     ) -> Option<LinuxSigaction> {
-        let signal = crate::kernel::LinuxSignal::for_signal_number(signum).ok()?;
-        context.shared().sighand().action_entry(signal)
+        signal_action_entry(context, signum)
     }
 
-    fn signal_action_static(context: &crate::kernel::KernelContext, signum: i32) -> LinuxSigaction {
-        crate::kernel::LinuxSignal::for_signal_number(signum)
-            .ok()
-            .map(|signal| context.shared().sighand().action(signal))
-            .unwrap_or_else(LinuxSigaction::empty)
+    #[inline]
+    pub(crate) fn signal_action_static(
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+    ) -> LinuxSigaction {
+        signal_action_static(context, signum)
     }
 
-    fn install_signal_action(
+    #[inline]
+    pub(crate) fn install_signal_action(
         context: &crate::kernel::KernelContext,
         signum: i32,
         action: LinuxSigaction,
     ) {
-        let signal =
-            crate::kernel::LinuxSignal::for_signal_number(signum).unwrap_or_else(|error| {
-                tracing::error!(%error, signum, "invalid signal reached Kernel Sighand install");
-                carrick_fatal!(
-                    "dispatch::signal_disposition",
-                    "invalid signal reached Kernel Sighand install"
-                );
-            });
-        context.shared().sighand().install_action(signal, action);
+        install_signal_action(context, signum, action);
     }
 
-    fn signal_actions(context: &crate::kernel::KernelContext) -> Vec<(i32, LinuxSigaction)> {
-        context
-            .shared()
-            .sighand()
-            .actions()
-            .into_iter()
-            .map(|(signal, action)| (signal.raw(), action))
-            .collect()
+    #[inline]
+    pub(crate) fn signal_actions(
+        context: &crate::kernel::KernelContext,
+    ) -> Vec<(i32, LinuxSigaction)> {
+        signal_actions(context)
     }
 
-    fn signal_thread(
+    #[inline]
+    pub(crate) fn signal_thread(
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
     ) -> Option<crate::kernel::ThreadRef> {
-        context.task().thread_by_registry_id(tid)
+        signal_thread(context, tid)
     }
 
-    fn required_signal_thread(
+    #[inline]
+    pub(crate) fn required_signal_thread(
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
     ) -> crate::kernel::ThreadRef {
-        Self::signal_thread(context, tid).unwrap_or_else(|| {
-            tracing::error!(
-                ?tid,
-                task = ?context.task().key(),
-                "signal operation escaped its captured KernelContext"
-            );
-            carrick_fatal!(
-                "dispatch::signal_authority",
-                "signal operation escaped its captured KernelContext"
-            );
-        })
+        required_signal_thread(context, tid)
     }
 
-    fn signal_authority_for(
+    #[inline]
+    pub(crate) fn signal_authority_for(
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
     ) -> crate::kernel::SignalAuthority {
-        crate::kernel::SignalAuthority::new(
-            context.shared().sighand(),
-            context.shared().pending_signals(),
-            Arc::clone(context.task()),
-            Self::required_signal_thread(context, tid),
-        )
+        signal_authority_for(context, tid)
     }
 
-    fn any_thread_blocks(threads: &[crate::kernel::ThreadRef], signum: i32) -> bool {
-        threads
-            .iter()
-            .any(|thread| thread.signal_state().blocked().contains(signum))
+    #[inline]
+    pub(crate) fn any_thread_blocks(threads: &[crate::kernel::ThreadRef], signum: i32) -> bool {
+        any_thread_blocks(threads, signum)
+    }
+
+    #[inline]
+    pub(crate) fn stop_for_ptrace_signal(&self, signum: i32) -> bool {
+        self.cross.stop_for_ptrace_signal(signum)
     }
 
     /// Look up the currently-installed handler from the exact captured Sighand.
@@ -1141,7 +1243,7 @@ impl SyscallDispatcher {
             return DispatchOutcome::Returned { value: 0 };
         }
         let s = signum as i32;
-        if crate::exec_helpers::stop_for_ptrace_signal(self, s) {
+        if self.stop_for_ptrace_signal(s) {
             return DispatchOutcome::Returned { value: 0 };
         }
         if s == LINUX_SIGSTOP {
@@ -1170,7 +1272,7 @@ impl SyscallDispatcher {
             return DispatchOutcome::Returned { value: 0 };
         }
         let s = signum as i32;
-        if crate::exec_helpers::stop_for_ptrace_signal(self, s) {
+        if self.stop_for_ptrace_signal(s) {
             return DispatchOutcome::Returned { value: 0 };
         }
         if s == LINUX_SIGSTOP {
@@ -1189,11 +1291,9 @@ impl SyscallDispatcher {
     }
 
     /// The calling guest thread's tid (or `0` if no thread context).
+    #[inline]
     pub(crate) fn ctx_tid<M: CurrentMmMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
-        ctx.thread
-            .as_ref()
-            .map(|thread| thread.tid)
-            .unwrap_or_else(|| ctx.kernel.thread().registry_id())
+        ctx_tid(ctx)
     }
 
     /// Deliver a PROCESS-directed signal (`kill(getpid(), sig)`), honoring the
@@ -1638,7 +1738,7 @@ impl SyscallDispatcher {
             if signal_target_names_self {
                 let tid = Self::ctx_tid(cx);
                 if signum != 0
-                    && crate::exec_helpers::stop_for_ptrace_signal(this, signum as i32)
+                    && this.stop_for_ptrace_signal(signum as i32)
                 {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
@@ -2476,6 +2576,566 @@ impl SyscallDispatcher {
         }
         self.mark_signal_pending(ctx.kernel, tid, s);
         DispatchOutcome::Returned { value: 0 }
+    }
+}
+
+macro_rules! forward_signal_handlers {
+    ($( $handler:ident ),* $(,)?) => {
+        impl SyscallDispatcher {
+            $(
+                #[inline]
+                pub(crate) fn $handler<M: CurrentMmMemory>(
+                    &self,
+                    cx: &mut SyscallCtx<M>,
+                ) -> Result<DispatchOutcome, DispatchError> {
+                    self.signal_view().$handler(cx)
+                }
+            )*
+        }
+    };
+}
+
+forward_signal_handlers! {
+    signalfd4,
+    kill,
+    tkill,
+    tgkill,
+    sigaltstack,
+    rt_sigsuspend,
+    rt_sigaction,
+    rt_sigprocmask,
+    rt_sigpending,
+    rt_sigtimedwait,
+    rt_sigqueueinfo,
+    rt_sigreturn,
+    rt_tgsigqueueinfo,
+}
+
+#[allow(dead_code)]
+impl SyscallDispatcher {
+    #[inline]
+    pub(crate) fn ctx_tid<M: CurrentMmMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
+        ctx_tid(ctx)
+    }
+
+    #[inline]
+    pub(crate) fn signal_action_entry(
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+    ) -> Option<LinuxSigaction> {
+        signal_action_entry(context, signum)
+    }
+
+    #[inline]
+    pub(crate) fn signal_actions(
+        context: &crate::kernel::KernelContext,
+    ) -> Vec<(i32, LinuxSigaction)> {
+        signal_actions(context)
+    }
+
+    #[inline]
+    pub(crate) fn signal_thread(
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> Option<crate::kernel::ThreadRef> {
+        signal_thread(context, tid)
+    }
+
+    pub(crate) fn required_signal_thread(
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> crate::kernel::ThreadRef {
+        Self::signal_thread(context, tid).unwrap_or_else(|| {
+            tracing::error!(
+                ?tid,
+                task = ?context.task().key(),
+                "signal operation escaped its captured KernelContext"
+            );
+            carrick_fatal!(
+                "dispatch::signal_authority",
+                "signal operation escaped its captured KernelContext"
+            );
+        })
+    }
+
+    #[inline]
+    pub(crate) fn signal_authority_for(
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> crate::kernel::SignalAuthority {
+        signal_authority_for(context, tid)
+    }
+
+    pub(crate) fn install_signal_action(
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+        action: LinuxSigaction,
+    ) {
+        let signal =
+            crate::kernel::LinuxSignal::for_signal_number(signum).unwrap_or_else(|error| {
+                tracing::error!(%error, signum, "invalid signal reached Kernel Sighand install");
+                carrick_fatal!(
+                    "dispatch::signal_disposition",
+                    "invalid signal reached Kernel Sighand install"
+                );
+            });
+        context.shared().sighand().install_action(signal, action);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn exact_signal_context_for_test(&self) -> crate::kernel::KernelContext {
+        self.signal_view().exact_signal_context_for_test()
+    }
+
+    #[inline]
+    pub fn registered_signal_handler(
+        &self,
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+    ) -> Option<LinuxSigaction> {
+        self.signal_view()
+            .registered_signal_handler(context, signum)
+    }
+
+    #[inline]
+    pub fn signal_action(
+        &self,
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+    ) -> LinuxSigaction {
+        self.signal_view().signal_action(context, signum)
+    }
+
+    #[inline]
+    pub fn signal_altstack(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> Option<(u64, u64)> {
+        self.signal_view().signal_altstack(context, tid)
+    }
+
+    #[inline]
+    pub fn signal_is_ignored(&self, context: &crate::kernel::KernelContext, signum: i32) -> bool {
+        signal_is_ignored(context, signum)
+    }
+
+    #[inline]
+    pub fn proc_status_signal_masks(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> (SigSet, SigSet, SigSet) {
+        proc_status_signal_masks(context)
+    }
+
+    #[inline]
+    pub fn child_exit_signal_needs_pump(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        exit_signal: u32,
+    ) -> bool {
+        self.signal_view()
+            .child_exit_signal_needs_pump(context, tid, exit_signal)
+    }
+
+    #[inline]
+    pub fn child_exit_signal_needs_process_pump(
+        &self,
+        context: &crate::kernel::KernelContext,
+        exit_signal: u32,
+    ) -> bool {
+        self.signal_view()
+            .child_exit_signal_needs_process_pump(context, exit_signal)
+    }
+
+    #[inline]
+    pub(crate) fn child_exit_signal_snapshot_needs_pump(
+        &self,
+        snapshot: &crate::kernel::core::KernelTaskSignalSnapshot,
+        exit_signal: u32,
+    ) -> bool {
+        self.signal_view()
+            .child_exit_signal_snapshot_needs_pump(snapshot, exit_signal)
+    }
+
+    #[inline]
+    pub fn non_interrupting_signal_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> SigSet {
+        self.signal_view()
+            .non_interrupting_signal_mask(context, tid)
+    }
+
+    #[inline]
+    pub fn signal_blocked(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) -> bool {
+        signal_blocked(context, tid, signum)
+    }
+
+    #[inline]
+    pub fn signal_mask_for(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> SigSet {
+        signal_mask_for(context, tid)
+    }
+
+    #[inline]
+    pub fn mark_signal_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) {
+        mark_signal_pending(context, tid, signum);
+    }
+
+    #[inline]
+    pub fn reset_signal_handlers_on_execve(&self, context: &crate::kernel::KernelContext) {
+        self.signal_view().reset_signal_handlers_on_execve(context)
+    }
+
+    #[inline]
+    pub fn enter_signal_handler(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+        action: LinuxSigaction,
+    ) -> SigSet {
+        self.signal_view()
+            .enter_signal_handler(context, tid, signum, action)
+    }
+
+    #[inline]
+    pub fn pop_handler_frame(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) {
+        self.signal_view().pop_handler_frame(context, tid);
+    }
+
+    #[inline]
+    pub fn arm_restore_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: SigSet,
+    ) {
+        self.signal_view().arm_restore_mask(context, tid, mask)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn begin_sigsuspend(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        suspend_mask: SigSet,
+    ) -> SigSet {
+        self.signal_view()
+            .begin_sigsuspend(context, tid, suspend_mask)
+    }
+
+    #[inline]
+    pub fn record_pending_siginfo(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+        info: LinuxSiginfo,
+    ) {
+        self.signal_view()
+            .record_pending_siginfo(context, tid, signum, info)
+    }
+
+    #[inline]
+    pub fn take_pending_siginfo(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) -> Option<LinuxSiginfo> {
+        self.signal_view()
+            .take_pending_siginfo(context, tid, signum)
+    }
+
+    #[inline]
+    pub fn record_pending_signal_action(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+        action: LinuxSigaction,
+    ) {
+        self.signal_view()
+            .record_pending_signal_action(context, tid, signum, action)
+    }
+
+    #[inline]
+    pub fn take_pending_signal_action(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) -> Option<LinuxSigaction> {
+        self.signal_view()
+            .take_pending_signal_action(context, tid, signum)
+    }
+
+    #[inline]
+    pub(crate) fn drain_xsignals_process_directed(&self, context: &crate::kernel::KernelContext) {
+        self.signal_view().drain_xsignals_process_directed(context)
+    }
+
+    #[inline]
+    pub fn restore_signal_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: SigSet,
+    ) {
+        self.signal_view().restore_signal_mask(context, tid, mask)
+    }
+
+    #[inline]
+    pub fn take_deliverable_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> Option<i32> {
+        self.signal_view().take_deliverable_pending(context, tid)
+    }
+
+    #[inline]
+    pub(crate) fn take_deliverable_pending_from(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> Option<DispatchPendingSignal> {
+        self.signal_view()
+            .take_deliverable_pending_from(context, tid)
+    }
+
+    #[inline]
+    pub(crate) fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.signal_view()
+            .has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask)
+    }
+
+    #[inline]
+    pub(crate) fn wait_ignored_disposition_mask(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> SigSet {
+        self.signal_view().wait_ignored_disposition_mask(context)
+    }
+
+    #[inline]
+    pub(crate) fn signal_wait_should_eintr(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        wait_set: carrick_abi::SigSet,
+        block_mask: carrick_abi::SigBlockMask,
+    ) -> bool {
+        self.signal_view()
+            .signal_wait_should_eintr(context, tid, wait_set, block_mask)
+    }
+
+    #[inline]
+    pub fn read_signalfd<M: CurrentMmMemory>(
+        &self,
+        context: &crate::kernel::KernelContext,
+        memory: &mut M,
+        address: u64,
+        length: usize,
+        mask: SigSet,
+        tid: crate::thread::ThreadId,
+    ) -> DispatchOutcome {
+        self.signal_view()
+            .read_signalfd(context, memory, address, length, mask, tid)
+    }
+
+    #[inline]
+    pub(crate) fn take_signalfd_bytes(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: SigSet,
+        max: usize,
+    ) -> Vec<u8> {
+        self.signal_view()
+            .take_signalfd_bytes(context, tid, mask, max)
+    }
+
+    #[inline]
+    pub fn mark_process_signal_pending(&self, context: &crate::kernel::KernelContext, signum: i32) {
+        self.signal_view()
+            .mark_process_signal_pending(context, signum)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn mark_process_signal_pending_with_info(
+        &self,
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+        info: Option<LinuxSiginfo>,
+    ) {
+        self.signal_view()
+            .mark_process_signal_pending_with_info(context, signum, info)
+    }
+
+    #[inline]
+    pub(crate) fn mark_in_process_signal_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        signum: i32,
+    ) {
+        self.signal_view()
+            .mark_in_process_signal_pending(context, signum)
+    }
+
+    #[inline]
+    pub(super) fn hvpatch_exact_process_signal(
+        &self,
+        context: &crate::kernel::KernelContext,
+        target_key: crate::kernel::TaskKey,
+        signum: u64,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> DispatchOutcome {
+        self.signal_view()
+            .hvpatch_exact_process_signal(context, target_key, signum, siginfo)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn hvpatch_specific_thread_signal(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tgid: Option<i32>,
+        tid: i32,
+        signum: u64,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> Option<DispatchOutcome> {
+        self.signal_view()
+            .hvpatch_specific_thread_signal(context, tgid, tid, signum, siginfo)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_on_altstack(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        current_guest_sp: Option<u64>,
+    ) -> bool {
+        self.signal_view()
+            .is_on_altstack(context, tid, current_guest_sp)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn sigsuspend_caught_handler_deliverable(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        suspend_mask: SigSet,
+    ) -> bool {
+        self.signal_view()
+            .sigsuspend_caught_handler_deliverable(context, tid, suspend_mask)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn kernel_group_signal<M: CurrentMmMemory>(
+        &self,
+        ctx: &SyscallCtx<M>,
+        pid: i32,
+        signum: u64,
+    ) -> DispatchOutcome {
+        self.signal_view().kernel_group_signal(ctx, pid, signum)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn record_tkill_siginfo(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) {
+        self.signal_view()
+            .record_tkill_siginfo(context, tid, signum)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn sigqueueinfo_common<M: CurrentMmMemory>(
+        &self,
+        ctx: &SyscallCtx<M>,
+        route_target: i64,
+        ns_target: i64,
+        signum: u64,
+        info_ptr: GuestPtr,
+        tid_directed: bool,
+    ) -> DispatchOutcome {
+        self.signal_view().sigqueueinfo_common(
+            ctx,
+            route_target,
+            ns_target,
+            signum,
+            info_ptr,
+            tid_directed,
+        )
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn take_pending_in(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        set: SigSet,
+    ) -> Option<i32> {
+        self.signal_view().take_pending_in(context, tid, set)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn take_pending_in_from(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        set: SigSet,
+    ) -> Option<DispatchPendingSignal> {
+        self.signal_view().take_pending_in_from(context, tid, set)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn route_thread_signal<M: CurrentMmMemory>(
+        &self,
+        ctx: &SyscallCtx<M>,
+        tid: i64,
+        signum: u64,
+        record_synthetic: bool,
+    ) -> Option<(DispatchOutcome, crate::thread::ThreadId)> {
+        self.signal_view()
+            .route_thread_signal(ctx, tid, signum, record_synthetic)
     }
 }
 
