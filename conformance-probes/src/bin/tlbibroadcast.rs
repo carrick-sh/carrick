@@ -230,12 +230,6 @@ fn main() {
         let stale_fault = B_STALE_FAULT.load(Ordering::SeqCst);
         libc::munmap(page3, 4096);
 
-        eprintln!(
-            "B_OBSERVED_ITERS: mprotect={}, munmap={}",
-            B_ITERS_1.load(Ordering::Relaxed),
-            B_ITERS_2.load(Ordering::Relaxed)
-        );
-
         report!(
             broadcast_mprotect_observed = mprotect_observed,
             broadcast_munmap_observed = munmap_observed,

@@ -171,7 +171,6 @@ fn test_cross_thread_window() {
         return;
     }
     let base = ptr as *mut u8;
-    eprintln!("test_cross_thread_window: ptr = {:p}", ptr);
     let step = AtomicUsize::new(0);
 
     let mut pipe_fds = [0 as libc::c_int; 2];
@@ -1154,10 +1153,6 @@ fn test_sibling_handoff_first_touch() {
     println!(
         "sibling_handoff_touch_mismatches={}",
         SIBLING_HANDOFF_TOUCH_MISMATCHES.load(Ordering::Relaxed)
-    );
-    eprintln!(
-        "test_sibling_handoff_first_touch: touches = {}",
-        touches.load(Ordering::Relaxed)
     );
 }
 
