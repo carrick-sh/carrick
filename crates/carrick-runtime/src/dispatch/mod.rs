@@ -1592,23 +1592,37 @@ impl SyscallDispatcher {
 
     /// Seed the guest's initial credentials (`docker run --user` / image `USER`).
     /// Applied once before the guest starts; defaults to (0, 0) = root.
-    pub fn set_credentials(&self, uid: carrick_abi::NsUid, gid: carrick_abi::NsGid) {
-        let context = self.capture_one_task_context().unwrap_or_else(|error| {
+    pub fn try_set_credentials(
+        &self,
+        uid: carrick_abi::NsUid,
+        gid: carrick_abi::NsGid,
+    ) -> Result<(), crate::run_result::RuntimeError> {
+        let context = self.capture_one_task_context().map_err(|error| {
             tracing::error!(%error, "cannot capture launch credential context");
-            carrick_fatal!(
-                "dispatch::credentials",
-                "cannot capture launch credential context"
-            );
-        });
+            crate::run_result::RuntimeError::CarrierFailed(format!(
+                "cannot capture launch credential context: {error}"
+            ))
+        })?;
         let credentials = self
             .update_credentials(&context, |credentials| {
                 credentials.seed_identity(uid, gid);
             })
-            .unwrap_or_else(|errno| {
+            .map_err(|errno| {
                 tracing::error!(errno = errno.get(), "publish launch Kernel credentials");
-                carrick_fatal!("dispatch::credentials", "publish launch Kernel credentials");
-            });
+                crate::run_result::RuntimeError::CarrierFailed(format!(
+                    "publish launch Kernel credentials: {errno:?}"
+                ))
+            })?;
         self.publish_external_credential_projection(&context, &credentials);
+        Ok(())
+    }
+
+    /// Seed the guest's initial credentials (`docker run --user` / image `USER`).
+    /// Applied once before the guest starts; defaults to (0, 0) = root.
+    pub fn set_credentials(&self, uid: carrick_abi::NsUid, gid: carrick_abi::NsGid) {
+        if let Err(error) = self.try_set_credentials(uid, gid) {
+            tracing::error!(%error, "set_credentials failed");
+        }
     }
 
     pub(crate) fn configure_logical_exec_context(
@@ -2156,21 +2170,19 @@ impl SyscallDispatcher {
         }
     }
 
-    pub fn cwd(&self) -> String {
+    pub fn try_cwd(&self) -> Result<String, crate::linux_abi::LinuxErrno> {
         if let Some(fs_context) = resources::fs_context() {
-            return fs_context.cwd();
+            return Ok(fs_context.cwd());
         }
-        self.capture_one_task_context()
-            .unwrap_or_else(|error| {
-                tracing::error!(%error, "cannot capture initial filesystem context");
-                carrick_fatal!(
-                    "dispatch::fs_context",
-                    "cannot capture initial filesystem context"
-                );
-            })
-            .resources()
-            .fs_context()
-            .cwd()
+        let context = self.capture_one_task_context().map_err(|error| {
+            tracing::error!(%error, "cannot capture initial filesystem context");
+            crate::linux_abi::LINUX_ENOENT
+        })?;
+        Ok(context.resources().fs_context().cwd())
+    }
+
+    pub fn cwd(&self) -> String {
+        self.try_cwd().unwrap_or_else(|_| "/".to_owned())
     }
 
     /// Absolutize an `execve(2)` target path against the guest cwd, matching
@@ -2197,9 +2209,9 @@ impl SyscallDispatcher {
     /// stands). Existence is not enforced here — matching docker, which treats
     /// a missing workdir leniently — a later `chdir` validates if the guest
     /// makes one.
-    pub fn set_cwd(&self, path: &str) {
+    pub fn try_set_cwd(&self, path: &str) -> Result<(), crate::linux_abi::LinuxErrno> {
         if !path.starts_with('/') {
-            return;
+            return Ok(());
         }
         let trimmed = path.trim_end_matches('/');
         let cwd = if trimmed.is_empty() {
@@ -2209,16 +2221,20 @@ impl SyscallDispatcher {
         };
         if let Some(fs_context) = resources::fs_context() {
             fs_context.set_cwd(cwd);
-            return;
+            return Ok(());
         }
-        let context = self.capture_one_task_context().unwrap_or_else(|error| {
+        let context = self.capture_one_task_context().map_err(|error| {
             tracing::error!(%error, "cannot capture initial filesystem context");
-            carrick_fatal!(
-                "dispatch::fs_context",
-                "cannot capture initial filesystem context"
-            );
-        });
+            crate::linux_abi::LINUX_ENOENT
+        })?;
         context.resources().fs_context().set_cwd(cwd);
+        Ok(())
+    }
+
+    pub fn set_cwd(&self, path: &str) {
+        if let Err(errno) = self.try_set_cwd(path) {
+            tracing::error!(errno = errno.get(), "set_cwd failed");
+        }
     }
 
     /// Shared pseudo-terminal table. Also held by the `/dev` (ptmx) and
@@ -2776,15 +2792,21 @@ impl SyscallDispatcher {
         Ok(snapshot)
     }
 
-    fn mem_snapshot(&self) -> mem::MemState {
+    pub(crate) fn try_mem_snapshot(&self) -> Result<mem::MemState, crate::kernel::SnapshotError> {
         self.mem_snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(30))
-            .unwrap_or_else(|error| {
-                tracing::error!(%error, "synthetic proc MemState snapshot timed out");
-                carrick_fatal!(
-                    "dispatch::mem_snapshot",
-                    "synthetic proc MemState snapshot timed out"
-                )
-            })
+    }
+
+    fn mem_snapshot(&self) -> mem::MemState {
+        match self.try_mem_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "synthetic proc MemState snapshot timed out; taking best-effort snapshot"
+                );
+                self.mm_binding.current.load_full().mem.lock().clone()
+            }
+        }
     }
 
     fn synthetic_proc_context(

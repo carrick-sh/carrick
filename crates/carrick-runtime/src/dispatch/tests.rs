@@ -855,6 +855,17 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
         assert!(matches!(result, Err(crate::run_result::RuntimeError::CarrierFailed(_))));
     }
 
+    #[test]
+    fn try_set_credentials_and_cwd_succeed() {
+        let dispatcher = SyscallDispatcher::new();
+        assert!(dispatcher
+            .try_set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000))
+            .is_ok());
+        assert!(dispatcher.try_set_cwd("/test_dir").is_ok());
+        assert_eq!(dispatcher.try_cwd().unwrap(), "/test_dir");
+        assert!(dispatcher.try_mem_snapshot().is_ok());
+    }
+
 
     #[test]
     fn epoll_et_repolls_host_level_when_mux_misses_wake() {

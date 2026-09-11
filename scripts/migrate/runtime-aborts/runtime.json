@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 18,
+  "typed_error_debt_ceiling": 13,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -689,18 +689,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::cwd",
-      "ordinal_in_function": 1,
-      "fingerprint": "6ddb0f6061a625eb3f9725dd525e264a821d4c1066fede753039091483d4aea5",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_context",
-      "rationale": "Capturing task context for cwd query occurs before filesystem operations and should return a typed LinuxErrno instead of aborting.",
-      "typed_error": "LinuxErrno",
-      "sink": "fatal",
-      "domain": "dispatch::fs_context"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
       "function": "SyscallDispatcher::enter_mm_executor_inner",
       "ordinal_in_function": 1,
       "fingerprint": "3941d164f4b56580856bb3e8315d65a6b9a336c4752757cb85ed73afb516700e",
@@ -720,54 +708,6 @@
       "rationale": "MM authority missing from HostAliasDispatchGuard in mark_vma_dispatch; cannot publish VMA revision update without active authority.",
       "sink": "fatal",
       "domain": "dispatch::mm_binding"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::mem_snapshot",
-      "ordinal_in_function": 1,
-      "fingerprint": "0158efe08bd26e36bea81858f8afa425f6ad6716d05ce3245060146e6a23ad9a",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::mem_snapshot",
-      "rationale": "Synthetic proc MemState snapshot acquisition timeout occurs during non-destructive read before synthetic VFS publication and should propagate SnapshotError instead of aborting.",
-      "typed_error": "SnapshotError",
-      "sink": "fatal",
-      "domain": "dispatch::mem_snapshot"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::set_credentials",
-      "ordinal_in_function": 1,
-      "fingerprint": "53e91153d05fdbde63ed310a363995f7eeb490fc347536b4192ffbe587c6132a",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::credentials",
-      "rationale": "Capturing task context when seeding initial guest credentials occurs before execution and should return a typed RuntimeError.",
-      "typed_error": "RuntimeError",
-      "sink": "fatal",
-      "domain": "dispatch::credentials"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::set_credentials",
-      "ordinal_in_function": 2,
-      "fingerprint": "7f4b76e4aff4bba38b4ff41b5bb2d8a4eeee30ef1ad4260eb973801b596748c5",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::credentials",
-      "rationale": "Publishing seeded initial credentials into kernel state occurs before execution and should return a typed RuntimeError.",
-      "typed_error": "RuntimeError",
-      "sink": "fatal",
-      "domain": "dispatch::credentials"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "function": "SyscallDispatcher::set_cwd",
-      "ordinal_in_function": 1,
-      "fingerprint": "f8957e6514b176087dae6c0746c03004e8d2def98797bbbc4da06ce2e66ec5ce",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::fs_context",
-      "rationale": "Capturing task context for set_cwd occurs before filesystem mutation and should return a typed LinuxErrno instead of aborting.",
-      "typed_error": "LinuxErrno",
-      "sink": "fatal",
-      "domain": "dispatch::fs_context"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
