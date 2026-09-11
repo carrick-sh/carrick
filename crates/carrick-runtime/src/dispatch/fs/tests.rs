@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 
 fn two_namespaced_roots_for_async_owner() -> (
