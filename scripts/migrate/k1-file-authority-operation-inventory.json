@@ -7,7 +7,7 @@
     "description_backing": 17,
     "epoll": 380,
     "stream": 174,
-    "mapping": 1101,
+    "mapping": 1104,
     "lifecycle": 23
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 6,
     "epoll": 158,
     "stream": 121,
-    "mapping": 722,
+    "mapping": 725,
     "lifecycle": 6
   },
   "files": {
@@ -490,7 +490,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1393,
+      "line": 1398,
       "categories": [
         "description_backing"
       ],
@@ -499,7 +499,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1413,
+      "line": 1418,
       "categories": [
         "description_backing"
       ],
@@ -508,7 +508,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1425,
+      "line": 1430,
       "categories": [
         "description_backing"
       ],
@@ -517,7 +517,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1454,
+      "line": 1459,
       "categories": [
         "mapping"
       ],
@@ -526,7 +526,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1475,
+      "line": 1480,
       "categories": [
         "epoll"
       ],
@@ -535,7 +535,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1493,
+      "line": 1499,
       "categories": [
         "epoll"
       ],
@@ -544,7 +544,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1533,
+      "line": 1540,
       "categories": [
         "epoll"
       ],
@@ -553,7 +553,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1551,
+      "line": 1558,
       "categories": [
         "epoll"
       ],
@@ -562,7 +562,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1645,
+      "line": 1653,
       "categories": [
         "table_guard"
       ],
@@ -571,7 +571,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1646,
+      "line": 1654,
       "categories": [
         "description_guard"
       ],
@@ -580,7 +580,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1654,
+      "line": 1662,
       "categories": [
         "description_backing"
       ],
@@ -589,7 +589,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1660,
+      "line": 1668,
       "categories": [
         "epoll"
       ],
@@ -598,7 +598,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1666,
+      "line": 1674,
       "categories": [
         "epoll"
       ],
@@ -607,7 +607,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1692,
+      "line": 1700,
       "categories": [
         "epoll"
       ],
@@ -616,7 +616,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1740,
+      "line": 1749,
       "categories": [
         "epoll"
       ],
@@ -625,7 +625,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 1803,
+      "line": 1812,
       "categories": [
         "epoll"
       ],
@@ -634,7 +634,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2169,
+      "line": 2179,
       "categories": [
         "epoll"
       ],
@@ -643,7 +643,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2241,
+      "line": 2251,
       "categories": [
         "description_backing"
       ],
@@ -652,7 +652,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2245,
+      "line": 2255,
       "categories": [
         "description_backing"
       ],
@@ -661,7 +661,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2249,
+      "line": 2259,
       "categories": [
         "description_backing"
       ],
@@ -670,7 +670,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2253,
+      "line": 2263,
       "categories": [
         "description_backing"
       ],
@@ -679,7 +679,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2262,
+      "line": 2272,
       "categories": [
         "description_backing"
       ],
@@ -688,7 +688,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2586,
+      "line": 2596,
       "categories": [
         "epoll"
       ],
@@ -697,7 +697,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2829,
+      "line": 2840,
       "categories": [
         "mapping"
       ],
@@ -706,7 +706,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2830,
+      "line": 2841,
       "categories": [
         "mapping"
       ],
@@ -715,7 +715,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2838,
+      "line": 2849,
       "categories": [
         "mapping"
       ],
@@ -724,7 +724,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2857,
+      "line": 2868,
       "categories": [
         "mapping"
       ],
@@ -733,7 +733,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
-      "line": 2858,
+      "line": 2869,
       "categories": [
         "mapping"
       ],
@@ -1940,7 +1940,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 482,
+      "line": 483,
       "categories": [
         "epoll"
       ],
@@ -1949,7 +1949,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 514,
+      "line": 515,
       "categories": [
         "epoll"
       ],
@@ -1958,7 +1958,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 629,
+      "line": 631,
       "categories": [
         "description_guard"
       ],
@@ -1967,7 +1967,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 703,
+      "line": 705,
       "categories": [
         "mapping"
       ],
@@ -1976,7 +1976,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 791,
+      "line": 793,
       "categories": [
         "epoll"
       ],
@@ -1985,7 +1985,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 931,
+      "line": 933,
       "categories": [
         "epoll"
       ],
@@ -1994,7 +1994,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1018,
+      "line": 1025,
       "categories": [
         "description_guard"
       ],
@@ -2003,7 +2003,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1263,
+      "line": 1270,
       "categories": [
         "epoll"
       ],
@@ -2012,7 +2012,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1305,
+      "line": 1313,
       "categories": [
         "description_guard"
       ],
@@ -2021,7 +2021,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1392,
+      "line": 1400,
       "categories": [
         "epoll"
       ],
@@ -2030,7 +2030,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1456,
+      "line": 1465,
       "categories": [
         "description_guard"
       ],
@@ -2039,7 +2039,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1559,
+      "line": 1568,
       "categories": [
         "epoll"
       ],
@@ -2048,7 +2048,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1621,
+      "line": 1631,
       "categories": [
         "description_guard"
       ],
@@ -2057,7 +2057,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1703,
+      "line": 1713,
       "categories": [
         "description_guard"
       ],
@@ -2066,7 +2066,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1787,
+      "line": 1797,
       "categories": [
         "description_guard"
       ],
@@ -2075,7 +2075,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1815,
+      "line": 1825,
       "categories": [
         "epoll"
       ],
@@ -2084,7 +2084,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1871,
+      "line": 1882,
       "categories": [
         "description_guard"
       ],
@@ -2093,7 +2093,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 1982,
+      "line": 1993,
       "categories": [
         "description_guard"
       ],
@@ -2102,7 +2102,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 2110,
+      "line": 2121,
       "categories": [
         "epoll"
       ],
@@ -2111,7 +2111,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 2228,
+      "line": 2240,
       "categories": [
         "description_guard"
       ],
@@ -2120,7 +2120,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 2752,
+      "line": 2769,
       "categories": [
         "description_guard"
       ],
@@ -2129,7 +2129,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/rw.rs",
-      "line": 2921,
+      "line": 2938,
       "categories": [
         "description_guard"
       ],
@@ -2201,7 +2201,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 218,
+      "line": 219,
       "categories": [
         "description_guard"
       ],
@@ -2210,7 +2210,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 223,
+      "line": 224,
       "categories": [
         "stream"
       ],
@@ -2219,7 +2219,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 270,
+      "line": 271,
       "categories": [
         "epoll"
       ],
@@ -2228,7 +2228,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 306,
+      "line": 308,
       "categories": [
         "stream"
       ],
@@ -2237,7 +2237,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 316,
+      "line": 318,
       "categories": [
         "stream"
       ],
@@ -2246,7 +2246,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 325,
+      "line": 327,
       "categories": [
         "stream"
       ],
@@ -2255,7 +2255,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 353,
+      "line": 355,
       "categories": [
         "stream"
       ],
@@ -2264,7 +2264,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 355,
+      "line": 357,
       "categories": [
         "stream"
       ],
@@ -2273,7 +2273,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 394,
+      "line": 396,
       "categories": [
         "stream"
       ],
@@ -2282,7 +2282,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 396,
+      "line": 398,
       "categories": [
         "stream"
       ],
@@ -2291,7 +2291,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 399,
+      "line": 401,
       "categories": [
         "stream"
       ],
@@ -2300,7 +2300,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 419,
+      "line": 421,
       "categories": [
         "description_guard"
       ],
@@ -2309,7 +2309,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 430,
+      "line": 432,
       "categories": [
         "stream"
       ],
@@ -2318,7 +2318,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 432,
+      "line": 434,
       "categories": [
         "stream"
       ],
@@ -2327,7 +2327,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 535,
+      "line": 537,
       "categories": [
         "description_guard"
       ],
@@ -2336,7 +2336,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 575,
+      "line": 577,
       "categories": [
         "description_guard"
       ],
@@ -2345,7 +2345,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs/sendfile.rs",
-      "line": 603,
+      "line": 605,
       "categories": [
         "stream"
       ],
@@ -5821,7 +5821,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3430,
+      "line": 3439,
       "categories": [
         "mapping"
       ],
@@ -5830,7 +5830,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3491,
+      "line": 3500,
       "categories": [
         "mapping"
       ],
@@ -5839,7 +5839,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3607,
+      "line": 3616,
       "categories": [
         "mapping"
       ],
@@ -5848,7 +5848,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3609,
+      "line": 3618,
       "categories": [
         "mapping"
       ],
@@ -5857,7 +5857,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3616,
+      "line": 3625,
       "categories": [
         "mapping"
       ],
@@ -5866,7 +5866,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3650,
+      "line": 3659,
       "categories": [
         "mapping"
       ],
@@ -5875,7 +5875,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3687,
+      "line": 3696,
       "categories": [
         "mapping"
       ],
@@ -5884,7 +5884,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3774,
+      "line": 3783,
       "categories": [
         "mapping"
       ],
@@ -5893,7 +5893,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3810,
+      "line": 3819,
       "categories": [
         "mapping"
       ],
@@ -5902,7 +5902,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3814,
+      "line": 3823,
       "categories": [
         "mapping"
       ],
@@ -5911,7 +5911,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3823,
+      "line": 3832,
       "categories": [
         "mapping"
       ],
@@ -5920,7 +5920,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3890,
+      "line": 3899,
       "categories": [
         "mapping"
       ],
@@ -5929,7 +5929,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4013,
+      "line": 4022,
       "categories": [
         "mapping"
       ],
@@ -5938,7 +5938,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4035,
+      "line": 4044,
       "categories": [
         "mapping"
       ],
@@ -5947,7 +5947,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4064,
+      "line": 4073,
       "categories": [
         "mapping"
       ],
@@ -5956,7 +5956,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4065,
+      "line": 4074,
       "categories": [
         "mapping"
       ],
@@ -5965,7 +5965,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4070,
+      "line": 4079,
       "categories": [
         "mapping"
       ],
@@ -5974,7 +5974,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4071,
+      "line": 4080,
       "categories": [
         "mapping"
       ],
@@ -5983,29 +5983,11 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4072,
+      "line": 4081,
       "categories": [
         "mapping"
       ],
       "text": "mapping.file_page_offset",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4073,
-      "categories": [
-        "mapping"
-      ],
-      "text": "+ (start - mapping.start) / crate::core_dump::GUEST_PAGE as u64",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4077,
-      "categories": [
-        "mapping"
-      ],
-      "text": "proc_maps_entry_mremap_metadata(&mapping, file_page_offset, fork_semantics);",
       "scope_kind": "production_callsite"
     },
     {
@@ -6014,12 +5996,30 @@
       "categories": [
         "mapping"
       ],
+      "text": "+ (start - mapping.start) / crate::core_dump::GUEST_PAGE as u64",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 4086,
+      "categories": [
+        "mapping"
+      ],
+      "text": "proc_maps_entry_mremap_metadata(&mapping, file_page_offset, fork_semantics);",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 4091,
+      "categories": [
+        "mapping"
+      ],
       "text": "// Complete mapping metadata is authoritative over the retained boot",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4106,
+      "line": 4115,
       "categories": [
         "mapping"
       ],
@@ -6028,7 +6028,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4109,
+      "line": 4118,
       "categories": [
         "mapping"
       ],
@@ -6037,7 +6037,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4117,
+      "line": 4126,
       "categories": [
         "mapping"
       ],
@@ -6046,7 +6046,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4118,
+      "line": 4127,
       "categories": [
         "mapping"
       ],
@@ -6055,7 +6055,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4119,
+      "line": 4128,
       "categories": [
         "mapping"
       ],
@@ -6064,7 +6064,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4120,
+      "line": 4129,
       "categories": [
         "mapping"
       ],
@@ -6073,7 +6073,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4287,
+      "line": 4296,
       "categories": [
         "mapping"
       ],
@@ -6082,7 +6082,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4308,
+      "line": 4317,
       "categories": [
         "mapping"
       ],
@@ -6091,7 +6091,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4388,
+      "line": 4397,
       "categories": [
         "mapping"
       ],
@@ -6100,7 +6100,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4392,
+      "line": 4401,
       "categories": [
         "mapping"
       ],
@@ -6109,7 +6109,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4408,
+      "line": 4417,
       "categories": [
         "mapping"
       ],
@@ -6118,7 +6118,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4645,
+      "line": 4654,
       "categories": [
         "mapping"
       ],
@@ -6127,7 +6127,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4656,
+      "line": 4665,
       "categories": [
         "description_guard"
       ],
@@ -6136,7 +6136,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4662,
+      "line": 4671,
       "categories": [
         "epoll"
       ],
@@ -6145,7 +6145,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4683,
+      "line": 4692,
       "categories": [
         "description_guard"
       ],
@@ -6154,7 +6154,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4799,
+      "line": 4808,
       "categories": [
         "mapping"
       ],
@@ -6163,7 +6163,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4839,
+      "line": 4848,
       "categories": [
         "mapping"
       ],
@@ -6172,7 +6172,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4846,
+      "line": 4855,
       "categories": [
         "mapping"
       ],
@@ -6181,7 +6181,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4851,
+      "line": 4860,
       "categories": [
         "mapping"
       ],
@@ -6190,7 +6190,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4852,
+      "line": 4861,
       "categories": [
         "mapping"
       ],
@@ -6199,7 +6199,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4860,
+      "line": 4869,
       "categories": [
         "description_guard"
       ],
@@ -6208,7 +6208,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4887,
+      "line": 4897,
       "categories": [
         "mapping"
       ],
@@ -6217,7 +6217,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4925,
+      "line": 4935,
       "categories": [
         "mapping"
       ],
@@ -6226,7 +6226,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4927,
+      "line": 4937,
       "categories": [
         "mapping"
       ],
@@ -6235,7 +6235,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4929,
+      "line": 4939,
       "categories": [
         "mapping"
       ],
@@ -6244,7 +6244,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4999,
+      "line": 5009,
       "categories": [
         "mapping"
       ],
@@ -6253,7 +6253,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5004,
+      "line": 5014,
       "categories": [
         "description_backing",
         "mapping"
@@ -6263,7 +6263,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5013,
+      "line": 5023,
       "categories": [
         "mapping"
       ],
@@ -6272,7 +6272,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5023,
+      "line": 5033,
       "categories": [
         "mapping"
       ],
@@ -6281,7 +6281,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5029,
+      "line": 5039,
       "categories": [
         "mapping"
       ],
@@ -6290,7 +6290,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5035,
+      "line": 5045,
       "categories": [
         "mapping"
       ],
@@ -6299,7 +6299,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5042,
+      "line": 5052,
       "categories": [
         "mapping"
       ],
@@ -6308,7 +6308,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5054,
+      "line": 5064,
       "categories": [
         "mapping"
       ],
@@ -6317,7 +6317,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5065,
+      "line": 5075,
       "categories": [
         "mapping"
       ],
@@ -6326,7 +6326,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5079,
+      "line": 5089,
       "categories": [
         "mapping"
       ],
@@ -6335,7 +6335,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5093,
+      "line": 5103,
       "categories": [
         "mapping"
       ],
@@ -6344,7 +6344,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5114,
+      "line": 5124,
       "categories": [
         "mapping"
       ],
@@ -6353,7 +6353,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5121,
+      "line": 5131,
       "categories": [
         "mapping"
       ],
@@ -6362,7 +6362,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5132,
+      "line": 5142,
       "categories": [
         "mapping"
       ],
@@ -6371,7 +6371,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5137,
+      "line": 5147,
       "categories": [
         "mapping"
       ],
@@ -6380,7 +6380,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5142,
+      "line": 5152,
       "categories": [
         "mapping"
       ],
@@ -6389,7 +6389,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5164,
+      "line": 5174,
       "categories": [
         "mapping"
       ],
@@ -6398,7 +6398,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5165,
+      "line": 5175,
       "categories": [
         "mapping"
       ],
@@ -6407,7 +6407,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5182,
+      "line": 5192,
       "categories": [
         "mapping"
       ],
@@ -6416,7 +6416,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5188,
+      "line": 5198,
       "categories": [
         "mapping"
       ],
@@ -6425,7 +6425,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5198,
+      "line": 5208,
       "categories": [
         "mapping"
       ],
@@ -6434,7 +6434,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5219,
+      "line": 5229,
       "categories": [
         "mapping"
       ],
@@ -6443,7 +6443,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5231,
+      "line": 5241,
       "categories": [
         "mapping"
       ],
@@ -6452,7 +6452,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5254,
+      "line": 5264,
       "categories": [
         "mapping"
       ],
@@ -6461,7 +6461,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5343,
+      "line": 5353,
       "categories": [
         "mapping"
       ],
@@ -6470,7 +6470,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5399,
+      "line": 5409,
       "categories": [
         "mapping"
       ],
@@ -6479,7 +6479,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5464,
+      "line": 5474,
       "categories": [
         "mapping"
       ],
@@ -6488,7 +6488,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5465,
+      "line": 5475,
       "categories": [
         "mapping"
       ],
@@ -6497,7 +6497,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5467,
+      "line": 5477,
       "categories": [
         "mapping"
       ],
@@ -6506,7 +6506,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5481,
+      "line": 5491,
       "categories": [
         "mapping"
       ],
@@ -6515,7 +6515,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5483,
+      "line": 5493,
       "categories": [
         "mapping"
       ],
@@ -6524,7 +6524,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5498,
+      "line": 5508,
       "categories": [
         "description_guard"
       ],
@@ -6533,7 +6533,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5501,
+      "line": 5511,
       "categories": [
         "mapping"
       ],
@@ -6542,7 +6542,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5513,
+      "line": 5523,
       "categories": [
         "mapping"
       ],
@@ -6551,7 +6551,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5547,
+      "line": 5557,
       "categories": [
         "mapping"
       ],
@@ -6560,7 +6560,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5595,
+      "line": 5605,
       "categories": [
         "mapping"
       ],
@@ -6569,7 +6569,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5602,
+      "line": 5612,
       "categories": [
         "mapping"
       ],
@@ -6578,7 +6578,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5623,
+      "line": 5633,
       "categories": [
         "mapping"
       ],
@@ -6587,7 +6587,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5633,
+      "line": 5643,
       "categories": [
         "mapping"
       ],
@@ -6596,7 +6596,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5635,
+      "line": 5645,
       "categories": [
         "mapping"
       ],
@@ -6605,7 +6605,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5647,
+      "line": 5657,
       "categories": [
         "mapping"
       ],
@@ -6614,7 +6614,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5649,
+      "line": 5659,
       "categories": [
         "mapping"
       ],
@@ -6623,7 +6623,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5652,
+      "line": 5662,
       "categories": [
         "mapping"
       ],
@@ -6632,7 +6632,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5772,
+      "line": 5782,
       "categories": [
         "mapping"
       ],
@@ -6641,7 +6641,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5776,
+      "line": 5786,
       "categories": [
         "mapping"
       ],
@@ -6650,7 +6650,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5793,
+      "line": 5803,
       "categories": [
         "mapping"
       ],
@@ -6659,7 +6659,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5833,
+      "line": 5843,
       "categories": [
         "mapping"
       ],
@@ -6668,7 +6668,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5913,
+      "line": 5923,
       "categories": [
         "mapping"
       ],
@@ -6677,7 +6677,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5915,
+      "line": 5925,
       "categories": [
         "mapping"
       ],
@@ -6686,7 +6686,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5931,
+      "line": 5941,
       "categories": [
         "mapping"
       ],
@@ -6695,7 +6695,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5932,
+      "line": 5942,
       "categories": [
         "mapping"
       ],
@@ -6704,7 +6704,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5936,
+      "line": 5946,
       "categories": [
         "mapping"
       ],
@@ -6713,7 +6713,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5940,
+      "line": 5950,
       "categories": [
         "mapping"
       ],
@@ -6722,7 +6722,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5958,
+      "line": 5968,
       "categories": [
         "mapping"
       ],
@@ -6731,7 +6731,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5961,
+      "line": 5971,
       "categories": [
         "mapping"
       ],
@@ -6740,7 +6740,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5974,
+      "line": 5984,
       "categories": [
         "mapping"
       ],
@@ -6749,7 +6749,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5976,
+      "line": 5986,
       "categories": [
         "mapping"
       ],
@@ -6758,7 +6758,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5987,
+      "line": 5997,
       "categories": [
         "mapping"
       ],
@@ -6767,7 +6767,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5996,
+      "line": 6006,
       "categories": [
         "mapping"
       ],
@@ -6776,7 +6776,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6009,
+      "line": 6019,
       "categories": [
         "mapping"
       ],
@@ -6785,7 +6785,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6020,
+      "line": 6030,
       "categories": [
         "mapping"
       ],
@@ -6794,20 +6794,11 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6030,
+      "line": 6040,
       "categories": [
         "mapping"
       ],
       "text": "MmapRefusal::Internal(\"mmap locked range population failed\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6108,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"protection publication failed (anonymous mapping)\"),",
       "scope_kind": "production_callsite"
     },
     {
@@ -6816,12 +6807,21 @@
       "categories": [
         "mapping"
       ],
+      "text": "MmapRefusal::Internal(\"protection publication failed (anonymous mapping)\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 6128,
+      "categories": [
+        "mapping"
+      ],
       "text": "MmapRefusal::Internal(\"mmap locked range population failed\"),",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6138,
+      "line": 6148,
       "categories": [
         "mapping"
       ],
@@ -6830,7 +6830,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6207,
+      "line": 6217,
       "categories": [
         "mapping"
       ],
@@ -6839,7 +6839,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6211,
+      "line": 6221,
       "categories": [
         "mapping"
       ],
@@ -6848,7 +6848,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6232,
+      "line": 6243,
       "categories": [
         "description_guard"
       ],
@@ -6857,7 +6857,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6239,
+      "line": 6250,
       "categories": [
         "description_guard"
       ],
@@ -6866,7 +6866,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6254,
+      "line": 6265,
       "categories": [
         "description_guard"
       ],
@@ -6875,7 +6875,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6269,
+      "line": 6280,
       "categories": [
         "mapping"
       ],
@@ -6884,7 +6884,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6307,
+      "line": 6318,
       "categories": [
         "mapping"
       ],
@@ -6893,7 +6893,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6375,
+      "line": 6386,
       "categories": [
         "mapping"
       ],
@@ -6902,7 +6902,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6384,
+      "line": 6395,
       "categories": [
         "mapping"
       ],
@@ -6911,7 +6911,34 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6392,
+      "line": 6404,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap of packet ring with non-zero offset\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 6412,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap of packet socket without ring\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 6419,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap size does not match packet ring size\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 6429,
       "categories": [
         "mapping"
       ],
@@ -6920,7 +6947,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6402,
+      "line": 6439,
       "categories": [
         "mapping"
       ],
@@ -6929,7 +6956,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6405,
+      "line": 6442,
       "categories": [
         "mapping"
       ],
@@ -6938,7 +6965,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6410,
+      "line": 6447,
       "categories": [
         "mapping"
       ],
@@ -6947,7 +6974,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6418,
+      "line": 6455,
       "categories": [
         "mapping"
       ],
@@ -6956,7 +6983,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6458,
+      "line": 6495,
       "categories": [
         "mapping"
       ],
@@ -6965,7 +6992,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6465,
+      "line": 6502,
       "categories": [
         "mapping"
       ],
@@ -6974,7 +7001,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6512,
+      "line": 6552,
       "categories": [
         "mapping"
       ],
@@ -6983,7 +7010,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6513,
+      "line": 6553,
       "categories": [
         "mapping"
       ],
@@ -6992,7 +7019,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6519,
+      "line": 6559,
       "categories": [
         "mapping"
       ],
@@ -7001,7 +7028,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6536,
+      "line": 6576,
       "categories": [
         "description_guard"
       ],
@@ -7010,7 +7037,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6622,
+      "line": 6662,
       "categories": [
         "mapping"
       ],
@@ -7019,7 +7046,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6641,
+      "line": 6681,
       "categories": [
         "mapping"
       ],
@@ -7028,7 +7055,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6665,
+      "line": 6705,
       "categories": [
         "mapping"
       ],
@@ -7037,7 +7064,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6732,
+      "line": 6772,
       "categories": [
         "mapping"
       ],
@@ -7046,7 +7073,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6895,
+      "line": 6938,
       "categories": [
         "mapping"
       ],
@@ -7055,7 +7082,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6898,
+      "line": 6941,
       "categories": [
         "mapping"
       ],
@@ -7064,7 +7091,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6916,
+      "line": 6959,
       "categories": [
         "mapping"
       ],
@@ -7073,7 +7100,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6981,
+      "line": 7024,
       "categories": [
         "mapping"
       ],
@@ -7082,7 +7109,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7204,
+      "line": 7247,
       "categories": [
         "mapping"
       ],
@@ -7091,7 +7118,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7205,
+      "line": 7248,
       "categories": [
         "mapping"
       ],
@@ -7100,7 +7127,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7279,
+      "line": 7322,
       "categories": [
         "mapping"
       ],
@@ -7109,7 +7136,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7280,
+      "line": 7323,
       "categories": [
         "mapping"
       ],
@@ -7118,7 +7145,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7283,
+      "line": 7326,
       "categories": [
         "mapping"
       ],
@@ -7127,7 +7154,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7291,
+      "line": 7334,
       "categories": [
         "mapping"
       ],
@@ -7136,7 +7163,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7341,
+      "line": 7384,
       "categories": [
         "mapping"
       ],
@@ -7145,7 +7172,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7630,
+      "line": 7673,
       "categories": [
         "mapping"
       ],
@@ -7154,7 +7181,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7659,
+      "line": 7702,
       "categories": [
         "mapping"
       ],
@@ -7163,7 +7190,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7684,
+      "line": 7727,
       "categories": [
         "mapping"
       ],
@@ -7172,7 +7199,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7696,
+      "line": 7739,
       "categories": [
         "mapping"
       ],
@@ -7181,7 +7208,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7704,
+      "line": 7747,
       "categories": [
         "mapping"
       ],
@@ -7190,7 +7217,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7705,
+      "line": 7748,
       "categories": [
         "mapping"
       ],
@@ -7199,7 +7226,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7706,
+      "line": 7749,
       "categories": [
         "mapping"
       ],
@@ -7208,7 +7235,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7713,
+      "line": 7756,
       "categories": [
         "mapping"
       ],
@@ -7217,7 +7244,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7748,
+      "line": 7791,
       "categories": [
         "mapping"
       ],
@@ -7226,7 +7253,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7775,
+      "line": 7818,
       "categories": [
         "mapping"
       ],
@@ -7235,7 +7262,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7777,
+      "line": 7820,
       "categories": [
         "mapping"
       ],
@@ -7244,7 +7271,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7778,
+      "line": 7821,
       "categories": [
         "mapping"
       ],
@@ -7253,7 +7280,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7806,
+      "line": 7849,
       "categories": [
         "mapping"
       ],
@@ -7262,7 +7289,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7839,
+      "line": 7882,
       "categories": [
         "mapping"
       ],
@@ -7271,7 +7298,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7855,
+      "line": 7898,
       "categories": [
         "mapping"
       ],
@@ -7280,7 +7307,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7856,
+      "line": 7899,
       "categories": [
         "mapping"
       ],
@@ -7289,7 +7316,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7859,
+      "line": 7902,
       "categories": [
         "mapping"
       ],
@@ -7298,7 +7325,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7901,
+      "line": 7944,
       "categories": [
         "mapping"
       ],
@@ -7307,7 +7334,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7937,
+      "line": 7980,
       "categories": [
         "mapping"
       ],
@@ -7316,7 +7343,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7938,
+      "line": 7981,
       "categories": [
         "mapping"
       ],
@@ -7325,7 +7352,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7992,
+      "line": 8035,
       "categories": [
         "mapping"
       ],
@@ -7334,7 +7361,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7994,
+      "line": 8037,
       "categories": [
         "mapping"
       ],
@@ -7343,7 +7370,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8102,
+      "line": 8145,
       "categories": [
         "mapping"
       ],
@@ -7352,7 +7379,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8143,
+      "line": 8186,
       "categories": [
         "mapping"
       ],
@@ -7361,7 +7388,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8149,
+      "line": 8192,
       "categories": [
         "mapping"
       ],
@@ -7370,7 +7397,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8152,
+      "line": 8195,
       "categories": [
         "mapping"
       ],
@@ -7379,7 +7406,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8233,
+      "line": 8276,
       "categories": [
         "mapping"
       ],
@@ -7388,7 +7415,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8275,
+      "line": 8318,
       "categories": [
         "mapping"
       ],
@@ -7397,7 +7424,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8277,
+      "line": 8320,
       "categories": [
         "mapping"
       ],
@@ -7406,7 +7433,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8355,
+      "line": 8398,
       "categories": [
         "mapping"
       ],
@@ -7415,7 +7442,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8357,
+      "line": 8400,
       "categories": [
         "mapping"
       ],
@@ -7424,7 +7451,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8603,
+      "line": 8646,
       "categories": [
         "mapping"
       ],
@@ -7433,7 +7460,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8615,
+      "line": 8658,
       "categories": [
         "mapping"
       ],
@@ -7442,7 +7469,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8639,
+      "line": 8682,
       "categories": [
         "mapping"
       ],
@@ -7451,7 +7478,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8689,
+      "line": 8732,
       "categories": [
         "mapping"
       ],
@@ -7460,7 +7487,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8694,
+      "line": 8737,
       "categories": [
         "mapping"
       ],
@@ -7469,7 +7496,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8745,
+      "line": 8788,
       "categories": [
         "mapping"
       ],
@@ -7478,7 +7505,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8755,
+      "line": 8798,
       "categories": [
         "mapping"
       ],
@@ -7487,7 +7514,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8763,
+      "line": 8806,
       "categories": [
         "mapping"
       ],
@@ -7496,7 +7523,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8767,
+      "line": 8810,
       "categories": [
         "mapping"
       ],
@@ -7505,7 +7532,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8815,
+      "line": 8858,
       "categories": [
         "mapping"
       ],
@@ -7514,7 +7541,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8935,
+      "line": 8978,
       "categories": [
         "mapping"
       ],
@@ -7523,7 +7550,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8936,
+      "line": 8979,
       "categories": [
         "mapping"
       ],
@@ -7532,7 +7559,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8937,
+      "line": 8980,
       "categories": [
         "mapping"
       ],
@@ -7541,7 +7568,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8939,
+      "line": 8982,
       "categories": [
         "mapping"
       ],
@@ -7550,7 +7577,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8967,
+      "line": 9010,
       "categories": [
         "mapping"
       ],
@@ -7559,7 +7586,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8980,
+      "line": 9023,
       "categories": [
         "mapping"
       ],
@@ -7568,7 +7595,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9003,
+      "line": 9046,
       "categories": [
         "mapping"
       ],
@@ -7577,7 +7604,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9075,
+      "line": 9118,
       "categories": [
         "mapping"
       ],
@@ -7586,7 +7613,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9113,
+      "line": 9156,
       "categories": [
         "mapping"
       ],
@@ -7595,7 +7622,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9115,
+      "line": 9158,
       "categories": [
         "mapping"
       ],
@@ -7604,7 +7631,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9197,
+      "line": 9240,
       "categories": [
         "mapping"
       ],
@@ -7613,7 +7640,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9205,
+      "line": 9248,
       "categories": [
         "mapping"
       ],
@@ -7622,7 +7649,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9206,
+      "line": 9249,
       "categories": [
         "mapping"
       ],
@@ -7631,7 +7658,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9246,
+      "line": 9289,
       "categories": [
         "mapping"
       ],
@@ -7640,7 +7667,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9562,
+      "line": 9605,
       "categories": [
         "mapping"
       ],
@@ -7649,7 +7676,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9586,
+      "line": 9629,
       "categories": [
         "mapping"
       ],
@@ -7658,7 +7685,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9758,
+      "line": 9801,
       "categories": [
         "mapping"
       ],
@@ -7667,7 +7694,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9761,
+      "line": 9804,
       "categories": [
         "mapping"
       ],
@@ -8991,7 +9018,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 392,
+      "line": 395,
       "categories": [
         "stream"
       ],
@@ -9000,7 +9027,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 434,
+      "line": 437,
       "categories": [
         "mapping"
       ],
@@ -9009,7 +9036,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 445,
+      "line": 448,
       "categories": [
         "description_guard"
       ],
@@ -9018,7 +9045,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 579,
+      "line": 582,
       "categories": [
         "description_guard"
       ],
@@ -9027,7 +9054,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 592,
+      "line": 595,
       "categories": [
         "description_guard"
       ],
@@ -9036,7 +9063,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 599,
+      "line": 602,
       "categories": [
         "description_guard"
       ],
@@ -9045,7 +9072,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 608,
+      "line": 611,
       "categories": [
         "description_guard"
       ],
@@ -9054,7 +9081,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 617,
+      "line": 620,
       "categories": [
         "description_guard"
       ],
@@ -9063,7 +9090,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 627,
+      "line": 630,
       "categories": [
         "description_guard"
       ],
@@ -9072,7 +9099,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 636,
+      "line": 639,
       "categories": [
         "description_guard"
       ],
@@ -9081,7 +9108,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 647,
+      "line": 650,
       "categories": [
         "description_guard"
       ],
@@ -9090,7 +9117,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 685,
+      "line": 688,
       "categories": [
         "description_guard"
       ],
@@ -9099,7 +9126,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 776,
+      "line": 779,
       "categories": [
         "description_guard"
       ],
@@ -9108,7 +9135,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 822,
+      "line": 825,
       "categories": [
         "description_guard"
       ],
@@ -9117,7 +9144,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 832,
+      "line": 836,
       "categories": [
         "description_guard"
       ],
@@ -9126,7 +9153,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 851,
+      "line": 858,
       "categories": [
         "description_guard"
       ],
@@ -9135,7 +9162,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 861,
+      "line": 869,
       "categories": [
         "description_guard"
       ],
@@ -9144,7 +9171,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 928,
+      "line": 936,
       "categories": [
         "epoll"
       ],
@@ -9153,7 +9180,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 941,
+      "line": 949,
       "categories": [
         "description_guard"
       ],
@@ -9162,7 +9189,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 955,
+      "line": 963,
       "categories": [
         "description_guard"
       ],
@@ -9171,7 +9198,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 1002,
+      "line": 1010,
       "categories": [
         "description_guard"
       ],
@@ -9180,7 +9207,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 1213,
+      "line": 1221,
       "categories": [
         "mapping"
       ],
@@ -9189,7 +9216,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 1443,
+      "line": 1457,
       "categories": [
         "table_guard"
       ],
@@ -9198,7 +9225,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 1467,
+      "line": 1481,
       "categories": [
         "description_guard"
       ],
@@ -9207,7 +9234,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 1788,
+      "line": 1811,
       "categories": [
         "description_guard"
       ],
@@ -9216,7 +9243,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 1893,
+      "line": 1916,
       "categories": [
         "description_guard"
       ],
@@ -9225,7 +9252,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 1927,
+      "line": 1950,
       "categories": [
         "description_guard"
       ],
@@ -9234,7 +9261,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2195,
+      "line": 2218,
       "categories": [
         "description_guard"
       ],
@@ -9243,7 +9270,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2204,
+      "line": 2227,
       "categories": [
         "description_guard"
       ],
@@ -9252,7 +9279,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2275,
+      "line": 2307,
       "categories": [
         "description_guard"
       ],
@@ -9261,7 +9288,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/lifecycle.rs",
-      "line": 2373,
+      "line": 2412,
       "categories": [
         "description_guard"
       ],
@@ -9369,7 +9396,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 499,
+      "line": 512,
       "categories": [
         "description_guard"
       ],
@@ -9378,7 +9405,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 601,
+      "line": 614,
       "categories": [
         "description_guard"
       ],
@@ -9387,7 +9414,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 702,
+      "line": 724,
       "categories": [
         "mapping"
       ],
@@ -9396,7 +9423,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 724,
+      "line": 746,
       "categories": [
         "description_guard"
       ],
@@ -9405,7 +9432,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 872,
+      "line": 894,
       "categories": [
         "description_guard"
       ],
@@ -9414,7 +9441,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 1039,
+      "line": 1061,
       "categories": [
         "description_guard"
       ],
@@ -9423,7 +9450,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 1126,
+      "line": 1148,
       "categories": [
         "stream"
       ],
@@ -9432,7 +9459,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 1260,
+      "line": 1282,
       "categories": [
         "description_guard"
       ],
@@ -9441,7 +9468,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/send_recv.rs",
-      "line": 1450,
+      "line": 1472,
       "categories": [
         "description_guard"
       ],
@@ -9450,7 +9477,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 103,
+      "line": 105,
       "categories": [
         "description_guard"
       ],
@@ -9459,7 +9486,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 167,
+      "line": 174,
       "categories": [
         "description_guard"
       ],
@@ -9468,7 +9495,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 219,
+      "line": 226,
       "categories": [
         "description_guard"
       ],
@@ -9477,7 +9504,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 238,
+      "line": 245,
       "categories": [
         "description_guard"
       ],
@@ -9486,7 +9513,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 278,
+      "line": 285,
       "categories": [
         "description_guard"
       ],
@@ -9495,7 +9522,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 321,
+      "line": 328,
       "categories": [
         "description_guard"
       ],
@@ -9504,7 +9531,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 396,
+      "line": 403,
       "categories": [
         "description_guard"
       ],
@@ -9513,7 +9540,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 508,
+      "line": 515,
       "categories": [
         "description_guard"
       ],
@@ -9522,7 +9549,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 584,
+      "line": 609,
       "categories": [
         "description_guard"
       ],
@@ -9531,7 +9558,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 619,
+      "line": 644,
       "categories": [
         "description_guard"
       ],
@@ -9540,7 +9567,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/sockopt.rs",
-      "line": 645,
+      "line": 670,
       "categories": [
         "description_guard"
       ],
@@ -9657,7 +9684,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-      "line": 1379,
+      "line": 1380,
       "categories": [
         "mapping"
       ],
@@ -9666,7 +9693,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-      "line": 1849,
+      "line": 1850,
       "categories": [
         "mapping"
       ],
@@ -9675,7 +9702,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-      "line": 2840,
+      "line": 2841,
       "categories": [
         "epoll"
       ],
@@ -9684,7 +9711,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-      "line": 3269,
+      "line": 3274,
       "categories": [
         "epoll",
         "mapping"
@@ -9730,7 +9757,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 309,
+      "line": 310,
       "categories": [
         "epoll"
       ],
@@ -9739,7 +9766,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 329,
+      "line": 330,
       "categories": [
         "epoll"
       ],
@@ -9748,7 +9775,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 331,
+      "line": 332,
       "categories": [
         "stream"
       ],
@@ -9757,7 +9784,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 361,
+      "line": 362,
       "categories": [
         "description_guard"
       ],
@@ -9766,7 +9793,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 381,
+      "line": 382,
       "categories": [
         "epoll"
       ],
@@ -9775,7 +9802,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 401,
+      "line": 402,
       "categories": [
         "epoll"
       ],
@@ -9784,7 +9811,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 410,
+      "line": 411,
       "categories": [
         "description_guard"
       ],
@@ -9793,7 +9820,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 430,
+      "line": 431,
       "categories": [
         "epoll"
       ],
@@ -9802,7 +9829,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 432,
+      "line": 433,
       "categories": [
         "epoll"
       ],
@@ -9811,7 +9838,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 436,
+      "line": 437,
       "categories": [
         "epoll"
       ],
@@ -9820,7 +9847,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 460,
+      "line": 461,
       "categories": [
         "epoll"
       ],
@@ -9829,7 +9856,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 483,
+      "line": 484,
       "categories": [
         "description_guard"
       ],
@@ -9838,7 +9865,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 493,
+      "line": 494,
       "categories": [
         "epoll"
       ],
@@ -9847,7 +9874,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 495,
+      "line": 496,
       "categories": [
         "epoll"
       ],
@@ -9856,7 +9883,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 500,
+      "line": 501,
       "categories": [
         "epoll"
       ],
@@ -9865,7 +9892,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 594,
+      "line": 595,
       "categories": [
         "epoll"
       ],
@@ -9874,7 +9901,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 598,
+      "line": 599,
       "categories": [
         "description_guard"
       ],
@@ -9883,7 +9910,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 707,
+      "line": 708,
       "categories": [
         "epoll"
       ],
@@ -9892,7 +9919,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 762,
+      "line": 763,
       "categories": [
         "stream"
       ],
@@ -9901,7 +9928,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 767,
+      "line": 768,
       "categories": [
         "epoll",
         "stream"
@@ -9911,7 +9938,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 775,
+      "line": 776,
       "categories": [
         "stream"
       ],
@@ -9920,7 +9947,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 823,
+      "line": 824,
       "categories": [
         "epoll"
       ],
@@ -9929,7 +9956,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 839,
+      "line": 840,
       "categories": [
         "epoll"
       ],
@@ -9938,7 +9965,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 841,
+      "line": 842,
       "categories": [
         "epoll"
       ],
@@ -9947,7 +9974,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 846,
+      "line": 847,
       "categories": [
         "epoll"
       ],
@@ -9956,7 +9983,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 851,
+      "line": 852,
       "categories": [
         "epoll"
       ],
@@ -9965,7 +9992,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 859,
+      "line": 860,
       "categories": [
         "epoll"
       ],
@@ -9974,7 +10001,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 885,
+      "line": 886,
       "categories": [
         "epoll"
       ],
@@ -9983,7 +10010,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 900,
+      "line": 901,
       "categories": [
         "epoll"
       ],
@@ -9992,7 +10019,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 916,
+      "line": 917,
       "categories": [
         "epoll"
       ],
@@ -10001,7 +10028,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 919,
+      "line": 920,
       "categories": [
         "epoll"
       ],
@@ -10010,7 +10037,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 944,
+      "line": 945,
       "categories": [
         "epoll"
       ],
@@ -10019,7 +10046,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 954,
+      "line": 955,
       "categories": [
         "epoll"
       ],
@@ -10028,7 +10055,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 973,
+      "line": 974,
       "categories": [
         "epoll"
       ],
@@ -10037,7 +10064,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 976,
+      "line": 977,
       "categories": [
         "epoll"
       ],
@@ -10046,7 +10073,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1057,
+      "line": 1058,
       "categories": [
         "epoll"
       ],
@@ -10055,20 +10082,11 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1080,
+      "line": 1081,
       "categories": [
         "epoll"
       ],
       "text": "Arc::new(RwLock::new(OpenDescription::Epoll {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1098,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// Before data is queued in original child_desc (Netlink), epoll is not ready even though fd 10 (EventFd) is ready!",
       "scope_kind": "test_or_definition"
     },
     {
@@ -10077,12 +10095,21 @@
       "categories": [
         "epoll"
       ],
+      "text": "// Before data is queued in original child_desc (Netlink), epoll is not ready even though fd 10 (EventFd) is ready!",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net.rs",
+      "line": 1100,
+      "categories": [
+        "epoll"
+      ],
       "text": "let epoll_file = dispatcher.open_file(epfd).expect(\"epoll file\");",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1105,
+      "line": 1106,
       "categories": [
         "epoll"
       ],
@@ -10091,7 +10118,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1113,
+      "line": 1114,
       "categories": [
         "epoll"
       ],
@@ -10100,7 +10127,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1120,
+      "line": 1121,
       "categories": [
         "epoll"
       ],
@@ -10109,7 +10136,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1232,
+      "line": 1233,
       "categories": [
         "epoll"
       ],
@@ -10118,7 +10145,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1247,
+      "line": 1248,
       "categories": [
         "epoll"
       ],
@@ -10127,7 +10154,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1279,
+      "line": 1280,
       "categories": [
         "epoll"
       ],
@@ -10136,7 +10163,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1282,
+      "line": 1283,
       "categories": [
         "epoll"
       ],
@@ -10145,7 +10172,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1286,
+      "line": 1287,
       "categories": [
         "epoll"
       ],
@@ -10154,7 +10181,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1334,
+      "line": 1335,
       "categories": [
         "epoll"
       ],
@@ -10163,7 +10190,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1363,
+      "line": 1364,
       "categories": [
         "epoll"
       ],
@@ -10172,7 +10199,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1368,
+      "line": 1369,
       "categories": [
         "epoll"
       ],
@@ -10181,7 +10208,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1370,
+      "line": 1371,
       "categories": [
         "epoll"
       ],
@@ -10190,7 +10217,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1393,
+      "line": 1394,
       "categories": [
         "epoll"
       ],
@@ -10199,7 +10226,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1408,
+      "line": 1409,
       "categories": [
         "epoll"
       ],
@@ -10208,7 +10235,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1453,
+      "line": 1454,
       "categories": [
         "epoll"
       ],
@@ -10217,7 +10244,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1468,
+      "line": 1469,
       "categories": [
         "epoll"
       ],
@@ -10226,7 +10253,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1593,
+      "line": 1594,
       "categories": [
         "epoll"
       ],
@@ -10235,7 +10262,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 2379,
+      "line": 2380,
       "categories": [
         "epoll"
       ],
