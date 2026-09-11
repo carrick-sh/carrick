@@ -3122,7 +3122,7 @@ mod tests {
             // This unit test self-spawns to isolate a process-global abort
             // boundary while proving pending exec error preservation. It is
             // not production host-process-per-guest architecture.
-            ("vcpu_loop/mod.rs", [0, 0, 1]),
+            ("vcpu_loop/exec.rs", [0, 0, 1]),
             // Both are unit tests that fork a child to BE the tracee, because
             // a ptrace stop needs a real host parent/child pair:
             // 1. `ptrace_signal_stop_queued_host_sigkill_remains_terminal`
