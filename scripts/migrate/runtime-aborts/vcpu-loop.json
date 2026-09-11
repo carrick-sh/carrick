@@ -513,7 +513,7 @@
       "domain": "vcpu_loop::panic_backstop"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "InjectedExecutionLeaseSlot::install",
       "ordinal_in_function": 1,
       "fingerprint": "4c6be0dc36ee7c9028ad8629ea49726a2b7a2dab977561d003352b34a2b99c18",
@@ -524,7 +524,7 @@
       "domain": "vcpu_loop::runtime_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "<InjectedExecutionLeasePublication<'_> as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "306e2a699851c505ee11d5fefac8096a7fd18a73d16a758eba2f408c728ebbf3",
@@ -535,7 +535,7 @@
       "domain": "vcpu_loop::runtime_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ExecutionLeaseCell::lock",
       "ordinal_in_function": 1,
       "fingerprint": "ccfae7710b7b253023f63154b4e16d94fc9e1da11914a4833c9dcc13a92e629b",
@@ -568,7 +568,7 @@
       "domain": "vcpu_loop::fail_stop"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::external_exec_failure",
       "ordinal_in_function": 1,
       "fingerprint": "5c221d1c5951ce60deff5ffb8bc1ffbbea6fefb1cafe0d9ae941a05126caf7d4",
@@ -579,7 +579,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::complete_persistent_process_fork",
       "ordinal_in_function": 1,
       "fingerprint": "d04d3cf2dddb3fc526c3e21fe575de3c812f0a58807de4ccc269879afa51ef6f",
@@ -590,7 +590,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 1,
       "fingerprint": "78268e8683d8cd0eb9f294fee34286b0679f7e723793f637cdf98c8a5adeba47",
@@ -601,7 +601,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 2,
       "fingerprint": "b8d5be8e3d193868a2ff7f3b548c6db405bc543f82924d64b54828fc5d1e9692",
@@ -612,7 +612,7 @@
       "domain": "hvpatch::task_backend_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 3,
       "fingerprint": "886992eca82bdf5cee9be53409256795fdda2ab4ec8fae6db6814f65867badde",
@@ -623,7 +623,7 @@
       "domain": "hvpatch::mm_reservation"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 4,
       "fingerprint": "7298a47efc115882ec9b99ce277566034b01aeed9f21d15fa7325f02551f5bf0",
@@ -634,7 +634,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 5,
       "fingerprint": "aaab67d87f0acf9090e6b1e0e061cc30de567308bda8c2b07d24f0944574546f",
@@ -645,7 +645,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 6,
       "fingerprint": "aaab67d87f0acf9090e6b1e0e061cc30de567308bda8c2b07d24f0944574546f",
@@ -656,7 +656,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 7,
       "fingerprint": "aaab67d87f0acf9090e6b1e0e061cc30de567308bda8c2b07d24f0944574546f",
@@ -667,7 +667,7 @@
       "domain": "kernel::container_scope"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 8,
       "fingerprint": "ee88ef521c0d6d321ecc57351f4262c52b244ed436add9e04eb528cd639edbac",
@@ -678,7 +678,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 9,
       "fingerprint": "e1c899c669319b9c7cd4c44d4cbd832e815891f26a1640be9cee9a4249196b82",
@@ -689,7 +689,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 10,
       "fingerprint": "d1a399bae70e4148a675ef447a87990f22cd0ca49858fd5f55b3326765a139f1",
@@ -700,7 +700,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 11,
       "fingerprint": "df71cd7859f1dfe8aaa6587c06cba6ddea4e62dfc526e3faf0c3630179256cce",
@@ -711,7 +711,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finalize_persistent_process_terminal",
       "ordinal_in_function": 12,
       "fingerprint": "285df17da9ee6db0c7eea1daf4abd51afde16a3ed8f0378849b7f96b46da2bfc",
@@ -722,7 +722,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::settle_persistent_thread_exit",
       "ordinal_in_function": 1,
       "fingerprint": "48279ff9f401a234c075afebc06ffb040633b231f9db920b2a8a1a207bb796c6",
@@ -733,7 +733,7 @@
       "domain": "kernel::thread_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::park_thread_exit_retry",
       "ordinal_in_function": 1,
       "fingerprint": "6fa9c7eca6d43b5bde86cd064660810c044a7f45367921222faab252356b0c92",
@@ -744,7 +744,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal",
       "ordinal_in_function": 1,
       "fingerprint": "3f55eea0ec01013c4b468af584c881ac2990ed9a0b03adbe205ecb6f9ce828ac",
@@ -755,7 +755,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_from_exec",
       "ordinal_in_function": 1,
       "fingerprint": "2cf58904b686baa94851caad73951ba9564795ab522cb1c0456f78ebf65c2198",
@@ -766,7 +766,7 @@
       "domain": "hvpatch::exec_terminal"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 1,
       "fingerprint": "43ca4472aa3e8813dba020fad0962a677d74e675acf8fbc9f2af75562b679006",
@@ -777,7 +777,7 @@
       "domain": "kernel::runtime_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 2,
       "fingerprint": "43ca4472aa3e8813dba020fad0962a677d74e675acf8fbc9f2af75562b679006",
@@ -788,7 +788,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 3,
       "fingerprint": "05c8e8c3b2bdadd3b2e5595c487ad729d86945d5133bb8ba3b37c1cb84c31b89",
@@ -799,7 +799,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 4,
       "fingerprint": "c024bf5a11ce35a0f0d274c6f44576eacc1ec1ca9bb2d9f39b6e7056fa3b76be",
@@ -810,7 +810,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::suspend_for_process_quiesce",
       "ordinal_in_function": 1,
       "fingerprint": "9d3516bf1e789152a414870414d79181d6ba8a0acc992806f838f5260e54d28a",
@@ -821,7 +821,7 @@
       "domain": "vcpu_loop::quiesce_barrier"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::suspend_for_job_control",
       "ordinal_in_function": 1,
       "fingerprint": "69b35f6fb785de358bc1d64d6981dfd36d37b66f995b8eb042e2619cfec7612a",
@@ -832,7 +832,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::rollback_published_hvpatch_clone",
       "ordinal_in_function": 1,
       "fingerprint": "75ca3530a052599b721c33bf3e2ef4b5ef5afdf1e33d6e238fe74a498e3cbbd4",
@@ -843,7 +843,7 @@
       "domain": "hvpatch::clone_rollback"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::rollback_published_hvpatch_clone",
       "ordinal_in_function": 2,
       "fingerprint": "2355330533945effdff44f6ba8488b378a81a82b08abdad0842cd3e4212b3c0b",
@@ -854,7 +854,7 @@
       "domain": "kernel::runtime_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::rollback_published_hvpatch_clone",
       "ordinal_in_function": 3,
       "fingerprint": "103af3822dc29a4d0a7cd6683690c849d9bf33fa4b874e531337c4f27e917d30",
@@ -865,7 +865,7 @@
       "domain": "hvpatch::clone_rollback"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::rollback_published_hvpatch_clone",
       "ordinal_in_function": 4,
       "fingerprint": "ef8f8b0b9fedd3612a020336dfc4c8291323db8cca2856a86124f89fefcb9b77",
@@ -876,7 +876,7 @@
       "domain": "hvpatch::clone_rollback"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 1,
       "fingerprint": "b10d38ed844c4ea049720b58c4490e4893557ee94dc9513219aae16a913301e2",
@@ -887,7 +887,7 @@
       "domain": "kernel::runtime_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 2,
       "fingerprint": "de17893e989a8e1e34f6342141769e16c2641dd480a9c05d04de0313265621fb",
@@ -898,7 +898,7 @@
       "domain": "hvpatch::task_backend_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 3,
       "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
@@ -909,7 +909,7 @@
       "domain": "hvpatch::clone_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 4,
       "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
@@ -920,7 +920,7 @@
       "domain": "kernel::runtime_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 5,
       "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
@@ -931,7 +931,7 @@
       "domain": "hvpatch::clone_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 6,
       "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
@@ -942,7 +942,7 @@
       "domain": "hvpatch::clone_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 7,
       "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
@@ -953,7 +953,7 @@
       "domain": "hvpatch::clone_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 8,
       "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
@@ -964,7 +964,7 @@
       "domain": "hvpatch::clone_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 9,
       "fingerprint": "7ec9790481f5c5c7e92e1ccb6e62891e1afe0da12a7ef925550d08773ff2b678",
@@ -975,7 +975,7 @@
       "domain": "hvpatch::clone_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 10,
       "fingerprint": "ab885957795106d97d43cf6a4dc09edf183d574503370a66252d281715f39aab",
@@ -986,7 +986,7 @@
       "domain": "kernel::runtime_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 11,
       "fingerprint": "14f60ad9d48f99e0c2f512c4d891648830590b365d56ede7112fef14ff5df9c8",
@@ -997,7 +997,7 @@
       "domain": "hvpatch::clone_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::spawn_persistent_hvpatch_clone_thread",
       "ordinal_in_function": 12,
       "fingerprint": "14f60ad9d48f99e0c2f512c4d891648830590b365d56ede7112fef14ff5df9c8",
@@ -1008,7 +1008,7 @@
       "domain": "hvpatch::clone_lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::finish",
       "ordinal_in_function": 1,
       "fingerprint": "294d25badc6d402f03978468b21181f54894070e35a9dd473f48b94e33b7b6a5",
@@ -1019,7 +1019,7 @@
       "domain": "vcpu_loop::lifecycle"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 1,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1030,7 +1030,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 2,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1041,7 +1041,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 3,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1052,7 +1052,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 4,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1063,7 +1063,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 5,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1074,7 +1074,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 6,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1085,7 +1085,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 7,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1096,7 +1096,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 8,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1107,7 +1107,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 9,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1118,7 +1118,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::service_outcome",
       "ordinal_in_function": 10,
       "fingerprint": "4613b1ee54466475f78e9557890c5f65b88499fb167d2ddc2487a056be3f4b7e",
@@ -1129,7 +1129,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::enter_terminal_with_outcome",
       "ordinal_in_function": 1,
       "fingerprint": "ee62fd99ae3bc1acc78e75e590a49bed484ccc679fa029b0d8d97723a1a5d197",
@@ -1140,7 +1140,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 1,
       "fingerprint": "9bab859303753b232f6aab25397b8801f9b652938e2e4f4bd826826272cfbd81",
@@ -1151,7 +1151,7 @@
       "domain": "vcpu_loop::service_context"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::poll",
       "ordinal_in_function": 1,
       "fingerprint": "cccfa7988489990ae04cef0d0182fde995ee65fc0e6958e370108f9af9d6616b",
@@ -1206,7 +1206,7 @@
       "domain": "vcpu_loop::process_membership"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "launch_persistent_hvpatch_job",
       "ordinal_in_function": 1,
       "fingerprint": "001145a7942e327fa94767856da674493ac15e6ec4b21cf13eb8d3e3446688c7",
@@ -1217,7 +1217,7 @@
       "domain": "vcpu_loop::job_launch"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "launch_persistent_hvpatch_job",
       "ordinal_in_function": 2,
       "fingerprint": "001145a7942e327fa94767856da674493ac15e6ec4b21cf13eb8d3e3446688c7",
@@ -1745,7 +1745,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::begin_persistent_process_terminal_with_claim",
       "ordinal_in_function": 5,
       "fingerprint": "c024bf5a11ce35a0f0d274c6f44576eacc1ec1ca9bb2d9f39b6e7056fa3b76be",
@@ -1756,7 +1756,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 1,
       "fingerprint": "27ee7a30c57c3e0a8198282c940c55396b10ba1cddb60bc44607f69d91e799dc",
@@ -1767,7 +1767,7 @@
       "domain": "hvpatch::exec_terminal"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 2,
       "fingerprint": "27ee7a30c57c3e0a8198282c940c55396b10ba1cddb60bc44607f69d91e799dc",
@@ -1778,7 +1778,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 3,
       "fingerprint": "7fb595d6e7a15cd3b901f5e5156a00b9a46ecb15125a24822219733a0d47cfcc",
@@ -1789,7 +1789,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 4,
       "fingerprint": "6c3ecf487f7e642b41e4107aefdf061943e0635285bcbd582e86dce969e750c9",
@@ -1800,7 +1800,7 @@
       "domain": "kernel::terminal_settlement"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "<ProductionHvpatchLoopJob<E> as ProductionHvpatchLoopPoll>::after_executor_failure_settlement",
       "ordinal_in_function": 5,
       "fingerprint": "960a7f81e74866622e620f27a76c59542bd3302a33d46955204569e885ab0114",
