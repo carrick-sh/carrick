@@ -28,7 +28,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::ids::LinuxTid;
-use super::objects::TaskRef;
+use super::objects::{TaskRef, ThreadExecutionState, ThreadRef};
 
 /// One task-local crash-capture attempt.
 ///
@@ -145,33 +145,39 @@ pub enum CrashQuorumPoll {
 /// The register files one fatal thread must collect before it may publish a
 /// core.
 ///
-/// Membership is re-read from the task on every [`poll`](Self::poll) rather
-/// than snapshotted once: a thread that retires mid-collection has genuinely
-/// stopped existing and must stop being expected.
+/// Membership is snapshotted at [`open`](Self::open) over the task's live
+/// census at the crash generation. The quorum blocks (interruptibly, no
+/// deadline) until every member in the census has published registers or been
+/// proven exited.
 pub struct CrashQuorum {
     task: TaskRef,
     generation: CrashCaptureGeneration,
+    census: Vec<ThreadRef>,
 }
 
 impl CrashQuorum {
     /// Open the quorum for `generation` over `task`'s live membership.
     pub fn open(task: TaskRef, generation: CrashCaptureGeneration) -> Self {
-        Self { task, generation }
+        let census: Vec<ThreadRef> = task.crash_capture_participants().into_threads().collect();
+        Self {
+            task,
+            generation,
+            census,
+        }
     }
 
     pub const fn generation(&self) -> CrashCaptureGeneration {
         self.generation
     }
 
-    /// Ask every live thread of the task for its vote.
+    /// Ask every thread in the census for its vote.
     ///
     /// A published vote counts even from a thread that has since left its vCPU
     /// loop — the registers were read at a valid safe point and stay valid.
-    /// A missing vote is only owed by a live participant.
+    /// A missing vote is owed until the thread publishes or is proven exited.
     pub fn poll(&self) -> CrashQuorumPoll {
-        let members = self.task.crash_capture_participants();
         let mut collected = Vec::new();
-        for thread in members.into_threads() {
+        for thread in &self.census {
             match thread.crash_vote(self.generation) {
                 Some(CrashRegisterVote::Published(registers)) => {
                     collected.push(CrashRegisterFile {
@@ -179,16 +185,37 @@ impl CrashQuorum {
                         registers: *registers,
                     });
                 }
-                Some(CrashRegisterVote::Withdrawn) => {}
-                None if thread.is_crash_safe_point_participant() => {
-                    return CrashQuorumPoll::Waiting(thread.key().tid);
-                }
-                None => {
+                Some(CrashRegisterVote::Withdrawn) => {
                     if let Some(registers) = thread.parked_registers() {
                         collected.push(CrashRegisterFile {
                             tid: thread.key().tid,
                             registers,
                         });
+                    }
+                }
+                None => {
+                    if self.task.thread(thread.key().tid).is_none()
+                        || matches!(
+                            thread.execution_state(),
+                            ThreadExecutionState::Exited { .. }
+                                | ThreadExecutionState::Failed { .. }
+                        )
+                    {
+                        if let Some(registers) = thread.parked_registers() {
+                            collected.push(CrashRegisterFile {
+                                tid: thread.key().tid,
+                                registers,
+                            });
+                        }
+                    } else if thread.is_crash_safe_point_participant() {
+                        return CrashQuorumPoll::Waiting(thread.key().tid);
+                    } else if let Some(registers) = thread.parked_registers() {
+                        collected.push(CrashRegisterFile {
+                            tid: thread.key().tid,
+                            registers,
+                        });
+                    } else {
+                        return CrashQuorumPoll::Waiting(thread.key().tid);
                     }
                 }
             }
@@ -261,6 +288,9 @@ mod tests {
 
         let authority = CrashCaptureAuthority::default();
         let generation = authority.issue().expect("capture generation");
+        leader
+            .thread()
+            .publish_crash_registers(generation, carrick_hal::Aarch64CoreRegisters::default());
         let quorum = CrashQuorum::open(leader.task().clone(), generation);
         assert!(matches!(
             quorum.poll(),
@@ -278,9 +308,92 @@ mod tests {
             refreshed_keys,
             std::collections::BTreeSet::from([leader_key])
         );
+        match quorum.poll() {
+            CrashQuorumPoll::Complete(registers) => {
+                assert_eq!(registers.len(), 1);
+                assert_eq!(registers[0].tid, leader.thread().key().tid);
+            }
+            other => panic!("expected Complete with leader registers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn crash_quorum_collects_published_registers_from_retiring_sibling() {
+        let (kernel, leader) = bootstrap(19_450);
+        let sibling = clone_sibling(&kernel, &leader, 19_451);
+        let sibling_tid = sibling.thread().key().tid;
+        let _participation = sibling
+            .thread()
+            .enter_crash_safe_point_participation()
+            .expect("crash safe-point participation");
+
+        let authority = CrashCaptureAuthority::default();
+        let generation = authority.issue().expect("capture generation");
+        leader
+            .thread()
+            .publish_crash_registers(generation, carrick_hal::Aarch64CoreRegisters::default());
+        let quorum = CrashQuorum::open(leader.task().clone(), generation);
         assert!(matches!(
             quorum.poll(),
-            CrashQuorumPoll::Complete(registers) if registers.is_empty()
+            CrashQuorumPoll::Waiting(tid) if tid == sibling_tid
+        ));
+
+        let mut regs = carrick_hal::Aarch64CoreRegisters::default();
+        regs.gprs[19] = 0x5255_4e4e_494e_4731;
+        sibling.thread().publish_crash_registers(generation, regs);
+
+        kernel.exit_thread(&sibling, None).expect("retire sibling");
+        match quorum.poll() {
+            CrashQuorumPoll::Complete(registers) => {
+                assert_eq!(registers.len(), 2);
+                let sibling_file = registers.iter().find(|r| r.tid == sibling_tid).unwrap();
+                assert_eq!(sibling_file.registers.gprs[19], 0x5255_4e4e_494e_4731);
+            }
+            other => panic!("expected Complete with 2 register files, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn crash_quorum_collects_parked_registers_from_blocked_sibling_without_vote() {
+        let (kernel, leader) = bootstrap(19_460);
+        let sibling = clone_sibling(&kernel, &leader, 19_461);
+        let sibling_tid = sibling.thread().key().tid;
+
+        let mut regs = carrick_hal::Aarch64CoreRegisters::default();
+        regs.gprs[19] = 0x424c_4f43_4b45_4431;
+        sibling.thread().stash_parked_registers(regs);
+
+        let authority = CrashCaptureAuthority::default();
+        let generation = authority.issue().expect("capture generation");
+        leader
+            .thread()
+            .publish_crash_registers(generation, carrick_hal::Aarch64CoreRegisters::default());
+        let quorum = CrashQuorum::open(leader.task().clone(), generation);
+        match quorum.poll() {
+            CrashQuorumPoll::Complete(registers) => {
+                assert_eq!(registers.len(), 2);
+                let sibling_file = registers.iter().find(|r| r.tid == sibling_tid).unwrap();
+                assert_eq!(sibling_file.registers.gprs[19], 0x424c_4f43_4b45_4431);
+            }
+            other => panic!("expected Complete with 2 register files, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn crash_quorum_waits_for_runnable_sibling_without_vote_or_parked_registers() {
+        let (kernel, leader) = bootstrap(19_470);
+        let sibling = clone_sibling(&kernel, &leader, 19_471);
+        let sibling_tid = sibling.thread().key().tid;
+
+        let authority = CrashCaptureAuthority::default();
+        let generation = authority.issue().expect("capture generation");
+        leader
+            .thread()
+            .publish_crash_registers(generation, carrick_hal::Aarch64CoreRegisters::default());
+        let quorum = CrashQuorum::open(leader.task().clone(), generation);
+        assert!(matches!(
+            quorum.poll(),
+            CrashQuorumPoll::Waiting(tid) if tid == sibling_tid
         ));
     }
 }

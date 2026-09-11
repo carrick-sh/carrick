@@ -373,7 +373,7 @@ where
             // parked at the barrier from a path with no readable register file.
             let quorum =
                 crate::kernel::CrashQuorum::open(std::sync::Arc::clone(context.task()), generation);
-            let collect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            // Structural fix: no wall-clock deadline; quorum blocks.
             let mut threads = loop {
                 match quorum.poll() {
                     crate::kernel::CrashQuorumPoll::Complete(files) => {
@@ -428,13 +428,13 @@ where
                             .collect::<Result<Vec<_>, RuntimeError>>()?;
                     }
                     crate::kernel::CrashQuorumPoll::Waiting(tid) => {
-                        if std::time::Instant::now() >= collect_deadline {
-                            return Err(RuntimeError::Configuration(format!(
-                                "core generation {} missing registers for tid {}",
-                                generation.get(),
-                                tid.raw()
-                            )));
-                        }
+                        let _ = tid;
+                        // Structural fix: capture blocks indefinitely
+                        // every live thread of the process at crash
+                        // generation has published or proven exited.
+                        // No deadline: under host CPU delay,
+                        // a timeout turns delay into lost siblings.
+                        // blocked.
                     }
                 }
                 self.kicker.kick_all_except(self.this_tid);

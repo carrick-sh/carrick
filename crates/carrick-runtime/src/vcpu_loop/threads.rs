@@ -721,6 +721,12 @@ where
         code: i32,
         traps: usize,
     ) -> PersistentThreadExitDisposition {
+        if !self.thread_exit_withdrawn {
+            let _ = self.stash_parked_registers(engine);
+            if self.publish_crash_registers_if_requested(engine).is_err() {
+                self.withdraw_from_crash_capture();
+            }
+        }
         // Runtime withdrawal (registry exit, kick unregister, host-signal
         // forget) runs EXACTLY ONCE across Busy retries: it is not
         // re-entrant, and the registry census it returns is only
