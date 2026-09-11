@@ -1699,13 +1699,9 @@ mod carrier_vm_custody_tests {
             .expect("initial guest entry setup");
         assert!(initial_rebind < initial_entry);
 
-        let exec = source
+        let exec = include_str!("execve_rebuild.rs")
             .split(concat!("pub(crate) fn execve_", "rebuild("))
             .nth(1)
-            .and_then(|tail| {
-                tail.split(concat!("pub(crate) fn restore_vcpu_", "into("))
-                    .next()
-            })
             .expect("exec rebuild body");
         assert!(
             exec.matches("reconcile_global_frame_owners_after_replay_in(")
@@ -3446,10 +3442,9 @@ mod carrier_vm_custody_tests {
                     .expect("shared handoff")
         );
 
-        let exec = source
+        let exec = include_str!("execve_rebuild.rs")
             .split(concat!("fn execve_rebuild_", "inner("))
             .nth(1)
-            .and_then(|tail| tail.split("impl HvfInner").next())
             .expect("exec rebuild body");
         assert!(exec.contains("SetupVmGuard::new(new_vm, true)"));
         assert!(exec.contains("SetupVcpuCleanup::PendingRaw"));
@@ -3942,7 +3937,8 @@ mod carrier_vm_custody_tests {
         let source = concat!(
             include_str!("../trap.rs"),
             include_str!("foreign_mm.rs"),
-            include_str!("global_frame.rs")
+            include_str!("global_frame.rs"),
+            include_str!("execve_rebuild.rs")
         );
         for (outer, inner) in [
             (

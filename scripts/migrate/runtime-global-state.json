@@ -2235,11 +2235,11 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs",
       "symbol": "exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS",
       "fingerprint": "7f4067c3ebd1a2fb346239d411c4c7966b024cdd7beb2939f3d49a0451111d5c",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS read in exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS read in exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS (crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var",
