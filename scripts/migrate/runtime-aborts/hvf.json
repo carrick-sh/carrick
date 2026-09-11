@@ -1313,7 +1313,7 @@
       "domain": "hvpatch::mm_authority"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
       "function": "fail_stop_partial_process_stage2_rollback",
       "ordinal_in_function": 1,
       "fingerprint": "f6080f81a91ae63729786043e999b75199e8c8acaefa2ae2b2fd42f28162bd59",
