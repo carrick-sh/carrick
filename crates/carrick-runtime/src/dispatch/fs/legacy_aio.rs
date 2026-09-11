@@ -275,3 +275,27 @@ pub(super) fn io_getevents<M: CurrentMmMemory>(
     }
     Ok(DispatchOutcome::Returned { value: 0 })
 }
+
+impl SyscallDispatcher {
+    define_syscall! {
+        fn io_setup(this, cx, nr_events: u64, ctxp: GuestPtr) {
+            io_setup(this, cx, nr_events, ctxp)
+        }
+
+        fn io_destroy(this, _cx, raw_ctx: u64) {
+            io_destroy(this, raw_ctx)
+        }
+
+        fn io_submit(this, cx, raw_ctx: u64, raw_count: u64, iocbpp: GuestPtr) {
+            io_submit(this, cx, raw_ctx, raw_count, iocbpp)
+        }
+
+        fn io_cancel(this, cx, raw_ctx: u64, iocb: GuestPtr, result: GuestPtr) {
+            io_cancel(this, cx, raw_ctx, iocb, result)
+        }
+
+        fn io_getevents(this, cx, raw_ctx: u64, min_nr: u64, nr: u64, events: GuestPtr, _timeout: GuestPtr) {
+            io_getevents(this, cx, raw_ctx, min_nr, nr, events)
+        }
+    }
+}

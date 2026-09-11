@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use super::DispatchOutcome;
+use super::*;
 use crate::dispatch::fd_table::{HostFdRef, make_readiness_pipe};
 use crate::dispatch::{FdWaitCompletion, WaitFds};
 
@@ -516,6 +516,66 @@ pub(crate) fn write_pipe(
         DispatchOutcome::errno(LINUX_EINTR)
     } else {
         DispatchOutcome::returned_len_or_errno(written)
+    }
+}
+
+impl SyscallDispatcher {
+    define_syscall! {
+        fn pipe2(this, cx, pipefd: GuestPtr, flags: u64) {
+            let address = pipefd.0;
+            let memory = &mut *cx.memory;
+            if super::LinuxPipe2Flags::from_bits(flags).is_none() {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+
+            let nonblock = flags & LINUX_O_NONBLOCK;
+            let fd_flags = linux_fd_flags_from_open_flags(flags);
+
+            let pipe_id = next_pipe_id();
+            let pipe = Arc::new(PipeInner::new(pipe_id, DEFAULT_PIPE_CAPACITY));
+
+            let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock);
+            read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+            let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock);
+            write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+
+            let read_open = OpenFile::from_open_description_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
+                    base: read_base,
+                    pipe: Arc::clone(&pipe),
+                })),
+                LINUX_O_RDONLY | nonblock,
+                fd_flags,
+            );
+            let write_open = OpenFile::from_open_description_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
+                    base: write_base,
+                    pipe,
+                })),
+                LINUX_O_WRONLY | nonblock,
+                fd_flags,
+            );
+            let Ok((read_fd, write_fd)) = this.install_fd_pair_at_or_above(3, read_open, write_open)
+            else {
+                return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
+            };
+            let pair = LinuxFdPair { read_fd, write_fd };
+            if write_kernel_struct_raw(memory, address, &pair).is_err() {
+                let removed = {
+                    let files = this.captured_file_table();
+                    let mut table = files.write_open_files();
+                    [table.remove(&read_fd), table.remove(&write_fd)]
+                };
+                for open_file in removed.into_iter().flatten() {
+                    this.close_open_file_and_free_pty(&open_file);
+                }
+                this.note_fd_closed(read_fd);
+                this.note_fd_closed(write_fd);
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
     }
 }
 

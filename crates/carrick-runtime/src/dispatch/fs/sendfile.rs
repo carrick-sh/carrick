@@ -288,4 +288,312 @@ impl SyscallDispatcher {
         };
         Ok(bytes)
     }
+
+    define_syscall! {
+        fn sendfile(this, cx, out_fd: Fd, in_fd: Fd, offset: GuestPtr, count: u64) {
+            let tid = cx.tid();
+
+            let out_fd: Fd = out_fd;
+            let in_fd: Fd = in_fd;
+            let offset_address = offset.0;
+            let count =
+                usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
+            let memory = &mut *cx.memory;
+            if count == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+
+            // in_fd must be READABLE — sendfile reads the source from it. An
+            // O_WRONLY in_fd → EBADF (LTP sendfile03 case 4). A bad in_fd is
+            // caught as EBADF by sendfile_offset below; out_fd writability is
+            // enforced on the write path (sendfile03 case 2 already passes).
+            if let Some(in_file) = this.open_file(in_fd.0)
+                && in_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+
+            // memfd_secret cannot be a sendfile endpoint (no file read/write
+            // methods) → EINVAL (memfd_secret(2)).
+            if this.fd_is_secretmem(in_fd.0) || this.fd_is_secretmem(out_fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+
+            let mut offset = this.sendfile_offset(in_fd.0, offset_address, memory)??;
+
+            // Darwin-native fast path: a regular file -> socket uses macOS
+            // sendfile(2) (BSD-style, in-kernel, zero-copy). It honors socket
+            // backpressure by returning a partial `len` + EAGAIN, which Go's
+            // netpoller drives via EPOLLOUT — so a large transfer does NOT hang
+            // the way a userspace read-into-buffer-then-write does. Non-socket
+            // destinations and in-memory file sources fall through to the buffer
+            // path below.
+            if let (Some(file_fd), Some(sock_fd)) =
+                (this.regular_host_file_fd(in_fd.0), this.host_socket_fd(out_fd.0))
+            {
+                // SAFETY: both are live host fds owned by these guest fds. The
+                // portable wrapper hides the Darwin (6-arg, in/out len) vs Linux
+                // (4-arg, swapped fds) signature: returns bytes sent, or -1
+                // (errno set), so `host_syscall_errno()` below still works.
+                let rc = unsafe {
+                    carrick_portable::sendfile_to_socket(
+                        file_fd.get(),
+                        sock_fd.get(),
+                        offset as i64,
+                        count,
+                    )
+                };
+                let sent = rc.max(0) as usize;
+                let advance_and_return = |offset: usize,
+                                          sent: usize,
+                                          memory: &mut dyn CurrentMmMemory|
+                 -> Result<DispatchOutcome, DispatchError> {
+                    let new_off = offset.saturating_add(sent);
+                    if offset_address == 0 {
+                        // macOS sendfile takes an explicit `offset` and does NOT
+                        // advance the file's kernel offset; do it so a follow-up
+                        // read/sendfile (no explicit offset) continues correctly.
+                        unsafe { libc::lseek(file_fd.get(), new_off as libc::off_t, libc::SEEK_SET) };
+                    } else if memory
+                        .write_bytes(offset_address, &(new_off as u64).to_ne_bytes())
+                        .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    Ok(DispatchOutcome::returned_len_or_errno(sent))
+                };
+                match (rc as i64).host_syscall_errno() {
+                    Ok(_) => return advance_and_return(offset, sent, memory),
+                    Err(e) if e == LINUX_EAGAIN => {
+                        if sent > 0 {
+                            // Partial transfer before the socket filled: report it
+                            // (Go advances and loops).
+                            return advance_and_return(offset, sent, memory);
+                        }
+                        return Ok(if this.io_is_nonblocking(out_fd.0, 0) {
+                            DispatchOutcome::errno(LINUX_EAGAIN)
+                        } else {
+                            DispatchOutcome::WaitOnFds {
+                                fds: match WaitFds::raw_one(sock_fd.get(), libc::POLLOUT)
+                                    .with_guest_slots(
+                                        &this.captured_file_table(),
+                                        [in_fd.0, out_fd.0],
+                                    )
+                                {
+                                    Ok(fds) => fds,
+                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                                },
+                                timeout: None,
+                                sig_mask: carrick_abi::WaitSigMask::NONE,
+                                completion: FdWaitCompletion::Fd {
+                                    on_timeout: LINUX_EAGAIN.guest_retval(),
+                                },
+                            }
+                        });
+                    }
+                    // FreeBSD sendfile(2) only supports STREAM sockets; an AF_UNIX
+                    // (especially DGRAM) out_fd is rejected with EINVAL. Linux
+                    // sendfile handles any socket destination, so fall through to the
+                    // buffer path below (read in_fd, then write_output_fd, which
+                    // honours the socket's EAGAIN/ENOBUFS backpressure) when the host
+                    // sendfile rejects the destination outright with nothing sent
+                    // (LTP sendfile07 sendfiles to a full non-blocking AF_UNIX fd).
+                    Err(e) if e == LINUX_EINVAL && sent == 0 => {}
+                    Err(e) => return Ok(DispatchOutcome::errno(e)),
+                }
+            }
+
+            let bytes = this.sendfile_bytes(in_fd.0, offset, count)?;
+            let outcome = this.complete_wait_fd_authority(
+                this.write_output_fd(out_fd.0, &bytes, tid),
+                &this.captured_file_table(),
+                [in_fd.0, out_fd.0],
+            );
+            let DispatchOutcome::Returned { value } = outcome else {
+                return Ok(outcome);
+            };
+            let written = usize::try_from(value).unwrap_or(0);
+            offset = offset.saturating_add(written);
+            if offset_address == 0 {
+                if let Some(open_file) = this.open_file(in_fd.0)
+                    && let Some(mut open) = open_file.description.write()
+                {
+                    match &mut *open {
+                        OpenDescription::File {
+                            offset: current, ..
+                        }
+                        | OpenDescription::SyntheticFile {
+                            offset: current, ..
+                        } => *current = offset,
+                        // HostFile reads via `pread` (sendfile_bytes), which does
+                        // NOT advance the kernel offset; advance it explicitly so a
+                        // follow-up sendfile/read with no explicit offset continues
+                        // past what we just sent. Without this, busybox `cat` —
+                        // which copies a file with `sendfile(out, file, NULL, n)` in
+                        // a `while (n > 0)` loop — re-sends offset 0 forever.
+                        OpenDescription::HostFile { host_fd, .. } => {
+                            // SAFETY: host_fd is a live regular-file fd owned by
+                            // this guest fd; lseek to an absolute position is benign.
+                            unsafe {
+                                libc::lseek(host_fd.raw(), offset as libc::off_t, libc::SEEK_SET);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if memory
+                .write_bytes(offset_address, &(offset as u64).to_ne_bytes())
+                .is_err()
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+
+            Ok(DispatchOutcome::Returned { value })
+
+        }
+
+        fn copy_file_range(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {
+
+            // Linux currently defines no copy_file_range flags. Reject unknown
+            // bits before inspecting length or endpoints.
+            if flags != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let tid = cx.tid();
+            let in_fd: Fd = fd_in;
+            let off_in_addr = off_in.0;
+            let out_fd: Fd = fd_out;
+            let off_out_addr = off_out.0;
+            // Callers (coreutils `cat`) pass len = SSIZE_MAX and loop until EOF,
+            // so cap each call to a bounded chunk rather than trying to allocate
+            // a multi-exabyte buffer. A short return is legal for copy_file_range.
+            let requested = usize::try_from(len).unwrap_or(usize::MAX);
+            let memory = &mut *cx.memory;
+            let count = requested.min(8 * 1024 * 1024);
+            if count == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+
+            // memfd_secret cannot be a copy_file_range endpoint (no file
+            // read/write methods) → EINVAL (memfd_secret(2)).
+            if this.fd_is_secretmem(in_fd.0) || this.fd_is_secretmem(out_fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+
+            let in_offset = this.sendfile_offset(in_fd.0, off_in_addr, memory)??;
+            // copy_file_range onto the SAME file with OVERLAPPING ranges must fail
+            // EINVAL (Linux). Go's io.Copy(f, f) self-copy hits exactly this: fd_in
+            // == fd_out, NULL/NULL offsets → identical (thus overlapping) ranges.
+            // Without this carrick copied the bytes and returned a success count, so
+            // Go's zero-copy hook recorded handled=true and skipped its generic
+            // doubling fallback (TestCopyFile/CopyFileItself). Reject ONLY when the
+            // fds are the same file AND the per-round ranges overlap — distinct
+            // files and non-overlapping self-copies are untouched. Resolve the out
+            // offset only in this branch to avoid touching the out fd on the common
+            // cross-file path. Sits above the Darwin clone fast path so it can't
+            // mis-handle an overlapping self-copy either.
+            if this.copy_same_file(in_fd.0, out_fd.0) {
+                let out_offset = this.sendfile_offset(out_fd.0, off_out_addr, memory)??;
+                let in_end = in_offset.saturating_add(count);
+                let out_end = out_offset.saturating_add(count);
+                if in_offset < out_end && out_offset < in_end {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(outcome) = this.try_darwin_copyfile_range_fast_path(
+                in_fd.0,
+                in_offset,
+                off_in_addr,
+                out_fd.0,
+                off_out_addr,
+                count,
+            )? {
+                return Ok(outcome);
+            }
+            let bytes = this.sendfile_bytes(in_fd.0, in_offset, count)?;
+            if bytes.is_empty() {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+
+            // Write side. off_out == NULL → write at out_fd's current position
+            // (the common case: cat to a pipe/stdout). Non-NULL → pwrite at the
+            // given offset on a real host fd and advance *off_out.
+            let written = if off_out_addr == 0 {
+                let outcome = this.complete_wait_fd_authority(
+                    this.write_output_fd(out_fd.0, &bytes, tid),
+                    &this.captured_file_table(),
+                    [in_fd.0, out_fd.0],
+                );
+                let DispatchOutcome::Returned { value } = outcome else {
+                    return Ok(outcome);
+                };
+                usize::try_from(value).unwrap_or(0)
+            } else {
+                let out_off = read_u64(memory, off_out_addr)?;
+                let host_fd = match this.open_file(out_fd.0).as_ref() {
+                    Some(of) => match of.description.read().as_deref() {
+                        Some(OpenDescription::HostFile {
+                            host_fd,
+                            writable: true,
+                            ..
+                        }) => host_fd.raw(),
+                        Some(OpenDescription::HostFile { .. }) => {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        }
+                        _ => {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                    },
+                    None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                };
+                let n = unsafe {
+                    libc::pwrite(
+                        host_fd,
+                        bytes.as_ptr() as *const _,
+                        bytes.len(),
+                        out_off as libc::off_t,
+                    )
+                };
+                let n = match n.host_syscall_errno() {
+                    Ok(value) => value as usize,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                if memory
+                    .write_bytes(off_out_addr, &(out_off + n as u64).to_ne_bytes())
+                    .is_err()
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                n
+            };
+
+            // Advance the input offset (pointer or the fd's own position).
+            let new_in = in_offset.saturating_add(written);
+            if off_in_addr == 0 {
+                if let Some(of) = this.open_file(in_fd.0).as_ref()
+                    && let Some(mut open) = of.description.write()
+                {
+                    match &mut *open {
+                        OpenDescription::File { offset, .. }
+                        | OpenDescription::SyntheticFile { offset, .. } => *offset = new_in,
+                        OpenDescription::HostFile { host_fd, .. } => {
+                            unsafe {
+                                libc::lseek(host_fd.raw(), new_in as libc::off_t, libc::SEEK_SET)
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            } else if memory
+                .write_bytes(off_in_addr, &(new_in as u64).to_ne_bytes())
+                .is_err()
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+
+            Ok(DispatchOutcome::returned_len_or_errno(written))
+
+        }
+    }
 }
