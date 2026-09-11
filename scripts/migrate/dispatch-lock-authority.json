@@ -220,7 +220,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4627,
+      "line": 4636,
       "item": "T::membarrier",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -229,7 +229,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#2",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4631,
+      "line": 4640,
       "item": "T::membarrier",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -238,17 +238,17 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#3",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4637,
+      "line": 4646,
       "item": "T::membarrier",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 3
     },
     {
-      "id": "crates/carrick-runtime/src/dispatch/mem.rs::SyscallDispatcher::mmap::proc#1",
+      "id": "crates/carrick-runtime/src/dispatch/mem.rs::MemView::mmap::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5246,
-      "item": "SyscallDispatcher::mmap",
+      "line": 5255,
+      "item": "MemView::mmap",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 1
