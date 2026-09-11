@@ -21,7 +21,7 @@
   },
   "files": {
     "table_guard": 20,
-    "description_guard": 29,
+    "description_guard": 30,
     "description_backing": 7,
     "epoll": 34,
     "stream": 15,
@@ -1813,6 +1813,24 @@
       "scope_kind": "production_callsite"
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/fs/pathres.rs",
+      "line": 429,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "match self.open_file(dirfd as i32)?.description.read().as_deref() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/pathres.rs",
+      "line": 561,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
+      "scope_kind": "production_callsite"
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/fs/pipe.rs",
       "line": 236,
       "categories": [
@@ -3066,25 +3084,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1888,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "match self.open_file(dirfd as i32)?.description.read().as_deref() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2020,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "Some(open_file) => match open_file.description.read().as_deref() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2456,
+      "line": 2002,
       "categories": [
         "table_guard"
       ],
@@ -3093,7 +3093,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2505,
+      "line": 2051,
       "categories": [
         "description_guard"
       ],
@@ -3102,7 +3102,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2705,
+      "line": 2251,
       "categories": [
         "description_guard"
       ],
@@ -3111,7 +3111,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2842,
+      "line": 2388,
       "categories": [
         "description_guard"
       ],
@@ -3120,7 +3120,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3090,
+      "line": 2636,
       "categories": [
         "epoll"
       ],
@@ -3129,7 +3129,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3122,
+      "line": 2668,
       "categories": [
         "epoll"
       ],
@@ -3138,7 +3138,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3237,
+      "line": 2783,
       "categories": [
         "description_guard"
       ],
@@ -3147,7 +3147,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3311,
+      "line": 2857,
       "categories": [
         "mapping"
       ],
@@ -3156,7 +3156,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3399,
+      "line": 2945,
       "categories": [
         "epoll"
       ],
@@ -3165,7 +3165,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3539,
+      "line": 3085,
       "categories": [
         "epoll"
       ],
@@ -3174,7 +3174,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3626,
+      "line": 3172,
       "categories": [
         "description_guard"
       ],
@@ -3183,7 +3183,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3871,
+      "line": 3417,
       "categories": [
         "epoll"
       ],
@@ -3192,7 +3192,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3913,
+      "line": 3459,
       "categories": [
         "description_guard"
       ],
@@ -3201,7 +3201,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4000,
+      "line": 3546,
       "categories": [
         "epoll"
       ],
@@ -3210,7 +3210,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4064,
+      "line": 3610,
       "categories": [
         "description_guard"
       ],
@@ -3219,7 +3219,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4167,
+      "line": 3713,
       "categories": [
         "epoll"
       ],
@@ -3228,7 +3228,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4229,
+      "line": 3775,
       "categories": [
         "description_guard"
       ],
@@ -3237,7 +3237,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4297,
+      "line": 3843,
       "categories": [
         "description_guard"
       ],
@@ -3246,7 +3246,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4381,
+      "line": 3927,
       "categories": [
         "description_guard"
       ],
@@ -3255,7 +3255,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4409,
+      "line": 3955,
       "categories": [
         "epoll"
       ],
@@ -3264,7 +3264,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4465,
+      "line": 4011,
       "categories": [
         "description_guard"
       ],
@@ -3273,7 +3273,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4576,
+      "line": 4122,
       "categories": [
         "description_guard"
       ],
@@ -3282,7 +3282,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4688,
+      "line": 4234,
       "categories": [
         "epoll"
       ],
@@ -3291,7 +3291,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4699,
+      "line": 4245,
       "categories": [
         "stream"
       ],
@@ -3300,7 +3300,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4712,
+      "line": 4258,
       "categories": [
         "stream"
       ],
@@ -3309,7 +3309,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4722,
+      "line": 4268,
       "categories": [
         "stream"
       ],
@@ -3318,7 +3318,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4731,
+      "line": 4277,
       "categories": [
         "stream"
       ],
@@ -3327,7 +3327,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4759,
+      "line": 4305,
       "categories": [
         "stream"
       ],
@@ -3336,7 +3336,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4761,
+      "line": 4307,
       "categories": [
         "stream"
       ],
@@ -3345,7 +3345,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4800,
+      "line": 4346,
       "categories": [
         "stream"
       ],
@@ -3354,7 +3354,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4802,
+      "line": 4348,
       "categories": [
         "stream"
       ],
@@ -3363,7 +3363,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4805,
+      "line": 4351,
       "categories": [
         "stream"
       ],
@@ -3372,7 +3372,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4825,
+      "line": 4371,
       "categories": [
         "description_guard"
       ],
@@ -3381,7 +3381,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4836,
+      "line": 4382,
       "categories": [
         "stream"
       ],
@@ -3390,7 +3390,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4838,
+      "line": 4384,
       "categories": [
         "stream"
       ],
@@ -3399,7 +3399,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4941,
+      "line": 4487,
       "categories": [
         "description_guard"
       ],
@@ -3408,7 +3408,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4981,
+      "line": 4527,
       "categories": [
         "description_guard"
       ],
@@ -3417,7 +3417,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5005,
+      "line": 4551,
       "categories": [
         "stream"
       ],
@@ -3426,7 +3426,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5007,
+      "line": 4553,
       "categories": [
         "stream"
       ],
@@ -3435,7 +3435,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5062,
+      "line": 4608,
       "categories": [
         "stream"
       ],
@@ -3444,7 +3444,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5083,
+      "line": 4629,
       "categories": [
         "stream"
       ],
@@ -3453,7 +3453,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5095,
+      "line": 4641,
       "categories": [
         "epoll"
       ],
@@ -3462,7 +3462,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5103,
+      "line": 4649,
       "categories": [
         "stream"
       ],
@@ -3471,7 +3471,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5111,
+      "line": 4657,
       "categories": [
         "stream",
         "mapping"
@@ -3481,7 +3481,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5116,
+      "line": 4662,
       "categories": [
         "stream"
       ],
@@ -3490,7 +3490,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5117,
+      "line": 4663,
       "categories": [
         "stream"
       ],
@@ -3499,7 +3499,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5123,
+      "line": 4669,
       "categories": [
         "stream"
       ],
@@ -3508,7 +3508,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5146,
+      "line": 4692,
       "categories": [
         "stream"
       ],
@@ -3517,7 +3517,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5161,
+      "line": 4707,
       "categories": [
         "stream"
       ],
@@ -3526,7 +3526,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5198,
+      "line": 4744,
       "categories": [
         "stream"
       ],
@@ -3535,7 +3535,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5199,
+      "line": 4745,
       "categories": [
         "stream"
       ],
@@ -3544,7 +3544,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5203,
+      "line": 4749,
       "categories": [
         "stream"
       ],
@@ -3553,7 +3553,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5217,
+      "line": 4763,
       "categories": [
         "description_guard"
       ],
@@ -3562,7 +3562,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5252,
+      "line": 4798,
       "categories": [
         "stream"
       ],
@@ -3571,7 +3571,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5254,
+      "line": 4800,
       "categories": [
         "stream"
       ],
@@ -3580,7 +3580,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5291,
+      "line": 4837,
       "categories": [
         "stream"
       ],
@@ -3589,7 +3589,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5312,
+      "line": 4858,
       "categories": [
         "stream"
       ],
@@ -3598,7 +3598,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5319,
+      "line": 4865,
       "categories": [
         "stream"
       ],
@@ -3607,7 +3607,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5321,
+      "line": 4867,
       "categories": [
         "stream"
       ],
@@ -3616,7 +3616,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5336,
+      "line": 4882,
       "categories": [
         "stream"
       ],
@@ -3625,7 +3625,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5349,
+      "line": 4895,
       "categories": [
         "stream"
       ],
@@ -3634,7 +3634,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5392,
+      "line": 4938,
       "categories": [
         "stream"
       ],
@@ -3643,7 +3643,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5405,
+      "line": 4951,
       "categories": [
         "description_guard"
       ],
@@ -3652,7 +3652,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5451,
+      "line": 4997,
       "categories": [
         "stream"
       ],
@@ -3661,7 +3661,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5457,
+      "line": 5003,
       "categories": [
         "stream"
       ],
@@ -3670,7 +3670,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5464,
+      "line": 5010,
       "categories": [
         "stream"
       ],
@@ -3679,7 +3679,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5472,
+      "line": 5018,
       "categories": [
         "stream"
       ],
@@ -3688,7 +3688,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5491,
+      "line": 5037,
       "categories": [
         "description_guard"
       ],
@@ -3697,7 +3697,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5500,
+      "line": 5046,
       "categories": [
         "stream"
       ],
@@ -3706,7 +3706,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5506,
+      "line": 5052,
       "categories": [
         "stream"
       ],
@@ -3715,7 +3715,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5529,
+      "line": 5075,
       "categories": [
         "stream"
       ],
@@ -3724,7 +3724,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5531,
+      "line": 5077,
       "categories": [
         "stream"
       ],
@@ -3733,7 +3733,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5547,
+      "line": 5093,
       "categories": [
         "stream"
       ],
@@ -3742,7 +3742,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5564,
+      "line": 5110,
       "categories": [
         "description_guard"
       ],
@@ -3751,7 +3751,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5581,
+      "line": 5127,
       "categories": [
         "stream"
       ],
@@ -3760,7 +3760,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5590,
+      "line": 5136,
       "categories": [
         "stream"
       ],
@@ -3769,7 +3769,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5839,
+      "line": 5385,
       "categories": [
         "epoll"
       ],
@@ -3778,7 +3778,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5843,
+      "line": 5389,
       "categories": [
         "description_guard"
       ],
@@ -3787,7 +3787,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5852,
+      "line": 5398,
       "categories": [
         "epoll"
       ],
@@ -3796,7 +3796,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5891,
+      "line": 5437,
       "categories": [
         "description_guard"
       ],
@@ -3805,7 +3805,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 6057,
+      "line": 5603,
       "categories": [
         "description_guard"
       ],
@@ -3814,7 +3814,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 6561,
+      "line": 6107,
       "categories": [
         "description_guard"
       ],
@@ -3823,7 +3823,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 6712,
+      "line": 6258,
       "categories": [
         "description_guard"
       ],
