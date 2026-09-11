@@ -74,7 +74,7 @@
       "file": "crates/carrick-runtime/src/dispatch/fd_table.rs",
       "function": "OpenDescription::stat_source",
       "ordinal_in_function": 1,
-      "fingerprint": "4b0c07e40e7b43eb75ecaf7fd0b090334d0230ec4bfb4e415c9e1021115d13c8",
+      "fingerprint": "909216d8e4757520ccfa956fd61a3745c8a237290735eb4b9ea30bfc6f3d59aa",
       "verdict": "typed_error_debt",
       "failure_domain": "dispatch::fd_table",
       "rationale": "Closed file description encountered in stat_source represents a normal close observation and should lower to EBADF instead of aborting.",

@@ -570,7 +570,8 @@ impl<'a> FsView<'a> {
             | OpenDescription::BpfProg { .. }
             | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::Netlink { .. }
-            | OpenDescription::InMemorySocket { .. } => synthetic_readonly_access(mode),
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::Packet { .. } => synthetic_readonly_access(mode),
         }
     }
 

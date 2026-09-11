@@ -10,9 +10,9 @@
 use std::sync::Arc;
 
 use carrick_abi::{
-    LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_UNIX, LINUX_EBADF, LINUX_EINVAL, LINUX_ENOTCONN,
-    LINUX_ENOTSOCK, LINUX_SOCK_DGRAM, LINUX_SOCK_RAW, LINUX_SOCK_STREAM, LinuxErrno,
-    LinuxSocketTypeFlags,
+    LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_PACKET, LINUX_AF_UNIX, LINUX_EBADF, LINUX_EINVAL,
+    LINUX_ENOTCONN, LINUX_ENOTSOCK, LINUX_SOCK_DGRAM, LINUX_SOCK_RAW, LINUX_SOCK_STREAM,
+    LinuxErrno, LinuxSocketTypeFlags,
 };
 use parking_lot::RwLock;
 
@@ -335,7 +335,10 @@ impl SyscallDispatcher {
         if let Some(errno) = canonical_socket_errno(family, base_type, protocol) {
             return DispatchOutcome::errno(errno);
         }
-        let host_family = linux_to_host_af(family);
+        let host_family = match linux_to_host_af(family) {
+            Ok(f) => f,
+            Err(errno) => return DispatchOutcome::errno(errno),
+        };
         let host_type = host_socktype_backing(family, base_type);
         // macOS has no UDPLITE protocol, so back IPPROTO_UDPLITE with a plain UDP
         // socket (proto 0 → UDP for SOCK_DGRAM). UDPLITE's datagram send/recv is
@@ -661,7 +664,7 @@ impl SyscallDispatcher {
         }
         let new_host = unsafe {
             libc::socket(
-                linux_to_host_af(*family),
+                linux_to_host_af(*family)?,
                 host_socktype_backing(*family, *type_),
                 0,
             )
@@ -823,6 +826,7 @@ impl SyscallDispatcher {
         match &*open {
             OpenDescription::HostSocket { type_, .. } => Some(*type_),
             OpenDescription::Netlink { sock_type, .. } => Some(*sock_type),
+            OpenDescription::Packet { socket, .. } => Some(socket.sock_type),
             _ => None,
         }
     }
@@ -842,6 +846,9 @@ impl SyscallDispatcher {
                 protocol,
                 ..
             } => Some((LINUX_AF_NETLINK, *sock_type, *protocol)),
+            OpenDescription::Packet { socket, .. } => {
+                Some((LINUX_AF_PACKET, socket.sock_type, socket.protocol as i32))
+            }
             _ => None,
         }
     }
@@ -852,6 +859,7 @@ impl SyscallDispatcher {
         match &*open {
             OpenDescription::HostSocket { protocol, .. } => Some(*protocol),
             OpenDescription::Netlink { protocol, .. } => Some(*protocol),
+            OpenDescription::Packet { socket, .. } => Some(socket.protocol as i32),
             _ => None,
         }
     }
@@ -1324,6 +1332,9 @@ impl SyscallDispatcher {
             if family == LINUX_AF_NETLINK {
                 return Ok(this.netlink_socket(type_, protocol));
             }
+            if family == LINUX_AF_PACKET {
+                return Ok(this.packet_socket(cx.kernel, type_, protocol));
+            }
             // Reject Linux-invalid (family,type,protocol) tuples with the
             // canonical errno first: protocol selection precedes the
             // capability check on Linux, so a raw socket naming no protocol
@@ -1366,7 +1377,10 @@ impl SyscallDispatcher {
             if let Some(errno) = canonical_socket_errno(family, base_type, protocol) {
                 return Ok(DispatchOutcome::errno(errno));
             }
-            let host_family = linux_to_host_af(family);
+            let host_family = match linux_to_host_af(family) {
+                Ok(f) => f,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
             let host_type = host_socktype_backing(family, base_type);
 
             let mut host_fds: [i32; 2] = [-1, -1];
@@ -1465,20 +1479,29 @@ impl SyscallDispatcher {
             // when the caller passed 0, i.e. "let the kernel choose").
             if let Some(open_file) = this.open_file(fd)
                 && let Some(mut open) = open_file.description.write()
-                && let OpenDescription::Netlink {
-                    pid: nl_pid,
-                    groups: nl_groups,
-                    ..
-                } = &mut *open
             {
-                let (req_pid, req_groups) = read_sockaddr_nl(memory, addr_addr, addrlen);
-                *nl_pid = if req_pid != 0 {
-                    req_pid
-                } else {
-                    std::process::id()
-                };
-                *nl_groups = req_groups;
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                match &mut *open {
+                    OpenDescription::Netlink {
+                        pid: nl_pid,
+                        groups: nl_groups,
+                        ..
+                    } => {
+                        let (req_pid, req_groups) = read_sockaddr_nl(memory, addr_addr, addrlen);
+                        *nl_pid = if req_pid != 0 {
+                            req_pid
+                        } else {
+                            std::process::id()
+                        };
+                        *nl_groups = req_groups;
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    OpenDescription::Packet { socket, .. } => {
+                        let socket = Arc::clone(socket);
+                        drop(open);
+                        return Ok(socket.bind(memory, addr_addr, addrlen));
+                    }
+                    _ => {}
+                }
             }
             let (host_fd, family) = this.host_socket_lookup(fd)?;
             // AF_UNIX autobind: a bind with only the family (addrlen == 2, empty
@@ -2202,26 +2225,35 @@ impl SyscallDispatcher {
             }
             if let Some(open_file) = this.open_file(fd)
                 && let Some(open) = open_file.description.read()
-                && let OpenDescription::InMemorySocket { socket, .. } = &*open
             {
-                if addr_addr == 0 || addrlen_addr == 0 {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                match &*open {
+                    OpenDescription::InMemorySocket { socket, .. } => {
+                        if addr_addr == 0 || addrlen_addr == 0 {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                        if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
+                            && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        let local = socket.local_addr();
+                        let linux_bytes = if let Some(local) = local {
+                            socket_addr_to_linux_sockaddr(local).unwrap_or_default()
+                        } else {
+                            vec![0u8; 16]
+                        };
+                        if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    OpenDescription::Packet { socket, .. } => {
+                        let socket = Arc::clone(socket);
+                        drop(open);
+                        return Ok(socket.getsockname(memory, addr_addr, addrlen_addr));
+                    }
+                    _ => {}
                 }
-                if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
-                    && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                let local = socket.local_addr();
-                let linux_bytes = if let Some(local) = local {
-                    socket_addr_to_linux_sockaddr(local).unwrap_or_default()
-                } else {
-                    vec![0u8; 16]
-                };
-                if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-                return Ok(DispatchOutcome::Returned { value: 0 });
             }
             let (host_fd, family) = this.host_socket_lookup(fd)?;
             // getsockname needs both output pointers; a NULL addr or addrlen →
@@ -2273,27 +2305,34 @@ impl SyscallDispatcher {
             let addrlen_addr = addrlen.0;
             if let Some(open_file) = this.open_file(fd)
                 && let Some(open) = open_file.description.read()
-                && let OpenDescription::InMemorySocket { socket, .. } = &*open
             {
-                if addr_addr == 0 || addrlen_addr == 0 {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                match &*open {
+                    OpenDescription::InMemorySocket { socket, .. } => {
+                        if addr_addr == 0 || addrlen_addr == 0 {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                        if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
+                            && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        let peer = socket.peer_addr();
+                        let Some(peer) = peer else {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOTCONN));
+                        };
+                        let Some(linux_bytes) = socket_addr_to_linux_sockaddr(peer) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        };
+                        if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    OpenDescription::Packet { .. } => {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTCONN));
+                    }
+                    _ => {}
                 }
-                if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
-                    && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                let peer = socket.peer_addr();
-                let Some(peer) = peer else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOTCONN));
-                };
-                let Some(linux_bytes) = socket_addr_to_linux_sockaddr(peer) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                };
-                if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-                return Ok(DispatchOutcome::Returned { value: 0 });
             }
             let (host_fd, family) = this.host_socket_lookup(fd)?;
             if cfg!(carrick_bsd)

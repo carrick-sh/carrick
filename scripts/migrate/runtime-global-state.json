@@ -499,6 +499,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-runtime/src/dispatch/net/packet.rs",
+      "symbol": "PACKET_SOCKETS",
+      "fingerprint": "318e7cf8bf189d2874a51e63f00800660280fb46c108664b299dca2b9c730429",
+      "classification": "host_kernel_object",
+      "rationale": "Host-kernel-object table PACKET_SOCKETS tracking in-zone AF_PACKET sockets across the carrier for local packet distribution."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-runtime/src/dispatch/net/recverr.rs",
       "symbol": "BOUND",
       "fingerprint": "3c9ddae16ef62655ccedd7a552ec0ec4b5b678536e06ba314a60dea03354874d",

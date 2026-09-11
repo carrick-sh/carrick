@@ -5,6 +5,8 @@
 //! tracking, SO_DOMAIN, SO_PROTOCOL, SO_PEERCRED, IPV6_ADDRFORM) and
 //! AF_NETLINK socket option handling.
 
+use carrick_abi::{LINUX_AF_PACKET, LINUX_SOL_PACKET};
+
 use super::support::*;
 use super::*;
 
@@ -103,6 +105,11 @@ impl SyscallDispatcher {
                     let Some(desc) = of.description.read() else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                     };
+                    if let OpenDescription::Packet { socket, .. } = &*desc {
+                        let socket = Arc::clone(socket);
+                        drop(desc);
+                        return Ok(socket.setsockopt(memory, level, optname, optval_addr, optlen));
+                    }
                     if matches!(&*desc, OpenDescription::InMemorySocket { .. }) {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
@@ -523,6 +530,24 @@ impl SyscallDispatcher {
                             0
                         };
                         return write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes());
+                    }
+                    if let OpenDescription::Packet { socket, .. } = &*desc {
+                        let socket = Arc::clone(socket);
+                        drop(desc);
+                        if level == LINUX_SOL_SOCKET {
+                            let val: i32 = match optname {
+                                LINUX_SO_TYPE => socket.sock_type,
+                                crate::linux_abi::LINUX_SO_DOMAIN => LINUX_AF_PACKET,
+                                crate::linux_abi::LINUX_SO_PROTOCOL => socket.protocol as i32,
+                                LINUX_SO_ERROR => 0,
+                                _ => 0,
+                            };
+                            return write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes());
+                        } else if level == LINUX_SOL_PACKET {
+                            return socket.getsockopt(memory, optname, optval_addr, optlen_addr);
+                        } else {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT));
+                        }
                     }
                     if !matches!(&*desc, OpenDescription::HostSocket { .. }) {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));

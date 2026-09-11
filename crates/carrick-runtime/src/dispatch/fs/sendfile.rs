@@ -202,7 +202,8 @@ impl<'a> FsView<'a> {
             | OpenDescription::BpfProg { .. }
             | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::Netlink { .. }
-            | OpenDescription::InMemorySocket { .. } => Ok(Err(LINUX_EINVAL)),
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::Packet { .. } => Ok(Err(LINUX_EINVAL)),
         }
     }
 
@@ -283,7 +284,8 @@ impl<'a> FsView<'a> {
             | OpenDescription::BpfProg { .. }
             | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::Netlink { .. }
-            | OpenDescription::InMemorySocket { .. } => return Err(LINUX_EINVAL),
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::Packet { .. } => return Err(LINUX_EINVAL),
             OpenDescription::Closed { .. } => return Err(LINUX_EBADF),
         };
         Ok(bytes)

@@ -1285,6 +1285,11 @@ pub(super) enum OpenDescription {
         /// Wait queue for synthetic Netlink readiness events.
         wait_queue: Arc<crate::kernel::WaitQueue>,
     },
+    /// A synthetic AF_PACKET socket (`socket(AF_PACKET, ...)`).
+    Packet {
+        base: OpenDescriptionBase,
+        socket: Arc<super::net::packet::PacketSocket>,
+    },
     /// A POSIX message-queue descriptor (`mq_open(3)`). macOS has no POSIX
     /// mqueue, so carrick emulates it on a real host file under
     /// `/tmp/carrick-mqueue/` (see [`crate::dispatch::mqueue`]): the `mqd_t` IS a
@@ -1474,6 +1479,7 @@ impl OpenDescription {
             Self::InMemorySocket { socket, .. } => Some(Arc::clone(&socket.wait_queue)),
             Self::Epoll { wait_queue, .. } => Some(Arc::clone(wait_queue)),
             Self::Netlink { wait_queue, .. } => Some(Arc::clone(wait_queue)),
+            Self::Packet { socket, .. } => Some(Arc::clone(&socket.wait_queue)),
             _ => None,
         }
     }
@@ -1503,6 +1509,7 @@ impl OpenDescription {
             Self::HostSocket { .. } => "host_socket",
             Self::HostFile { .. } => "host_file",
             Self::Netlink { .. } => "netlink",
+            Self::Packet { .. } => "packet",
             Self::Mqueue { .. } => "mqueue",
             Self::BpfMap { .. } => "bpf_map",
             Self::BpfProg { .. } => "bpf_prog",
@@ -1581,7 +1588,8 @@ impl OpenDescription {
             }
             OpenDescription::HostSocket { .. }
             | OpenDescription::InMemorySocket { .. }
-            | OpenDescription::Netlink { .. } => {
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::Packet { .. } => {
                 format!("socket:[{}]", inode_for_path(Path::new("socket:[carrick]")))
             }
         };
@@ -1701,6 +1709,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::Fanotify { .. } => Kind::Fanotify,
             OpenDescription::SignalFd { .. } => Kind::SignalFd,
             OpenDescription::Netlink { .. } => Kind::Netlink,
+            OpenDescription::Packet { .. } => Kind::InMemorySocket,
             OpenDescription::Mqueue { .. } => Kind::Mqueue,
             OpenDescription::BpfMap { .. } => Kind::BpfMap,
             OpenDescription::BpfProg { .. } => Kind::BpfProg,
@@ -2105,6 +2114,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 ready |= LinuxEpollEvents::OUT;
                 ready & (interest | LinuxEpollEvents::ERR | LinuxEpollEvents::HUP)
             }
+            OpenDescription::Packet { socket, .. } => socket.readiness(interest),
             OpenDescription::BpfMap { .. } | OpenDescription::BpfProg { .. } => {
                 interest & (LinuxEpollEvents::IN | LinuxEpollEvents::OUT)
             }
@@ -2657,7 +2667,8 @@ impl OpenDescription {
             }
             OpenDescription::HostSocket { .. }
             | OpenDescription::InMemorySocket { .. }
-            | OpenDescription::Netlink { .. } => OpenStatSource::Record(StatRecord::synthetic(
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::Packet { .. } => OpenStatSource::Record(StatRecord::synthetic(
                 "socket:[carrick]",
                 0,
                 LINUX_S_IFSOCK | 0o600,

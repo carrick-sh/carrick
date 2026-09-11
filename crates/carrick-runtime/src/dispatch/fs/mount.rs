@@ -183,7 +183,8 @@ impl<'a> FsView<'a> {
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
                 | OpenDescription::SyntheticDevice { .. }
-                | OpenDescription::Netlink { .. } => DispatchOutcome::errno(LINUX_ENOTDIR),
+                | OpenDescription::Netlink { .. }
+                | OpenDescription::Packet { .. } => DispatchOutcome::errno(LINUX_ENOTDIR),
             })
         }
     }

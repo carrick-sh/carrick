@@ -255,7 +255,6 @@ impl SyscallDispatcher {
 
     define_syscall! {
         fn sendto(this, cx, fd: Fd, buf: GuestPtr, len: u64, flags: u64, dest_addr: GuestPtr, addrlen: u64) {
-            let memory = &*cx.memory;
             let fd = fd.0;
             let buf_addr = buf.0;
             let len = len as usize;
@@ -265,7 +264,7 @@ impl SyscallDispatcher {
             // AF_NETLINK send: treat the payload as an rtnetlink request and
             // queue a synthetic dump reply for the next recv.
             if this.fd_is_netlink(fd) {
-                let bytes = match memory.read_bytes(buf_addr, len) {
+                let bytes = match cx.memory.read_bytes(buf_addr, len) {
                     Ok(b) => b,
                     Err(_) => {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -273,30 +272,44 @@ impl SyscallDispatcher {
                 };
                 return Ok(this.netlink_send(cx.kernel, fd, &bytes));
             }
+            let memory = &*cx.memory;
             if let Some(open_file) = this.open_file(fd)
                 && let Some(open) = open_file.description.read()
-                && let OpenDescription::InMemorySocket { socket, .. } = &*open
             {
-                let socket = Arc::clone(socket);
-                drop(open);
-                let bytes = match memory.read_bytes(buf_addr, len) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                };
-                match socket.send_stream(&bytes, Vec::new()) {
-                    Ok(written) => {
-                        this.notify_inmem_epoll();
-                        return Ok(DispatchOutcome::returned_len(written)?);
+                match &*open {
+                    OpenDescription::Packet { socket, .. } => {
+                        let socket = Arc::clone(socket);
+                        drop(open);
+                        let bytes = match cx.memory.read_bytes(buf_addr, len) {
+                            Ok(b) => b,
+                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                        };
+                        return Ok(socket.sendto(&mut *cx.memory, &bytes, flags, dest_addr, dest_len as u64));
                     }
-                    Err(LINUX_EPIPE) => {
-                        let outcome = DispatchOutcome::errno(LINUX_EPIPE);
-                        if (flags & LINUX_MSG_NOSIGNAL) == 0 {
-                            return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
-                        } else {
-                            return Ok(outcome);
+                    OpenDescription::InMemorySocket { socket, .. } => {
+                        let socket = Arc::clone(socket);
+                        drop(open);
+                        let bytes = match memory.read_bytes(buf_addr, len) {
+                            Ok(b) => b,
+                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                        };
+                        match socket.send_stream(&bytes, Vec::new()) {
+                            Ok(written) => {
+                                this.notify_inmem_epoll();
+                                return Ok(DispatchOutcome::returned_len(written)?);
+                            }
+                            Err(LINUX_EPIPE) => {
+                                let outcome = DispatchOutcome::errno(LINUX_EPIPE);
+                                if (flags & LINUX_MSG_NOSIGNAL) == 0 {
+                                    return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
+                                } else {
+                                    return Ok(outcome);
+                                }
+                            }
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         }
                     }
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    _ => {}
                 }
             }
             let send_view = this.host_socket_send_view(fd)?;
@@ -599,33 +612,42 @@ impl SyscallDispatcher {
             }
             if let Some(open_file) = this.open_file(fd)
                 && let Some(open) = open_file.description.read()
-                && let OpenDescription::InMemorySocket { socket, .. } = &*open
             {
-                let socket = Arc::clone(socket);
-                drop(open);
-                let mut target_buf = vec![0u8; len];
-                match socket.recv_stream(&mut target_buf, 0) {
-                    Ok((read_len, _rights)) => {
-                        if read_len > 0 {
-                            if memory.write_bytes(buf_addr, &target_buf[..read_len]).is_err() {
-                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                            }
-                        }
-                        if let Some(peer) = socket.peer_addr() {
-                            if src_addr != 0 && src_len_addr != 0 {
-                                if let Some(sockaddr_bytes) = socket_addr_to_linux_sockaddr(peer) {
-                                    let _ = write_linux_sockaddr(
-                                        memory,
-                                        src_addr,
-                                        src_len_addr,
-                                        &sockaddr_bytes,
-                                    );
-                                }
-                            }
-                        }
-                        return Ok(DispatchOutcome::returned_len(read_len)?);
+                match &*open {
+                    OpenDescription::Packet { socket, .. } => {
+                        let socket = Arc::clone(socket);
+                        drop(open);
+                        return Ok(socket.recvfrom(memory, buf_addr, len, flags, src_addr, src_len_addr));
                     }
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    OpenDescription::InMemorySocket { socket, .. } => {
+                        let socket = Arc::clone(socket);
+                        drop(open);
+                        let mut target_buf = vec![0u8; len];
+                        match socket.recv_stream(&mut target_buf, 0) {
+                            Ok((read_len, _rights)) => {
+                                if read_len > 0 {
+                                    if memory.write_bytes(buf_addr, &target_buf[..read_len]).is_err() {
+                                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                                    }
+                                }
+                                if let Some(peer) = socket.peer_addr() {
+                                    if src_addr != 0 && src_len_addr != 0 {
+                                        if let Some(sockaddr_bytes) = socket_addr_to_linux_sockaddr(peer) {
+                                            let _ = write_linux_sockaddr(
+                                                memory,
+                                                src_addr,
+                                                src_len_addr,
+                                                &sockaddr_bytes,
+                                            );
+                                        }
+                                    }
+                                }
+                                return Ok(DispatchOutcome::returned_len(read_len)?);
+                            }
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        }
+                    }
+                    _ => {}
                 }
             }
             let (host_fd, family) = this.host_socket_lookup(fd)?;

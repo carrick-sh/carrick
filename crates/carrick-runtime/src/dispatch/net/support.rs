@@ -395,16 +395,17 @@ fn linux_fd_set_len(nfds: usize) -> Option<usize> {
     nfds.checked_add(63)?.checked_div(64)?.checked_mul(8)
 }
 
-pub(super) fn linux_to_host_af(family: i32) -> i32 {
+pub(super) fn linux_to_host_af(family: i32) -> Result<i32, LinuxErrno> {
     match family {
-        LINUX_AF_UNSPEC => libc::AF_UNSPEC,
-        LINUX_AF_UNIX => libc::AF_UNIX,
-        LINUX_AF_INET => libc::AF_INET,
-        LINUX_AF_INET6 => libc::AF_INET6,
-        // Linux-only families. macOS doesn't have AF_NETLINK / AF_PACKET;
-        // pass through whatever number was given so the host socket()
-        // call returns EAFNOSUPPORT naturally.
-        _ => family,
+        LINUX_AF_UNSPEC => Ok(libc::AF_UNSPEC),
+        LINUX_AF_UNIX => Ok(libc::AF_UNIX),
+        LINUX_AF_INET => Ok(libc::AF_INET),
+        LINUX_AF_INET6 => Ok(libc::AF_INET6),
+        // Linux-only families or unrecognised numbers fail with EAFNOSUPPORT.
+        // Passing them through to Darwin is dangerous because Linux family
+        // numbers collide with Darwin ones (e.g. Linux AF_PACKET=17 collides
+        // with Darwin AF_ROUTE=17).
+        _ => Err(LINUX_EAFNOSUPPORT),
     }
 }
 
@@ -3148,11 +3149,15 @@ mod tests {
 
     #[test]
     fn address_family_translation_covers_bsd_families_and_passthrough() {
-        assert_eq!(linux_to_host_af(LINUX_AF_UNSPEC), libc::AF_UNSPEC);
-        assert_eq!(linux_to_host_af(LINUX_AF_UNIX), libc::AF_UNIX);
-        assert_eq!(linux_to_host_af(LINUX_AF_INET), libc::AF_INET);
-        assert_eq!(linux_to_host_af(LINUX_AF_INET6), libc::AF_INET6);
-        assert_eq!(linux_to_host_af(12345), 12345);
+        assert_eq!(linux_to_host_af(LINUX_AF_UNSPEC), Ok(libc::AF_UNSPEC));
+        assert_eq!(linux_to_host_af(LINUX_AF_UNIX), Ok(libc::AF_UNIX));
+        assert_eq!(linux_to_host_af(LINUX_AF_INET), Ok(libc::AF_INET));
+        assert_eq!(linux_to_host_af(LINUX_AF_INET6), Ok(libc::AF_INET6));
+        assert_eq!(linux_to_host_af(12345), Err(LINUX_EAFNOSUPPORT));
+        assert_eq!(
+            linux_to_host_af(carrick_abi::LINUX_AF_PACKET),
+            Err(LINUX_EAFNOSUPPORT)
+        );
 
         assert_eq!(
             host_to_linux_af(libc::AF_UNSPEC as u16),
