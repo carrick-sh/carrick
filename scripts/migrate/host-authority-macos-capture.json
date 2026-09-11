@@ -11508,7 +11508,7 @@
   ],
   "rows_sha256": "077534e83f3a7517e77fabd11fe985f86d9f4d2dfc09ca4a656e474dc30ac541",
   "schema": 1,
-  "source_head": "f26e0c0f2d326632697f36e2d7ad6205d454a2a2",
+  "source_head": "9dcf4cd1a86e9adf4903f33ebd79a49dc720adf8",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
