@@ -5728,6 +5728,10 @@ pub enum KernelOperationError {
     IdentityPermission,
     #[error("a process-group leader cannot create a session")]
     AlreadyProcessGroupLeader,
+    #[error("standard signal {0:?} entered real-time queue")]
+    StandardSignalInRealtimeQueue(LinuxSignal),
+    #[error("real-time signal {0:?} entered standard queue")]
+    RealtimeSignalInStandardQueue(LinuxSignal),
     #[error("injected kernel operation failure at {0:?}")]
     Injected(KernelFailpoint),
 }

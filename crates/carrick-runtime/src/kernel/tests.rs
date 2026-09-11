@@ -1211,7 +1211,7 @@ fn exec_invalidation_cannot_revoke_a_switching_out_lease_before_destructive_save
     let mut lease = thread.claim_runnable(executor).unwrap();
     thread.begin_switch_out(&lease).unwrap();
 
-    thread.invalidate_execution_for_exec();
+    thread.invalidate_execution_for_exec().unwrap();
     assert!(matches!(
         thread.execution_state(),
         ThreadExecutionState::SwitchingOut { .. }
@@ -1439,7 +1439,7 @@ fn thread_execution_stale_owner_and_generation_cannot_settle() {
     let stale_lease = thread_b
         .claim_runnable(ExecutorId::synthetic_for_tests(22))
         .unwrap();
-    thread_b.invalidate_execution_for_exec();
+    thread_b.invalidate_execution_for_exec().unwrap();
     assert!(matches!(
         thread_b.park_from_executor(stale_lease, BlockedReason::ChildState),
         Err((ThreadExecutionError::StaleLease { .. }, _))
@@ -1460,7 +1460,7 @@ fn thread_execution_stale_owner_and_generation_cannot_settle() {
     let stale_exit_lease = thread_c
         .claim_runnable(ExecutorId::synthetic_for_tests(23))
         .unwrap();
-    thread_c.invalidate_execution_for_exec();
+    thread_c.invalidate_execution_for_exec().unwrap();
     assert!(matches!(
         thread_c.exit_from_executor(stale_exit_lease),
         Err((ThreadExecutionError::StaleLease { .. }, _))

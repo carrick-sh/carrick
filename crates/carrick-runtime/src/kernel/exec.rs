@@ -539,7 +539,7 @@ impl Kernel {
 
         prepared
             .old_caller
-            .transfer_runner_to(&prepared.replacement);
+            .transfer_runner_to(&prepared.replacement)?;
         let old_threads = record.task.publish_exec_thread_set(prepared.thread_set);
         record.task.replace_shared(Arc::clone(&prepared.shared));
         record
@@ -697,6 +697,8 @@ fn check_exec_failpoint(
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
     #[error(transparent)]
+    ThreadExecution(#[from] super::objects::ThreadExecutionError),
+    #[error(transparent)]
     ObjectId(#[from] super::ids::ObjectIdError),
     #[error(transparent)]
     ObjectGraph(#[from] ObjectGraphError),
@@ -834,7 +836,9 @@ impl ExecPrepareError {
                 | ExecError::StalePublication => LINUX_EAGAIN,
                 ExecError::TaskExited | ExecError::CallerExited => LINUX_ESRCH,
                 ExecError::FileTableDraining => LINUX_EBADF,
-                ExecError::RevisionExhausted | ExecError::RetiredThreadCapacity(_) => LINUX_ENOMEM,
+                ExecError::ThreadExecution(_)
+                | ExecError::RevisionExhausted
+                | ExecError::RetiredThreadCapacity(_) => LINUX_ENOMEM,
                 ExecError::ObjectId(_) | ExecError::ObjectGraph(_) => LINUX_ENOMEM,
                 ExecError::ForeignContext
                 | ExecError::ForeignPreparation

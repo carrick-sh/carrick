@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 11,
+  "typed_error_debt_ceiling": 7,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -1634,30 +1634,7 @@
       "rationale": "ObjectRevision atomic counter overflow would wrap revision numbers and corrupt kernel object change observation.",
       "sink": "fatal",
       "domain": "kernel::object_revision"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "PendingQueue::enqueue_realtime",
-      "ordinal_in_function": 1,
-      "fingerprint": "08cedfa7d19ce4efb655dadde8fd5e34ced399683c2d8d7300e5185e2f3d1ca4",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::pending_signals",
-      "rationale": "Realtime signal queue class routing mismatch is local typed validation and should return an error instead of aborting.",
-      "typed_error": "KernelOperationError",
-      "sink": "fatal",
-      "domain": "kernel::pending_signals"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "PendingQueue::enqueue_standard",
-      "ordinal_in_function": 1,
-      "fingerprint": "c75506ee7536b122e92cabaceee798531856bce121d37ba193462ee1a7bb6136",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::pending_signals",
-      "rationale": "Standard signal queue class routing mismatch is local typed validation and should return an error instead of aborting.",
-      "typed_error": "KernelOperationError",
-      "sink": "fatal",
-      "domain": "kernel::pending_signals"
+
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
@@ -1680,30 +1657,7 @@
       "rationale": "The monotone process-group object generation exhausted u64; wrapping would let stale group authority authenticate as a new object.",
       "sink": "fatal",
       "domain": "kernel::process_group_generation"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "Thread::fail_unsettled_execution_lease",
-      "ordinal_in_function": 1,
-      "fingerprint": "2f9fdc846f2285a46f37df1bc555b9835ae5a35fc3389345167012ec6eac37ac",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::execution_lease",
-      "rationale": "Execution generation counter overflow in fail_unsettled_execution_lease should return ThreadExecutionError::GenerationExhausted instead of aborting.",
-      "typed_error": "ThreadExecutionError",
-      "sink": "fatal",
-      "domain": "kernel::execution_lease"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "function": "Thread::invalidate_execution_for_exec",
-      "ordinal_in_function": 1,
-      "fingerprint": "859ea79345e59b1d4567fb2ea6cda53a948c8a35008c2eda18c879916ace5b90",
-      "verdict": "typed_error_debt",
-      "failure_domain": "kernel::execution_lease",
-      "rationale": "Execution generation counter overflow in invalidate_execution_for_exec should return ThreadExecutionError::GenerationExhausted instead of aborting.",
-      "typed_error": "ThreadExecutionError",
-      "sink": "fatal",
-      "domain": "kernel::execution_lease"
+
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
