@@ -371,3 +371,12 @@ commits and is re-checked at the next vet.
   alias-newest-index, hostfs-amplification. Director verification for the
   perf three = paired interleaved A/B of the row on a quiet host after the
   Phase 3 landings.
+- multiprocessing finding: the row is a PARALLELISM defect, not per-op CPU.
+  Docker runs the test in 2.9 s wall with ~14 s of user CPU (rusage of the
+  container's children; CPU measured under load, wall from the cached
+  oracle), i.e. ~5 cores busy; carrick takes 7.6 s wall for 10.3 s user
+  (1.3 cores). The guest does no more work under carrick; its child
+  processes do not run concurrently. Next instrument (quiet host, after the
+  workers finish): per-task syscall flow / executor claim sequence during
+  the row to name what serializes fork+exec children (carrier topology lock,
+  PtQuiesce election, fork admission, vCPU leases are the candidates).
