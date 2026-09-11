@@ -367,18 +367,8 @@ use super::fd_table::is_anon_overlay_path;
 
 impl<'a> FsView<'a> {
     #[inline]
-    #[allow(clippy::expect_used)]
     pub(super) fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
-        if let Some(cross) = self.cross {
-            return cross.captured_file_table();
-        }
-        if let Some(files) = resources::files() {
-            return files;
-        }
-        self.capture_one_task_context()
-            .expect("test file-table context")
-            .resources()
-            .files()
+        self.cross.captured_file_table()
     }
 
     #[inline]
@@ -394,57 +384,22 @@ impl<'a> FsView<'a> {
         &self,
         fd: i32,
     ) -> Option<crate::kernel::objects::FileSlotAuthority> {
-        if let Some(cross) = self.cross {
-            return cross.captured_slot_authority(fd);
-        }
-        let number = crate::kernel::FileSlotNumber::for_open_fd(fd).ok()?;
-        self.captured_file_table().capture_slot_authority(number)
+        self.cross.captured_slot_authority(fd)
     }
 
     #[inline]
-    #[allow(clippy::expect_used)]
     pub(super) fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext> {
-        if let Some(cross) = self.cross {
-            return cross.captured_fs_context();
-        }
-        if let Some(fs_context) = resources::fs_context() {
-            return fs_context;
-        }
-        self.capture_one_task_context()
-            .expect("test filesystem context")
-            .resources()
-            .fs_context()
+        self.cross.captured_fs_context()
     }
 
     #[inline]
-    #[allow(clippy::expect_used)]
     pub(super) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
-        if let Some(cross) = self.cross {
-            return cross.cred_snapshot();
-        }
-        if let Some(credentials) = resources::credentials() {
-            return credentials;
-        }
-        self.capture_one_task_context()
-            .expect("test credential context")
-            .resources()
-            .credentials()
+        self.cross.cred_snapshot()
     }
 
     #[inline]
-    #[allow(clippy::expect_used)]
     pub fn cwd(&self) -> String {
-        if let Some(cross) = self.cross {
-            return cross.cwd();
-        }
-        if let Some(fs_context) = resources::fs_context() {
-            return fs_context.cwd();
-        }
-        self.capture_one_task_context()
-            .expect("cannot capture initial filesystem context")
-            .resources()
-            .fs_context()
-            .cwd()
+        self.cross.cwd()
     }
 
     #[inline]
@@ -624,15 +579,11 @@ impl<'a> FsView<'a> {
     }
 
     pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
-        if let Some(cross) = self.cross {
-            cross.detach_fd_from_epolls(fd);
-        }
+        self.cross.detach_fd_from_epolls(fd);
     }
 
     pub(in crate::dispatch) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
-        if let Some(cross) = self.cross {
-            cross.close_open_file_and_free_pty(open_file);
-        }
+        self.cross.close_open_file_and_free_pty(open_file);
     }
 
     pub(in crate::dispatch) fn mqueue_owner_alias_closed(
@@ -640,9 +591,7 @@ impl<'a> FsView<'a> {
         files: &Arc<crate::kernel::FileTable>,
         open_file: &OpenFile,
     ) {
-        if let Some(cross) = self.cross {
-            cross.mqueue_owner_alias_closed(files, open_file);
-        }
+        self.cross.mqueue_owner_alias_closed(files, open_file);
     }
 
     pub(in crate::dispatch) fn mqueue_owner_alias_closed_known(
@@ -651,9 +600,8 @@ impl<'a> FsView<'a> {
         open_file: &OpenFile,
         alias_remains: bool,
     ) {
-        if let Some(cross) = self.cross {
-            cross.mqueue_owner_alias_closed_known(file_table, open_file, alias_remains);
-        }
+        self.cross
+            .mqueue_owner_alias_closed_known(file_table, open_file, alias_remains);
     }
 
     pub(crate) fn close_draining_file_table(
@@ -663,9 +611,8 @@ impl<'a> FsView<'a> {
         owner: Option<crate::kernel::TaskKey>,
         exec_successor: Option<&Arc<crate::kernel::FileTable>>,
     ) {
-        if let Some(cross) = self.cross {
-            cross.close_draining_file_table(kernel, files, owner, exec_successor);
-        }
+        self.cross
+            .close_draining_file_table(kernel, files, owner, exec_successor);
     }
 
     pub(crate) fn with_kernel_resources<R>(
@@ -683,9 +630,7 @@ impl<'a> FsView<'a> {
     }
 
     pub(in crate::dispatch) fn rename_open_paths(&self, resolved_old: &str, resolved_new: &str) {
-        if let Some(cross) = self.cross {
-            cross.rename_open_paths(resolved_old, resolved_new);
-        }
+        self.cross.rename_open_paths(resolved_old, resolved_new);
     }
 
     pub fn signal_mask_for(
@@ -719,8 +664,7 @@ impl<'a> FsView<'a> {
         sig_mask: carrick_abi::WaitSigMask,
     ) -> bool {
         self.cross
-            .map(|cross| cross.has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask))
-            .unwrap_or(false)
+            .has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask)
     }
 
     #[inline]
@@ -750,9 +694,7 @@ impl<'a> FsView<'a> {
         &self,
         description: &Arc<crate::kernel::FileDescription>,
     ) -> bool {
-        self.cross
-            .map(|c| c.memfd_has_writable_shared_map(description))
-            .unwrap_or(false)
+        self.cross.memfd_has_writable_shared_map(description)
     }
 
     pub(crate) fn authority_call(
@@ -761,48 +703,18 @@ impl<'a> FsView<'a> {
         slot: crate::kernel::objects::FileSlotAuthority,
         command: crate::file_authority::Command,
     ) -> Result<crate::file_authority::Outcome, AuthorityCallError> {
-        if let Some(cross) = self.cross {
-            return cross.authority_call(table, slot, command);
-        }
-        let authority_guard = self.file_authority.read();
-        let Some(active) = authority_guard.as_ref() else {
-            return Err(AuthorityCallError::Fatal(
-                crate::file_authority::AuthorityFatal::TransportUnavailable,
-            ));
-        };
-
-        if slot.table() != table.id() {
-            return Err(AuthorityCallError::Fatal(
-                crate::file_authority::AuthorityFatal::InvariantViolation(
-                    "slot table ID does not match target table ID",
-                ),
-            ));
-        }
-
-        let target = crate::file_authority::CanonicalAuthorityTarget { table, slot };
-        let response = active
-            .execute_canonical(target, command)
-            .map_err(AuthorityCallError::Fatal)?;
-
-        match response.outcome {
-            crate::file_authority::Outcome::Rejected(error) => {
-                Err(AuthorityCallError::Rejected(error))
-            }
-            outcome => Ok(outcome),
-        }
+        self.cross.authority_call(table, slot, command)
     }
 
     pub(crate) fn notify_inmem_epoll(&self) {
-        if let Some(cross) = self.cross {
-            cross.notify_inmem_epoll();
-        }
+        self.cross.notify_inmem_epoll();
     }
 
     pub(in crate::dispatch) fn io_uring_description(
         &self,
         fd: i32,
     ) -> Option<Arc<crate::kernel::FileDescription>> {
-        self.cross.and_then(|c| c.io_uring_description(fd))
+        self.cross.io_uring_description(fd)
     }
 
     pub(super) fn io_is_nonblocking(&self, fd: i32, msg_flags: i32) -> bool {
@@ -812,9 +724,7 @@ impl<'a> FsView<'a> {
     }
 
     pub(in crate::dispatch) fn range_touches_secretmem(&self, start: u64, len: u64) -> bool {
-        self.cross
-            .map(|c| c.range_touches_secretmem(start, len))
-            .unwrap_or(false)
+        self.cross.range_touches_secretmem(start, len)
     }
 
     pub fn read_signalfd<M: CurrentMmMemory>(
@@ -831,10 +741,7 @@ impl<'a> FsView<'a> {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
         let max = length / SIGINFO_LEN;
-        let out = self
-            .cross
-            .map(|c| c.take_signalfd_bytes(context, tid, mask, max))
-            .unwrap_or_default();
+        let out = self.cross.take_signalfd_bytes(context, tid, mask, max);
         if out.is_empty() {
             return DispatchOutcome::errno(LINUX_EAGAIN);
         }
@@ -845,7 +752,7 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn perf_event_state(&self, fd: i32) -> Option<Arc<super::perf::PerfEventState>> {
-        self.cross.and_then(|c| c.perf_event_state(fd))
+        self.cross.perf_event_state(fd)
     }
 
     pub(super) fn perf_event_ioctl<M: CurrentMmMemory>(
@@ -856,10 +763,10 @@ impl<'a> FsView<'a> {
         request: u64,
         arg: u64,
     ) -> DispatchOutcome {
-        let Some(cross) = self.cross else {
-            return DispatchOutcome::errno(LINUX_ENOTTY);
-        };
-        match cross.perf_event_ioctl_out(cx.reporter, fd, state, request, arg) {
+        match self
+            .cross
+            .perf_event_ioctl_out(cx.reporter, fd, state, request, arg)
+        {
             Ok(Some(bytes)) => write_packed(&mut *cx.memory, arg, &bytes),
             Ok(None) => DispatchOutcome::Returned { value: 0 },
             Err(errno) => DispatchOutcome::errno(errno),
@@ -873,10 +780,7 @@ impl<'a> FsView<'a> {
         length: usize,
         state: &Arc<super::perf::PerfEventState>,
     ) -> DispatchOutcome {
-        let Some(cross) = self.cross else {
-            return DispatchOutcome::errno(LINUX_EINVAL);
-        };
-        match cross.perf_event_read_bytes(state, length) {
+        match self.cross.perf_event_read_bytes(state, length) {
             Ok(bytes) => {
                 if memory.write_bytes(address, &bytes).is_err() {
                     DispatchOutcome::errno(LINUX_EFAULT)
@@ -892,14 +796,11 @@ impl<'a> FsView<'a> {
         &self,
         fd: i32,
     ) -> Result<(HostFd, i32), LinuxErrno> {
-        if let Some(cross) = self.cross {
-            return cross.host_socket_lookup(fd);
-        }
-        Err(LINUX_EBADF)
+        self.cross.host_socket_lookup(fd)
     }
 
     pub(in crate::dispatch) fn socket_guest_type(&self, fd: i32) -> Option<i32> {
-        self.cross.and_then(|c| c.socket_guest_type(fd))
+        self.cross.socket_guest_type(fd)
     }
 
     pub(in crate::dispatch) fn complete_wait_fd_authority(
@@ -909,27 +810,8 @@ impl<'a> FsView<'a> {
         guest_fds: impl IntoIterator<Item = i32>,
     ) -> DispatchOutcome {
         let guest_fds = guest_fds.into_iter().collect::<Vec<_>>();
-        if let Some(cross) = self.cross {
-            return cross.complete_wait_fd_authority(outcome, files, &guest_fds);
-        }
-        let authorize = |fds: WaitFds| fds.with_guest_slots(files, guest_fds.iter().copied());
-        match outcome {
-            DispatchOutcome::WaitOnFds {
-                fds,
-                timeout,
-                sig_mask,
-                completion,
-            } => match authorize(fds) {
-                Ok(fds) => DispatchOutcome::WaitOnFds {
-                    fds,
-                    timeout,
-                    sig_mask,
-                    completion,
-                },
-                Err(errno) => DispatchOutcome::errno(errno),
-            },
-            outcome => outcome,
-        }
+        self.cross
+            .complete_wait_fd_authority(outcome, files, &guest_fds)
     }
 
     #[inline]
@@ -937,32 +819,8 @@ impl<'a> FsView<'a> {
         self.proc.lock().hvpatch_process.clone()
     }
 
-    pub(super) fn mem_snapshot_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Result<mem::MemState, crate::kernel::SnapshotError> {
-        let authority = self.mm_binding.current.load_full();
-        let _snapshot = authority
-            .mutation_coordinator
-            .begin_snapshot_until(deadline)
-            .ok_or_else(|| {
-                if std::time::Instant::now() >= deadline {
-                    crate::kernel::SnapshotError::TimedOut
-                } else {
-                    crate::kernel::SnapshotError::Busy
-                }
-            })?;
-        let snapshot = authority.mem.lock().clone();
-        Ok(snapshot)
-    }
-
-    #[allow(clippy::expect_used)]
     pub(super) fn mem_snapshot(&self) -> mem::MemState {
-        if let Some(cross) = self.cross {
-            return cross.mem_snapshot();
-        }
-        self.mem_snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(30))
-            .expect("synthetic proc MemState snapshot timed out in test")
+        self.cross.mem_snapshot()
     }
 
     pub(super) fn synthetic_proc_identity(
@@ -1198,11 +1056,7 @@ impl<'a> FsView<'a> {
         context: &crate::kernel::KernelContext,
         path: &str,
     ) -> bool {
-        if let Some(cross) = self.cross {
-            return cross.is_synthetic_virtual_path(context, path);
-        }
-        crate::vfs::may_be_synthetic_virtual_path(path)
-            && crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context(context))
+        self.cross.is_synthetic_virtual_path(context, path)
     }
 
     pub(super) fn read_exec_file_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
@@ -1245,18 +1099,8 @@ impl<'a> FsView<'a> {
         (resolved != path).then_some(resolved)
     }
 
-    #[allow(clippy::expect_used)]
     pub(super) fn captured_mm(&self) -> Arc<crate::kernel::Mm> {
-        if let Some(cross) = self.cross {
-            return cross.captured_mm();
-        }
-        if let Some(mm) = resources::mm() {
-            return mm;
-        }
-        self.capture_one_task_context()
-            .expect("test mm context")
-            .shared()
-            .mm()
+        self.cross.captured_mm()
     }
 
     #[inline]
@@ -1264,25 +1108,8 @@ impl<'a> FsView<'a> {
         &self.fs.pty_table
     }
 
-    #[allow(clippy::expect_used)]
     pub(crate) fn identity_pid(&self) -> u32 {
-        if let Some(cross) = self.cross {
-            return cross.identity_pid();
-        }
-        if let Some(pid) = crate::dispatch::resources::with_active_context(|context| {
-            let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
-            crate::namespace::pid::ns_self_pid_for(context, task_id)
-        }) {
-            return pid;
-        }
-        let proc = self.proc.lock();
-        if let Some(_internal_pid) = proc.virtual_pid {
-            return proc
-                .namespace_pid
-                .expect("bound dispatcher is missing its cached namespace-local pid in test");
-        }
-        drop(proc);
-        crate::namespace::pid::self_ns_pid()
+        self.cross.identity_pid()
     }
 
     pub(super) fn sysvipc_shm_table(&self) -> String {

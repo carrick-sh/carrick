@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::dispatch::dispatcher::FsCrossSubsystem;
 
 fn two_namespaced_roots_for_async_owner() -> (
     Arc<crate::kernel::Kernel>,
@@ -8163,11 +8164,17 @@ struct FsViewFixture {
     kernel_binding: RwLock<crate::kernel::KernelTaskBinding>,
     network: Arc<crate::network::RuntimeNetwork>,
     page_geometry: crate::page_profile::PageGeometry,
+    task_context: crate::kernel::KernelContext,
 }
 
 impl FsViewFixture {
     fn new() -> Self {
         let (kernel_binding, mm_id) = crate::dispatch::kernel_context::bootstrap_one_task_binding();
+        let task_context = kernel_binding
+            .capture(crate::kernel::LinuxTid::for_task_leader(
+                kernel_binding.task_id(),
+            ))
+            .expect("fixture kernel context");
         let mm_authority = Arc::new(DispatchMmAuthority::new(mm_id));
         Self {
             fs: FsState::new_with_host_resolver(None),
@@ -8182,6 +8189,7 @@ impl FsViewFixture {
                 linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
                 native_profile: None,
             },
+            task_context,
         }
     }
 
@@ -8197,8 +8205,39 @@ impl FsViewFixture {
             page_geometry: self.page_geometry,
             sysv: None,
             exec_host_fs_fallback: false,
-            cross: None,
+            cross: self,
         }
+    }
+}
+
+impl FsCrossSubsystem for FsViewFixture {
+    fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext> {
+        self.task_context.resources().fs_context()
+    }
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        self.task_context.resources().files()
+    }
+    fn captured_mm(&self) -> Arc<crate::kernel::Mm> {
+        self.task_context.shared().mm()
+    }
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.task_context.resources().credentials()
+    }
+    fn cwd(&self) -> String {
+        self.task_context.resources().fs_context().cwd()
+    }
+    fn mem_snapshot(&self) -> crate::dispatch::mem::MemState {
+        crate::dispatch::mem::MemState::new()
+    }
+    fn identity_pid(&self) -> u32 {
+        1
+    }
+    fn captured_slot_authority(
+        &self,
+        fd: i32,
+    ) -> Option<crate::kernel::objects::FileSlotAuthority> {
+        let number = crate::kernel::FileSlotNumber::for_open_fd(fd).ok()?;
+        self.captured_file_table().capture_slot_authority(number)
     }
 }
 

@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "description": "Reviewed inventory of classified production raw lock acquisitions (fail-closed, shrink-only)",
-  "total_count": 101,
+  "total_count": 100,
   "category_counts": {
-    "proc": 57,
+    "proc": 56,
     "pty_table": 10,
     "sysv_process": 1,
     "sysv_namespace": 3,
@@ -94,7 +94,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchOutcome::hvpatch_process::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 937,
+      "line": 819,
       "item": "DispatchOutcome::hvpatch_process",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -103,17 +103,8 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyntheticProcContext::synthetic_proc_context_observed::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1085,
+      "line": 943,
       "item": "SyntheticProcContext::synthetic_proc_context_observed",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyntheticProcContext::identity_pid::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1278,
-      "item": "SyntheticProcContext::identity_pid",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 1
