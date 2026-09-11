@@ -367,6 +367,7 @@ use super::fd_table::is_anon_overlay_path;
 
 impl<'a> FsView<'a> {
     #[inline]
+    #[allow(clippy::expect_used)]
     pub(super) fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
         if let Some(cross) = self.cross {
             return cross.captured_file_table();
@@ -401,6 +402,7 @@ impl<'a> FsView<'a> {
     }
 
     #[inline]
+    #[allow(clippy::expect_used)]
     pub(super) fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext> {
         if let Some(cross) = self.cross {
             return cross.captured_fs_context();
@@ -415,6 +417,7 @@ impl<'a> FsView<'a> {
     }
 
     #[inline]
+    #[allow(clippy::expect_used)]
     pub(super) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
         if let Some(cross) = self.cross {
             return cross.cred_snapshot();
@@ -429,6 +432,7 @@ impl<'a> FsView<'a> {
     }
 
     #[inline]
+    #[allow(clippy::expect_used)]
     pub fn cwd(&self) -> String {
         if let Some(cross) = self.cross {
             return cross.cwd();
@@ -975,6 +979,7 @@ impl<'a> FsView<'a> {
         Ok(snapshot)
     }
 
+    #[allow(clippy::expect_used)]
     pub(super) fn mem_snapshot(&self) -> mem::MemState {
         if let Some(cross) = self.cross {
             return cross.mem_snapshot();
@@ -1263,6 +1268,7 @@ impl<'a> FsView<'a> {
         (resolved != path).then_some(resolved)
     }
 
+    #[allow(clippy::expect_used)]
     pub(super) fn captured_mm(&self) -> Arc<crate::kernel::Mm> {
         if let Some(cross) = self.cross {
             return cross.captured_mm();
@@ -1281,6 +1287,7 @@ impl<'a> FsView<'a> {
         &self.fs.pty_table
     }
 
+    #[allow(clippy::expect_used)]
     pub(crate) fn identity_pid(&self) -> u32 {
         if let Some(cross) = self.cross {
             return cross.identity_pid();
