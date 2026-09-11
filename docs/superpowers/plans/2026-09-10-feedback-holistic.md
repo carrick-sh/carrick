@@ -117,3 +117,15 @@ from sibling branches.
   timer_create thread-clock SIGEV_THREAD_ID) and the conformance-next
   retained-probe manifest check; all fixed forward and attributed to
   pre-campaign commits in their commit bodies.
+- 2026-09-10 wave 3 round 1 LANDED (pure moves, inventories re-homed):
+  trap.rs 61,201 → 32,014 lines (vcpu_admission, carrier_custody,
+  foreign_mm, task_mapping_index, frame_inventory, memory_protection
+  submodules); vcpu_loop/mod.rs 22,797 → 20,051 (wait_wake, terminal,
+  VcpuThreadRegistry); dispatch/fs.rs 16,754 → 12,256 (notify, locks,
+  proc_synthetic, mount, directory); dispatch/mod.rs 13,583 → 10,122
+  (outcome, request, wait_authority, host_alias, core_publication; the
+  semgrep exclusion for mod.rs is gone). Each worker hit its 90-minute
+  budget twice; round 2 continues from the landed state with a
+  commit-per-move, stop-green-at-70-minutes rule. T17 spec/embed hygiene
+  landed (70f8413a3). T16 dispatcher subsystem views is briefed and waits
+  for the dispatch split to finish.
