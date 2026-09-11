@@ -8766,8 +8766,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 82495,
-        "byte_start": 82479,
+        "byte_end": 82521,
+        "byte_start": 82505,
         "column": 39,
         "column_end": 55,
         "column_start": 39,
@@ -8786,8 +8786,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 90959,
-        "byte_start": 90943,
+        "byte_end": 90985,
+        "byte_start": 90969,
         "column": 47,
         "column_end": 63,
         "column_start": 47,
@@ -11506,9 +11506,9 @@
       }
     }
   ],
-  "rows_sha256": "c7818fd64f40baa757bc772f9a8808dcc15519537139c79fa6d0feeb84a9e402",
+  "rows_sha256": "222e43e9e89dac4c4830de7cd9142964b221c5652f6178fa7b0f285bae6621d9",
   "schema": 1,
-  "source_head": "02bbcd8fdbaeeb3be25c726684579734881211c8",
+  "source_head": "ea9f9e501d283d2fc076bfa59fd758873d01dfef",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",

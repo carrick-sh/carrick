@@ -11745,8 +11745,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2068 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 82495,
-      "byte_start": 82479,
+      "byte_end": 82521,
+      "byte_start": 82505,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
@@ -11772,8 +11772,8 @@
     "rationale": "At crates/carrick-runtime/src/dispatch/mod.rs:2281 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 90959,
-      "byte_start": 90943,
+      "byte_end": 90985,
+      "byte_start": 90969,
       "column": 47,
       "column_end": 63,
       "column_start": 47,

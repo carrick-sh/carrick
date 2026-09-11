@@ -7712,7 +7712,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 688,
+      "line": 686,
       "categories": [
         "mapping"
       ],
