@@ -2063,7 +2063,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1508,
+      "line": 1504,
       "categories": [
         "table_guard"
       ],
@@ -2074,7 +2074,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1974,
+      "line": 1970,
       "categories": [
         "description_guard"
       ],
@@ -2085,7 +2085,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2002,
+      "line": 1998,
       "categories": [
         "description_guard"
       ],
@@ -2096,7 +2096,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2075,
+      "line": 2071,
       "categories": [
         "description_guard"
       ],
@@ -2349,107 +2349,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 467,
-      "categories": [
-        "description_backing",
-        "mapping"
-      ],
-      "text": ".concrete_backing::<crate::dispatch::ioring::IoUringBacking>()",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "fd_is_epollable",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 472,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "fd_is_epollable",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 492,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "open_file.description.read().as_deref(),",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "fd_supports_epoll_oob",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 502,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "open_file.description.read().as_deref(),",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "fd_supports_read_lowat",
-      "migration_family": "read_attempt"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 512,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "open_file.description.read().as_deref(),",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "fd_is_listening_socket",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 701,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "host_read_avail_for_poll",
-      "migration_family": "inspect_misc"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 833,
-      "categories": [
-        "table_guard"
-      ],
-      "text": ".read_epoll_fds()",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "epoll_rearm_after_io",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 841,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "epoll_rearm_after_io",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 999,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "self.captured_file_table().write_epoll_fds().remove(&epfd);",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "epoll_rearm_after_io",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1055,
+      "line": 361,
       "categories": [
         "description_guard"
       ],
@@ -2460,7 +2360,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1104,
+      "line": 410,
       "categories": [
         "description_guard"
       ],
@@ -2471,7 +2371,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1177,
+      "line": 483,
       "categories": [
         "description_guard"
       ],
@@ -2482,18 +2382,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1247,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let table = files.read_open_files();",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "detach_fd_from_epolls",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1474,
+      "line": 598,
       "categories": [
         "description_guard"
       ],
@@ -2503,8 +2392,174 @@
       "migration_family": "create_install"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 1602,
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 188,
+      "categories": [
+        "description_backing",
+        "mapping"
+      ],
+      "text": ".concrete_backing::<crate::dispatch::ioring::IoUringBacking>()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "fd_is_epollable",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 193,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "fd_is_epollable",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 213,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "open_file.description.read().as_deref(),",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "fd_supports_epoll_oob",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 223,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "open_file.description.read().as_deref(),",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "fd_supports_read_lowat",
+      "migration_family": "read_attempt"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 233,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "open_file.description.read().as_deref(),",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "fd_is_listening_socket",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 422,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "host_read_avail_for_poll",
+      "migration_family": "inspect_misc"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 554,
+      "categories": [
+        "table_guard"
+      ],
+      "text": ".read_epoll_fds()",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "epoll_rearm_after_io",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 562,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "epoll_rearm_after_io",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 720,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "self.captured_file_table().write_epoll_fds().remove(&epfd);",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "epoll_rearm_after_io",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 775,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let table = files.read_open_files();",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "detach_fd_from_epolls",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 926,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "epoll_pwait_wait_core",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 954,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "epoll_pwait_wait_core",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 1032,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "epoll_pwait_wait_core",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 1479,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(mut open) = open_file.description.write() {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "epoll_pwait_wait_core",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 1601,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(mut open) = open_file.description.write() {",
+      "scope_kind": "production_callsite",
+      "enclosing_function": "epoll_pwait_wait_core",
+      "migration_family": "epoll_wait"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 1778,
       "categories": [
         "table_guard"
       ],
@@ -2514,63 +2569,8 @@
       "migration_family": "epoll_wait"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3394,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "epoll_pwait_wait_core",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3422,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "epoll_pwait_wait_core",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3500,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "epoll_pwait_wait_core",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 3947,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "epoll_pwait_wait_core",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4069,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
-      "scope_kind": "production_callsite",
-      "enclosing_function": "epoll_pwait_wait_core",
-      "migration_family": "epoll_wait"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4228,
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 2955,
       "categories": [
         "table_guard"
       ],
@@ -2580,8 +2580,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4259,
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 2986,
       "categories": [
         "table_guard"
       ],
@@ -2591,8 +2591,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4318,
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 3045,
       "categories": [
         "table_guard"
       ],
@@ -2602,8 +2602,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4320,
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 3047,
       "categories": [
         "description_guard"
       ],
@@ -2613,8 +2613,8 @@
       "migration_family": "create_install"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4668,
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 3395,
       "categories": [
         "table_guard"
       ],
@@ -2624,8 +2624,8 @@
       "migration_family": "epoll_wait"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/net.rs",
-      "line": 4773,
+      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
+      "line": 3500,
       "categories": [
         "table_guard"
       ],
