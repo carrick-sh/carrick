@@ -801,3 +801,91 @@ fn tkill_to_unknown_tid_is_esrch() {
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_ESRCH });
 }
+
+#[test]
+fn tgkill_to_retired_sibling_returns_esrch_before_runtime_withdrawal() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x2000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let initial = dispatcher.capture_one_task_context().unwrap();
+    let main = initial.thread().registry_id();
+    let registry = Arc::new(ThreadRegistry::new(main));
+    let futex = Arc::new(FutexTable::new());
+    let sibling = registry.register_child(0);
+    let flags = carrick_abi::LinuxCloneFlags::VM
+        | carrick_abi::LinuxCloneFlags::FS
+        | carrick_abi::LinuxCloneFlags::FILES
+        | carrick_abi::LinuxCloneFlags::SIGHAND
+        | carrick_abi::LinuxCloneFlags::THREAD;
+    let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
+    let sibling_context = initial
+        .kernel()
+        .reserve_thread_clone(&initial, plan, None)
+        .unwrap()
+        .prepare(sibling)
+        .unwrap()
+        .commit()
+        .unwrap()
+        .start_thread()
+        .unwrap()
+        .into_context();
+    let parent_context = dispatcher.capture_one_task_context().unwrap();
+    install_guest_signal_handler(&parent_context, SIGUSR1 as i32);
+
+    // Before retirement, signaling the live sibling succeeds.
+    let outcome = dispatcher
+        .dispatch_threaded(
+            &parent_context,
+            SyscallRequest::new(
+                131,
+                SyscallArgs::from([main.raw() as u64, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+            main,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        DispatchOutcome::SignalThread {
+            tid: sibling,
+            signum: SIGUSR1 as i32,
+            kernel_target: Some(sibling_context.thread().key()),
+        }
+    );
+
+    // Retire the sibling in the kernel graph, simulating the first step of
+    // handle_persistent_thread_exit. Note: registry.is_live(sibling) is still true,
+    // simulating the window before withdraw_persistent_terminal_owner_runtime runs
+    // (which clears ctid, wakes join futexes, and unregisters host signals).
+    sibling_context
+        .kernel()
+        .exit_thread(&sibling_context, None)
+        .unwrap();
+
+    assert!(registry.is_live(sibling));
+
+    // tgkill from sibling's peer must immediately see ESRCH and not attempt signal delivery
+    // to a thread that is retired from the kernel graph.
+    let outcome = dispatcher
+        .dispatch_threaded(
+            &parent_context,
+            SyscallRequest::new(
+                131,
+                SyscallArgs::from([main.raw() as u64, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+            main,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_ESRCH });
+
+    // Withdrawing the sibling from the registry completes the lifecycle.
+    assert!(!registry.exit(sibling));
+    assert!(!registry.is_live(sibling));
+}

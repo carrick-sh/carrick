@@ -1281,6 +1281,12 @@ where
                         carrick_observability::probes::HvpatchThreadTerminalReason::ProcessTerminalLoser,
                         1,
                     );
+                    if !self.state.thread_exit_withdrawn {
+                        let _ = self
+                            .state
+                            .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                        self.state.thread_exit_withdrawn = true;
+                    }
                     return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
                 }
                 self.park_thread_exit_retry(
@@ -1406,6 +1412,12 @@ where
                         127,
                         self.traps,
                     );
+                    if !self.state.thread_exit_withdrawn {
+                        let _ = self
+                            .state
+                            .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                        self.state.thread_exit_withdrawn = true;
+                    }
                     self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
                 }
                 return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
@@ -3430,6 +3442,12 @@ where
                     // later publishes, final wake Err(UnknownThread), 10/12
                     // teardown hangs). Finish; the owner retires the row.
                     let _ = observed_epoch;
+                    if !self.state.thread_exit_withdrawn {
+                        let _ = self
+                            .state
+                            .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                        self.state.thread_exit_withdrawn = true;
+                    }
                     return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
                 }
             }
