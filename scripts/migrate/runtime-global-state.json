@@ -2299,7 +2299,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs",
       "symbol": "tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
       "fingerprint": "fdb935da923d0387bd758fc1663b763193697ffd32ef5be9644304ce07758269",
       "classification": "test_only",
@@ -2579,7 +2579,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs",
       "symbol": "tag_strip_tests::EXEC_PAYLOAD_ENV_LOCK",
       "fingerprint": "d1cfca7c8c7f11866ce66352f586e9263280a936d4d32c0bbe2a5684dcf74d9d",
       "classification": "test_only",
