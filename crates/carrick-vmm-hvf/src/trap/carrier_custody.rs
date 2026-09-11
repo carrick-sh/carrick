@@ -1666,7 +1666,7 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn vm_rebuild_funnels_reconcile_owner_generation_before_guest_entry_static_audit() {
-        let source = include_str!("../trap.rs");
+        let source = concat!(include_str!("../trap.rs"), include_str!("mapping_plan.rs"));
         let shared_wait = source
             .split(concat!("pub(crate) fn shared_wait_", "resume("))
             .nth(1)
@@ -3936,6 +3936,7 @@ mod carrier_vm_custody_tests {
     fn creation_funnels_hold_transaction_through_setup_and_prepared_writes_hold_pin_static_audit() {
         let source = concat!(
             include_str!("../trap.rs"),
+            include_str!("mapping_plan.rs"),
             include_str!("foreign_mm.rs"),
             include_str!("global_frame.rs"),
             include_str!("execve_rebuild.rs")

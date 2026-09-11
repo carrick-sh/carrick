@@ -2243,7 +2243,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
       "symbol": "exec_private_file_cache_enabled::CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE",
       "fingerprint": "931b0171ed8676aebdab76e043eb81a34bbe39080ebecdd84606053168c4b276",
       "classification": "config_debug",
@@ -2259,7 +2259,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
       "symbol": "from_address_space::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
       "fingerprint": "1357cf78f5861bad30288ff0d2aab454e3d90331512adf0ba53a1d44b9dcd505",
       "classification": "config_debug",
@@ -2267,7 +2267,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
       "symbol": "from_address_space::CARRICK_HVPATCH_SPARSE_EXEC_STACK",
       "fingerprint": "63723637515fd90dcfbccd79091db164dd893a05c6210831a669f790286a8136",
       "classification": "config_debug",
@@ -2275,7 +2275,7 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
       "symbol": "lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES",
       "fingerprint": "0cf902e86dd15cce376d7459d8b960e42afcf28a2af5ae4408d90f8cc01e3fad",
       "classification": "config_debug",
@@ -2355,7 +2355,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
       "symbol": "cached_exec_private_file_backing::NEXT_IDENTITY",
       "fingerprint": "5c5f4956246e7f14625962f3175165e73413ca16202db1c1b623f9b187430691",
       "classification": "monotonic_allocator",
@@ -2387,7 +2387,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
       "symbol": "create_exec_private_file_artifact::NEXT_FILE",
       "fingerprint": "cf4dad726c1b170f3e7e45d5554dd15c2240d65ed0d48a9bc3210af6e6d1277d",
       "classification": "monotonic_allocator",
@@ -2403,7 +2403,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
       "symbol": "exec_private_file_cache::CACHE",
       "fingerprint": "1658305af907a3175584e3ee62aa97b4fb3a07776dfa5394c4047bc7c8f2a32d",
       "classification": "config_debug",
