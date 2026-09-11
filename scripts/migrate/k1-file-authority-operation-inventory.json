@@ -20,12 +20,12 @@
     "lifecycle": 6
   },
   "files": {
-    "table_guard": 21,
-    "description_guard": 30,
+    "table_guard": 22,
+    "description_guard": 31,
     "description_backing": 7,
-    "epoll": 34,
-    "stream": 15,
-    "mapping": 74,
+    "epoll": 35,
+    "stream": 16,
+    "mapping": 75,
     "lifecycle": 5
   },
   "entries": [
@@ -2660,6 +2660,709 @@
       "scope_kind": "test_or_definition"
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 21,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// Host passthrough for tee(2). On Linux the guest pipes are real host kernel",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 22,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// pipes, so the host tee(2) gives exact zero-consume semantics; on hosts",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 23,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// without tee(2) (macOS/BSD) `SyscallDispatcher::userspace_tee` emulates it.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 34,
+      "categories": [
+        "stream"
+      ],
+      "text": "libc::tee(",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 55,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// also models as a `HostPipe`), a socket, or a regular file. splice(2)",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 62,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 74,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// True iff `fd` is a splice/tee SOURCE that is not open for reading, so",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 75,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// splice(2) must reject it with EBADF: an `O_PATH` descriptor, a",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 85,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 106,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// tee(2) for in-memory anonymous pipes: duplicate up to `count` bytes from",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 157,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// tee(2): duplicate up to `count` bytes from the source pipe's read end to",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 159,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// host the real `tee(2)` is exact; elsewhere (macOS/BSD lack `tee(2)`) fall",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 180,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// Userspace `tee(2)` for hosts without the syscall: drain the source pipe's",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 198,
+      "categories": [
+        "stream"
+      ],
+      "text": "// Nothing buffered: a non-blocking tee is EAGAIN; a blocking tee",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 279,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 300,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// ([`super::host_pipe_write_room`]), so a `splice(2)`/`vmsplice(2)` that bounds",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 306,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 344,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "for slot in files.read_open_files().values() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 368,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// Write `bytes` to a splice/sendfile destination, honoring `off_out`: NULL",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 374,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// The destination is written with `splice(2)`'s PARTIAL contract",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 379,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// never consumed it (`vmsplice` gathers from guest memory), so a short",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 392,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(open) = open_file.description.read()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 414,
+      "categories": [
+        "stream"
+      ],
+      "text": "// `splice(2)` waits for room; the partial write path reports",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 428,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "Some(of) => match of.description.read().as_deref() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 462,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// Pull up to `count` bytes off a `splice(2)` SOURCE pipe.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 466,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// splice, a `WaitOnFds` readiness park for a blocking one \u2014 the same",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 470,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// `splice` on an empty pipe failed instead of waiting.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 564,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// host kqueue/poll edge cannot announce it. Wake epoll instances to",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 569,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// Push an undelivered `splice(2)` tail back onto the FRONT of an",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 577,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// The destination's readiness park for a blocking `splice`/`vmsplice`",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 583,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = file.description.read()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 649,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// `splice(2)` flavour of [`Self::write_output_fd`]: the destination is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 655,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// `splice(2)` explicitly may transfer fewer bytes than requested and",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 656,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// leaves the loop to the caller. Using the `write(2)` contract for splice",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 658,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// it cannot drain the pipe until the splice it is blocked in returns.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 679,
+      "categories": [
+        "stream"
+      ],
+      "text": "// `sendfile(1, infile, ...)` writes the file contents to the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 685,
+      "categories": [
+        "stream"
+      ],
+      "text": "// directly. This is what makes splice/copy_file_range/sendfile to a",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 687,
+      "categories": [
+        "stream"
+      ],
+      "text": "// real Linux (splice pipe->file).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 691,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 939,
+      "categories": [
+        "stream"
+      ],
+      "text": "fn tee(this, cx, fd_in: Fd, fd_out: Fd, len: u64, flags: u64) {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 940,
+      "categories": [
+        "stream"
+      ],
+      "text": "// tee(2) duplicates up to `len` bytes of pipe data from fd_in to",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 997,
+      "categories": [
+        "stream"
+      ],
+      "text": "fn splice(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1017,
+      "categories": [
+        "stream"
+      ],
+      "text": "// splice(2) reads from fd_in, so a source not open for reading \u2014 an",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1029,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// (eventfd/signalfd/timerfd/epoll/pidfd/memfd/sockets/regular",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1037,
+      "categories": [
+        "stream"
+      ],
+      "text": "// splice(2) requires at least ONE end to be a genuine pipe; a",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1045,
+      "categories": [
+        "stream",
+        "mapping"
+      ],
+      "text": "// An `io_uring` ring is an anonymous inode with no splice file",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1050,
+      "categories": [
+        "stream"
+      ],
+      "text": "// `contents`, and splice reported a successful 0-byte transfer",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1051,
+      "categories": [
+        "stream"
+      ],
+      "text": "// (splice07 \"splice() on io uring -> pipe write end succeeded\").",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1057,
+      "categories": [
+        "stream"
+      ],
+      "text": "// memfd_secret cannot be a splice endpoint (secretmem has no",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1080,
+      "categories": [
+        "stream"
+      ],
+      "text": "// write path returns a SHORT count rather than parking (splice(2)'s",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1095,
+      "categories": [
+        "stream"
+      ],
+      "text": "// ESPIPE (splice(2)). off_out IS allowed (honored below) when",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1133,
+      "categories": [
+        "stream"
+      ],
+      "text": "// Splice OUT of a real host pipe's read end (the fork-safe pipe model;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1134,
+      "categories": [
+        "stream"
+      ],
+      "text": "// `pipe2`/`fcntl` now hand back HostPipe descriptions, so splice must",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1138,
+      "categories": [
+        "stream"
+      ],
+      "text": "// ESPIPE (splice(2)). off_out IS allowed (honored below) when",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1152,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = file.description.read()?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1187,
+      "categories": [
+        "stream"
+      ],
+      "text": "// Splice OUT of a host socket (socket -> pipe, and socket -> socket).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1189,
+      "categories": [
+        "stream"
+      ],
+      "text": "// socket source fell through to the sendfile path below, which treats",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1226,
+      "categories": [
+        "stream"
+      ],
+      "text": "// A socket that STRUCTURALLY cannot serve as a splice",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1247,
+      "categories": [
+        "stream"
+      ],
+      "text": "// The destination is typically Go's O_NONBLOCK splice pipe (64 KiB",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1254,
+      "categories": [
+        "stream"
+      ],
+      "text": "// 10MB sendfile). MSG_PEEK leaves the bytes in the socket; we",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1256,
+      "categories": [
+        "stream"
+      ],
+      "text": "// the guest's Go splice loop just makes another pass for the rest.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1271,
+      "categories": [
+        "stream"
+      ],
+      "text": "// A socket that STRUCTURALLY cannot serve as a splice source \u2014",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1284,
+      "categories": [
+        "stream"
+      ],
+      "text": "// EOF: the writer closed; splice reports 0 (Go stops the loop).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1327,
+      "categories": [
+        "stream"
+      ],
+      "text": "// Neither side is a pipe \u2192 EINVAL (splice(2)); the pipe-source",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1340,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(open) = open_file.description.read()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1386,
+      "categories": [
+        "stream"
+      ],
+      "text": "// splice(2) into a pipe moves at most what the pipe can hold and",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1392,
+      "categories": [
+        "stream"
+      ],
+      "text": "// AFTER this splice returns, so `cat` of any file larger than one",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1399,
+      "categories": [
+        "stream"
+      ],
+      "text": "// splice(2) is specified to wait out, and the write path's own",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1407,
+      "categories": [
+        "stream"
+      ],
+      "text": "// reports EAGAIN; a blocking splice(2) must wait for room. Waiting",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1426,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "&& let Some(mut open) = open_file.description.write()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1435,
+      "categories": [
+        "stream"
+      ],
+      "text": "// Same contract as `sendfile`: HostFile reads via `pread`",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1441,
+      "categories": [
+        "stream"
+      ],
+      "text": "// with `splice(file, NULL, pipe, NULL, n)` in a loop \u2014",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1463,
+      "categories": [
+        "stream"
+      ],
+      "text": "fn vmsplice(this, cx, fd: Fd, iov: GuestPtr, nr_segs: u64, flags: u64) {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1464,
+      "categories": [
+        "stream"
+      ],
+      "text": "// vmsplice(2): fd must be a pipe; the pipe END selects the direction \u2014",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1480,
+      "categories": [
+        "stream"
+      ],
+      "text": "// SPLICE_F_NONBLOCK *or* an O_NONBLOCK pipe: vmsplice(2) blocks",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1497,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1514,
+      "categories": [
+        "stream"
+      ],
+      "text": "// vmsplice(2): a valid fd that does not refer to a pipe is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs/transfer.rs",
+      "line": 1523,
+      "categories": [
+        "stream"
+      ],
+      "text": "// vmsplice(2) into a pipe moves AT MOST what the pipe can",
+      "scope_kind": "production_callsite"
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/fs/xattr.rs",
       "line": 46,
       "categories": [
@@ -2688,7 +3391,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 112,
+      "line": 113,
       "categories": [
         "stream"
       ],
@@ -2697,7 +3400,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 113,
+      "line": 114,
       "categories": [
         "stream"
       ],
@@ -2706,7 +3409,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 114,
+      "line": 115,
       "categories": [
         "stream"
       ],
@@ -2715,7 +3418,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 158,
+      "line": 159,
       "categories": [
         "stream"
       ],
@@ -2724,7 +3427,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 208,
+      "line": 209,
       "categories": [
         "stream"
       ],
@@ -2733,43 +3436,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 420,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// Host passthrough for tee(2). On Linux the guest pipes are real host kernel",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 421,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// pipes, so the host tee(2) gives exact zero-consume semantics; on hosts",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 422,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// without tee(2) (macOS/BSD) `SyscallDispatcher::userspace_tee` emulates it.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 433,
-      "categories": [
-        "stream"
-      ],
-      "text": "libc::tee(",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 454,
+      "line": 432,
       "categories": [
         "table_guard"
       ],
@@ -2778,7 +3445,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 460,
+      "line": 438,
       "categories": [
         "table_guard"
       ],
@@ -2787,7 +3454,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 469,
+      "line": 447,
       "categories": [
         "description_guard"
       ],
@@ -2796,7 +3463,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 535,
+      "line": 513,
       "categories": [
         "stream"
       ],
@@ -2805,7 +3472,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 536,
+      "line": 514,
       "categories": [
         "mapping"
       ],
@@ -2814,7 +3481,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 636,
+      "line": 614,
       "categories": [
         "description_guard"
       ],
@@ -2823,7 +3490,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 647,
+      "line": 625,
       "categories": [
         "table_guard"
       ],
@@ -2832,7 +3499,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 649,
+      "line": 627,
       "categories": [
         "description_guard"
       ],
@@ -2841,7 +3508,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 668,
+      "line": 646,
       "categories": [
         "stream"
       ],
@@ -2850,7 +3517,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 670,
+      "line": 648,
       "categories": [
         "stream"
       ],
@@ -2859,7 +3526,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 676,
+      "line": 654,
       "categories": [
         "table_guard"
       ],
@@ -2868,7 +3535,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 678,
+      "line": 656,
       "categories": [
         "description_guard"
       ],
@@ -2877,124 +3544,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 697,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// also models as a `HostPipe`), a socket, or a regular file. splice(2)",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 704,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 716,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// True iff `fd` is a splice/tee SOURCE that is not open for reading, so",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 717,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// splice(2) must reject it with EBADF: an `O_PATH` descriptor, a",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 727,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 748,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// tee(2) for in-memory anonymous pipes: duplicate up to `count` bytes from",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 802,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// tee(2): duplicate up to `count` bytes from the source pipe's read end to",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 804,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// host the real `tee(2)` is exact; elsewhere (macOS/BSD lack `tee(2)`) fall",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 825,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// Userspace `tee(2)` for hosts without the syscall: drain the source pipe's",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 843,
-      "categories": [
-        "stream"
-      ],
-      "text": "// Nothing buffered: a non-blocking tee is EAGAIN; a blocking tee",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 924,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 945,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// ([`super::host_pipe_write_room`]), so a `splice(2)`/`vmsplice(2)` that bounds",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 951,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1012,
+      "line": 707,
       "categories": [
         "table_guard"
       ],
@@ -3003,7 +3553,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1014,
+      "line": 709,
       "categories": [
         "description_guard"
       ],
@@ -3012,16 +3562,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1043,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "for slot in files.read_open_files().values() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1075,
+      "line": 735,
       "categories": [
         "description_guard"
       ],
@@ -3030,187 +3571,52 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1229,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// Write `bytes` to a splice/sendfile destination, honoring `off_out`: NULL",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1235,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// The destination is written with `splice(2)`'s PARTIAL contract",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1240,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// never consumed it (`vmsplice` gathers from guest memory), so a short",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1253,
+      "line": 1052,
       "categories": [
         "description_guard"
       ],
-      "text": "if let Some(open) = open_file.description.read()",
+      "text": "let Some(mut open) = open_file.description.write() else {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1275,
-      "categories": [
-        "stream"
-      ],
-      "text": "// `splice(2)` waits for room; the partial write path reports",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1289,
+      "line": 1252,
       "categories": [
         "description_guard"
       ],
-      "text": "Some(of) => match of.description.read().as_deref() {",
+      "text": "let Some(mut open) = open_file.description.write() else {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1323,
+      "line": 1389,
       "categories": [
-        "stream"
+        "description_guard"
       ],
-      "text": "/// Pull up to `count` bytes off a `splice(2)` SOURCE pipe.",
+      "text": "let Some(mut open) = open_file.description.write() else {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1327,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// splice, a `WaitOnFds` readiness park for a blocking one \u2014 the same",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1331,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// `splice` on an empty pipe failed instead of waiting.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1425,
+      "line": 1637,
       "categories": [
         "epoll"
       ],
-      "text": "// host kqueue/poll edge cannot announce it. Wake epoll instances to",
+      "text": "| OpenDescription::Epoll { .. }",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1430,
+      "line": 1669,
       "categories": [
-        "stream"
+        "epoll"
       ],
-      "text": "/// Push an undelivered `splice(2)` tail back onto the FRONT of an",
+      "text": "| OpenDescription::Epoll { .. }",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1438,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// The destination's readiness park for a blocking `splice`/`vmsplice`",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1444,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = file.description.read()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1510,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// `splice(2)` flavour of [`Self::write_output_fd`]: the destination is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1516,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// `splice(2)` explicitly may transfer fewer bytes than requested and",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1517,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// leaves the loop to the caller. Using the `write(2)` contract for splice",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1519,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// it cannot drain the pipe until the splice it is blocked in returns.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1540,
-      "categories": [
-        "stream"
-      ],
-      "text": "// `sendfile(1, infile, ...)` writes the file contents to the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1546,
-      "categories": [
-        "stream"
-      ],
-      "text": "// directly. This is what makes splice/copy_file_range/sendfile to a",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1548,
-      "categories": [
-        "stream"
-      ],
-      "text": "// real Linux (splice pipe->file).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1552,
+      "line": 1784,
       "categories": [
         "description_guard"
       ],
@@ -3219,7 +3625,34 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1962,
+      "line": 1858,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// touches a live secretmem mapping fails EIO",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "line": 1946,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// used non-blocking + epoll; a true blocking wait on the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "line": 2086,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll { .. }",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "line": 2173,
       "categories": [
         "description_guard"
       ],
@@ -3228,20 +3661,20 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2162,
+      "line": 2418,
       "categories": [
-        "description_guard"
+        "epoll"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "| OpenDescription::Epoll { .. }",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2299,
+      "line": 2460,
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(open) = open_file.description.read() else {",
       "scope_kind": "production_callsite"
     },
     {
@@ -3255,7 +3688,16 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2579,
+      "line": 2611,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "line": 2714,
       "categories": [
         "epoll"
       ],
@@ -3264,7 +3706,16 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2694,
+      "line": 2776,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "line": 2844,
       "categories": [
         "description_guard"
       ],
@@ -3273,43 +3724,16 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2768,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// touches a live secretmem mapping fails EIO",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2856,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// used non-blocking + epoll; a true blocking wait on the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2996,
-      "categories": [
-        "epoll"
-      ],
-      "text": "OpenDescription::Epoll { .. }",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3083,
+      "line": 2928,
       "categories": [
         "description_guard"
       ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
+      "text": "let Some(open) = open_file.description.read() else {",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3328,
+      "line": 2956,
       "categories": [
         "epoll"
       ],
@@ -3318,7 +3742,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3370,
+      "line": 3012,
       "categories": [
         "description_guard"
       ],
@@ -3327,79 +3751,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3457,
-      "categories": [
-        "epoll"
-      ],
-      "text": "| OpenDescription::Epoll { .. }",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3521,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3624,
-      "categories": [
-        "epoll"
-      ],
-      "text": "| OpenDescription::Epoll { .. }",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3686,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3754,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(mut open) = open_file.description.write() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3838,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3866,
-      "categories": [
-        "epoll"
-      ],
-      "text": "| OpenDescription::Epoll { .. }",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 3922,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4033,
+      "line": 3123,
       "categories": [
         "description_guard"
       ],
@@ -3408,7 +3760,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4145,
+      "line": 3235,
       "categories": [
         "epoll"
       ],
@@ -3417,359 +3769,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4156,
-      "categories": [
-        "stream"
-      ],
-      "text": "fn tee(this, cx, fd_in: Fd, fd_out: Fd, len: u64, flags: u64) {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4158,
-      "categories": [
-        "stream"
-      ],
-      "text": "// tee(2) duplicates up to `len` bytes of pipe data from fd_in to",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4213,
-      "categories": [
-        "stream"
-      ],
-      "text": "fn splice(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4234,
-      "categories": [
-        "stream"
-      ],
-      "text": "// splice(2) reads from fd_in, so a source not open for reading \u2014 an",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4246,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// (eventfd/signalfd/timerfd/epoll/pidfd/memfd/sockets/regular",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4254,
-      "categories": [
-        "stream"
-      ],
-      "text": "// splice(2) requires at least ONE end to be a genuine pipe; a",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4262,
-      "categories": [
-        "stream",
-        "mapping"
-      ],
-      "text": "// An `io_uring` ring is an anonymous inode with no splice file",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4267,
-      "categories": [
-        "stream"
-      ],
-      "text": "// `contents`, and splice reported a successful 0-byte transfer",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4268,
-      "categories": [
-        "stream"
-      ],
-      "text": "// (splice07 \"splice() on io uring -> pipe write end succeeded\").",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4274,
-      "categories": [
-        "stream"
-      ],
-      "text": "// memfd_secret cannot be a splice endpoint (secretmem has no",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4297,
-      "categories": [
-        "stream"
-      ],
-      "text": "// write path returns a SHORT count rather than parking (splice(2)'s",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4312,
-      "categories": [
-        "stream"
-      ],
-      "text": "// ESPIPE (splice(2)). off_out IS allowed (honored below) when",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4349,
-      "categories": [
-        "stream"
-      ],
-      "text": "// Splice OUT of a real host pipe's read end (the fork-safe pipe model;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4350,
-      "categories": [
-        "stream"
-      ],
-      "text": "// `pipe2`/`fcntl` now hand back HostPipe descriptions, so splice must",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4354,
-      "categories": [
-        "stream"
-      ],
-      "text": "// ESPIPE (splice(2)). off_out IS allowed (honored below) when",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4368,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = file.description.read()?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4403,
-      "categories": [
-        "stream"
-      ],
-      "text": "// Splice OUT of a host socket (socket -> pipe, and socket -> socket).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4405,
-      "categories": [
-        "stream"
-      ],
-      "text": "// socket source fell through to the sendfile path below, which treats",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4442,
-      "categories": [
-        "stream"
-      ],
-      "text": "// A socket that STRUCTURALLY cannot serve as a splice",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4463,
-      "categories": [
-        "stream"
-      ],
-      "text": "// The destination is typically Go's O_NONBLOCK splice pipe (64 KiB",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4470,
-      "categories": [
-        "stream"
-      ],
-      "text": "// 10MB sendfile). MSG_PEEK leaves the bytes in the socket; we",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4472,
-      "categories": [
-        "stream"
-      ],
-      "text": "// the guest's Go splice loop just makes another pass for the rest.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4487,
-      "categories": [
-        "stream"
-      ],
-      "text": "// A socket that STRUCTURALLY cannot serve as a splice source \u2014",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4500,
-      "categories": [
-        "stream"
-      ],
-      "text": "// EOF: the writer closed; splice reports 0 (Go stops the loop).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4543,
-      "categories": [
-        "stream"
-      ],
-      "text": "// Neither side is a pipe \u2192 EINVAL (splice(2)); the pipe-source",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4556,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(open) = open_file.description.read()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4602,
-      "categories": [
-        "stream"
-      ],
-      "text": "// splice(2) into a pipe moves at most what the pipe can hold and",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4608,
-      "categories": [
-        "stream"
-      ],
-      "text": "// AFTER this splice returns, so `cat` of any file larger than one",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4615,
-      "categories": [
-        "stream"
-      ],
-      "text": "// splice(2) is specified to wait out, and the write path's own",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4623,
-      "categories": [
-        "stream"
-      ],
-      "text": "// reports EAGAIN; a blocking splice(2) must wait for room. Waiting",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4642,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "&& let Some(mut open) = open_file.description.write()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4651,
-      "categories": [
-        "stream"
-      ],
-      "text": "// Same contract as `sendfile`: HostFile reads via `pread`",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4657,
-      "categories": [
-        "stream"
-      ],
-      "text": "// with `splice(file, NULL, pipe, NULL, n)` in a loop \u2014",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4680,
-      "categories": [
-        "stream"
-      ],
-      "text": "fn vmsplice(this, cx, fd: Fd, iov: GuestPtr, nr_segs: u64, flags: u64) {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4682,
-      "categories": [
-        "stream"
-      ],
-      "text": "// vmsplice(2): fd must be a pipe; the pipe END selects the direction \u2014",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4698,
-      "categories": [
-        "stream"
-      ],
-      "text": "// SPLICE_F_NONBLOCK *or* an O_NONBLOCK pipe: vmsplice(2) blocks",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4715,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4732,
-      "categories": [
-        "stream"
-      ],
-      "text": "// vmsplice(2): a valid fd that does not refer to a pipe is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4741,
-      "categories": [
-        "stream"
-      ],
-      "text": "// vmsplice(2) into a pipe moves AT MOST what the pipe can",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4905,
+      "line": 3317,
       "categories": [
         "epoll"
       ],
@@ -3778,7 +3778,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4909,
+      "line": 3321,
       "categories": [
         "description_guard"
       ],
@@ -3787,7 +3787,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4918,
+      "line": 3330,
       "categories": [
         "epoll"
       ],
@@ -3796,7 +3796,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 4957,
+      "line": 3369,
       "categories": [
         "description_guard"
       ],
@@ -3805,7 +3805,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5123,
+      "line": 3535,
       "categories": [
         "description_guard"
       ],
@@ -3814,7 +3814,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5627,
+      "line": 4039,
       "categories": [
         "description_guard"
       ],
@@ -3823,7 +3823,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 5778,
+      "line": 4190,
       "categories": [
         "description_guard"
       ],
