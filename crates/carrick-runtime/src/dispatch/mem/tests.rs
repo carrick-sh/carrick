@@ -844,25 +844,27 @@ where
 {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
     let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
-        guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
-            len: LINUX_PAGE_SIZE,
-            prot: LinuxProtFlags::READ,
-            sharing: ProcMapSharing::Private,
-            path: String::new(),
-            file_page_offset: None,
-            droppable: false,
-            semantic_vmas: None,
-            locked: None,
-            resident: false,
-            bus_fault: None,
-            write_sealed_shared: false,
-            read_only_shared_file: false,
-            secretmem: false,
-            writable_memfd: None,
-            private_file: None,
-            shared_file_alias: None,
-        }))
+        guard
+            .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+                len: LINUX_PAGE_SIZE,
+                prot: LinuxProtFlags::READ,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+                locked: None,
+                resident: false,
+                bus_fault: None,
+                write_sealed_shared: false,
+                read_only_shared_file: false,
+                secretmem: false,
+                writable_memfd: None,
+                private_file: None,
+                shared_file_alias: None,
+            }))
+            .expect("publish")
     });
     transaction
         .with_claim_for_test(|install| {
@@ -7221,25 +7223,27 @@ fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
     let page = LINUX_PAGE_SIZE;
     let len = 3 * page;
     let transaction = parent.with_host_alias_dispatch_for_test(|guard| {
-        guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-            start,
-            len,
-            prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-            sharing: ProcMapSharing::Shared,
-            path: String::new(),
-            file_page_offset: None,
-            droppable: false,
-            semantic_vmas: None,
-            locked: None,
-            resident: false,
-            bus_fault: None,
-            write_sealed_shared: false,
-            read_only_shared_file: false,
-            secretmem: false,
-            writable_memfd: None,
-            private_file: None,
-            shared_file_alias: None,
-        }))
+        guard
+            .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                start,
+                len,
+                prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                sharing: ProcMapSharing::Shared,
+                path: String::new(),
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+                locked: None,
+                resident: false,
+                bus_fault: None,
+                write_sealed_shared: false,
+                read_only_shared_file: false,
+                secretmem: false,
+                writable_memfd: None,
+                private_file: None,
+                shared_file_alias: None,
+            }))
+            .expect("publish")
     });
     assert!(
         !parent.range_has_host_alias_backing(start, len),
@@ -7318,25 +7322,27 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
     assert!(!dispatcher.range_has_host_alias_backing(start, len));
     let vma_source = dispatcher.vma_snapshot_source();
     let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
-        guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-            start,
-            len,
-            prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-            sharing: ProcMapSharing::Shared,
-            path: "replacement".to_string(),
-            file_page_offset: None,
-            droppable: false,
-            semantic_vmas: None,
-            locked: None,
-            resident: false,
-            bus_fault: None,
-            write_sealed_shared: false,
-            read_only_shared_file: false,
-            secretmem: false,
-            writable_memfd: None,
-            private_file: None,
-            shared_file_alias: None,
-        }))
+        guard
+            .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                start,
+                len,
+                prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                sharing: ProcMapSharing::Shared,
+                path: "replacement".to_string(),
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+                locked: None,
+                resident: false,
+                bus_fault: None,
+                write_sealed_shared: false,
+                read_only_shared_file: false,
+                secretmem: false,
+                writable_memfd: None,
+                private_file: None,
+                shared_file_alias: None,
+            }))
+            .expect("publish")
     });
 
     assert!(
@@ -7388,25 +7394,27 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
 fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
     let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
-        guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
-            len: LINUX_PAGE_SIZE,
-            prot: LinuxProtFlags::READ,
-            sharing: ProcMapSharing::Private,
-            path: String::new(),
-            file_page_offset: None,
-            droppable: false,
-            semantic_vmas: None,
-            locked: None,
-            resident: false,
-            bus_fault: None,
-            write_sealed_shared: false,
-            read_only_shared_file: false,
-            secretmem: false,
-            writable_memfd: None,
-            private_file: None,
-            shared_file_alias: None,
-        }))
+        guard
+            .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+                len: LINUX_PAGE_SIZE,
+                prot: LinuxProtFlags::READ,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+                locked: None,
+                resident: false,
+                bus_fault: None,
+                write_sealed_shared: false,
+                read_only_shared_file: false,
+                secretmem: false,
+                writable_memfd: None,
+                private_file: None,
+                shared_file_alias: None,
+            }))
+            .expect("publish")
     });
     let sibling = std::sync::Arc::clone(&dispatcher);
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -7440,25 +7448,27 @@ fn proc_mem_snapshot_waits_for_install_and_returns_one_coherent_generation() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
     dispatcher.mem().lock().brk_current = 0x1111_0000;
     let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
-        guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
-            len: LINUX_PAGE_SIZE,
-            prot: LinuxProtFlags::READ,
-            sharing: ProcMapSharing::Private,
-            path: String::new(),
-            file_page_offset: None,
-            droppable: false,
-            semantic_vmas: None,
-            locked: None,
-            resident: false,
-            bus_fault: None,
-            write_sealed_shared: false,
-            read_only_shared_file: false,
-            secretmem: false,
-            writable_memfd: None,
-            private_file: None,
-            shared_file_alias: None,
-        }))
+        guard
+            .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+                len: LINUX_PAGE_SIZE,
+                prot: LinuxProtFlags::READ,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+                locked: None,
+                resident: false,
+                bus_fault: None,
+                write_sealed_shared: false,
+                read_only_shared_file: false,
+                secretmem: false,
+                writable_memfd: None,
+                private_file: None,
+                shared_file_alias: None,
+            }))
+            .expect("publish")
     });
     transaction
         .with_claim_for_test(|install| {
@@ -7492,25 +7502,27 @@ fn proc_mem_snapshot_waits_for_install_and_returns_one_coherent_generation() {
 fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
     let dispatcher = SyscallDispatcher::new();
     let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
-        guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
-            len: LINUX_PAGE_SIZE,
-            prot: LinuxProtFlags::READ,
-            sharing: ProcMapSharing::Shared,
-            path: String::new(),
-            file_page_offset: None,
-            droppable: false,
-            semantic_vmas: None,
-            locked: None,
-            resident: false,
-            bus_fault: None,
-            write_sealed_shared: false,
-            read_only_shared_file: false,
-            secretmem: false,
-            writable_memfd: None,
-            private_file: None,
-            shared_file_alias: None,
-        }))
+        guard
+            .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+                len: LINUX_PAGE_SIZE,
+                prot: LinuxProtFlags::READ,
+                sharing: ProcMapSharing::Shared,
+                path: String::new(),
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+                locked: None,
+                resident: false,
+                bus_fault: None,
+                write_sealed_shared: false,
+                read_only_shared_file: false,
+                secretmem: false,
+                writable_memfd: None,
+                private_file: None,
+                shared_file_alias: None,
+            }))
+            .expect("publish")
     });
     let mut pipe = [-1; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
@@ -7548,25 +7560,27 @@ fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
 fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
     let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
-        guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
-            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
-            len: LINUX_PAGE_SIZE,
-            prot: LinuxProtFlags::READ,
-            sharing: ProcMapSharing::Private,
-            path: String::new(),
-            file_page_offset: None,
-            droppable: false,
-            semantic_vmas: None,
-            locked: None,
-            resident: false,
-            bus_fault: None,
-            write_sealed_shared: false,
-            read_only_shared_file: false,
-            secretmem: false,
-            writable_memfd: None,
-            private_file: None,
-            shared_file_alias: None,
-        }))
+        guard
+            .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+                len: LINUX_PAGE_SIZE,
+                prot: LinuxProtFlags::READ,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+                locked: None,
+                resident: false,
+                bus_fault: None,
+                write_sealed_shared: false,
+                read_only_shared_file: false,
+                secretmem: false,
+                writable_memfd: None,
+                private_file: None,
+                shared_file_alias: None,
+            }))
+            .expect("publish")
     });
     transaction
         .with_claim_for_test(|install| {

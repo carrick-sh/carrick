@@ -2631,7 +2631,7 @@ impl<'a> IpcView<'a> {
                 crate::linux_abi::LinuxProtFlags::READ
                     | crate::linux_abi::LinuxProtFlags::WRITE
             };
-            let transaction = host_alias_dispatch.publish(HostAliasCommit::shmat(
+            let transaction = match host_alias_dispatch.publish(HostAliasCommit::shmat(
                 crate::dispatch::mem::HostAliasMmapCommit {
                     start: va,
                     len: map_len,
@@ -2657,7 +2657,10 @@ impl<'a> IpcView<'a> {
                     lpid,
                     reservation,
                 },
-            ));
+            )) {
+                Ok(transaction) => transaction,
+                Err(_) => return Ok(DispatchOutcome::errno(linux_errno::ENOMEM)),
+            };
 
             Ok(DispatchOutcome::MapHostAlias {
                 success_retval: va as i64,
@@ -5659,39 +5662,41 @@ mod ipc_set_tests {
         );
         let va = crate::memory::LINUX_HIGH_VA_THRESHOLD;
         let transaction = dispatcher.with_host_alias_dispatch_for_test(|guard| {
-            guard.publish(HostAliasCommit::shmat(
-                crate::dispatch::mem::HostAliasMmapCommit {
-                    start: va,
-                    len: LINUX_PAGE_SIZE,
-                    prot: crate::linux_abi::LinuxProtFlags::READ
-                        | crate::linux_abi::LinuxProtFlags::WRITE,
-                    sharing: ProcMapSharing::Shared,
-                    path: String::new(),
-                    file_page_offset: None,
-                    droppable: false,
-                    semantic_vmas: None,
-                    locked: None,
-                    resident: true,
-                    bus_fault: None,
-                    write_sealed_shared: false,
-                    read_only_shared_file: false,
-                    secretmem: false,
-                    writable_memfd: None,
-                    private_file: None,
-                    shared_file_alias: None,
-                },
-                HostAliasShmatCommit {
-                    va,
-                    atime: 99,
-                    lpid: 100,
-                    reservation: PendingShmat {
-                        namespace: std::sync::Arc::clone(&dispatcher.sysv),
-                        shmid,
-                        path: PathBuf::from("/tmp/carrick-shm/test-pending-shmat"),
-                        armed: true,
+            guard
+                .publish(HostAliasCommit::shmat(
+                    crate::dispatch::mem::HostAliasMmapCommit {
+                        start: va,
+                        len: LINUX_PAGE_SIZE,
+                        prot: crate::linux_abi::LinuxProtFlags::READ
+                            | crate::linux_abi::LinuxProtFlags::WRITE,
+                        sharing: ProcMapSharing::Shared,
+                        path: String::new(),
+                        file_page_offset: None,
+                        droppable: false,
+                        semantic_vmas: None,
+                        locked: None,
+                        resident: true,
+                        bus_fault: None,
+                        write_sealed_shared: false,
+                        read_only_shared_file: false,
+                        secretmem: false,
+                        writable_memfd: None,
+                        private_file: None,
+                        shared_file_alias: None,
                     },
-                },
-            ))
+                    HostAliasShmatCommit {
+                        va,
+                        atime: 99,
+                        lpid: 100,
+                        reservation: PendingShmat {
+                            namespace: std::sync::Arc::clone(&dispatcher.sysv),
+                            shmid,
+                            path: PathBuf::from("/tmp/carrick-shm/test-pending-shmat"),
+                            armed: true,
+                        },
+                    },
+                ))
+                .expect("publish shmat")
         });
         {
             assert!(!dispatcher.sysv_process.lock().attachments.contains_key(&va));

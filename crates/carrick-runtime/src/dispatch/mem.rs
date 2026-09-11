@@ -5089,29 +5089,31 @@ impl<'a> MemView<'a> {
                     backing_offset: region_layout.backing_offset,
                 };
                 let mm = this.captured_mm();
-                let transaction = host_alias_dispatch.publish(HostAliasCommit::io_uring_mmap(
-                    HostAliasMmapCommit {
-                        start: address,
-                        len: length,
-                        prot: prot_flags,
-                        sharing: ProcMapSharing::Shared,
-                        path: "anon_inode:[io_uring]".to_owned(),
-                        file_page_offset: None,
-                        droppable: false,
-                        semantic_vmas: None,
-                        locked: this.prepare_mmap_locked_range(map_flags, address, length)?,
-                        resident: true,
-                        bus_fault: None,
-                        write_sealed_shared: false,
-                        read_only_shared_file: false,
-                        secretmem: false,
-                        writable_memfd: None,
-                        private_file: None,
-                        shared_file_alias: None,
-                    },
-                    mapping,
-                    mm,
-                ));
+                let transaction = host_alias_dispatch
+                    .publish(HostAliasCommit::io_uring_mmap(
+                        HostAliasMmapCommit {
+                            start: address,
+                            len: length,
+                            prot: prot_flags,
+                            sharing: ProcMapSharing::Shared,
+                            path: "anon_inode:[io_uring]".to_owned(),
+                            file_page_offset: None,
+                            droppable: false,
+                            semantic_vmas: None,
+                            locked: this.prepare_mmap_locked_range(map_flags, address, length)?,
+                            resident: true,
+                            bus_fault: None,
+                            write_sealed_shared: false,
+                            read_only_shared_file: false,
+                            secretmem: false,
+                            writable_memfd: None,
+                            private_file: None,
+                            shared_file_alias: None,
+                        },
+                        mapping,
+                        mm,
+                    ))
+                    .map_err(|_| DispatchError::Errno(linux_errno::ENOMEM))?;
                 return Ok(DispatchOutcome::MapHostAlias {
                     success_retval: address as i64,
                     transaction,
@@ -5668,35 +5670,37 @@ impl<'a> MemView<'a> {
                     // the live host file mapping succeeds; publishing here would
                     // expose a transient private/cacheable executable view.
                     let prot_none = pf.is_empty();
-                    let transaction = host_alias_dispatch.publish(HostAliasCommit::mmap(
-                        HostAliasMmapCommit {
-                            start: va,
-                            len: length,
-                            prot: prot_flags,
-                            sharing: ProcMapSharing::Shared,
-                            path: proc_map_path.clone(),
-                            file_page_offset: (!proc_map_path.is_empty()).then_some(
-                                offset / crate::core_dump::GUEST_PAGE as u64,
-                            ),
-                            droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
-                            semantic_vmas: None,
-                            locked: locked_range,
-                            resident: true,
-                            bus_fault: None,
-                            write_sealed_shared: alias_write_sealed_shared,
-                            read_only_shared_file: mmap_read_only_shared_file,
-                            secretmem: false,
-                            writable_memfd: alias_writable_memfd,
-                            private_file: None,
-                            shared_file_alias: alias_description.map(|description| {
-                                SharedFileAliasCommit {
-                                    description,
-                                    extent_base: Gpa(ipa.saturating_sub(offset)),
-                                    row_file_offset: offset,
-                                }
-                            }),
-                        },
-                    ));
+                    let transaction = host_alias_dispatch
+                        .publish(HostAliasCommit::mmap(
+                            HostAliasMmapCommit {
+                                start: va,
+                                len: length,
+                                prot: prot_flags,
+                                sharing: ProcMapSharing::Shared,
+                                path: proc_map_path.clone(),
+                                file_page_offset: (!proc_map_path.is_empty()).then_some(
+                                    offset / crate::core_dump::GUEST_PAGE as u64,
+                                ),
+                                droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
+                                semantic_vmas: None,
+                                locked: locked_range,
+                                resident: true,
+                                bus_fault: None,
+                                write_sealed_shared: alias_write_sealed_shared,
+                                read_only_shared_file: mmap_read_only_shared_file,
+                                secretmem: false,
+                                writable_memfd: alias_writable_memfd,
+                                private_file: None,
+                                shared_file_alias: alias_description.map(|description| {
+                                    SharedFileAliasCommit {
+                                        description,
+                                        extent_base: Gpa(ipa.saturating_sub(offset)),
+                                        row_file_offset: offset,
+                                    }
+                                }),
+                            },
+                        ))
+                        .map_err(|_| DispatchError::Errno(linux_errno::ENOMEM))?;
                     return Ok(DispatchOutcome::MapHostAlias {
                         success_retval: va as i64,
                         transaction,
@@ -6508,32 +6512,34 @@ impl<'a> MemView<'a> {
                         length.checked_sub(bus_offset)?,
                     ))
                 });
-                let transaction = host_alias_dispatch.publish(HostAliasCommit::mmap(
-                    HostAliasMmapCommit {
-                        start: address,
-                        len: length,
-                        prot: prot_flags,
-                        sharing: map_sharing.proc_map_sharing(),
-                        path: proc_map_path.clone(),
-                        file_page_offset: (!proc_map_path.is_empty()).then_some(
-                            offset / crate::core_dump::GUEST_PAGE as u64,
-                        ),
-                        droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
-                        semantic_vmas: None,
-                        locked: locked_range,
-                        resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
-                            || map_flags.contains(LinuxMmapFlags::POPULATE),
-                        bus_fault,
-                        write_sealed_shared: mmap_write_sealed_shared,
-                        read_only_shared_file: mmap_read_only_shared_file,
-                        secretmem: secretmem_backed,
-                        writable_memfd: writable_memfd_desc,
-                        private_file: PrivateFileMapEntry::for_mapping(
-                            &private_file_description, address, length, offset,
-                        ),
-                        shared_file_alias: None,
-                    },
-                ));
+                let transaction = host_alias_dispatch
+                    .publish(HostAliasCommit::mmap(
+                        HostAliasMmapCommit {
+                            start: address,
+                            len: length,
+                            prot: prot_flags,
+                            sharing: map_sharing.proc_map_sharing(),
+                            path: proc_map_path.clone(),
+                            file_page_offset: (!proc_map_path.is_empty()).then_some(
+                                offset / crate::core_dump::GUEST_PAGE as u64,
+                            ),
+                            droppable: map_flags.contains(LinuxMmapFlags::DROPPABLE),
+                            semantic_vmas: None,
+                            locked: locked_range,
+                            resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                                || map_flags.contains(LinuxMmapFlags::POPULATE),
+                            bus_fault,
+                            write_sealed_shared: mmap_write_sealed_shared,
+                            read_only_shared_file: mmap_read_only_shared_file,
+                            secretmem: secretmem_backed,
+                            writable_memfd: writable_memfd_desc,
+                            private_file: PrivateFileMapEntry::for_mapping(
+                                &private_file_description, address, length, offset,
+                            ),
+                            shared_file_alias: None,
+                        },
+                    ))
+                    .map_err(|_| DispatchError::Errno(linux_errno::ENOMEM))?;
                 if let Some(socket) = &packet_socket_desc {
                     socket.set_mapped_va(GuestVa(address));
                 }
@@ -7390,7 +7396,7 @@ impl<'a> MemView<'a> {
                  dup_fd: i32|
                  -> DispatchOutcome {
                     let transaction =
-                        host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                        match host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
                             start: va,
                             len: new_size,
                             prot: pf,
@@ -7412,7 +7418,10 @@ impl<'a> MemView<'a> {
                                 extent_base: Gpa(ipa.saturating_sub(file_offset)),
                                 row_file_offset: file_offset,
                             }),
-                        }));
+                        })) {
+                            Ok(transaction) => transaction,
+                            Err(_) => return DispatchOutcome::errno(LINUX_ENOMEM),
+                        };
                     DispatchOutcome::MapHostAlias {
                         success_retval: va as i64,
                         transaction,
@@ -8687,8 +8696,8 @@ impl<'a> MemView<'a> {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     let shared = reservation.sharing == ProcMapSharing::Shared;
-                    let transaction =
-                        host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                    let transaction = host_alias_dispatch
+                        .publish(HostAliasCommit::mmap(HostAliasMmapCommit {
                             start: address.0,
                             len: length,
                             prot: prot_flags,
@@ -8716,7 +8725,8 @@ impl<'a> MemView<'a> {
                             writable_memfd: None,
                             private_file: None,
                             shared_file_alias: None,
-                        }));
+                        }))
+                        .map_err(|_| DispatchError::Errno(linux_errno::ENOMEM))?;
                     return Ok(DispatchOutcome::MapHostAlias {
                         // mprotect answers 0, not the address.
                         success_retval: 0,

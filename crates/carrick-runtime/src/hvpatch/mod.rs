@@ -3198,7 +3198,9 @@ mod tests {
         );
 
         let parent_transaction = parent.with_host_alias_dispatch_for_test(|guard| {
-            guard.publish(crate::dispatch::HostAliasCommit::empty_for_test())
+            guard
+                .publish(crate::dispatch::HostAliasCommit::empty_for_test())
+                .expect("publish host-alias transaction")
         });
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let promotion = std::thread::spawn(move || {
