@@ -2857,7 +2857,10 @@ fn global_frame_host_owner_drop_does_no_hv_and_explicit_retirement_releases_back
 #[test]
 fn owner_structs_encode_their_required_retirement_authority_static_audit() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    let source = include_str!("../../trap.rs");
+    let source = concat!(
+        include_str!("../../trap.rs"),
+        include_str!("../global_frame.rs")
+    );
 
     // 1. GlobalFrameHostOwner: carrier custody is the sole stage-2
     // retirement authority. The owner has no lease and no Drop path that
