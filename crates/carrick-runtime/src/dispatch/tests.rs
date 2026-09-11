@@ -825,21 +825,14 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
     }
 
     #[test]
-    fn host_alias_transaction_id_overflow_aborts() {
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
-        if pid == 0 {
-            let no_core = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
-            let dispatcher = SyscallDispatcher::new();
-            dispatcher.host_alias_transactions()
-                .next_id
-                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-            dispatcher.with_host_alias_dispatch_for_test(|guard| {
-                let _ = guard.publish(HostAliasCommit::mmap(mem::HostAliasMmapCommit {
+    fn host_alias_transaction_id_overflow_returns_typed_error() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .host_alias_transactions()
+            .next_id
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        let result = dispatcher.with_host_alias_dispatch_for_test(|guard| {
+            guard.publish(HostAliasCommit::mmap(mem::HostAliasMmapCommit {
                 start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
                 len: LINUX_PAGE_SIZE,
                 prot: LinuxProtFlags::READ,
@@ -857,14 +850,9 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                 writable_memfd: None,
                 private_file: None,
                 shared_file_alias: None,
-                }));
-            });
-            unsafe { libc::_exit(0) };
-        }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
-        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+            }))
+        });
+        assert!(matches!(result, Err(crate::run_result::RuntimeError::CarrierFailed(_))));
     }
 
 

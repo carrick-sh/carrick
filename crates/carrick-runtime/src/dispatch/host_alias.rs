@@ -4,6 +4,8 @@ use carrick_abi::{LINUX_ENOMEM, LinuxErrno};
 use carrick_fatal::carrick_fatal;
 use serde::Serialize;
 
+use crate::run_result::RuntimeError;
+
 use super::mm_mutation;
 use super::{DispatchMmAuthority, SyscallDispatcher, mem, sysv};
 
@@ -290,7 +292,10 @@ impl HostAliasDispatchGuard<'_> {
         self.vma_revision = Some(revision);
     }
 
-    pub(crate) fn publish(mut self, commit: HostAliasCommit) -> HostAliasTransaction {
+    pub(crate) fn publish(
+        mut self,
+        commit: HostAliasCommit,
+    ) -> Result<HostAliasTransaction, RuntimeError> {
         // A publisher running under the SHARED native `:3440` dispatch guard
         // defers its install past that guard's release: the alias phase then
         // outlives the publisher's memory guard and the install must
@@ -311,12 +316,9 @@ impl HostAliasDispatchGuard<'_> {
                 std::sync::atomic::Ordering::Relaxed,
                 |id| id.checked_add(1),
             )
-            .unwrap_or_else(|_| {
-                carrick_fatal!(
-                    "dispatch::host_alias_transactions",
-                    "host-alias transaction id exhaustion"
-                )
-            });
+            .map_err(|_| {
+                RuntimeError::CarrierFailed("host-alias transaction id exhaustion".to_owned())
+            })?;
         let id = HostAliasTransactionId(raw);
         let mut phase = self.transactions.phase.lock();
         debug_assert!(matches!(*phase, HostAliasPhase::Dispatching));
@@ -333,12 +335,12 @@ impl HostAliasDispatchGuard<'_> {
                 "host-alias publication lacks MM authority"
             );
         });
-        HostAliasTransaction {
+        Ok(HostAliasTransaction {
             authority,
             transactions: Arc::clone(&self.transactions),
             id,
             armed: true,
-        }
+        })
     }
 }
 

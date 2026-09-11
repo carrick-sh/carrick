@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 22,
+  "typed_error_debt_ceiling": 21,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -208,7 +208,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "MemView<'a>::mmap",
       "ordinal_in_function": 1,
-      "fingerprint": "4f36df731c70158d96408647cf360e0dd1dcb121cae52f37e7abb194168d9c10",
+      "fingerprint": "edca27f7286d5b8fb2fb17255e718a254c65e98a9a0c4823b56f1063e8d2a3ab",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mmap_ioring",
       "rationale": "io_uring file description missing concrete IoUringBacking during mmap dispatch; description backing is corrupted.",
@@ -307,7 +307,7 @@
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "function": "MemView<'a>::mprotect",
       "ordinal_in_function": 1,
-      "fingerprint": "f131bae9e5cd8de3a4f2816c472d65fedd62cf011f55e316286500b1d7f3aa2e",
+      "fingerprint": "1d5684eff4d84a1d9c50f6fe036c11a824ae502946649817439856eb23c178c0",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::mprotect",
       "rationale": "Stored reservation fork semantics contradict selected VMA subrange, corrupting semantic-VMA authority during host alias transaction commit.",
@@ -560,18 +560,6 @@
       "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
       "function": "HostAliasDispatchGuard<'_>::publish",
       "ordinal_in_function": 1,
-      "fingerprint": "151fb0f88540693135133e77b970bb88c42c51bcf642d6bc9c730d7646845c4e",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::host_alias_transactions",
-      "rationale": "HostAlias transaction ID exhaustion occurs before phase publication and should return a typed error instead of aborting.",
-      "typed_error": "RuntimeError",
-      "sink": "fatal",
-      "domain": "dispatch::host_alias_transactions"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
-      "function": "HostAliasDispatchGuard<'_>::publish",
-      "ordinal_in_function": 2,
       "fingerprint": "f8bcea04aa49a5898808a9640ced88393e1339d743d9a6f65fbd9aaa2a7406ca",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::host_alias_transactions",
