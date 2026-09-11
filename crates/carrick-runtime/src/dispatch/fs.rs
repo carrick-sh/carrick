@@ -424,36 +424,17 @@ impl<'a> FsView<'a> {
 
     #[inline]
     pub fn signal_is_ignored(&self, context: &crate::kernel::KernelContext, signum: i32) -> bool {
-        crate::kernel::LinuxSignal::for_signal_number(signum)
-            .ok()
-            .and_then(|sig| context.shared().sighand().action_entry(sig))
-            .is_some_and(|action| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
+        signal::signal_is_ignored(context, signum)
     }
 
+    #[inline]
     pub fn mark_signal_pending(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: i32,
     ) {
-        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
-            return;
-        };
-        let Some(thread) = context.task().thread_by_registry_id(tid) else {
-            return;
-        };
-        let authority = crate::kernel::SignalAuthority::new(
-            context.shared().sighand(),
-            context.shared().pending_signals(),
-            Arc::clone(context.task()),
-            thread,
-        );
-        if signal.is_realtime() {
-            authority.enqueue_thread_realtime(signal, None);
-        } else {
-            authority.enqueue_thread_standard(signal, None);
-        }
-        context.task().wake();
+        signal::mark_signal_pending(context, tid, signum);
     }
 
     #[inline]
@@ -550,22 +531,7 @@ impl<'a> FsView<'a> {
         crate::linux_abi::SigSet,
         crate::linux_abi::SigSet,
     ) {
-        let mut ignored = crate::linux_abi::SigSet::EMPTY;
-        let mut caught = crate::linux_abi::SigSet::EMPTY;
-        for (signal, action) in context.shared().sighand().actions() {
-            let signum = signal.raw();
-            if !(1..=64).contains(&signum) {
-                continue;
-            }
-            let handler = action.sa_handler;
-            if handler == crate::linux_abi::LINUX_SIG_IGN {
-                ignored = ignored.with(signum);
-            } else if handler != crate::linux_abi::LINUX_SIG_DFL {
-                caught = caught.with(signum);
-            }
-        }
-        let pending = context.shared().pending_signals().present();
-        (ignored, caught, pending)
+        signal::proc_status_signal_masks(context)
     }
 
     #[inline]
@@ -633,28 +599,23 @@ impl<'a> FsView<'a> {
         self.cross.rename_open_paths(resolved_old, resolved_new);
     }
 
+    #[inline]
     pub fn signal_mask_for(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
     ) -> carrick_abi::SigSet {
-        context
-            .task()
-            .thread_by_registry_id(tid)
-            .map(|thread| thread.signal_state().blocked())
-            .unwrap_or(carrick_abi::SigSet::EMPTY)
+        signal::signal_mask_for(context, tid)
     }
 
+    #[inline]
     pub fn signal_blocked(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
         signum: i32,
     ) -> bool {
-        if signum == carrick_abi::LINUX_SIGKILL || signum == carrick_abi::LINUX_SIGSTOP {
-            return false;
-        }
-        self.signal_mask_for(context, tid).contains(signum)
+        signal::signal_blocked(context, tid, signum)
     }
 
     pub(crate) fn has_deliverable_dispatch_pending_for_wait(

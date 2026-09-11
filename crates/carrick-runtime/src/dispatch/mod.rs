@@ -704,7 +704,7 @@ mod proctitle;
 pub(crate) mod resources;
 mod retval;
 #[macro_use]
-mod signal;
+pub(crate) mod signal;
 mod bpf;
 pub mod mm_mutation;
 mod mount_api;
