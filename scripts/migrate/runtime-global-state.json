@@ -404,14 +404,6 @@
     {
       "kind": "env_var",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "cow_refusal_diagnostics_enabled::CARRICK_COW_REFUSAL_DIAGNOSTICS",
-      "fingerprint": "43db9f06606a9143f79288608f8feb422b011330838c585691d5a6942746afce",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_COW_REFUSAL_DIAGNOSTICS enables bounded COW and stage-2 diagnostic recording only; it cannot select or mutate guest authority."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS",
       "fingerprint": "7f4067c3ebd1a2fb346239d411c4c7966b024cdd7beb2939f3d49a0451111d5c",
       "classification": "config_debug",
@@ -427,19 +419,27 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "fork_debug_ipa::CARRICK_FORK_DEBUG_IPA",
-      "fingerprint": "5e78b2d6dddad4dc3afd74d2be47b360264cc9793a9177baf3b5cd0ef5cfc297",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "cow_refusal_diagnostics_enabled::CARRICK_COW_REFUSAL_DIAGNOSTICS",
+      "fingerprint": "43db9f06606a9143f79288608f8feb422b011330838c585691d5a6942746afce",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_IPA read in fork_debug_ipa::CARRICK_FORK_DEBUG_IPA (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_COW_REFUSAL_DIAGNOSTICS enables bounded COW and stage-2 diagnostic recording only; it cannot select or mutate guest authority."
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "fork_debug_ipa::CARRICK_FORK_DEBUG_IPA",
+      "fingerprint": "5e78b2d6dddad4dc3afd74d2be47b360264cc9793a9177baf3b5cd0ef5cfc297",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FORK_DEBUG_IPA read in fork_debug_ipa::CARRICK_FORK_DEBUG_IPA (crates/carrick-vmm-hvf/src/trap/global_frame.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
       "symbol": "fork_debug_va::CARRICK_FORK_DEBUG_VA",
       "fingerprint": "8a486c4772ae04c4c4a61fa8a71ef4fda067bbaa29ac55d8f8869ea1f6ef02d7",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in fork_debug_va::CARRICK_FORK_DEBUG_VA (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in fork_debug_va::CARRICK_FORK_DEBUG_VA (crates/carrick-vmm-hvf/src/trap/global_frame.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var_os",
@@ -2164,14 +2164,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "ALIAS_REMAP_COUNT",
-      "fingerprint": "807136604cd04dc311fd05591e30f4013d620ab30a5e4229690ae406941bedea",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static ALIAS_REMAP_COUNT in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "CARRIER_VM_LIVE",
       "fingerprint": "a0ccdeda340da2b279747bf16082da76bc8e007411347293f55726be1efa45db",
       "classification": "carrier_infra",
@@ -2200,14 +2192,6 @@
       "fingerprint": "df8fa8a992d559cbcd63f03c2956b954afa018f6121b2af1a3d7f4fb5f5435f9",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static KICK_PATH_INJECT in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "STRUCTURAL_EPOCH_ALLOCATOR",
-      "fingerprint": "a7481b4fb92940c93b18cc3e9b4d1f52a042ff99da74a5b5afd8918fb204b5d2",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator STRUCTURAL_EPOCH_ALLOCATOR in crates/carrick-vmm-hvf/src/trap.rs generating unique structural epoch IDs across the host process."
     },
     {
       "kind": "static",
@@ -2284,22 +2268,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "cow_diagnostic_history::HISTORY",
-      "fingerprint": "7c3d0d63c3f8d0673e7ad155a4c750dba6532a1a9ca147be9d50fbbba3c139ae",
-      "classification": "config_debug",
-      "rationale": "Opt-in bounded carrier diagnostic history keyed by exact custody and MM identities; disabled by default and never consulted for kernel semantics."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "cow_refusal_diagnostics_enabled::ENABLED",
-      "fingerprint": "36833e7b8d81b0acafe43de2e53df551a8c2c019b1582a9dc718da51ee441c9b",
-      "classification": "config_debug",
-      "rationale": "Process-cached enable flag for opt-in COW refusal diagnostics; immutable after first read and carries no container identity."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "create_exec_private_file_artifact::NEXT_FILE",
       "fingerprint": "cf4dad726c1b170f3e7e45d5554dd15c2240d65ed0d48a9bc3210af6e6d1277d",
       "classification": "monotonic_allocator",
@@ -2340,22 +2308,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "fork_debug_ipa::CELL",
-      "fingerprint": "cc3f21d07848ecf292592d67a15c1705782e6f022e25f6936acd6d67fc592f23",
-      "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache fork_debug_ipa::CELL in crates/carrick-vmm-hvf/src/trap.rs initialized from environment flags."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "fork_debug_va::CELL",
-      "fingerprint": "cc3f21d07848ecf292592d67a15c1705782e6f022e25f6936acd6d67fc592f23",
-      "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache fork_debug_va::CELL in crates/carrick-vmm-hvf/src/trap.rs initialized from environment flags."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "fpsimd_save_enabled::FLAG",
       "fingerprint": "1acadd6c61b273c95cd5b4463eb79dc98fa4d11c5180e0098f3fcefe5b1e0669",
       "classification": "config_debug",
@@ -2376,14 +2328,6 @@
       "fingerprint": "3733301ed62b969ff1a71d81f5a661292521b46329c1fee163ff6f4d540fd28e",
       "classification": "test_only",
       "rationale": "Test-only fixture or lock frame_inventory_backend_tests::global_frame_allocator_test_lock::LOCK in crates/carrick-vmm-hvf/src/trap.rs scoped strictly to test harness execution."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "global_frame_ipa_allocator::ALLOCATOR",
-      "fingerprint": "f4855a08a380b4c60abb46c0f00e505b122867a957c56b196dbdde915090ecaa",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static global_frame_ipa_allocator::ALLOCATOR in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "static",
@@ -2460,14 +2404,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "replay_mappings::CELL",
-      "fingerprint": "5db43974bf444a888d1331cd1d12fa3ebe33196f2a4283becf742635c03e705f",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static replay_mappings::CELL in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "run_to_exit::FIRST_RUN",
       "fingerprint": "9cc1655c6d1940056b8848a31784a8e19f4d96eef3a8e749f84cd4f793ff7c8d",
       "classification": "carrier_infra",
@@ -2512,6 +2448,70 @@
       "fingerprint": "36833e7b8d81b0acafe43de2e53df551a8c2c019b1582a9dc718da51ee441c9b",
       "classification": "config_debug",
       "rationale": "OnceLock cache of the CARRICK_DSR_ZERO_REMAP hatch in zero_anonymous_remap_enabled::ENABLED (crates/carrick-vmm-hvf/src/trap.rs); carrier-wide configuration read once, describes the carrier and no Linux process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "ALIAS_REMAP_COUNT",
+      "fingerprint": "76fc5db67163a4efdcf08336f3aef94f2617faf9078f28502021324f749c294c",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure static ALIAS_REMAP_COUNT in crates/carrick-vmm-hvf/src/trap/global_frame.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "STRUCTURAL_EPOCH_ALLOCATOR",
+      "fingerprint": "a7481b4fb92940c93b18cc3e9b4d1f52a042ff99da74a5b5afd8918fb204b5d2",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator STRUCTURAL_EPOCH_ALLOCATOR in crates/carrick-vmm-hvf/src/trap/global_frame.rs generating unique structural epoch IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "cow_diagnostic_history::HISTORY",
+      "fingerprint": "7c3d0d63c3f8d0673e7ad155a4c750dba6532a1a9ca147be9d50fbbba3c139ae",
+      "classification": "config_debug",
+      "rationale": "Opt-in bounded carrier diagnostic history keyed by exact custody and MM identities; disabled by default and never consulted for kernel semantics."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "cow_refusal_diagnostics_enabled::ENABLED",
+      "fingerprint": "36833e7b8d81b0acafe43de2e53df551a8c2c019b1582a9dc718da51ee441c9b",
+      "classification": "config_debug",
+      "rationale": "Process-cached enable flag for opt-in COW refusal diagnostics; immutable after first read and carries no container identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "fork_debug_ipa::CELL",
+      "fingerprint": "cc3f21d07848ecf292592d67a15c1705782e6f022e25f6936acd6d67fc592f23",
+      "classification": "config_debug",
+      "rationale": "Process-global configuration or failpoint cache fork_debug_ipa::CELL in crates/carrick-vmm-hvf/src/trap/global_frame.rs initialized from environment flags."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "fork_debug_va::CELL",
+      "fingerprint": "cc3f21d07848ecf292592d67a15c1705782e6f022e25f6936acd6d67fc592f23",
+      "classification": "config_debug",
+      "rationale": "Process-global configuration or failpoint cache fork_debug_va::CELL in crates/carrick-vmm-hvf/src/trap/global_frame.rs initialized from environment flags."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "global_frame_ipa_allocator::ALLOCATOR",
+      "fingerprint": "f4855a08a380b4c60abb46c0f00e505b122867a957c56b196dbdde915090ecaa",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure static global_frame_ipa_allocator::ALLOCATOR in crates/carrick-vmm-hvf/src/trap/global_frame.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "symbol": "replay_mappings::CELL",
+      "fingerprint": "5db43974bf444a888d1331cd1d12fa3ebe33196f2a4283becf742635c03e705f",
+      "classification": "carrier_infra",
+      "rationale": "Carrier-wide host infrastructure static replay_mappings::CELL in crates/carrick-vmm-hvf/src/trap/global_frame.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "static",
