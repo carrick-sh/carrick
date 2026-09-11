@@ -453,15 +453,22 @@ impl FsState {
         mounts
     }
 
-    pub(in crate::dispatch) fn rootfs_vfs_mut(&mut self) -> &mut crate::vfs::RootFsVfs {
+    pub(in crate::dispatch) fn try_rootfs_vfs_mut(
+        &mut self,
+    ) -> Result<&mut crate::vfs::RootFsVfs, crate::run_result::RuntimeError> {
         let strong = std::sync::Arc::strong_count(&self.rootfs_vfs);
         let Some(rootfs) = std::sync::Arc::get_mut(&mut self.rootfs_vfs) else {
-            carrick_fatal!(
-                "dispatch::fs_mounts",
+            return Err(crate::run_result::RuntimeError::Configuration(format!(
                 "rootfs cannot be reconfigured after guest fork: strong={strong}"
-            );
+            )));
         };
-        rootfs
+        Ok(rootfs)
+    }
+
+    #[allow(clippy::expect_used)]
+    pub(in crate::dispatch) fn rootfs_vfs_mut(&mut self) -> &mut crate::vfs::RootFsVfs {
+        self.try_rootfs_vfs_mut()
+            .expect("rootfs cannot be reconfigured after guest fork")
     }
 
     pub(in crate::dispatch) fn new_with_host_resolver(
@@ -1003,5 +1010,16 @@ mod stdio_sink_tests {
             DispatchOutcome::Returned { value: 10 }
         );
         assert_eq!(&*err.lock(), b"piped err\n");
+    }
+
+    #[test]
+    fn try_rootfs_vfs_mut_fails_when_shared() {
+        let mut fs = FsState::new_with_host_resolver(None);
+        assert!(fs.try_rootfs_vfs_mut().is_ok());
+        let _shared = std::sync::Arc::clone(&fs.rootfs_vfs);
+        assert!(matches!(
+            fs.try_rootfs_vfs_mut(),
+            Err(crate::run_result::RuntimeError::Configuration(_))
+        ));
     }
 }
