@@ -193,3 +193,12 @@ from sibling branches.
   `mark_signal_pending`, `proc_status_signal_masks`) that also exist on
   SyscallDispatcher in dispatch/signal.rs; they take no dispatcher state
   and should become shared free functions (duplication class 5).
+
+## Closing state — 2026-09-11
+
+`just ci` green on main at 2fa79aba3 (`target/perf/ci-final3-sep11.log`);
+signed probe gate shows only the four reds recorded before the campaign
+(`probes-final2-sep11.log`). Every task in the mapping table landed. The
+carry-forward items above are the honest remainder; none is a regression
+introduced by this campaign (the one regression the gate caught, sysvmsg,
+was fixed forward the same day).
