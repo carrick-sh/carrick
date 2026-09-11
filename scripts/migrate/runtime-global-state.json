@@ -1851,11 +1851,11 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
       "symbol": "issue_hvpatch_child_token::NEXT_AUTHORITY_ID",
       "fingerprint": "45bc010bdbb41963d263ca602e8a97759c89d7012ee1f19bbb6056b47b1b1735",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator issue_hvpatch_child_token::NEXT_AUTHORITY_ID in crates/carrick-runtime/src/vcpu_loop/mod.rs generating unique IDs across the host process."
+      "rationale": "Carrier-wide monotonic allocator issue_hvpatch_child_token::NEXT_AUTHORITY_ID in crates/carrick-runtime/src/vcpu_loop/memory.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
