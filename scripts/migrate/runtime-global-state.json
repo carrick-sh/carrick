@@ -378,6 +378,22 @@
       "rationale": "Environment variable CARRICK_STRICT_DURABILITY read in strict_durability_enabled::CARRICK_STRICT_DURABILITY (crates/carrick-runtime/src/dispatch/fs/state.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/dispatch/io_pipe.rs",
+      "symbol": "AR_MAGIC_SEQ",
+      "fingerprint": "e21c7a80ce4c3fcda98345c912b4a4d5da7127a55b9186d3ffecad9eff3556c4",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator AR_MAGIC_SEQ in crates/carrick-runtime/src/dispatch/mod.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/dispatch/io_pipe.rs",
+      "symbol": "AR_MAGIC_WRITES",
+      "fingerprint": "368ee47b5b49d42b13dc24e69a5145d6adfd06c080fe2b2d3ce7e7cc7f4da277",
+      "classification": "host_kernel_object",
+      "rationale": "Host-fd keyed archive write forensics table AR_MAGIC_WRITES tracking concurrent writes to host file descriptors."
+    },
+    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
       "symbol": "debug_mmap_next_lowering::CARRICK_FORK_DEBUG_VA",
@@ -456,22 +472,6 @@
       "fingerprint": "42b2e84a656a95d08fdf542b45cd94f833b8b7ced38daf82353c603572ee747b",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_WATCH_ADDR read in watch_addr::CARRICK_WATCH_ADDR (crates/carrick-runtime/src/dispatch/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/io_pipe.rs",
-      "symbol": "AR_MAGIC_SEQ",
-      "fingerprint": "e21c7a80ce4c3fcda98345c912b4a4d5da7127a55b9186d3ffecad9eff3556c4",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator AR_MAGIC_SEQ in crates/carrick-runtime/src/dispatch/mod.rs generating unique IDs across the host process."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/io_pipe.rs",
-      "symbol": "AR_MAGIC_WRITES",
-      "fingerprint": "368ee47b5b49d42b13dc24e69a5145d6adfd06c080fe2b2d3ce7e7cc7f4da277",
-      "classification": "host_kernel_object",
-      "rationale": "Host-fd keyed archive write forensics table AR_MAGIC_WRITES tracking concurrent writes to host file descriptors."
     },
     {
       "kind": "static",
