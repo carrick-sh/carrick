@@ -94,7 +94,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchOutcome::hvpatch_process::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 819,
+      "line": 780,
       "item": "DispatchOutcome::hvpatch_process",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -103,7 +103,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::SyntheticProcContext::synthetic_proc_context_observed::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 943,
+      "line": 904,
       "item": "SyntheticProcContext::synthetic_proc_context_observed",
       "category": "proc",
       "expression": ".proc.lock()",
