@@ -168,3 +168,16 @@ from sibling branches.
   2K, the remaining lines are `mod` declarations and re-exports). `just ci`
   green on main (ci-wave3f). Remaining: T16 dispatcher subsystem views
   (FsView landed in review), then the final probe run.
+- 2026-09-11 T16 LANDED (2624ae8bc): typed subsystem views (`FsView`,
+  `NetView`, `ProcView`, `SignalView`, `IpcView`, `MemView`) on
+  `SyscallDispatcher`; all 88 fs handlers take `FsView`, whose
+  `cross: &dyn FsCrossSubsystem` is non-optional (the test fixture
+  implements the trait — no production fallback, no `expect`);
+  `open_at_path_string` takes `OpenAtArgs`. `too_many_arguments` allows
+  140 → 101. Every task in the mapping table is landed; final `just ci` +
+  probe gate running (`ci-final-sep11`, `probes-final-sep11`).
+- Carried forward (not done, recorded honestly): routing net/proc/signal/
+  ipc/mem handlers through their views (T16 did fs only); dispatch/mod.rs
+  at 3.1K vs the 2K target; 101 `too_many_arguments` allows; 24 + 3
+  `typed_error_debt` ledger rows still `sink: fatal`; the load-sensitive
+  `coredumpfile` thread census; four pre-recorded probe reds.
