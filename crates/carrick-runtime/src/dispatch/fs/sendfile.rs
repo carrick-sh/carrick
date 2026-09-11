@@ -290,7 +290,7 @@ impl<'a> FsView<'a> {
     }
 
     define_syscall! {
-        fn sendfile(this, cx, out_fd: Fd, in_fd: Fd, offset: GuestPtr, count: u64) {
+        fn sendfile_dispatch(this, cx, out_fd: Fd, in_fd: Fd, offset: GuestPtr, count: u64) {
             let tid = cx.tid();
 
             let out_fd: Fd = out_fd;
@@ -594,6 +594,15 @@ impl<'a> FsView<'a> {
 
             Ok(DispatchOutcome::returned_len_or_errno(written))
 
+        }
+    }
+}
+
+impl SyscallDispatcher {
+    define_syscall! {
+        fn sendfile(this, cx, out_fd: Fd, in_fd: Fd, offset: GuestPtr, count: u64) {
+            let _ = (out_fd, in_fd, offset, count);
+            this.fs_view().sendfile_dispatch(cx)
         }
     }
 }

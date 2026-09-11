@@ -782,6 +782,11 @@ pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
         slot: crate::kernel::objects::FileSlotAuthority,
         command: crate::file_authority::Command,
     ) -> Result<crate::file_authority::Outcome, super::AuthorityCallError>;
+    fn io_uring_description(&self, fd: i32) -> Option<Arc<crate::kernel::FileDescription>>;
+    fn notify_inmem_epoll(&self);
+    fn host_socket_lookup(&self, fd: i32) -> Result<(super::HostFd, i32), carrick_abi::LinuxErrno>;
+    fn socket_guest_type(&self, fd: i32) -> Option<i32>;
+    fn perf_event_state(&self, fd: i32) -> Option<Arc<super::perf::PerfEventState>>;
     fn write_eventfd(&self, bytes: &[u8], state: &super::EventFdState) -> super::DispatchOutcome;
 }
 
@@ -911,6 +916,21 @@ impl FsCrossSubsystem for SyscallDispatcher {
         command: crate::file_authority::Command,
     ) -> Result<crate::file_authority::Outcome, super::AuthorityCallError> {
         self.authority_call(table, slot, command)
+    }
+    fn io_uring_description(&self, fd: i32) -> Option<Arc<crate::kernel::FileDescription>> {
+        self.io_uring_description(fd)
+    }
+    fn notify_inmem_epoll(&self) {
+        self.notify_inmem_epoll();
+    }
+    fn host_socket_lookup(&self, fd: i32) -> Result<(super::HostFd, i32), carrick_abi::LinuxErrno> {
+        self.host_socket_lookup(fd)
+    }
+    fn socket_guest_type(&self, fd: i32) -> Option<i32> {
+        self.socket_guest_type(fd)
+    }
+    fn perf_event_state(&self, fd: i32) -> Option<Arc<super::perf::PerfEventState>> {
+        self.perf_event_state(fd)
     }
     fn write_eventfd(&self, bytes: &[u8], state: &super::EventFdState) -> super::DispatchOutcome {
         super::write_eventfd(self, bytes, state)
