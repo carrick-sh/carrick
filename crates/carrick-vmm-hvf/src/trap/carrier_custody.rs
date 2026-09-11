@@ -1666,7 +1666,11 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn vm_rebuild_funnels_reconcile_owner_generation_before_guest_entry_static_audit() {
-        let source = concat!(include_str!("../trap.rs"), include_str!("mapping_plan.rs"));
+        let source = concat!(
+            include_str!("../trap.rs"),
+            include_str!("mapping_plan.rs"),
+            include_str!("persistent_executor.rs")
+        );
         let shared_wait = source
             .split(concat!("pub(crate) fn shared_wait_", "resume("))
             .nth(1)
@@ -3406,7 +3410,10 @@ mod carrier_vm_custody_tests {
 
     #[test]
     fn fresh_vm_vcpu_and_permit_wrappers_remain_guarded_until_commit_static_audit() {
-        let source = include_str!("../trap.rs");
+        let source = concat!(
+            include_str!("../trap.rs"),
+            include_str!("persistent_executor.rs")
+        );
         let create = source
             .split("fn create_vm_with_admission(")
             .nth(1)
@@ -3939,7 +3946,8 @@ mod carrier_vm_custody_tests {
             include_str!("mapping_plan.rs"),
             include_str!("foreign_mm.rs"),
             include_str!("global_frame.rs"),
-            include_str!("execve_rebuild.rs")
+            include_str!("execve_rebuild.rs"),
+            include_str!("persistent_executor.rs")
         );
         for (outer, inner) in [
             (

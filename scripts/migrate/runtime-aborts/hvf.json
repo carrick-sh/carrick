@@ -202,7 +202,7 @@
       "domain": "hvpatch::exec_commit"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs",
       "function": "<PersistentCarrierMappings as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "a0a503c51799a86f72029d8b7c92ebea8278ca862d2a4997f08de2c6540d2f5a",
@@ -213,7 +213,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs",
       "function": "<PersistentCarrierMappings as Drop>::drop",
       "ordinal_in_function": 2,
       "fingerprint": "a0a503c51799a86f72029d8b7c92ebea8278ca862d2a4997f08de2c6540d2f5a",
