@@ -23,9 +23,9 @@
     "table_guard": 16,
     "description_guard": 26,
     "description_backing": 7,
-    "epoll": 31,
+    "epoll": 32,
     "stream": 14,
-    "mapping": 66,
+    "mapping": 68,
     "lifecycle": 5
   },
   "entries": [
@@ -3822,6 +3822,177 @@
       "scope_kind": "production_callsite"
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 19,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// blocked sibling mapping syscalls.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 121,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".and_then(|commit| commit.mmap.as_ref())",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 122,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".and_then(|mmap| mmap.bus_fault),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 141,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mmap: Option<mem::HostAliasMmapCommit>,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 142,
+      "categories": [
+        "mapping"
+      ],
+      "text": "io_uring_mapping: Option<super::ioring::IoUringMapping>,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 152,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mmap: None,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 159,
+      "categories": [
+        "mapping"
+      ],
+      "text": "pub(crate) fn mmap(mmap: mem::HostAliasMmapCommit) -> Self {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 161,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mmap: Some(mmap),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 169,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mmap: mem::HostAliasMmapCommit,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 170,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping: super::ioring::IoUringMapping,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 174,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mmap: Some(mmap),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 175,
+      "categories": [
+        "mapping"
+      ],
+      "text": "io_uring_mapping: Some(mapping),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 181,
+      "categories": [
+        "mapping"
+      ],
+      "text": "pub(crate) fn shmat(mmap: mem::HostAliasMmapCommit, shmat: sysv::HostAliasShmatCommit) -> Self {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 183,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mmap: Some(mmap),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 297,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// re-acquire the exclusive guard while sibling mapping syscalls park",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 462,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if let Some(mmap) = commit.mmap {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 463,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let start = mmap.start;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 464,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let len = mmap.len;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/host_alias.rs",
+      "line": 465,
+      "categories": [
+        "mapping"
+      ],
+      "text": "self.commit_host_alias_mmap_observed(&authority, mmap);",
+      "scope_kind": "production_callsite"
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
       "line": 1,
       "categories": [
@@ -7478,7 +7649,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 753,
+      "line": 751,
       "categories": [
         "mapping"
       ],
@@ -7487,295 +7658,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1338,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// blocked sibling mapping syscalls.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1440,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".and_then(|commit| commit.mmap.as_ref())",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1441,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".and_then(|mmap| mmap.bus_fault),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1481,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// This is for epoll's backing kqueue fd:",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1482,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// polling a kqueue fd observes pending epoll events without consuming",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1484,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// drain the epoll instance kqueue normally.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1597,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Back a dynamic high-VA `mmap` (a guest VA at/above 1 TiB that can't be",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1601,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// completes the `mmap` with `va`. The dispatcher has already reserved `ipa`",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1605,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// immediately before host mapping, then commit exactly once on full",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1611,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Value the syscall returns on success. `mmap` answers with the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1617,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// content for a snapshot mmap; empty for anonymous, which the host",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1618,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// anon mapping already zeroes). Ignored for a file backing \u2014 a live",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1619,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// file mapping is backed by the page cache directly.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1621,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// What backs the host memory at `ipa`: an anonymous mapping (private",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1622,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// or fork-coherent), or a file mapping \u2014 `MAP_SHARED` (guest writes",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1628,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// after mapping.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1634,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// The guest asked for `PROT_NONE`: after installing the alias mapping",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1691,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// A `FUTEX_WAIT` on a genuine `MAP_SHARED` file mapping \u2014 an inter-PROCESS",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1711,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// A `FUTEX_WAKE` on a genuine `MAP_SHARED` mapping \u2014 the cross-PROCESS wake",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1742,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// wait-word mmap/fd and blocked queue id alive across executor",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2052,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mmap: Option<mem::HostAliasMmapCommit>,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2053,
-      "categories": [
-        "mapping"
-      ],
-      "text": "io_uring_mapping: Option<ioring::IoUringMapping>,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2063,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mmap: None,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2070,
-      "categories": [
-        "mapping"
-      ],
-      "text": "pub(crate) fn mmap(mmap: mem::HostAliasMmapCommit) -> Self {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2072,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mmap: Some(mmap),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2080,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mmap: mem::HostAliasMmapCommit,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2081,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping: ioring::IoUringMapping,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2085,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mmap: Some(mmap),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2086,
-      "categories": [
-        "mapping"
-      ],
-      "text": "io_uring_mapping: Some(mapping),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2092,
-      "categories": [
-        "mapping"
-      ],
-      "text": "pub(crate) fn shmat(mmap: mem::HostAliasMmapCommit, shmat: sysv::HostAliasShmatCommit) -> Self {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2094,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mmap: Some(mmap),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3029,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// re-acquire the exclusive guard while sibling mapping syscalls park",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3133,
+      "line": 1730,
       "categories": [
         "mapping"
       ],
@@ -7784,7 +7667,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3277,
+      "line": 1798,
       "categories": [
         "epoll"
       ],
@@ -7793,7 +7676,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3279,
+      "line": 1800,
       "categories": [
         "epoll"
       ],
@@ -7802,7 +7685,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3284,
+      "line": 1805,
       "categories": [
         "stream"
       ],
@@ -7811,7 +7694,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3295,
+      "line": 1816,
       "categories": [
         "epoll"
       ],
@@ -7820,7 +7703,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3298,
+      "line": 1819,
       "categories": [
         "epoll"
       ],
@@ -7829,7 +7712,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3301,
+      "line": 1822,
       "categories": [
         "epoll"
       ],
@@ -7838,7 +7721,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3309,
+      "line": 1830,
       "categories": [
         "epoll"
       ],
@@ -7847,7 +7730,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3342,
+      "line": 1863,
       "categories": [
         "epoll"
       ],
@@ -7856,7 +7739,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3349,
+      "line": 1870,
       "categories": [
         "epoll"
       ],
@@ -7865,7 +7748,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3360,
+      "line": 1881,
       "categories": [
         "epoll"
       ],
@@ -7874,7 +7757,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3361,
+      "line": 1882,
       "categories": [
         "epoll"
       ],
@@ -7883,7 +7766,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3402,
+      "line": 1923,
       "categories": [
         "epoll"
       ],
@@ -7892,7 +7775,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3404,
+      "line": 1925,
       "categories": [
         "epoll"
       ],
@@ -7901,7 +7784,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3407,
+      "line": 1928,
       "categories": [
         "epoll"
       ],
@@ -7910,7 +7793,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3412,
+      "line": 1933,
       "categories": [
         "epoll"
       ],
@@ -7919,7 +7802,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4549,
+      "line": 2125,
       "categories": [
         "table_guard"
       ],
@@ -7928,7 +7811,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4592,
+      "line": 2168,
       "categories": [
         "table_guard"
       ],
@@ -7937,7 +7820,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 4600,
+      "line": 2176,
       "categories": [
         "table_guard"
       ],
@@ -7946,7 +7829,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5223,
+      "line": 2799,
       "categories": [
         "lifecycle"
       ],
@@ -7955,43 +7838,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6299,
-      "categories": [
-        "mapping"
-      ],
-      "text": "if let Some(mmap) = commit.mmap {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6300,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let start = mmap.start;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6301,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let len = mmap.len;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6302,
-      "categories": [
-        "mapping"
-      ],
-      "text": "self.commit_host_alias_mmap_observed(&authority, mmap);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 6491,
+      "line": 3950,
       "categories": [
         "table_guard"
       ],
@@ -8000,7 +7847,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7133,
+      "line": 4080,
       "categories": [
         "mapping"
       ],
@@ -8009,7 +7856,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7138,
+      "line": 4085,
       "categories": [
         "mapping"
       ],
@@ -8018,7 +7865,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7628,
+      "line": 4575,
       "categories": [
         "description_guard"
       ],
@@ -8027,7 +7874,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7656,
+      "line": 4603,
       "categories": [
         "description_guard"
       ],
@@ -8036,7 +7883,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7729,
+      "line": 4676,
       "categories": [
         "description_guard"
       ],
@@ -8045,7 +7892,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 7758,
+      "line": 4705,
       "categories": [
         "epoll"
       ],
@@ -8054,7 +7901,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 8099,
+      "line": 5046,
       "categories": [
         "mapping"
       ],
@@ -8063,7 +7910,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 9414,
+      "line": 6361,
       "categories": [
         "mapping"
       ],
@@ -8072,7 +7919,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 11394,
+      "line": 8341,
       "categories": [
         "mapping"
       ],
@@ -10403,6 +10250,159 @@
       ],
       "text": "\"waiter on 3-level deep epoll must wake on leaf write\"",
       "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 249,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// This is for epoll's backing kqueue fd:",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 250,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// polling a kqueue fd observes pending epoll events without consuming",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 252,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// drain the epoll instance kqueue normally.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 365,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Back a dynamic high-VA `mmap` (a guest VA at/above 1 TiB that can't be",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 369,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// completes the `mmap` with `va`. The dispatcher has already reserved `ipa`",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 373,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// immediately before host mapping, then commit exactly once on full",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 379,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Value the syscall returns on success. `mmap` answers with the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 385,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// content for a snapshot mmap; empty for anonymous, which the host",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 386,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// anon mapping already zeroes). Ignored for a file backing \u2014 a live",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 387,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// file mapping is backed by the page cache directly.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 389,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// What backs the host memory at `ipa`: an anonymous mapping (private",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 390,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// or fork-coherent), or a file mapping \u2014 `MAP_SHARED` (guest writes",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 396,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// after mapping.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 402,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// The guest asked for `PROT_NONE`: after installing the alias mapping",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 459,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// A `FUTEX_WAIT` on a genuine `MAP_SHARED` file mapping \u2014 an inter-PROCESS",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 479,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// A `FUTEX_WAKE` on a genuine `MAP_SHARED` mapping \u2014 the cross-PROCESS wake",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/outcome.rs",
+      "line": 510,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// wait-word mmap/fd and blocked queue id alive across executor",
+      "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/perf.rs",
