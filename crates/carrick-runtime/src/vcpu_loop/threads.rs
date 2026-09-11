@@ -174,6 +174,143 @@ impl CloneTidOutputTransaction {
     }
 }
 
+/// A guest thread's handle in the process-private thread list. The retired
+/// `Job` variant carried a transitional-runner task receipt, which nothing on
+/// the persistent path ever produced.
+pub(crate) enum VcpuThreadHandle {
+    Persistent {
+        terminal_settlement: HvpatchExternalTerminalSettlement,
+    },
+}
+
+impl VcpuThreadHandle {
+    pub(crate) fn completion(&self) -> continuation::LogicalJobCompletion {
+        match self {
+            Self::Persistent {
+                terminal_settlement,
+            } => terminal_settlement.completion(),
+        }
+    }
+
+    /// Settle a drained member externally. Returns whether THIS call
+    /// published the member's `ThreadDone` (false for the current job and
+    /// for a member that already finished its own job).
+    pub(crate) fn finish_completed(
+        self,
+        current: continuation::JobId,
+    ) -> Result<bool, RuntimeError> {
+        match self {
+            Self::Persistent {
+                terminal_settlement,
+            } if terminal_settlement.completion().id() == current => Ok(false),
+            Self::Persistent {
+                terminal_settlement,
+            } => {
+                let published =
+                    terminal_settlement.publish_member(Ok(VcpuLoopOutcome::ThreadDone))?;
+                if !terminal_settlement.is_published()
+                    || !terminal_settlement.completion().is_finished()
+                {
+                    return Err(RuntimeError::Configuration(
+                        "external persistent terminal settlement violated result-before-completion"
+                            .to_owned(),
+                    ));
+                }
+                Ok(published)
+            }
+        }
+    }
+}
+
+pub(crate) fn enroll_persistent_process_member(
+    threads: &VcpuThreadRegistry,
+    terminal_settlement: &HvpatchExternalTerminalSettlement,
+) {
+    if !threads.register(terminal_settlement) {
+        carrick_fatal!(
+            "vcpu_loop::process_membership",
+            "Duplicate terminal settlement registration in persistent process handle list"
+        );
+    }
+}
+
+pub(crate) fn remove_persistent_process_member(
+    threads: &VcpuThreadRegistry,
+    completion: continuation::JobId,
+) {
+    let _ = threads.take_by_id(completion);
+}
+
+/// Settle every enrolled member externally; returns how many member
+/// `ThreadDone` results this drain published (members that never finished
+/// their own job).
+pub(crate) fn finish_persistent_process_handles(
+    threads: &VcpuThreadRegistry,
+    current: &continuation::LogicalJobCompletion,
+) -> Result<(usize, Vec<continuation::LogicalJobCompletion>), RuntimeError> {
+    let handles = threads.drain();
+    let mut completions = handles
+        .iter()
+        .map(VcpuThreadHandle::completion)
+        .collect::<Vec<_>>();
+    if !completions
+        .iter()
+        .any(|completion| completion.id() == current.id())
+    {
+        completions.push(current.clone());
+    }
+    let mut published = 0;
+    for handle in handles {
+        if handle.finish_completed(current.id())? {
+            published += 1;
+        }
+    }
+    Ok((published, completions))
+}
+
+pub(crate) fn publish_unexpected_executor_failure_retirement(
+    kernel: &Kernel,
+    threads: &VcpuThreadRegistry,
+    current: &continuation::LogicalJobCompletion,
+) -> Result<(), RuntimeError> {
+    let (_published, completions) = finish_persistent_process_handles(threads, current)?;
+    kernel.process_physical_retirement.publish(completions)?;
+    kernel.publish_process_terminal(Err(()));
+    Ok(())
+}
+
+pub(crate) struct PersistentProcessMemberPublication {
+    threads: VcpuThreadRegistry,
+    completion: continuation::JobId,
+    armed: bool,
+}
+
+impl PersistentProcessMemberPublication {
+    pub(crate) fn new(
+        threads: VcpuThreadRegistry,
+        terminal_settlement: &HvpatchExternalTerminalSettlement,
+    ) -> Self {
+        enroll_persistent_process_member(&threads, terminal_settlement);
+        Self {
+            threads,
+            completion: terminal_settlement.completion().id(),
+            armed: true,
+        }
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PersistentProcessMemberPublication {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_persistent_process_member(&self.threads, self.completion);
+        }
+    }
+}
+
 /// Encapsulates the collection of active persistent vCPU thread handles for a process.
 #[derive(Clone, Default)]
 pub(crate) struct VcpuThreadRegistry(Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>);
