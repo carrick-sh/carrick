@@ -7,6 +7,226 @@ use super::*;
 
 use carrick_fatal::carrick_fatal;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "guest completion stays inline so the ordinary trapped-syscall path does not allocate"
+)]
+pub(crate) enum SyscallCompletionOwnership {
+    Idle,
+    Guest(SyscallCompletionToken),
+    InternalControlExec,
+}
+
+/// Non-copyable completion authority transferred into a pending exec phase.
+///
+/// Once this owner exists, `ThreadRuntimeState::syscall_completion` is Idle.
+/// Dropping a pending phase therefore retires a guest exec without fabricating
+/// a return, and cannot strand live completion authority in shared runtime
+/// state. Extracting guest ownership consumes and destroys the completion
+/// token without publication, then carries this non-copyable provenance marker
+/// across the pending exec phase.
+pub(crate) enum PendingExecCompletionOwnership {
+    Guest,
+    InternalControlExec,
+}
+
+// Keep the explicit consumption points in the exec state machine meaningful:
+// this linear marker is retired where the formerly boxed token was retired,
+// even though guest-token destruction now happens before the pending phase.
+impl Drop for PendingExecCompletionOwnership {
+    fn drop(&mut self) {}
+}
+
+impl SyscallCompletionOwnership {
+    pub(crate) const fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    pub(crate) fn guest(
+        &self,
+        missing: &'static str,
+    ) -> Result<&SyscallCompletionToken, RuntimeError> {
+        match self {
+            Self::Guest(completion) => Ok(completion),
+            Self::Idle | Self::InternalControlExec => {
+                Err(RuntimeError::Configuration(missing.to_owned()))
+            }
+        }
+    }
+}
+
+pub(crate) struct PendingExecTerminal {
+    pub(crate) context: crate::kernel::KernelContext,
+    pub(crate) handoff: ExecTerminalHandoff,
+}
+
+pub(crate) struct PendingExecTerminalError {
+    pub(crate) error: RuntimeError,
+    pub(crate) pending: PendingExecTerminal,
+}
+
+pub(crate) enum ProductionHvpatchPollError {
+    Runtime(RuntimeError),
+    Exec(Box<PendingExecTerminalError>),
+}
+
+impl ProductionHvpatchPollError {
+    pub(super) fn from_exec_failure(failure: ExecTerminalFailure) -> Self {
+        Self::Exec(failure.into_pending())
+    }
+
+    pub(crate) fn from_exec_error(
+        error: RuntimeError,
+        context: crate::kernel::KernelContext,
+        handoff: ExecTerminalHandoff,
+    ) -> Self {
+        Self::Exec(Box::new(PendingExecTerminalError {
+            error,
+            pending: PendingExecTerminal { context, handoff },
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_runtime_error(self) -> RuntimeError {
+        match self {
+            Self::Runtime(error) => error,
+            Self::Exec(pending) => pending.error,
+        }
+    }
+}
+
+impl From<RuntimeError> for ProductionHvpatchPollError {
+    fn from(error: RuntimeError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+impl From<TrapError> for ProductionHvpatchPollError {
+    fn from(error: TrapError) -> Self {
+        Self::Runtime(RuntimeError::Trap(error))
+    }
+}
+
+impl std::fmt::Debug for ProductionHvpatchPollError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => formatter.debug_tuple("Runtime").field(error).finish(),
+            Self::Exec(pending) => formatter.debug_tuple("Exec").field(&pending.error).finish(),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecCompletionOrigin {
+    GuestSyscall,
+    InternalControl,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedExecCompletionOrigin(pub(crate) ExecCompletionOrigin);
+
+impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
+where
+    E::SiblingSpec: 'static,
+{
+    pub(crate) fn begin_internal_control_exec(&mut self) -> Result<(), RuntimeError> {
+        if !self.syscall_completion.is_idle() {
+            return Err(RuntimeError::Configuration(
+                "internal control exec collided with live syscall ownership".to_owned(),
+            ));
+        }
+        self.syscall_completion = SyscallCompletionOwnership::InternalControlExec;
+        Ok(())
+    }
+
+    pub(crate) fn authenticate_exec_completion_origin(
+        &self,
+        origin: ExecCompletionOrigin,
+    ) -> Result<AuthenticatedExecCompletionOrigin, RuntimeError> {
+        match (&self.syscall_completion, origin) {
+            (SyscallCompletionOwnership::Guest(_), ExecCompletionOrigin::GuestSyscall)
+            | (
+                SyscallCompletionOwnership::InternalControlExec,
+                ExecCompletionOrigin::InternalControl,
+            ) => Ok(AuthenticatedExecCompletionOrigin(origin)),
+            (SyscallCompletionOwnership::Idle, ExecCompletionOrigin::GuestSyscall) => Err(
+                RuntimeError::Configuration("guest exec missing completion token".to_owned()),
+            ),
+            (SyscallCompletionOwnership::Idle, ExecCompletionOrigin::InternalControl) => {
+                Err(RuntimeError::Configuration(
+                    "internal control exec missing typed ownership".to_owned(),
+                ))
+            }
+            (SyscallCompletionOwnership::Guest(_), ExecCompletionOrigin::InternalControl)
+            | (
+                SyscallCompletionOwnership::InternalControlExec,
+                ExecCompletionOrigin::GuestSyscall,
+            ) => Err(RuntimeError::Configuration(
+                "exec completion origin mismatched live typed ownership".to_owned(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_authenticated_exec_completion(
+        &mut self,
+        origin: AuthenticatedExecCompletionOrigin,
+    ) -> Result<(), RuntimeError> {
+        match origin.0 {
+            ExecCompletionOrigin::GuestSyscall => self.retire_syscall(),
+            ExecCompletionOrigin::InternalControl => self.finish_internal_control_exec(),
+        }
+    }
+
+    pub(crate) fn take_authenticated_exec_completion_ownership(
+        &mut self,
+        origin: AuthenticatedExecCompletionOrigin,
+    ) -> Result<PendingExecCompletionOwnership, RuntimeError> {
+        let ownership = std::mem::replace(
+            &mut self.syscall_completion,
+            SyscallCompletionOwnership::Idle,
+        );
+        match (origin.0, ownership) {
+            (ExecCompletionOrigin::GuestSyscall, SyscallCompletionOwnership::Guest(completion)) => {
+                drop(completion);
+                Ok(PendingExecCompletionOwnership::Guest)
+            }
+            (
+                ExecCompletionOrigin::InternalControl,
+                SyscallCompletionOwnership::InternalControlExec,
+            ) => Ok(PendingExecCompletionOwnership::InternalControlExec),
+            (ExecCompletionOrigin::GuestSyscall, other) => {
+                self.syscall_completion = other;
+                Err(RuntimeError::Configuration(
+                    "threaded syscall retired without guest completion ownership".to_owned(),
+                ))
+            }
+            (ExecCompletionOrigin::InternalControl, other) => {
+                self.syscall_completion = other;
+                Err(RuntimeError::Configuration(
+                    "internal control exec lost typed ownership".to_owned(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn finish_internal_control_exec(&mut self) -> Result<(), RuntimeError> {
+        match std::mem::replace(
+            &mut self.syscall_completion,
+            SyscallCompletionOwnership::Idle,
+        ) {
+            SyscallCompletionOwnership::InternalControlExec => Ok(()),
+            other => {
+                self.syscall_completion = other;
+                Err(RuntimeError::Configuration(
+                    "internal control exec lost typed ownership".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
 fn first_byte_mismatch(expected: &[u8], observed: &[u8]) -> Option<usize> {
     expected
         .iter()
@@ -164,14 +384,14 @@ impl PreparedExecve {
 /// A post-close failure paired with the exact, non-reconstructible admission
 /// token that must become terminal ownership before the original error can be
 /// published.
-pub(super) struct ExecTerminalFailure(Box<super::PendingExecTerminalError>);
+pub(super) struct ExecTerminalFailure(Box<PendingExecTerminalError>);
 
 impl ExecTerminalFailure {
     fn from_prepared(error: RuntimeError, prepared: PreparedExecve) -> Self {
         let (context, handoff) = prepared.into_terminal_authority();
-        Self(Box::new(super::PendingExecTerminalError {
+        Self(Box::new(PendingExecTerminalError {
             error,
-            pending: super::PendingExecTerminal { context, handoff },
+            pending: PendingExecTerminal { context, handoff },
         }))
     }
 
@@ -180,16 +400,16 @@ impl ExecTerminalFailure {
         context: crate::kernel::KernelContext,
         clone_admission: ExecCloneAdmission,
     ) -> Self {
-        Self(Box::new(super::PendingExecTerminalError {
+        Self(Box::new(PendingExecTerminalError {
             error,
-            pending: super::PendingExecTerminal {
+            pending: PendingExecTerminal {
                 context,
-                handoff: super::ExecTerminalHandoff { clone_admission },
+                handoff: ExecTerminalHandoff { clone_admission },
             },
         }))
     }
 
-    pub(super) fn into_pending(self) -> Box<super::PendingExecTerminalError> {
+    pub(super) fn into_pending(self) -> Box<PendingExecTerminalError> {
         self.0
     }
 }
@@ -2066,15 +2286,13 @@ where
                 context: terminal_context,
                 handoff,
             }),
-            Err(error) => Err(ExecTerminalFailure(Box::new(
-                super::PendingExecTerminalError {
-                    error,
-                    pending: super::PendingExecTerminal {
-                        context: terminal_context,
-                        handoff,
-                    },
+            Err(error) => Err(ExecTerminalFailure(Box::new(PendingExecTerminalError {
+                error,
+                pending: PendingExecTerminal {
+                    context: terminal_context,
+                    handoff,
                 },
-            ))),
+            }))),
         }
     }
 
@@ -2148,5 +2366,3859 @@ where
         let result = self.finish_prepared_execve(kernel, engine, prepared);
         drop(completion_ownership);
         result
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super as exec;
+    use super::super::tests::*;
+    use super::super::*;
+    use super::*;
+    use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
+    use crate::vcpu_loop::executor::TaskBindingResolver;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    struct CompletionOrderObserver {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        returns: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl crate::observe::SyscallObserver for CompletionOrderObserver {
+        fn on_syscall_return(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::SyscallInfo<'_>,
+            outcome: &crate::observe::SyscallOutcome,
+        ) {
+            self.events.lock().push("observer");
+            self.returns.lock().push(outcome.value);
+        }
+    }
+
+    struct CountingEntryObserver {
+        entries: Arc<std::sync::atomic::AtomicUsize>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl crate::observe::SyscallObserver for CountingEntryObserver {
+        fn on_syscall(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::SyscallInfo<'_>,
+        ) -> crate::observe::SyscallAction {
+            self.entries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.events.lock().push("entry");
+            crate::observe::SyscallAction::Allow
+        }
+    }
+
+    struct CountingPreflightInterceptor {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl crate::observe::SyscallInterceptor for CountingPreflightInterceptor {
+        fn intercept(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::InterceptedSyscall<'_>,
+        ) -> crate::observe::InterceptAction {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.events.lock().push("interceptor");
+            crate::observe::InterceptAction::Continue
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ObservedCompletionIdentity {
+        pid: i32,
+        tid: i32,
+        task: crate::kernel::TaskKey,
+        container: crate::kernel::container::ContainerId,
+        value: i64,
+    }
+
+    struct CompletionIdentityObserver(Arc<Mutex<Vec<ObservedCompletionIdentity>>>);
+
+    impl crate::observe::SyscallObserver for CompletionIdentityObserver {
+        fn on_syscall_return(
+            &self,
+            process: &crate::observe::ProcessInfo<'_>,
+            _call: &crate::observe::SyscallInfo<'_>,
+            outcome: &crate::observe::SyscallOutcome,
+        ) {
+            self.0.lock().push(ObservedCompletionIdentity {
+                pid: process.pid(),
+                tid: process.tid(),
+                task: process.task_key(),
+                container: process.container_id(),
+                value: outcome.value,
+            });
+        }
+    }
+
+    struct ExecPreparationCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::observe::SyscallObserver for ExecPreparationCounter {
+        fn on_exec(
+            &self,
+            _process: &crate::observe::ProcessInfo<'_>,
+            _exe: &[u8],
+            _argv: &[&[u8]],
+        ) -> crate::observe::SyscallAction {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::observe::SyscallAction::Allow
+        }
+    }
+
+    fn typed_completion_fixture(
+        pid: i32,
+        dispatcher: SyscallDispatcher,
+    ) -> (
+        Arc<KernelState>,
+        crate::kernel::KernelContext,
+        ThreadRuntimeState<CrashCaptureTestEngine>,
+    ) {
+        let (process, root) = crate::hvpatch::process_context_for_tests(pid);
+        dispatcher.bind_hvpatch_process(process.clone());
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            Some(process.clone()),
+            None,
+            None,
+        ));
+        let this_tid = ThreadId::synthetic_for_tests(pid);
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+        (kernel, root, state)
+    }
+
+    fn install_typed_guest_completion(
+        kernel: &Kernel,
+        context: &crate::kernel::KernelContext,
+        state: &mut ThreadRuntimeState<CrashCaptureTestEngine>,
+    ) -> PreparedSyscall {
+        let prepared = kernel
+            .dispatcher
+            .prepare_syscall(
+                context,
+                SyscallRequest::new(92, crate::compat::SyscallArgs::from([0; 6])),
+                &kernel.reporter,
+            )
+            .unwrap();
+        let PreparedDispatch::Invoke(syscall) = prepared else {
+            panic!("personality completion fixture must reach its handler")
+        };
+        state.syscall_completion = SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
+            syscall,
+            context.retain_exact(),
+            kernel.dispatcher.observers().cloned(),
+        ));
+        syscall
+    }
+
+    #[test]
+    fn guest_syscall_completion_owner_retains_token_inline() {
+        assert!(
+            std::mem::size_of::<SyscallCompletionOwnership>()
+                >= std::mem::size_of::<SyscallCompletionToken>(),
+            "the per-trap completion owner must retain its token inline rather than heap-allocate it"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn interception_completion_dynamic_fork_and_clone_children_publish_once_at_bootstrap() {
+        for (case, process_child) in [("fork", true), ("clone", false)] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let returns = Arc::new(Mutex::new(Vec::new()));
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+                events: Arc::clone(&events),
+                returns: Arc::clone(&returns),
+            }));
+            let pid = if process_child { 72_420 } else { 72_421 };
+            let (kernel, context, mut state) = typed_completion_fixture(pid, dispatcher);
+            install_typed_guest_completion(&kernel, &context, &mut state);
+            let mut engine = CrashCaptureTestEngine::default();
+
+            if process_child {
+                bootstrap_hvpatch_process_child(
+                    &kernel,
+                    &mut state,
+                    &mut engine,
+                    ProcessChildBootstrap::GuestFork {
+                        shares_mm: true,
+                        child_settid: None,
+                    },
+                )
+                .unwrap();
+            } else {
+                state
+                    .complete_precompleted_child(&kernel.reporter, 0)
+                    .unwrap();
+            }
+
+            assert!(state.syscall_completion.is_idle(), "{case}");
+            assert!(engine.completed_syscalls.is_empty(), "{case}");
+            assert_eq!(*returns.lock(), vec![0], "{case}");
+            assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+            assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 1);
+            assert!(
+                state
+                    .complete_precompleted_child(&kernel.reporter, 0)
+                    .is_err(),
+                "{case} child bootstrap must consume exactly once"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn interception_completion_dynamic_fork_child_job_preserves_exact_observer_identity_once() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(CompletionIdentityObserver(Arc::clone(&observed))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (runtime, scheduler, kernel, root, process, root_generation) =
+            test_carrier_graph_with_dispatcher!(72_425, dispatcher);
+        let root_authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(root.thread().key(), root_generation)
+            .expect("root submission authority");
+        let root_executor = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .expect("root executor");
+        let mut root_running = scheduler.take(&root_executor).expect("take queued root");
+
+        let this_tid = ThreadId::synthetic_for_tests(72_425);
+        let registry = Arc::new(ThreadRegistry::new(this_tid));
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            registry,
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&kicker),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        *state.execution_lease.lock() = Some(root_running.take_lease());
+        let mm_executor = kernel
+            .dispatcher
+            .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+            .expect("parent MM executor participation");
+        state.guest_execution = Some(mm_executor);
+        let frame = carrick_hal::RawSyscall {
+            number: carrick_abi::CanonicalNr(220),
+            args: [0; 6],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(220),
+        };
+        let mut parent_engine = CrashCaptureTestEngine {
+            completion_events: Some(Arc::clone(&events)),
+            ..Default::default()
+        };
+        let outcome = state
+            .service_threaded_syscall(&kernel, &mut parent_engine, frame)
+            .expect("production parent fork dispatch");
+        let DispatchOutcome::Fork {
+            flags,
+            pidfd_out,
+            clone_parent,
+            parent_tid_addr,
+            child_tid_addr,
+            exit_signal,
+            child_stack,
+            vfork,
+        } = outcome
+        else {
+            panic!("clone syscall must route to process fork")
+        };
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut parent_submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&root_authority),
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut parent_control =
+            executor::HvpatchQuantumControl::for_test(&need_resched, &mut parent_submission);
+        let mut memory = Memory::default();
+        let prepared = state
+            .prepare_in_process_fork(
+                &kernel,
+                &root,
+                &mut memory,
+                &mut parent_control,
+                &mut FakeBackendOps::default(),
+                quiesce::ProcessForkAttempt {
+                    request: quiesce::ForkRequest {
+                        flags,
+                        pidfd_out,
+                        clone_parent,
+                        parent_tid_addr,
+                        child_tid_addr,
+                        exit_signal,
+                        child_stack,
+                        vfork,
+                    },
+                    coordinator: None,
+                    external_exec: None,
+                },
+            )
+            .expect("actual guest fork publication");
+        let child_pid = match &prepared {
+            quiesce::PreparedInProcessFork::Complete(Some(child_pid)) => *child_pid,
+            _ => panic!("guest fork must publish one child"),
+        };
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        assert!(matches!(
+            job.complete_persistent_process_fork(
+                &mut parent_engine,
+                &mut parent_control,
+                Some(frame),
+                None,
+                prepared,
+            )
+            .expect("production parent fork completion"),
+            executor::ExecutorExit::Syscall
+        ));
+        assert_eq!(parent_engine.completed_syscalls, vec![child_pid]);
+        assert_eq!(*events.lock(), vec!["engine", "observer"]);
+        assert_eq!(*returns.lock(), vec![child_pid]);
+        assert!(job.state.syscall_completion.is_idle());
+
+        let child_id =
+            crate::kernel::TaskId::for_root_bootstrap(child_pid as i32).expect("child task id");
+        let child_context = root
+            .kernel()
+            .context(child_id, crate::kernel::LinuxTid::for_task_leader(child_id))
+            .expect("published child context");
+        let child_generation = child_context
+            .thread()
+            .execution_state()
+            .generation()
+            .expect("child execution generation");
+        let child_binding = runtime
+            .persistent_bindings()
+            .resolve(child_context.thread().key(), child_generation)
+            .expect("active child binding");
+        let child_authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(child_context.thread().key(), child_generation)
+            .expect("child submission authority");
+        let child_executor = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .expect("child executor");
+        let mut child_running = scheduler.take(&child_executor).expect("take queued child");
+        assert_eq!(child_running.thread_key(), child_context.thread().key());
+
+        let mut child_engine = CrashCaptureTestEngine::default();
+        let mut child_submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&child_authority),
+            lease: Some(child_running.take_lease()),
+            exec_replacement: None,
+        };
+        let (first, second) = {
+            let mut child_control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut child_submission);
+            let first = child_binding
+                .quantum()
+                .poll_quantum_with_engine(&mut child_engine, &mut child_control);
+            let second = child_binding
+                .quantum()
+                .poll_quantum_with_engine(&mut child_engine, &mut child_control);
+            (first, second)
+        };
+        assert!(matches!(first, executor::ExecutorExit::Syscall));
+        assert!(matches!(second, executor::ExecutorExit::Syscall));
+        child_running
+            .restore_lease(child_submission.lease.take().expect("returned child lease"))
+            .expect("restore child lease");
+        scheduler
+            .settle_runnable(child_running)
+            .expect("settle child after bootstrap");
+        root_running
+            .restore_lease(
+                job.state
+                    .execution_lease
+                    .lock()
+                    .take()
+                    .expect("returned parent lease"),
+            )
+            .expect("restore parent lease");
+        scheduler
+            .settle_runnable(root_running)
+            .expect("settle parent after fork");
+        drop(child_authority);
+        drop(root_authority);
+
+        assert!(child_engine.completed_syscalls.is_empty());
+        assert_eq!(*events.lock(), vec!["engine", "observer", "observer"]);
+        assert_eq!(*returns.lock(), vec![child_pid, 0]);
+        let completions = observed.lock();
+        assert_eq!(
+            completions.len(),
+            2,
+            "second quantum must not republish fork return"
+        );
+        assert_eq!(
+            completions[0],
+            ObservedCompletionIdentity {
+                pid: process.pid(),
+                tid: root.thread().key().tid.raw(),
+                task: root.task().key(),
+                container: root.task().container().id(),
+                value: child_pid,
+            }
+        );
+        assert_eq!(
+            completions[1],
+            ObservedCompletionIdentity {
+                pid: child_pid as i32,
+                tid: child_pid as i32,
+                task: child_context.task().key(),
+                container: child_context.task().container().id(),
+                value: 0,
+            }
+        );
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 1);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn interception_completion_dynamic_clone_child_job_preserves_exact_observer_identity_once() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(CompletionIdentityObserver(Arc::clone(&observed))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (runtime, scheduler, kernel, root, process, root_generation) =
+            test_carrier_graph_with_dispatcher!(72_426, dispatcher);
+        let root_authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(root.thread().key(), root_generation)
+            .expect("root submission authority");
+        let root_executor = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .expect("root executor");
+        let mut root_running = scheduler.take(&root_executor).expect("take queued root");
+
+        let this_tid = ThreadId::synthetic_for_tests(72_426);
+        let registry = Arc::new(ThreadRegistry::new(this_tid));
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            registry,
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&kicker),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        *state.execution_lease.lock() = Some(root_running.take_lease());
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+                .expect("parent MM executor participation"),
+        );
+        let flags = (carrick_abi::LinuxCloneFlags::THREAD
+            | carrick_abi::LinuxCloneFlags::SIGHAND
+            | carrick_abi::LinuxCloneFlags::VM)
+            .bits();
+        let frame = carrick_hal::RawSyscall {
+            number: carrick_abi::CanonicalNr(220),
+            args: [flags, 0x9000, 0, 0, 0, 0],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(220),
+        };
+        let mut parent_engine = CrashCaptureTestEngine {
+            completion_events: Some(Arc::clone(&events)),
+            ..Default::default()
+        };
+        let outcome = state
+            .service_threaded_syscall(&kernel, &mut parent_engine, frame)
+            .expect("production parent clone dispatch");
+        let DispatchOutcome::CloneThread {
+            stack,
+            tls,
+            flags,
+            parent_tid_addr,
+            child_tid_addr,
+            clear_child_tid_addr,
+        } = outcome
+        else {
+            panic!("thread clone flags must route to persistent thread clone")
+        };
+
+        let job_result = HvpatchLoopResult::pending();
+        let job_completion = continuation::LogicalJobCompletion::pending();
+        let mut job = ProductionHvpatchLoopJob {
+            kernel: Arc::clone(&kernel),
+            state,
+            phase: HvpatchProductionPhase::Resident,
+            registration_wait: None,
+            terminal_settlement: HvpatchExternalTerminalSettlement::new(
+                job_result,
+                job_completion.clone(),
+            ),
+            terminal_result: None,
+            completion: job_completion,
+            traps: 0,
+            budget_floor: 0,
+            seen_signal_progress: signal_progress_count(),
+            last_signal_progress: Instant::now(),
+            terminal_runtime: PersistentTerminalRuntimeState::Resident,
+            pending_terminal_retirement: None,
+            pending_terminal_inventory: None,
+            external_exec: None,
+        };
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut parent_submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&root_authority),
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut parent_control =
+            executor::HvpatchQuantumControl::for_test(&need_resched, &mut parent_submission);
+        let mut memory = Memory::default();
+        let spawned = job
+            .spawn_persistent_hvpatch_clone_thread(
+                &mut memory,
+                &mut parent_control,
+                &root,
+                HvpatchCloneThreadRequest {
+                    stack,
+                    tls,
+                    flags,
+                    parent_tid_addr,
+                    child_tid_addr,
+                    clear_child_tid_addr,
+                },
+                None,
+                &mut DynamicCloneBackendOps,
+            )
+            .expect("actual persistent clone publication");
+        let PersistentHvpatchCloneAttempt::Complete(threads::CloneThreadSpawn::Started {
+            internal: child_tid,
+            visible: child_visible_tid,
+        }) = spawned
+        else {
+            panic!("persistent clone must start one child thread")
+        };
+        assert!(matches!(
+            job.complete_persistent_hvpatch_clone(
+                &mut parent_engine,
+                threads::CloneThreadSpawn::Started {
+                    internal: child_tid,
+                    visible: child_visible_tid,
+                },
+            )
+            .expect("parent clone completion"),
+            executor::ExecutorExit::Syscall
+        ));
+
+        let child_context = root
+            .kernel()
+            .context(root.task().key().id, child_tid)
+            .expect("published clone context");
+        let child_generation = child_context
+            .thread()
+            .execution_state()
+            .generation()
+            .expect("child execution generation");
+        let child_binding = runtime
+            .persistent_bindings()
+            .resolve(child_context.thread().key(), child_generation)
+            .expect("active child binding");
+        let child_authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(child_context.thread().key(), child_generation)
+            .expect("child submission authority");
+        let child_executor = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .expect("child executor");
+        let mut child_running = scheduler.take(&child_executor).expect("take queued child");
+        assert_eq!(child_running.thread_key(), child_context.thread().key());
+
+        let mut child_engine = CrashCaptureTestEngine::default();
+        let mut child_submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&child_authority),
+            lease: Some(child_running.take_lease()),
+            exec_replacement: None,
+        };
+        let (first, second) = {
+            let mut child_control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut child_submission);
+            let first = child_binding
+                .quantum()
+                .poll_quantum_with_engine(&mut child_engine, &mut child_control);
+            let second = child_binding
+                .quantum()
+                .poll_quantum_with_engine(&mut child_engine, &mut child_control);
+            (first, second)
+        };
+        assert!(matches!(first, executor::ExecutorExit::Syscall));
+        assert!(matches!(second, executor::ExecutorExit::Syscall));
+        child_running
+            .restore_lease(child_submission.lease.take().expect("returned child lease"))
+            .expect("restore child lease");
+        scheduler
+            .settle_runnable(child_running)
+            .expect("settle child after bootstrap");
+        root_running
+            .restore_lease(
+                job.state
+                    .execution_lease
+                    .lock()
+                    .take()
+                    .expect("returned parent lease"),
+            )
+            .expect("restore parent lease");
+        scheduler
+            .settle_runnable(root_running)
+            .expect("settle parent after clone");
+        drop(child_authority);
+        drop(root_authority);
+
+        assert_eq!(
+            parent_engine.completed_syscalls,
+            vec![i64::from(child_visible_tid)]
+        );
+        assert!(child_engine.completed_syscalls.is_empty());
+        assert_eq!(*events.lock(), vec!["engine", "observer", "observer"]);
+        assert_eq!(*returns.lock(), vec![i64::from(child_visible_tid), 0]);
+        let completions = observed.lock();
+        assert_eq!(
+            completions.len(),
+            2,
+            "second child quantum must not republish"
+        );
+        assert_eq!(
+            completions[0],
+            ObservedCompletionIdentity {
+                pid: process.pid(),
+                tid: root.thread().key().tid.raw(),
+                task: root.task().key(),
+                container: root.task().container().id(),
+                value: i64::from(child_visible_tid),
+            }
+        );
+        assert_eq!(
+            completions[1],
+            ObservedCompletionIdentity {
+                pid: process.pid(),
+                tid: child_tid.raw(),
+                task: root.task().key(),
+                container: root.task().container().id(),
+                value: 0,
+            }
+        );
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 2);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn interception_completion_dynamic_timeout_and_interruption_resume_through_scheduler_once() {
+        for (case, interrupted, expected) in [
+            ("timeout", false, 0),
+            (
+                "interruption",
+                true,
+                crate::linux_abi::LINUX_EINTR.guest_retval(),
+            ),
+        ] {
+            let interceptor_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let returns = Arc::new(Mutex::new(Vec::new()));
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_interceptor(Arc::new(CountingPreflightInterceptor {
+                calls: Arc::clone(&interceptor_calls),
+                events: Arc::clone(&events),
+            }));
+            dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+                events: Arc::clone(&events),
+                returns: Arc::clone(&returns),
+            }));
+            let pid = if interrupted { 72_428 } else { 72_427 };
+            let (runtime, scheduler, kernel, root, process, root_generation) =
+                test_carrier_graph_with_dispatcher!(pid, dispatcher);
+            let root_authority = runtime
+                .persistent_bindings()
+                .take_submission_authority(root.thread().key(), root_generation)
+                .expect("root submission authority");
+            let root_executor = scheduler
+                .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                .expect("root executor");
+            let mut root_running = scheduler.take(&root_executor).expect("take queued root");
+
+            let this_tid = ThreadId::synthetic_for_tests(pid);
+            let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+            let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+            let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                Arc::new(ThreadRegistry::new(this_tid)),
+                Arc::new(FutexTable::new()),
+                platform,
+                platform_factory,
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(root.thread())),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                this_tid,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::clone(&kicker),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.guest_execution = Some(
+                kernel
+                    .dispatcher
+                    .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+                    .expect("root MM executor participation"),
+            );
+            let request_address = 0x20_000;
+            let duration = if interrupted {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_millis(1)
+            };
+            let mut timespec = Vec::with_capacity(16);
+            timespec.extend_from_slice(&(duration.as_secs() as i64).to_le_bytes());
+            timespec.extend_from_slice(&(i64::from(duration.subsec_nanos())).to_le_bytes());
+            let frame = carrick_hal::RawSyscall {
+                number: carrick_abi::CanonicalNr(101),
+                args: [request_address, 0, 0, 0, 0, 0],
+                guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                native_number: carrick_abi::NativeNr(101),
+            };
+            let mut engine = CrashCaptureTestEngine {
+                completion_events: Some(Arc::clone(&events)),
+                guest_memory: [(request_address, timespec)].into(),
+                ..Default::default()
+            };
+            let outcome = state
+                .service_threaded_syscall(&kernel, &mut engine, frame)
+                .expect("production nanosleep dispatch");
+            assert!(
+                matches!(outcome, DispatchOutcome::WaitOnSleep { .. }),
+                "{case}"
+            );
+            assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+
+            let job_result = HvpatchLoopResult::pending();
+            let job_completion = continuation::LogicalJobCompletion::pending();
+            let mut job = ProductionHvpatchLoopJob {
+                kernel: Arc::clone(&kernel),
+                state,
+                phase: HvpatchProductionPhase::Resident,
+                registration_wait: None,
+                terminal_settlement: HvpatchExternalTerminalSettlement::new(
+                    job_result,
+                    job_completion.clone(),
+                ),
+                terminal_result: None,
+                completion: job_completion,
+                traps: 0,
+                budget_floor: 0,
+                seen_signal_progress: signal_progress_count(),
+                last_signal_progress: Instant::now(),
+                terminal_runtime: PersistentTerminalRuntimeState::Resident,
+                pending_terminal_retirement: None,
+                pending_terminal_inventory: None,
+                external_exec: None,
+            };
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: Some(&root_authority),
+                lease: Some(root_running.take_lease()),
+                exec_replacement: None,
+            };
+            let blocked_exit = {
+                let mut control =
+                    executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                job.service_outcome(&mut engine, &mut control, frame, outcome)
+                    .expect("production continuation capture")
+            };
+            let executor::ExecutorExit::BlockedContinuation {
+                continuation,
+                vfork_activation: None,
+            } = blocked_exit
+            else {
+                panic!("{case} must suspend as a typed continuation")
+            };
+            let wait_service = runtime.continuation_services(root.kernel()).1;
+            let mut registration = wait_service.prepare_registration(&continuation);
+            wait_service
+                .enroll(&mut registration)
+                .expect("enroll real wait-service continuation");
+            root_running
+                .restore_lease(submission.lease.take().expect("returned blocked lease"))
+                .expect("restore blocked lease");
+            scheduler
+                .settle_blocked_continuation(root_running, *continuation, registration)
+                .expect("settle Kernel-owned continuation");
+
+            if interrupted {
+                let signal =
+                    crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGUSR1)
+                        .expect("SIGUSR1");
+                let mut action = carrick_abi::LinuxSigaction::empty();
+                action.sa_handler = 0x4000;
+                root.signal_authority().install_action(signal, action);
+                let ticket = match root.kernel().authorize_signal_target_exact(
+                    &root,
+                    root.task().key(),
+                    Some(root.thread().key()),
+                    Some(signal),
+                ) {
+                    crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+                    other => panic!("authorize exact continuation signal: {other:?}"),
+                };
+                assert_eq!(
+                    root.kernel()
+                        .post_guest_thread_signal_to_authorized_target(&ticket, signal, None),
+                    crate::kernel::ExactThreadSignalPost::Posted(Some(root.thread().key()))
+                );
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut resumed_running = loop {
+                match scheduler.take(&root_executor) {
+                    Ok(running) => break running,
+                    Err(crate::kernel::scheduler::RunQueueError::QueueEmpty) => {}
+                    Err(error) => panic!("{case} scheduler take: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{case} continuation did not wake"
+                );
+                std::thread::yield_now();
+            };
+            let mut resumed_submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: Some(&root_authority),
+                lease: Some(resumed_running.take_lease()),
+                exec_replacement: None,
+            };
+            let resumed = {
+                let mut control = executor::HvpatchQuantumControl::for_test(
+                    &need_resched,
+                    &mut resumed_submission,
+                );
+                job.poll_with_engine(&mut engine, &mut control)
+                    .expect("production ResumeBlocked completion")
+            };
+            assert!(matches!(resumed, executor::ExecutorExit::Syscall), "{case}");
+            resumed_running
+                .restore_lease(
+                    resumed_submission
+                        .lease
+                        .take()
+                        .expect("returned resumed lease"),
+                )
+                .expect("restore resumed lease");
+            scheduler
+                .settle_runnable(resumed_running)
+                .expect("settle resumed syscall");
+            drop(root_authority);
+
+            assert_eq!(
+                interceptor_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{case}"
+            );
+            assert_eq!(engine.completed_syscalls, vec![expected], "{case}");
+            assert_eq!(
+                *events.lock(),
+                vec!["interceptor", "engine", "observer"],
+                "{case}"
+            );
+            assert_eq!(*returns.lock(), vec![expected], "{case}");
+            assert!(job.state.syscall_completion.is_idle(), "{case}");
+            assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+            assert_eq!(
+                kernel.reporter.snapshot().summary.syscall_returns_ok,
+                usize::from(!interrupted) as u64,
+                "{case}"
+            );
+            assert_eq!(
+                kernel.reporter.snapshot().summary.syscall_returns_errno,
+                usize::from(interrupted) as u64,
+                "{case}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn interception_completion_dynamic_readiness_once_and_twice_redispatches_handler_only() {
+        for redispatches in [1, 2] {
+            let interceptor_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let entry_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let returns = Arc::new(Mutex::new(Vec::new()));
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_interceptor(Arc::new(CountingPreflightInterceptor {
+                calls: Arc::clone(&interceptor_calls),
+                events: Arc::clone(&events),
+            }));
+            dispatcher.install_observer(Arc::new(CountingEntryObserver {
+                entries: Arc::clone(&entry_calls),
+                events: Arc::clone(&events),
+            }));
+            dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+                events: Arc::clone(&events),
+                returns: Arc::clone(&returns),
+            }));
+            let pid = 72_430 + redispatches;
+            let (runtime, scheduler, kernel, root, process, root_generation) =
+                test_carrier_graph_with_dispatcher!(pid, dispatcher);
+            let root_authority = runtime
+                .persistent_bindings()
+                .take_submission_authority(root.thread().key(), root_generation)
+                .expect("root submission authority");
+            let root_executor = scheduler
+                .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                .expect("root executor");
+            let mut running = scheduler.take(&root_executor).expect("take queued root");
+
+            let this_tid = ThreadId::synthetic_for_tests(pid);
+            let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+            let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+            let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                Arc::new(ThreadRegistry::new(this_tid)),
+                Arc::new(FutexTable::new()),
+                platform,
+                platform_factory,
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(root.thread())),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                this_tid,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::clone(&kicker),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.guest_execution = Some(
+                kernel
+                    .dispatcher
+                    .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+                    .expect("root MM executor participation"),
+            );
+            let request_address = 0x21_000;
+            let duration = Duration::from_millis(250);
+            let mut timespec = Vec::with_capacity(16);
+            timespec.extend_from_slice(&(duration.as_secs() as i64).to_le_bytes());
+            timespec.extend_from_slice(&(i64::from(duration.subsec_nanos())).to_le_bytes());
+            let frame = carrick_hal::RawSyscall {
+                number: carrick_abi::CanonicalNr(101),
+                args: [request_address, 0, 0, 0, 0, 0],
+                guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                native_number: carrick_abi::NativeNr(101),
+            };
+            let mut engine = CrashCaptureTestEngine {
+                completion_events: Some(Arc::clone(&events)),
+                guest_memory: [(request_address, timespec)].into(),
+                ..Default::default()
+            };
+            let outcome = state
+                .service_threaded_syscall(&kernel, &mut engine, frame)
+                .expect("production nanosleep dispatch");
+            assert!(matches!(outcome, DispatchOutcome::WaitOnSleep { .. }));
+
+            let job_result = HvpatchLoopResult::pending();
+            let job_completion = continuation::LogicalJobCompletion::pending();
+            let mut job = ProductionHvpatchLoopJob {
+                kernel: Arc::clone(&kernel),
+                state,
+                phase: HvpatchProductionPhase::Resident,
+                registration_wait: None,
+                terminal_settlement: HvpatchExternalTerminalSettlement::new(
+                    job_result,
+                    job_completion.clone(),
+                ),
+                terminal_result: None,
+                completion: job_completion,
+                traps: 0,
+                budget_floor: 0,
+                seen_signal_progress: signal_progress_count(),
+                last_signal_progress: Instant::now(),
+                terminal_runtime: PersistentTerminalRuntimeState::Resident,
+                pending_terminal_retirement: None,
+                pending_terminal_inventory: None,
+                external_exec: None,
+            };
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: Some(&root_authority),
+                lease: Some(running.take_lease()),
+                exec_replacement: None,
+            };
+            let mut next_exit = {
+                let mut control =
+                    executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                job.service_outcome(&mut engine, &mut control, frame, outcome)
+                    .expect("initial production continuation")
+            };
+            let wait_service = runtime.continuation_services(root.kernel()).1;
+
+            for readiness in 0..redispatches {
+                let executor::ExecutorExit::BlockedContinuation {
+                    continuation,
+                    vfork_activation: None,
+                } = next_exit
+                else {
+                    panic!("readiness {readiness} did not retain a typed continuation")
+                };
+                let mut registration = wait_service.prepare_registration(&continuation);
+                let token = registration.wake_token();
+                wait_service
+                    .enroll(&mut registration)
+                    .expect("enroll readiness continuation");
+                running
+                    .restore_lease(submission.lease.take().expect("returned blocked lease"))
+                    .expect("restore blocked lease");
+                scheduler
+                    .settle_blocked_continuation(running, *continuation, registration)
+                    .expect("settle readiness continuation");
+                assert!(
+                    wait_service.publish_ready(token).accepted(),
+                    "readiness {readiness} must win exactly once"
+                );
+                let deadline = Instant::now() + Duration::from_secs(2);
+                running = loop {
+                    match scheduler.take(&root_executor) {
+                        Ok(running) => break running,
+                        Err(crate::kernel::scheduler::RunQueueError::QueueEmpty) => {}
+                        Err(error) => panic!("readiness {readiness} scheduler take: {error}"),
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "readiness {readiness} did not wake"
+                    );
+                    std::thread::yield_now();
+                };
+                submission.lease = Some(running.take_lease());
+                next_exit = {
+                    let mut control =
+                        executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                    job.poll_with_engine(&mut engine, &mut control)
+                        .expect("handler-only readiness redispatch")
+                };
+                assert!(
+                    matches!(
+                        next_exit,
+                        executor::ExecutorExit::BlockedContinuation { .. }
+                    ),
+                    "readiness {readiness} must redispatch the nanosleep handler and re-park"
+                );
+                assert!(engine.completed_syscalls.is_empty());
+                assert!(returns.lock().is_empty());
+            }
+
+            let executor::ExecutorExit::BlockedContinuation {
+                continuation,
+                vfork_activation: None,
+            } = next_exit
+            else {
+                panic!("final timer continuation missing")
+            };
+            let mut registration = wait_service.prepare_registration(&continuation);
+            wait_service
+                .enroll(&mut registration)
+                .expect("enroll final timer continuation");
+            running
+                .restore_lease(
+                    submission
+                        .lease
+                        .take()
+                        .expect("returned final blocked lease"),
+                )
+                .expect("restore final blocked lease");
+            scheduler
+                .settle_blocked_continuation(running, *continuation, registration)
+                .expect("settle final timer continuation");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            running = loop {
+                match scheduler.take(&root_executor) {
+                    Ok(running) => break running,
+                    Err(crate::kernel::scheduler::RunQueueError::QueueEmpty) => {}
+                    Err(error) => panic!("final timer scheduler take: {error}"),
+                }
+                assert!(Instant::now() < deadline, "final timer did not wake");
+                std::thread::yield_now();
+            };
+            submission.lease = Some(running.take_lease());
+            let final_exit = {
+                let mut control =
+                    executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                job.poll_with_engine(&mut engine, &mut control)
+                    .expect("final timer completion")
+            };
+            assert!(matches!(final_exit, executor::ExecutorExit::Syscall));
+            running
+                .restore_lease(submission.lease.take().expect("returned final lease"))
+                .expect("restore final lease");
+            scheduler
+                .settle_runnable(running)
+                .expect("settle completed nanosleep");
+            drop(root_authority);
+
+            assert_eq!(
+                interceptor_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "redispatch count {redispatches} reran the interceptor"
+            );
+            assert_eq!(
+                entry_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "redispatch count {redispatches} reran user entry observers"
+            );
+            assert_eq!(engine.completed_syscalls, vec![0]);
+            assert_eq!(
+                *events.lock(),
+                vec!["interceptor", "entry", "engine", "observer"]
+            );
+            assert_eq!(*returns.lock(), vec![0]);
+            assert!(job.state.syscall_completion.is_idle());
+            assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+            assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 1);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn interception_completion_dynamic_blocking_partial_runs_driver_before_one_publication() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (runtime, scheduler, kernel, root, process, root_generation) =
+            test_carrier_graph_with_dispatcher!(72_433, dispatcher);
+        let root_authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(root.thread().key(), root_generation)
+            .expect("root submission authority");
+        let root_executor = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .expect("root executor");
+        let mut running = scheduler.take(&root_executor).expect("take queued root");
+
+        let this_tid = ThreadId::synthetic_for_tests(72_433);
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&kicker),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(Some(Arc::clone(root.thread())), kicker, this_tid)
+                .expect("root MM executor participation"),
+        );
+        let frame = carrick_hal::RawSyscall {
+            number: carrick_abi::CanonicalNr(92),
+            args: [0; 6],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(92),
+        };
+        let mut engine = CrashCaptureTestEngine {
+            completion_events: Some(Arc::clone(&events)),
+            ..Default::default()
+        };
+        let handler_outcome = state
+            .service_threaded_syscall(&kernel, &mut engine, frame)
+            .expect("production preflight and handler");
+        assert!(matches!(handler_outcome, DispatchOutcome::Returned { .. }));
+
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let write = crate::dispatch::BlockingHostWrite::for_tests(
+            fds[1],
+            vec![1, 2, 3, 4],
+            2,
+            this_tid,
+            true,
+        )
+        .expect("partial blocking write");
+        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+
+        let job_result = HvpatchLoopResult::pending();
+        let job_completion = continuation::LogicalJobCompletion::pending();
+        let mut job = ProductionHvpatchLoopJob {
+            kernel: Arc::clone(&kernel),
+            state,
+            phase: HvpatchProductionPhase::Resident,
+            registration_wait: None,
+            terminal_settlement: HvpatchExternalTerminalSettlement::new(
+                job_result,
+                job_completion.clone(),
+            ),
+            terminal_result: None,
+            completion: job_completion,
+            traps: 0,
+            budget_floor: 0,
+            seen_signal_progress: signal_progress_count(),
+            last_signal_progress: Instant::now(),
+            terminal_runtime: PersistentTerminalRuntimeState::Resident,
+            pending_terminal_retirement: None,
+            pending_terminal_inventory: None,
+            external_exec: None,
+        };
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&root_authority),
+            lease: Some(running.take_lease()),
+            exec_replacement: None,
+        };
+        let blocked_exit = {
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+            job.service_outcome(
+                &mut engine,
+                &mut control,
+                frame,
+                DispatchOutcome::BlockingHostWrite(write),
+            )
+            .expect("production blocking-write continuation")
+        };
+        let executor::ExecutorExit::BlockedContinuation {
+            continuation,
+            vfork_activation: None,
+        } = blocked_exit
+        else {
+            panic!("blocking partial must park in the production driver")
+        };
+        let wait_service = runtime.continuation_services(root.kernel()).1;
+        let mut registration = wait_service.prepare_registration(&continuation);
+        wait_service
+            .enroll(&mut registration)
+            .expect("enroll blocking-write driver");
+        running
+            .restore_lease(submission.lease.take().expect("returned blocked lease"))
+            .expect("restore blocked lease");
+        scheduler
+            .settle_blocked_continuation(running, *continuation, registration)
+            .expect("settle blocking-write continuation");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        running = loop {
+            match scheduler.take(&root_executor) {
+                Ok(running) => break running,
+                Err(crate::kernel::scheduler::RunQueueError::QueueEmpty) => {}
+                Err(error) => panic!("blocking-write scheduler take: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "blocking-write driver did not wake"
+            );
+            std::thread::yield_now();
+        };
+        submission.lease = Some(running.take_lease());
+        let final_exit = {
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+            job.poll_with_engine(&mut engine, &mut control)
+                .expect("production blocking-write completion")
+        };
+        assert!(matches!(final_exit, executor::ExecutorExit::Syscall));
+        running
+            .restore_lease(submission.lease.take().expect("returned final lease"))
+            .expect("restore final lease");
+        scheduler
+            .settle_runnable(running)
+            .expect("settle completed blocking write");
+        drop(root_authority);
+
+        assert_eq!(engine.completed_syscalls, vec![2]);
+        assert_eq!(*events.lock(), vec!["engine", "observer"]);
+        assert_eq!(*returns.lock(), vec![2]);
+        assert!(job.state.syscall_completion.is_idle());
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 1);
+    }
+
+    #[test]
+    fn interception_completion_dynamic_signal_and_partial_return_publish_after_engine_once() {
+        for (case, value, signal_path) in [("signal", 0, true), ("partial-write", 3, false)] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let returns = Arc::new(Mutex::new(Vec::new()));
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+                events: Arc::clone(&events),
+                returns: Arc::clone(&returns),
+            }));
+            let pid = if signal_path { 72_422 } else { 72_423 };
+            let (kernel, context, mut state) = typed_completion_fixture(pid, dispatcher);
+            install_typed_guest_completion(&kernel, &context, &mut state);
+            let mut engine = CrashCaptureTestEngine {
+                completion_events: Some(Arc::clone(&events)),
+                ..Default::default()
+            };
+
+            let completed = if signal_path {
+                let target = ThreadId::synthetic_for_tests(context.thread().key().tid.raw());
+                state
+                    .complete_signal_thread(
+                        &kernel,
+                        &mut engine,
+                        target,
+                        crate::linux_abi::LINUX_SIGUSR1,
+                        Some(context.thread().key()),
+                    )
+                    .unwrap()
+            } else {
+                state
+                    .complete_returned(&mut engine, &kernel.reporter, value)
+                    .unwrap()
+            };
+
+            assert_eq!(completed, value, "{case}");
+            assert_eq!(engine.completed_syscalls, vec![value], "{case}");
+            assert_eq!(*events.lock(), vec!["engine", "observer"], "{case}");
+            assert_eq!(*returns.lock(), vec![value], "{case}");
+            assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+            assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 1);
+            assert!(
+                state
+                    .complete_returned(&mut engine, &kernel.reporter, value)
+                    .is_err(),
+                "{case} completion token must be single-use"
+            );
+            assert_eq!(engine.completed_syscalls, vec![value], "{case}");
+        }
+    }
+
+    #[test]
+    fn interception_completion_dynamic_guest_exec_failure_completes_errno_once() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(72_424, dispatcher);
+        install_typed_guest_completion(&kernel, &context, &mut state);
+        let mut engine = CrashCaptureTestEngine {
+            completion_events: Some(Arc::clone(&events)),
+            ..Default::default()
+        };
+
+        let preparation = state
+            .prepare_execve(
+                &kernel,
+                &context,
+                &mut engine,
+                "/definitely/missing/guest-exec".to_owned(),
+                vec![b"missing".to_vec()],
+                Vec::new(),
+                ExecCompletionOrigin::GuestSyscall,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            preparation,
+            exec::ExecvePreparation::Complete(None)
+        ));
+        let expected = crate::linux_abi::LINUX_ENOENT.guest_retval();
+        assert_eq!(engine.completed_syscalls, vec![expected]);
+        assert_eq!(*events.lock(), vec!["engine", "observer"]);
+        assert_eq!(*returns.lock(), vec![expected]);
+        assert!(state.syscall_completion.is_idle());
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_invocations, 1);
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_errno, 1);
+    }
+
+    fn suffix_failure_test_executable() -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut executable = tempfile::NamedTempFile::new().expect("synthetic executable");
+        executable
+            .write_all(&synthetic_elf(183))
+            .expect("write synthetic ELF");
+        let mut permissions = executable
+            .as_file()
+            .metadata()
+            .expect("synthetic ELF metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        executable
+            .as_file()
+            .set_permissions(permissions)
+            .expect("mark synthetic ELF executable");
+        executable
+    }
+
+    trait TestRuntimeError {
+        fn into_runtime_error(self) -> RuntimeError;
+    }
+
+    impl TestRuntimeError for RuntimeError {
+        fn into_runtime_error(self) -> RuntimeError {
+            self
+        }
+    }
+
+    impl TestRuntimeError for ProductionHvpatchPollError {
+        fn into_runtime_error(self) -> RuntimeError {
+            ProductionHvpatchPollError::into_runtime_error(self)
+        }
+    }
+
+    fn assert_exact_configuration_error(error: impl TestRuntimeError, expected: &str) {
+        match error.into_runtime_error() {
+            RuntimeError::Configuration(actual) => assert_eq!(actual, expected),
+            other => panic!("expected RuntimeError::Configuration({expected:?}), got {other:?}"),
+        }
+    }
+
+    fn assert_no_exec_return_publication(
+        kernel: &Kernel,
+        engine: &CrashCaptureTestEngine,
+        returns: &Arc<Mutex<Vec<i64>>>,
+        events: &Arc<Mutex<Vec<&'static str>>>,
+    ) {
+        assert!(engine.completed_syscalls.is_empty());
+        assert!(returns.lock().is_empty());
+        assert!(events.lock().is_empty());
+        let report = kernel.reporter.snapshot();
+        assert_eq!(report.summary.syscall_returns_ok, 0);
+        assert_eq!(report.summary.syscall_returns_errno, 0);
+    }
+
+    fn install_exec_terminal_handoff_contender(
+        gate: &Arc<CloneAdmissionGate>,
+        contender: ThreadId,
+    ) -> std::thread::JoinHandle<Result<ExecCloneAdmission, RuntimeError>> {
+        let (validated_tx, validated_rx) = std::sync::mpsc::channel();
+        let (observation_tx, observation_rx) = std::sync::mpsc::channel::<bool>();
+        gate.install_exec_terminal_handoff_hook(move || {
+            validated_tx
+                .send(())
+                .expect("publish exact handoff validation");
+            assert!(
+                observation_rx
+                    .recv()
+                    .expect("receive contender mutex observation"),
+                "production contender must encounter the held gate mutex"
+            );
+        });
+        let contender_gate = Arc::clone(gate);
+        std::thread::spawn(move || {
+            validated_rx.recv().expect("wait for exact handoff");
+            let encountered_held_mutex = contender_gate.state.try_lock().is_none();
+            observation_tx
+                .send(encountered_held_mutex)
+                .expect("publish contender mutex observation");
+            contender_gate.close_for_exec(contender)
+        })
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_production_exec_terminal_failure(
+        job: &mut ProductionHvpatchLoopJob<CrashCaptureTestEngine>,
+        engine: &mut CrashCaptureTestEngine,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        expected: &str,
+        origin: ExecCompletionOrigin,
+        contender: ThreadId,
+    ) {
+        let contender_thread =
+            install_exec_terminal_handoff_contender(&job.kernel.clone_admission, contender);
+
+        let exit = ProductionHvpatchLoopPoll::poll(job, engine, control);
+
+        assert!(
+            matches!(exit, executor::ExecutorExit::Exited),
+            "exec terminal failure must exit, got {exit:?}"
+        );
+        assert_pending_exec_terminal_error(job, expected);
+        assert!(
+            contender_thread
+                .join()
+                .expect("join exec contender")
+                .is_err(),
+            "different exec must lose at the exact terminal handoff"
+        );
+        assert_eq!(
+            job.kernel
+                .clone_admission
+                .try_claim_process_exit(job.state.this_tid)
+                .expect("same-owner terminal retry")
+                .claim,
+            ProcessExitClaim::Owner,
+        );
+        assert_eq!(
+            job.kernel
+                .clone_admission
+                .try_claim_process_exit(contender)
+                .expect("different-owner terminal retry")
+                .claim,
+            ProcessExitClaim::AlreadyOwned,
+        );
+        assert!(job.state.syscall_completion.is_idle());
+        assert!(
+            job.state
+                .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(origin))
+                .is_err(),
+            "terminal exec failure must not replay its completion origin"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_production_exec_terminal_trap_failure(
+        job: &mut ProductionHvpatchLoopJob<CrashCaptureTestEngine>,
+        engine: &mut CrashCaptureTestEngine,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        expected: &str,
+        origin: ExecCompletionOrigin,
+        contender: ThreadId,
+    ) {
+        let contender_thread =
+            install_exec_terminal_handoff_contender(&job.kernel.clone_admission, contender);
+
+        let exit = ProductionHvpatchLoopPoll::poll(job, engine, control);
+
+        assert!(
+            matches!(exit, executor::ExecutorExit::Exited),
+            "exec terminal failure must exit, got {exit:?}"
+        );
+        match job.terminal_result.as_ref() {
+            Some(Err(RuntimeError::Trap(TrapError::Hypervisor(actual)))) => {
+                assert_eq!(actual, expected)
+            }
+            Some(Err(other)) => panic!("expected exact terminal trap {expected:?}, got {other:?}"),
+            Some(Ok(_)) => panic!("expected exact terminal trap {expected:?}, got success"),
+            None => panic!("expected exact terminal trap {expected:?}, got none"),
+        }
+        assert!(matches!(job.phase, HvpatchProductionPhase::Complete));
+        assert!(
+            contender_thread
+                .join()
+                .expect("join exec contender")
+                .is_err(),
+            "different exec must lose at the exact terminal handoff"
+        );
+        assert_eq!(
+            job.kernel
+                .clone_admission
+                .try_claim_process_exit(job.state.this_tid)
+                .expect("same-owner terminal retry")
+                .claim,
+            ProcessExitClaim::Owner,
+        );
+        assert_eq!(
+            job.kernel
+                .clone_admission
+                .try_claim_process_exit(contender)
+                .expect("different-owner terminal retry")
+                .claim,
+            ProcessExitClaim::AlreadyOwned,
+        );
+        assert!(job.state.syscall_completion.is_idle());
+        assert!(
+            job.state
+                .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(origin))
+                .is_err(),
+            "terminal exec failure must not replay its completion origin"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn external_exec_work_for_test(
+        path: String,
+        context: &crate::kernel::KernelContext,
+    ) -> crate::kernel::control::ExecWork {
+        use crate::kernel::control::{
+            CarrierExecAdmission, ControlNonce, ExecAttach, ExecCapability, ExecRequest,
+            ExecRuntime, ExecStatus,
+        };
+
+        let runtime = ExecRuntime::new(1);
+        let capability = ExecCapability::from(ControlNonce::fresh().expect("control nonce"));
+        let submit_runtime = runtime.clone();
+        let submitter = std::thread::spawn(move || {
+            submit_runtime.admit(
+                capability,
+                ExecRequest {
+                    argv: vec![path],
+                    env: Vec::new(),
+                    workdir: None,
+                    user: None,
+                    tty: false,
+                    attach: ExecAttach::Capture,
+                },
+            )
+        });
+        while runtime.query(capability) != ExecStatus::Pending {
+            std::thread::yield_now();
+        }
+        let mut work = loop {
+            if let Some(work) = runtime.try_take() {
+                break work;
+            }
+            std::thread::yield_now();
+        };
+        assert!(work.begin_publication());
+        assert!(work.admit(context.task().key().into()));
+        assert_eq!(submitter.join().expect("exec submitter"), Ok(capability));
+        work
+    }
+
+    fn process_owner_drain_failure(
+        state: &ThreadRuntimeState<CrashCaptureTestEngine>,
+    ) -> HvpatchExternalTerminalSettlement {
+        let settlement = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            continuation::LogicalJobCompletion::pending(),
+        );
+        settlement.arm_process_owner().unwrap();
+        enroll_persistent_process_member(&state.threads, &settlement);
+        settlement
+    }
+
+    fn execve_test_frame() -> carrick_hal::RawSyscall {
+        carrick_hal::RawSyscall {
+            number: carrick_abi::CanonicalNr(221),
+            args: [0; 6],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(221),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn scripted_guest_execve_engine(path: &str) -> CrashCaptureTestEngine {
+        const PATH: u64 = 0x30_000;
+        const ARGV: u64 = 0x31_000;
+        let mut path_bytes = vec![0; 256];
+        path_bytes[..path.len()].copy_from_slice(path.as_bytes());
+        let guest_memory = [
+            (PATH, path_bytes),
+            (ARGV, PATH.to_le_bytes().to_vec()),
+            (ARGV + 8, 0_u64.to_le_bytes().to_vec()),
+        ]
+        .into();
+        CrashCaptureTestEngine {
+            next_syscall: Some(carrick_hal::RawSyscall {
+                number: carrick_abi::CanonicalNr(221),
+                args: [PATH, ARGV, 0, 0, 0, 0],
+                guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                native_number: carrick_abi::NativeNr(221),
+            }),
+            guest_memory,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn enable_exec_support_for_test(
+        engine: &mut CrashCaptureTestEngine,
+        context: &crate::kernel::KernelContext,
+        owner_generation: u64,
+    ) {
+        engine.exec_support = true;
+        engine.snapshot_cpu = Some(executor::tests::task_state(context, 901).cpu);
+        engine.frame_cow_owner_inventory = Some(fixed_frame_cow_owner_inventory_for_test(
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(
+                std::num::NonZeroU64::new(owner_generation).expect("nonzero exec owner generation"),
+            ),
+        ));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct ImmediateProductionExecFailureCase {
+        _executable: tempfile::NamedTempFile,
+        kernel: Arc<KernelState>,
+        context: crate::kernel::KernelContext,
+        job: ProductionHvpatchLoopJob<CrashCaptureTestEngine>,
+        engine: CrashCaptureTestEngine,
+        preparations: Arc<std::sync::atomic::AtomicUsize>,
+        returns: Arc<Mutex<Vec<i64>>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn immediate_production_exec_failure_case(
+        pid: i32,
+        origin: ExecCompletionOrigin,
+        fail_drain_begin: bool,
+    ) -> ImmediateProductionExecFailureCase {
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(pid, dispatcher);
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    state.kernel_thread.as_ref().map(Arc::clone),
+                    Arc::clone(&state.kicker),
+                    state.this_tid,
+                )
+                .expect("immediate production exec MM participation"),
+        );
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let (phase, engine) = match origin {
+            ExecCompletionOrigin::GuestSyscall => (
+                HvpatchProductionPhase::Resident,
+                scripted_guest_execve_engine(&path),
+            ),
+            ExecCompletionOrigin::InternalControl => {
+                state.begin_internal_control_exec().unwrap();
+                kernel
+                    .install_external_exec_work(external_exec_work_for_test(path.clone(), &context))
+                    .expect("install production external exec work");
+                (
+                    HvpatchProductionPhase::BootstrapProcessChild(
+                        ProcessChildBootstrap::ExternalControlExec { shares_mm: true },
+                    ),
+                    CrashCaptureTestEngine::default(),
+                )
+            }
+        };
+        if fail_drain_begin {
+            state.kernel_thread = None;
+        }
+        let job = suffix_failure_test_job(&kernel, state, phase, None);
+        ImmediateProductionExecFailureCase {
+            _executable: executable,
+            kernel,
+            context,
+            job,
+            engine,
+            preparations,
+            returns,
+            events,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn context_boundary_production_exec_failure_case(
+        pid: i32,
+        origin: ExecCompletionOrigin,
+        failpoint: Option<exec::ExecTerminalContextFailpoint>,
+    ) -> ImmediateProductionExecFailureCase {
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (_runtime, scheduler, kernel, context, process, _root_generation) =
+            test_carrier_graph_with_dispatcher!(pid, dispatcher);
+        let executor = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .expect("context-boundary executor");
+        let mut running = scheduler
+            .take(&executor)
+            .expect("context-boundary runnable root");
+        let this_tid = ThreadId::synthetic_for_tests(pid);
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(context.thread())),
+            Some(process.pid()),
+            context.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&kicker),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        *state.execution_lease.lock() = Some(running.take_lease());
+        state.service_kernel_context = Some(context.retain_exact());
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(Some(Arc::clone(context.thread())), kicker, this_tid)
+                .expect("context-boundary MM participation"),
+        );
+        if let Some(failpoint) = failpoint {
+            state.install_exec_terminal_context_failpoint_for_test(failpoint);
+        }
+
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let (phase, mut engine) = match origin {
+            ExecCompletionOrigin::GuestSyscall => (
+                HvpatchProductionPhase::Resident,
+                scripted_guest_execve_engine(&path),
+            ),
+            ExecCompletionOrigin::InternalControl => {
+                state.begin_internal_control_exec().unwrap();
+                kernel
+                    .install_external_exec_work(external_exec_work_for_test(path.clone(), &context))
+                    .expect("install context-boundary external exec work");
+                (
+                    HvpatchProductionPhase::BootstrapProcessChild(
+                        ProcessChildBootstrap::ExternalControlExec { shares_mm: true },
+                    ),
+                    CrashCaptureTestEngine::default(),
+                )
+            }
+        };
+        enable_exec_support_for_test(&mut engine, &context, pid as u64);
+        let job = suffix_failure_test_job(&kernel, state, phase, None);
+        ImmediateProductionExecFailureCase {
+            _executable: executable,
+            kernel,
+            context,
+            job,
+            engine,
+            preparations,
+            returns,
+            events,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct PendingExecDrainTestCase {
+        kernel: Kernel,
+        context: crate::kernel::KernelContext,
+        job: ProductionHvpatchLoopJob<CrashCaptureTestEngine>,
+        engine: CrashCaptureTestEngine,
+        sibling: HvpatchExternalTerminalSettlement,
+        preparations: Arc<std::sync::atomic::AtomicUsize>,
+        returns: Arc<Mutex<Vec<i64>>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn pending_exec_drain_test_case(
+        pid: i32,
+        origin: ExecCompletionOrigin,
+    ) -> PendingExecDrainTestCase {
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(pid, dispatcher);
+        match origin {
+            ExecCompletionOrigin::GuestSyscall => {
+                install_typed_guest_completion(&kernel, &context, &mut state);
+            }
+            ExecCompletionOrigin::InternalControl => {
+                state.begin_internal_control_exec().unwrap();
+            }
+        }
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    state.kernel_thread.as_ref().map(Arc::clone),
+                    Arc::clone(&state.kicker),
+                    state.this_tid,
+                )
+                .expect("pending exec MM participation"),
+        );
+        let sibling = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            continuation::LogicalJobCompletion::pending(),
+        );
+        enroll_persistent_process_member(&state.threads, &sibling);
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let external_exec = match origin {
+            ExecCompletionOrigin::GuestSyscall => None,
+            ExecCompletionOrigin::InternalControl => {
+                Some(external_exec_work_for_test(path.clone(), &context))
+            }
+        };
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .expect("HVPatch runtime")
+            .continuation_services(context.kernel())
+            .0;
+        let mut job = suffix_failure_test_job(
+            &kernel,
+            state,
+            HvpatchProductionPhase::Resident,
+            external_exec,
+        );
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        let mut engine = CrashCaptureTestEngine::default();
+        let first = match origin {
+            ExecCompletionOrigin::GuestSyscall => job
+                .service_outcome(
+                    &mut engine,
+                    &mut control,
+                    execve_test_frame(),
+                    DispatchOutcome::Execve {
+                        path: path.clone(),
+                        argv: vec![path.into_bytes()],
+                        env: Vec::new(),
+                    },
+                )
+                .expect("guest exec must suspend with its pending drain owner"),
+            ExecCompletionOrigin::InternalControl => job
+                .start_external_exec(&mut engine, &mut control)
+                .expect("internal exec must suspend with its pending drain owner"),
+        };
+        assert!(matches!(
+            first,
+            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState)
+        ));
+        assert!(matches!(
+            job.phase,
+            HvpatchProductionPhase::ExecSiblingDrain { .. }
+        ));
+        assert!(
+            job.state.syscall_completion.is_idle(),
+            "pending exec phase must exclusively own completion authority"
+        );
+        assert_eq!(preparations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        PendingExecDrainTestCase {
+            kernel,
+            context,
+            job,
+            engine,
+            sibling,
+            preparations,
+            returns,
+            events,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_pending_exec_terminal_error(
+        job: &ProductionHvpatchLoopJob<CrashCaptureTestEngine>,
+        expected: &str,
+    ) {
+        match job.terminal_result.as_ref() {
+            Some(Err(RuntimeError::Configuration(actual))) => assert_eq!(actual, expected),
+            Some(Err(other)) => {
+                panic!("expected exact pending-exec terminal error {expected:?}, got {other:?}")
+            }
+            Some(Ok(_)) => {
+                panic!(
+                    "expected exact pending-exec terminal error {expected:?}, got success (successor committed: {})",
+                    job.state.committed_exec_context_for_test.is_some()
+                )
+            }
+            None => panic!("expected exact pending-exec terminal error {expected:?}, got none"),
+        }
+        assert!(matches!(job.phase, HvpatchProductionPhase::Complete));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn pending_exec_completion_ownership_survives_mm_readmission_failure_without_masking_error() {
+        for (pid, origin) in [
+            (72_429, ExecCompletionOrigin::GuestSyscall),
+            (72_430, ExecCompletionOrigin::InternalControl),
+        ] {
+            let mut case = pending_exec_drain_test_case(pid, origin);
+            case.sibling
+                .publish_member(Ok(VcpuLoopOutcome::ThreadDone))
+                .expect("settle the real pending sibling");
+            let blocker = case
+                .kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    case.job.state.kernel_thread.as_ref().map(Arc::clone),
+                    Arc::clone(&case.job.state.kicker),
+                    case.job.state.this_tid,
+                )
+                .expect("occupy the exact MM/thread admission");
+            let expected = format!(
+                "thread {:?} is already admitted as a guest executor",
+                case.context.thread().key()
+            );
+            let scheduler = case
+                .kernel
+                .hvpatch_runtime
+                .as_ref()
+                .expect("HVPatch runtime")
+                .continuation_services(case.context.kernel())
+                .0;
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: None,
+                lease: None,
+                exec_replacement: None,
+            };
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+
+            let exit =
+                ProductionHvpatchLoopPoll::poll(&mut case.job, &mut case.engine, &mut control);
+
+            drop(blocker);
+            assert!(matches!(exit, executor::ExecutorExit::Exited));
+            assert_pending_exec_terminal_error(&case.job, &expected);
+            assert!(case.job.state.syscall_completion.is_idle());
+            assert_eq!(
+                case.preparations.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_no_exec_return_publication(
+                &case.kernel,
+                &case.engine,
+                &case.returns,
+                &case.events,
+            );
+            assert_eq!(
+                case.kernel
+                    .clone_admission
+                    .try_claim_process_exit(case.job.state.this_tid)
+                    .expect("same-owner retry")
+                    .claim,
+                ProcessExitClaim::Owner,
+            );
+            assert!(
+                case.kernel
+                    .clone_admission
+                    .close_for_exec(ThreadId::synthetic_for_tests(74_102))
+                    .is_err(),
+                "terminal ownership must keep exec admission closed"
+            );
+            assert!(
+                case.job
+                    .state
+                    .finish_authenticated_exec_completion(
+                        AuthenticatedExecCompletionOrigin(origin,)
+                    )
+                    .is_err(),
+                "pending exec authority must reject replay after re-admission failure"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn pending_exec_owner_executor_failure_converts_exec_close_to_exit() {
+        for (pid, origin) in [
+            (72_445, ExecCompletionOrigin::GuestSyscall),
+            (72_446, ExecCompletionOrigin::InternalControl),
+        ] {
+            let mut case = pending_exec_drain_test_case(pid, origin);
+
+            assert_eq!(
+                ProductionHvpatchLoopPoll::after_executor_failure_settlement(&mut case.job),
+                continuation::ExecutorFailureSettlement::PublishCurrent,
+                "the executor that owns the pending exec must settle itself"
+            );
+            assert!(
+                !matches!(
+                    case.job.phase,
+                    HvpatchProductionPhase::ExecSiblingDrain { .. }
+                ),
+                "executor failure must consume the pending exec owner"
+            );
+            assert_eq!(
+                case.kernel
+                    .clone_admission
+                    .try_claim_process_exit(case.job.state.this_tid)
+                    .expect("same-owner exit retry")
+                    .claim,
+                ProcessExitClaim::Owner,
+                "the exact exec handoff must become the process-exit owner"
+            );
+            assert!(
+                case.sibling.is_published(),
+                "self-owned exec failure must settle the sibling member"
+            );
+            assert_eq!(
+                case.job
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .expect("restored exact terminal context")
+                    .thread()
+                    .key(),
+                case.context.thread().key(),
+            );
+        }
+    }
+
+    /// An executor failure on a job that LOST the process-exit claim must still
+    /// publish that job's own logical result.
+    ///
+    /// Deferring to the process terminal owner is only sound while this job's
+    /// settlement is still enrolled in the owner's member list. An `execve`
+    /// survivor is removed from that list by `finish_persistent_process_handles`
+    /// and never re-enrolled, so the owner's drain never publishes it: the
+    /// container's `wait_process_jobs` then waits on an `HvpatchLoopResult` that
+    /// no one can ever publish, with an empty kernel graph and idle executors
+    /// (the `go build` / `go_types` exit wedge).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn executor_failure_after_a_lost_exit_claim_publishes_its_own_result() {
+        let (kernel, _context, state) = typed_completion_fixture(72_461, SyscallDispatcher::new());
+        let owner = ThreadId::synthetic_for_tests(72_462);
+        assert_eq!(
+            kernel
+                .clone_admission
+                .try_claim_process_exit(owner)
+                .expect("sibling claims the process exit")
+                .claim,
+            ProcessExitClaim::Owner,
+        );
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let settlement = job.terminal_settlement.clone();
+        let result = settlement.result.clone();
+        let completion = settlement.completion();
+        assert_ne!(
+            kernel
+                .clone_admission
+                .try_claim_process_exit(job.state.this_tid)
+                .expect("loser claim")
+                .claim,
+            ProcessExitClaim::Owner,
+        );
+
+        assert_eq!(
+            ProductionHvpatchLoopPoll::after_executor_failure_settlement(&mut job),
+            continuation::ExecutorFailureSettlement::PublishCurrent,
+            "a job that cannot prove an owner will publish it must publish itself"
+        );
+
+        assert!(
+            settlement.is_published(),
+            "the lost-claim member left its container job result unpublished"
+        );
+        assert!(completion.is_finished());
+        assert!(
+            matches!(result.wait(), Ok(VcpuLoopOutcome::ThreadDone)),
+            "Linux terminated this thread at the owner's exit_group: ThreadDone"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn pending_exec_completion_ownership_survives_control_context_failure_without_abort() {
+        const CHILD: &str = "CARRICK_PENDING_EXEC_CONTEXT_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("runtime unit-test executable"),
+            )
+            .arg("--exact")
+            .arg("vcpu_loop::tests::pending_exec_completion_ownership_survives_control_context_failure_without_abort")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated pending-exec context failure");
+            assert!(
+                output.status.success(),
+                "isolated pending-exec context failure did not preserve the exact terminal error:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        for (pid, origin) in [
+            (72_431, ExecCompletionOrigin::GuestSyscall),
+            (72_432, ExecCompletionOrigin::InternalControl),
+        ] {
+            let mut case = pending_exec_drain_test_case(pid, origin);
+            case.sibling
+                .publish_member(Ok(VcpuLoopOutcome::ThreadDone))
+                .expect("settle the real pending sibling");
+            case.job.state.service_kernel_context = None;
+            let scheduler = case
+                .kernel
+                .hvpatch_runtime
+                .as_ref()
+                .expect("HVPatch runtime")
+                .continuation_services(case.context.kernel())
+                .0;
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: None,
+                lease: None,
+                exec_replacement: None,
+            };
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+
+            let exit =
+                ProductionHvpatchLoopPoll::poll(&mut case.job, &mut case.engine, &mut control);
+
+            assert!(matches!(exit, executor::ExecutorExit::Exited));
+            assert_pending_exec_terminal_error(
+                &case.job,
+                "carrier logical exec lost exact root Kernel context",
+            );
+            assert!(case.job.state.syscall_completion.is_idle());
+            assert_no_exec_return_publication(
+                &case.kernel,
+                &case.engine,
+                &case.returns,
+                &case.events,
+            );
+            assert_eq!(
+                case.kernel
+                    .clone_admission
+                    .try_claim_process_exit(case.job.state.this_tid)
+                    .expect("same-owner retry")
+                    .claim,
+                ProcessExitClaim::Owner,
+            );
+            assert!(
+                case.kernel
+                    .clone_admission
+                    .close_for_exec(ThreadId::synthetic_for_tests(74_102))
+                    .is_err(),
+                "terminal ownership must keep exec admission closed"
+            );
+            assert!(
+                case.job
+                    .state
+                    .finish_authenticated_exec_completion(
+                        AuthenticatedExecCompletionOrigin(origin,)
+                    )
+                    .is_err(),
+                "pending exec authority must reject replay after context failure"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn pending_exec_completion_ownership_is_drop_safe_for_external_settlement_and_unwind() {
+        for (pid, origin) in [
+            (72_433, ExecCompletionOrigin::GuestSyscall),
+            (72_434, ExecCompletionOrigin::InternalControl),
+        ] {
+            let mut case = pending_exec_drain_test_case(pid, origin);
+            case.job
+                .terminal_settlement
+                .publish_member(Ok(VcpuLoopOutcome::ThreadDone))
+                .expect("externally settle the pending exec job");
+            let scheduler = case
+                .kernel
+                .hvpatch_runtime
+                .as_ref()
+                .expect("HVPatch runtime")
+                .continuation_services(case.context.kernel())
+                .0;
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: None,
+                lease: None,
+                exec_replacement: None,
+            };
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+
+            let exit = case
+                .job
+                .poll_with_engine(&mut case.engine, &mut control)
+                .expect("external settlement must retire the pending exec owner");
+
+            assert!(matches!(exit, executor::ExecutorExit::Exited));
+            assert!(matches!(case.job.phase, HvpatchProductionPhase::Complete));
+            assert!(case.job.state.syscall_completion.is_idle());
+            assert_no_exec_return_publication(
+                &case.kernel,
+                &case.engine,
+                &case.returns,
+                &case.events,
+            );
+            assert!(
+                case.job
+                    .state
+                    .finish_authenticated_exec_completion(
+                        AuthenticatedExecCompletionOrigin(origin,)
+                    )
+                    .is_err(),
+                "externally settled pending exec authority must reject replay"
+            );
+        }
+
+        let case = pending_exec_drain_test_case(72_435, ExecCompletionOrigin::GuestSyscall);
+        assert!(
+            case.job.state.syscall_completion.is_idle(),
+            "pending owner must remove live completion authority from droppable runtime state"
+        );
+        let kernel = Arc::clone(&case.kernel);
+        let returns = Arc::clone(&case.returns);
+        let events = Arc::clone(&case.events);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _pending_owner = case.job;
+            panic!("exercise pending exec owner unwind");
+        }));
+        assert!(unwind.is_err());
+        let report = kernel.reporter.snapshot();
+        assert_eq!(report.summary.syscall_returns_ok, 0);
+        assert_eq!(report.summary.syscall_returns_errno, 0);
+        assert!(returns.lock().is_empty());
+        assert!(events.lock().is_empty());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn production_poll_preserves_immediate_exec_drain_begin_errors_for_both_origins() {
+        for (pid, origin, contender_pid) in [
+            (72_436, ExecCompletionOrigin::GuestSyscall, 74_130),
+            (72_437, ExecCompletionOrigin::InternalControl, 74_131),
+        ] {
+            let mut case = immediate_production_exec_failure_case(pid, origin, true);
+            let scheduler = case
+                .kernel
+                .hvpatch_runtime
+                .as_ref()
+                .expect("HVPatch runtime")
+                .continuation_services(case.context.kernel())
+                .0;
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: None,
+                lease: None,
+                exec_replacement: None,
+            };
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+
+            assert_production_exec_terminal_failure(
+                &mut case.job,
+                &mut case.engine,
+                &mut control,
+                "HVPatch persistent sibling drain lost exact Kernel thread",
+                origin,
+                ThreadId::synthetic_for_tests(contender_pid),
+            );
+
+            assert_eq!(
+                case.job
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .expect("restored exact terminal context")
+                    .thread()
+                    .key(),
+                case.context.thread().key(),
+            );
+            assert_eq!(
+                case.preparations.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(case.engine.exec_inventory_arms, 0);
+            assert_eq!(case.engine.execve_installs, 0);
+            assert_no_exec_return_publication(
+                &case.kernel,
+                &case.engine,
+                &case.returns,
+                &case.events,
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn production_poll_preserves_immediate_exec_suffix_errors_for_both_origins() {
+        for (pid, origin, contender_pid) in [
+            (72_438, ExecCompletionOrigin::GuestSyscall, 74_132),
+            (72_439, ExecCompletionOrigin::InternalControl, 74_133),
+        ] {
+            let mut case = immediate_production_exec_failure_case(pid, origin, false);
+            let scheduler = case
+                .kernel
+                .hvpatch_runtime
+                .as_ref()
+                .expect("HVPatch runtime")
+                .continuation_services(case.context.kernel())
+                .0;
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: None,
+                lease: None,
+                exec_replacement: None,
+            };
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+
+            assert_production_exec_terminal_failure(
+                &mut case.job,
+                &mut case.engine,
+                &mut control,
+                "exec replacement lost worker-authenticated execution lease",
+                origin,
+                ThreadId::synthetic_for_tests(contender_pid),
+            );
+
+            assert_eq!(
+                case.preparations.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(case.engine.exec_inventory_arms, 1);
+            assert_eq!(case.engine.execve_installs, 0);
+            assert_no_exec_return_publication(
+                &case.kernel,
+                &case.engine,
+                &case.returns,
+                &case.events,
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn production_poll_exec_terminal_context_changes_only_at_kernel_successor_commit() {
+        use exec::ExecTerminalContextFailpoint::{
+            BeforeKernelCommit, FrameCowBinding, IdentityPublication, InventoryActivation,
+            SnapshotPublication, TaskLoadPublication, VvarPublication,
+        };
+
+        let points = [
+            BeforeKernelCommit,
+            TaskLoadPublication,
+            SnapshotPublication,
+            FrameCowBinding,
+            InventoryActivation,
+            IdentityPublication,
+            VvarPublication,
+        ];
+        for (case_index, point) in points.into_iter().enumerate() {
+            for (origin_index, origin) in [
+                ExecCompletionOrigin::GuestSyscall,
+                ExecCompletionOrigin::InternalControl,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let pid = 74_200 + (case_index * 2 + origin_index) as i32;
+                let mut case =
+                    context_boundary_production_exec_failure_case(pid, origin, Some(point));
+                let scheduler = case
+                    .kernel
+                    .hvpatch_runtime
+                    .as_ref()
+                    .expect("HVPatch runtime")
+                    .continuation_services(case.context.kernel())
+                    .0;
+                let need_resched = std::sync::atomic::AtomicBool::new(false);
+                let mut submission = executor::ExecutorSubmissionContext {
+                    scheduler: &scheduler,
+                    publish_test_descendant: &|_, _| unreachable!(),
+                    current: None,
+                    lease: None,
+                    exec_replacement: None,
+                };
+                let mut control =
+                    executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                let expected = format!("injected exec terminal context failure at {point:?}");
+
+                assert_production_exec_terminal_failure(
+                    &mut case.job,
+                    &mut case.engine,
+                    &mut control,
+                    &expected,
+                    origin,
+                    ThreadId::synthetic_for_tests(pid + 2_000),
+                );
+
+                let terminal_context = case
+                    .job
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .expect("terminal path must retain an exact context");
+                if point == BeforeKernelCommit {
+                    assert_eq!(terminal_context.thread().key(), case.context.thread().key());
+                    assert_eq!(
+                        terminal_context.shared().mm().id(),
+                        case.context.shared().mm().id()
+                    );
+                    assert!(case.job.state.committed_exec_context_for_test.is_none());
+                } else {
+                    let successor = case
+                        .job
+                        .state
+                        .committed_exec_context_for_test
+                        .as_ref()
+                        .expect("post-commit failpoint must observe the Kernel successor");
+                    assert_ne!(successor.thread().key(), case.context.thread().key());
+                    assert_ne!(
+                        successor.shared().mm().id(),
+                        case.context.shared().mm().id()
+                    );
+                    assert_eq!(terminal_context.thread().key(), successor.thread().key());
+                    assert_eq!(
+                        terminal_context.shared().mm().id(),
+                        successor.shared().mm().id()
+                    );
+                }
+                assert_eq!(
+                    case.preparations.load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+                assert_no_exec_return_publication(
+                    &case.kernel,
+                    &case.engine,
+                    &case.returns,
+                    &case.events,
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn production_poll_preserves_successor_context_on_actual_duplicate_replacement_publication() {
+        for (case_index, origin) in [
+            ExecCompletionOrigin::GuestSyscall,
+            ExecCompletionOrigin::InternalControl,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pid = 74_230 + case_index as i32;
+            let mut case = context_boundary_production_exec_failure_case(pid, origin, None);
+            let scheduler = case
+                .kernel
+                .hvpatch_runtime
+                .as_ref()
+                .expect("HVPatch runtime")
+                .continuation_services(case.context.kernel())
+                .0;
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: None,
+                lease: None,
+                exec_replacement: None,
+            };
+
+            let first_exit = {
+                let mut control =
+                    executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                ProductionHvpatchLoopPoll::poll(&mut case.job, &mut case.engine, &mut control)
+            };
+            assert!(matches!(first_exit, executor::ExecutorExit::Preempted));
+            assert!(
+                submission.exec_replacement.is_some(),
+                "first real exec must occupy the quantum replacement slot"
+            );
+            assert!(case.job.terminal_result.is_none());
+            let first_successor = case
+                .job
+                .state
+                .service_kernel_context
+                .as_ref()
+                .expect("first exec successor context")
+                .retain_exact();
+            assert_ne!(first_successor.thread().key(), case.context.thread().key());
+
+            let path = case._executable.path().to_string_lossy().into_owned();
+            case.job.state.committed_exec_context_for_test = None;
+            case.job.state.exec_terminal_context_failpoint = None;
+            match origin {
+                ExecCompletionOrigin::GuestSyscall => {
+                    install_typed_guest_completion(
+                        &case.kernel,
+                        &first_successor,
+                        &mut case.job.state,
+                    );
+                }
+                ExecCompletionOrigin::InternalControl => {
+                    case.job.state.begin_internal_control_exec().unwrap();
+                }
+            }
+            case.job.state.guest_execution = Some(
+                case.kernel
+                    .dispatcher
+                    .enter_mm_executor_for_thread(
+                        case.job.state.kernel_thread.as_ref().map(Arc::clone),
+                        Arc::clone(&case.job.state.kicker),
+                        case.job.state.this_tid,
+                    )
+                    .expect("second exec MM participation"),
+            );
+            let mut second_engine = CrashCaptureTestEngine::default();
+            enable_exec_support_for_test(&mut second_engine, &first_successor, (pid + 100) as u64);
+            let exec::ExecvePreparation::Prepared(prepared) = case
+                .job
+                .state
+                .prepare_execve(
+                    &case.kernel,
+                    &first_successor,
+                    &mut second_engine,
+                    path.clone(),
+                    vec![path.into_bytes()],
+                    Vec::new(),
+                    origin,
+                )
+                .expect("second exec preparation")
+            else {
+                panic!("second exec must reach its destructive suffix")
+            };
+            let owner = case
+                .job
+                .state
+                .prepared_execve_drain_for_test(
+                    *prepared,
+                    continuation::ProcessDrain::excluding(
+                        continuation::LogicalJobCompletion::pending(),
+                        Vec::new(),
+                    ),
+                )
+                .expect("second exec delayed owner");
+            case.job.phase = HvpatchProductionPhase::ExecSiblingDrain {
+                context: first_successor.retain_exact(),
+                owner,
+            };
+            case.engine = second_engine;
+
+            let contender = ThreadId::synthetic_for_tests(pid + 2_000);
+            {
+                let mut control =
+                    executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                assert_production_exec_terminal_trap_failure(
+                    &mut case.job,
+                    &mut case.engine,
+                    &mut control,
+                    "quantum published more than one exec replacement",
+                    origin,
+                    contender,
+                );
+            }
+
+            let successor = case
+                .job
+                .state
+                .committed_exec_context_for_test
+                .as_ref()
+                .expect("duplicate publication follows the second Kernel successor");
+            let terminal_context = case
+                .job
+                .state
+                .service_kernel_context
+                .as_ref()
+                .expect("duplicate publication terminal context");
+            assert_ne!(successor.thread().key(), first_successor.thread().key());
+            assert_ne!(
+                successor.shared().mm().id(),
+                first_successor.shared().mm().id()
+            );
+            assert_eq!(terminal_context.thread().key(), successor.thread().key());
+            assert_eq!(
+                terminal_context.shared().mm().id(),
+                successor.shared().mm().id()
+            );
+            assert_no_exec_return_publication(
+                &case.kernel,
+                &case.engine,
+                &case.returns,
+                &case.events,
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn production_poll_terminal_outcome_after_successor_commit_keeps_successor_context() {
+        for (case_index, origin) in [
+            ExecCompletionOrigin::GuestSyscall,
+            ExecCompletionOrigin::InternalControl,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pid = 74_240 + case_index as i32;
+            let mut case = context_boundary_production_exec_failure_case(pid, origin, None);
+            case.engine.snapshot_cpu = None;
+            let scheduler = case
+                .kernel
+                .hvpatch_runtime
+                .as_ref()
+                .expect("HVPatch runtime")
+                .continuation_services(case.context.kernel())
+                .0;
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut submission = executor::ExecutorSubmissionContext {
+                scheduler: &scheduler,
+                publish_test_descendant: &|_, _| unreachable!(),
+                current: None,
+                lease: None,
+                exec_replacement: None,
+            };
+            let contender = ThreadId::synthetic_for_tests(pid + 2_000);
+            let contender_thread =
+                install_exec_terminal_handoff_contender(&case.kernel.clone_admission, contender);
+            let exit = {
+                let mut control =
+                    executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                ProductionHvpatchLoopPoll::poll(&mut case.job, &mut case.engine, &mut control)
+            };
+
+            assert!(matches!(exit, executor::ExecutorExit::Exited));
+            match case.job.terminal_result.as_ref() {
+                Some(Ok(VcpuLoopOutcome::ProcessExit(run))) => {
+                    assert_eq!(
+                        run.terminating_signal,
+                        Some(crate::linux_abi::LINUX_SIGSEGV)
+                    );
+                }
+                Some(Ok(_)) => panic!("post-commit exec failure fabricated a non-process exit"),
+                Some(Err(error)) => panic!("post-commit terminal outcome was masked: {error:?}"),
+                None => panic!("post-commit terminal outcome disappeared"),
+            }
+            assert!(
+                contender_thread
+                    .join()
+                    .expect("join outcome contender")
+                    .is_err()
+            );
+            assert_eq!(
+                case.kernel
+                    .clone_admission
+                    .try_claim_process_exit(case.job.state.this_tid)
+                    .expect("same-owner terminal outcome retry")
+                    .claim,
+                ProcessExitClaim::Owner
+            );
+            assert_eq!(
+                case.kernel
+                    .clone_admission
+                    .try_claim_process_exit(contender)
+                    .expect("different-owner terminal outcome retry")
+                    .claim,
+                ProcessExitClaim::AlreadyOwned
+            );
+            let successor = case
+                .job
+                .state
+                .committed_exec_context_for_test
+                .as_ref()
+                .expect("snapshot failure follows Kernel successor commit");
+            let terminal_context = case
+                .job
+                .state
+                .service_kernel_context
+                .as_ref()
+                .expect("terminal outcome exact context");
+            assert_ne!(successor.thread().key(), case.context.thread().key());
+            assert_ne!(
+                successor.shared().mm().id(),
+                case.context.shared().mm().id()
+            );
+            assert_eq!(terminal_context.thread().key(), successor.thread().key());
+            assert_eq!(
+                terminal_context.shared().mm().id(),
+                successor.shared().mm().id()
+            );
+            assert!(case.job.state.syscall_completion.is_idle());
+            assert!(
+                case.job
+                    .state
+                    .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(origin))
+                    .is_err()
+            );
+            assert_no_exec_return_publication(
+                &case.kernel,
+                &case.engine,
+                &case.returns,
+                &case.events,
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_immediate_guest_exec_drain_begin_error_consumes_origin() {
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(72_425, dispatcher);
+        install_typed_guest_completion(&kernel, &context, &mut state);
+        state.kernel_thread = None;
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .expect("HVPatch runtime")
+            .continuation_services(context.kernel())
+            .0;
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let error = job
+            .service_outcome(
+                &mut engine,
+                &mut control,
+                execve_test_frame(),
+                DispatchOutcome::Execve {
+                    path: path.clone(),
+                    argv: vec![path.into_bytes()],
+                    env: Vec::new(),
+                },
+            )
+            .expect_err("missing Kernel thread must fail real drain begin");
+
+        assert_exact_configuration_error(
+            error,
+            "HVPatch persistent sibling drain lost exact Kernel thread",
+        );
+        assert_eq!(preparations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(engine.exec_inventory_arms, 0);
+        assert_eq!(engine.execve_installs, 0);
+        assert_no_exec_return_publication(&kernel, &engine, &returns, &events);
+        assert!(job.state.syscall_completion.is_idle());
+        assert_exact_configuration_error(
+            job.state
+                .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(
+                    ExecCompletionOrigin::GuestSyscall,
+                ))
+                .expect_err("authenticated guest origin must be one-shot"),
+            "threaded syscall retired without guest completion ownership",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_immediate_internal_exec_drain_begin_error_consumes_origin() {
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(72_426, dispatcher);
+        state.begin_internal_control_exec().unwrap();
+        state.kernel_thread = None;
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let work = external_exec_work_for_test(path, &context);
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .expect("HVPatch runtime")
+            .continuation_services(context.kernel())
+            .0;
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, Some(work));
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let error = job
+            .start_external_exec(&mut engine, &mut control)
+            .expect_err("missing Kernel thread must fail real internal drain begin");
+
+        assert_exact_configuration_error(
+            error,
+            "HVPatch persistent sibling drain lost exact Kernel thread",
+        );
+        assert_eq!(preparations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(engine.exec_inventory_arms, 0);
+        assert_eq!(engine.execve_installs, 0);
+        assert_no_exec_return_publication(&kernel, &engine, &returns, &events);
+        assert!(job.state.syscall_completion.is_idle());
+        assert_exact_configuration_error(
+            job.state
+                .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(
+                    ExecCompletionOrigin::InternalControl,
+                ))
+                .expect_err("authenticated internal origin must be one-shot"),
+            "internal control exec lost typed ownership",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_delayed_guest_exec_drain_finish_error_consumes_origin() {
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(72_427, dispatcher);
+        install_typed_guest_completion(&kernel, &context, &mut state);
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    state.kernel_thread.as_ref().map(Arc::clone),
+                    Arc::clone(&state.kicker),
+                    state.this_tid,
+                )
+                .expect("delayed guest exec MM participation"),
+        );
+        let failing_sibling = process_owner_drain_failure(&state);
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .expect("HVPatch runtime")
+            .continuation_services(context.kernel())
+            .0;
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let first = job
+            .service_outcome(
+                &mut engine,
+                &mut control,
+                execve_test_frame(),
+                DispatchOutcome::Execve {
+                    path: path.clone(),
+                    argv: vec![path.into_bytes()],
+                    env: Vec::new(),
+                },
+            )
+            .expect("guest exec must retain its prepared owner while drain is pending");
+        assert!(matches!(
+            first,
+            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState)
+        ));
+        assert!(matches!(
+            job.phase,
+            HvpatchProductionPhase::ExecSiblingDrain { .. }
+        ));
+        failing_sibling.completion().publish();
+
+        assert_production_exec_terminal_failure(
+            &mut job,
+            &mut engine,
+            &mut control,
+            "drained-member settlement attempted to replace process-owner outcome",
+            ExecCompletionOrigin::GuestSyscall,
+            ThreadId::synthetic_for_tests(74_134),
+        );
+        assert_eq!(preparations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(engine.exec_inventory_arms, 0);
+        assert_eq!(engine.execve_installs, 0);
+        assert_no_exec_return_publication(&kernel, &engine, &returns, &events);
+        assert!(job.state.syscall_completion.is_idle());
+        assert_exact_configuration_error(
+            job.state
+                .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(
+                    ExecCompletionOrigin::GuestSyscall,
+                ))
+                .expect_err("delayed guest origin must be one-shot"),
+            "threaded syscall retired without guest completion ownership",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_delayed_internal_exec_drain_finish_error_consumes_origin() {
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(72_428, dispatcher);
+        state.begin_internal_control_exec().unwrap();
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    state.kernel_thread.as_ref().map(Arc::clone),
+                    Arc::clone(&state.kicker),
+                    state.this_tid,
+                )
+                .expect("delayed internal exec MM participation"),
+        );
+        let failing_sibling = process_owner_drain_failure(&state);
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let work = external_exec_work_for_test(path, &context);
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .expect("HVPatch runtime")
+            .continuation_services(context.kernel())
+            .0;
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, Some(work));
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let first = job
+            .start_external_exec(&mut engine, &mut control)
+            .expect("internal exec must retain its prepared owner while drain is pending");
+        assert!(matches!(
+            first,
+            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState)
+        ));
+        assert!(matches!(
+            job.phase,
+            HvpatchProductionPhase::ExecSiblingDrain { .. }
+        ));
+        failing_sibling.completion().publish();
+
+        assert_production_exec_terminal_failure(
+            &mut job,
+            &mut engine,
+            &mut control,
+            "drained-member settlement attempted to replace process-owner outcome",
+            ExecCompletionOrigin::InternalControl,
+            ThreadId::synthetic_for_tests(74_135),
+        );
+        assert_eq!(preparations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(engine.exec_inventory_arms, 0);
+        assert_eq!(engine.execve_installs, 0);
+        assert_no_exec_return_publication(&kernel, &engine, &returns, &events);
+        assert!(job.state.syscall_completion.is_idle());
+        assert_exact_configuration_error(
+            job.state
+                .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(
+                    ExecCompletionOrigin::InternalControl,
+                ))
+                .expect_err("delayed internal origin must be one-shot"),
+            "internal control exec lost typed ownership",
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_immediate_guest_exec_suffix_error_consumes_origin() {
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(72_405, dispatcher);
+        install_typed_guest_completion(&kernel, &context, &mut state);
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .expect("HVPatch runtime")
+            .continuation_services(context.kernel())
+            .0;
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        let frame = carrick_hal::RawSyscall {
+            number: carrick_abi::CanonicalNr(221),
+            args: [0; 6],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(221),
+        };
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let error = job
+            .service_outcome(
+                &mut engine,
+                &mut control,
+                frame,
+                DispatchOutcome::Execve {
+                    path: path.clone(),
+                    argv: vec![path.into_bytes()],
+                    env: Vec::new(),
+                },
+            )
+            .expect_err("missing execution lease must fail the prepared suffix");
+
+        assert_exact_configuration_error(
+            error,
+            "exec replacement lost worker-authenticated execution lease",
+        );
+        assert_eq!(preparations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(engine.exec_inventory_arms, 1);
+        assert_eq!(engine.execve_installs, 0);
+        assert_no_exec_return_publication(&kernel, &engine, &returns, &events);
+        assert!(job.state.syscall_completion.is_idle());
+        assert!(
+            job.state
+                .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(
+                    ExecCompletionOrigin::GuestSyscall,
+                ))
+                .is_err(),
+            "the suffix owner must consume the authenticated origin exactly once"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_immediate_internal_exec_suffix_error_consumes_origin() {
+        use crate::kernel::control::{
+            CarrierExecAdmission, ControlNonce, ExecAttach, ExecCapability, ExecRequest,
+            ExecRuntime, ExecStatus,
+        };
+
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(72_406, dispatcher);
+        state.begin_internal_control_exec().unwrap();
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let runtime = ExecRuntime::new(1);
+        let capability = ExecCapability::from(ControlNonce::fresh().expect("control nonce"));
+        let submit_runtime = runtime.clone();
+        let submitted_path = path.clone();
+        let submitter = std::thread::spawn(move || {
+            submit_runtime.admit(
+                capability,
+                ExecRequest {
+                    argv: vec![submitted_path],
+                    env: Vec::new(),
+                    workdir: None,
+                    user: None,
+                    tty: false,
+                    attach: ExecAttach::Capture,
+                },
+            )
+        });
+        while runtime.query(capability) != ExecStatus::Pending {
+            std::thread::yield_now();
+        }
+        let mut work = loop {
+            if let Some(work) = runtime.try_take() {
+                break work;
+            }
+            std::thread::yield_now();
+        };
+        assert!(work.begin_publication());
+        assert!(work.admit(context.task().key().into()));
+        assert_eq!(submitter.join().expect("exec submitter"), Ok(capability));
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .expect("HVPatch runtime")
+            .continuation_services(context.kernel())
+            .0;
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, Some(work));
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let error = job
+            .start_external_exec(&mut engine, &mut control)
+            .expect_err("missing execution lease must fail internal prepared suffix");
+
+        assert_exact_configuration_error(
+            error,
+            "exec replacement lost worker-authenticated execution lease",
+        );
+        assert_eq!(preparations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(engine.exec_inventory_arms, 1);
+        assert_eq!(engine.execve_installs, 0);
+        assert_no_exec_return_publication(&kernel, &engine, &returns, &events);
+        assert!(job.state.syscall_completion.is_idle());
+        assert!(
+            job.state
+                .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(
+                    ExecCompletionOrigin::InternalControl,
+                ))
+                .is_err(),
+            "the internal origin must be single-use"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_delayed_exec_suffix_error_consumes_origin(pid: i32, origin: ExecCompletionOrigin) {
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(&preparations))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (kernel, context, mut state) = typed_completion_fixture(pid, dispatcher);
+        match origin {
+            ExecCompletionOrigin::GuestSyscall => {
+                install_typed_guest_completion(&kernel, &context, &mut state);
+            }
+            ExecCompletionOrigin::InternalControl => {
+                state.begin_internal_control_exec().unwrap();
+            }
+        }
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    state.kernel_thread.as_ref().map(Arc::clone),
+                    Arc::clone(&state.kicker),
+                    state.this_tid,
+                )
+                .expect("delayed exec MM participation"),
+        );
+        let executable = suffix_failure_test_executable();
+        let path = executable.path().to_string_lossy().into_owned();
+        let mut engine = CrashCaptureTestEngine::default();
+        let exec::ExecvePreparation::Prepared(prepared) = state
+            .prepare_execve(
+                &kernel,
+                &context,
+                &mut engine,
+                path.clone(),
+                vec![path.into_bytes()],
+                Vec::new(),
+                origin,
+            )
+            .expect("valid guest exec preparation")
+        else {
+            panic!("valid guest exec must reach the destructive suffix")
+        };
+        let completion = continuation::LogicalJobCompletion::pending();
+        let owner = state
+            .prepared_execve_drain_for_test(
+                *prepared,
+                continuation::ProcessDrain::excluding(completion.clone(), Vec::new()),
+            )
+            .expect("test sibling drain must transfer authenticated ownership");
+        let phase = HvpatchProductionPhase::ExecSiblingDrain {
+            context: context.retain_exact(),
+            owner,
+        };
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .expect("HVPatch runtime")
+            .continuation_services(context.kernel())
+            .0;
+        let mut job = suffix_failure_test_job(&kernel, state, phase, None);
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+
+        assert_production_exec_terminal_failure(
+            &mut job,
+            &mut engine,
+            &mut control,
+            "exec replacement lost worker-authenticated execution lease",
+            origin,
+            ThreadId::synthetic_for_tests(pid + 2_000),
+        );
+        assert_eq!(preparations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(engine.exec_inventory_arms, 1);
+        assert_eq!(engine.execve_installs, 0);
+        assert_no_exec_return_publication(&kernel, &engine, &returns, &events);
+        assert!(job.state.syscall_completion.is_idle());
+        assert!(
+            job.state
+                .finish_authenticated_exec_completion(AuthenticatedExecCompletionOrigin(origin))
+                .is_err(),
+            "the delayed suffix must consume its origin exactly once"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn two_task_mm_thread_sibling_sharing_manager_does_not_error() {
+        let (kernel, context, state1) = typed_completion_fixture(79_001, SyscallDispatcher::new());
+        let mut job1 =
+            suffix_failure_test_job(&kernel, state1, HvpatchProductionPhase::Resident, None);
+
+        let mut engine = CrashCaptureTestEngine::default();
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .expect("HVPatch runtime")
+            .continuation_services(context.kernel())
+            .0;
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+
+        // Task 1 of the MM runs and polls.
+        let _ = job1.poll_with_engine(&mut engine, &mut control);
+
+        // Task 2 (thread sibling in the same MM) runs and polls with the same engine.
+        // Under the old first-poll install, task 2 attempted a second install of the arena source
+        // on the shared manager and panicked/errored with "stage-1 table arena source is already installed".
+        // Now, arena sources are MM properties installed at MM creation, so sibling task polling does not error.
+        let (_, _, state2) = typed_completion_fixture(79_002, SyscallDispatcher::new());
+        let mut job2 =
+            suffix_failure_test_job(&kernel, state2, HvpatchProductionPhase::Resident, None);
+        let _ = job2.poll_with_engine(&mut engine, &mut control);
+
+        // Neither task panicked or attempted a redundant arena source installation.
+        assert_eq!(engine.installed_table_arena_sources, 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_delayed_guest_and_internal_suffix_errors_consume_origins() {
+        for (pid, origin) in [
+            (72_407, ExecCompletionOrigin::GuestSyscall),
+            (72_408, ExecCompletionOrigin::InternalControl),
+        ] {
+            assert_delayed_exec_suffix_error_consumes_origin(pid, origin);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_external_exec_bootstrap_is_tokenless_and_nonpublishing() {
+        use crate::kernel::control::{
+            CarrierExecAdmission, ControlNonce, ExecAttach, ExecCapability, ExecRequest,
+            ExecRuntime, ExecStatus,
+        };
+
+        let preparation_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returns = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(
+            &preparation_count,
+        ))));
+        dispatcher.install_observer(Arc::new(CompletionOrderObserver {
+            events: Arc::clone(&events),
+            returns: Arc::clone(&returns),
+        }));
+        let (runtime, scheduler, kernel, root, process, root_generation) =
+            test_carrier_graph_with_dispatcher!(72_401, dispatcher);
+        let root_authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(root.thread().key(), root_generation)
+            .expect("root submission authority");
+        let this_tid = ThreadId::synthetic_for_tests(72_401);
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+
+        let exec_runtime = ExecRuntime::new(1);
+        let capability = ExecCapability::from(ControlNonce::fresh().expect("control nonce"));
+        let submit_runtime = exec_runtime.clone();
+        let submitter = std::thread::spawn(move || {
+            submit_runtime.admit(
+                capability,
+                ExecRequest {
+                    argv: vec!["/definitely/missing/external-control-exec".to_owned()],
+                    env: Vec::new(),
+                    workdir: None,
+                    user: None,
+                    tty: false,
+                    attach: ExecAttach::Capture,
+                },
+            )
+        });
+        while exec_runtime.query(capability) != ExecStatus::Pending {
+            std::thread::yield_now();
+        }
+        let work = loop {
+            if let Some(work) = exec_runtime.try_take() {
+                break work;
+            }
+            std::thread::yield_now();
+        };
+
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut parent_submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&root_authority),
+            lease: None,
+            exec_replacement: None,
+        };
+        let mut parent_control =
+            executor::HvpatchQuantumControl::for_test(&need_resched, &mut parent_submission);
+        let mut memory = Memory::default();
+        let prepared = state
+            .prepare_in_process_fork(
+                &kernel,
+                &root,
+                &mut memory,
+                &mut parent_control,
+                &mut FakeBackendOps::default(),
+                quiesce::ProcessForkAttempt {
+                    request: quiesce::ForkRequest {
+                        flags: 0,
+                        pidfd_out: None,
+                        clone_parent: false,
+                        parent_tid_addr: None,
+                        child_tid_addr: None,
+                        exit_signal: 0,
+                        child_stack: 0,
+                        vfork: None,
+                    },
+                    coordinator: None,
+                    external_exec: Some(work),
+                },
+            )
+            .expect("actual external exec process-child publication");
+        let quiesce::PreparedInProcessFork::Complete(Some(child_pid)) = prepared else {
+            panic!("external exec fork must publish one runnable child")
+        };
+        assert_eq!(submitter.join().expect("exec submitter"), Ok(capability));
+
+        let child_id =
+            crate::kernel::TaskId::for_root_bootstrap(child_pid as i32).expect("child task id");
+        let child_context = root
+            .kernel()
+            .context(child_id, crate::kernel::LinuxTid::for_task_leader(child_id))
+            .expect("published child context");
+        let child_generation = child_context
+            .thread()
+            .execution_state()
+            .generation()
+            .expect("published child execution generation");
+        let child_binding = runtime
+            .persistent_bindings()
+            .resolve(child_context.thread().key(), child_generation)
+            .expect("active external exec child binding");
+        let child_authority = runtime
+            .persistent_bindings()
+            .take_submission_authority(child_context.thread().key(), child_generation)
+            .expect("child submission authority");
+
+        let root_executor = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .expect("root executor");
+        let child_executor = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .expect("child executor");
+        let root_running = scheduler.take(&root_executor).expect("take queued root");
+        assert_eq!(root_running.thread_key(), root.thread().key());
+        let mut child_running = scheduler.take(&child_executor).expect("take queued child");
+        assert_eq!(child_running.thread_key(), child_context.thread().key());
+
+        let mut engine = CrashCaptureTestEngine::default();
+        let mut child_submission = executor::ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &|_, _| unreachable!(),
+            current: Some(&child_authority),
+            lease: Some(child_running.take_lease()),
+            exec_replacement: None,
+        };
+        let exit = {
+            let mut child_control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut child_submission);
+            child_binding
+                .quantum()
+                .poll_quantum_with_engine(&mut engine, &mut child_control)
+        };
+        child_running
+            .restore_lease(child_submission.lease.take().expect("returned child lease"))
+            .expect("restore child lease");
+        match exit {
+            executor::ExecutorExit::Blocked(reason) => {
+                scheduler
+                    .settle_blocked(child_running, reason)
+                    .expect("settle blocked external exec child");
+            }
+            executor::ExecutorExit::Exited => scheduler
+                .settle_exited(child_running)
+                .expect("settle exited external exec child"),
+            executor::ExecutorExit::Syscall
+            | executor::ExecutorExit::Yielded
+            | executor::ExecutorExit::Preempted => scheduler
+                .settle_runnable(child_running)
+                .expect("settle runnable external exec child"),
+            other => panic!("unexpected external exec bootstrap exit: {other:?}"),
+        }
+        scheduler
+            .settle_runnable(root_running)
+            .expect("settle untouched root");
+        drop(child_authority);
+        drop(root_authority);
+
+        assert_eq!(
+            preparation_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "bootstrap must consume queued work through start_external_exec"
+        );
+        assert!(engine.completed_syscalls.is_empty());
+        assert!(returns.lock().is_empty());
+        assert!(events.lock().is_empty());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_guest_exec_missing_token_is_rejected() {
+        let dispatcher = SyscallDispatcher::new();
+        let (_runtime, _scheduler, kernel, root, process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_402, dispatcher);
+        let this_tid = ThreadId::synthetic_for_tests(72_402);
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let error = match state.prepare_execve(
+            &kernel,
+            &root,
+            &mut engine,
+            "/definitely/missing/carrick-exec".to_owned(),
+            vec![b"missing".to_vec()],
+            Vec::new(),
+            ExecCompletionOrigin::GuestSyscall,
+        ) {
+            Ok(_) => panic!("guest exec without its completion token must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("guest exec missing completion token")
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_guest_valid_exec_authenticates_before_preparation() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let preparation_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.install_observer(Arc::new(ExecPreparationCounter(Arc::clone(
+            &preparation_count,
+        ))));
+        let (kernel, context, mut state) = typed_completion_fixture(72_404, dispatcher);
+        let mut executable = tempfile::NamedTempFile::new().expect("synthetic executable");
+        executable
+            .write_all(&synthetic_elf(183))
+            .expect("write synthetic ELF");
+        let mut permissions = executable
+            .as_file()
+            .metadata()
+            .expect("synthetic ELF metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        executable
+            .as_file()
+            .set_permissions(permissions)
+            .expect("mark synthetic ELF executable");
+        let path = executable.path().to_string_lossy().into_owned();
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let error = match state.prepare_execve(
+            &kernel,
+            &context,
+            &mut engine,
+            path.clone(),
+            vec![path.into_bytes()],
+            Vec::new(),
+            ExecCompletionOrigin::GuestSyscall,
+        ) {
+            Ok(_) => panic!("guest exec without its completion token must fail before preparation"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("guest exec missing completion token")
+        );
+        assert_eq!(
+            preparation_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "authentication must precede observer-visible exec preparation"
+        );
+        assert_eq!(engine.execve_installs, 0);
+        assert!(engine.completed_syscalls.is_empty());
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 0);
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_errno, 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_completion_ownership_internal_exec_failure_is_tokenless_and_nonpublishing() {
+        let dispatcher = SyscallDispatcher::new();
+        let (_runtime, _scheduler, kernel, root, process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_403, dispatcher);
+        let this_tid = ThreadId::synthetic_for_tests(72_403);
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+        state.begin_internal_control_exec().unwrap();
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let result = state
+            .prepare_execve(
+                &kernel,
+                &root,
+                &mut engine,
+                "/definitely/missing/carrick-control-exec".to_owned(),
+                vec![b"missing".to_vec()],
+                Vec::new(),
+                ExecCompletionOrigin::InternalControl,
+            )
+            .unwrap();
+        assert!(matches!(result, exec::ExecvePreparation::Complete(None)));
+        assert!(state.syscall_completion.is_idle());
+        assert!(engine.completed_syscalls.is_empty());
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 0);
+        assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_errno, 0);
     }
 }
