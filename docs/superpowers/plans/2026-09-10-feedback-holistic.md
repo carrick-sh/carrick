@@ -256,3 +256,18 @@ rows, (4) resume the perf2x campaign.
   allows are still 101 — the workers routed handlers but did not use the
   views to delete the allows; that is a bounded follow-up.
 - (3) dispatched (`typed-error-debt`).
+- (3) LANDED (57de08799): 22 of the 27 `typed_error_debt` rows converted
+  to their named typed errors (KernelOperationError, RuntimeError,
+  LinuxErrno, ArenaError, ThreadExecutionError; the wait reactor
+  constructor is fallible and the scheduler propagates it); 5 rows remain
+  in runtime.json with the worker's reasons in its report — a bounded
+  follow-up. Every generic probe shard MATCHed in the phase-2d gate (first
+  zero-DIFF generic run). The legacy CLI step of the gate was red on two
+  pre-existing bookkeeping items: the probe-source denominator (531 sources
+  vs a 527 constant, four sources added 2026-09-10 by sibling sessions) and
+  the three quarantined probes with no blessed oracle since 2026-09-08.
+  Blessing them (arm64 only; a Rosetta amd64 container hung and was killed)
+  found: `tlbibroadcast`/`windowcoherence` print non-deterministic
+  telemetry (probe defect, being fixed) and `ppollwaitset` exposes a real
+  runtime bug — poll on an unconnected stream socket must be POLLHUP
+  immediately (worker dispatched).
