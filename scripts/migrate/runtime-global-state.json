@@ -2234,22 +2234,6 @@
       "rationale": "Environment variable CARRICK_HVF_ATOMIC_PERMIT read in atomic_permit_enabled::CARRICK_HVF_ATOMIC_PERMIT (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
     },
     {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs",
-      "symbol": "exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS",
-      "fingerprint": "7f4067c3ebd1a2fb346239d411c4c7966b024cdd7beb2939f3d49a0451111d5c",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS read in exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS (crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var",
-      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "symbol": "fault_window_bytes::CARRICK_FAULT_WINDOW_BYTES",
-      "fingerprint": "d65ad01b7ba81d1b0a9121f3ea237b8bc22533fd63dc95b2b2c796bf63dfe2ca",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAULT_WINDOW_BYTES read in fault_window_bytes::CARRICK_FAULT_WINDOW_BYTES (crates/carrick-vmm-hvf/src/trap.rs) configuring the anonymous private fault window size."
-    },
-    {
       "kind": "env_var_os",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "admission_trace_enabled::CARRICK_HVF_ADMISSION_TRACE",
@@ -2296,30 +2280,6 @@
       "fingerprint": "0cf902e86dd15cce376d7459d8b960e42afcf28a2af5ae4408d90f8cc01e3fad",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES read in lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs",
-      "symbol": "guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
-      "fingerprint": "1357cf78f5861bad30288ff0d2aab454e3d90331512adf0ba53a1d44b9dcd505",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD in crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs scoped strictly to test harness execution."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "symbol": "zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP",
-      "fingerprint": "71305498cda28a62a37368e8985d314746d4eb66e989ed11a3142a11e5e54b18",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DSR_ZERO_REMAP read in zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP (crates/carrick-vmm-hvf/src/trap.rs): the exact =0 escape hatch for the reused-anonymous zero-remap lever (default ON), carrier-wide configuration, not Linux process state."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "symbol": "zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP#2",
-      "fingerprint": "71305498cda28a62a37368e8985d314746d4eb66e989ed11a3142a11e5e54b18",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_DSR_ZERO_REMAP read in zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP#2 (crates/carrick-vmm-hvf/src/trap.rs): the exact =0 escape hatch for the reused-anonymous zero-remap lever (default ON), carrier-wide configuration, not Linux process state."
     },
     {
       "kind": "static",
@@ -2451,14 +2411,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "symbol": "fault_window_bytes::WINDOW",
-      "fingerprint": "0623d2cbce0e61f080c5fccc451aa8bc1ba2283f9cd07e1a7dca3ea71ae1127a",
-      "classification": "config_debug",
-      "rationale": "OnceLock cache of the CARRICK_FAULT_WINDOW_BYTES configuration in fault_window_bytes::WINDOW (crates/carrick-vmm-hvf/src/trap.rs); carrier-wide configuration read once, describes the carrier and no Linux process."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "foreign_mm_tests::FOREIGN_MM_TEST_LOCK",
       "fingerprint": "93502987434aeab58511d7c5865a095b1819487990ad883ce0ebc4eca2fae982",
@@ -2579,27 +2531,11 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs",
-      "symbol": "EXEC_PAYLOAD_ENV_LOCK",
-      "fingerprint": "42bf125b1a2036c1901bd98b788faff5653ebe534424c4863eea3ab7f676ee54",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock tag_strip_tests::EXEC_PAYLOAD_ENV_LOCK in crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs scoped strictly to test harness execution."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "vm_residency_region::REGION",
       "fingerprint": "8337504193fa1c503217c6e69cf96734ab3164654082dc9f7623b5f48f089fd6",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static vm_residency_region::REGION in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
-      "symbol": "zero_anonymous_remap_enabled::ENABLED",
-      "fingerprint": "36833e7b8d81b0acafe43de2e53df551a8c2c019b1582a9dc718da51ee441c9b",
-      "classification": "config_debug",
-      "rationale": "OnceLock cache of the CARRICK_DSR_ZERO_REMAP hatch in zero_anonymous_remap_enabled::ENABLED (crates/carrick-vmm-hvf/src/trap.rs); carrier-wide configuration read once, describes the carrier and no Linux process."
     },
     {
       "kind": "thread_local",
@@ -2619,14 +2555,6 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
-      "symbol": "STAGE2_AUDIT_STATE",
-      "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
-      "classification": "test_only",
-      "rationale": "Test-only thread-local cell STAGE2_AUDIT_STATE in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 audit and failure injection in unit tests."
-    },
-    {
-      "kind": "thread_local",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "TASK_MAPPING_ROWS_SCANNED",
       "fingerprint": "476e97a36c4b9a69f322816d15b90d5552754fc54380db16c752f072c69abf7f",
@@ -2640,6 +2568,54 @@
       "fingerprint": "d4c0c2b4d0434b284b08ad53be54942e8a78fe5ab78362a24ab33dbb97953d8e",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell THREAD_VCPU_CREATED_TOTAL in crates/carrick-vmm-hvf/src/trap.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "symbol": "fault_window_bytes::CARRICK_FAULT_WINDOW_BYTES",
+      "fingerprint": "d65ad01b7ba81d1b0a9121f3ea237b8bc22533fd63dc95b2b2c796bf63dfe2ca",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FAULT_WINDOW_BYTES read in fault_window_bytes::CARRICK_FAULT_WINDOW_BYTES (crates/carrick-vmm-hvf/src/trap.rs) configuring the anonymous private fault window size."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "symbol": "zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP",
+      "fingerprint": "71305498cda28a62a37368e8985d314746d4eb66e989ed11a3142a11e5e54b18",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DSR_ZERO_REMAP read in zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP (crates/carrick-vmm-hvf/src/trap.rs): the exact =0 escape hatch for the reused-anonymous zero-remap lever (default ON), carrier-wide configuration, not Linux process state."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "symbol": "zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP#2",
+      "fingerprint": "71305498cda28a62a37368e8985d314746d4eb66e989ed11a3142a11e5e54b18",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_DSR_ZERO_REMAP read in zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP#2 (crates/carrick-vmm-hvf/src/trap.rs): the exact =0 escape hatch for the reused-anonymous zero-remap lever (default ON), carrier-wide configuration, not Linux process state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "symbol": "fault_window_bytes::WINDOW",
+      "fingerprint": "0623d2cbce0e61f080c5fccc451aa8bc1ba2283f9cd07e1a7dca3ea71ae1127a",
+      "classification": "config_debug",
+      "rationale": "OnceLock cache of the CARRICK_FAULT_WINDOW_BYTES configuration in fault_window_bytes::WINDOW (crates/carrick-vmm-hvf/src/trap.rs); carrier-wide configuration read once, describes the carrier and no Linux process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "symbol": "zero_anonymous_remap_enabled::ENABLED",
+      "fingerprint": "36833e7b8d81b0acafe43de2e53df551a8c2c019b1582a9dc718da51ee441c9b",
+      "classification": "config_debug",
+      "rationale": "OnceLock cache of the CARRICK_DSR_ZERO_REMAP hatch in zero_anonymous_remap_enabled::ENABLED (crates/carrick-vmm-hvf/src/trap.rs); carrier-wide configuration read once, describes the carrier and no Linux process."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs",
+      "symbol": "exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS",
+      "fingerprint": "7f4067c3ebd1a2fb346239d411c4c7966b024cdd7beb2939f3d49a0451111d5c",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS read in exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS (crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var",
@@ -2754,12 +2730,36 @@
       "rationale": "Test-only fixture or lock alias_registry_tests::thread_mapping_desc_from_region_and_fork_inheritance_with_offset::TEST_LOCK in crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs scoped strictly to test harness execution."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs",
+      "symbol": "STAGE2_AUDIT_STATE",
+      "fingerprint": "f4a8dd5e57f884559783cd3de35e10deac5ea59dfd6c204ad6ecdf6f75b88658",
+      "classification": "test_only",
+      "rationale": "Test-only thread-local cell STAGE2_AUDIT_STATE in crates/carrick-vmm-hvf/src/trap.rs enabling hypervisor stage-2 audit and failure injection in unit tests."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap/sysreg.rs",
       "symbol": "guest_counter_ticks::START",
       "fingerprint": "70b7dbc3d0ba6b0aee53fa1f30b331629bfff43ce1f777ce658be289ff197b95",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static guest_counter_ticks::START in crates/carrick-vmm-hvf/src/trap/sysreg.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs",
+      "symbol": "guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
+      "fingerprint": "1357cf78f5861bad30288ff0d2aab454e3d90331512adf0ba53a1d44b9dcd505",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or lock tag_strip_tests::guest_mapping_plan_payload_sharing_hatch_restores_deep_copy::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD in crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs scoped strictly to test harness execution."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs",
+      "symbol": "EXEC_PAYLOAD_ENV_LOCK",
+      "fingerprint": "42bf125b1a2036c1901bd98b788faff5653ebe534424c4863eea3ab7f676ee54",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or lock tag_strip_tests::EXEC_PAYLOAD_ENV_LOCK in crates/carrick-vmm-hvf/src/trap/tag_strip_tests.rs scoped strictly to test harness execution."
     },
     {
       "kind": "static",
