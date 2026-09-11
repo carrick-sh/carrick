@@ -83,6 +83,7 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table. Socket/netlink/fd-set
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
+pub(crate) use super::dispatcher::NetView;
 use super::*;
 use crate::linux_abi::{
     LINUX_ICMP_ECHO_REPLY, LINUX_ICMP_ECHO_REQUEST, LINUX_IPPROTO_ICMP, LINUX_IPPROTO_TCP,
@@ -303,7 +304,212 @@ pub(super) struct HostPollTarget {
     pub(super) readiness_pipe: bool,
 }
 
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
+    #[inline]
+    pub(in crate::dispatch) fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        self.cross.captured_file_table()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cross.cred_snapshot()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn identity_pid(&self) -> u32 {
+        self.cross.identity_pid()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn open_file(&self, fd: i32) -> Option<OpenFile> {
+        self.cross.open_file(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn fd_is_valid(&self, fd: i32) -> bool {
+        self.cross.fd_is_valid(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn stdio_is_closed(&self, fd: i32) -> bool {
+        self.cross.stdio_is_closed(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn bare_stdio_description(
+        &self,
+        fd: i32,
+    ) -> Result<Arc<crate::kernel::FileDescription>, carrick_abi::LinuxErrno> {
+        self.cross.bare_stdio_description(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd(
+        &self,
+        description: OpenDescription,
+        fd_flags: u64,
+    ) -> DispatchOutcome {
+        self.cross.install_fd(description, fd_flags)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd_at_or_above(
+        &self,
+        min_fd: i32,
+        open_file: OpenFile,
+    ) -> Result<i32, OpenFile> {
+        self.cross.install_fd_at_or_above(min_fd, open_file)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd_pair_at_or_above(
+        &self,
+        min_fd: i32,
+        first: OpenFile,
+        second: OpenFile,
+    ) -> Result<(i32, i32), (OpenFile, OpenFile)> {
+        self.cross
+            .install_fd_pair_at_or_above(min_fd, first, second)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd_with_status_flags(
+        &self,
+        description: OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> DispatchOutcome {
+        self.cross
+            .install_fd_with_status_flags(description, status_flags, fd_flags)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.cross
+            .has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn begin_sigsuspend(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        suspend_mask: carrick_abi::SigSet,
+    ) -> carrick_abi::SigSet {
+        self.cross.begin_sigsuspend(context, tid, suspend_mask)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn resolve_at_path(
+        &self,
+        dirfd: u64,
+        path: &str,
+    ) -> Result<String, carrick_abi::LinuxErrno> {
+        self.cross.resolve_at_path(dirfd, path)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn layered_metadata(
+        &self,
+        path: &str,
+    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
+        self.cross.layered_metadata(path)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn layered_lstat(
+        &self,
+        path: &str,
+    ) -> Result<crate::rootfs::RootFsMetadata, carrick_abi::LinuxErrno> {
+        self.cross.layered_lstat(path)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn stamp_new_node_owner(&self, path: &str, node_mode: u32) {
+        self.cross.stamp_new_node_owner(path, node_mode);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn nofile_limit(&self) -> i32 {
+        self.cross.nofile_limit()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn staged_splice_pipe_bytes(&self, fd: i32) -> usize {
+        self.cross.staged_splice_pipe_bytes(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn staged_splice_description_bytes(
+        &self,
+        id: crate::kernel::FileDescriptionId,
+    ) -> usize {
+        self.cross.staged_splice_description_bytes(id)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn host_pipe_capacity_room(
+        &self,
+        pipe_capacity: i64,
+        pipe_id: u64,
+        is_read_end: bool,
+        bidirectional: bool,
+        host_fd: i32,
+    ) -> Option<usize> {
+        self.cross.host_pipe_capacity_room(
+            pipe_capacity,
+            pipe_id,
+            is_read_end,
+            bidirectional,
+            host_fd,
+        )
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn note_fd_closed(&self, fd: i32) {
+        self.cross.note_fd_closed(fd);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
+        self.cross.close_open_file_and_free_pty(open_file);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn notify_inmem_epoll(&self) {
+        self.cross.notify_inmem_epoll();
+    }
+
+    #[inline]
+    pub(crate) fn caller_net_ns(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Arc<crate::kernel::NetNs> {
+        self.cross.caller_net_ns(context)
+    }
+
+    pub(crate) fn raise_sigpipe_on_epipe<M: CurrentMmMemory>(
+        &self,
+        cx: &SyscallCtx<M>,
+        outcome: DispatchOutcome,
+    ) -> DispatchOutcome {
+        if matches!(&outcome, DispatchOutcome::Errno { errno } if *errno == carrick_abi::LINUX_EPIPE)
+            && !crate::dispatch::signal::signal_is_ignored(cx.kernel, carrick_abi::LINUX_SIGPIPE)
+        {
+            let tid = SyscallDispatcher::ctx_tid(cx);
+            crate::dispatch::signal::mark_signal_pending(
+                cx.kernel,
+                tid,
+                carrick_abi::LINUX_SIGPIPE,
+            );
+        }
+        outcome
+    }
     /// Whether `fd` is a pollable target for `epoll_ctl(ADD)`. The kernel
     /// returns EPERM when adding an fd whose file has no `->poll` op — regular
     /// files, directories, and synthetic /proc files. Pipes, sockets, eventfd,
@@ -643,7 +849,7 @@ impl SyscallDispatcher {
         }
     }
 
-    fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
+    pub(in crate::dispatch) fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
         if fd < 0 {
             return 0;
         }
@@ -2167,6 +2373,37 @@ mod netlink_readiness_tests {
 
 impl crate::kernel::ReadinessContext for SyscallDispatcher {
     fn staged_splice_bytes(&self, id: crate::kernel::FileDescriptionId) -> usize {
+        self.net_view().staged_splice_bytes(id)
+    }
+
+    fn host_pipe_write_room(
+        &self,
+        pipe_capacity: i64,
+        pipe_id: u64,
+        is_read_end: bool,
+        bidirectional: bool,
+        host_fd: i32,
+    ) -> Option<usize> {
+        self.net_view().host_pipe_write_room(
+            pipe_capacity,
+            pipe_id,
+            is_read_end,
+            bidirectional,
+            host_fd,
+        )
+    }
+
+    fn description_readiness(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+        interest: carrick_abi::LinuxEpollEvents,
+    ) -> carrick_abi::LinuxEpollEvents {
+        self.net_view().description_readiness(description, interest)
+    }
+}
+
+impl<'a> crate::kernel::ReadinessContext for NetView<'a> {
+    fn staged_splice_bytes(&self, id: crate::kernel::FileDescriptionId) -> usize {
         self.staged_splice_description_bytes(id)
     }
 
@@ -2204,7 +2441,7 @@ impl crate::kernel::ReadinessContext for SyscallDispatcher {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
     define_syscall! {
 
         fn eventfd2(this, cx, initial_value: u64, flags: u64) {
@@ -2972,5 +3209,242 @@ impl SyscallDispatcher {
                 completion: FdWaitCompletion::Poll { on_timeout: 0 },
             });
         }
+    }
+}
+
+macro_rules! forward_net_handlers {
+    ($( $handler:ident ),* $(,)?) => {
+        impl SyscallDispatcher {
+            $(
+                #[inline]
+                pub(crate) fn $handler<M: CurrentMmMemory>(
+                    &self,
+                    cx: &mut SyscallCtx<M>,
+                ) -> Result<DispatchOutcome, DispatchError> {
+                    self.net_view().$handler(cx)
+                }
+            )*
+        }
+    };
+}
+
+forward_net_handlers! {
+    eventfd2,
+    epoll_create1,
+    x86_epoll_create,
+    epoll_ctl,
+    epoll_pwait,
+    epoll_pwait2,
+    pselect6,
+    ppoll,
+    socket,
+    socketpair,
+    bind,
+    listen,
+    accept,
+    connect,
+    getsockname,
+    getpeername,
+    sendto,
+    recvfrom,
+    setsockopt,
+    getsockopt,
+    shutdown,
+    sendmsg,
+    recvmsg,
+    accept4,
+    sys_recvmmsg,
+    sys_sendmmsg,
+}
+
+#[allow(dead_code)]
+impl SyscallDispatcher {
+    #[inline]
+    pub(in crate::dispatch) fn host_socket_install(
+        &self,
+        family: i32,
+        type_: i32,
+        protocol: i32,
+    ) -> DispatchOutcome {
+        self.net_view().host_socket_install(family, type_, protocol)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn epoll_ready_events(&self, fd: i32, requested: u32) -> u32 {
+        self.net_view().epoll_ready_events(fd, requested)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
+        self.net_view().host_read_avail_for_poll(fd)
+    }
+
+    #[inline]
+    pub(crate) fn epoll_rearm_after_io(&self, request: &SyscallRequest, outcome: &DispatchOutcome) {
+        self.net_view().epoll_rearm_after_io(request, outcome);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
+        self.net_view().detach_fd_from_epolls(fd);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn host_socket_lookup(
+        &self,
+        fd: i32,
+    ) -> Result<(super::HostFd, i32), carrick_abi::LinuxErrno> {
+        self.net_view().host_socket_lookup(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn socket_guest_type(&self, fd: i32) -> Option<i32> {
+        self.net_view().socket_guest_type(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn host_fd_for_poll(&self, fd: i32) -> Option<super::HostFd> {
+        self.net_view().host_fd_for_poll(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn fd_is_nonblocking(&self, fd: i32) -> bool {
+        self.net_view().fd_is_nonblocking(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn io_is_nonblocking(&self, fd: i32, msg_flags: i32) -> bool {
+        self.net_view().io_is_nonblocking(fd, msg_flags)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn fd_is_netlink(&self, fd: i32) -> bool {
+        self.net_view().fd_is_netlink(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn recvmmsg(
+        &self,
+        fd: Fd,
+        msgvec: GuestPtr,
+        vlen: u64,
+        flags: u64,
+        timeout: GuestPtr,
+        memory: &mut impl CurrentMmMemory,
+    ) -> DispatchOutcome {
+        self.net_view()
+            .recvmmsg(fd, msgvec, vlen, flags, timeout, memory)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn accept_common(
+        &self,
+        fd: Fd,
+        addr: GuestPtr,
+        addrlen: GuestPtr,
+        memory: &mut impl CurrentMmMemory,
+        accept4_flags: i32,
+    ) -> DispatchOutcome {
+        self.net_view()
+            .accept_common(fd, addr, addrlen, memory, accept4_flags)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn connect_common(
+        &self,
+        fd: i32,
+        addr_addr: u64,
+        addrlen: u32,
+        memory: &impl CurrentMmMemory,
+    ) -> DispatchOutcome {
+        self.net_view()
+            .connect_common(fd, addr_addr, addrlen, memory)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn enqueue_netlink_message(
+        &self,
+        fd: i32,
+        bytes: &[u8],
+    ) -> Result<(), carrick_abi::LinuxErrno> {
+        self.net_view().enqueue_netlink_message(fd, bytes)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn netlink_socket(&self, type_: i32, protocol: i32) -> DispatchOutcome {
+        self.net_view().netlink_socket(type_, protocol)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn packet_socket(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        type_: i32,
+        protocol: i32,
+    ) -> DispatchOutcome {
+        self.net_view().packet_socket(kernel, type_, protocol)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
+        self.net_view().poll_ready_events(fd, requested_events)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn epoll_effective_interest(
+        &self,
+        fd: i32,
+        events: u32,
+        last_ready: u32,
+        last_read_avail: u64,
+        write_backpressured: bool,
+    ) -> carrick_hal::event::Interest {
+        self.net_view().epoll_effective_interest(
+            fd,
+            events,
+            last_ready,
+            last_read_avail,
+            write_backpressured,
+        )
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn socket_guest_protocol(&self, fd: i32) -> Option<i32> {
+        self.net_view().socket_guest_protocol(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn maybe_queue_icmp_echo_reply(
+        &self,
+        fd: i32,
+        request: &[u8],
+        requested: std::net::SocketAddr,
+    ) -> bool {
+        self.net_view()
+            .maybe_queue_icmp_echo_reply(fd, request, requested)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn maybe_queue_dns_response(
+        &self,
+        fd: i32,
+        request: &[u8],
+        requested: std::net::SocketAddr,
+    ) -> bool {
+        self.net_view()
+            .maybe_queue_dns_response(fd, request, requested)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn synthetic_datagram_drain(
+        &self,
+        fd: i32,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.net_view().synthetic_datagram_drain(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn is_dns_gateway_addr(&self, addr: std::net::SocketAddr) -> bool {
+        self.net_view().is_dns_gateway_addr(addr)
     }
 }

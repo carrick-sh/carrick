@@ -77,7 +77,7 @@ mod host_dgram_msg_trunc_tests {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
     fn host_socket_send_view(&self, fd: i32) -> Result<SocketSendView, LinuxErrno> {
         let (host_fd, family) = self.host_socket_lookup(fd)?;
         let (cork_enabled, has_pending_cork) = self.open_file(fd).map_or((false, false), |of| {
@@ -169,7 +169,7 @@ impl SyscallDispatcher {
     /// AFTER each received datagram (Linux only consults the timeout
     /// between datagrams — it does NOT bound the wait for the first
     /// one), NOT as an up-front poll.
-    fn recvmmsg(
+    pub(super) fn recvmmsg(
         &self,
         fd: Fd,
         msgvec: GuestPtr,

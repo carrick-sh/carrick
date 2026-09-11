@@ -316,7 +316,7 @@ mod accept4_flag_tests {
         unsafe { libc::close(unconnected) };
     }
 }
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
     pub(in crate::dispatch) fn host_socket_install(
         &self,
         family: i32,
@@ -853,7 +853,7 @@ impl SyscallDispatcher {
         }
     }
 
-    fn socket_guest_protocol(&self, fd: i32) -> Option<i32> {
+    pub(in crate::dispatch) fn socket_guest_protocol(&self, fd: i32) -> Option<i32> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read()?;
         match &*open {
@@ -878,7 +878,7 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(super) fn maybe_queue_icmp_echo_reply(
+    pub(in crate::dispatch) fn maybe_queue_icmp_echo_reply(
         &self,
         fd: i32,
         request: &[u8],
@@ -904,7 +904,7 @@ impl SyscallDispatcher {
         self.queue_synthetic_datagram(fd, response, source)
     }
 
-    pub(super) fn maybe_queue_dns_response(
+    pub(in crate::dispatch) fn maybe_queue_dns_response(
         &self,
         fd: i32,
         request: &[u8],
@@ -958,7 +958,10 @@ impl SyscallDispatcher {
         true
     }
 
-    pub(super) fn synthetic_datagram_drain(&self, fd: i32) -> Option<(Vec<u8>, Vec<u8>)> {
+    pub(in crate::dispatch) fn synthetic_datagram_drain(
+        &self,
+        fd: i32,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
         let open_file = self.open_file(fd)?;
         let mut open = open_file.description.write()?;
         let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
@@ -967,7 +970,7 @@ impl SyscallDispatcher {
         synthetic_recv.pop_front()
     }
 
-    pub(super) fn is_dns_gateway_addr(&self, addr: std::net::SocketAddr) -> bool {
+    pub(in crate::dispatch) fn is_dns_gateway_addr(&self, addr: std::net::SocketAddr) -> bool {
         addr.port() == 53
             && matches!(addr.ip(), std::net::IpAddr::V4(ip) if ip == self.network.spec.gateway_v4)
     }
@@ -1317,7 +1320,7 @@ mod icmp_ping_tests {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
     define_syscall! {
         fn socket(this, cx, domain: u64, socket_type: u64, protocol: u64) {
 

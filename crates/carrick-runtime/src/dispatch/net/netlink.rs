@@ -10,7 +10,7 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-impl SyscallDispatcher {
+impl<'a> NetView<'a> {
     /// Create a synthetic AF_NETLINK socket. Linux accepts SOCK_RAW and
     /// SOCK_DGRAM for netlink (they're equivalent there); other socket
     /// types are rejected with ESOCKTNOSUPPORT, matching the kernel.

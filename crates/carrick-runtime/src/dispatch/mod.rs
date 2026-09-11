@@ -769,9 +769,9 @@ pub(crate) use kernel_context::GuestProcessTarget;
 pub(crate) use kernel_context::bootstrap_one_task_binding;
 
 pub mod dispatcher;
-pub use dispatcher::SyscallDispatcher;
 #[allow(unused_imports)]
 pub(crate) use dispatcher::resolv_conf_contents_for_network;
+pub use dispatcher::{FsView, IpcView, MemView, NetView, ProcView, SignalView, SyscallDispatcher};
 
 pub mod execution;
 pub mod futex;
