@@ -260,6 +260,159 @@ impl SyntheticDeviceKind {
     }
 }
 
+/// Typed filesystem identity identifying the filesystem behind an open
+/// description or VFS mount. Used by `statfs`/`fstatfs` to report geometry
+/// and filesystem magic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FsIdentity {
+    #[default]
+    Overlay,
+    Pipe,
+    Socket,
+    Proc,
+    Tmpfs,
+    SecretMem,
+    AnonInode,
+    DevPts,
+    Sysfs,
+}
+
+impl FsIdentity {
+    pub fn statfs(self) -> carrick_abi::LinuxStatfs {
+        match self {
+            Self::Overlay => {
+                let blocks = 1_048_576;
+                carrick_abi::LinuxStatfs {
+                    f_type: carrick_abi::LINUX_OVERLAYFS_SUPER_MAGIC,
+                    f_bsize: carrick_abi::LINUX_PAGE_SIZE as i64,
+                    f_blocks: blocks,
+                    f_bfree: blocks / 2,
+                    f_bavail: blocks / 2,
+                    f_files: 1_048_576,
+                    f_ffree: 1_048_576,
+                    f_fsid: [0, 0],
+                    f_namelen: 255,
+                    f_frsize: carrick_abi::LINUX_PAGE_SIZE as i64,
+                    f_flags: 0,
+                    f_spare: [0; 4],
+                }
+            }
+            Self::Pipe => carrick_abi::LinuxStatfs {
+                f_type: carrick_abi::LINUX_PIPEFS_MAGIC,
+                f_bsize: 4096,
+                f_blocks: 0,
+                f_bfree: 0,
+                f_bavail: 0,
+                f_files: 0,
+                f_ffree: 0,
+                f_fsid: [0, 0],
+                f_namelen: 255,
+                f_frsize: 4096,
+                f_flags: 0,
+                f_spare: [0; 4],
+            },
+            Self::Socket => carrick_abi::LinuxStatfs {
+                f_type: carrick_abi::LINUX_SOCKFS_MAGIC,
+                f_bsize: 4096,
+                f_blocks: 0,
+                f_bfree: 0,
+                f_bavail: 0,
+                f_files: 0,
+                f_ffree: 0,
+                f_fsid: [0, 0],
+                f_namelen: 255,
+                f_frsize: 4096,
+                f_flags: 0,
+                f_spare: [0; 4],
+            },
+            Self::Proc => carrick_abi::LinuxStatfs {
+                f_type: carrick_abi::LINUX_PROC_SUPER_MAGIC,
+                f_bsize: 4096,
+                f_blocks: 0,
+                f_bfree: 0,
+                f_bavail: 0,
+                f_files: 0,
+                f_ffree: 0,
+                f_fsid: [0, 0],
+                f_namelen: 255,
+                f_frsize: 4096,
+                f_flags: 0,
+                f_spare: [0; 4],
+            },
+            Self::Tmpfs => carrick_abi::LinuxStatfs {
+                f_type: carrick_abi::LINUX_TMPFS_MAGIC,
+                f_bsize: 4096,
+                f_blocks: 0,
+                f_bfree: 0,
+                f_bavail: 0,
+                f_files: 0,
+                f_ffree: 0,
+                f_fsid: [0, 0],
+                f_namelen: 255,
+                f_frsize: 4096,
+                f_flags: 0,
+                f_spare: [0; 4],
+            },
+            Self::SecretMem => carrick_abi::LinuxStatfs {
+                f_type: carrick_abi::LINUX_SECRETMEM_MAGIC,
+                f_bsize: 4096,
+                f_blocks: 0,
+                f_bfree: 0,
+                f_bavail: 0,
+                f_files: 0,
+                f_ffree: 0,
+                f_fsid: [0, 0],
+                f_namelen: 255,
+                f_frsize: 4096,
+                f_flags: 0,
+                f_spare: [0; 4],
+            },
+            Self::AnonInode => carrick_abi::LinuxStatfs {
+                f_type: carrick_abi::LINUX_ANON_INODE_FS_MAGIC,
+                f_bsize: 4096,
+                f_blocks: 0,
+                f_bfree: 0,
+                f_bavail: 0,
+                f_files: 0,
+                f_ffree: 0,
+                f_fsid: [0, 0],
+                f_namelen: 255,
+                f_frsize: 4096,
+                f_flags: 0,
+                f_spare: [0; 4],
+            },
+            Self::DevPts => carrick_abi::LinuxStatfs {
+                f_type: carrick_abi::LINUX_DEVPTS_SUPER_MAGIC,
+                f_bsize: 4096,
+                f_blocks: 0,
+                f_bfree: 0,
+                f_bavail: 0,
+                f_files: 0,
+                f_ffree: 0,
+                f_fsid: [0, 0],
+                f_namelen: 255,
+                f_frsize: 4096,
+                f_flags: 0,
+                f_spare: [0; 4],
+            },
+            Self::Sysfs => carrick_abi::LinuxStatfs {
+                f_type: carrick_abi::LINUX_SYSFS_MAGIC,
+                f_bsize: 4096,
+                f_blocks: 0,
+                f_bfree: 0,
+                f_bavail: 0,
+                f_files: 0,
+                f_ffree: 0,
+                f_fsid: [0, 0],
+                f_namelen: 255,
+                f_frsize: 4096,
+                f_flags: 0,
+                f_spare: [0; 4],
+            },
+        }
+    }
+}
+
 /// What a successful [`Vfs::open`] returns. Each variant carries just
 /// enough information for the dispatcher to construct its own private
 /// `OpenDescription` *without* the mount needing to know about that enum —
@@ -753,6 +906,10 @@ impl<'a> From<&'a SyntheticProcContext> for OpenContext<'a> {
 /// guest's per-thread vCPUs; mounts that hold mutable host state (the pty
 /// table, the writable overlay) carry their own interior locking.
 pub trait Vfs: Send + Sync {
+    fn fs_identity(&self) -> FsIdentity {
+        FsIdentity::Overlay
+    }
+
     fn native_reexec_bind_mount(&self) -> Option<bind::NativeReexecBindMountV1> {
         None
     }

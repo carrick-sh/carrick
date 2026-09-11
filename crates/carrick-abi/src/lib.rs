@@ -4135,6 +4135,14 @@ pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
 pub const LINUX_RUSAGE_THREAD: i32 = 1;
 pub const LINUX_CLK_TCK: i64 = 100;
 pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
+pub const LINUX_PROC_SUPER_MAGIC: i64 = 0x9fa0;
+pub const LINUX_PIPEFS_MAGIC: i64 = 0x50495045;
+pub const LINUX_SOCKFS_MAGIC: i64 = 0x534f434b;
+pub const LINUX_TMPFS_MAGIC: i64 = 0x01021994;
+pub const LINUX_SECRETMEM_MAGIC: i64 = 0x5345434d;
+pub const LINUX_ANON_INODE_FS_MAGIC: i64 = 0x09041934;
+pub const LINUX_DEVPTS_SUPER_MAGIC: i64 = 0x1cd1;
+pub const LINUX_SYSFS_MAGIC: i64 = 0x62656572;
 pub const LINUX_EAFNOSUPPORT: LinuxErrno = LinuxErrno::new(97);
 
 // ===== ABI constants moved from dispatch.rs (Goal #3, private set, now pub) =====

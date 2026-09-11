@@ -427,7 +427,8 @@ impl<'a> FsView<'a> {
                         pipe_id: host_inode_pipe_id(host_fd),
                         host_fd: HostFdRef::new(host_fd),
                         is_read_end: access != LINUX_O_WRONLY,
-                        base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                        base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC)
+                            .with_fs_identity(crate::vfs::FsIdentity::Overlay),
                         pty: None,
                         bidirectional: access == LINUX_O_RDWR,
                         write_kind: HostWriteKind::PipeLike,
@@ -1490,6 +1491,7 @@ impl<'a> FsView<'a> {
                 return VfsOpenAttempt::Errno(errno);
             }
         };
+        let mount_fs_id = m.vfs.fs_identity();
         match handle {
             crate::vfs::VfsHandle::HostFd {
                 host_fd,
@@ -1518,7 +1520,8 @@ impl<'a> FsView<'a> {
                             mode: (st.st_mode & 0o7777) as u32,
                             size: st.st_size.max(0) as usize,
                         },
-                        base: OpenDescriptionBase::new(status_flags as u64),
+                        base: OpenDescriptionBase::new(status_flags as u64)
+                            .with_fs_identity(mount_fs_id),
                         writable: !is_read_end,
                     }
                 } else {
@@ -1528,7 +1531,8 @@ impl<'a> FsView<'a> {
                         pipe_id: host_inode_pipe_id(host_fd),
                         host_fd: HostFdRef::new(host_fd),
                         is_read_end,
-                        base: OpenDescriptionBase::new(status_flags as u64),
+                        base: OpenDescriptionBase::new(status_flags as u64)
+                            .with_fs_identity(mount_fs_id),
                         pty: None,
                         // A VFS stream opened O_RDWR must serve BOTH directions
                         // (mirrors the O_RDWR FIFO open above). DevVfs encodes
@@ -1560,7 +1564,7 @@ impl<'a> FsView<'a> {
                 let open_file = OpenFile::from_open_description_with_status_flags(
                     Arc::new(RwLock::new(OpenDescription::SyntheticDevice {
                         kind,
-                        base: OpenDescriptionBase::new(status),
+                        base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
                     })),
                     status,
                     linux_fd_flags_from_open_flags(flags),
@@ -1583,7 +1587,7 @@ impl<'a> FsView<'a> {
                         path,
                         contents,
                         offset: 0,
-                        base: OpenDescriptionBase::new(status),
+                        base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
                     })),
                     status,
                     linux_fd_flags_from_open_flags(flags),
@@ -1611,7 +1615,7 @@ impl<'a> FsView<'a> {
                         // A pty end is bidirectional; route reads and
                         // writes through the host fd like /dev/null.
                         is_read_end: true,
-                        base: OpenDescriptionBase::new(status),
+                        base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
                         pty: Some(crate::vfs::PtyRole {
                             index: pts_index,
                             is_master,
@@ -1699,7 +1703,7 @@ impl<'a> FsView<'a> {
                         metadata,
                         listing: DirListing::Fixed(rootfs_entries),
                         offset: 0,
-                        base: OpenDescriptionBase::new(status),
+                        base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
                         // VFS-mount (synthetic) directories never take the
                         // trusted host-dirfd lane.
                         trusted_host_dir: None,
@@ -1728,7 +1732,7 @@ impl<'a> FsView<'a> {
                         offset: 0,
                         writable,
                         max_size,
-                        base: OpenDescriptionBase::new(status),
+                        base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
                     })),
                     status,
                     linux_fd_flags_from_open_flags(flags),
@@ -2094,7 +2098,8 @@ impl<'a> FsView<'a> {
                 path,
                 contents: FileContents::host_backed(host_file),
                 offset: 0,
-                base: OpenDescriptionBase::new(0),
+                base: OpenDescriptionBase::new(0)
+                    .with_fs_identity(crate::vfs::FsIdentity::Tmpfs),
                 writable: true,
             };
             let fd_flags = if memfd_flags.contains(LinuxMemfdFlags::CLOEXEC) {
@@ -2144,7 +2149,8 @@ impl<'a> FsView<'a> {
                 path,
                 contents: FileContents::dense(Vec::new()),
                 offset: 0,
-                base: OpenDescriptionBase::new(0),
+                base: OpenDescriptionBase::new(0)
+                    .with_fs_identity(crate::vfs::FsIdentity::SecretMem),
                 writable: true,
             };
             let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {

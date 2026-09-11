@@ -66,7 +66,8 @@ impl<'a> FsView<'a> {
             // genuinely closed: report EBADF, not our still-open host stream.
             if is_stdio_fd(fd) && !self.stdio_is_closed(fd) {
                 let (label, mode) = self.stdio_synthetic_label_mode(fd);
-                return Ok(StatRecord::synthetic(&label, 0, mode));
+                return Ok(StatRecord::synthetic(&label, 0, mode)
+                    .with_fs_identity(crate::vfs::FsIdentity::Pipe));
             }
             return Err(LINUX_EBADF);
         };
@@ -75,7 +76,8 @@ impl<'a> FsView<'a> {
             .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
             .is_some()
         {
-            return Ok(StatRecord::synthetic("anon_inode:[io_uring]", 0, 0o600));
+            return Ok(StatRecord::synthetic("anon_inode:[io_uring]", 0, 0o600)
+                .with_fs_identity(crate::vfs::FsIdentity::AnonInode));
         }
         let Some(open) = open_file.description.read() else {
             return Err(LINUX_EBADF);
@@ -91,6 +93,7 @@ impl<'a> FsView<'a> {
         // `HostPipe` but carry no recorded path, so they keep the synthetic
         // record. Recover the real FIFO stat from the fd's recorded path.
         let is_named_pipe = matches!(&*open, OpenDescription::HostPipe { pty: None, .. });
+        let fs_id = open.fs_identity();
         let source = open.stat_source();
         drop(open);
         if is_named_pipe
@@ -98,10 +101,10 @@ impl<'a> FsView<'a> {
             && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, false)
             && real.kind == RootFsEntryKind::Fifo
         {
-            return Ok(StatRecord::from_real(&path, &real));
+            return Ok(StatRecord::from_real(&path, &real).with_fs_identity(fs_id));
         }
-        match source {
-            OpenStatSource::Record(record) => Ok(record),
+        let record = match source {
+            OpenStatSource::Record(record) => record,
             OpenStatSource::HostStream {
                 host_fd,
                 identity,
@@ -134,7 +137,7 @@ impl<'a> FsView<'a> {
                 // collide across devices; use `pipe_id` for identity because
                 // BSD gives the two ends of one pipe different host inodes.
                 let label = host_stream_stat_label(identity, mode & LINUX_S_IFMT);
-                Ok(StatRecord::synthetic(&label, 0, mode))
+                StatRecord::synthetic(&label, 0, mode)
             }
             // An open Directory or in-memory File: its fd-stat must report the
             // SAME st_ino/st_dev as a path-stat of the same path. Under
@@ -146,7 +149,7 @@ impl<'a> FsView<'a> {
             // synthetic record, so the `fallback` already matches.
             OpenStatSource::PathRecord { path, fallback } => {
                 if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true) {
-                    Ok(StatRecord::from_real(&path, &real))
+                    StatRecord::from_real(&path, &real)
                 } else if let Some(real) = self
                     .fs
                     .vfs_mounts
@@ -161,7 +164,7 @@ impl<'a> FsView<'a> {
                     // TestFileChdir; Python os.path.samestat). Without this the
                     // fd fell back to the path-HASH inode while the path-stat
                     // returned the real host inode.
-                    Ok(StatRecord::from_real(&path, &real))
+                    StatRecord::from_real(&path, &real)
                 } else if let Some(real) = self
                     .fs
                     .rootfs_vfs
@@ -175,35 +178,37 @@ impl<'a> FsView<'a> {
                     // otherwise fixing the regular-file case would simply move
                     // the `samestat` disagreement onto directories. Regular
                     // files never reach here: they open as a real `HostFile`.
-                    Ok(real)
+                    real
                 } else {
-                    Ok(fallback)
+                    fallback
                 }
             }
             OpenStatSource::HostFile { host_fd, metadata } => {
                 let path = metadata.path.to_string_lossy().into_owned();
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(host_fd.get(), &mut st) } == 0 {
+                let mut host_st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: host_fd is a live host fd; &host_st is a valid out-param.
+                if unsafe { libc::fstat(host_fd.get(), &mut host_st) } == 0 {
                     let inode_rec = self
                         .fs
                         .rootfs_vfs
-                        .get_or_fill_host_inode(host_fd.get(), &st);
+                        .get_or_fill_host_inode(host_fd.get(), &host_st);
                     let device = if inode_rec.dev_type != 0 {
                         Some((inode_rec.dev_type, inode_rec.rdev))
                     } else {
                         None
                     };
-                    let mut real = super::real_stat_from_libc(&st);
+                    let mut real = super::real_stat_from_libc(&host_st);
                     real.mode = inode_rec.mode & 0o7777;
                     real.uid = inode_rec.uid;
                     real.gid = inode_rec.gid;
                     let mut record = StatRecord::from_real(&path, &real);
                     record.apply_device_node(device);
-                    return Ok(record);
+                    return Ok(record.with_fs_identity(fs_id));
                 }
-                Ok(StatRecord::from_metadata(&metadata))
+                StatRecord::from_metadata(&metadata)
             }
-        }
+        };
+        Ok(record.with_fs_identity(fs_id))
     }
 
     /// Build a [`StatRecord`] from a real backing stat, applying the `mknod(2)`
@@ -311,14 +316,20 @@ impl<'a> FsView<'a> {
         if let Err(errno) = self.layered_metadata(&path) {
             return Ok(DispatchOutcome::errno(errno));
         }
-        Ok(write_statfs(memory, buffer.0))
+        let identity = if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
+            m.vfs.fs_identity()
+        } else {
+            crate::vfs::FsIdentity::Overlay
+        };
+        Ok(write_statfs(memory, buffer.0, &identity.statfs()))
     }
 
     fn fstatfs(&self, fd: Fd, buf: GuestPtr, memory: &mut impl CurrentMmMemory) -> DispatchOutcome {
-        if !self.fd_table_contains(fd.0) {
-            return DispatchOutcome::errno(LINUX_EBADF);
-        }
-        write_statfs(memory, buf.0)
+        let record = match self.fd_stat_record(fd.0) {
+            Ok(record) => record,
+            Err(errno) => return DispatchOutcome::errno(errno),
+        };
+        write_statfs(memory, buf.0, &record.fs_identity.statfs())
     }
 
     /// Single-component `newfstatat`/`statx` through a TRUSTED host dirfd:

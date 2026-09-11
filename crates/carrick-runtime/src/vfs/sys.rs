@@ -316,6 +316,10 @@ impl Vfs for SysVfs {
         })
     }
 
+    fn fs_identity(&self) -> super::FsIdentity {
+        super::FsIdentity::Sysfs
+    }
+
     fn name(&self) -> &'static str {
         "sys"
     }
