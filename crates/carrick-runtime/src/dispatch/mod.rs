@@ -337,7 +337,6 @@ use crate::linux_abi::{
     LINUX_O_TRUNC,
     LINUX_O_WRONLY,
     LINUX_OPEN_HOW_SIZE,
-    LINUX_OVERLAYFS_SUPER_MAGIC,
     LINUX_P_ALL,
     LINUX_P_PGID,
     LINUX_P_PID,
@@ -2497,23 +2496,12 @@ where
     Ok(value)
 }
 
-fn write_statfs(memory: &mut impl CurrentMmMemory, statfsbuf: u64) -> DispatchOutcome {
-    let blocks = 1_048_576;
-    let statfs = LinuxStatfs {
-        f_type: LINUX_OVERLAYFS_SUPER_MAGIC,
-        f_bsize: LINUX_PAGE_SIZE as i64,
-        f_blocks: blocks,
-        f_bfree: blocks / 2,
-        f_bavail: blocks / 2,
-        f_files: 1_048_576,
-        f_ffree: 1_048_576,
-        f_fsid: [0, 0],
-        f_namelen: 255,
-        f_frsize: LINUX_PAGE_SIZE as i64,
-        f_flags: 0,
-        f_spare: [0; 4],
-    };
-    write_kernel_struct(memory, statfsbuf, &statfs)
+fn write_statfs(
+    memory: &mut impl CurrentMmMemory,
+    statfsbuf: u64,
+    statfs: &LinuxStatfs,
+) -> DispatchOutcome {
+    write_kernel_struct(memory, statfsbuf, statfs)
 }
 
 fn linux_fd_flags_from_open_flags(flags: u64) -> u64 {

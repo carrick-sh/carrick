@@ -254,6 +254,7 @@ pub(super) struct TimerFdInner {
 
 #[derive(Debug, Clone)]
 pub(super) struct OpenDescriptionBase {
+    fs_identity: Option<crate::vfs::FsIdentity>,
     /// SO_RCVTIMEO: bounds a blocking recv on this socket. None = block forever.
     recv_timeout: Option<Duration>,
     /// SO_SNDTIMEO: bounds a blocking send on this socket. None = block forever.
@@ -333,6 +334,7 @@ pub(super) struct SocketMulticastMembership {
 impl OpenDescriptionBase {
     pub(super) fn new(#[allow(unused)] status_flags: u64) -> Self {
         Self {
+            fs_identity: None,
             so_reuseaddr: false,
             so_reuseport: false,
             ipv6_multicast_if: None,
@@ -348,6 +350,15 @@ impl OpenDescriptionBase {
             pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
             pipe_capacity_shared: None,
         }
+    }
+
+    pub(super) fn fs_identity(&self) -> Option<crate::vfs::FsIdentity> {
+        self.fs_identity
+    }
+
+    pub(super) fn with_fs_identity(mut self, id: crate::vfs::FsIdentity) -> Self {
+        self.fs_identity = Some(id);
+        self
     }
 
     /// Route pipe capacity through a cell shared with the pipe's other end.
@@ -2314,6 +2325,7 @@ pub(super) struct StatRecord {
     pub(super) atime: (i64, i64),
     pub(super) mtime: (i64, i64),
     pub(super) ctime: (i64, i64),
+    pub(super) fs_identity: crate::vfs::FsIdentity,
 }
 
 impl StatRecord {
@@ -2334,6 +2346,7 @@ impl StatRecord {
             atime: (0, 0),
             mtime: (0, 0),
             ctime: (0, 0),
+            fs_identity: crate::vfs::FsIdentity::Overlay,
         }
     }
 
@@ -2357,6 +2370,7 @@ impl StatRecord {
             atime: real.atime,
             mtime: real.mtime,
             ctime: real.ctime,
+            fs_identity: crate::vfs::FsIdentity::Overlay,
         }
     }
 
@@ -2374,7 +2388,13 @@ impl StatRecord {
             atime: (0, 0),
             mtime: (0, 0),
             ctime: (0, 0),
+            fs_identity: crate::vfs::FsIdentity::Overlay,
         }
+    }
+
+    pub(super) fn with_fs_identity(mut self, fs_identity: crate::vfs::FsIdentity) -> Self {
+        self.fs_identity = fs_identity;
+        self
     }
 
     /// Override the reported file TYPE and `st_rdev` for a `mknod(2)` character/
@@ -2461,6 +2481,52 @@ impl OpenDescription {
         match self {
             OpenDescription::HostSocket { base, .. } => base.send_timeout(),
             _ => None,
+        }
+    }
+
+    pub(super) fn fs_identity(&self) -> crate::vfs::FsIdentity {
+        match self {
+            Self::Closed { .. } => crate::vfs::FsIdentity::Overlay,
+            Self::PipeReader { base, .. } | Self::PipeWriter { base, .. } => {
+                base.fs_identity().unwrap_or(crate::vfs::FsIdentity::Pipe)
+            }
+            Self::HostPipe { base, pty, .. } => {
+                if let Some(id) = base.fs_identity() {
+                    id
+                } else if pty.is_some() {
+                    crate::vfs::FsIdentity::DevPts
+                } else {
+                    crate::vfs::FsIdentity::Pipe
+                }
+            }
+            Self::HostSocket { base, .. }
+            | Self::InMemorySocket { base, .. }
+            | Self::Netlink { base, .. } => {
+                base.fs_identity().unwrap_or(crate::vfs::FsIdentity::Socket)
+            }
+            Self::SyntheticDevice { base, .. } => base
+                .fs_identity()
+                .unwrap_or(crate::vfs::FsIdentity::Overlay),
+            Self::File { base, path, .. }
+            | Self::Directory { base, path, .. }
+            | Self::SyntheticFile { base, path, .. }
+            | Self::InMemoryFile { base, path, .. } => {
+                if let Some(id) = base.fs_identity() {
+                    id
+                } else if path.starts_with("/proc") {
+                    crate::vfs::FsIdentity::Proc
+                } else if path.starts_with("/sys") {
+                    crate::vfs::FsIdentity::Sysfs
+                } else if path.starts_with("/dev/pts") {
+                    crate::vfs::FsIdentity::DevPts
+                } else {
+                    crate::vfs::FsIdentity::Overlay
+                }
+            }
+            Self::HostFile { base, .. } => base
+                .fs_identity()
+                .unwrap_or(crate::vfs::FsIdentity::Overlay),
+            _ => crate::vfs::FsIdentity::AnonInode,
         }
     }
 

@@ -2675,6 +2675,10 @@ impl Vfs for ProcVfs {
         })
     }
 
+    fn fs_identity(&self) -> super::FsIdentity {
+        super::FsIdentity::Proc
+    }
+
     fn name(&self) -> &'static str {
         "proc"
     }

@@ -332,6 +332,10 @@ impl Vfs for DevptsVfs {
         })
     }
 
+    fn fs_identity(&self) -> super::FsIdentity {
+        super::FsIdentity::DevPts
+    }
+
     fn name(&self) -> &'static str {
         "devpts"
     }
