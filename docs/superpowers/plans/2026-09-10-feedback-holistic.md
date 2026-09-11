@@ -277,3 +277,28 @@ rows, (4) resume the perf2x campaign.
   blessed oracles; `ppollwaitset` is bounded (5 s caps, 4 s writer) and
   blessed, and stays red until the POLLHUP runtime fix lands (worker
   running). No known-gap excuse was added anywhere.
+- ppollwaitset LANDED (f2e69c86c + 85d8f3240, reconciled f9a240698): the
+  runtime now reports POLLHUP immediately on an unconnected stream socket
+  (`connected` on the open description; readiness and the wait authority
+  consult it). Probe-design finding: the probe put that unconnected socket
+  in EVERY wait set, so on Linux cases (b)..(g) returned at once and never
+  tested a blocking wait; the blessed oracle recorded them all false. The
+  probe now keeps the unconnected socket only in case (a) (pinning the
+  answer that exposed the bug) and uses a connected AF_UNIX socketpair end
+  for the blocking cases; raw timings are gone and the two threshold lines
+  the Docker oracle itself missed under load (30 ms timeout inside 28..33,
+  SIGALRM wake under 10 ms) became "never early" and "under 500 ms".
+  Re-blessed arm64 musl+gnu (every semantic line true on Linux); carrick
+  PASS/MATCH on both lanes. The legacy lane has no open red.
+- Cleanup: 7 orphan worktree directories (one holding an 11 GiB stale
+  build), 64 merged worktrees and 46 merged branches removed; 94 GiB of
+  stale `target/debug` cleared before the confirming `just ci`. Left in
+  place: unmerged opus/codex/agy branches with commits ahead of main (other
+  sessions' work), `codex-hybrid-kernel` (root-owned lldb cores) and the
+  root-owned 12 GiB `asid-wedge` core cited by the 2026-08-22 audit.
+- Item 4 started: paired interleaved scorecard armed
+  (`target/conformance/eco-load/paired-sep11.sh`, summary
+  `paired-summary.py`): base = pinned 62c63d979 binary afccec0cc339993c,
+  cand = pinned current main, w4 x3 reps with alternating order, then w1,
+  quiet-gated before every phase. Workers are dispatched only after it
+  finishes (their builds would contaminate it).
