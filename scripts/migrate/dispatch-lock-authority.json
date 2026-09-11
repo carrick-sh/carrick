@@ -31,7 +31,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::open_at_path_string::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 840,
+      "line": 725,
       "item": "DispatchError::open_at_path_string",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -40,7 +40,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::dup_stdio_pty_role::pty_table#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2192,
+      "line": 1898,
       "item": "DispatchError::dup_stdio_pty_role",
       "category": "pty_table",
       "expression": ".pty_table.lock()",
@@ -49,7 +49,7 @@
     {
       "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::try_vfs_open::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 2399,
+      "line": 2105,
       "item": "DispatchError::try_vfs_open",
       "category": "proc",
       "expression": ".proc.lock()",
