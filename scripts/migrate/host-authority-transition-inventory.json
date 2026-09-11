@@ -769,18 +769,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:12000 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:11193 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000048",
     "source": {
-      "byte_end": 537266,
-      "byte_start": 537254,
+      "byte_end": 499143,
+      "byte_start": 499131,
       "column": 21,
       "column_end": 33,
       "column_start": 21,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 12000,
-      "line_end": 12000,
-      "line_start": 12000
+      "line": 11193,
+      "line_end": 11193,
+      "line_start": 11193
     }
   },
   {
@@ -797,18 +797,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:12046 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:11239 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000049",
     "source": {
-      "byte_end": 539897,
-      "byte_start": 539885,
+      "byte_end": 501774,
+      "byte_start": 501762,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 12046,
-      "line_end": 12046,
-      "line_start": 12046
+      "line": 11239,
+      "line_end": 11239,
+      "line_start": 11239
     }
   },
   {
@@ -825,18 +825,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:12087 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:11280 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000050",
     "source": {
-      "byte_end": 542214,
-      "byte_start": 542202,
+      "byte_end": 504091,
+      "byte_start": 504079,
       "column": 25,
       "column_end": 37,
       "column_start": 25,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 12087,
-      "line_end": 12087,
-      "line_start": 12087
+      "line": 11280,
+      "line_end": 11280,
+      "line_start": 11280
     }
   },
   {
@@ -2600,18 +2600,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:423 in `create_exec_private_file_artifact`, `std::fs::OpenOptions::new` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap/mapping_plan.rs:142 in `create_exec_private_file_artifact`, `std::fs::OpenOptions::new` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000118",
     "source": {
-      "byte_end": 21130,
-      "byte_start": 21105,
+      "byte_end": 5757,
+      "byte_start": 5732,
       "column": 16,
       "column_end": 41,
       "column_start": 16,
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 423,
-      "line_end": 423,
-      "line_start": 423
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "line": 142,
+      "line_end": 142,
+      "line_start": 142
     }
   },
   {
@@ -3162,18 +3162,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:428 in `create_exec_private_file_artifact`, `std::fs::OpenOptions::open` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap/mapping_plan.rs:147 in `create_exec_private_file_artifact`, `std::fs::OpenOptions::open` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000141",
     "source": {
-      "byte_end": 21234,
-      "byte_start": 21230,
+      "byte_end": 5861,
+      "byte_start": 5857,
       "column": 10,
       "column_end": 14,
       "column_start": 10,
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 428,
-      "line_end": 428,
-      "line_start": 428
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "line": 147,
+      "line_end": 147,
+      "line_start": 147
     }
   },
   {
@@ -7942,18 +7942,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:429 in `create_exec_private_file_artifact`, `std::fs::remove_file` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap/mapping_plan.rs:148 in `create_exec_private_file_artifact`, `std::fs::remove_file` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000348",
     "source": {
-      "byte_end": 21288,
-      "byte_start": 21268,
+      "byte_end": 5915,
+      "byte_start": 5895,
       "column": 25,
       "column_end": 45,
       "column_start": 25,
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 429,
-      "line_end": 429,
-      "line_start": 429
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "line": 148,
+      "line_end": 148,
+      "line_start": 148
     }
   },
   {
@@ -7970,18 +7970,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:431 in `create_exec_private_file_artifact`, `std::fs::remove_file` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap/mapping_plan.rs:150 in `create_exec_private_file_artifact`, `std::fs::remove_file` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000349",
     "source": {
-      "byte_end": 21354,
-      "byte_start": 21334,
+      "byte_end": 5981,
+      "byte_start": 5961,
       "column": 17,
       "column_end": 37,
       "column_start": 17,
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 431,
-      "line_end": 431,
-      "line_start": 431
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "line": 150,
+      "line_end": 150,
+      "line_start": 150
     }
   },
   {
@@ -13527,18 +13527,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:421 in `create_exec_private_file_artifact`, `std::process::id` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap/mapping_plan.rs:140 in `create_exec_private_file_artifact`, `std::process::id` accesses only the private executable backing artifact for the current HVF VM used by `create_exec_private_file_artifact`.",
     "review_id": "HA-000571",
     "source": {
-      "byte_end": 21079,
-      "byte_start": 21063,
+      "byte_end": 5706,
+      "byte_start": 5690,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 421,
-      "line_end": 421,
-      "line_start": 421
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "line": 140,
+      "line_end": 140,
+      "line_start": 140
     }
   },
   {
