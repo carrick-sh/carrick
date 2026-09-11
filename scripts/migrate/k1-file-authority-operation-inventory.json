@@ -25,7 +25,7 @@
     "description_backing": 7,
     "epoll": 34,
     "stream": 15,
-    "mapping": 72,
+    "mapping": 74,
     "lifecycle": 5
   },
   "entries": [
@@ -3828,6 +3828,24 @@
         "description_guard"
       ],
       "text": "let Some(mut open) = open_file.description.write() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/futex.rs",
+      "line": 218,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A futex word that lives in a genuine MAP_SHARED file mapping is an",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/futex.rs",
+      "line": 613,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Read a futex word, falling back to the fork-coherent shared mapping when the",
       "scope_kind": "production_callsite"
     },
     {
@@ -7694,7 +7712,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 751,
+      "line": 742,
       "categories": [
         "mapping"
       ],
@@ -7703,7 +7721,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 900,
+      "line": 916,
       "categories": [
         "epoll"
       ],
@@ -7712,7 +7730,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 902,
+      "line": 918,
       "categories": [
         "epoll"
       ],
@@ -7721,7 +7739,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 907,
+      "line": 923,
       "categories": [
         "stream"
       ],
@@ -7730,7 +7748,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 918,
+      "line": 934,
       "categories": [
         "epoll"
       ],
@@ -7739,7 +7757,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 921,
+      "line": 937,
       "categories": [
         "epoll"
       ],
@@ -7748,7 +7766,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 924,
+      "line": 940,
       "categories": [
         "epoll"
       ],
@@ -7757,7 +7775,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 932,
+      "line": 948,
       "categories": [
         "epoll"
       ],
@@ -7766,7 +7784,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 965,
+      "line": 981,
       "categories": [
         "epoll"
       ],
@@ -7775,7 +7793,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 972,
+      "line": 988,
       "categories": [
         "epoll"
       ],
@@ -7784,7 +7802,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 983,
+      "line": 999,
       "categories": [
         "epoll"
       ],
@@ -7793,7 +7811,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 984,
+      "line": 1000,
       "categories": [
         "epoll"
       ],
@@ -7802,7 +7820,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1025,
+      "line": 1041,
       "categories": [
         "epoll"
       ],
@@ -7811,7 +7829,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1027,
+      "line": 1043,
       "categories": [
         "epoll"
       ],
@@ -7820,7 +7838,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1030,
+      "line": 1046,
       "categories": [
         "epoll"
       ],
@@ -7829,7 +7847,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1035,
+      "line": 1051,
       "categories": [
         "epoll"
       ],
@@ -7838,7 +7856,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1719,
+      "line": 1508,
       "categories": [
         "table_guard"
       ],
@@ -7847,7 +7865,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1829,
+      "line": 1618,
       "categories": [
         "mapping"
       ],
@@ -7856,7 +7874,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1834,
+      "line": 1623,
       "categories": [
         "mapping"
       ],
@@ -7865,7 +7883,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2185,
+      "line": 1974,
       "categories": [
         "description_guard"
       ],
@@ -7874,7 +7892,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2213,
+      "line": 2002,
       "categories": [
         "description_guard"
       ],
@@ -7883,7 +7901,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2286,
+      "line": 2075,
       "categories": [
         "description_guard"
       ],
@@ -7892,38 +7910,11 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2315,
+      "line": 2104,
       "categories": [
         "epoll"
       ],
       "text": "// A FIFO write-end close drops a beacon writer \u2014 wake epoll/poll so FIFO",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2656,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// profile's denial of `bpf`/`unshare`/`setns`/`io_uring`. The grant and",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 3971,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A futex word that lives in a genuine MAP_SHARED file mapping is an",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 5951,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Read a futex word, falling back to the fork-coherent shared mapping when the",
       "scope_kind": "production_callsite"
     },
     {
@@ -10502,6 +10493,15 @@
       ],
       "text": "222, // mmap",
       "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/seccomp_observer.rs",
+      "line": 144,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// profile's denial of `bpf`/`unshare`/`setns`/`io_uring`. The grant and",
+      "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
