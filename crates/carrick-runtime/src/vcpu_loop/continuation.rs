@@ -28,6 +28,7 @@ use crate::kernel::{
     Kernel, KernelContext, MmId, Scheduler, Task, TaskKey, TaskRevision, VforkParentWait,
 };
 use crate::linux_abi::{LINUX_EAGAIN, LINUX_EINTR, LINUX_ETIMEDOUT, LinuxErrno};
+use crate::run_result::RuntimeError;
 use crate::thread::{FutexTable, FutexWait};
 
 static NEXT_CONTINUATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -55,14 +56,13 @@ fn next_nonzero(source: &AtomicU64) -> u64 {
     value
 }
 
-fn make_control_pipe() -> (OwnedFd, OwnedFd) {
+fn make_control_pipe() -> Result<(OwnedFd, OwnedFd), RuntimeError> {
     let mut fds = [-1; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        carrick_fatal!(
-            "vcpu_loop::continuation_reactor",
-            "host pipe creation failed when initializing wait reactor: errno={}",
-            std::io::Error::last_os_error()
-        );
+        let err = std::io::Error::last_os_error();
+        return Err(RuntimeError::CarrierFailed(format!(
+            "host pipe creation failed when initializing wait reactor: errno={err}"
+        )));
     }
     for fd in fds {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -72,16 +72,19 @@ fn make_control_pipe() -> (OwnedFd, OwnedFd) {
             || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
             || unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0
         {
-            carrick_fatal!(
-                "vcpu_loop::continuation_reactor",
-                "host fcntl configuration failed on reactor control pipe fd={fd}: errno={}",
-                std::io::Error::last_os_error()
-            );
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(RuntimeError::CarrierFailed(format!(
+                "host fcntl configuration failed on reactor control pipe fd={fd}: errno={err}"
+            )));
         }
     }
-    (unsafe { OwnedFd::from_raw_fd(fds[0]) }, unsafe {
+    Ok((unsafe { OwnedFd::from_raw_fd(fds[0]) }, unsafe {
         OwnedFd::from_raw_fd(fds[1])
-    })
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -3758,8 +3761,8 @@ impl Drop for CarrierWaitService {
 }
 
 impl CarrierWaitService {
-    pub fn new(scheduler: Arc<Scheduler>) -> Self {
-        let (control_read, control_write) = make_control_pipe();
+    pub fn try_new(scheduler: Arc<Scheduler>) -> Result<Self, RuntimeError> {
+        let (control_read, control_write) = make_control_pipe()?;
         let inner = Arc::new(CarrierWaitServiceInner {
             scheduler,
             state: Mutex::new(CarrierWaitState::default()),
@@ -3781,14 +3784,18 @@ impl CarrierWaitService {
         let handle = std::thread::Builder::new()
             .name("carrick-carrier-wait".to_owned())
             .spawn(move || CarrierWaitServiceInner::run_reactor(weak))
-            .unwrap_or_else(|e| {
-                carrick_fatal!(
-                    "vcpu_loop::continuation_reactor",
+            .map_err(|e| {
+                RuntimeError::CarrierFailed(format!(
                     "host thread spawn failure for carrier wait reactor: error={e}"
-                );
-            });
+                ))
+            })?;
         *inner.reactor.lock() = Some(handle);
-        Self { inner }
+        Ok(Self { inner })
+    }
+
+    #[allow(clippy::expect_used)]
+    pub fn new(scheduler: Arc<Scheduler>) -> Self {
+        Self::try_new(scheduler).expect("carrier wait service initialization")
     }
 
     pub fn prepare_registration(
@@ -5392,6 +5399,13 @@ mod tests {
     ) -> Option<Result<ContinuationEvent, WaitServiceError>> {
         let service = service.clone();
         block_on_timeout(async move { service.event(token).await }, timeout)
+    }
+
+    #[test]
+    fn carrier_wait_service_try_new_succeeds() {
+        let (kernel, _) = bootstrap(15_469);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        assert!(CarrierWaitService::try_new(scheduler).is_ok());
     }
 
     #[test]
