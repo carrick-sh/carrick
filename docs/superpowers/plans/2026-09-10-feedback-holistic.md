@@ -139,3 +139,10 @@ from sibling branches.
   not covered by `--rehome`; the director merges the worker's rows for the
   touched files over main's ledger at landing (`merge-global-state.py`,
   session scratchpad) until the tool grows that mode.
+- 2026-09-10 wave 3 round 3 LANDED: trap.rs → 14,123 (execve_rebuild,
+  stage2_backend and more); vcpu_loop/mod.rs → 10,890; dispatch/fs.rs →
+  6,135; dispatch/mod.rs → 4,773. net.rs (11,837) untouched so far — round 4
+  starts it. Landing recipe now: `prep-split.sh` (save any half-move as a
+  patch, reset to the green prefix, rebase, merge the global-state rows,
+  reconcile --rehome, gate) then the gated `land()`; a doc link to a
+  now-private helper was the only fix needed after the moves.
