@@ -10532,7 +10532,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 528,
+      "line": 630,
       "categories": [
         "lifecycle"
       ],
@@ -10541,7 +10541,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 1037,
+      "line": 1139,
       "categories": [
         "epoll"
       ],
@@ -10550,7 +10550,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 1428,
+      "line": 1528,
       "categories": [
         "mapping"
       ],
@@ -10559,7 +10559,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/signal.rs",
-      "line": 1730,
+      "line": 1830,
       "categories": [
         "description_guard"
       ],
