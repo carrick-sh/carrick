@@ -793,22 +793,16 @@ impl<'a> FsView<'a> {
     }
 
     pub(crate) fn notify_inmem_epoll(&self) {
-        notify_inmem_epoll(self.captured_file_table().epoll_wake_registry());
+        if let Some(cross) = self.cross {
+            cross.notify_inmem_epoll();
+        }
     }
 
     pub(in crate::dispatch) fn io_uring_description(
         &self,
         fd: i32,
     ) -> Option<Arc<crate::kernel::FileDescription>> {
-        let description = self.open_file(fd)?.description;
-        if description
-            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
-            .is_some()
-        {
-            Some(description)
-        } else {
-            None
-        }
+        self.cross.and_then(|c| c.io_uring_description(fd))
     }
 
     pub(super) fn io_is_nonblocking(&self, fd: i32, msg_flags: i32) -> bool {
@@ -851,12 +845,7 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn perf_event_state(&self, fd: i32) -> Option<Arc<super::perf::PerfEventState>> {
-        let open_file = self.open_file(fd)?;
-        let open = open_file.description.read()?;
-        match &*open {
-            OpenDescription::PerfEvent { state, .. } => Some(state.clone()),
-            _ => None,
-        }
+        self.cross.and_then(|c| c.perf_event_state(fd))
     }
 
     pub(super) fn perf_event_ioctl<M: CurrentMmMemory>(
@@ -903,26 +892,14 @@ impl<'a> FsView<'a> {
         &self,
         fd: i32,
     ) -> Result<(HostFd, i32), LinuxErrno> {
-        let Some(open_file) = self.open_file(fd) else {
-            return Err(LINUX_EBADF);
-        };
-        let open = open_file.description.read().ok_or(LINUX_ENOTSOCK)?;
-        match &*open {
-            OpenDescription::HostSocket {
-                host_fd, family, ..
-            } => Ok((host_fd.view(), *family)),
-            _ => Err(LINUX_ENOTSOCK),
+        if let Some(cross) = self.cross {
+            return cross.host_socket_lookup(fd);
         }
+        Err(LINUX_EBADF)
     }
 
     pub(in crate::dispatch) fn socket_guest_type(&self, fd: i32) -> Option<i32> {
-        let open_file = self.open_file(fd)?;
-        let open = open_file.description.read()?;
-        match &*open {
-            OpenDescription::HostSocket { type_, .. } => Some(*type_),
-            OpenDescription::Netlink { sock_type, .. } => Some(*sock_type),
-            _ => None,
-        }
+        self.cross.and_then(|c| c.socket_guest_type(fd))
     }
 
     pub(in crate::dispatch) fn complete_wait_fd_authority(
@@ -2492,9 +2469,6 @@ forward_fs_handlers! {
     pwrite64,
     preadv,
     pwritev,
-    sendfile,
-    vmsplice,
-    splice,
     readlinkat,
     newfstatat,
     fstat,
@@ -2530,7 +2504,6 @@ forward_fs_handlers! {
     sys_statfs,
     sys_fstatfs,
     sys_truncate,
-    tee,
 }
 
 #[allow(dead_code)]

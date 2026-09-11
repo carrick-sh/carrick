@@ -936,7 +936,7 @@ impl<'a> FsView<'a> {
     }
 
     define_syscall! {
-        fn tee(this, cx, fd_in: Fd, fd_out: Fd, len: u64, flags: u64) {
+        fn tee_dispatch(this, cx, fd_in: Fd, fd_out: Fd, len: u64, flags: u64) {
             // tee(2) duplicates up to `len` bytes of pipe data from fd_in to
             // fd_out WITHOUT consuming the source.
             let _ = cx;
@@ -994,7 +994,7 @@ impl<'a> FsView<'a> {
             Ok(DispatchOutcome::errno(LINUX_EINVAL))
         }
 
-        fn splice(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {
+        fn splice_dispatch(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {
             let tid = cx.tid();
             let in_fd: Fd = fd_in;
             let off_in_address = off_in.0;
@@ -1460,7 +1460,7 @@ impl<'a> FsView<'a> {
             Ok(DispatchOutcome::Returned { value })
         }
 
-        fn vmsplice(this, cx, fd: Fd, iov: GuestPtr, nr_segs: u64, flags: u64) {
+        fn vmsplice_dispatch(this, cx, fd: Fd, iov: GuestPtr, nr_segs: u64, flags: u64) {
             // vmsplice(2): fd must be a pipe; the pipe END selects the direction —
             // the WRITE end gathers user pages into the pipe, the READ end extracts
             // pipe bytes into user pages. SPLICE_F_GIFT/MOVE/MORE are advisory hints
@@ -1614,6 +1614,23 @@ impl<'a> FsView<'a> {
                     Ok(DispatchOutcome::returned_len_or_errno(off))
                 }
             }
+        }
+    }
+}
+
+impl SyscallDispatcher {
+    define_syscall! {
+        fn tee(this, cx, fd_in: Fd, fd_out: Fd, len: u64, flags: u64) {
+            let _ = (fd_in, fd_out, len, flags);
+            this.fs_view().tee_dispatch(cx)
+        }
+        fn splice(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {
+            let _ = (fd_in, off_in, fd_out, off_out, len, flags);
+            this.fs_view().splice_dispatch(cx)
+        }
+        fn vmsplice(this, cx, fd: Fd, iov: GuestPtr, nr_segs: u64, flags: u64) {
+            let _ = (fd, iov, nr_segs, flags);
+            this.fs_view().vmsplice_dispatch(cx)
         }
     }
 }
