@@ -223,3 +223,11 @@ rows, (4) resume the perf2x campaign.
 - (2) dispatched (`views-routing`).
 - rerere is now disabled for this clone (`git config rerere.enabled false`)
   after it replayed a wrong inventory resolution onto a later rebase.
+- (1) `coredumpfile` LANDED (22f6ddbf1): `try_claim_persistent_process_exit`
+  no longer flips `process_exiting` before capture; `CrashQuorum` snapshots
+  the census at open, collects parked registers from blocked/withdrawing
+  siblings, treats a dropped participation as departure, and has no
+  wall-clock deadline. `vcpu_loop` + `core_publication` test filters return
+  (the round-1 branch hung one of them for 44 minutes); probe 3/3 alone and
+  10/10 under `cargo clippy` load per the worker. Item 1 is complete; a
+  full probe gate + CI on main is running to confirm (phase2b logs).
