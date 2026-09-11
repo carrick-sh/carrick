@@ -513,10 +513,12 @@ impl SyscallDispatcher {
             this.open_at_path_string(
                 cx.kernel,
                 cx.thread.as_ref().map(|thread| thread.registry),
-                crate::linux_abi::LINUX_AT_FDCWD,
-                &resolved,
-                open_flags,
-                0,
+                crate::dispatch::fs::OpenAtArgs {
+                    dirfd: crate::linux_abi::LINUX_AT_FDCWD,
+                    path: &resolved,
+                    flags: open_flags,
+                    mode: 0,
+                },
                 cx.reporter,
             )
         }

@@ -700,3 +700,349 @@ pub(crate) fn resolv_conf_contents_for_network(
 ) -> Vec<u8> {
     model.render_resolv_conf()
 }
+
+// ============================================================================
+// Subsystem Views
+// ============================================================================
+
+/// Cross-subsystem capabilities required during filesystem operations (such as fd close lifecycle).
+pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
+    fn detach_fd_from_epolls(&self, fd: i32);
+    fn close_open_file_and_free_pty(&self, open_file: &OpenFile);
+    fn mqueue_owner_alias_closed(
+        &self,
+        files: &Arc<crate::kernel::FileTable>,
+        open_file: &OpenFile,
+    );
+    fn mqueue_owner_alias_closed_known(
+        &self,
+        file_table: crate::kernel::FileTableId,
+        open_file: &OpenFile,
+        alias_remains: bool,
+    );
+    fn close_draining_file_table(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        files: &Arc<crate::kernel::FileTable>,
+        owner: Option<crate::kernel::TaskKey>,
+        exec_successor: Option<&Arc<crate::kernel::FileTable>>,
+    );
+    fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool;
+    fn take_signalfd_bytes(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: carrick_abi::SigSet,
+        max: usize,
+    ) -> Vec<u8>;
+    fn perf_event_read_bytes(
+        &self,
+        state: &Arc<crate::dispatch::perf::PerfEventState>,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_abi::LinuxErrno>;
+    fn perf_event_ioctl_out(
+        &self,
+        reporter: &carrick_observability::compat::CompatReporter,
+        fd: i32,
+        state: &Arc<crate::dispatch::perf::PerfEventState>,
+        request: u64,
+        arg: u64,
+    ) -> Result<Option<[u8; 8]>, carrick_abi::LinuxErrno>;
+    fn memfd_has_writable_shared_map(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+    ) -> bool;
+    fn range_touches_secretmem(&self, start: u64, len: u64) -> bool;
+    fn is_synthetic_virtual_path(&self, context: &crate::kernel::KernelContext, path: &str)
+    -> bool;
+    fn complete_wait_fd_authority(
+        &self,
+        outcome: super::DispatchOutcome,
+        files: &crate::kernel::objects::FileTable,
+        wait_fds: &[i32],
+    ) -> super::DispatchOutcome;
+    fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext>;
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable>;
+    fn captured_mm(&self) -> Arc<crate::kernel::Mm>;
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
+    fn cwd(&self) -> String;
+    fn mem_snapshot(&self) -> super::mem::MemState;
+    fn identity_pid(&self) -> u32;
+    fn captured_slot_authority(&self, fd: i32)
+    -> Option<crate::kernel::objects::FileSlotAuthority>;
+    fn rename_open_paths(&self, resolved_old: &str, resolved_new: &str);
+    fn authority_call(
+        &self,
+        table: Arc<crate::kernel::FileTable>,
+        slot: crate::kernel::objects::FileSlotAuthority,
+        command: crate::file_authority::Command,
+    ) -> Result<crate::file_authority::Outcome, super::AuthorityCallError>;
+    fn write_eventfd(&self, bytes: &[u8], state: &super::EventFdState) -> super::DispatchOutcome;
+}
+
+impl FsCrossSubsystem for SyscallDispatcher {
+    fn detach_fd_from_epolls(&self, fd: i32) {
+        self.detach_fd_from_epolls(fd);
+    }
+    fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
+        self.close_open_file_and_free_pty(open_file);
+    }
+    fn mqueue_owner_alias_closed(
+        &self,
+        files: &Arc<crate::kernel::FileTable>,
+        open_file: &OpenFile,
+    ) {
+        self.mqueue_owner_alias_closed(files, open_file);
+    }
+    fn mqueue_owner_alias_closed_known(
+        &self,
+        file_table: crate::kernel::FileTableId,
+        open_file: &OpenFile,
+        alias_remains: bool,
+    ) {
+        self.mqueue_owner_alias_closed_known(file_table, open_file, alias_remains);
+    }
+    fn close_draining_file_table(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        files: &Arc<crate::kernel::FileTable>,
+        owner: Option<crate::kernel::TaskKey>,
+        exec_successor: Option<&Arc<crate::kernel::FileTable>>,
+    ) {
+        self.close_draining_file_table(kernel, files, owner, exec_successor);
+    }
+    fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask)
+    }
+    fn take_signalfd_bytes(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: carrick_abi::SigSet,
+        max: usize,
+    ) -> Vec<u8> {
+        self.take_signalfd_bytes(context, tid, mask, max)
+    }
+    fn perf_event_read_bytes(
+        &self,
+        state: &Arc<crate::dispatch::perf::PerfEventState>,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_abi::LinuxErrno> {
+        self.perf_event_read_bytes(state, length)
+    }
+    fn perf_event_ioctl_out(
+        &self,
+        reporter: &carrick_observability::compat::CompatReporter,
+        fd: i32,
+        state: &Arc<crate::dispatch::perf::PerfEventState>,
+        request: u64,
+        arg: u64,
+    ) -> Result<Option<[u8; 8]>, carrick_abi::LinuxErrno> {
+        self.perf_event_ioctl_out(reporter, fd, state, request, arg)
+    }
+    fn memfd_has_writable_shared_map(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+    ) -> bool {
+        self.memfd_has_writable_shared_map(description)
+    }
+    fn range_touches_secretmem(&self, start: u64, len: u64) -> bool {
+        self.range_touches_secretmem(start, len)
+    }
+    fn is_synthetic_virtual_path(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+    ) -> bool {
+        self.is_synthetic_virtual_path(context, path)
+    }
+    fn complete_wait_fd_authority(
+        &self,
+        outcome: super::DispatchOutcome,
+        files: &crate::kernel::objects::FileTable,
+        wait_fds: &[i32],
+    ) -> super::DispatchOutcome {
+        self.complete_wait_fd_authority(outcome, files, wait_fds.iter().copied())
+    }
+    fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext> {
+        self.captured_fs_context()
+    }
+    fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        self.captured_file_table()
+    }
+    fn captured_mm(&self) -> Arc<crate::kernel::Mm> {
+        self.captured_mm()
+    }
+    fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        self.cred_snapshot()
+    }
+    fn cwd(&self) -> String {
+        self.cwd()
+    }
+    fn mem_snapshot(&self) -> super::mem::MemState {
+        self.mem_snapshot()
+    }
+    fn identity_pid(&self) -> u32 {
+        self.identity_pid()
+    }
+    fn captured_slot_authority(
+        &self,
+        fd: i32,
+    ) -> Option<crate::kernel::objects::FileSlotAuthority> {
+        self.captured_slot_authority(fd)
+    }
+    fn rename_open_paths(&self, resolved_old: &str, resolved_new: &str) {
+        self.rename_open_paths(resolved_old, resolved_new);
+    }
+    fn authority_call(
+        &self,
+        table: Arc<crate::kernel::FileTable>,
+        slot: crate::kernel::objects::FileSlotAuthority,
+        command: crate::file_authority::Command,
+    ) -> Result<crate::file_authority::Outcome, super::AuthorityCallError> {
+        self.authority_call(table, slot, command)
+    }
+    fn write_eventfd(&self, bytes: &[u8], state: &super::EventFdState) -> super::DispatchOutcome {
+        super::write_eventfd(self, bytes, state)
+    }
+}
+
+/// Subsystem view for filesystem operations.
+pub struct FsView<'a> {
+    pub(in crate::dispatch) fs: &'a fs::FsState,
+    pub(in crate::dispatch) file_authority:
+        &'a RwLock<Option<Arc<crate::file_authority::FileAuthorityRun>>>,
+    pub(in crate::dispatch) io: &'a fs::RuntimeIo,
+    pub(in crate::dispatch) mm_binding: &'a Arc<DispatchMmBinding>,
+    pub(in crate::dispatch) proc: &'a Mutex<proc::ProcState>,
+    pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+    pub(in crate::dispatch) network: &'a Arc<crate::network::RuntimeNetwork>,
+    pub(in crate::dispatch) page_geometry: crate::page_profile::PageGeometry,
+    #[allow(dead_code)]
+    pub(in crate::dispatch) sysv: Option<&'a Arc<sysv::SysvIpcNamespace>>,
+    pub(in crate::dispatch) exec_host_fs_fallback: bool,
+    pub(in crate::dispatch) cross: Option<&'a (dyn FsCrossSubsystem + 'a)>,
+}
+
+/// Subsystem view for network operations.
+#[allow(dead_code)]
+pub struct NetView<'a> {
+    pub(in crate::dispatch) network: &'a Arc<crate::network::RuntimeNetwork>,
+    pub(in crate::dispatch) file_authority:
+        &'a RwLock<Option<Arc<crate::file_authority::FileAuthorityRun>>>,
+    pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+    pub(in crate::dispatch) io: &'a fs::RuntimeIo,
+    pub(in crate::dispatch) fs: &'a fs::FsState,
+}
+
+/// Subsystem view for process operations.
+#[allow(dead_code)]
+pub struct ProcView<'a> {
+    pub(in crate::dispatch) proc: &'a Mutex<proc::ProcState>,
+    pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+    pub(in crate::dispatch) container: &'a RwLock<Option<Arc<crate::kernel::Container>>>,
+    pub(in crate::dispatch) exec_host_fs_fallback: bool,
+}
+
+/// Subsystem view for signal operations.
+#[allow(dead_code)]
+pub struct SignalView<'a> {
+    pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+    pub(in crate::dispatch) signal_pump_requested: &'a std::sync::atomic::AtomicBool,
+    pub(in crate::dispatch) async_signal_wake_owner: AsyncSignalWakeOwner,
+}
+
+/// Subsystem view for IPC operations.
+#[allow(dead_code)]
+pub struct IpcView<'a> {
+    pub(in crate::dispatch) sysv: &'a Arc<sysv::SysvIpcNamespace>,
+    pub(in crate::dispatch) sysv_process: &'a Mutex<sysv::SysvProcessAttachments>,
+    pub(in crate::dispatch) mqueue: &'a Arc<mqueue::MqueueRegistry>,
+    pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+}
+
+/// Subsystem view for memory operations.
+#[allow(dead_code)]
+pub struct MemView<'a> {
+    pub(in crate::dispatch) mm_binding: &'a Arc<DispatchMmBinding>,
+    pub(in crate::dispatch) page_geometry: crate::page_profile::PageGeometry,
+    pub(in crate::dispatch) kernel_binding: &'a RwLock<crate::kernel::KernelTaskBinding>,
+}
+
+impl SyscallDispatcher {
+    #[inline]
+    pub fn fs_view(&self) -> FsView<'_> {
+        FsView {
+            fs: &self.fs,
+            file_authority: &self.file_authority,
+            io: &self.io,
+            mm_binding: &self.mm_binding,
+            proc: &self.proc,
+            kernel_binding: &self.kernel_binding,
+            network: &self.network,
+            page_geometry: self.page_geometry,
+            sysv: Some(&self.sysv),
+            exec_host_fs_fallback: self.exec_host_fs_fallback,
+            cross: Some(self),
+        }
+    }
+
+    #[inline]
+    pub fn net_view(&self) -> NetView<'_> {
+        NetView {
+            network: &self.network,
+            file_authority: &self.file_authority,
+            kernel_binding: &self.kernel_binding,
+            io: &self.io,
+            fs: &self.fs,
+        }
+    }
+
+    #[inline]
+    pub fn proc_view(&self) -> ProcView<'_> {
+        ProcView {
+            proc: &self.proc,
+            kernel_binding: &self.kernel_binding,
+            container: &self.container,
+            exec_host_fs_fallback: self.exec_host_fs_fallback,
+        }
+    }
+
+    #[inline]
+    pub fn signal_view(&self) -> SignalView<'_> {
+        SignalView {
+            kernel_binding: &self.kernel_binding,
+            signal_pump_requested: &self.signal_pump_requested,
+            async_signal_wake_owner: self.async_signal_wake_owner,
+        }
+    }
+
+    #[inline]
+    pub fn ipc_view(&self) -> IpcView<'_> {
+        IpcView {
+            sysv: &self.sysv,
+            sysv_process: &self.sysv_process,
+            mqueue: &self.mqueue,
+            kernel_binding: &self.kernel_binding,
+        }
+    }
+
+    #[inline]
+    pub fn mem_view(&self) -> MemView<'_> {
+        MemView {
+            mm_binding: &self.mm_binding,
+            page_geometry: self.page_geometry,
+            kernel_binding: &self.kernel_binding,
+        }
+    }
+}

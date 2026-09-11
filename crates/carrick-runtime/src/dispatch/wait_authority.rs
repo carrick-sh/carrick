@@ -320,6 +320,7 @@ impl std::ops::Deref for WaitFds {
 }
 
 impl SyscallDispatcher {
+    #[allow(dead_code)]
     pub(in crate::dispatch) fn complete_wait_fd_authority(
         &self,
         outcome: DispatchOutcome,

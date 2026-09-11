@@ -24,7 +24,7 @@ pub(crate) struct ReadFanotifyRequest<'a, M> {
     pub(crate) guest_fd: i32,
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     pub(in crate::dispatch) fn dnotify_register(
         &self,
         context: &crate::kernel::KernelContext,
@@ -538,7 +538,7 @@ impl SyscallDispatcher {
 /// closed and the events are pushed back on the front of the queue, so the
 /// guest's `EFAULT` leaves nothing consumed and no fd leaked.
 pub(in crate::dispatch) fn read_fanotify<M: CurrentMmMemory>(
-    this: &SyscallDispatcher,
+    this: &FsView<'_>,
     req: ReadFanotifyRequest<'_, M>,
 ) -> Result<DispatchOutcome, DispatchError> {
     // A buffer too small for even one record can never make progress.
@@ -576,10 +576,12 @@ pub(in crate::dispatch) fn read_fanotify<M: CurrentMmMemory>(
         let fd = match this.open_at_path_string(
             req.context,
             req.registry,
-            LINUX_AT_FDCWD,
-            &event.path,
-            req.group.event_f_flags(),
-            0,
+            OpenAtArgs {
+                dirfd: LINUX_AT_FDCWD,
+                path: &event.path,
+                flags: req.group.event_f_flags(),
+                mode: 0,
+            },
             req.reporter,
         ) {
             Ok(DispatchOutcome::Returned { value }) if value >= 0 => {

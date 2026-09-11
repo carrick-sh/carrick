@@ -27,7 +27,7 @@ struct RecordLockRequest<'a, M> {
 /// macOS flock (`libc::flock`): l_start:i64, l_len:i64, l_pid:i32, l_type:i16,
 ///   l_whence:i16. l_type: RDLCK=1, UNLCK=2, WRLCK=3. cmd: GETLK=7/SETLK=8/SETLKW=9.
 fn forward_record_lock<M: CurrentMmMemory>(
-    this: &SyscallDispatcher,
+    this: &FsView<'_>,
     req: RecordLockRequest<'_, M>,
 ) -> DispatchOutcome {
     // OFD locks (F_OFD_*) are owned by the open file description, not the process.
@@ -896,7 +896,7 @@ fn write_logical_record_lock_conflict(
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     /// Access modes (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) of every OTHER open file
     /// description that refers to the SAME underlying file as `fd` — i.e. a
     /// distinct `open(2)` of the same inode, not a `dup(2)` (which shares the

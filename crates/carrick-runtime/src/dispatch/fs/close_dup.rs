@@ -11,7 +11,7 @@ use crate::linux_abi::{
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     fn dup_stdio_pty_role(&self, old_fd: i32) -> Option<crate::vfs::PtyRole> {
         if crate::host_tty::host_isatty(old_fd) {
             let index = self.pty_table().lock().controlling().unwrap_or(0);

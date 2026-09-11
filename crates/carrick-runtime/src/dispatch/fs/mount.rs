@@ -10,7 +10,9 @@ impl SyscallDispatcher {
     ) {
         self.fs.vfs_mounts_mut().mount(point, vfs);
     }
+}
 
+impl<'a> FsView<'a> {
     define_syscall! {
         fn getcwd(this, cx, address: GuestPtr, size: u64) {
             let address = address.0;

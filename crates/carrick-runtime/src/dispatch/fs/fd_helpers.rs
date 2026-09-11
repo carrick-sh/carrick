@@ -20,7 +20,7 @@ pub(in crate::dispatch) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     fn first_free_fd<S: std::hash::BuildHasher>(
         table: &HashMap<i32, OpenFile, S>,
         min_fd: i32,

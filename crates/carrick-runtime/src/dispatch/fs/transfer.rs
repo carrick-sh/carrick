@@ -49,7 +49,7 @@ struct InMemoryTeeEndpoint<'a> {
     status_flags: u64,
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     /// True iff `fd` refers to a genuine pipe end — an anonymous pipe, a FIFO,
     /// or a pty — as opposed to a char device (e.g. `/dev/zero`, which carrick
     /// also models as a `HostPipe`), a socket, or a regular file. splice(2)

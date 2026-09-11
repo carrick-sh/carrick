@@ -6,7 +6,7 @@
 use super::*;
 use crate::linux_abi::LINUX_ELOOP;
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     pub(super) fn access_at(
         &self,
         context: &crate::kernel::KernelContext,

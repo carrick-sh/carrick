@@ -1012,7 +1012,25 @@ impl SyscallDispatcher {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
         let max = length / SIGINFO_LEN;
-        let mut out: Vec<u8> = Vec::new();
+        let out = self.take_signalfd_bytes(context, tid, mask, max);
+        if out.is_empty() {
+            return DispatchOutcome::errno(LINUX_EAGAIN);
+        }
+        if memory.write_bytes(address, &out).is_err() {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
+        DispatchOutcome::returned_len_or_errno(out.len())
+    }
+
+    pub(crate) fn take_signalfd_bytes(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        mask: SigSet,
+        max: usize,
+    ) -> Vec<u8> {
+        const SIGINFO_LEN: usize = 128;
+        let mut out = Vec::new();
         for _ in 0..max {
             let Some(pending) = self.take_pending_in_from(context, tid, mask) else {
                 break;
@@ -1030,13 +1048,7 @@ impl SyscallDispatcher {
             }
             out.extend_from_slice(&rec);
         }
-        if out.is_empty() {
-            return DispatchOutcome::errno(LINUX_EAGAIN);
-        }
-        if memory.write_bytes(address, &out).is_err() {
-            return DispatchOutcome::errno(LINUX_EFAULT);
-        }
-        DispatchOutcome::returned_len_or_errno(out.len())
+        out
     }
 
     /// Record a PROCESS-directed signal in the SHARED pending set (no thread

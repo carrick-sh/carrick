@@ -3428,10 +3428,12 @@ fn bind_mount_rejects_o_directory_for_regular_file() {
             .open_at_path_string(
                 &dispatcher.exact_signal_context_for_test(),
                 None,
-                LINUX_AT_FDCWD,
-                "/bind/target",
-                flags,
-                0,
+                OpenAtArgs {
+                    dirfd: LINUX_AT_FDCWD,
+                    path: "/bind/target",
+                    flags,
+                    mode: 0,
+                },
                 &reporter,
             )
             .unwrap();
@@ -3443,10 +3445,12 @@ fn bind_mount_rejects_o_directory_for_regular_file() {
         .open_at_path_string(
             &dispatcher.exact_signal_context_for_test(),
             None,
-            LINUX_AT_FDCWD,
-            "/bind/missing",
-            LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_DIRECTORY,
-            0o600,
+            OpenAtArgs {
+                dirfd: LINUX_AT_FDCWD,
+                path: "/bind/missing",
+                flags: LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_DIRECTORY,
+                mode: 0o600,
+            },
             &reporter,
         )
         .unwrap();
@@ -3458,10 +3462,12 @@ fn bind_mount_rejects_o_directory_for_regular_file() {
             .open_at_path_string(
                 &dispatcher.exact_signal_context_for_test(),
                 None,
-                LINUX_AT_FDCWD,
-                "/bind",
-                crate::linux_abi::LINUX_O_PATH | LINUX_O_DIRECTORY,
-                0,
+                OpenAtArgs {
+                    dirfd: LINUX_AT_FDCWD,
+                    path: "/bind",
+                    flags: crate::linux_abi::LINUX_O_PATH | LINUX_O_DIRECTORY,
+                    mode: 0,
+                },
                 &reporter,
             )
             .unwrap(),
@@ -8144,4 +8150,142 @@ fn test_path_resolution_observable_behavior_pinned() {
         57,
         [open_follow_fd as u64, 0, 0, 0, 0, 0],
     );
+}
+
+struct FsViewFixture {
+    fs: FsState,
+    file_authority: RwLock<Option<Arc<crate::file_authority::FileAuthorityRun>>>,
+    io: RuntimeIo,
+    mm_binding: Arc<DispatchMmBinding>,
+    proc: Mutex<proc::ProcState>,
+    kernel_binding: RwLock<crate::kernel::KernelTaskBinding>,
+    network: Arc<crate::network::RuntimeNetwork>,
+    page_geometry: crate::page_profile::PageGeometry,
+}
+
+impl FsViewFixture {
+    fn new() -> Self {
+        let (kernel_binding, mm_id) = crate::dispatch::kernel_context::bootstrap_one_task_binding();
+        let mm_authority = Arc::new(DispatchMmAuthority::new(mm_id));
+        Self {
+            fs: FsState::new_with_host_resolver(None),
+            file_authority: RwLock::new(None),
+            io: RuntimeIo::new(),
+            mm_binding: DispatchMmBinding::new(mm_authority),
+            proc: Mutex::new(proc::ProcState::new()),
+            kernel_binding: RwLock::new(kernel_binding),
+            network: Arc::new(crate::network::RuntimeNetwork::host_default()),
+            page_geometry: crate::page_profile::PageGeometry {
+                host_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+                linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
+                native_profile: None,
+            },
+        }
+    }
+
+    fn view(&self) -> FsView<'_> {
+        FsView {
+            fs: &self.fs,
+            file_authority: &self.file_authority,
+            io: &self.io,
+            mm_binding: &self.mm_binding,
+            proc: &self.proc,
+            kernel_binding: &self.kernel_binding,
+            network: &self.network,
+            page_geometry: self.page_geometry,
+            sysv: None,
+            exec_host_fs_fallback: false,
+            cross: None,
+        }
+    }
+}
+
+#[test]
+fn fs_view_direct_construction_and_operations() {
+    let fixture = FsViewFixture::new();
+    let view = fixture.view();
+
+    // 1. Directory anchor resolution without a SyscallDispatcher
+    let anchor = view
+        .openat2_anchor_for_dirfd(carrick_abi::LINUX_AT_FDCWD as u64)
+        .expect("openat2 anchor for AT_FDCWD");
+    assert_eq!(anchor, "/");
+
+    // 2. Duplicate stdio fd directly through FsView
+    let dup_outcome = view.duplicate_fd(0, 0, 0);
+    let new_fd = match dup_outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("expected returned fd, got {:?}", other),
+    };
+    assert!(
+        new_fd >= 3,
+        "duped fd must be allocated at or above 3, got {}",
+        new_fd
+    );
+    assert!(view.fd_table_contains(new_fd));
+
+    // 3. Stat the duped fd through FsView
+    let stat = view
+        .fd_stat_record(new_fd)
+        .expect("fd_stat_record on duped fd");
+    assert!(stat.mode != 0);
+
+    // 4. Duplicate again with min_fd constraint
+    let dup2_outcome = view.duplicate_fd(new_fd, 10, 0);
+    let new_fd2 = match dup2_outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("expected returned fd, got {:?}", other),
+    };
+    assert!(new_fd2 >= 10, "duped fd must be >= 10, got {}", new_fd2);
+    assert!(view.fd_table_contains(new_fd2));
+
+    // 5. Test SyscallCtx handlers directly on FsView without SyscallDispatcher
+    let context = view.capture_one_task_context().expect("context");
+    let reporter = carrick_observability::compat::CompatReporter::default();
+    let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 64]);
+
+    // Test dup handler on FsView
+    let mut dup_req = crate::dispatch::SyscallCtx {
+        kernel: &context,
+        request: crate::dispatch::SyscallRequest::new(
+            23, // dup
+            crate::dispatch::SyscallArgs::from([new_fd as u64, 0, 0, 0, 0, 0]),
+        ),
+        memory: &mut memory,
+        reporter: &reporter,
+        thread: None,
+        execution_lease: None,
+        mm_executor: None,
+    };
+    let handler_dup_outcome = resources::with_captured_resources(&context, || {
+        view.dup(&mut dup_req).expect("dup handler on FsView")
+    });
+    let new_fd3 = match handler_dup_outcome {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("expected returned fd from dup handler, got {:?}", other),
+    };
+    assert!(new_fd3 >= 3);
+    assert!(view.fd_table_contains(new_fd3));
+
+    // Test close handler on FsView
+    let mut close_req = crate::dispatch::SyscallCtx {
+        kernel: &context,
+        request: crate::dispatch::SyscallRequest::new(
+            57, // close
+            crate::dispatch::SyscallArgs::from([new_fd3 as u64, 0, 0, 0, 0, 0]),
+        ),
+        memory: &mut memory,
+        reporter: &reporter,
+        thread: None,
+        execution_lease: None,
+        mm_executor: None,
+    };
+    let handler_close_outcome = resources::with_captured_resources(&context, || {
+        view.close(&mut close_req).expect("close handler on FsView")
+    });
+    assert_eq!(
+        handler_close_outcome,
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(!view.fd_table_contains(new_fd3));
 }

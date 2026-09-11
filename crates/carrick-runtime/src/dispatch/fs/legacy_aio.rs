@@ -105,11 +105,11 @@ impl LegacyAioIocb {
     }
 }
 
-fn legacy_aio_context_exists(this: &SyscallDispatcher, ctx: LegacyAioContextId) -> bool {
+fn legacy_aio_context_exists(this: &FsView<'_>, ctx: LegacyAioContextId) -> bool {
     this.captured_mm().read_legacy_aio_contexts().contains(&ctx)
 }
 
-fn legacy_aio_iocb_errno(this: &SyscallDispatcher, iocb: LegacyAioIocb) -> Option<LinuxErrno> {
+fn legacy_aio_iocb_errno(this: &FsView<'_>, iocb: LegacyAioIocb) -> Option<LinuxErrno> {
     let open_file = this.open_file(iocb.fd.0)?;
     let access = open_file.description.common().status_flags() & LINUX_O_ACCMODE;
     if iocb.opcode.needs_readable_fd() && access == LINUX_O_WRONLY {
@@ -135,7 +135,7 @@ fn legacy_aio_iocb_errno(this: &SyscallDispatcher, iocb: LegacyAioIocb) -> Optio
 }
 
 pub(super) fn io_setup<M: CurrentMmMemory>(
-    this: &SyscallDispatcher,
+    this: &FsView<'_>,
     cx: &mut SyscallCtx<M>,
     nr_events: u64,
     ctxp: GuestPtr,
@@ -172,7 +172,7 @@ pub(super) fn io_setup<M: CurrentMmMemory>(
 }
 
 pub(super) fn io_destroy(
-    this: &SyscallDispatcher,
+    this: &FsView<'_>,
     raw_ctx: u64,
 ) -> Result<DispatchOutcome, DispatchError> {
     let Some(ctx) = LegacyAioContextId::from_guest(raw_ctx) else {
@@ -186,7 +186,7 @@ pub(super) fn io_destroy(
 }
 
 pub(super) fn io_submit<M: CurrentMmMemory>(
-    this: &SyscallDispatcher,
+    this: &FsView<'_>,
     cx: &mut SyscallCtx<M>,
     raw_ctx: u64,
     raw_count: u64,
@@ -231,7 +231,7 @@ pub(super) fn io_submit<M: CurrentMmMemory>(
 }
 
 pub(super) fn io_cancel<M: CurrentMmMemory>(
-    this: &SyscallDispatcher,
+    this: &FsView<'_>,
     cx: &mut SyscallCtx<M>,
     raw_ctx: u64,
     iocb: GuestPtr,
@@ -253,7 +253,7 @@ pub(super) fn io_cancel<M: CurrentMmMemory>(
 }
 
 pub(super) fn io_getevents<M: CurrentMmMemory>(
-    this: &SyscallDispatcher,
+    this: &FsView<'_>,
     cx: &mut SyscallCtx<M>,
     raw_ctx: u64,
     min_nr: u64,
@@ -276,7 +276,7 @@ pub(super) fn io_getevents<M: CurrentMmMemory>(
     Ok(DispatchOutcome::Returned { value: 0 })
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     define_syscall! {
         fn io_setup(this, cx, nr_events: u64, ctxp: GuestPtr) {
             io_setup(this, cx, nr_events, ctxp)

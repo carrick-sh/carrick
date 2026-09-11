@@ -79,7 +79,7 @@ impl PathLookup {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     /// The single, unified path resolution entry point for filesystem operations.
     ///
     /// Handles:
