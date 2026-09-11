@@ -66,7 +66,9 @@ impl SyscallDispatcher {
             DotdotDepthGuard::enter().expect("enter persistent test path-resolution depth"),
         )
     }
+}
 
+impl<'a> FsView<'a> {
     /// Layered "is this a directory?" probe used by mkdirat / openat
     /// (O_CREAT) parent-existence checks. The synthetic /proc and
     /// /sys roots count as directories so that

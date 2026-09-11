@@ -74,7 +74,7 @@ fn host_fd_matches_device(host_fd: i32, path: &str) -> bool {
         && fd_stat.st_rdev == path_stat.st_rdev
 }
 
-fn fd_is_random_device(this: &SyscallDispatcher, fd: i32) -> bool {
+fn fd_is_random_device(this: &FsView<'_>, fd: i32) -> bool {
     this.open_file(fd)
         .is_some_and(|open_file| match open_file.description.read().as_deref() {
             Some(OpenDescription::HostPipe { host_fd, .. }) => {
@@ -171,7 +171,7 @@ enum FicloneFs {
     Other,
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     fn tty_ioctl_fd_kind(&self, fd: i32) -> Result<TtyFdKind, LinuxErrno> {
         if is_stdio_fd(fd) && !self.stdio_is_closed(fd) && !self.fd_table_contains(fd) {
             Ok(TtyFdKind::Stdio)

@@ -17,7 +17,7 @@ fn darwin_copyfile_fast_path_disabled() -> bool {
     })
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     /// copy_file_range(2): like sendfile but file-to-file with independent
     /// in/out offset pointers. coreutils `cat`/`cp` and apt/dpkg use it for
     /// efficient copies; it was unimplemented and the panic-on-unknown guard

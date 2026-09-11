@@ -99,7 +99,66 @@ fn prepare_readv_targets(
     }))
 }
 
-impl SyscallDispatcher {
+fn write_eventfd(this: &FsView<'_>, bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
+    if let Some(cross) = this.cross {
+        return cross.write_eventfd(bytes, state);
+    }
+    if bytes.len() != core::mem::size_of::<LinuxEventfdValue>() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    let Ok(value) = LinuxEventfdValue::read_from_bytes(bytes) else {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    };
+    let increment = value.value;
+    if increment == u64::MAX {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    let counter = state.counter_ref();
+    loop {
+        let current = counter.load(std::sync::atomic::Ordering::SeqCst);
+        let next = match current.checked_add(increment) {
+            Some(next) if next < u64::MAX => next,
+            _ => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EAGAIN,
+                };
+            }
+        };
+        if counter
+            .compare_exchange(
+                current,
+                next,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        crate::event_ring::rec(
+            crate::event_ring::EFDWRITE,
+            -1,
+            current as u32 as i32,
+            next as u32 as i32,
+        );
+        if current == 0 && next > 0 {
+            if let Some(w) = &state.write_fd {
+                let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
+            }
+            this.notify_inmem_epoll();
+        }
+        state.wait_queue.wake_all();
+        return DispatchOutcome::returned_len_or_errno(core::mem::size_of::<LinuxEventfdValue>());
+    }
+}
+
+impl<'a> FsView<'a> {
     /// The RLIMIT_FSIZE soft cap the guest set via setrlimit/prlimit64, or
     /// `None` when unset / RLIM_INFINITY. A write whose bytes would land past
     /// this offset is EFBIG + SIGXFSZ on Linux (llseek01). Stored in the

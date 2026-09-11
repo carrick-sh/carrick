@@ -4,7 +4,7 @@
 use super::*;
 use crate::linux_abi::LinuxErrno;
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     /// The synthetic `(label, st_mode)` for a bare stdio fd (0/1/2) with no
     /// OpenDescription. Glibc fstat()s stdio on startup to pick its tty/file/
     /// pipe code path, so report the REAL host type (a pty → S_IFCHR, a pipe →

@@ -235,7 +235,9 @@ mod stat;
 mod state;
 mod transfer;
 mod xattr;
+pub(crate) use super::dispatcher::FsView;
 pub(in crate::dispatch) use lookup::{LookupIntent, LookupTarget};
+pub(crate) use open::OpenAtArgs;
 pub(crate) use pipe::*;
 pub use state::StdioSink;
 use state::*;
@@ -363,7 +365,960 @@ pub(super) fn path_is_under_or_equal(path: &str, root: &str) -> bool {
 
 use super::fd_table::is_anon_overlay_path;
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
+    #[inline]
+    pub(super) fn captured_file_table(&self) -> Arc<crate::kernel::FileTable> {
+        if let Some(cross) = self.cross {
+            return cross.captured_file_table();
+        }
+        if let Some(files) = resources::files() {
+            return files;
+        }
+        self.capture_one_task_context()
+            .expect("test file-table context")
+            .resources()
+            .files()
+    }
+
+    #[inline]
+    pub fn capture_one_task_context(
+        &self,
+    ) -> Result<crate::kernel::KernelContext, crate::kernel::KernelError> {
+        let binding = self.kernel_binding.read();
+        binding.capture(crate::kernel::LinuxTid::for_task_leader(binding.task_id()))
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn captured_slot_authority(
+        &self,
+        fd: i32,
+    ) -> Option<crate::kernel::objects::FileSlotAuthority> {
+        if let Some(cross) = self.cross {
+            return cross.captured_slot_authority(fd);
+        }
+        let number = crate::kernel::FileSlotNumber::for_open_fd(fd).ok()?;
+        self.captured_file_table().capture_slot_authority(number)
+    }
+
+    #[inline]
+    pub(super) fn captured_fs_context(&self) -> Arc<crate::kernel::FsContext> {
+        if let Some(cross) = self.cross {
+            return cross.captured_fs_context();
+        }
+        if let Some(fs_context) = resources::fs_context() {
+            return fs_context;
+        }
+        self.capture_one_task_context()
+            .expect("test filesystem context")
+            .resources()
+            .fs_context()
+    }
+
+    #[inline]
+    pub(super) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
+        if let Some(cross) = self.cross {
+            return cross.cred_snapshot();
+        }
+        if let Some(credentials) = resources::credentials() {
+            return credentials;
+        }
+        self.capture_one_task_context()
+            .expect("test credential context")
+            .resources()
+            .credentials()
+    }
+
+    #[inline]
+    pub fn cwd(&self) -> String {
+        if let Some(cross) = self.cross {
+            return cross.cwd();
+        }
+        if let Some(fs_context) = resources::fs_context() {
+            return fs_context.cwd();
+        }
+        self.capture_one_task_context()
+            .expect("cannot capture initial filesystem context")
+            .resources()
+            .fs_context()
+            .cwd()
+    }
+
+    #[inline]
+    pub(crate) fn task_rlimits(&self) -> crate::kernel::RlimitSet {
+        if let Some(limits) = resources::rlimits() {
+            return limits;
+        }
+        #[cfg(test)]
+        if let Ok(context) = self.capture_one_task_context() {
+            return context.task().rlimits();
+        }
+        crate::kernel::RlimitSet::carrick_defaults()
+    }
+
+    #[inline]
+    pub(crate) fn effective_resource_limit(&self, resource: u64) -> LinuxRlimit {
+        let Ok(resource) = carrick_abi::LinuxResource::from_guest_arg(resource) else {
+            return LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY);
+        };
+        self.task_rlimits().get(resource)
+    }
+
+    #[inline]
+    pub fn signal_is_ignored(&self, context: &crate::kernel::KernelContext, signum: i32) -> bool {
+        crate::kernel::LinuxSignal::for_signal_number(signum)
+            .ok()
+            .and_then(|sig| context.shared().sighand().action_entry(sig))
+            .is_some_and(|action| action.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
+    }
+
+    pub fn mark_signal_pending(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) {
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+            return;
+        };
+        let Some(thread) = context.task().thread_by_registry_id(tid) else {
+            return;
+        };
+        let authority = crate::kernel::SignalAuthority::new(
+            context.shared().sighand(),
+            context.shared().pending_signals(),
+            Arc::clone(context.task()),
+            thread,
+        );
+        if signal.is_realtime() {
+            authority.enqueue_thread_realtime(signal, None);
+        } else {
+            authority.enqueue_thread_standard(signal, None);
+        }
+        context.task().wake();
+    }
+
+    #[inline]
+    pub(crate) fn ctx_tid<M: CurrentMmMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
+        SyscallDispatcher::ctx_tid(ctx)
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn linux_page_size(&self) -> u64 {
+        self.page_geometry.linux_page_size
+    }
+
+    #[inline]
+    pub(super) fn page_geometry(&self) -> crate::page_profile::PageGeometry {
+        self.page_geometry
+    }
+
+    #[inline]
+    pub(super) fn event_ring_guest_pid(&self) -> i32 {
+        let Ok(context) = self.capture_one_task_context() else {
+            return 0;
+        };
+        let pid = context.task().key().id.raw();
+        if pid != 0 {
+            pid
+        } else {
+            context.thread().key().tid.raw()
+        }
+    }
+
+    pub(crate) fn record_fd_close_owner(&self, fd: i32, guest_tid: i32, open_file: &OpenFile) {
+        let guest_pid = self.event_ring_guest_pid();
+        let refs_before = open_file.description.fd_ref_count();
+        crate::event_ring::rec(crate::event_ring::FDOWNER, guest_pid, guest_tid, fd);
+        crate::event_ring::rec(
+            crate::event_ring::FDREF,
+            guest_pid,
+            fd,
+            i32::try_from(refs_before).unwrap_or(i32::MAX),
+        );
+    }
+
+    pub(super) fn current_groups(&self) -> Vec<carrick_abi::NsGid> {
+        let credentials = self.cred_snapshot();
+        match credentials.supplementary_groups_override() {
+            Some(groups) => groups.to_vec(),
+            None => {
+                let egid = credentials.egid;
+                let mut gids: Vec<carrick_abi::NsGid> = vec![egid];
+                let euid = credentials.euid;
+                let username =
+                    self.read_exec_file_head("/etc/passwd", 64 * 1024)
+                        .and_then(|passwd| {
+                            String::from_utf8_lossy(&passwd).lines().find_map(|line| {
+                                let f: Vec<&str> = line.split(':').collect();
+                                if f.len() >= 3 && f[2].parse::<u32>().ok() == Some(euid.raw()) {
+                                    Some(f[0].to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                if let (Some(user), Some(group)) =
+                    (username, self.read_exec_file_head("/etc/group", 64 * 1024))
+                {
+                    for line in String::from_utf8_lossy(&group).lines() {
+                        let f: Vec<&str> = line.split(':').collect();
+                        if f.len() < 4 {
+                            continue;
+                        }
+                        let Ok(gid) = f[2].parse::<u32>() else {
+                            continue;
+                        };
+                        let gid = carrick_abi::NsGid::new(gid);
+                        if !gids.contains(&gid)
+                            && f[3].split(',').any(|m| !m.is_empty() && m == user)
+                        {
+                            gids.push(gid);
+                        }
+                    }
+                }
+                gids
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn proc_status_signal_masks(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> (
+        crate::linux_abi::SigSet,
+        crate::linux_abi::SigSet,
+        crate::linux_abi::SigSet,
+    ) {
+        let mut ignored = crate::linux_abi::SigSet::EMPTY;
+        let mut caught = crate::linux_abi::SigSet::EMPTY;
+        for (signal, action) in context.shared().sighand().actions() {
+            let signum = signal.raw();
+            if !(1..=64).contains(&signum) {
+                continue;
+            }
+            let handler = action.sa_handler;
+            if handler == crate::linux_abi::LINUX_SIG_IGN {
+                ignored = ignored.with(signum);
+            } else if handler != crate::linux_abi::LINUX_SIG_DFL {
+                caught = caught.with(signum);
+            }
+        }
+        let pending = context.shared().pending_signals().present();
+        (ignored, caught, pending)
+    }
+
+    #[inline]
+    pub fn exec_host_fs_fallback(&self) -> bool {
+        self.exec_host_fs_fallback
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn close_needs_mqueue_alias_scan(open_file: &OpenFile) -> bool {
+        SyscallDispatcher::close_needs_mqueue_alias_scan(open_file)
+    }
+
+    pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
+        if let Some(cross) = self.cross {
+            cross.detach_fd_from_epolls(fd);
+        }
+    }
+
+    pub(in crate::dispatch) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
+        if let Some(cross) = self.cross {
+            cross.close_open_file_and_free_pty(open_file);
+        }
+    }
+
+    pub(in crate::dispatch) fn mqueue_owner_alias_closed(
+        &self,
+        files: &Arc<crate::kernel::FileTable>,
+        open_file: &OpenFile,
+    ) {
+        if let Some(cross) = self.cross {
+            cross.mqueue_owner_alias_closed(files, open_file);
+        }
+    }
+
+    pub(in crate::dispatch) fn mqueue_owner_alias_closed_known(
+        &self,
+        file_table: crate::kernel::FileTableId,
+        open_file: &OpenFile,
+        alias_remains: bool,
+    ) {
+        if let Some(cross) = self.cross {
+            cross.mqueue_owner_alias_closed_known(file_table, open_file, alias_remains);
+        }
+    }
+
+    pub(crate) fn close_draining_file_table(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+        files: &Arc<crate::kernel::FileTable>,
+        owner: Option<crate::kernel::TaskKey>,
+        exec_successor: Option<&Arc<crate::kernel::FileTable>>,
+    ) {
+        if let Some(cross) = self.cross {
+            cross.close_draining_file_table(kernel, files, owner, exec_successor);
+        }
+    }
+
+    pub(crate) fn with_kernel_resources<R>(
+        &self,
+        context: &crate::kernel::KernelContext,
+        operation: impl FnOnce() -> R,
+    ) -> R {
+        resources::with_captured_resources(context, operation)
+    }
+
+    pub fn set_cwd(&self, path: &str) {
+        let path = normalize_abs_path(path);
+        let fs_context = self.captured_fs_context();
+        fs_context.set_cwd(path);
+    }
+
+    pub(in crate::dispatch) fn rename_open_paths(&self, resolved_old: &str, resolved_new: &str) {
+        if let Some(cross) = self.cross {
+            cross.rename_open_paths(resolved_old, resolved_new);
+        }
+    }
+
+    pub fn signal_mask_for(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+    ) -> carrick_abi::SigSet {
+        context
+            .task()
+            .thread_by_registry_id(tid)
+            .map(|thread| thread.signal_state().blocked())
+            .unwrap_or(carrick_abi::SigSet::EMPTY)
+    }
+
+    pub fn signal_blocked(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) -> bool {
+        if signum == carrick_abi::LINUX_SIGKILL || signum == carrick_abi::LINUX_SIGSTOP {
+            return false;
+        }
+        self.signal_mask_for(context, tid).contains(signum)
+    }
+
+    pub(crate) fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        context: &crate::kernel::KernelContext,
+        tid: crate::thread::ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.cross
+            .map(|cross| cross.has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask))
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    pub(super) fn fd_is_nonblocking(&self, fd: i32) -> bool {
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(
+            open_file.description.common().status_flags(),
+        )
+        .contains(carrick_abi::LinuxOpenFlags::NONBLOCK)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mem(&self) -> arc_swap::Guard<Arc<DispatchMmAuthority>> {
+        self.mm_binding.current.load()
+    }
+
+    pub(crate) fn begin_host_alias_dispatch<'permit>(
+        &self,
+        permit: &'permit mm_mutation::HostAliasPermit<'_>,
+    ) -> HostAliasDispatchGuard<'permit> {
+        self.mm_binding.begin_dispatch(permit, false)
+    }
+
+    pub(in crate::dispatch) fn memfd_has_writable_shared_map(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+    ) -> bool {
+        self.cross
+            .map(|c| c.memfd_has_writable_shared_map(description))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn authority_call(
+        &self,
+        table: Arc<crate::kernel::FileTable>,
+        slot: crate::kernel::objects::FileSlotAuthority,
+        command: crate::file_authority::Command,
+    ) -> Result<crate::file_authority::Outcome, AuthorityCallError> {
+        if let Some(cross) = self.cross {
+            return cross.authority_call(table, slot, command);
+        }
+        let authority_guard = self.file_authority.read();
+        let Some(active) = authority_guard.as_ref() else {
+            return Err(AuthorityCallError::Fatal(
+                crate::file_authority::AuthorityFatal::TransportUnavailable,
+            ));
+        };
+
+        if slot.table() != table.id() {
+            return Err(AuthorityCallError::Fatal(
+                crate::file_authority::AuthorityFatal::InvariantViolation(
+                    "slot table ID does not match target table ID",
+                ),
+            ));
+        }
+
+        let target = crate::file_authority::CanonicalAuthorityTarget { table, slot };
+        let response = active
+            .execute_canonical(target, command)
+            .map_err(AuthorityCallError::Fatal)?;
+
+        match response.outcome {
+            crate::file_authority::Outcome::Rejected(error) => {
+                Err(AuthorityCallError::Rejected(error))
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
+    pub(crate) fn notify_inmem_epoll(&self) {
+        notify_inmem_epoll(self.captured_file_table().epoll_wake_registry());
+    }
+
+    pub(in crate::dispatch) fn io_uring_description(
+        &self,
+        fd: i32,
+    ) -> Option<Arc<crate::kernel::FileDescription>> {
+        let description = self.open_file(fd)?.description;
+        if description
+            .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
+            .is_some()
+        {
+            Some(description)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn io_is_nonblocking(&self, fd: i32, msg_flags: i32) -> bool {
+        self.fd_is_nonblocking(fd)
+            || carrick_abi::LinuxMsgFlags::from_bits_retain(msg_flags)
+                .contains(carrick_abi::LinuxMsgFlags::DONTWAIT)
+    }
+
+    pub(in crate::dispatch) fn range_touches_secretmem(&self, start: u64, len: u64) -> bool {
+        self.cross
+            .map(|c| c.range_touches_secretmem(start, len))
+            .unwrap_or(false)
+    }
+
+    pub fn read_signalfd<M: CurrentMmMemory>(
+        &self,
+        context: &crate::kernel::KernelContext,
+        memory: &mut M,
+        address: u64,
+        length: usize,
+        mask: carrick_abi::SigSet,
+        tid: crate::thread::ThreadId,
+    ) -> DispatchOutcome {
+        const SIGINFO_LEN: usize = 128;
+        if length < SIGINFO_LEN {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
+        let max = length / SIGINFO_LEN;
+        let out = self
+            .cross
+            .map(|c| c.take_signalfd_bytes(context, tid, mask, max))
+            .unwrap_or_default();
+        if out.is_empty() {
+            return DispatchOutcome::errno(LINUX_EAGAIN);
+        }
+        if memory.write_bytes(address, &out).is_err() {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
+        DispatchOutcome::returned_len_or_errno(out.len())
+    }
+
+    pub(super) fn perf_event_state(&self, fd: i32) -> Option<Arc<super::perf::PerfEventState>> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read()?;
+        match &*open {
+            OpenDescription::PerfEvent { state, .. } => Some(state.clone()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn perf_event_ioctl<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        fd: i32,
+        state: &Arc<super::perf::PerfEventState>,
+        request: u64,
+        arg: u64,
+    ) -> DispatchOutcome {
+        let Some(cross) = self.cross else {
+            return DispatchOutcome::errno(LINUX_ENOTTY);
+        };
+        match cross.perf_event_ioctl_out(cx.reporter, fd, state, request, arg) {
+            Ok(Some(bytes)) => write_packed(&mut *cx.memory, arg, &bytes),
+            Ok(None) => DispatchOutcome::Returned { value: 0 },
+            Err(errno) => DispatchOutcome::errno(errno),
+        }
+    }
+
+    pub(super) fn read_perf_event<M: CurrentMmMemory>(
+        &self,
+        memory: &mut M,
+        address: u64,
+        length: usize,
+        state: &Arc<super::perf::PerfEventState>,
+    ) -> DispatchOutcome {
+        let Some(cross) = self.cross else {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        };
+        match cross.perf_event_read_bytes(state, length) {
+            Ok(bytes) => {
+                if memory.write_bytes(address, &bytes).is_err() {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                } else {
+                    DispatchOutcome::returned_len_or_errno(bytes.len())
+                }
+            }
+            Err(errno) => DispatchOutcome::errno(errno),
+        }
+    }
+
+    pub(in crate::dispatch) fn host_socket_lookup(
+        &self,
+        fd: i32,
+    ) -> Result<(HostFd, i32), LinuxErrno> {
+        let Some(open_file) = self.open_file(fd) else {
+            return Err(LINUX_EBADF);
+        };
+        let open = open_file.description.read().ok_or(LINUX_ENOTSOCK)?;
+        match &*open {
+            OpenDescription::HostSocket {
+                host_fd, family, ..
+            } => Ok((host_fd.view(), *family)),
+            _ => Err(LINUX_ENOTSOCK),
+        }
+    }
+
+    pub(in crate::dispatch) fn socket_guest_type(&self, fd: i32) -> Option<i32> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read()?;
+        match &*open {
+            OpenDescription::HostSocket { type_, .. } => Some(*type_),
+            OpenDescription::Netlink { sock_type, .. } => Some(*sock_type),
+            _ => None,
+        }
+    }
+
+    pub(in crate::dispatch) fn complete_wait_fd_authority(
+        &self,
+        outcome: DispatchOutcome,
+        files: &crate::kernel::objects::FileTable,
+        guest_fds: impl IntoIterator<Item = i32>,
+    ) -> DispatchOutcome {
+        let guest_fds = guest_fds.into_iter().collect::<Vec<_>>();
+        if let Some(cross) = self.cross {
+            return cross.complete_wait_fd_authority(outcome, files, &guest_fds);
+        }
+        let authorize = |fds: WaitFds| fds.with_guest_slots(files, guest_fds.iter().copied());
+        match outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                sig_mask,
+                completion,
+            } => match authorize(fds) {
+                Ok(fds) => DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout,
+                    sig_mask,
+                    completion,
+                },
+                Err(errno) => DispatchOutcome::errno(errno),
+            },
+            outcome => outcome,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
+        self.proc.lock().hvpatch_process.clone()
+    }
+
+    pub(super) fn mem_snapshot_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<mem::MemState, crate::kernel::SnapshotError> {
+        let authority = self.mm_binding.current.load_full();
+        let _snapshot = authority
+            .mutation_coordinator
+            .begin_snapshot_until(deadline)
+            .ok_or_else(|| {
+                if std::time::Instant::now() >= deadline {
+                    crate::kernel::SnapshotError::TimedOut
+                } else {
+                    crate::kernel::SnapshotError::Busy
+                }
+            })?;
+        let snapshot = authority.mem.lock().clone();
+        Ok(snapshot)
+    }
+
+    pub(super) fn mem_snapshot(&self) -> mem::MemState {
+        if let Some(cross) = self.cross {
+            return cross.mem_snapshot();
+        }
+        self.mem_snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(30))
+            .expect("synthetic proc MemState snapshot timed out in test")
+    }
+
+    pub(super) fn synthetic_proc_identity(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Option<crate::vfs::SyntheticProcIdentity> {
+        Some(()).and_then(|()| {
+            let task = context.task();
+            let identity = context.kernel().task_identity(task.key().id).ok()?;
+            let to_ns = |raw: i32| {
+                u32::try_from(raw)
+                    .ok()
+                    .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
+            };
+            Some(crate::vfs::SyntheticProcIdentity {
+                pid: to_ns(identity.task.id.raw())?,
+                tid: to_ns(context.thread().key().tid.raw())?,
+                ppid: identity
+                    .parent
+                    .and_then(|parent| to_ns(parent.id.raw()))
+                    .unwrap_or(0),
+                pgrp: crate::namespace::pid::process_group_to_ns_for(
+                    context,
+                    identity.process_group,
+                )?,
+                session: crate::namespace::pid::session_to_ns_for(context, identity.session)?,
+                user_cpu_us: task.self_cpu_us(),
+                system_cpu_us: task.self_system_cpu_us(),
+            })
+        })
+    }
+
+    pub(super) fn synthetic_proc_processes(
+        context: &crate::kernel::KernelContext,
+        hvpatch_process: Option<&crate::hvpatch::ProcessContext>,
+    ) -> Option<Vec<crate::vfs::SyntheticProcProcess>> {
+        SyscallDispatcher::synthetic_proc_processes(context, hvpatch_process)
+    }
+
+    pub(super) fn synthetic_proc_threads(
+        &self,
+        context: &crate::kernel::KernelContext,
+        registry: Option<&crate::thread::ThreadRegistry>,
+    ) -> Option<Vec<crate::vfs::SyntheticProcThread>> {
+        #[cfg(feature = "platform-macos")]
+        let states: Option<std::collections::HashMap<_, _>> = registry.map(|r| {
+            r.thread_ports()
+                .into_iter()
+                .filter(|&(_, port)| port != 0)
+                .map(|(id, port)| (id, crate::host_proc::thread_run_state_char(port)))
+                .collect()
+        });
+        #[cfg(any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ))]
+        let states: Option<std::collections::HashMap<_, _>> =
+            registry.map(|r| r.thread_state_chars().into_iter().collect());
+        let mut threads: Vec<_> = context
+            .task()
+            .threads()
+            .into_iter()
+            .map(|thread| {
+                let registry_id = thread.registry_id();
+                let internal_tid = u32::try_from(thread.key().tid.raw()).ok()?;
+                let visible_tid = crate::namespace::pid::kernel_to_ns_for(context, internal_tid)?;
+                let comm = registry
+                    .and_then(|r| r.thread_name(registry_id))
+                    .or_else(|| {
+                        carrick_thread::thread::container_thread_name(
+                            context.container().id(),
+                            registry_id,
+                        )
+                    })
+                    .map(|name| {
+                        let len = name
+                            .iter()
+                            .position(|&byte| byte == 0)
+                            .unwrap_or(name.len());
+                        String::from_utf8_lossy(&name[..len]).into_owned()
+                    });
+                let state = thread
+                    .linux_run_state()
+                    .or_else(|| states.as_ref().and_then(|m| m.get(&registry_id).copied()))
+                    .unwrap_or('R');
+                Some(crate::vfs::SyntheticProcThread {
+                    tid: visible_tid,
+                    state,
+                    comm,
+                    user_cpu_us: thread.cpu_us(),
+                    system_cpu_us: thread.system_cpu_us(),
+                    processor: thread.last_cpu(),
+                    cpus_allowed: thread.affinity(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        threads.sort_by_key(|thread| thread.tid);
+        Some(threads)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn synthetic_proc_context(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> crate::vfs::SyntheticProcContext {
+        self.synthetic_proc_context_observed(context, || {})
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn synthetic_proc_context_observed(
+        &self,
+        context: &crate::kernel::KernelContext,
+        after_proc_snapshot: impl FnOnce(),
+    ) -> crate::vfs::SyntheticProcContext {
+        let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks(context);
+        let (sig_ignored, sig_caught, sig_shdpnd) =
+            (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
+        let (hvpatch_process, executable_path, argv, task_comm, timerslack_ns, guest_arch, environ) = {
+            let proc = self.proc.lock();
+            (
+                proc.hvpatch_process.clone(),
+                proc.executable_path.clone(),
+                proc.argv.clone(),
+                super::linux_task_name_to_string(&proc.task_name),
+                proc.timerslack,
+                proc.reported_arch(),
+                proc.env.clone(),
+            )
+        };
+        let guest_hostname = context.task().uts_ns().nodename();
+        let network_model = context.task().net_ns().view().as_ref().clone();
+        after_proc_snapshot();
+        let mem = self.mem_snapshot();
+        let mut address_space_regions = mem.address_space_regions;
+        if !mem.dynamic_maps.is_empty() {
+            match &mut address_space_regions {
+                Some(regions) => regions.extend(mem.dynamic_maps),
+                None => address_space_regions = Some(mem.dynamic_maps),
+            }
+        }
+        let creds = self.cred_snapshot();
+        let groups = self.current_groups();
+        let oom_score_adj = hvpatch_process
+            .as_ref()
+            .map(|process| {
+                process
+                    .kernel_graph()
+                    .registry()
+                    .oom_score_adj_by_pid_for_container(context.container().id())
+                    .into_iter()
+                    .filter_map(|(pid, value)| {
+                        crate::namespace::pid::kernel_to_ns_for(context, pid)
+                            .map(|pid| (pid, value))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let creds_ns = context.task().creds_ns();
+        let processes = Self::synthetic_proc_processes(context, hvpatch_process.as_ref());
+        let zombies = hvpatch_process.map(|process| {
+            process
+                .kernel_graph()
+                .registry()
+                .zombies_for_container(context.container().id())
+                .into_iter()
+                .filter_map(|zombie| {
+                    let to_ns = |raw: i32| {
+                        u32::try_from(raw)
+                            .ok()
+                            .and_then(|raw| crate::namespace::pid::kernel_to_ns_for(context, raw))
+                    };
+                    Some(crate::vfs::SyntheticProcZombie {
+                        pid: to_ns(zombie.key.id.raw())?,
+                        ppid: zombie
+                            .parent
+                            .and_then(|parent| to_ns(parent.id.raw()))
+                            .unwrap_or(1),
+                        pgrp: zombie.namespace_process_group,
+                        session: zombie.namespace_session,
+                        comm: zombie.diagnostic_name,
+                        user_cpu_us: u64::try_from(zombie.rusage.user_time.as_micros())
+                            .unwrap_or(0),
+                        system_cpu_us: u64::try_from(zombie.rusage.system_time.as_micros())
+                            .unwrap_or(0),
+                    })
+                })
+                .collect()
+        });
+        crate::vfs::SyntheticProcContext {
+            executable_path,
+            argv,
+            task_comm,
+            timerslack_ns,
+            guest_arch,
+            guest_hostname,
+            environ,
+            open_fds: self.open_fd_numbers(),
+            network: self.network.spec.clone(),
+            network_model: Some(network_model),
+            runtime_endpoint_container: Some(context.container().id()),
+            auxv: mem.linux_auxv_image,
+            address_space_regions,
+            locked_memory: mem.locked_ranges,
+            brk_current: mem.brk_current,
+            mmap_next: mem.mmap_next,
+            heap_base: mem.layout.heap_base,
+            native_guest_va: self.page_geometry().native_geometry().is_some(),
+            ruid: creds.ruid,
+            euid: creds.euid,
+            suid: creds.suid,
+            rgid: creds.rgid,
+            egid: creds.egid,
+            sgid: creds.sgid,
+            groups,
+            sig_ignored,
+            sig_caught,
+            sig_shdpnd,
+            identity: self.synthetic_proc_identity(context),
+            oom_score_adj,
+            creds_ns,
+            processes,
+            threads: self.synthetic_proc_threads(context, None),
+            zombies,
+            sysvipc_shm: self.sysvipc_shm_table(),
+            sysvipc_sem: self.sysvipc_sem_table(),
+            sysvipc_msg: self.sysvipc_msg_table(),
+        }
+    }
+
+    pub(super) fn is_synthetic_virtual_path(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+    ) -> bool {
+        if let Some(cross) = self.cross {
+            return cross.is_synthetic_virtual_path(context, path);
+        }
+        crate::vfs::may_be_synthetic_virtual_path(path)
+            && crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context(context))
+    }
+
+    pub(super) fn read_exec_file_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
+        self.read_exec_file_head_at(path, max).or_else(|| {
+            let resolved = self.exec_symlink_resolved(path)?;
+            self.read_exec_file_head_at(&resolved, max)
+        })
+    }
+
+    fn read_exec_file_head_at(&self, path: &str, max: usize) -> Option<Vec<u8>> {
+        match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
+            Some(crate::fs_backend::OverlayEntryKind::File) => {
+                return self.fs.rootfs_vfs.overlay.file_head(path, max);
+            }
+            Some(crate::fs_backend::OverlayEntryKind::Dir)
+            | Some(crate::fs_backend::OverlayEntryKind::Deleted) => return None,
+            None => {}
+        }
+        if let Some(bytes) = self
+            .fs
+            .rootfs_vfs
+            .rootfs
+            .as_ref()
+            .and_then(|r| r.read_head(path, max).ok())
+        {
+            return Some(bytes);
+        }
+        self.fs
+            .vfs_mounts
+            .resolve(path)
+            .and_then(|m| m.vfs.read_file(path).ok())
+            .map(|mut bytes| {
+                bytes.truncate(max);
+                bytes
+            })
+    }
+
+    fn exec_symlink_resolved(&self, path: &str) -> Option<String> {
+        let resolved = self.canonicalize_following(path).ok()?;
+        (resolved != path).then_some(resolved)
+    }
+
+    pub(super) fn captured_mm(&self) -> Arc<crate::kernel::Mm> {
+        if let Some(cross) = self.cross {
+            return cross.captured_mm();
+        }
+        if let Some(mm) = resources::mm() {
+            return mm;
+        }
+        self.capture_one_task_context()
+            .expect("test mm context")
+            .shared()
+            .mm()
+    }
+
+    #[inline]
+    pub(super) fn pty_table(&self) -> &std::sync::Arc<parking_lot::Mutex<crate::vfs::PtyTable>> {
+        &self.fs.pty_table
+    }
+
+    pub(crate) fn identity_pid(&self) -> u32 {
+        if let Some(cross) = self.cross {
+            return cross.identity_pid();
+        }
+        if let Some(pid) = crate::dispatch::resources::with_active_context(|context| {
+            let task_id = u32::try_from(context.task().key().id.raw()).unwrap_or(0);
+            crate::namespace::pid::ns_self_pid_for(context, task_id)
+        }) {
+            return pid;
+        }
+        let proc = self.proc.lock();
+        if let Some(_internal_pid) = proc.virtual_pid {
+            return proc
+                .namespace_pid
+                .expect("bound dispatcher is missing its cached namespace-local pid in test");
+        }
+        drop(proc);
+        crate::namespace::pid::self_ns_pid()
+    }
+
+    pub(super) fn sysvipc_shm_table(&self) -> String {
+        String::from(
+            "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
+        )
+    }
+
+    pub(super) fn sysvipc_sem_table(&self) -> String {
+        String::from(
+            "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
+        )
+    }
+
+    pub(super) fn sysvipc_msg_table(&self) -> String {
+        String::from(
+            "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
+        )
+    }
+
     #[inline]
     pub(crate) fn invalidate_dentry_host_fd(&self, raw_fd: i32) {
         self.fs.rootfs_vfs.invalidate_host_fd(raw_fd);
@@ -920,7 +1875,7 @@ impl SyscallDispatcher {
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     define_syscall! {
 
         fn fallocate(this, cx, fd: Fd, mode: u64, offset: u64, len: u64) {
@@ -1462,6 +2417,568 @@ impl SyscallDispatcher {
         }
 
 
+    }
+}
+
+macro_rules! forward_fs_handlers {
+    ($( $handler:ident ),* $(,)?) => {
+        impl SyscallDispatcher {
+            $(
+                #[inline]
+                pub(crate) fn $handler<M: CurrentMmMemory>(
+                    &self,
+                    cx: &mut SyscallCtx<M>,
+                ) -> Result<DispatchOutcome, DispatchError> {
+                    self.fs_view().$handler(cx)
+                }
+            )*
+        }
+    };
+}
+
+forward_fs_handlers! {
+    io_setup,
+    io_destroy,
+    io_submit,
+    io_cancel,
+    io_getevents,
+    getcwd,
+    dup,
+    dup3,
+    dup2,
+    x86_stat,
+    x86_fstat,
+    x86_lstat,
+    x86_newfstatat,
+    inotify_init1,
+    inotify_add_watch,
+    inotify_rm_watch,
+    ioctl,
+    flock,
+    mknodat,
+    ftruncate,
+    fallocate,
+    faccessat,
+    mkdirat,
+    unlinkat,
+    symlinkat,
+    linkat,
+    renameat,
+    chdir,
+    fchdir,
+    chroot,
+    fchmod,
+    fchmodat,
+    fchmodat2,
+    fchownat,
+    fchown,
+    openat,
+    close,
+    pipe2,
+    getdents64,
+    lseek,
+    read,
+    write,
+    readv,
+    writev,
+    pread64,
+    pwrite64,
+    preadv,
+    pwritev,
+    sendfile,
+    vmsplice,
+    splice,
+    readlinkat,
+    newfstatat,
+    fstat,
+    sync,
+    fsync,
+    fdatasync,
+    utimensat,
+    fanotify_init,
+    fanotify_mark,
+    syncfs,
+    sync_file_range,
+    cachestat,
+    renameat2,
+    memfd_create,
+    memfd_secret,
+    copy_file_range,
+    statx,
+    close_range,
+    openat2,
+    faccessat2,
+    sys_setxattr_path,
+    sys_lsetxattr_path,
+    sys_setxattr_fd,
+    sys_getxattr_path,
+    sys_lgetxattr_path,
+    sys_getxattr_fd,
+    sys_listxattr_path,
+    sys_llistxattr_path,
+    sys_listxattr_fd,
+    sys_removexattr_path,
+    sys_lremovexattr_path,
+    sys_removexattr_fd,
+    sys_statfs,
+    sys_fstatfs,
+    sys_truncate,
+    tee,
+}
+
+#[allow(dead_code)]
+impl SyscallDispatcher {
+    #[inline]
+    pub(crate) fn fcntl<M: CurrentMmMemory>(
+        &self,
+        cx: &mut super::MutationSyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.fs_view().fcntl(cx)
+    }
+
+    #[inline]
+    pub(crate) fn invalidate_dentry_host_fd(&self, raw_fd: i32) {
+        self.fs_view().invalidate_dentry_host_fd(raw_fd);
+    }
+
+    #[inline]
+    pub(crate) fn open_file(&self, fd: i32) -> Option<super::fd_table::OpenFile> {
+        self.fs_view().open_file(fd)
+    }
+
+    #[inline]
+    pub(crate) fn fd_is_valid(&self, fd: i32) -> bool {
+        self.fs_view().fd_is_valid(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd(
+        &self,
+        description: OpenDescription,
+        fd_flags: u64,
+    ) -> DispatchOutcome {
+        self.fs_view().install_fd(description, fd_flags)
+    }
+
+    #[inline]
+    pub(crate) fn install_fd_at_or_above(
+        &self,
+        min_fd: i32,
+        open_file: super::fd_table::OpenFile,
+    ) -> Result<i32, super::fd_table::OpenFile> {
+        self.fs_view().install_fd_at_or_above(min_fd, open_file)
+    }
+
+    #[inline]
+    pub(crate) fn install_fd_pair_at_or_above(
+        &self,
+        min_fd: i32,
+        first: super::fd_table::OpenFile,
+        second: super::fd_table::OpenFile,
+    ) -> Result<(i32, i32), (super::fd_table::OpenFile, super::fd_table::OpenFile)> {
+        self.fs_view()
+            .install_fd_pair_at_or_above(min_fd, first, second)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd_with_common(
+        &self,
+        description: OpenDescription,
+        common: Arc<crate::kernel::DescriptionCommon>,
+        fd_flags: u64,
+    ) -> DispatchOutcome {
+        self.fs_view()
+            .install_fd_with_common(description, common, fd_flags)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn install_fd_with_status_flags(
+        &self,
+        description: OpenDescription,
+        status_flags: u64,
+        fd_flags: u64,
+    ) -> DispatchOutcome {
+        self.fs_view()
+            .install_fd_with_status_flags(description, status_flags, fd_flags)
+    }
+
+    #[inline]
+    pub(crate) fn duplicate_fd(&self, oldfd: i32, min_fd: i32, flags: u64) -> DispatchOutcome {
+        self.fs_view().duplicate_fd(oldfd, min_fd, flags)
+    }
+
+    #[inline]
+    pub(crate) fn note_fd_closed(&self, fd: i32) {
+        self.fs_view().note_fd_closed(fd);
+    }
+
+    #[inline]
+    pub(crate) fn open_fd_numbers(&self) -> Vec<i32> {
+        self.fs_view().open_fd_numbers()
+    }
+
+    #[inline]
+    pub(crate) fn fd_table_contains(&self, fd: i32) -> bool {
+        self.fs_view().fd_table_contains(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn fd_stat_record(&self, fd: i32) -> Result<StatRecord, LinuxErrno> {
+        self.fs_view().fd_stat_record(fd)
+    }
+
+    #[inline]
+    pub(crate) fn nofile_limit(&self) -> i32 {
+        self.fs_view().nofile_limit()
+    }
+
+    #[inline]
+    pub(crate) fn clear_closed_stdio(&self, fd: i32) {
+        self.fs_view().clear_closed_stdio(fd);
+    }
+
+    #[inline]
+    pub(crate) fn stdio_is_closed(&self, fd: i32) -> bool {
+        self.fs_view().stdio_is_closed(fd)
+    }
+
+    #[inline]
+    pub(crate) fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, LinuxErrno> {
+        self.fs_view().resolve_at_path(dirfd, path)
+    }
+
+    #[inline]
+    pub(crate) fn record_fd_open_path(&self, fd: i32, path: String) {
+        self.fs_view().record_fd_open_path(fd, path);
+    }
+
+    #[inline]
+    pub(crate) fn lookup_recorded_fd_open_path(&self, fd: i32) -> Option<String> {
+        self.fs_view().lookup_recorded_fd_open_path(fd)
+    }
+
+    #[inline]
+    pub(crate) fn write_shared_supported(&self, fd: i32) -> bool {
+        self.fs_view().write_shared_supported(fd)
+    }
+
+    #[inline]
+    pub(crate) fn canonicalize_following(&self, path: &str) -> Result<String, LinuxErrno> {
+        self.fs_view().canonicalize_following(path)
+    }
+
+    #[inline]
+    pub(crate) fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, LinuxErrno> {
+        self.fs_view().layered_metadata(path)
+    }
+
+    #[inline]
+    pub(crate) fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, LinuxErrno> {
+        self.fs_view().layered_lstat(path)
+    }
+
+    #[inline]
+    pub(crate) fn host_file_fd_for_flush(&self, fd: i32) -> Result<Option<i32>, LinuxErrno> {
+        self.fs_view().host_file_fd_for_flush(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn open_at_path_string(
+        &self,
+        context: &crate::kernel::KernelContext,
+        registry: Option<&crate::thread::ThreadRegistry>,
+        args: OpenAtArgs<'_>,
+        reporter: &CompatReporter,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.fs_view()
+            .open_at_path_string(context, registry, args, reporter)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn dnotify_register(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        mask: LinuxDnotifyMask,
+        tid: crate::thread::ThreadId,
+    ) -> Result<(), LinuxErrno> {
+        self.fs_view().dnotify_register(context, fd, mask, tid)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn dnotify_attrib(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+    ) {
+        self.fs_view().dnotify_attrib(context, path);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn regular_host_file_fd(&self, fd: i32) -> Option<HostFd> {
+        self.fs_view().regular_host_file_fd(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn regular_host_file_write_fd(&self, fd: i32) -> Option<HostFd> {
+        self.fs_view().regular_host_file_write_fd(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn host_socket_fd(&self, fd: i32) -> Option<HostFd> {
+        self.fs_view().host_socket_fd(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn bare_stdio_description(
+        &self,
+        fd: i32,
+    ) -> Result<Arc<crate::kernel::FileDescription>, LinuxErrno> {
+        self.fs_view().bare_stdio_description(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn discard_splice_pushback_if_final(&self, guest_fd: i32) {
+        self.fs_view().discard_splice_pushback_if_final(guest_fd);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn staged_splice_pipe_bytes(&self, guest_fd: i32) -> usize {
+        self.fs_view().staged_splice_pipe_bytes(guest_fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn staged_splice_description_bytes(
+        &self,
+        id: crate::kernel::FileDescriptionId,
+    ) -> usize {
+        self.fs_view().staged_splice_description_bytes(id)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn host_pipe_capacity_room(
+        &self,
+        pipe_capacity: i64,
+        pipe_id: u64,
+        is_read_end: bool,
+        bidirectional: bool,
+        host_fd: i32,
+    ) -> Option<usize> {
+        self.fs_view().host_pipe_capacity_room(
+            pipe_capacity,
+            pipe_id,
+            is_read_end,
+            bidirectional,
+            host_fd,
+        )
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn stage_splice_bytes_for_description(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+        bytes: Vec<u8>,
+    ) {
+        self.fs_view()
+            .stage_splice_bytes_for_description(description, bytes);
+    }
+
+    #[inline]
+    pub(crate) fn raise_sigpipe_on_epipe<M: CurrentMmMemory>(
+        &self,
+        cx: &SyscallCtx<M>,
+        outcome: DispatchOutcome,
+    ) -> DispatchOutcome {
+        self.fs_view().raise_sigpipe_on_epipe(cx, outcome)
+    }
+
+    #[inline]
+    pub(crate) fn stamp_new_node_owner(&self, path: &str, node_mode: u32) {
+        self.fs_view().stamp_new_node_owner(path, node_mode);
+    }
+
+    #[inline]
+    pub(crate) fn check_exec_target(&self, path: &str) -> Result<(), LinuxErrno> {
+        self.fs_view().check_exec_target(path)
+    }
+
+    #[inline]
+    pub(crate) fn validate_directory_search_as(
+        &self,
+        path: &str,
+        target_uid: carrick_abi::NsUid,
+        target_gid: carrick_abi::NsGid,
+        target_groups: &[carrick_abi::NsGid],
+    ) -> Result<String, LinuxErrno> {
+        self.fs_view()
+            .validate_directory_search_as(path, target_uid, target_gid, target_groups)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn openat2_anchor_for_dirfd(
+        &self,
+        dirfd: u64,
+    ) -> Result<String, LinuxErrno> {
+        self.fs_view().openat2_anchor_for_dirfd(dirfd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn fasync_pipe_id_for_open_file(
+        &self,
+        open_file: &super::fd_table::OpenFile,
+    ) -> Option<u64> {
+        self.fs_view().fasync_pipe_id_for_open_file(open_file)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn dnotify_close_fd(&self, fd: i32) {
+        self.fs_view().dnotify_close_fd(fd);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn inotify_close_for_fd(&self, fd: i32) {
+        self.fs_view().inotify_close_for_fd(fd);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn fanotify_close_for_fd(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+    ) {
+        self.fs_view().fanotify_close_for_fd(context, fd);
+    }
+
+    #[inline]
+    pub(crate) fn fanotify_notify_exec(&self, path: &str) {
+        self.fs_view().fanotify_notify_exec(path);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn release_hvpatch_classic_record_locks(
+        &self,
+        owner: crate::kernel::TaskKey,
+        open_file: &super::fd_table::OpenFile,
+    ) {
+        self.fs_view()
+            .release_hvpatch_classic_record_locks(owner, open_file);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn path_stat_record(
+        &self,
+        context: &crate::kernel::KernelContext,
+        dirfd: u64,
+        path: &str,
+        flags: u64,
+    ) -> Result<StatRecord, LinuxErrno> {
+        self.fs_view().path_stat_record(context, dirfd, path, flags)
+    }
+
+    #[inline]
+    pub(crate) fn try_immutable_lower_absolute_open(
+        &self,
+        dirfd: u64,
+        path: &str,
+        flags: u64,
+    ) -> Option<DispatchOutcome> {
+        self.fs_view()
+            .try_immutable_lower_absolute_open(dirfd, path, flags)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn host_pipe_read_fd(&self, fd: i32) -> Option<HostFd> {
+        self.fs_view().host_pipe_read_fd(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn stage_splice_pipe_bytes_owned(&self, guest_fd: i32, bytes: Vec<u8>) {
+        self.fs_view()
+            .stage_splice_pipe_bytes_owned(guest_fd, bytes);
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn take_splice_pipe_bytes(
+        &self,
+        guest_fd: i32,
+        host_fd: HostFd,
+        host_fd_owner: Option<HostFdRef>,
+        count: usize,
+        nonblocking: bool,
+    ) -> Result<Result<Vec<u8>, DispatchOutcome>, DispatchError> {
+        self.fs_view()
+            .take_splice_pipe_bytes(guest_fd, host_fd, host_fd_owner, count, nonblocking)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn host_pipe_pipe_id(&self, fd: i32) -> Option<u64> {
+        self.fs_view().host_pipe_pipe_id(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn splice_pipe_write_room(&self, fd: i32) -> Option<usize> {
+        self.fs_view().splice_pipe_write_room(fd)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn splice_host_output_wait(
+        &self,
+        fd: i32,
+        host_fd: i32,
+        events: i16,
+        owner: Option<HostFdRef>,
+        nonblocking: bool,
+    ) -> DispatchOutcome {
+        self.fs_view()
+            .splice_host_output_wait(fd, host_fd, events, owner, nonblocking)
+    }
+
+    #[inline]
+    pub(crate) fn splice_source_not_readable(&self, fd: i32) -> bool {
+        self.fs_view().splice_source_not_readable(fd)
+    }
+
+    #[inline]
+    pub(crate) fn try_trusted_dirfd_openat(
+        &self,
+        dirfd: u64,
+        path: &str,
+        flags: u64,
+    ) -> Option<DispatchOutcome> {
+        self.fs_view().try_trusted_dirfd_openat(dirfd, path, flags)
+    }
+
+    #[inline]
+    pub(super) fn try_vfs_open(
+        &self,
+        context: &crate::kernel::KernelContext,
+        registry: Option<&crate::thread::ThreadRegistry>,
+        path: &str,
+        access: u64,
+        flags: u64,
+        create_mode: u32,
+    ) -> VfsOpenAttempt {
+        self.fs_view()
+            .try_vfs_open(context, registry, path, access, flags, create_mode)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn close_fd_for_internal_rollback(&self, fd: i32) {
+        self.fs_view().close_fd_for_internal_rollback(fd);
+    }
+
+    #[inline]
+    pub(super) fn setxattr(
+        &self,
+        memory: &mut impl CurrentMmMemory,
+        target: XattrTarget,
+        name_ptr: GuestPtr,
+        value_ptr: GuestPtr,
+        size: u64,
+        flags: u64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.fs_view()
+            .setxattr(memory, target, name_ptr, value_ptr, size, flags)
     }
 }
 

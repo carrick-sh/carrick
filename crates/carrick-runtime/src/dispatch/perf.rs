@@ -447,14 +447,11 @@ impl SyscallDispatcher {
 
     /// `read(2)` on a perf event fd: report the counter in the `read_format`
     /// layout; a buffer smaller than the format needs is ENOSPC (verified
-    /// against the oracle). Reads never drain — a counting fd re-reports.
-    pub(super) fn read_perf_event<M: CurrentMmMemory>(
+    pub(in crate::dispatch) fn perf_event_read_bytes(
         &self,
-        memory: &mut M,
-        address: u64,
-        length: usize,
         state: &Arc<PerfEventState>,
-    ) -> DispatchOutcome {
+        length: usize,
+    ) -> Result<Vec<u8>, LinuxErrno> {
         let group = state.read_format.contains(PerfEventReadFormat::GROUP);
         let members: Vec<Arc<PerfEventState>> = if group {
             state.members.lock().clone()
@@ -462,7 +459,7 @@ impl SyscallDispatcher {
             Vec::new()
         };
         if length < perf_read_size(state.read_format, 1 + members.len()) {
-            return DispatchOutcome::errno(LINUX_ENOSPC);
+            return Err(LINUX_ENOSPC);
         }
         let (value, enabled, running) = state.snapshot(state.ledger());
         let mut entries = vec![(value, state.id)];
@@ -470,24 +467,44 @@ impl SyscallDispatcher {
             let (value, _, _) = member.snapshot(member.ledger());
             entries.push((value, member.id));
         }
-        let bytes = encode_perf_read(state.read_format, (enabled, running), &entries);
-        if memory.write_bytes(address, &bytes).is_err() {
-            return DispatchOutcome::errno(LINUX_EFAULT);
-        }
-        DispatchOutcome::returned_len_or_errno(bytes.len())
+        Ok(encode_perf_read(
+            state.read_format,
+            (enabled, running),
+            &entries,
+        ))
     }
 
-    /// perf event ioctls. Called from the `ioctl` handler once the fd is known
-    /// to be a perf event; unknown requests report unhandled and ENOTTY like
-    /// every other fd kind.
-    pub(super) fn perf_event_ioctl<M: CurrentMmMemory>(
+    /// `read(2)` on a perf event fd: report the counter in the `read_format`
+    /// layout; a buffer smaller than the format needs is ENOSPC (verified
+    /// against the oracle). Reads never drain — a counting fd re-reports.
+    #[allow(dead_code)]
+    pub(super) fn read_perf_event<M: CurrentMmMemory>(
         &self,
-        cx: &mut SyscallCtx<M>,
+        memory: &mut M,
+        address: u64,
+        length: usize,
+        state: &Arc<PerfEventState>,
+    ) -> DispatchOutcome {
+        match self.perf_event_read_bytes(state, length) {
+            Ok(bytes) => {
+                if memory.write_bytes(address, &bytes).is_err() {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                } else {
+                    DispatchOutcome::returned_len_or_errno(bytes.len())
+                }
+            }
+            Err(errno) => DispatchOutcome::errno(errno),
+        }
+    }
+
+    pub(in crate::dispatch) fn perf_event_ioctl_out(
+        &self,
+        reporter: &CompatReporter,
         fd: i32,
         state: &Arc<PerfEventState>,
         request: u64,
         arg: u64,
-    ) -> DispatchOutcome {
+    ) -> Result<Option<[u8; 8]>, LinuxErrno> {
         let group_wide = arg & LINUX_PERF_IOC_FLAG_GROUP != 0;
         let fan_out = |op: &dyn Fn(&Arc<PerfEventState>)| {
             op(state);
@@ -500,32 +517,46 @@ impl SyscallDispatcher {
         match request {
             LINUX_PERF_EVENT_IOC_ENABLE => {
                 fan_out(&|target| target.enable(target.ledger()));
-                DispatchOutcome::Returned { value: 0 }
+                Ok(None)
             }
             LINUX_PERF_EVENT_IOC_DISABLE => {
                 fan_out(&|target| target.disable(target.ledger()));
-                DispatchOutcome::Returned { value: 0 }
+                Ok(None)
             }
             LINUX_PERF_EVENT_IOC_RESET => {
                 fan_out(&|target| target.reset(target.ledger()));
-                DispatchOutcome::Returned { value: 0 }
+                Ok(None)
             }
-            LINUX_PERF_EVENT_IOC_ID => write_packed(&mut *cx.memory, arg, &state.id.to_le_bytes()),
-            // Requests whose machinery carrick does not provide (overflow
-            // delivery, sampling periods, ring-buffer redirection, filters,
-            // BPF attachment). EINVAL — the kernel's own answer for an event
-            // that does not support the operation — never a silent success.
+            LINUX_PERF_EVENT_IOC_ID => Ok(Some(state.id.to_le_bytes())),
             LINUX_PERF_EVENT_IOC_REFRESH
             | LINUX_PERF_EVENT_IOC_PERIOD
             | LINUX_PERF_EVENT_IOC_SET_OUTPUT
             | LINUX_PERF_EVENT_IOC_SET_FILTER
             | LINUX_PERF_EVENT_IOC_SET_BPF
-            | LINUX_PERF_EVENT_IOC_PAUSE_OUTPUT => DispatchOutcome::errno(LINUX_EINVAL),
+            | LINUX_PERF_EVENT_IOC_PAUSE_OUTPUT => Err(LINUX_EINVAL),
             _ => {
-                cx.reporter
-                    .record(CompatEvent::unhandled_ioctl(fd, request, arg));
-                DispatchOutcome::errno(LINUX_ENOTTY)
+                reporter.record(CompatEvent::unhandled_ioctl(fd, request, arg));
+                Err(LINUX_ENOTTY)
             }
+        }
+    }
+
+    /// perf event ioctls. Called from the `ioctl` handler once the fd is known
+    /// to be a perf event; unknown requests report unhandled and ENOTTY like
+    /// every other fd kind.
+    #[allow(dead_code)]
+    pub(super) fn perf_event_ioctl<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        fd: i32,
+        state: &Arc<PerfEventState>,
+        request: u64,
+        arg: u64,
+    ) -> DispatchOutcome {
+        match self.perf_event_ioctl_out(cx.reporter, fd, state, request, arg) {
+            Ok(Some(bytes)) => write_packed(&mut *cx.memory, arg, &bytes),
+            Ok(None) => DispatchOutcome::Returned { value: 0 },
+            Err(errno) => DispatchOutcome::errno(errno),
         }
     }
 

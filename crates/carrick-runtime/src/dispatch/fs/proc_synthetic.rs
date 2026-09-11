@@ -165,7 +165,7 @@ pub(crate) fn reportable_status_flags(raw: u64) -> u64 {
     raw & !CREATION_ONLY
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     pub(super) fn reopen_proc_self_fd(
         &self,
         context: &crate::kernel::KernelContext,
@@ -388,10 +388,12 @@ impl SyscallDispatcher {
                 .open_at_path_string(
                     context,
                     registry,
-                    LINUX_AT_FDCWD,
-                    &target_path,
-                    flags,
-                    0,
+                    OpenAtArgs {
+                        dirfd: LINUX_AT_FDCWD,
+                        path: &target_path,
+                        flags,
+                        mode: 0,
+                    },
                     reporter,
                 )
                 .map_err(|e| match e {

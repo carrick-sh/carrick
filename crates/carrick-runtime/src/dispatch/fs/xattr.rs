@@ -6,7 +6,7 @@
 use super::*;
 use crate::linux_abi::LinuxErrno;
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     /// Resolve the first argument of an xattr syscall to the rootfs path it
     /// names: a path string (path/lpath variants) or the path of the file an
     /// fd refers to (f-variant). Returns `Err(errno)` on a bad path or an fd

@@ -519,7 +519,7 @@ pub(crate) fn write_pipe(
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     define_syscall! {
         fn pipe2(this, cx, pipefd: GuestPtr, flags: u64) {
             let address = pipefd.0;

@@ -23,7 +23,16 @@ fn trusted_fs_lane_enabled() -> bool {
     })
 }
 
-impl SyscallDispatcher {
+/// Consolidated path, dirfd, flags, and mode arguments for `openat(2)` / `openat2(2)`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OpenAtArgs<'a> {
+    pub dirfd: u64,
+    pub path: &'a str,
+    pub flags: u64,
+    pub mode: u64,
+}
+
+impl<'a> FsView<'a> {
     fn open_at_path<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<'_, M>,
@@ -36,25 +45,29 @@ impl SyscallDispatcher {
         self.open_at_path_string(
             cx.kernel,
             cx.thread.as_ref().map(|thread| thread.registry),
-            dirfd,
-            &path,
-            flags,
-            mode,
+            OpenAtArgs {
+                dirfd,
+                path: &path,
+                flags,
+                mode,
+            },
             cx.reporter,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::dispatch) fn open_at_path_string(
         &self,
         context: &crate::kernel::KernelContext,
         registry: Option<&crate::thread::ThreadRegistry>,
-        dirfd: u64,
-        path: &str,
-        flags: u64,
-        mode: u64,
+        args: OpenAtArgs<'_>,
         reporter: &CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let OpenAtArgs {
+            dirfd,
+            path,
+            flags,
+            mode,
+        } = args;
         let access = flags & LINUX_O_ACCMODE;
         if access != LINUX_O_RDONLY && access != LINUX_O_WRONLY && access != LINUX_O_RDWR {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -1730,13 +1743,13 @@ impl SyscallDispatcher {
         }
     }
 
-    fn openat2_checked_path<'a>(
+    fn openat2_checked_path<'p>(
         &self,
         context: &crate::kernel::KernelContext,
         dirfd: u64,
-        path: &'a str,
+        path: &'p str,
         resolve: u64,
-    ) -> Result<std::borrow::Cow<'a, str>, LinuxErrno> {
+    ) -> Result<std::borrow::Cow<'p, str>, LinuxErrno> {
         const RESOLVE_NO_XDEV: u64 = 0x01;
         const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
         const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -1990,10 +2003,12 @@ impl SyscallDispatcher {
             this.open_at_path_string(
                 cx.kernel,
                 cx.thread.as_ref().map(|thread| thread.registry),
-                arg0,
-                path.as_ref(),
-                flags,
-                mode,
+                OpenAtArgs {
+                    dirfd: arg0,
+                    path: path.as_ref(),
+                    flags,
+                    mode,
+                },
                 cx.reporter,
             )
 

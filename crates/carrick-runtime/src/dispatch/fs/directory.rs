@@ -12,7 +12,7 @@ struct RenameAtRequest {
     target_tid: Option<crate::thread::ThreadId>,
 }
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     /// Whether a raw `getdirentries64` stream off `trusted`'s fd IS the exact
     /// guest listing of `dir_path` — i.e. no other layer contributes a name to
     /// it and every `d_type` the stream reports is the guest-visible type.

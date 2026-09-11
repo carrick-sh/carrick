@@ -10,7 +10,7 @@ use crate::linux_abi::{
 use std::path::Path;
 use std::sync::Arc;
 
-impl SyscallDispatcher {
+impl<'a> FsView<'a> {
     /// Linux clears a regular file's set-user-ID (and set-group-ID, when the
     /// file is group-executable) bits on chown — a security measure so a
     /// chowned setuid binary can't grant the new owner's privileges. setgid
