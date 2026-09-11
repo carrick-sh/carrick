@@ -2243,43 +2243,11 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-      "symbol": "exec_private_file_cache_enabled::CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE",
-      "fingerprint": "931b0171ed8676aebdab76e043eb81a34bbe39080ebecdd84606053168c4b276",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE read in exec_private_file_cache_enabled::CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "fpsimd_save_enabled::CARRICK_NO_FPSIMD",
       "fingerprint": "a3914e10f7177b1a3edf81904459d94c3c07cb2295413b522876e4ddb44fa3a1",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_NO_FPSIMD read in fpsimd_save_enabled::CARRICK_NO_FPSIMD (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-      "symbol": "from_address_space::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
-      "fingerprint": "1357cf78f5861bad30288ff0d2aab454e3d90331512adf0ba53a1d44b9dcd505",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD read in from_address_space::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-      "symbol": "from_address_space::CARRICK_HVPATCH_SPARSE_EXEC_STACK",
-      "fingerprint": "63723637515fd90dcfbccd79091db164dd893a05c6210831a669f790286a8136",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_SPARSE_EXEC_STACK read in from_address_space::CARRICK_HVPATCH_SPARSE_EXEC_STACK (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-      "symbol": "lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES",
-      "fingerprint": "0cf902e86dd15cce376d7459d8b960e42afcf28a2af5ae4408d90f8cc01e3fad",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES read in lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
@@ -2355,14 +2323,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-      "symbol": "cached_exec_private_file_backing::NEXT_IDENTITY",
-      "fingerprint": "5c5f4956246e7f14625962f3175165e73413ca16202db1c1b623f9b187430691",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator cached_exec_private_file_backing::NEXT_IDENTITY in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "carrier_initial_arena_retired::RETIRED",
       "fingerprint": "a73ba058c0b39fd43a438589fb96451f39d3b2a03bc5f1eda73cbc6553cc90de",
@@ -2387,27 +2347,11 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-      "symbol": "create_exec_private_file_artifact::NEXT_FILE",
-      "fingerprint": "cf4dad726c1b170f3e7e45d5554dd15c2240d65ed0d48a9bc3210af6e6d1277d",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator create_exec_private_file_artifact::NEXT_FILE in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "default::NEXT_DIRECTORY_INSTANCE",
       "fingerprint": "b4ce1645f862d42b5cdaff8b7b521ffc0121a41927d6ddcf446ed75d072a59e2",
       "classification": "monotonic_allocator",
       "rationale": "Carrier-wide monotonic allocator default::NEXT_DIRECTORY_INSTANCE in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
-      "symbol": "exec_private_file_cache::CACHE",
-      "fingerprint": "1658305af907a3175584e3ee62aa97b4fb3a07776dfa5394c4047bc7c8f2a32d",
-      "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache exec_private_file_cache::CACHE in crates/carrick-vmm-hvf/src/trap.rs initialized from environment flags."
     },
     {
       "kind": "static",
@@ -2491,22 +2435,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
-      "symbol": "private_backing_identity::NEXT",
-      "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator private_backing_identity::NEXT in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
-      "symbol": "private_file_view_backing_identity::NEXT",
-      "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator private_file_view_backing_identity::NEXT in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "rebuilt_vm_cell::CELL",
       "fingerprint": "83a85c0b1708c84bd817d0cb6ef9e3ad0be56a252a9d815b303acd125dbd94cf",
@@ -2520,14 +2448,6 @@
       "fingerprint": "9cc1655c6d1940056b8848a31784a8e19f4d96eef3a8e749f84cd4f793ff7c8d",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static run_to_exit::FIRST_RUN in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
-      "symbol": "shared_anon_backing_identity::NEXT",
-      "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator shared_anon_backing_identity::NEXT in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
@@ -2618,6 +2538,30 @@
       "rationale": "Environment variable CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS read in exec_stage2_fail_after_maps::CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS (crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs) configuring carrier behavior or debug logging."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
+      "symbol": "private_backing_identity::NEXT",
+      "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator private_backing_identity::NEXT in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
+      "symbol": "private_file_view_backing_identity::NEXT",
+      "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator private_file_view_backing_identity::NEXT in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs",
+      "symbol": "shared_anon_backing_identity::NEXT",
+      "fingerprint": "a9778af5ccd1c6630d44c1e80c649fc3ac982ad5cc21d72bb30a021510749473",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator shared_anon_backing_identity::NEXT in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
+    },
+    {
       "kind": "env_var",
       "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
       "symbol": "cow_refusal_diagnostics_enabled::CARRICK_COW_REFUSAL_DIAGNOSTICS",
@@ -2704,6 +2648,62 @@
       "fingerprint": "5db43974bf444a888d1331cd1d12fa3ebe33196f2a4283becf742635c03e705f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static replay_mappings::CELL in crates/carrick-vmm-hvf/src/trap/global_frame.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "symbol": "exec_private_file_cache_enabled::CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE",
+      "fingerprint": "931b0171ed8676aebdab76e043eb81a34bbe39080ebecdd84606053168c4b276",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE read in exec_private_file_cache_enabled::CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "symbol": "from_address_space::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD",
+      "fingerprint": "1357cf78f5861bad30288ff0d2aab454e3d90331512adf0ba53a1d44b9dcd505",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD read in from_address_space::CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "symbol": "from_address_space::CARRICK_HVPATCH_SPARSE_EXEC_STACK",
+      "fingerprint": "63723637515fd90dcfbccd79091db164dd893a05c6210831a669f790286a8136",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_SPARSE_EXEC_STACK read in from_address_space::CARRICK_HVPATCH_SPARSE_EXEC_STACK (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "symbol": "lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES",
+      "fingerprint": "0cf902e86dd15cce376d7459d8b960e42afcf28a2af5ae4408d90f8cc01e3fad",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES read in lazy_exec_page_tables_enabled::CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES (crates/carrick-vmm-hvf/src/trap.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "symbol": "cached_exec_private_file_backing::NEXT_IDENTITY",
+      "fingerprint": "5c5f4956246e7f14625962f3175165e73413ca16202db1c1b623f9b187430691",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator cached_exec_private_file_backing::NEXT_IDENTITY in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "symbol": "create_exec_private_file_artifact::NEXT_FILE",
+      "fingerprint": "cf4dad726c1b170f3e7e45d5554dd15c2240d65ed0d48a9bc3210af6e6d1277d",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator create_exec_private_file_artifact::NEXT_FILE in crates/carrick-vmm-hvf/src/trap.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs",
+      "symbol": "exec_private_file_cache::CACHE",
+      "fingerprint": "1658305af907a3175584e3ee62aa97b4fb3a07776dfa5394c4047bc7c8f2a32d",
+      "classification": "config_debug",
+      "rationale": "Process-global configuration or failpoint cache exec_private_file_cache::CACHE in crates/carrick-vmm-hvf/src/trap.rs initialized from environment flags."
     },
     {
       "kind": "env_var_os",
