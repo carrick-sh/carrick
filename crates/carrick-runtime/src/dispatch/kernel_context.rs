@@ -30,36 +30,36 @@ impl GuestProcessTarget {
     }
 }
 
-pub(crate) fn bootstrap_one_task_binding() -> (crate::kernel::KernelTaskBinding, crate::kernel::MmId)
+pub(crate) fn try_bootstrap_one_task_binding()
+-> Result<(crate::kernel::KernelTaskBinding, crate::kernel::MmId), crate::run_result::RuntimeError>
 {
     let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);
     let registry_id = crate::thread::ThreadId::main_from_host_pid();
-    let bootstrap = match crate::kernel::RootBootstrap::for_reference_model(
+    let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
         observed_pid,
         registry_id,
         "one-task-dispatch-adapter".to_owned(),
-    ) {
-        Ok(bootstrap) => bootstrap,
-        Err(error) => {
-            tracing::error!(%error, "cannot build mandatory one-task kernel adapter");
-            carrick_fatal!(
-                "dispatch::bootstrap",
-                "cannot build mandatory one-task kernel adapter"
-            );
-        }
-    };
-    let context = match crate::kernel::Kernel::bootstrap_root(bootstrap) {
-        Ok((_, context)) => context,
-        Err(error) => {
-            tracing::error!(%error, "cannot bootstrap mandatory one-task kernel adapter");
-            carrick_fatal!(
-                "dispatch::bootstrap",
-                "cannot bootstrap mandatory one-task kernel adapter"
-            );
-        }
-    };
+    )
+    .map_err(|error| {
+        tracing::error!(%error, "cannot build mandatory one-task kernel adapter");
+        crate::run_result::RuntimeError::CarrierFailed(format!(
+            "cannot build mandatory one-task kernel adapter: {error}"
+        ))
+    })?;
+    let (_, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| {
+        tracing::error!(%error, "cannot bootstrap mandatory one-task kernel adapter");
+        crate::run_result::RuntimeError::CarrierFailed(format!(
+            "cannot bootstrap mandatory one-task kernel adapter: {error}"
+        ))
+    })?;
     let mm_id = context.shared().mm().id();
-    (context.task_binding(), mm_id)
+    Ok((context.task_binding(), mm_id))
+}
+
+#[allow(clippy::expect_used)]
+pub(crate) fn bootstrap_one_task_binding() -> (crate::kernel::KernelTaskBinding, crate::kernel::MmId)
+{
+    try_bootstrap_one_task_binding().expect("mandatory one-task kernel adapter")
 }
 
 impl SyscallDispatcher {
@@ -937,5 +937,11 @@ mod tests {
         });
         assert_eq!(resolved, Ok("/private-bin/tool".to_owned()));
         assert_eq!(configured.resources().fs_context().cwd(), "/private-bin");
+    }
+
+    #[test]
+    fn try_bootstrap_one_task_binding_succeeds() {
+        let res = try_bootstrap_one_task_binding();
+        assert!(res.is_ok());
     }
 }
