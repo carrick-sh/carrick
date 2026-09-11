@@ -24,6 +24,7 @@
 //!   - Complete SysV semaphore parity; this module still forwards semaphores to
 //!     host SysV semaphores with Carrick-owned guest metadata layered above.
 
+pub(crate) use super::dispatcher::IpcView;
 use super::*;
 use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
 use carrick_abi::{NsGid, NsUid};
@@ -899,7 +900,7 @@ impl SysvIpcService {
     }
 
     fn msgctl<M: CurrentMmMemory>(
-        dispatcher: &SyscallDispatcher,
+        dispatcher: &IpcView<'_>,
         cx: &mut SyscallCtx<M>,
         msqid: u64,
         cmd: u64,
@@ -2320,10 +2321,10 @@ fn sysvipc_msg_table_from_files() -> String {
 // Syscall handlers (wired into dispatch_sysv as 194/195/196/197).
 // ===================================================================
 
-impl SyscallDispatcher {
-    pub(in crate::dispatch::sysv) fn lock_sysv_process(&self) -> SysvProcessGuard<'_> {
-        let guard = self.sysv_process.lock();
-        SysvProcessGuard::new(guard, &self.sysv)
+impl<'a> IpcView<'a> {
+    pub(in crate::dispatch::sysv) fn lock_sysv_process(&self) -> SysvProcessGuard<'a> {
+        let guard = (*self.sysv_process).lock();
+        SysvProcessGuard::new(guard, self.sysv)
     }
 
     pub(in crate::dispatch::sysv) fn with_sysv_process<F, R>(&self, f: F) -> R
@@ -2548,7 +2549,7 @@ impl SyscallDispatcher {
             let lpid = this.identity_pid() as i32;
             let needs_write = !attach_flags.contains(ShmAttachFlags::RDONLY);
             let (host_fd, size, reservation) =
-                match reserve_shmat(&this.sysv, &creds, shmid, needs_write) {
+                match reserve_shmat(this.sysv, &creds, shmid, needs_write) {
                     Ok(v) => v,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
@@ -3225,6 +3226,151 @@ impl SyscallDispatcher {
     }
 }
 
+macro_rules! forward_sysv_handlers {
+    ($( $handler:ident ),* $(,)?) => {
+        impl SyscallDispatcher {
+            $(
+                #[inline]
+                pub(crate) fn $handler<M: CurrentMmMemory>(
+                    &self,
+                    cx: &mut SyscallCtx<M>,
+                ) -> Result<DispatchOutcome, DispatchError> {
+                    self.ipc_view().$handler(cx)
+                }
+            )*
+        }
+    };
+}
+
+forward_sysv_handlers! {
+    shmget,
+    shmctl,
+    msgget,
+    msgsnd,
+    msgrcv,
+    msgctl,
+    semget,
+    semop,
+    semtimedop,
+    semctl,
+}
+
+macro_rules! forward_sysv_mutation_handlers {
+    ($( $handler:ident ),* $(,)?) => {
+        impl SyscallDispatcher {
+            $(
+                #[inline]
+                pub(crate) fn $handler<M: CurrentMmMemory>(
+                    &self,
+                    cx: &mut MutationSyscallCtx<M>,
+                ) -> Result<DispatchOutcome, DispatchError> {
+                    self.ipc_view().$handler(cx)
+                }
+            )*
+        }
+    };
+}
+
+forward_sysv_mutation_handlers! {
+    shmat,
+    shmdt,
+}
+
+impl SyscallDispatcher {
+    #[cfg(test)]
+    pub(in crate::dispatch::sysv) fn lock_sysv_process(&self) -> SysvProcessGuard<'_> {
+        self.ipc_view().lock_sysv_process()
+    }
+
+    #[cfg(test)]
+    pub(in crate::dispatch::sysv) fn with_sysv_process<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&SysvProcessAttachments) -> R,
+    {
+        self.ipc_view().with_sysv_process(f)
+    }
+
+    #[cfg(test)]
+    pub(in crate::dispatch::sysv) fn with_sysv_process_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut SysvProcessAttachments) -> R,
+    {
+        self.ipc_view().with_sysv_process_mut(f)
+    }
+
+    pub(super) fn commit_host_alias_shmat(&self, commit: HostAliasShmatCommit) {
+        self.ipc_view().commit_host_alias_shmat(commit);
+    }
+
+    pub(crate) fn sysvipc_shm_table(&self) -> String {
+        self.ipc_view().sysvipc_shm_table()
+    }
+
+    pub(crate) fn sysvipc_sem_table(&self) -> String {
+        self.ipc_view().sysvipc_sem_table()
+    }
+
+    pub(crate) fn sysvipc_msg_table(&self) -> String {
+        self.ipc_view().sysvipc_msg_table()
+    }
+
+    pub(crate) fn note_sysv_remap_file_pages(
+        &self,
+        addr: u64,
+        end: u64,
+    ) -> Result<bool, LinuxErrno> {
+        self.ipc_view().note_sysv_remap_file_pages(addr, end)
+    }
+
+    pub(crate) fn cleanup_sysv_shm_attachments_on_process_exit(&self) {
+        self.ipc_view()
+            .cleanup_sysv_shm_attachments_on_process_exit();
+    }
+
+    pub(super) fn fork_sysv_process_attachments(&self) -> SysvProcessAttachments {
+        self.ipc_view().fork_sysv_process_attachments()
+    }
+
+    pub(super) fn commit_sysv_fork_inheritance(&self) {
+        self.ipc_view().commit_sysv_fork_inheritance();
+    }
+
+    pub(crate) fn cleanup_sysv_ipc_on_process_exit(&self) {
+        self.ipc_view().cleanup_sysv_ipc_on_process_exit();
+    }
+
+    pub(crate) fn cleanup_sysv_ipc_on_run_exit(&self) {
+        self.ipc_view().cleanup_sysv_ipc_on_run_exit();
+    }
+
+    #[cfg(test)]
+    pub(super) fn sysv_semop<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        semid: i32,
+        sops_addr: u64,
+        nsops: usize,
+        timeout: Option<LinuxTimespec>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.ipc_view()
+            .sysv_semop(cx, semid, sops_addr, nsops, timeout)
+    }
+
+    #[cfg(test)]
+    pub(super) fn sysv_semctl<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        semid: i32,
+        semnum: i32,
+        cmd: u64,
+        arg: u64,
+        creds: &crate::kernel::Credentials,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.ipc_view()
+            .sysv_semctl(cx, semid, semnum, cmd, arg, creds)
+    }
+}
+
 fn msgget_open(
     state: &mut SysvShmState,
     creds: &crate::kernel::Credentials,
@@ -3559,7 +3705,7 @@ fn msg_stat_by_index<M: CurrentMmMemory>(
 }
 
 fn sysv_msgctl<M: CurrentMmMemory>(
-    this: &SyscallDispatcher,
+    this: &IpcView<'_>,
     cx: &mut SyscallCtx<M>,
     msqid: u64,
     cmd: u64,
@@ -3662,7 +3808,7 @@ fn sysv_msgctl<M: CurrentMmMemory>(
 }
 
 fn sysv_msg_wait_interrupted(
-    this: &SyscallDispatcher,
+    this: &IpcView<'_>,
     context: &crate::kernel::KernelContext,
     tid: crate::thread::ThreadId,
 ) -> bool {
@@ -3945,7 +4091,7 @@ fn sysv_semop<M: CurrentMmMemory>(
     }
 }
 
-impl SyscallDispatcher {
+impl<'a> IpcView<'a> {
     fn sysv_semop<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<M>,
