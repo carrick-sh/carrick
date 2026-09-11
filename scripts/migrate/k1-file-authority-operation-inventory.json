@@ -25,7 +25,7 @@
     "description_backing": 7,
     "epoll": 32,
     "stream": 14,
-    "mapping": 69,
+    "mapping": 70,
     "lifecycle": 5
   },
   "entries": [
@@ -17597,8 +17597,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 219,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 147,
       "categories": [
         "mapping"
       ],
@@ -17606,8 +17606,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 234,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 162,
       "categories": [
         "mapping"
       ],
@@ -17615,8 +17615,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 246,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 174,
       "categories": [
         "mapping"
       ],
@@ -17624,8 +17624,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 262,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 190,
       "categories": [
         "mapping"
       ],
@@ -17633,8 +17633,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 281,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 209,
       "categories": [
         "mapping"
       ],
@@ -17642,8 +17642,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 289,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 217,
       "categories": [
         "mapping"
       ],
@@ -17651,8 +17651,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 463,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 391,
       "categories": [
         "mapping"
       ],
@@ -17660,8 +17660,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 493,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 421,
       "categories": [
         "mapping"
       ],
@@ -17669,8 +17669,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 500,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 428,
       "categories": [
         "mapping"
       ],
@@ -17678,8 +17678,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 518,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 446,
       "categories": [
         "mapping"
       ],
@@ -17687,8 +17687,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 536,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 464,
       "categories": [
         "mapping"
       ],
@@ -17696,8 +17696,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 548,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 476,
       "categories": [
         "mapping"
       ],
@@ -17705,8 +17705,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 561,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 489,
       "categories": [
         "mapping"
       ],
@@ -17714,8 +17714,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 569,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 497,
       "categories": [
         "mapping"
       ],
@@ -17723,8 +17723,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 578,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 506,
       "categories": [
         "mapping"
       ],
@@ -17732,8 +17732,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 592,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 520,
       "categories": [
         "mapping"
       ],
@@ -17741,8 +17741,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 598,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 526,
       "categories": [
         "mapping"
       ],
@@ -17750,8 +17750,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 606,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 534,
       "categories": [
         "mapping"
       ],
@@ -17759,8 +17759,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 613,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 541,
       "categories": [
         "mapping"
       ],
@@ -17768,17 +17768,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 677,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// mapping entirely; libc then uses ordinary syscalls. AArch64 retains the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1459,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 666,
       "categories": [
         "mapping"
       ],
@@ -17786,8 +17777,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1460,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 667,
       "categories": [
         "mapping"
       ],
@@ -17795,8 +17786,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1461,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 668,
       "categories": [
         "mapping"
       ],
@@ -17804,8 +17795,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1462,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 669,
       "categories": [
         "mapping"
       ],
@@ -17813,8 +17804,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1463,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 670,
       "categories": [
         "mapping"
       ],
@@ -17822,8 +17813,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1464,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 671,
       "categories": [
         "mapping"
       ],
@@ -17831,8 +17822,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1596,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 803,
       "categories": [
         "mapping"
       ],
@@ -17840,8 +17831,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1649,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 856,
       "categories": [
         "mapping"
       ],
@@ -17849,71 +17840,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 7771,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Stage-1 page-table editors \u2014 munmap(215), mremap(216), mmap(222),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 7829,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// No dispatcher/backend mapping call has started yet. Return",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 8021,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// (an oversized/awkwardly-placed mmap can exhaust the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 8024,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// one Linux process's bad mmap would otherwise kill",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 8031,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mmap fails as an \"overlapping HVPatch alias inventory",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 8035,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// blocked sibling mapping syscalls.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 8049,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"HVPatch alias install failed; guest mmap lowered to ENOMEM\"",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9734,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 907,
       "categories": [
         "mapping"
       ],
@@ -17921,35 +17849,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9977,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = reservation.claim_mapping().expect(\"mapping candidate\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 9985,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 10001,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 12091,
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 1061,
       "categories": [
         "mapping"
       ],
@@ -17958,7 +17859,106 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 16534,
+      "line": 127,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// mapping entirely; libc then uses ordinary syscalls. AArch64 retains the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 6909,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Stage-1 page-table editors \u2014 munmap(215), mremap(216), mmap(222),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 6967,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// No dispatcher/backend mapping call has started yet. Return",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 7159,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// (an oversized/awkwardly-placed mmap can exhaust the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 7162,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// one Linux process's bad mmap would otherwise kill",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 7169,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mmap fails as an \"overlapping HVPatch alias inventory",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 7173,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// blocked sibling mapping syscalls.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 7187,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"HVPatch alias install failed; guest mmap lowered to ENOMEM\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 8955,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = reservation.claim_mapping().expect(\"mapping candidate\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 8963,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 8979,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 15474,
       "categories": [
         "mapping"
       ],
@@ -17967,7 +17967,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 16536,
+      "line": 15476,
       "categories": [
         "mapping"
       ],
@@ -17976,7 +17976,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 16544,
+      "line": 15484,
       "categories": [
         "mapping"
       ],
@@ -17985,7 +17985,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 16556,
+      "line": 15496,
       "categories": [
         "mapping"
       ],
@@ -17994,7 +17994,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 16560,
+      "line": 15500,
       "categories": [
         "mapping"
       ],
@@ -18003,7 +18003,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 16563,
+      "line": 15503,
       "categories": [
         "mapping"
       ],
