@@ -299,22 +299,6 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "symbol": "ficlone_errno::CARRICK_FICLONE_DEBUG",
-      "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FICLONE_DEBUG read in ficlone_errno::CARRICK_FICLONE_DEBUG (crates/carrick-runtime/src/dispatch/fs/ioctl.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "symbol": "ioctl::CARRICK_FICLONE_DEBUG",
-      "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FICLONE_DEBUG read in ioctl::CARRICK_FICLONE_DEBUG (crates/carrick-runtime/src/dispatch/fs/ioctl.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/dispatch/fs.rs",
       "symbol": "trusted_fs_lane_enabled::CARRICK_FS_TRUSTED_LANE",
       "fingerprint": "2d8b98ce0979b1e11b266d37f3240be459bc06655f7c405419ccb62cdebd6331",
@@ -336,6 +320,22 @@
       "fingerprint": "0e35528151ec05afe88f94ff04d8674b9532c027b68aff8211ef9d2c74457a7e",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell OPEN_FD_NUMBERS_CALLS in crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
+      "symbol": "ficlone_errno::CARRICK_FICLONE_DEBUG",
+      "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FICLONE_DEBUG read in ficlone_errno::CARRICK_FICLONE_DEBUG (crates/carrick-runtime/src/dispatch/fs/ioctl.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
+      "symbol": "ioctl::CARRICK_FICLONE_DEBUG",
+      "fingerprint": "d81b6311036aa8db461da744b96b226a6a1aff08042108d1e97536d4328f9c4f",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FICLONE_DEBUG read in ioctl::CARRICK_FICLONE_DEBUG (crates/carrick-runtime/src/dispatch/fs/ioctl.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "thread_local",
