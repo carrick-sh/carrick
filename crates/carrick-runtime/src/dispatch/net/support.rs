@@ -3566,3 +3566,54 @@ mod tests {
         assert!(!is_known_sockopt_optname(0x4242, a::LINUX_IP_TTL));
     }
 }
+
+#[cfg(test)]
+mod staged_splice_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn staged_splice_pipe_bytes_are_pollin_ready() {
+        let mut host_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+
+        let dispatcher = SyscallDispatcher::new();
+        let read_open = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[0]),
+                is_read_end: true,
+                pipe_id: 44,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_RDONLY,
+            0,
+        );
+        let write_open = OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[1]),
+                is_read_end: false,
+                pipe_id: 44,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+                stdio_stream: None,
+            })),
+            LINUX_O_WRONLY,
+            0,
+        );
+        let (read_fd, _write_fd) = dispatcher
+            .install_fd_pair_at_or_above(3, read_open, write_open)
+            .expect("install host pipe pair");
+
+        dispatcher.stage_splice_pipe_bytes_owned(read_fd, b"staged".to_vec());
+
+        assert_ne!(
+            dispatcher.poll_ready_events(read_fd, LINUX_POLLIN) & LINUX_POLLIN,
+            0
+        );
+    }
+}
