@@ -42,7 +42,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use carrick_fatal::carrick_fatal;
 use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
@@ -177,10 +176,10 @@ static MY_SLOT: AtomicU64 = AtomicU64::new(REF_NONE);
 /// index in `MY_SLOT`, then updates it in place — so the hot-path republish (every
 /// loop iteration) is one bounds check + one atomic store, not a full-table scan.
 /// A single atomic store publishes pid+state atomically.
-pub fn publish(state: RunState) {
+pub fn try_publish(state: RunState) -> Result<(), ArenaError> {
     let pid = std::process::id();
     if pid == 0 {
-        return;
+        return Ok(());
     }
     let section = processes();
     let want = pack(pid, state);
@@ -189,23 +188,36 @@ pub fn publish(state: RunState) {
     let cached = MY_SLOT.load(Ordering::Relaxed);
     if let Some(record) = cached_record(section, cached, pid, false) {
         record.run_state.store(want, Ordering::Release);
-        return;
+        return Ok(());
     }
-    let r = claim_record(section, pid, want, false);
+    let r = claim_record(section, pid, want, false)?;
     MY_SLOT.store(pack_ref(r), Ordering::Relaxed);
+    Ok(())
+}
+
+pub fn publish(state: RunState) {
+    if let Err(err) = try_publish(state) {
+        eprintln!("carrick: run-state arena publication failed: {err:?}");
+    }
 }
 
 /// Publish `state` for an ARBITRARY pid (used to seed a child's `Booting` from
 /// the parent, and by tests). Cache-free: never reads or writes `MY_SLOT` (that
 /// cache belongs to THIS process's own slot), so it can't perturb the caller's
 /// fast path.
-fn publish_for(pid: u32, state: RunState) {
+pub fn try_publish_for(pid: u32, state: RunState) -> Result<(), ArenaError> {
     if pid == 0 {
-        return;
+        return Ok(());
     }
     let section = processes();
     let want = pack(pid, state);
-    let _ = claim_record(section, pid, want, false);
+    claim_record(section, pid, want, false).map(|_| ())
+}
+
+fn publish_for(pid: u32, state: RunState) {
+    if let Err(err) = try_publish_for(pid, state) {
+        eprintln!("carrick: run-state arena publication failed for pid {pid}: {err:?}");
+    }
 }
 
 /// Publish one HVPatch thread's run state under authoritative Linux identity.
@@ -218,18 +230,26 @@ fn publish_for(pid: u32, state: RunState) {
 /// the answer decided a wrong root cause once already — the forked-child
 /// `/proc` render falls back to the host/ns derivation, and only the ids used
 /// here distinguish "never published" from "published under the wrong pid".
-pub fn publish_task_thread(task_pid: i32, tid: i32, state: RunState) {
+pub fn try_publish_task_thread(task_pid: i32, tid: i32, state: RunState) -> Result<(), ArenaError> {
     let (Ok(task_pid), Ok(tid)) = (u32::try_from(task_pid), u32::try_from(tid)) else {
-        return;
+        return Ok(());
     };
     if task_pid == 0 || tid == 0 {
-        return;
+        return Ok(());
     }
     if tid == task_pid {
-        publish_for(task_pid, state);
+        try_publish_for(task_pid, state)
     } else {
         let section = processes();
-        let _ = claim_record(section, tid, pack_tid(tid, state), true);
+        claim_record(section, tid, pack_tid(tid, state), true).map(|_| ())
+    }
+}
+
+pub fn publish_task_thread(task_pid: i32, tid: i32, state: RunState) {
+    if let Err(err) = try_publish_task_thread(task_pid, tid, state) {
+        eprintln!(
+            "carrick: run-state arena publication failed for task {task_pid} tid {tid}: {err:?}"
+        );
     }
 }
 
@@ -239,13 +259,21 @@ pub fn publish_task_thread(task_pid: i32, tid: i32, state: RunState) {
 /// guest processes can still poll `/proc/<tid>/stat` for them, fork-coherently,
 /// without clobbering a process's slot. A tid equal to this process's own pid is
 /// the thread-group LEADER, already covered by [`publish`], so it is skipped.
-pub fn publish_guest_tid(tid: i32, state: RunState) {
+pub fn try_publish_guest_tid(tid: i32, state: RunState) -> Result<(), ArenaError> {
     if let Ok(tid) = u32::try_from(tid) {
         if tid == 0 || tid == std::process::id() {
-            return;
+            return Ok(());
         }
         let section = processes();
-        let _ = claim_record(section, tid, pack_tid(tid, state), true);
+        claim_record(section, tid, pack_tid(tid, state), true).map(|_| ())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn publish_guest_tid(tid: i32, state: RunState) {
+    if let Err(err) = try_publish_guest_tid(tid, state) {
+        eprintln!("carrick: run-state arena publication failed for tid {tid}: {err:?}");
     }
 }
 
@@ -278,12 +306,19 @@ pub fn clear_guest_tid(tid: i32) {
 ///
 /// Clears ONLY the process-kind slot, never a `KIND_TID` entry that happens to
 /// share the low-32 value, mirroring [`clear_guest_tid`].
-pub fn clear_guest_process(pid: i32) {
+pub fn try_clear_guest_process(pid: i32) -> Result<(), ProcessRecordTransitionError> {
+    try_clear_guest_process_with_timeout(pid, std::time::Duration::from_secs(5))
+}
+
+pub(crate) fn try_clear_guest_process_with_timeout(
+    pid: i32,
+    timeout: std::time::Duration,
+) -> Result<(), ProcessRecordTransitionError> {
     let Ok(pid) = u32::try_from(pid) else {
-        return;
+        return Ok(());
     };
     if pid == 0 {
-        return;
+        return Ok(());
     }
     let section = processes();
     // Namespace membership and run-state share one physical record, but the
@@ -333,7 +368,7 @@ pub fn clear_guest_process(pid: i32) {
         // revalidates generation/host identity, and releases only while ns_pid
         // is still unpublished. A namespace adopter that owns or completed the
         // transition wins; this path then clears only its run-state word.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             match section.with_record_transition(record_ref, HostPid::new(pid), |record| {
                 record.run_state.store(0, Ordering::Release);
@@ -345,13 +380,17 @@ pub fn clear_guest_process(pid: i32) {
                 }
                 Err(ProcessRecordTransitionError::Busy) => {
                     eprintln!("carrick: process record transition did not quiesce for pid {pid}");
-                    carrick_fatal!(
-                        "run_state::process_section",
-                        "process record transition did not quiesce"
-                    );
+                    return Err(ProcessRecordTransitionError::Busy);
                 }
             }
         }
+    }
+    Ok(())
+}
+
+pub fn clear_guest_process(pid: i32) {
+    if let Err(err) = try_clear_guest_process(pid) {
+        eprintln!("carrick: clear_guest_process failed for pid {pid}: {err:?}");
     }
 }
 
@@ -409,12 +448,17 @@ fn mark_owner_domain(record: &carrick_kernel::process::ProcessRecord) {
     }
 }
 
-fn claim_record(section: &ProcessSection, id: u32, want: u64, want_tid: bool) -> ProcessRecordRef {
+fn claim_record(
+    section: &ProcessSection,
+    id: u32,
+    want: u64,
+    want_tid: bool,
+) -> Result<ProcessRecordRef, ArenaError> {
     if let Some(r) = find_record(section, id, want_tid) {
         let record = &section.records[r.index];
         record.run_state.store(want, Ordering::Release);
         mark_owner_domain(record);
-        return r;
+        return Ok(r);
     }
 
     // One record per PROCESS: a fork child's metadata record (host pid
@@ -442,30 +486,19 @@ fn claim_record(section: &ProcessSection, id: u32, want: u64, want_tid: bool) ->
             if ours {
                 record.run_state.store(want, Ordering::Release);
                 mark_owner_domain(record);
-                return ProcessRecordRef {
+                return Ok(ProcessRecordRef {
                     index,
                     generation: ProcessGeneration::new(generation),
-                };
+                });
             }
         }
     }
 
     let generation = KernelArena::global().allocate_generation();
-    match section.claim(Some(HostPid::new(id)), generation, |record| {
+    section.claim(Some(HostPid::new(id)), generation, |record| {
         record.run_state.store(want, Ordering::Relaxed);
         mark_owner_domain(record);
-    }) {
-        Ok(r) => r,
-        Err(err) => abort_on_arena_error(err),
-    }
-}
-
-fn abort_on_arena_error(err: ArenaError) -> ! {
-    eprintln!("carrick: run-state arena publication failed: {err:?}");
-    carrick_fatal!(
-        "run_state::kernel_arena",
-        "run-state arena publication failed"
-    );
+    })
 }
 
 /// Reset THIS (freshly-forked child) process's published state to `Booting`.
@@ -495,16 +528,16 @@ pub fn reinit_booting_after_fork() {
 /// (the round-8 sysvsem GETZCNT sleepers undercount). Any published state is
 /// fresher than the seed by definition, so the seed only fills EMPTY slots
 /// (compare-exchange from 0).
-pub fn publish_child_booting(child_pid: u32) {
+pub fn try_publish_child_booting(child_pid: u32) -> Result<(), ArenaError> {
     if child_pid == 0 {
-        return;
+        return Ok(());
     }
     let section = processes();
     let want = pack(child_pid, RunState::Booting);
     // A decodable process state for this pid already exists — the child (or an
     // earlier seed) published; never regress it.
     if find_record(section, child_pid, false).is_some() {
-        return;
+        return Ok(());
     }
     // Adopt the pre-fork metadata record only while still EMPTY. CAS from 0 so
     // a concurrent first publish from the child wins and is never clobbered.
@@ -528,17 +561,22 @@ pub fn publish_child_booting(child_pid: u32) {
         let _ = record
             .run_state
             .compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire);
-        return;
+        return Ok(());
     }
     // No record for this pid at all. The fork paths stamp the child's metadata
     // record before seeding, so this is only reachable from direct callers
     // (tests); claim a fresh record so early /proc polls still read `R`.
     let generation = KernelArena::global().allocate_generation();
-    match section.claim(Some(HostPid::new(child_pid)), generation, |record| {
-        record.run_state.store(want, Ordering::Relaxed);
-    }) {
-        Ok(_) => {}
-        Err(err) => abort_on_arena_error(err),
+    section
+        .claim(Some(HostPid::new(child_pid)), generation, |record| {
+            record.run_state.store(want, Ordering::Relaxed);
+        })
+        .map(|_| ())
+}
+
+pub fn publish_child_booting(child_pid: u32) {
+    if let Err(err) = try_publish_child_booting(child_pid) {
+        eprintln!("carrick: run-state arena publication failed for child pid {child_pid}: {err:?}");
     }
 }
 
@@ -1060,5 +1098,49 @@ mod tests {
         assert_eq!(published(770_077), Some(RunState::Blocked));
         publish_for(770_077, RunState::Running);
         assert_eq!(published(770_077), Some(RunState::Running));
+    }
+
+    #[test]
+    fn clear_guest_process_timeout_returns_busy_error() {
+        let pid = 0x0BAD_C099;
+        wipe_id(pid);
+        let generation = KernelArena::global().allocate_generation();
+        let record_ref = processes()
+            .claim(Some(HostPid::new(pid)), generation, |record| {
+                record
+                    .run_state
+                    .store(pack(pid, RunState::Running), Ordering::Relaxed);
+            })
+            .expect("claim process record");
+        let record = &processes().records[record_ref.index];
+        let guard = record
+            .begin_transition()
+            .expect("hold transition guard to simulate contention");
+
+        let res =
+            try_clear_guest_process_with_timeout(pid as i32, std::time::Duration::from_millis(10));
+        assert!(matches!(res, Err(ProcessRecordTransitionError::Busy)));
+
+        drop(guard);
+        processes().release(record_ref);
+        wipe_id(pid);
+    }
+
+    #[test]
+    fn claim_record_returns_exhausted_error_when_arena_full() {
+        let arena = Box::leak(Box::new(KernelArena::create().expect("test kernel arena")));
+        let section = &arena.layout().processes;
+        for i in 0..carrick_kernel::process::PROCESS_RECORDS {
+            let generation = arena.allocate_generation();
+            let _ = section.claim(Some(HostPid::new(100_000 + i as u32)), generation, |_| {});
+        }
+        let want = pack(999_999, RunState::Running);
+        let err = claim_record(section, 999_999, want, false).unwrap_err();
+        match err {
+            ArenaError::Exhausted { section, capacity } => {
+                assert_eq!(section, "processes");
+                assert_eq!(capacity, carrick_kernel::process::PROCESS_RECORDS);
+            }
+        }
     }
 }
