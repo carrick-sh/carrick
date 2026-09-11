@@ -302,3 +302,13 @@ rows, (4) resume the perf2x campaign.
   cand = pinned current main, w4 x3 reps with alternating order, then w1,
   quiet-gated before every phase. Workers are dispatched only after it
   finishes (their builds would contaminate it).
+- Gate receipt on main 541a575ff (binary sha256 3c8dbee5b686c49d, CDHash sha256=cced55bc2,
+  hypervisor entitlement present, `__dof_carrick` present): `just ci`
+  EXIT 0 (target/perf/ci-ppoll-sep11.log, after clearing target/debug so
+  every crate rebuilt from scratch) and `just conformance-probes` EXIT 0
+  (target/perf/probes-ppoll-sep11.log; every generic shard and the legacy
+  CLI step green, no gating DIFF). Pushed to origin/main
+  (01f812101..541a575ff). Residual: the report-only amd64:musl lane still
+  shows a stale ppollwaitset oracle carrying the old probe's panic text
+  (non-gating, no native amd64 bless host here; root@carrick-x86 and
+  willow VM 210 are candidates for a native amd64 oracle later).
