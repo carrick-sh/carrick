@@ -342,19 +342,15 @@ impl SyscallDispatcher {
         }
     }
 
-    fn update_fs_umask(&self, kernel: &crate::kernel::KernelContext, umask: u32) -> u32 {
-        match kernel.kernel().update_fs_umask(kernel, umask) {
-            Ok((_, previous)) => previous,
-            Err(_error) => {
-                // umask(2) has no error return. Reservation contention is
-                // retried inside Kernel; any remaining failure means the exact
-                // dispatch context violated its authority boundary.
-                carrick_fatal!(
-                    "dispatch::credentials",
-                    "CLONE_FS umask publication invariant failed"
-                );
-            }
-        }
+    pub(crate) fn update_fs_umask(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        umask: u32,
+    ) -> Result<u32, crate::kernel::KernelOperationError> {
+        kernel
+            .kernel()
+            .update_fs_umask(kernel, umask)
+            .map(|(_, previous)| previous)
     }
 
     /// Capture the process identity snapshot published across the guest-visible
@@ -593,8 +589,10 @@ impl SyscallDispatcher {
 
         fn umask(this, cx, new: u64) {
             let new = new as u32 & 0o777;
-            let previous = this.update_fs_umask(cx.kernel, new);
-            Ok(DispatchOutcome::returned_u32(previous))
+            match this.update_fs_umask(cx.kernel, new) {
+                Ok(previous) => Ok(DispatchOutcome::returned_u32(previous)),
+                Err(_) => Ok(DispatchOutcome::errno(LINUX_EINTR)),
+            }
         }
 
         fn setpriority(this, cx, which: u64, who: Pid, prio: u64) {

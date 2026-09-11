@@ -7493,5 +7493,34 @@ mod scm_rights_tests {
         assert_eq!(g.ok(SYS_CLOSE, [pipe_r as u64, 0, 0, 0, 0, 0]), 0);
         assert_eq!(g.ok(SYS_CLOSE, [pipe_w as u64, 0, 0, 0, 0, 0]), 0);
     }
+
+    #[test]
+    fn update_fs_umask_typed_error_on_exited_task() {
+        let dispatcher = SyscallDispatcher::new();
+        let cx = dispatcher.capture_one_task_context().unwrap();
+
+        // Calling update_fs_umask on active task succeeds.
+        let _ = dispatcher.update_fs_umask(&cx, 0o027).unwrap();
+        assert_eq!(dispatcher.update_fs_umask(&cx, 0o022).unwrap(), 0o027);
+
+        // Terminate the task in the kernel.
+        let _ = cx
+            .kernel()
+            .exit_task(
+                cx.task().key().id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+
+        // Calling update_fs_umask on an exited task returns Err(ParentExited) rather than aborting.
+        let err = dispatcher.update_fs_umask(&cx, 0o022).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::kernel::KernelOperationError::ParentExited
+        ));
+    }
 }
+
+
 
