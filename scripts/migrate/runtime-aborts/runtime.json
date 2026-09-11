@@ -559,7 +559,7 @@
       "domain": "dispatch::mem_revision"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
       "function": "DispatchMmBinding::rebind_prepared_root",
       "ordinal_in_function": 1,
       "fingerprint": "95a3e30e28bdfefdfd10ca31403374bfde67c323ba2d4fd65c210f6e6af4b9f4",
@@ -570,7 +570,7 @@
       "domain": "dispatch::mm_binding"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
       "function": "DispatchMmBinding::stage_private_exec",
       "ordinal_in_function": 1,
       "fingerprint": "4cf254739a9d86140b156fc9683fec9579b5617d6e08e2487301f371192904bf",
@@ -615,7 +615,7 @@
       "domain": "dispatch::host_alias_transactions"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
       "function": "MmExecutorParticipation::participation_mut",
       "ordinal_in_function": 1,
       "fingerprint": "7b4470815c28e947603f9a8a0f6a3e3c88132ea25b560702d3c2faf0890b1929",
@@ -626,7 +626,7 @@
       "domain": "dispatch::mm_executor_participation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
       "function": "MmExecutorParticipation::reenter_exact",
       "ordinal_in_function": 1,
       "fingerprint": "943f7d94656f10965a4c99e51be6386f9eeb7897dbd1f700b560f343b6392cb4",
@@ -637,7 +637,7 @@
       "domain": "dispatch::mm_executor_participation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
       "function": "PreparedDispatchMmExec::commit",
       "ordinal_in_function": 1,
       "fingerprint": "df1e00241c924d3655780d711e4ed37c65242bba6fe04cb3d4fe0b6d36422a58",
@@ -648,7 +648,7 @@
       "domain": "dispatch::mm_exec_commit"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mm_authority.rs",
       "function": "PreparedDispatchMmExec::commit",
       "ordinal_in_function": 2,
       "fingerprint": "7afa329bbfce4d67a674fd50b4a1a5cb72f20b7279a6a1c166fa1b95062875e3",
