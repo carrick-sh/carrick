@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "shard": "runtime.json",
-  "typed_error_debt_ceiling": 21,
+  "typed_error_debt_ceiling": 20,
   "rows": [
     {
       "file": "crates/carrick-runtime/src/carrier.rs",
@@ -81,18 +81,6 @@
       "typed_error": "KernelOperationError",
       "sink": "fatal",
       "domain": "dispatch::fd_table"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/ioring.rs",
-      "function": "<CrossProcessLock<'_> as Drop>::drop",
-      "ordinal_in_function": 1,
-      "fingerprint": "2395a38c7a41235a0bab984d182ee4d9109da481d46905f0fbcc86d038e95077",
-      "verdict": "typed_error_debt",
-      "failure_domain": "dispatch::io_uring",
-      "rationale": "CrossProcessLock unlock should be explicit and fallible, poisoning and retiring its exact io_uring backing with a typed EIO/host error instead of aborting.",
-      "typed_error": "LinuxErrno",
-      "sink": "fatal",
-      "domain": "dispatch"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",

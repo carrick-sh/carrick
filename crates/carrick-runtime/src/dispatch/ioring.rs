@@ -33,7 +33,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use carrick_fatal::carrick_fatal;
+use carrick_abi::LinuxErrno;
 use zerocopy::{FromBytes, IntoBytes};
 
 const U32: u32 = 4;
@@ -483,7 +483,10 @@ impl IoUringBacking {
         lock.l_len = 1;
         loop {
             if unsafe { libc::fcntl(self.lock_fd.as_raw_fd(), libc::F_SETLKW, &lock) } == 0 {
-                return Some(CrossProcessLock { backing: self });
+                return Some(CrossProcessLock {
+                    backing: self,
+                    unlocked: false,
+                });
             }
             if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 return None;
@@ -505,17 +508,31 @@ impl IoUringBacking {
 
 struct CrossProcessLock<'a> {
     backing: &'a IoUringBacking,
+    unlocked: bool,
 }
 
-impl Drop for CrossProcessLock<'_> {
-    fn drop(&mut self) {
+impl<'a> CrossProcessLock<'a> {
+    fn unlock(&mut self) -> Result<(), LinuxErrno> {
+        if self.unlocked {
+            return Ok(());
+        }
+        self.unlocked = true;
         let mut lock: libc::flock = unsafe { core::mem::zeroed() };
         lock.l_type = libc::F_UNLCK;
         lock.l_whence = libc::SEEK_SET as i16;
         lock.l_start = 0;
         lock.l_len = 1;
         if unsafe { libc::fcntl(self.backing.lock_fd.as_raw_fd(), libc::F_SETLK, &lock) } != 0 {
-            carrick_fatal!("dispatch", "CrossProcessLock unlock failed");
+            return Err(linux_errno::EIO);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CrossProcessLock<'_> {
+    fn drop(&mut self) {
+        if let Err(err) = self.unlock() {
+            tracing::error!("CrossProcessLock unlock failed: {err:?}");
         }
     }
 }
@@ -855,7 +872,7 @@ impl SyscallDispatcher {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
         let _local_enter = backing.local_enter.lock();
-        let Some(_cross_process) = backing.cross_process_lock() else {
+        let Some(mut cross_process) = backing.cross_process_lock() else {
             return DispatchOutcome::errno(linux_errno::EIO);
         };
         let layout = backing.layout;
@@ -907,6 +924,9 @@ impl SyscallDispatcher {
                             cq_tail,
                             Ordering::Release,
                         );
+                        if let Err(errno) = cross_process.unlock() {
+                            return DispatchOutcome::errno(errno);
+                        }
                         return self.io_uring_block_outcome(fd, sqe, host_fd, events);
                     }
                 },
@@ -940,6 +960,9 @@ impl SyscallDispatcher {
         // Publish the consumed SQ head and the produced CQ tail back to the guest.
         let _ = backing.store_u32(layout.sq_off.head as u64, sq_head, Ordering::Release);
         let _ = backing.store_u32(layout.cq_off.tail as u64, cq_tail, Ordering::Release);
+        if let Err(errno) = cross_process.unlock() {
+            return DispatchOutcome::errno(errno);
+        }
         // Number of SQEs this call submitted (bounded by to_submit; correct
         // across a WaitOnFds re-dispatch, which recounts only still-pending SQEs).
         DispatchOutcome::returned_u32(processed)
@@ -1794,5 +1817,15 @@ mod tests {
         });
         assert_eq!(c.res, 7);
         assert_eq!(c.user_data, 0x22);
+    }
+
+    #[test]
+    fn cross_process_lock_unlock_is_idempotent() {
+        let backing = IoUringBacking::create(8, 4096).expect("ring backing");
+        let mut lock = backing.cross_process_lock().expect("lock");
+        assert!(lock.unlock().is_ok());
+        assert!(lock.unlock().is_ok());
+        let mut lock2 = backing.cross_process_lock().expect("lock2");
+        assert!(lock2.unlock().is_ok());
     }
 }
