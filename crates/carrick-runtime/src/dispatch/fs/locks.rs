@@ -147,7 +147,7 @@ fn validate_flock_arg<M: CurrentMmMemory>(memory: &M, arg: u64) -> Result<(), Li
 }
 
 /// Same-file identity used for F_SETLEASE conflict accounting (see
-/// [`SyscallDispatcher::same_file_other_openers`]). Two open descriptions
+/// [`FsView::same_file_other_openers`]). Two open descriptions
 /// conflict for lease purposes iff they name the same underlying file: the host
 /// inode under `--fs host`, or the guest open-path for the in-memory backing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
