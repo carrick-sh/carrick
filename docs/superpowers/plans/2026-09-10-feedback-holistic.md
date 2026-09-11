@@ -129,3 +129,13 @@ from sibling branches.
   commit-per-move, stop-green-at-70-minutes rule. T17 spec/embed hygiene
   landed (70f8413a3). T16 dispatcher subsystem views is briefed and waits
   for the dispatch split to finish.
+- 2026-09-10 wave 3 round 2 LANDED: trap.rs → 21,662 (guest_memory,
+  global_frame, test modules moved with their subjects); vcpu_loop/mod.rs
+  → 16,525 (memory, crash, outcome); dispatch/fs.rs → 9,603 (attr, stat,
+  ioctl); dispatch/mod.rs → 7,724 (mm_authority, dispatcher,
+  kernel_context). `just ci` green after round 1 (ci-wave3a); round 2 CI
+  running (ci-wave3b). Round 3 dispatched; net.rs starts this round.
+  Note for the splits: `runtime-global-state.json` keys rows by file and is
+  not covered by `--rehome`; the director merges the worker's rows for the
+  touched files over main's ledger at landing (`merge-global-state.py`,
+  session scratchpad) until the tool grows that mode.
