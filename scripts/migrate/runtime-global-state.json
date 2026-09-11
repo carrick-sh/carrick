@@ -299,19 +299,19 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "file": "crates/carrick-runtime/src/dispatch/fs/open.rs",
       "symbol": "trusted_fs_lane_enabled::CARRICK_FS_TRUSTED_LANE",
       "fingerprint": "2d8b98ce0979b1e11b266d37f3240be459bc06655f7c405419ccb62cdebd6331",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FS_TRUSTED_LANE read in trusted_fs_lane_enabled::CARRICK_FS_TRUSTED_LANE (crates/carrick-runtime/src/dispatch/fs.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_FS_TRUSTED_LANE read in trusted_fs_lane_enabled::CARRICK_FS_TRUSTED_LANE (crates/carrick-runtime/src/dispatch/fs/open.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+      "file": "crates/carrick-runtime/src/dispatch/fs/open.rs",
       "symbol": "trusted_fs_lane_enabled::ENABLED",
       "fingerprint": "810e6edc6ac71f37c4eb86f28b68168eb8d1faac13e5facea0127a51501d3002",
       "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache trusted_fs_lane_enabled::ENABLED in crates/carrick-runtime/src/dispatch/fs.rs initialized from environment flags."
+      "rationale": "Process-global configuration or failpoint cache trusted_fs_lane_enabled::ENABLED in crates/carrick-runtime/src/dispatch/fs/open.rs initialized from environment flags."
     },
     {
       "kind": "thread_local",

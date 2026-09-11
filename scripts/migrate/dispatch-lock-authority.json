@@ -11,154 +11,19 @@
   },
   "entries": [
     {
+      "id": "crates/carrick-runtime/src/dispatch/core_publication.rs::SyscallDispatcher::core_process_snapshot::proc#1",
+      "file": "crates/carrick-runtime/src/dispatch/core_publication.rs",
+      "line": 124,
+      "item": "SyscallDispatcher::core_process_snapshot",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 1
+    },
+    {
       "id": "crates/carrick-runtime/src/dispatch/creds.rs::LinuxErrno::identity_pid::proc#1",
       "file": "crates/carrick-runtime/src/dispatch/creds.rs",
       "line": 384,
       "item": "LinuxErrno::identity_pid",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::SyscallDispatcher::fd_is_controlling_tty::pty_table#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "line": 205,
-      "item": "SyscallDispatcher::fd_is_controlling_tty",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::open_at_path_string::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 731,
-      "item": "DispatchError::open_at_path_string",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs/close_dup.rs::SyscallDispatcher::dup_stdio_pty_role::pty_table#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs/close_dup.rs",
-      "line": 17,
-      "item": "SyscallDispatcher::dup_stdio_pty_role",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs.rs::DispatchError::try_vfs_open::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-      "line": 1913,
-      "item": "DispatchError::try_vfs_open",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::SyscallDispatcher::pty_is_controlling::pty_table#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "line": 402,
-      "item": "SyscallDispatcher::pty_is_controlling",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs/proc_synthetic.rs::SyscallDispatcher::proc_self_fd_tty_link::pty_table#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs/proc_synthetic.rs",
-      "line": 523,
-      "item": "SyscallDispatcher::proc_self_fd_tty_link",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::SyscallDispatcher::ioctl::pty_table#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "line": 503,
-      "item": "SyscallDispatcher::ioctl",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::SyscallDispatcher::ioctl::pty_table#2",
-      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
-      "line": 1107,
-      "item": "SyscallDispatcher::ioctl",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 2
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs/directory.rs::SyscallDispatcher::readlinkat::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs/directory.rs",
-      "line": 562,
-      "item": "SyscallDispatcher::readlinkat",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/fs/stat.rs::SyscallDispatcher::stdio_synthetic_label_mode::pty_table#1",
-      "file": "crates/carrick-runtime/src/dispatch/fs/stat.rs",
-      "line": 18,
-      "item": "SyscallDispatcher::stdio_synthetic_label_mode",
-      "category": "pty_table",
-      "expression": ".pty_table.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4618,
-      "item": "T::membarrier",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#2",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4622,
-      "item": "T::membarrier",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 2
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#3",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4628,
-      "item": "T::membarrier",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 3
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/mem.rs::SyscallDispatcher::mmap::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5236,
-      "item": "SyscallDispatcher::mmap",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/kernel_context.rs::SyscallDispatcher::bind_hvpatch_process_exact::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
-      "line": 141,
-      "item": "SyscallDispatcher::bind_hvpatch_process_exact",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/kernel_context.rs::R::hvpatch_process::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
-      "line": 356,
-      "item": "R::hvpatch_process",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 1
@@ -177,15 +42,6 @@
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
       "line": 596,
       "item": "SnapshotError::event_ring_guest_pid",
-      "category": "proc",
-      "expression": ".proc.lock()",
-      "ordinal": 1
-    },
-    {
-      "id": "crates/carrick-runtime/src/dispatch/core_publication.rs::SyscallDispatcher::core_process_snapshot::proc#1",
-      "file": "crates/carrick-runtime/src/dispatch/core_publication.rs",
-      "line": 124,
-      "item": "SyscallDispatcher::core_process_snapshot",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 1
@@ -231,6 +87,150 @@
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
       "line": 690,
       "item": "u8::current_exec_env",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/close_dup.rs::SyscallDispatcher::dup_stdio_pty_role::pty_table#1",
+      "file": "crates/carrick-runtime/src/dispatch/fs/close_dup.rs",
+      "line": 17,
+      "item": "SyscallDispatcher::dup_stdio_pty_role",
+      "category": "pty_table",
+      "expression": ".pty_table.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/directory.rs::SyscallDispatcher::readlinkat::proc#1",
+      "file": "crates/carrick-runtime/src/dispatch/fs/directory.rs",
+      "line": 562,
+      "item": "SyscallDispatcher::readlinkat",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::SyscallDispatcher::fd_is_controlling_tty::pty_table#1",
+      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
+      "line": 205,
+      "item": "SyscallDispatcher::fd_is_controlling_tty",
+      "category": "pty_table",
+      "expression": ".pty_table.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::SyscallDispatcher::pty_is_controlling::pty_table#1",
+      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
+      "line": 402,
+      "item": "SyscallDispatcher::pty_is_controlling",
+      "category": "pty_table",
+      "expression": ".pty_table.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::SyscallDispatcher::ioctl::pty_table#1",
+      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
+      "line": 503,
+      "item": "SyscallDispatcher::ioctl",
+      "category": "pty_table",
+      "expression": ".pty_table.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs::SyscallDispatcher::ioctl::pty_table#2",
+      "file": "crates/carrick-runtime/src/dispatch/fs/ioctl.rs",
+      "line": 1107,
+      "item": "SyscallDispatcher::ioctl",
+      "category": "pty_table",
+      "expression": ".pty_table.lock()",
+      "ordinal": 2
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/open.rs::SyscallDispatcher::open_at_path_string::proc#1",
+      "file": "crates/carrick-runtime/src/dispatch/fs/open.rs",
+      "line": 132,
+      "item": "SyscallDispatcher::open_at_path_string",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/open.rs::SyscallDispatcher::try_vfs_open::proc#1",
+      "file": "crates/carrick-runtime/src/dispatch/fs/open.rs",
+      "line": 1314,
+      "item": "SyscallDispatcher::try_vfs_open",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/proc_synthetic.rs::SyscallDispatcher::proc_self_fd_tty_link::pty_table#1",
+      "file": "crates/carrick-runtime/src/dispatch/fs/proc_synthetic.rs",
+      "line": 523,
+      "item": "SyscallDispatcher::proc_self_fd_tty_link",
+      "category": "pty_table",
+      "expression": ".pty_table.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/fs/stat.rs::SyscallDispatcher::stdio_synthetic_label_mode::pty_table#1",
+      "file": "crates/carrick-runtime/src/dispatch/fs/stat.rs",
+      "line": 18,
+      "item": "SyscallDispatcher::stdio_synthetic_label_mode",
+      "category": "pty_table",
+      "expression": ".pty_table.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/kernel_context.rs::SyscallDispatcher::bind_hvpatch_process_exact::proc#1",
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "line": 141,
+      "item": "SyscallDispatcher::bind_hvpatch_process_exact",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/kernel_context.rs::R::hvpatch_process::proc#1",
+      "file": "crates/carrick-runtime/src/dispatch/kernel_context.rs",
+      "line": 356,
+      "item": "R::hvpatch_process",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#1",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 4618,
+      "item": "T::membarrier",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 1
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#2",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 4622,
+      "item": "T::membarrier",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 2
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/mem.rs::T::membarrier::proc#3",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 4628,
+      "item": "T::membarrier",
+      "category": "proc",
+      "expression": ".proc.lock()",
+      "ordinal": 3
+    },
+    {
+      "id": "crates/carrick-runtime/src/dispatch/mem.rs::SyscallDispatcher::mmap::proc#1",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "line": 5236,
+      "item": "SyscallDispatcher::mmap",
       "category": "proc",
       "expression": ".proc.lock()",
       "ordinal": 1
