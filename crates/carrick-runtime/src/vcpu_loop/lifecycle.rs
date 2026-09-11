@@ -704,6 +704,7 @@ pub(crate) fn bootstrap_hvpatch_process_child_tid(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::super::binding::*;
     use super::super::tests::*;
     use super::super::*;
     use super::*;

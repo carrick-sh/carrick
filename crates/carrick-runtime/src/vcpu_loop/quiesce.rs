@@ -3619,7 +3619,7 @@ mod pt_pause_tests {
 
     #[test]
     fn raised_pt_pause_denies_guest_reentry_until_guard_releases() {
-        let production = include_str!("mod.rs")
+        let production = include_str!("binding.rs")
             .split("fn poll_with_engine(")
             .nth(1)
             .expect("production poll body");

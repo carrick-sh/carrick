@@ -5448,7 +5448,7 @@ mod tests {
 
     #[test]
     fn hvpatch_launch_callgraph_never_constructs_the_compatibility_loop_future() {
-        let source = include_str!("mod.rs");
+        let source = include_str!("binding.rs");
         // INVERTED for the fork-closure deletion. This used to bound the launch
         // entry between `launch_vcpu_until_exit` and `PreparedInitialRunnerTask`
         // and assert the HVPatch arm came first. Both are deleted: there is no
@@ -5664,10 +5664,11 @@ mod tests {
         assert!(hvpatch_fork.contains("PreparedInProcessFork::SuspendVfork"));
         assert!(!hvpatch_fork.contains(".await"));
         assert!(!hvpatch_fork.contains("wait.wait_for_release"));
-        let fork_wrapper = loop_source
+        let binding = include_str!("binding.rs");
+        let fork_wrapper = binding
             .split("fn complete_persistent_process_fork")
             .nth(1)
-            .and_then(|tail| tail.split("fn finalize_persistent_process_failure").next())
+            .and_then(|tail| tail.split("fn finalize_persistent_process_terminal").next())
             .expect("persistent fork suspension wrapper");
         assert!(fork_wrapper.contains("HvpatchBlockInput::Vfork"));
 
@@ -5805,7 +5806,7 @@ mod tests {
         assert_send::<super::super::ExecCloneAdmission>();
         assert_send::<super::super::exec::PreparedExecve>();
 
-        let source = include_str!("mod.rs")
+        let source = include_str!("binding.rs")
             .split_once("struct HvpatchLoopJob")
             .expect("real HVPatch loop job")
             .1
@@ -6116,7 +6117,7 @@ mod tests {
 
     #[test]
     fn production_hvpatch_thread_clone_never_reaches_host_thread_or_vcpu_materialization() {
-        let source = include_str!("mod.rs");
+        let source = include_str!("binding.rs");
         let production = source
             .split_once("impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopJob<E>")
             .expect("production HVPatch job")
@@ -6196,7 +6197,7 @@ mod tests {
     fn production_hvpatch_process_fork_never_reaches_host_thread_or_vcpu_materialization() {
         let quiesce = include_str!("quiesce.rs");
         let lifecycle = include_str!("lifecycle.rs");
-        let production = include_str!("mod.rs");
+        let production = include_str!("binding.rs");
         let backend_ops = lifecycle
             .split_once("for ProductionHvpatchProcessBackendOps")
             .expect("production HVPatch process backend ops")
@@ -6296,7 +6297,7 @@ mod tests {
             "trap_watchdog_decision",
         ] {
             assert!(
-                production.contains(required),
+                production.contains(required) || lifecycle.contains(required),
                 "persistent fork failure/quiesce contract omitted {required}"
             );
         }
