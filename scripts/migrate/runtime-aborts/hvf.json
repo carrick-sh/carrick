@@ -356,7 +356,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 1,
       "fingerprint": "fb6fb91149a0f41f07e6ed10a1aaed97802ea86ecf3c7b12f256861f4e872ff3",
@@ -367,7 +367,7 @@
       "domain": "hvpatch::cow_token"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 2,
       "fingerprint": "7b7b163a65a1d2491cee0e49c8f447d136f77d44dfcfc2397bdf3089d187c2f7",
@@ -378,7 +378,7 @@
       "domain": "hvpatch::cow_token"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 3,
       "fingerprint": "b9532137cde3ac1dfe9316cb9d8f7b50ac43e72922e2d20c3ae413c26a57c56d",
@@ -389,7 +389,7 @@
       "domain": "hvpatch::mm_authority"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 4,
       "fingerprint": "5f02d7573efe52cd9ce714ff4c6614546a72c15c48a7bc00000786fdbc6494c2",
@@ -400,7 +400,7 @@
       "domain": "hvpatch::mm_authority"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 5,
       "fingerprint": "a0adf7cb66d77c00ee33ea5f0b824165c06da935bb6dca22682ba106d408376c",
@@ -411,7 +411,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 6,
       "fingerprint": "296cd55f3b0a373a2a14549c36bb06c3d1804a2514ed777dc002e4e49d99dd28",
@@ -422,7 +422,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 7,
       "fingerprint": "e51536ac20dea2bc32e8893b1cef712c54b5094d4405c5076f783f4efb5ffbcd",
@@ -433,7 +433,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 8,
       "fingerprint": "898b08d0c6460d7a5a2a4892f0454a65009b35c31d12c4257af9d13232d15459",
@@ -444,7 +444,7 @@
       "domain": "hvpatch::cow_token"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfTaskState::perform_frame_cow",
       "ordinal_in_function": 9,
       "fingerprint": "898b08d0c6460d7a5a2a4892f0454a65009b35c31d12c4257af9d13232d15459",
@@ -521,7 +521,7 @@
       "domain": "hvpatch::fork_publication"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::add_alias",
       "ordinal_in_function": 1,
       "fingerprint": "4a84f1e1d7120f56f923c54fbf348a8e33feda3e30c3ecc311d87febbf10a331",
@@ -532,7 +532,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::add_alias",
       "ordinal_in_function": 2,
       "fingerprint": "4a84f1e1d7120f56f923c54fbf348a8e33feda3e30c3ecc311d87febbf10a331",
@@ -708,7 +708,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
       "ordinal_in_function": 1,
       "fingerprint": "afd4ec93585a3a41b86adfdab8b31fad05e9087ca8855dd631695a0d2875e8b8",
@@ -719,7 +719,7 @@
       "domain": "hvpatch::mm_authority"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
       "ordinal_in_function": 2,
       "fingerprint": "a9d475d24cfad9626d476df23f3d1dde6bcae6ff80673dbeac853258bcdd1d36",
@@ -730,7 +730,7 @@
       "domain": "hvpatch::mm_authority"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
       "ordinal_in_function": 3,
       "fingerprint": "59b22977ed31a965e1eda95ca1f98930df58933baf1c268dd7ef95b3a8d0652c",
@@ -741,7 +741,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
       "ordinal_in_function": 4,
       "fingerprint": "692b957fdb97e7fbac5d68f7c966c473857b77a68645b4fabb2233d8ed4e78bf",
@@ -752,7 +752,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
       "ordinal_in_function": 5,
       "fingerprint": "fa53404a4db12bc717ac9b6bd451d5456194e8c845d0aa3f8f016eca19bb78c4",
@@ -763,7 +763,7 @@
       "domain": "hvpatch::cow_token"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_retired_reuse",
       "ordinal_in_function": 6,
       "fingerprint": "fa53404a4db12bc717ac9b6bd451d5456194e8c845d0aa3f8f016eca19bb78c4",
@@ -774,7 +774,7 @@
       "domain": "hvpatch::cow_token"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::observe_frame_cow_protection",
       "ordinal_in_function": 1,
       "fingerprint": "2e8bf245f7f147d17f2340ed1dc31fc484f938d73f2d676127ae0e275960c34d",
@@ -785,7 +785,7 @@
       "domain": "hvpatch::cow_token"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::observe_frame_cow_protection",
       "ordinal_in_function": 2,
       "fingerprint": "2e8bf245f7f147d17f2340ed1dc31fc484f938d73f2d676127ae0e275960c34d",
@@ -796,7 +796,7 @@
       "domain": "hvpatch::cow_token"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::observe_frame_cow_protection",
       "ordinal_in_function": 3,
       "fingerprint": "2e8bf245f7f147d17f2340ed1dc31fc484f938d73f2d676127ae0e275960c34d",
@@ -873,7 +873,7 @@
       "domain": "hvpatch::executor_boundary"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::commit_process_alias_retirement",
       "ordinal_in_function": 1,
       "fingerprint": "6437f4320e19b0f83157566e875ad71bdd11b0ed9de954e71283a9049141bed9",
@@ -884,7 +884,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::commit_process_alias_retirement",
       "ordinal_in_function": 2,
       "fingerprint": "61a5927bcaa2e6e900b2f9924838f3c1f0ba43add8b4d797e0b3035e35640e32",
@@ -895,7 +895,7 @@
       "domain": "hvpatch::frame_inventory"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::commit_process_alias_retirement",
       "ordinal_in_function": 3,
       "fingerprint": "01b3f0e769642447c147922ddb0326a92967cd6a5aa1509976035a2e31724e2b",
@@ -1742,7 +1742,7 @@
       "domain": "hvpatch::host_alias"
     },
     {
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_sparse_mmap_extent_inner",
       "ordinal_in_function": 1,
       "fingerprint": "ea4e805f9e505cec827854c644bf4643cf7f425e8af9e9227b9b63212fb17119",
