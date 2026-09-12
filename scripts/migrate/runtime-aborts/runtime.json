@@ -1647,7 +1647,7 @@
       "domain": "kernel::pending_signals"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-runtime/src/kernel/objects/session.rs",
       "function": "ProcessGroup::new",
       "ordinal_in_function": 1,
       "fingerprint": "d4a55ae392cf44587e26b549ac1900ea08796f25fd872979d50a2a5bb9532683",
