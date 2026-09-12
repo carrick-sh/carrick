@@ -313,3 +313,47 @@ fn fork_exec_exit_and_unmap_sites_contain_no_carrier_topology_lock() {
         failures.join("\n")
     );
 }
+
+/// The frame-registry leaf is a non-reentrant mutex. `commit_process_alias_retirement`
+/// runs INSIDE `materialize_sparse_mmap_extent_inner`'s registry hold (a private-file
+/// `mmap` publishes its replacement and retires the displaced rows under one leaf
+/// section), so the commit must take the caller's guard as proof and never lock the
+/// leaf itself. On 2026-09-12 it did lock it: every `mmap` of a private file-backed
+/// mapping over live rows (Python loading an extension module) self-deadlocked the
+/// executor and wedged the guest.
+#[test]
+fn alias_retirement_commit_takes_the_callers_registry_guard_and_never_locks_the_leaf() {
+    let cow_engine_src = include_str!("../cow_engine.rs");
+    let (_, after_sig) = cow_engine_src
+        .split_once("pub(crate) fn commit_process_alias_retirement(")
+        .expect("commit_process_alias_retirement exists");
+    let (signature, body) = after_sig
+        .split_once(") -> Result<(), TrapError> {")
+        .expect("commit_process_alias_retirement signature ends with its Result");
+    assert!(
+        signature.contains("registry: &crate::fork_quiesce::FrameRegistryGuard<'_>"),
+        "commit_process_alias_retirement must take the caller's FrameRegistryGuard as proof of the leaf hold"
+    );
+    let body = body
+        .split_once("\n    pub(crate) fn ")
+        .map_or(body, |(head, _)| head);
+    assert!(
+        !body.contains("frame_registry_lock()"),
+        "commit_process_alias_retirement must never take the frame-registry leaf itself: its callers hold it"
+    );
+    for caller in [
+        "materialize_sparse_mmap_extent_inner",
+        "unregister_process_alias",
+    ] {
+        let (_, after) = cow_engine_src
+            .split_once(&format!("fn {caller}("))
+            .unwrap_or_else(|| panic!("{caller} exists"));
+        let section = after
+            .split_once("\n    pub(crate) fn ")
+            .map_or(after, |(head, _)| head);
+        assert!(
+            section.contains("commit_process_alias_retirement(") && section.contains("&registry)"),
+            "{caller} must pass its own registry guard into the retirement commit"
+        );
+    }
+}

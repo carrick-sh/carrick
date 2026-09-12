@@ -1745,7 +1745,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::materialize_sparse_mmap_extent_inner",
       "ordinal_in_function": 1,
-      "fingerprint": "ea4e805f9e505cec827854c644bf4643cf7f425e8af9e9227b9b63212fb17119",
+      "fingerprint": "aad7fa35db74c84c48e7894370fddef4e4608c486260c4114cf13564bccbe43c",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Retirement failed after replacement descriptors and inventory committed. Preparation has already reserved retirement events; returning an ordinary guest error here would expose divergent alias and frame ownership. Stop the carrier rather than continue with an invalid lifetime graph.",
