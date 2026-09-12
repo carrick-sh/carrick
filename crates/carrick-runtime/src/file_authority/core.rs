@@ -48,6 +48,33 @@ impl FileSlotState {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct TableTarget {
+    client: ClientIdentity,
+    table: FileTableId,
+    generation: ObjectGeneration,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct SlotAllocation {
+    minimum: FileSlotNumber,
+    ceiling: NofileAllocationCeiling,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct FileFlags {
+    descriptor: DescriptorFlags,
+    status: StatusFlags,
+}
+
+#[derive(Clone, Debug)]
+struct DescriptionInstallSpec {
+    descriptor_flags: DescriptorFlags,
+    access_mode: AccessMode,
+    status_flags: StatusFlags,
+    path: Option<CanonicalPath>,
+}
+
 #[derive(Debug)]
 struct FileTableState {
     generation: ObjectGeneration,
@@ -493,13 +520,19 @@ impl FileAuthorityCore {
                 status_flags,
                 capacity,
             } => self.create_pipe_and_install(
-                request.client,
-                *table,
-                request.expected_generation,
-                *minimum,
-                *ceiling,
-                *descriptor_flags,
-                *status_flags,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
+                FileFlags {
+                    descriptor: *descriptor_flags,
+                    status: *status_flags,
+                },
                 *capacity,
             ),
             Command::SetPipeCapacity {
@@ -534,13 +567,19 @@ impl FileAuthorityCore {
                 status_flags,
                 mask,
             } => self.create_signalfd_and_install(
-                request.client,
-                *table,
-                request.expected_generation,
-                *minimum,
-                *ceiling,
-                *descriptor_flags,
-                *status_flags,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
+                FileFlags {
+                    descriptor: *descriptor_flags,
+                    status: *status_flags,
+                },
                 *mask,
             ),
             Command::SetSignalFdMask { table, fd, mask } => self.set_signalfd_mask(
@@ -557,13 +596,19 @@ impl FileAuthorityCore {
                 descriptor_flags,
                 status_flags,
             } => self.create_timer_and_install(
-                request.client,
-                *table,
-                request.expected_generation,
-                *minimum,
-                *ceiling,
-                *descriptor_flags,
-                *status_flags,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
+                FileFlags {
+                    descriptor: *descriptor_flags,
+                    status: *status_flags,
+                },
             ),
             Command::SetTimer {
                 table,
@@ -598,15 +643,21 @@ impl FileAuthorityCore {
                 descriptor_flags,
                 status_flags,
             } => self.create_event_counter_and_install(
-                request.client,
-                *table,
-                request.expected_generation,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
                 *initial,
                 *semaphore,
-                *minimum,
-                *ceiling,
-                *descriptor_flags,
-                *status_flags,
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
+                FileFlags {
+                    descriptor: *descriptor_flags,
+                    status: *status_flags,
+                },
             ),
             Command::CreateVfsFile {
                 path,
@@ -635,17 +686,23 @@ impl FileAuthorityCore {
                 status_flags,
                 path,
             } => self.open_vfs_and_install(
-                request.client,
-                *table,
-                request.expected_generation,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
                 *object,
                 *object_generation,
-                *minimum,
-                *ceiling,
-                *descriptor_flags,
-                *access_mode,
-                *status_flags,
-                path.clone(),
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
+                DescriptionInstallSpec {
+                    descriptor_flags: *descriptor_flags,
+                    access_mode: *access_mode,
+                    status_flags: *status_flags,
+                    path: path.clone(),
+                },
             ),
             Command::CreateSyntheticAndInstall {
                 table,
@@ -657,16 +714,22 @@ impl FileAuthorityCore {
                 status_flags,
                 path,
             } => self.create_synthetic_and_install(
-                request.client,
-                *table,
-                request.expected_generation,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
                 contents.clone(),
-                *minimum,
-                *ceiling,
-                *descriptor_flags,
-                *access_mode,
-                *status_flags,
-                path.clone(),
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
+                DescriptionInstallSpec {
+                    descriptor_flags: *descriptor_flags,
+                    access_mode: *access_mode,
+                    status_flags: *status_flags,
+                    path: path.clone(),
+                },
             ),
             Command::AdoptHostStreamAndInstall {
                 table,
@@ -678,16 +741,22 @@ impl FileAuthorityCore {
                 kind,
                 path,
             } => self.adopt_host_stream_and_install(
-                request.client,
-                *table,
-                request.expected_generation,
-                *minimum,
-                *ceiling,
-                *descriptor_flags,
-                *access_mode,
-                *status_flags,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
+                DescriptionInstallSpec {
+                    descriptor_flags: *descriptor_flags,
+                    access_mode: *access_mode,
+                    status_flags: *status_flags,
+                    path: path.clone(),
+                },
                 *kind,
-                path.clone(),
                 capabilities,
             ),
             Command::AdoptIoUringAndInstall {
@@ -699,13 +768,19 @@ impl FileAuthorityCore {
                 entries,
                 data_length,
             } => self.adopt_io_uring_and_install(
-                request.client,
-                *table,
-                request.expected_generation,
-                *minimum,
-                *ceiling,
-                *descriptor_flags,
-                *status_flags,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
+                FileFlags {
+                    descriptor: *descriptor_flags,
+                    status: *status_flags,
+                },
                 *entries,
                 *data_length,
                 capabilities,
@@ -720,16 +795,22 @@ impl FileAuthorityCore {
                 writable,
                 path,
             } => self.adopt_host_file_and_install(
-                request.client,
-                *table,
-                request.expected_generation,
-                *minimum,
-                *ceiling,
-                *descriptor_flags,
-                *access_mode,
-                *status_flags,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
+                DescriptionInstallSpec {
+                    descriptor_flags: *descriptor_flags,
+                    access_mode: *access_mode,
+                    status_flags: *status_flags,
+                    path: path.clone(),
+                },
                 *writable,
-                path.clone(),
                 capabilities,
             ),
             Command::AcquireCapabilityLease { table, fd, purpose } => self
@@ -779,9 +860,11 @@ impl FileAuthorityCore {
                 flags,
                 same_slot,
             } => self.replace_slot(
-                request.client,
-                *table,
-                request.expected_generation,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
                 *source,
                 *target,
                 *ceiling,
@@ -870,9 +953,11 @@ impl FileAuthorityCore {
                 read_available,
                 write_backpressured,
             } => self.epoll_acknowledge_io(
-                request.client,
-                *table,
-                request.expected_generation,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
                 *fd,
                 *consumed,
                 *read_available,
@@ -925,12 +1010,16 @@ impl FileAuthorityCore {
                 ceiling,
                 flags,
             } => self.duplicate(
-                request.client,
-                *table,
-                request.expected_generation,
+                TableTarget {
+                    client: request.client,
+                    table: *table,
+                    generation: request.expected_generation,
+                },
                 *source,
-                *minimum,
-                *ceiling,
+                SlotAllocation {
+                    minimum: *minimum,
+                    ceiling: *ceiling,
+                },
                 *flags,
             ),
             Command::ForkCopy { source, owner } => {
@@ -1066,20 +1155,15 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_pipe_and_install(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        table_generation: ObjectGeneration,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
-        descriptor_flags: DescriptorFlags,
-        status_flags: StatusFlags,
+        target: TableTarget,
+        alloc: SlotAllocation,
+        flags: FileFlags,
         capacity: PipeCapacity,
     ) -> Result<Outcome, AuthorityError> {
-        self.require_bound_table(client, table, table_generation)?;
-        let (read_fd, write_fd) = self.allocate_pair(table, minimum, ceiling)?;
+        self.require_bound_table(target.client, target.table, target.generation)?;
+        let (read_fd, write_fd) = self.allocate_pair(target.table, alloc.minimum, alloc.ceiling)?;
         let pipe = self.allocate_pipe();
         let read_description = self.allocate_description();
         let write_description = self.allocate_description();
@@ -1099,13 +1183,13 @@ impl FileAuthorityCore {
                     capability_lease_refs: 0,
                     offset: FileOffset::default(),
                     access_mode,
-                    status_flags,
+                    status_flags: flags.status,
                     readiness: self.pipe_readiness(pipe, end),
                     backing: AuthorityBacking::new(PipeEndBacking { pipe, end }),
                 },
             );
         }
-        let table_state = self.tables.get_mut(&table).unwrap_or_else(|| {
+        let table_state = self.tables.get_mut(&target.table).unwrap_or_else(|| {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "pipe creation lost its validated file table",
             ))
@@ -1116,14 +1200,14 @@ impl FileAuthorityCore {
                 FileSlotState {
                     description,
                     description_generation: ObjectGeneration::INITIAL,
-                    flags: descriptor_flags,
+                    flags: flags.descriptor,
                     path: None,
                 },
             );
         }
         table_state.revision = revision;
         Ok(Outcome::PipeCreated {
-            table,
+            table: target.table,
             pipe,
             read_fd,
             write_fd,
@@ -1182,10 +1266,12 @@ impl FileAuthorityCore {
             table,
             fd,
             description,
-            descriptor_flags,
-            AccessMode::PathOnly,
-            StatusFlags::default(),
-            None,
+            DescriptionInstallSpec {
+                descriptor_flags,
+                access_mode: AccessMode::PathOnly,
+                status_flags: StatusFlags::default(),
+                path: None,
+            },
             AuthorityBacking::new(EpollBacking {
                 state: EpollState::default(),
             }),
@@ -1211,29 +1297,26 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_signalfd_and_install(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        table_generation: ObjectGeneration,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
-        descriptor_flags: DescriptorFlags,
-        status_flags: StatusFlags,
+        target: TableTarget,
+        alloc: SlotAllocation,
+        flags: FileFlags,
         mask: carrick_abi::SigSet,
     ) -> Result<Outcome, AuthorityError> {
-        self.require_bound_table(client, table, table_generation)?;
-        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        self.require_bound_table(target.client, target.table, target.generation)?;
+        let fd = self.allocate_lowest(target.table, alloc.minimum, alloc.ceiling)?;
         let description = self.allocate_description();
         let outcome = self.commit_new_description_install(
-            table,
+            target.table,
             fd,
             description,
-            descriptor_flags,
-            AccessMode::ReadOnly,
-            status_flags,
-            None,
+            DescriptionInstallSpec {
+                descriptor_flags: flags.descriptor,
+                access_mode: AccessMode::ReadOnly,
+                status_flags: flags.status,
+                path: None,
+            },
             AuthorityBacking::new(SignalFdBacking { mask }),
             None,
         );
@@ -1248,7 +1331,7 @@ impl FileAuthorityCore {
             ));
         };
         Ok(Outcome::SignalFdCreated {
-            table,
+            table: target.table,
             fd,
             description,
             generation: ObjectGeneration::INITIAL,
@@ -1292,28 +1375,25 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_timer_and_install(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        table_generation: ObjectGeneration,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
-        descriptor_flags: DescriptorFlags,
-        status_flags: StatusFlags,
+        target: TableTarget,
+        alloc: SlotAllocation,
+        flags: FileFlags,
     ) -> Result<Outcome, AuthorityError> {
-        self.require_bound_table(client, table, table_generation)?;
-        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        self.require_bound_table(target.client, target.table, target.generation)?;
+        let fd = self.allocate_lowest(target.table, alloc.minimum, alloc.ceiling)?;
         let description = self.allocate_description();
         let outcome = self.commit_new_description_install(
-            table,
+            target.table,
             fd,
             description,
-            descriptor_flags,
-            AccessMode::ReadOnly,
-            status_flags,
-            None,
+            DescriptionInstallSpec {
+                descriptor_flags: flags.descriptor,
+                access_mode: AccessMode::ReadOnly,
+                status_flags: flags.status,
+                path: None,
+            },
             AuthorityBacking::new(TimerBacking {
                 interval_ns: 0,
                 initial_ns: 0,
@@ -1332,7 +1412,7 @@ impl FileAuthorityCore {
             ));
         };
         Ok(Outcome::TimerCreated {
-            table,
+            table: target.table,
             fd,
             description,
             generation: ObjectGeneration::INITIAL,
@@ -1431,33 +1511,30 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_event_counter_and_install(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        table_generation: ObjectGeneration,
+        target: TableTarget,
         initial: u64,
         semaphore: bool,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
-        descriptor_flags: DescriptorFlags,
-        status_flags: StatusFlags,
+        alloc: SlotAllocation,
+        flags: FileFlags,
     ) -> Result<Outcome, AuthorityError> {
         if initial == u64::MAX {
             return Err(AuthorityError::InvalidEventCounterValue);
         }
-        self.require_bound_table(client, table, table_generation)?;
-        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        self.require_bound_table(target.client, target.table, target.generation)?;
+        let fd = self.allocate_lowest(target.table, alloc.minimum, alloc.ceiling)?;
         let description = self.allocate_description();
         let outcome = self.commit_new_description_install(
-            table,
+            target.table,
             fd,
             description,
-            descriptor_flags,
-            AccessMode::ReadWrite,
-            status_flags,
-            None,
+            DescriptionInstallSpec {
+                descriptor_flags: flags.descriptor,
+                access_mode: AccessMode::ReadWrite,
+                status_flags: flags.status,
+                path: None,
+            },
             AuthorityBacking::new(EventCounterBacking {
                 counter: initial,
                 semaphore,
@@ -1481,7 +1558,7 @@ impl FileAuthorityCore {
         });
         state.readiness = event_counter_readiness(initial);
         Ok(Outcome::EventCounterCreated {
-            table,
+            table: target.table,
             fd,
             description,
             generation: ObjectGeneration::INITIAL,
@@ -1704,22 +1781,15 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn open_vfs_and_install(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        table_generation: ObjectGeneration,
+        target: TableTarget,
         object: VfsObjectId,
         object_generation: ObjectGeneration,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
-        descriptor_flags: DescriptorFlags,
-        access_mode: AccessMode,
-        status_flags: StatusFlags,
-        path: Option<CanonicalPath>,
+        alloc: SlotAllocation,
+        spec: DescriptionInstallSpec,
     ) -> Result<Outcome, AuthorityError> {
-        self.require_bound_table(client, table, table_generation)?;
+        self.require_bound_table(target.client, target.table, target.generation)?;
         let object_state = self
             .vfs_objects
             .get(&object)
@@ -1733,69 +1803,49 @@ impl FileAuthorityCore {
                     "VFS open-description reference overflow",
                 ))
             });
-        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let fd = self.allocate_lowest(target.table, alloc.minimum, alloc.ceiling)?;
         let description = self.allocate_description();
         Ok(self.commit_new_description_install(
-            table,
+            target.table,
             fd,
             description,
-            descriptor_flags,
-            access_mode,
-            status_flags,
-            path,
+            spec,
             AuthorityBacking::new(VfsBacking { object }),
             Some(open_description_refs),
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_synthetic_and_install(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        table_generation: ObjectGeneration,
+        target: TableTarget,
         contents: Vec<u8>,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
-        descriptor_flags: DescriptorFlags,
-        access_mode: AccessMode,
-        status_flags: StatusFlags,
-        path: Option<CanonicalPath>,
+        alloc: SlotAllocation,
+        spec: DescriptionInstallSpec,
     ) -> Result<Outcome, AuthorityError> {
-        self.require_bound_table(client, table, table_generation)?;
+        self.require_bound_table(target.client, target.table, target.generation)?;
         self.validate_payload(&contents)?;
-        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let fd = self.allocate_lowest(target.table, alloc.minimum, alloc.ceiling)?;
         let description = self.allocate_description();
         Ok(self.commit_new_description_install(
-            table,
+            target.table,
             fd,
             description,
-            descriptor_flags,
-            access_mode,
-            status_flags,
-            path,
+            spec,
             AuthorityBacking::new(SyntheticBacking { contents }),
             None,
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn adopt_host_file_and_install(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        table_generation: ObjectGeneration,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
-        descriptor_flags: DescriptorFlags,
-        access_mode: AccessMode,
-        status_flags: StatusFlags,
+        target: TableTarget,
+        alloc: SlotAllocation,
+        spec: DescriptionInstallSpec,
         writable: bool,
-        path: Option<CanonicalPath>,
         capabilities: &mut Vec<OwnedFd>,
     ) -> Result<Outcome, AuthorityError> {
-        self.require_bound_table(client, table, table_generation)?;
-        if access_mode.writable() && !writable {
+        self.require_bound_table(target.client, target.table, target.generation)?;
+        if spec.access_mode.writable() && !writable {
             return Err(AuthorityError::BackingReadOnly);
         }
         let host_fd = capabilities.first().unwrap_or_else(|| {
@@ -1803,8 +1853,8 @@ impl FileAuthorityCore {
                 "host-file adoption lost its validated descriptor",
             ))
         });
-        validate_host_file(host_fd.as_raw_fd(), access_mode)?;
-        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        validate_host_file(host_fd.as_raw_fd(), spec.access_mode)?;
+        let fd = self.allocate_lowest(target.table, alloc.minimum, alloc.ceiling)?;
         let description = self.allocate_description();
         let host_fd = capabilities.pop().unwrap_or_else(|| {
             abort_fatal(AuthorityFatal::InvariantViolation(
@@ -1812,13 +1862,10 @@ impl FileAuthorityCore {
             ))
         });
         Ok(self.commit_new_description_install(
-            table,
+            target.table,
             fd,
             description,
-            descriptor_flags,
-            access_mode,
-            status_flags,
-            path,
+            spec,
             AuthorityBacking::new(HostBacking {
                 fd: host_fd,
                 writable,
@@ -1827,36 +1874,26 @@ impl FileAuthorityCore {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn adopt_host_stream_and_install(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        table_generation: ObjectGeneration,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
-        descriptor_flags: DescriptorFlags,
-        access_mode: AccessMode,
-        status_flags: StatusFlags,
+        target: TableTarget,
+        alloc: SlotAllocation,
+        spec: DescriptionInstallSpec,
         kind: HostStreamKind,
-        path: Option<CanonicalPath>,
         capabilities: &mut Vec<OwnedFd>,
     ) -> Result<Outcome, AuthorityError> {
-        self.require_bound_table(client, table, table_generation)?;
-        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        self.require_bound_table(target.client, target.table, target.generation)?;
+        let fd = self.allocate_lowest(target.table, alloc.minimum, alloc.ceiling)?;
         let host_fd = capabilities
             .pop()
             .ok_or(AuthorityError::HostBackingTypeMismatch)?;
-        validate_host_stream(host_fd.as_raw_fd(), access_mode, kind)?;
+        validate_host_stream(host_fd.as_raw_fd(), spec.access_mode, kind)?;
         let description = self.allocate_description();
         let outcome = self.commit_new_description_install(
-            table,
+            target.table,
             fd,
             description,
-            descriptor_flags,
-            access_mode,
-            status_flags,
-            path,
+            spec,
             AuthorityBacking::new(HostStreamBacking { fd: host_fd, kind }),
             None,
         );
@@ -1871,7 +1908,7 @@ impl FileAuthorityCore {
             ));
         };
         Ok(Outcome::HostStreamCreated {
-            table,
+            table: target.table,
             fd,
             description,
             generation: ObjectGeneration::INITIAL,
@@ -1881,25 +1918,20 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn adopt_io_uring_and_install(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        table_generation: ObjectGeneration,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
-        descriptor_flags: DescriptorFlags,
-        status_flags: StatusFlags,
+        target: TableTarget,
+        alloc: SlotAllocation,
+        flags: FileFlags,
         entries: u32,
         data_length: u64,
         capabilities: &mut Vec<OwnedFd>,
     ) -> Result<Outcome, AuthorityError> {
-        self.require_bound_table(client, table, table_generation)?;
+        self.require_bound_table(target.client, target.table, target.generation)?;
         if entries == 0 || data_length == 0 {
             return Err(AuthorityError::InvalidMappingRange);
         }
-        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let fd = self.allocate_lowest(target.table, alloc.minimum, alloc.ceiling)?;
         let data_fd = capabilities
             .pop()
             .ok_or(AuthorityError::HostBackingTypeMismatch)?;
@@ -1910,13 +1942,15 @@ impl FileAuthorityCore {
         validate_regular_file_length(lock_fd.as_raw_fd(), 1)?;
         let description = self.allocate_description();
         let outcome = self.commit_new_description_install(
-            table,
+            target.table,
             fd,
             description,
-            descriptor_flags,
-            AccessMode::ReadWrite,
-            status_flags,
-            None,
+            DescriptionInstallSpec {
+                descriptor_flags: flags.descriptor,
+                access_mode: AccessMode::ReadWrite,
+                status_flags: flags.status,
+                path: None,
+            },
             AuthorityBacking::new(IoUringBacking {
                 data_fd,
                 lock_fd,
@@ -1936,7 +1970,7 @@ impl FileAuthorityCore {
             ));
         };
         Ok(Outcome::IoUringCreated {
-            table,
+            table: target.table,
             fd,
             description,
             generation: ObjectGeneration::INITIAL,
@@ -2033,7 +2067,6 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn finalize_mapping_lease(
         &mut self,
         client: ClientIdentity,
@@ -2156,16 +2189,12 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn commit_new_description_install(
         &mut self,
         table: FileTableId,
         fd: FileSlotNumber,
         description: FileDescriptionId,
-        descriptor_flags: DescriptorFlags,
-        access_mode: AccessMode,
-        status_flags: StatusFlags,
-        path: Option<CanonicalPath>,
+        spec: DescriptionInstallSpec,
         backing: AuthorityBacking,
         open_description_refs: Option<u64>,
     ) -> Outcome {
@@ -2196,8 +2225,8 @@ impl FileAuthorityCore {
                 logical_slot_refs: 1,
                 capability_lease_refs: 0,
                 offset: FileOffset::default(),
-                access_mode,
-                status_flags,
+                access_mode: spec.access_mode,
+                status_flags: spec.status_flags,
                 readiness: ReadinessSnapshot {
                     ready: LinuxEpollEvents::empty(),
                     read_available: 0,
@@ -2215,8 +2244,8 @@ impl FileAuthorityCore {
             FileSlotState {
                 description,
                 description_generation: ObjectGeneration::INITIAL,
-                flags: descriptor_flags,
-                path,
+                flags: spec.descriptor_flags,
+                path: spec.path,
             },
         );
         table_state.revision = revision;
@@ -2302,30 +2331,38 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn replace_slot(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        expected: ObjectGeneration,
+        target_table: TableTarget,
         source: FileSlotNumber,
         target: FileSlotNumber,
         ceiling: NofileAllocationCeiling,
         flags: DescriptorFlags,
         same_slot: SameSlotBehavior,
     ) -> Result<Outcome, AuthorityError> {
-        let source_slot = self.slot(client, table, expected, source)?.clone();
+        let source_slot = self
+            .slot(
+                target_table.client,
+                target_table.table,
+                target_table.generation,
+                source,
+            )?
+            .clone();
         let target_raw = u32::try_from(target.raw()).map_err(|_| AuthorityError::NofileExceeded)?;
         if target_raw >= ceiling.raw() {
             return Err(AuthorityError::NofileExceeded);
         }
-        let table_state = self.bound_table(client, table, expected)?;
+        let table_state = self.bound_table(
+            target_table.client,
+            target_table.table,
+            target_table.generation,
+        )?;
         if source == target {
             if same_slot == SameSlotBehavior::Reject {
                 return Err(AuthorityError::SameSlotRejected);
             }
             return Ok(Outcome::SlotReplaced {
-                table,
+                table: target_table.table,
                 source,
                 target,
                 replaced_description: None,
@@ -2355,7 +2392,7 @@ impl FileAuthorityCore {
                 })
         });
         let revision = self.publish_mutation();
-        let table_state = self.tables.get_mut(&table).unwrap_or_else(|| {
+        let table_state = self.tables.get_mut(&target_table.table).unwrap_or_else(|| {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "slot replacement lost its validated table",
             ))
@@ -2387,7 +2424,7 @@ impl FileAuthorityCore {
                 self.release_description_ref(slot.description, revision)
             });
         Ok(Outcome::SlotReplaced {
-            table,
+            table: target_table.table,
             source,
             target,
             replaced_description: replaced.map(|slot| slot.description),
@@ -2740,18 +2777,22 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn epoll_acknowledge_io(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        expected: ObjectGeneration,
+        target_table: TableTarget,
         fd: FileSlotNumber,
         consumed: LinuxEpollEvents,
         read_available: u64,
         write_backpressured: bool,
     ) -> Result<Outcome, AuthorityError> {
-        let description = self.slot(client, table, expected, fd)?.description;
+        let description = self
+            .slot(
+                target_table.client,
+                target_table.table,
+                target_table.generation,
+                fd,
+            )?
+            .description;
         self.descriptions
             .get(&description)
             .ok_or(AuthorityError::DescriptionNotFound)?;
@@ -3559,18 +3600,21 @@ impl FileAuthorityCore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn duplicate(
         &mut self,
-        client: ClientIdentity,
-        table: FileTableId,
-        expected: ObjectGeneration,
+        target_table: TableTarget,
         source: FileSlotNumber,
-        minimum: FileSlotNumber,
-        ceiling: NofileAllocationCeiling,
+        alloc: SlotAllocation,
         flags: DescriptorFlags,
     ) -> Result<Outcome, AuthorityError> {
-        let source_slot = self.slot(client, table, expected, source)?.clone();
+        let source_slot = self
+            .slot(
+                target_table.client,
+                target_table.table,
+                target_table.generation,
+                source,
+            )?
+            .clone();
         let description = self
             .descriptions
             .get(&source_slot.description)
@@ -3583,9 +3627,9 @@ impl FileAuthorityCore {
                     "logical slot reference overflow during dup",
                 ))
             });
-        let fd = self.allocate_lowest(table, minimum, ceiling)?;
+        let fd = self.allocate_lowest(target_table.table, alloc.minimum, alloc.ceiling)?;
         let revision = self.publish_mutation();
-        let table_state = self.tables.get_mut(&table).unwrap_or_else(|| {
+        let table_state = self.tables.get_mut(&target_table.table).unwrap_or_else(|| {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "dup lost its validated file table",
             ))
