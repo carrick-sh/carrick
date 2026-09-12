@@ -618,50 +618,25 @@ macro_rules! define_syscall {
 /// edit (Task A1). Defined before the `mod` declarations so the child dispatch
 /// modules can invoke it.
 macro_rules! syscall_table {
-    ( $(#[$meta:meta])* $vis:vis fn $name:ident ; $( $num:literal => $handler:ident ),* $(,)? ) => {
-        $(#[$meta])*
-        // An empty (or about-to-be-emptied) table is a `match` whose only arm
-        // returns, making the `Some(..)` unreachable — that's expected for a
-        // not-yet-populated module table, so allow it.
-        #[allow(unreachable_code)]
-        $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
-            Some(match number {
-                $( $num => SyscallDispatcher::$handler, )*
-                _ => return None,
-            })
-        }
-    };
     ( $(#[$meta:meta])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
         $(#[$meta])*
-        #[allow(unreachable_code)]
         $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
-            Some(match carrick_abi::CanonicalNr(number) {
-                $( $num => SyscallDispatcher::$handler, )*
-                _ => return None,
-            })
+            match carrick_abi::CanonicalNr(number) {
+                $( $num => Some(SyscallDispatcher::$handler), )*
+                _ => None,
+            }
         }
     };
 }
 
 macro_rules! mutation_syscall_table {
-    ( $(#[$meta:meta])* $vis:vis fn $name:ident ; $( $num:literal => $handler:ident ),* $(,)? ) => {
-        $(#[$meta])*
-        #[allow(unreachable_code)]
-        $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<MutationSyscallHandler<M>> {
-            Some(match number {
-                $( $num => SyscallDispatcher::$handler, )*
-                _ => return None,
-            })
-        }
-    };
     ( $(#[$meta:meta])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
         $(#[$meta])*
-        #[allow(unreachable_code)]
         $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<MutationSyscallHandler<M>> {
-            Some(match carrick_abi::CanonicalNr(number) {
-                $( $num => SyscallDispatcher::$handler, )*
-                _ => return None,
-            })
+            match carrick_abi::CanonicalNr(number) {
+                $( $num => Some(SyscallDispatcher::$handler), )*
+                _ => None,
+            }
         }
     };
 }
