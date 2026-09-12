@@ -306,3 +306,18 @@ pub struct ThreadCtx<'a> {
     pub registry: &'a crate::thread::ThreadRegistry,
     pub futex: &'a crate::thread::FutexTable,
 }
+
+impl<'a> ThreadCtx<'a> {
+    #[inline]
+    pub const fn new(
+        tid: crate::thread::ThreadId,
+        registry: &'a crate::thread::ThreadRegistry,
+        futex: &'a crate::thread::FutexTable,
+    ) -> Self {
+        Self {
+            tid,
+            registry,
+            futex,
+        }
+    }
+}

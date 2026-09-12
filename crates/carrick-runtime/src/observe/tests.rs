@@ -8,7 +8,9 @@ use proptest::prelude::*;
 
 use super::intercept::InterceptorChain;
 use super::*;
-use crate::dispatch::{DispatchOutcome, LinearMemory, SyscallDispatcher, SyscallRequest};
+use crate::dispatch::{
+    DispatchOutcome, LinearMemory, SyscallDispatcher, SyscallRequest, ThreadCtx,
+};
 use crate::kernel::{
     CloneObjectMode, Kernel, KernelContext, LinuxWaitStatus, RootBootstrap, TaskKey,
 };
@@ -30,7 +32,13 @@ fn dispatch_req(
     let futex = crate::thread::FutexTable::new();
     let req = SyscallRequest::new(number, SyscallArgs(args));
     dispatcher
-        .dispatch_threaded(&ctx, req, &mut mem, &reporter, tid, &registry, &futex)
+        .dispatch_threaded(
+            &ctx,
+            req,
+            &mut mem,
+            &reporter,
+            ThreadCtx::new(tid, &registry, &futex),
+        )
         .expect("dispatch")
 }
 
@@ -446,7 +454,13 @@ fn test_container_policy_as_first_observer() {
     // unshare is denied by default Docker policy
     let req = SyscallRequest::new(SYS_UNSHARE, SyscallArgs([0; 6]));
     let outcome = dispatcher
-        .dispatch_threaded(&ctx, req, &mut mem, &reporter, tid, &registry, &futex)
+        .dispatch_threaded(
+            &ctx,
+            req,
+            &mut mem,
+            &reporter,
+            ThreadCtx::new(tid, &registry, &futex),
+        )
         .expect("dispatch");
     assert_eq!(
         outcome,
@@ -472,7 +486,13 @@ fn test_user_observer_deny_and_pipeline_order() {
 
     let req = SyscallRequest::new(SYS_GETPID, SyscallArgs([0; 6]));
     let outcome = dispatcher
-        .dispatch_threaded(&ctx, req, &mut mem, &reporter, tid, &registry, &futex)
+        .dispatch_threaded(
+            &ctx,
+            req,
+            &mut mem,
+            &reporter,
+            ThreadCtx::new(tid, &registry, &futex),
+        )
         .expect("dispatch");
     assert_eq!(
         outcome,
@@ -500,7 +520,13 @@ fn test_user_observer_kill() {
 
     let req = SyscallRequest::new(SYS_GETPID, SyscallArgs([0; 6]));
     let outcome = dispatcher
-        .dispatch_threaded(&ctx, req, &mut mem, &reporter, tid, &registry, &futex)
+        .dispatch_threaded(
+            &ctx,
+            req,
+            &mut mem,
+            &reporter,
+            ThreadCtx::new(tid, &registry, &futex),
+        )
         .expect("dispatch");
     assert_eq!(
         outcome,

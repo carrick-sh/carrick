@@ -120,9 +120,7 @@ fn gettid_returns_per_thread_tid_not_pid() {
             SyscallRequest::new(178, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            tid,
-            &registry,
-            &futex,
+            tc(tid, &registry, &futex),
         )
         .unwrap();
     assert_eq!(
@@ -152,9 +150,7 @@ fn set_tid_address_records_clear_child_tid_and_returns_tid() {
             SyscallRequest::new(96, SyscallArgs::from([0x10500, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            tid,
-            &registry,
-            &futex,
+            tc(tid, &registry, &futex),
         )
         .unwrap();
     assert_eq!(
@@ -185,9 +181,7 @@ fn sched_getscheduler_accepts_live_sibling_tid() {
             ),
             &mut memory,
             &reporter,
-            test_tid(1000),
-            &registry,
-            &futex,
+            tc(test_tid(1000), &registry, &futex),
         )
         .unwrap();
 
@@ -218,9 +212,7 @@ fn sched_getparam_accepts_live_sibling_tid() {
             ),
             &mut memory,
             &reporter,
-            test_tid(1000),
-            &registry,
-            &futex,
+            tc(test_tid(1000), &registry, &futex),
         )
         .unwrap();
 
@@ -246,9 +238,7 @@ fn sched_getscheduler_unknown_sibling_tid_is_esrch() {
             ),
             &mut memory,
             &reporter,
-            test_tid(1000),
-            &registry,
-            &futex,
+            tc(test_tid(1000), &registry, &futex),
         )
         .unwrap();
 
@@ -273,9 +263,7 @@ fn futex_wait_value_mismatch_returns_eagain() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 7, 0, 0, 0])),
             &mut memory,
             &reporter,
-            test_tid(1001),
-            &registry,
-            &futex,
+            tc(test_tid(1001), &registry, &futex),
         )
         .unwrap();
     assert_eq!(
@@ -302,9 +290,7 @@ fn futex_wake_returns_count_and_advances_table() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 0, 0, 0])),
             &mut memory,
             &reporter,
-            test_tid(1001),
-            &registry,
-            &futex,
+            tc(test_tid(1001), &registry, &futex),
         )
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -327,9 +313,7 @@ fn futex_wait_matching_value_blocks_via_outcome() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 42, 0, 0, 0])),
             &mut memory,
             &reporter,
-            test_tid(1001),
-            &registry,
-            &futex,
+            tc(test_tid(1001), &registry, &futex),
         )
         .unwrap();
     match outcome {
@@ -358,9 +342,7 @@ fn futex_requeue_private_no_waiters_returns_zero() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 8, 0x10900, 0])),
             &mut memory,
             &reporter,
-            test_tid(1001),
-            &registry,
-            &futex,
+            tc(test_tid(1001), &registry, &futex),
         )
         .unwrap();
 
@@ -391,9 +373,7 @@ fn futex_cmp_requeue_matching_val3_no_waiters_returns_zero() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 8, 0x10900, 77])),
             &mut memory,
             &reporter,
-            test_tid(1001),
-            &registry,
-            &futex,
+            tc(test_tid(1001), &registry, &futex),
         )
         .unwrap();
 
@@ -431,9 +411,7 @@ fn futex_lock_pi_private_uncontended_records_owner_tid() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            test_tid(1001),
-            &registry,
-            &futex,
+            tc(test_tid(1001), &registry, &futex),
         )
         .unwrap();
 
@@ -463,9 +441,7 @@ fn futex_trylock_pi_private_owned_by_self_is_deadlock() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            test_tid(1001),
-            &registry,
-            &futex,
+            tc(test_tid(1001), &registry, &futex),
         )
         .unwrap();
 
@@ -500,9 +476,7 @@ fn futex_unlock_pi_private_owned_by_self_clears_word() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            test_tid(1001),
-            &registry,
-            &futex,
+            tc(test_tid(1001), &registry, &futex),
         )
         .unwrap();
 
@@ -555,9 +529,7 @@ fn tgkill_to_sibling_emits_signalthread() {
             ),
             &mut memory,
             &reporter,
-            main,
-            &registry,
-            &futex,
+            tc(main, &registry, &futex),
         )
         .unwrap();
     assert_eq!(
@@ -608,9 +580,7 @@ fn tgkill_to_sibling_uses_kernel_pending_without_siginfo_sidecar() {
             ),
             &mut memory,
             &reporter,
-            main,
-            &registry,
-            &futex,
+            tc(main, &registry, &futex),
         )
         .unwrap();
     assert_eq!(
@@ -652,9 +622,7 @@ fn tgkill_to_self_raises_locally() {
             ),
             &mut memory,
             &reporter,
-            main,
-            &registry,
-            &futex,
+            tc(main, &registry, &futex),
         )
         .unwrap();
     assert_eq!(
@@ -720,9 +688,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
                 ),
                 &mut memory,
                 &reporter,
-                sibling,
-                &registry,
-                &futex,
+                tc(sibling, &registry, &futex),
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -737,9 +703,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
             ),
             &mut memory,
             &reporter,
-            main,
-            &registry,
-            &futex,
+            tc(main, &registry, &futex),
         )
         .unwrap();
     assert_eq!(
@@ -765,9 +729,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
                 ),
                 &mut memory,
                 &reporter,
-                sibling,
-                &registry,
-                &futex,
+                tc(sibling, &registry, &futex),
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -794,9 +756,7 @@ fn tkill_to_unknown_tid_is_esrch() {
             SyscallRequest::new(130, SyscallArgs::from([424242, SIGUSR1, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            test_tid(1000),
-            &registry,
-            &futex,
+            tc(test_tid(1000), &registry, &futex),
         )
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_ESRCH });
@@ -842,9 +802,7 @@ fn tgkill_to_retired_sibling_returns_esrch_before_runtime_withdrawal() {
             ),
             &mut memory,
             &reporter,
-            main,
-            &registry,
-            &futex,
+            tc(main, &registry, &futex),
         )
         .unwrap();
     assert_eq!(
@@ -878,9 +836,7 @@ fn tgkill_to_retired_sibling_returns_esrch_before_runtime_withdrawal() {
             ),
             &mut memory,
             &reporter,
-            main,
-            &registry,
-            &futex,
+            tc(main, &registry, &futex),
         )
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_ESRCH });

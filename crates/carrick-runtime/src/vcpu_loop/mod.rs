@@ -45,9 +45,10 @@ use parking_lot::{Condvar, Mutex};
 use carrick_hal::{PlatformFutex, SignalPumpControl, ThreadedEngine, VcpuRegistry};
 
 use crate::compat::CompatReporter;
+use crate::dispatch::routing::{MutationDispatchRoute, OrdinaryDispatchRoute};
 use crate::dispatch::{
     CurrentMmMemory, DispatchError, DispatchOutcome, PreparedDispatch, PreparedSyscall,
-    SyscallCompletionToken, SyscallDispatcher, SyscallRequest,
+    SyscallCompletionToken, SyscallDispatcher, SyscallRequest, ThreadCtx,
 };
 use crate::linux_abi::LinuxErrno;
 use crate::memory::AddressSpace;
@@ -1644,11 +1645,11 @@ where
                                         syscall,
                                         engine,
                                         &kernel.reporter,
-                                        self.this_tid,
-                                        &self.registry,
-                                        &self.futex,
-                                        &mut mutation,
-                                        lease,
+                                        ThreadCtx::new(self.this_tid, &self.registry, &self.futex),
+                                        MutationDispatchRoute {
+                                            guard: &mut mutation,
+                                            lease,
+                                        },
                                     )
                             }
                             quiesce::MmStage1Authority::Paused(authority) => {
@@ -1661,11 +1662,11 @@ where
                                         syscall,
                                         engine,
                                         &kernel.reporter,
-                                        self.this_tid,
-                                        &self.registry,
-                                        &self.futex,
-                                        &mut mutation,
-                                        lease,
+                                        ThreadCtx::new(self.this_tid, &self.registry, &self.futex),
+                                        MutationDispatchRoute {
+                                            guard: &mut mutation,
+                                            lease,
+                                        },
                                     )
                             }
                         }
@@ -1685,15 +1686,15 @@ where
                         kernel
                             .dispatcher
                             .dispatch_threaded_prepared_with_mm_executor_and_lease(
-                                mm_executor,
                                 &kernel_context,
                                 syscall,
                                 engine,
                                 &kernel.reporter,
-                                self.this_tid,
-                                &self.registry,
-                                &self.futex,
-                                lease,
+                                ThreadCtx::new(self.this_tid, &self.registry, &self.futex),
+                                OrdinaryDispatchRoute {
+                                    lease,
+                                    mm_executor: Some(mm_executor),
+                                },
                             )
                     }
                 })?;

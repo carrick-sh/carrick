@@ -11,7 +11,7 @@
 mod support;
 
 #[cfg(target_os = "macos")]
-use carrick_runtime::dispatch::{FdWaitCompletion, WaitFds};
+use carrick_runtime::dispatch::{FdWaitCompletion, ThreadCtx, WaitFds};
 #[cfg(target_os = "macos")]
 use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
 use carrick_runtime::linux_abi::{
@@ -926,9 +926,7 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
             SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
             &mut setup_memory,
             &reporter,
-            test_tid(20),
-            &registry,
-            &futex,
+            ThreadCtx::new(test_tid(20), &registry, &futex),
         )
         .unwrap();
     let DispatchOutcome::Returned { value: fd } = created else {
@@ -948,9 +946,7 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
                 SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
                 &read_reporter,
-                test_tid(20),
-                &read_registry,
-                &read_futex,
+                ThreadCtx::new(test_tid(20), &read_registry, &read_futex),
             )
             .unwrap();
         let expirations = read_timerfd_expirations(&memory, 0x4000).expirations;
@@ -976,9 +972,7 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
                 SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
                 &mut arm_memory,
                 &reporter,
-                test_tid(21),
-                &registry,
-                &futex,
+                ThreadCtx::new(test_tid(21), &registry, &futex),
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1008,9 +1002,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
             SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
             &mut setup_memory,
             &reporter,
-            test_tid(30),
-            &registry,
-            &futex,
+            ThreadCtx::new(test_tid(30), &registry, &futex),
         )
         .unwrap();
     let DispatchOutcome::Returned { value: fd } = created else {
@@ -1031,9 +1023,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
                 SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
                 &mut setup_memory,
                 &reporter,
-                test_tid(30),
-                &registry,
-                &futex,
+                ThreadCtx::new(test_tid(30), &registry, &futex),
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1052,9 +1042,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
                 SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
                 &read_reporter,
-                test_tid(30),
-                &read_registry,
-                &read_futex,
+                ThreadCtx::new(test_tid(30), &read_registry, &read_futex),
             )
             .unwrap();
         tx.send(outcome).unwrap();
@@ -1077,9 +1065,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
                 SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
                 &mut rearm_memory,
                 &reporter,
-                test_tid(31),
-                &registry,
-                &futex,
+                ThreadCtx::new(test_tid(31), &registry, &futex),
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -2782,9 +2768,7 @@ fn dispatch_threaded_once(
             request,
             &mut *memory,
             threaded.reporter.as_ref(),
-            tid,
-            threaded.registry.as_ref(),
-            threaded.futex.as_ref(),
+            ThreadCtx::new(tid, threaded.registry.as_ref(), threaded.futex.as_ref()),
         )
         .unwrap()
 }
