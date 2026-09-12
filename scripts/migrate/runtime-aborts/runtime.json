@@ -1713,7 +1713,7 @@
       "domain": "kernel::file_slot_generation"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/exit.rs",
       "function": "Kernel::commit_task_exit_notifying",
       "ordinal_in_function": 1,
       "fingerprint": "bacdf1e940b9eb1cea493ce7019ea2f566fe9f76ba599b7d07969dab72f4edaa",
@@ -1724,7 +1724,7 @@
       "domain": "kernel::task_exit_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/exit.rs",
       "function": "Kernel::commit_task_exit_notifying",
       "ordinal_in_function": 2,
       "fingerprint": "597582362627a10c245b5e4fe600ca452a4917d1cf2969b45a370801ba999339",
@@ -1735,7 +1735,7 @@
       "domain": "kernel::task_exit_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/exit.rs",
       "function": "Kernel::exit_thread",
       "ordinal_in_function": 1,
       "fingerprint": "e26ae01fabcca7e2d0b7743d391daa1b81a421e564f0f52aeba533af8c46a3fe",
@@ -1746,7 +1746,7 @@
       "domain": "kernel::thread_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/exit.rs",
       "function": "Kernel::exit_thread",
       "ordinal_in_function": 2,
       "fingerprint": "e26ae01fabcca7e2d0b7743d391daa1b81a421e564f0f52aeba533af8c46a3fe",
