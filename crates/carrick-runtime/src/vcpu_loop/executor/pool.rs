@@ -530,6 +530,15 @@ type PendingAsidInvalidation = (
 );
 type PendingAsidInvalidations = Vec<PendingAsidInvalidation>;
 
+struct InvalidationServicingContext<'a, E> {
+    retirement: &'a crate::hvpatch::Stage1MmRetirement,
+    current: ExecutorId,
+    backend: &'a mut E,
+    boundary: &'a WorkerBoundaryAudit,
+    receipts: &'a ReceiptLog,
+    commands: &'a mpsc::Receiver<WorkerCommand>,
+}
+
 impl PoolControl {
     fn new(workers: usize, scheduler: Arc<Scheduler>) -> Self {
         Self {
@@ -621,20 +630,22 @@ impl PoolControl {
     /// returned so the caller can honor shutdown after the terminal settles —
     /// it must not be lost (shutdown stalls) or treated as an error (it is
     /// routine at pool shutdown).
-    #[allow(clippy::too_many_arguments)]
     fn consume_invalidation_acks_servicing<E: PersistentExecutor>(
         &self,
-        retirement: &crate::hvpatch::Stage1MmRetirement,
         pending: Vec<(
             ExecutorId,
             mpsc::Receiver<Result<crate::hvpatch::InvalidationAck, String>>,
         )>,
-        current: ExecutorId,
-        backend: &mut E,
-        boundary: &WorkerBoundaryAudit,
-        receipts: &ReceiptLog,
-        commands: &mpsc::Receiver<WorkerCommand>,
+        ctx: InvalidationServicingContext<'_, E>,
     ) -> Result<bool, String> {
+        let InvalidationServicingContext {
+            retirement,
+            current,
+            backend,
+            boundary,
+            receipts,
+            commands,
+        } = ctx;
         let mut stop_seen = false;
         // Re-poke cadence: the dispatch-side queue poke can race an executor
         // that is between its epoch check and its condvar enroll, or one that
@@ -782,7 +793,15 @@ impl PoolControl {
                 .map_err(|error| error.to_string())?;
         }
         self.consume_invalidation_acks_servicing(
-            retirement, pending, current, backend, boundary, receipts, commands,
+            pending,
+            InvalidationServicingContext {
+                retirement,
+                current,
+                backend,
+                boundary,
+                receipts,
+                commands,
+            },
         )
     }
 }
