@@ -1874,6 +1874,17 @@
       "migration_family": "inspect_misc"
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 432,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "dispatcher.captured_file_table().write_open_files().insert(",
+      "scope_kind": "test_or_definition",
+      "enclosing_function": "mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success",
+      "migration_family": "mapping_ring"
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
       "line": 326,
       "categories": [
@@ -2051,19 +2062,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
-      "line": 432,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "dispatcher.captured_file_table().write_open_files().insert(",
-      "scope_kind": "test_or_definition",
-      "enclosing_function": "mmap_private_hostfile_refusal_with_unstattable_fd_keeps_legacy_success",
-      "migration_family": "mapping_ring"
-    },
-    {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1493,
+      "line": 1472,
       "categories": [
         "table_guard"
       ],
@@ -2074,7 +2074,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1973,
+      "line": 1952,
       "categories": [
         "description_guard"
       ],
@@ -2085,7 +2085,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2001,
+      "line": 1980,
       "categories": [
         "description_guard"
       ],
@@ -2096,7 +2096,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2074,
+      "line": 2053,
       "categories": [
         "description_guard"
       ],
