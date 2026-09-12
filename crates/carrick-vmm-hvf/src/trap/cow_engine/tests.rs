@@ -227,3 +227,75 @@ fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
         "binding.rs begin_retirement_inventory",
     );
 }
+
+#[test]
+fn fork_exec_exit_and_unmap_sites_contain_no_carrier_topology_lock() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let quiesce_src =
+        std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/quiesce.rs"))
+            .expect("read quiesce.rs");
+    let exec_src =
+        std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/exec.rs"))
+            .expect("read exec.rs");
+    let binding_src =
+        std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/binding.rs"))
+            .expect("read binding.rs");
+    let executor_settlement_src = std::fs::read_to_string(
+        manifest_dir.join("../carrick-runtime/src/vcpu_loop/executor/settlement.rs"),
+    )
+    .expect("read executor/settlement.rs");
+    let executor_src =
+        std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/executor.rs"))
+            .expect("read executor.rs");
+    let cow_engine_src = include_str!("../cow_engine.rs");
+
+    fn strip_tests(src: &str) -> &str {
+        if let Some((prod, _)) = src.split_once("\n#[cfg(test)]\nmod tests") {
+            prod
+        } else if let Some((prod, _)) = src.split_once("\n#[cfg(test)]\npub(crate) mod tests") {
+            prod
+        } else {
+            src
+        }
+    }
+
+    let mut failures = Vec::new();
+    if strip_tests(&quiesce_src).contains("try_acquire_topology_lock(")
+        || strip_tests(&quiesce_src).contains("acquire_topology_lock(")
+    {
+        failures.push("quiesce.rs production code contains carrier topology lock");
+    }
+    if strip_tests(&exec_src).contains("try_acquire_topology_lock(")
+        || strip_tests(&exec_src).contains("acquire_topology_lock(")
+    {
+        failures.push("exec.rs production code contains carrier topology lock");
+    }
+    if strip_tests(&binding_src).contains("try_acquire_topology_lock(")
+        || strip_tests(&binding_src).contains("acquire_topology_lock(")
+    {
+        failures.push("binding.rs production code contains carrier topology lock");
+    }
+    if strip_tests(&executor_settlement_src).contains("try_acquire_topology_lock(")
+        || strip_tests(&executor_settlement_src).contains("acquire_topology_lock(")
+    {
+        failures.push("executor/settlement.rs production code contains carrier topology lock");
+    }
+    if strip_tests(&executor_src).contains("acquire_process_retire_topology_lock_servicing")
+        || strip_tests(&executor_settlement_src)
+            .contains("acquire_process_retire_topology_lock_servicing")
+    {
+        failures.push(
+            "executor production code contains acquire_process_retire_topology_lock_servicing",
+        );
+    }
+    if strip_tests(cow_engine_src).contains("try_acquire_topology_lock(")
+        || strip_tests(cow_engine_src).contains("acquire_topology_lock(")
+    {
+        failures.push("cow_engine.rs production code contains carrier topology lock");
+    }
+    assert!(
+        failures.is_empty(),
+        "production fork, exec, exit, unmap sites must not contain carrier topology lock:\n{}",
+        failures.join("\n")
+    );
+}
