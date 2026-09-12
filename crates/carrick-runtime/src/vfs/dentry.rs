@@ -2196,6 +2196,91 @@ impl DentryCache {
         Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
     }
 
+    /// Get or open a directory file descriptor for `path`, resolving through the dentry cache.
+    /// Returns the cached `upper_dir_fd` if available, or opens it via the cached parent dirfd.
+    pub fn get_or_open_dir_fd(
+        &self,
+        path: &str,
+        backend: &dyn FsBackend,
+        rootfs: Option<&RootFs>,
+    ) -> Result<Arc<OwnedFd>, LinuxErrno> {
+        self.check_fork();
+        let resolved = self.lookup_path(path, true, backend, rootfs)?;
+        let dir_id = resolved.dentry.id.ok_or(LINUX_ENOTDIR)?;
+        if resolved.dentry.kind != RootFsEntryKind::Directory {
+            return Err(LINUX_ENOTDIR);
+        }
+        self.get_or_open_dir_fd_by_id(dir_id, backend)
+    }
+
+    fn get_or_open_dir_fd_by_id(
+        &self,
+        dir_id: DentryId,
+        backend: &dyn FsBackend,
+    ) -> Result<Arc<OwnedFd>, LinuxErrno> {
+        if dir_id == DentryId::ROOT {
+            let mut dirs = self.dirs.write();
+            let d = dirs.get_mut(&DentryId::ROOT).ok_or(LINUX_ENOENT)?;
+            if d.upper_dir_fd.is_none() {
+                d.upper_dir_fd = backend.dir_fd_for(Path::new(""));
+            }
+            return d.upper_dir_fd.clone().ok_or(LINUX_ENOENT);
+        }
+
+        {
+            let dirs = self.dirs.read();
+            if let Some(d) = dirs.get(&dir_id)
+                && let Some(ref fd) = d.upper_dir_fd
+            {
+                return Ok(fd.clone());
+            }
+        }
+
+        let (parent_id, leaf_name) = {
+            let dirs = self.dirs.read();
+            let d = dirs.get(&dir_id).ok_or(LINUX_ENOENT)?;
+            d.parent.clone().ok_or(LINUX_ENOENT)?
+        };
+
+        let parent_fd = self.get_or_open_dir_fd_by_id(parent_id, backend)?;
+        let leaf_name_c = CString::new(leaf_name.as_bytes()).map_err(|_| LINUX_ENOENT)?;
+        let mut raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                leaf_name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            let rc = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), leaf_name_c.as_ptr(), 0o755) };
+            if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+                raw = unsafe {
+                    libc::openat(
+                        parent_fd.as_raw_fd(),
+                        leaf_name_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+            }
+        }
+        if raw < 0 {
+            return Err(crate::host_to_linux_errno(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            ));
+        }
+        self.host_opens.fetch_add(1, Ordering::Relaxed);
+        let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        {
+            let mut dirs = self.dirs.write();
+            if let Some(d) = dirs.get_mut(&dir_id) {
+                d.upper_dir_fd = Some(fd.clone());
+            }
+        }
+        Ok(fd)
+    }
+
     /// Get cached inode record for `(dev, ino)`.
     pub fn get_inode_record(&self, dev: u64, ino: u64) -> Option<InodeRecord> {
         self.check_fork();

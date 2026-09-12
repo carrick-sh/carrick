@@ -594,6 +594,20 @@ impl<'a> FsView<'a> {
             return self.resolve_dotdot_symlink_aware(&anchor, path);
         }
         let abs = join_rootfs_path(&anchor, path);
+        if self.fs.rootfs_vfs.overlay.serves_dentry_cache() {
+            let parent_norm = Path::new(&abs)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("/");
+            let parent_norm = if parent_norm.is_empty() {
+                "/"
+            } else {
+                parent_norm
+            };
+            if self.fs.rootfs_vfs.dentry_cache.has_dir(parent_norm) {
+                return Ok(abs);
+            }
+        }
         // Fast path: ONE kernel-walked openat+F_GETPATH of the PARENT chain
         // replaces both per-component O(K²) passes below (validate_intermediate_
         // dirs + resolve_intermediate_symlinks) for the common case — every

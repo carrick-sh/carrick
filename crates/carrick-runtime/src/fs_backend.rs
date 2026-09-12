@@ -458,6 +458,18 @@ pub trait FsBackend: Send + Sync {
     /// Create a directory at `path`. Idempotent.
     fn make_dir(&self, path: &str) -> Result<(), BackendError>;
 
+    /// Create a directory using an already-held parent directory fd and leaf name
+    /// resolved by Carrick's dentry layer, avoiding whole-path walks.
+    fn make_dir_at(
+        &self,
+        parent_fd: Option<&std::os::fd::OwnedFd>,
+        leaf_c: Option<&std::ffi::CStr>,
+        rel: &NormalizedRelPath,
+    ) -> Result<(), BackendError> {
+        let _ = (parent_fd, leaf_c);
+        self.make_dir(rel.as_path().to_str().ok_or(BackendError::Invalid)?)
+    }
+
     /// Materialise an empty file at `path`. Used by `openat(..., O_CREAT)`
     /// when the file did not previously exist.
     fn create_file(&self, path: &str) -> Result<(), BackendError>;
@@ -575,6 +587,19 @@ pub trait FsBackend: Send + Sync {
         Ok(self.remove_entry(path))
     }
 
+    /// Remove an entry using an already-held parent directory fd and leaf name
+    /// resolved by Carrick's dentry layer, avoiding whole-path walks.
+    fn remove_entry_at(
+        &self,
+        parent_fd: Option<&std::os::fd::OwnedFd>,
+        leaf_c: Option<&std::ffi::CStr>,
+        rel: &NormalizedRelPath,
+        is_dir: bool,
+    ) -> Result<bool, BackendError> {
+        let _ = (parent_fd, leaf_c, is_dir);
+        self.remove_entry_checked(rel.as_path().to_str().ok_or(BackendError::Invalid)?)
+    }
+
     /// Tombstone `path` so that subsequent layered lookups treat it as
     /// absent, even if the rootfs still has it underneath.
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError>;
@@ -627,6 +652,24 @@ pub trait FsBackend: Send + Sync {
     /// caller has to materialise the rootfs-backed source into the
     /// backend first.
     fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError>;
+
+    /// Rename an entry using already-held parent directory fds and leaf names
+    /// resolved by Carrick's dentry layer, avoiding whole-path walks.
+    fn rename_overlay_entry_at(
+        &self,
+        src_parent_fd: Option<&std::os::fd::OwnedFd>,
+        src_leaf_c: Option<&std::ffi::CStr>,
+        src_rel: &NormalizedRelPath,
+        dst_parent_fd: Option<&std::os::fd::OwnedFd>,
+        dst_leaf_c: Option<&std::ffi::CStr>,
+        dst_rel: &NormalizedRelPath,
+    ) -> Result<bool, BackendError> {
+        let _ = (src_parent_fd, src_leaf_c, dst_parent_fd, dst_leaf_c);
+        self.rename_overlay_entry(
+            src_rel.as_path().to_str().ok_or(BackendError::Invalid)?,
+            dst_rel.as_path().to_str().ok_or(BackendError::Invalid)?,
+        )
+    }
 
     /// Atomically EXCHANGE the two entries `a` and `b` (`renameat2(2)`
     /// `RENAME_EXCHANGE`): each path ends up referring to what the other named,
@@ -1019,6 +1062,61 @@ pub fn normalize_raw(raw: &Path) -> Option<PathBuf> {
         }
     }
     Some(out)
+}
+
+/// A path that is already normalized relative to the sandbox/rootfs root (no
+/// leading `/`, no `.` or `..` components). Bypasses redundant re-normalization
+/// passes and component splits when passed from the dentry layer.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NormalizedRelPath(PathBuf);
+
+impl NormalizedRelPath {
+    /// Construct from a path known to already be normalized and relative to root.
+    pub fn from_normalized_relative(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    /// Construct from an already-normalized string (e.g. from dentry cache),
+    /// stripping a leading `/` if present without running component normalization.
+    pub fn from_normalized_str(s: &str) -> Self {
+        let stripped = s.strip_prefix('/').unwrap_or(s);
+        let trimmed = stripped.trim_end_matches('/');
+        Self(PathBuf::from(trimmed))
+    }
+
+    /// Construct by running `normalize()` if not already normalized.
+    pub fn from_raw(s: &str) -> Option<Self> {
+        normalize(s).map(Self)
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn parent(&self) -> Option<&Path> {
+        self.0.parent()
+    }
+
+    pub fn file_name(&self) -> Option<&std::ffi::OsStr> {
+        self.0.file_name()
+    }
+
+    pub fn file_name_c(&self) -> Option<std::ffi::CString> {
+        self.file_name().and_then(cstring_from_osstr)
+    }
+}
+
+impl AsRef<Path> for NormalizedRelPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for NormalizedRelPath {
+    type Target = Path;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// Build a NUL-terminated C path from a raw host `OsStr` *by its bytes* —
@@ -1888,7 +1986,7 @@ pub struct HostFsBackend {
     /// cached as a parent — that single case can briefly serve a stale path until
     /// eviction. Validated regression-free across the full conformance matrix.
     /// See docs/fs-host-capstd-amplification.md.
-    stat_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, StatCacheEntry>>,
+    stat_cache: parking_lot::Mutex<std::collections::BTreeMap<PathBuf, StatCacheEntry>>,
     /// **The kernel directory cache** — carrick's own `dcache`, keyed by the
     /// sandbox-relative directory path and holding a CONTAINMENT-PROVEN host
     /// dirfd for each.
@@ -1910,18 +2008,6 @@ pub struct HostFsBackend {
     /// argument, which is why the hot path issues no `F_GETPATH` at all — that
     /// check exists to audit a traversal, and there is none to audit.
     ///
-    /// **Why an entry may go stale, and what catches it.** A dirfd names an
-    /// INODE, not a path: rename the directory and the fd silently follows it,
-    /// so a cached entry would serve a path that no longer exists. Every entry
-    /// is therefore stamped with
-    /// [`crate::fs_resolve_cache::current_dir_generation`] and served only
-    /// while it still matches. That generation is bumped by directory renames,
-    /// exchanges and removals ONLY — not by file creation or unlink — which is
-    /// what lets the cache survive a build that creates thousands of files.
-    /// Because the counter lives in a `MAP_SHARED` page, a rename in ANY
-    /// carrick process invalidates every process's cache; this is a real
-    /// coherence improvement over the in-process clear it replaces.
-    ///
     /// Strong `Arc`s, not `Weak`: the cache owns the fds and is bounded
     /// explicitly (`DIR_CACHE_MAX_ENTRIES`), so a directory's fd survives
     /// between the operations that share it rather than dying with whichever
@@ -1930,7 +2016,14 @@ pub struct HostFsBackend {
     /// Benign race: two threads may both miss on one directory and both open
     /// it; the later `insert` replaces the earlier. Both are valid, contained
     /// and independently owned, so the only effect is a transient second fd.
-    dir_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, DirCacheEntry>>,
+    dir_cache: parking_lot::Mutex<std::collections::BTreeMap<PathBuf, DirCacheEntry>>,
+    /// Per-directory generation cells referenced by entries. An entry is stale
+    /// if its parent directory's generation moved.
+    dir_generations: parking_lot::Mutex<
+        std::collections::BTreeMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    >,
+    /// Instrument cache eviction visits for testing: visits <= (evicted entries + log n).
+    cache_eviction_visited_keys: std::sync::atomic::AtomicU64,
     /// Host `openat` calls spent WALKING a path to a directory fd
     /// ([`Self::dir_fd_for_hops`] and its post-reclaim retry) — the exact cost
     /// that `namei_leaf` -> `dir_fd_for(parent)` pays on every guest
@@ -2024,12 +2117,11 @@ pub struct HostFsBackend {
 #[cfg(target_os = "macos")]
 struct StatCacheEntry {
     parent_fd: std::sync::Arc<std::os::fd::OwnedFd>,
-    /// Directory-topology generation the `parent_fd` was proven at. A dirfd
-    /// follows its inode through a rename, so without this a cached leaf under
-    /// a renamed directory would keep revalidating successfully — same inode,
-    /// same ctime — for a path that no longer exists. The in-process clear this
-    /// supersedes could not see a rename performed by a SIBLING process; the
-    /// generation lives in a `MAP_SHARED` word and can.
+    /// Generation cell of the parent directory. An entry is stale if its parent's
+    /// generation moved.
+    parent_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stamped_parent_gen: u64,
+    /// Shared directory-topology generation this entry's parent dirfd was proven at.
     dir_generation: u64,
     /// Guest-metadata generation the xattr-derived fields (`mode_override`,
     /// `real.uid`/`gid`, the socket kind) were read at. While it still equals
@@ -2049,11 +2141,28 @@ struct StatCacheEntry {
     real: RealStat,
 }
 
+#[cfg(target_os = "macos")]
+impl StatCacheEntry {
+    fn is_valid(&self, current_dir_gen: u64) -> bool {
+        self.dir_generation == current_dir_gen
+            && self.parent_gen.load(std::sync::atomic::Ordering::Relaxed) == self.stamped_parent_gen
+    }
+}
+
 /// One directory in [`HostFsBackend::dir_cache`]: a containment-proven host
-/// dirfd plus the directory-topology generation it was proven at.
+/// dirfd plus its parent directory's generation cell.
 struct DirCacheEntry {
     fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    parent_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stamped_parent_gen: u64,
     dir_generation: u64,
+}
+
+impl DirCacheEntry {
+    fn is_valid(&self, current_dir_gen: u64) -> bool {
+        self.dir_generation == current_dir_gen
+            && self.parent_gen.load(std::sync::atomic::Ordering::Relaxed) == self.stamped_parent_gen
+    }
 }
 
 /// Non-macOS placeholder so the `stat_cache` field type is well-formed; the
@@ -2066,21 +2175,11 @@ struct StatCacheEntry {
     real: RealStat,
 }
 
-#[cfg(target_os = "macos")]
-impl StatCacheEntry {
-    /// Re-stamp the directory-topology generation this entry's `parent_fd` is
-    /// trusted at. Sound only for a survivor of
-    /// [`HostFsBackend::evict_dir_cache_subtree_restamping`]: the caller
-    /// established `generation` itself and has already dropped every entry the
-    /// mutation could have re-pointed.
-    fn restamp_dir_generation(&mut self, generation: u64) {
-        self.dir_generation = generation;
-    }
-}
-
 #[cfg(not(target_os = "macos"))]
 impl StatCacheEntry {
-    fn restamp_dir_generation(&mut self, _generation: u64) {}
+    fn is_valid(&self, _current_dir_gen: u64) -> bool {
+        true
+    }
 }
 
 struct WatchResCacheEntry {
@@ -2694,8 +2793,10 @@ impl HostFsBackend {
             root_prefix,
             fast_fs,
             sparse_upper_fast_miss: false,
-            stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            stat_cache: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            dir_cache: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            dir_generations: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            cache_eviction_visited_keys: std::sync::atomic::AtomicU64::new(0),
             path_walk_host_opens: std::sync::atomic::AtomicU64::new(0),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
@@ -2753,8 +2854,10 @@ impl HostFsBackend {
             root_prefix,
             fast_fs,
             sparse_upper_fast_miss: false,
-            stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            dir_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            stat_cache: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            dir_cache: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            dir_generations: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            cache_eviction_visited_keys: std::sync::atomic::AtomicU64::new(0),
             path_walk_host_opens: std::sync::atomic::AtomicU64::new(0),
             dir_cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
             cache_proc_gen: std::sync::atomic::AtomicU64::new(proc_gen),
@@ -2919,7 +3022,7 @@ impl HostFsBackend {
                 self.dir_cache_proc_gen.store(proc_gen, Relaxed);
             }
             if let Some(entry) = cache.get(dir)
-                && entry.dir_generation == generation
+                && entry.is_valid(generation)
             {
                 return Ok(entry.fd.clone());
             }
@@ -2932,7 +3035,7 @@ impl HostFsBackend {
                 let cache = self.dir_cache.lock();
                 cache
                     .get(Path::new(""))
-                    .filter(|entry| entry.dir_generation == generation)
+                    .filter(|entry| entry.is_valid(generation))
                     .map(|entry| entry.fd.clone())
             };
             match cached {
@@ -2958,7 +3061,7 @@ impl HostFsBackend {
             let mut found = false;
             for ancestor in dir.ancestors().skip(1) {
                 if let Some(entry) = cache.get(ancestor)
-                    && entry.dir_generation == generation
+                    && entry.is_valid(generation)
                     && let Ok(rest) = dir.strip_prefix(ancestor)
                 {
                     current = entry.fd.clone();
@@ -3132,7 +3235,7 @@ impl HostFsBackend {
         &self,
         dir: &Path,
         fd: &std::sync::Arc<std::os::fd::OwnedFd>,
-        generation: u64,
+        dir_generation: u64,
     ) {
         if !self.fast_fs {
             return;
@@ -3142,11 +3245,16 @@ impl HostFsBackend {
         if cache.len() >= DIR_CACHE_MAX_ENTRIES {
             cache.clear();
         }
+        let parent = dir.parent().unwrap_or_else(|| Path::new(""));
+        let parent_gen = self.dir_gen_for(parent);
+        let stamped_parent_gen = parent_gen.load(std::sync::atomic::Ordering::Relaxed);
         cache.insert(
             dir.to_path_buf(),
             DirCacheEntry {
                 fd: fd.clone(),
-                dir_generation: generation,
+                parent_gen,
+                stamped_parent_gen,
+                dir_generation,
             },
         );
     }
@@ -3282,47 +3390,66 @@ impl HostFsBackend {
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Evict `dir` and its descendants from BOTH generation-stamped caches and
-    /// re-stamp every surviving entry with `new_dir_generation`.
-    ///
-    /// A directory removal must bump the shared directory-topology generation
-    /// (`fs_resolve_cache::bump_dir_generation`) so a SIBLING host process
-    /// cannot keep serving a dirfd for a path that a later `mkdir` re-creates
-    /// as a different inode. But that bump also invalidates THIS process's
-    /// caches, and this process knows precisely what it invalidated: the
-    /// removed path and anything under it. Every other entry still names the
-    /// same live inode at the same path, so re-stamping them to the generation
-    /// we ourselves established keeps them servable.
-    ///
-    /// Measured by `warm_dir_cache_bounds_path_walk_opens_per_guest_op`: 20
-    /// warm create/remove operations under `pkg/a/b` cost 12 host path-walk
-    /// `openat` calls when the bump invalidates our own cache, and 0 with this
-    /// re-stamp. That difference is the cpython-tarfile `rmtree` amplification.
-    ///
-    /// LOCK ORDER `stat_cache` -> `dir_cache`, per
-    /// [`Self::drop_stat_cache_after_rename`].
-    fn evict_dir_cache_subtree_restamping(&self, dir: &Path, new_dir_generation: u64) {
-        if self.use_stat_cache {
-            let mut stats = self.stat_cache.lock();
-            stats.retain(|k, _| k != dir && !k.starts_with(dir));
-            for entry in stats.values_mut() {
-                entry.restamp_dir_generation(new_dir_generation);
+    pub fn cache_eviction_visited_keys(&self) -> u64 {
+        self.cache_eviction_visited_keys
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reset_cache_eviction_visited_keys(&self) {
+        self.cache_eviction_visited_keys
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn dir_gen_for(&self, dir: &Path) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        let mut gens = self.dir_generations.lock();
+        gens.entry(dir.to_path_buf())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)))
+            .clone()
+    }
+
+    /// Evict `dir` and all its descendants from [`Self::dir_cache`] using
+    /// ordered BTreeMap range removal.
+    fn evict_dir_cache_subtree(&self, dir: &Path) {
+        let mut cache = self.dir_cache.lock();
+        let mut visited = 0u64;
+        let mut to_remove = Vec::new();
+        for (k, _) in cache.range(dir.to_path_buf()..) {
+            visited += 1;
+            if k.as_path() == dir || k.starts_with(dir) {
+                to_remove.push(k.clone());
+            } else {
+                break;
             }
         }
-        let mut cache = self.dir_cache.lock();
-        cache.retain(|k, _| k != dir && !k.starts_with(dir));
-        for entry in cache.values_mut() {
-            entry.dir_generation = new_dir_generation;
+        self.cache_eviction_visited_keys
+            .fetch_add(visited, std::sync::atomic::Ordering::Relaxed);
+        for k in to_remove {
+            cache.remove(&k);
         }
     }
 
-    /// Evict `dir` and all its descendants from [`Self::dir_cache`].
-    /// Used when a directory or symlink is removed: the directory itself and
-    /// any cached subpaths (if any) are gone, but parent and sibling
-    /// directories remain valid containment anchors and must NOT be evicted.
-    fn evict_dir_cache_subtree(&self, dir: &Path) {
-        let mut cache = self.dir_cache.lock();
-        cache.retain(|k, _| k != dir && !k.starts_with(dir));
+    /// Evict `dir` and all its descendants from [`Self::stat_cache`] using
+    /// ordered BTreeMap range removal.
+    fn evict_stat_cache_subtree(&self, dir: &Path) {
+        if !self.use_stat_cache {
+            return;
+        }
+        let mut stats = self.stat_cache.lock();
+        let mut visited = 0u64;
+        let mut to_remove = Vec::new();
+        for (k, _) in stats.range(dir.to_path_buf()..) {
+            visited += 1;
+            if k.as_path() == dir || k.starts_with(dir) {
+                to_remove.push(k.clone());
+            } else {
+                break;
+            }
+        }
+        self.cache_eviction_visited_keys
+            .fetch_add(visited, std::sync::atomic::Ordering::Relaxed);
+        for k in to_remove {
+            stats.remove(&k);
+        }
     }
 
     /// The guest's own host open failed with `host_errno`. If that is
@@ -4388,7 +4515,6 @@ impl HostFsBackend {
 
         let name = rel.file_name()?; // leaf is always a single component here
         let name_c = std::ffi::CString::new(name.as_bytes()).ok()?;
-        let dir_generation = crate::fs_resolve_cache::current_dir_generation();
 
         // --- Revalidate an existing entry: ONE fstatat through the cached,
         //     already-contained parent fd (no path walk, no openat). Clone the
@@ -4403,6 +4529,7 @@ impl HostFsBackend {
         //     unchanged at the new location.
         let proc_gen = crate::fs_resolve_cache::current_process_generation();
         let meta_generation = crate::fs_resolve_cache::current_meta_generation();
+        let dir_generation = crate::fs_resolve_cache::current_dir_generation();
         let cached = {
             use std::sync::atomic::Ordering::Relaxed;
             let mut map = self.stat_cache.lock();
@@ -4414,7 +4541,7 @@ impl HostFsBackend {
                 self.cache_proc_gen.store(proc_gen, Relaxed);
             }
             map.get(rel)
-                .filter(|e| e.dir_generation == dir_generation)
+                .filter(|e| e.is_valid(dir_generation))
                 .map(|e| {
                     (
                         e.parent_fd.clone(),
@@ -4525,6 +4652,7 @@ impl HostFsBackend {
         // and the insert bumps past this value, so the entry is born stale
         // and refills on its first hit instead of serving the pre-write bytes.
         let meta_generation = crate::fs_resolve_cache::current_meta_generation();
+        let dir_generation = crate::fs_resolve_cache::current_dir_generation();
         let (override_mode, uid, gid, is_socket) = if self.serves_plain_metadata() {
             (None, None, None, false)
         } else {
@@ -4569,10 +4697,15 @@ impl HostFsBackend {
         if map.len() >= 4096 {
             map.clear();
         }
+        let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+        let parent_gen = self.dir_gen_for(parent);
+        let stamped_parent_gen = parent_gen.load(std::sync::atomic::Ordering::Relaxed);
         map.insert(
             rel.to_path_buf(),
             StatCacheEntry {
                 parent_fd,
+                parent_gen,
+                stamped_parent_gen,
                 dir_generation,
                 meta_generation,
                 mode_override: override_mode,
@@ -6030,23 +6163,66 @@ impl FsBackend for HostFsBackend {
     }
 
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
-        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let parent_fd = match self.ensure_parent_dirs(rel) {
-            Ok(fd) => fd,
-            Err(errno) => {
-                return match host_open_refusal(errno) {
-                    Some(refused) => Err(BackendError::Host(refused)),
-                    None => Err(BackendError::Io),
+        let rel = NormalizedRelPath::from_normalized_relative(normalized);
+        self.make_dir_at(None, None, &rel)
+    }
+
+    fn make_dir_at(
+        &self,
+        parent_fd: Option<&std::os::fd::OwnedFd>,
+        leaf_c: Option<&std::ffi::CStr>,
+        rel: &NormalizedRelPath,
+    ) -> Result<(), BackendError> {
+        use std::os::fd::AsRawFd;
+        let _mutation = self.archive_mutation_gate.mutation();
+        let (pfd, name_c) = match (parent_fd, leaf_c) {
+            (Some(fd), Some(name)) => (fd.as_raw_fd(), name),
+            _ => {
+                let parent_fd = match self.ensure_parent_dirs(rel.as_path()) {
+                    Ok(fd) => fd,
+                    Err(errno) => {
+                        return match host_open_refusal(errno) {
+                            Some(refused) => Err(BackendError::Host(refused)),
+                            None => Err(BackendError::Io),
+                        };
+                    }
                 };
+                let leaf_name = rel
+                    .file_name()
+                    .and_then(cstring_from_osstr)
+                    .ok_or(BackendError::Invalid)?;
+                let rc = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), 0o755) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::AlreadyExists {
+                        return match io_open_refusal(&err) {
+                            Some(refused) => Err(BackendError::Host(refused)),
+                            None => Err(BackendError::Io),
+                        };
+                    }
+                } else {
+                    let flags = libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK
+                        | libc::O_NOFOLLOW;
+                    let raw = unsafe {
+                        libc::openat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0)
+                    };
+                    if raw >= 0 {
+                        let fd =
+                            std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+                        let generation = crate::fs_resolve_cache::current_dir_generation();
+                        self.publish_dir_fd(rel.as_path(), &fd, generation);
+                    }
+                }
+                self.clear_whiteout_normalized(rel.as_path());
+                crate::fs_resolve_cache::bump_generation();
+                return Ok(());
             }
         };
-        let leaf_name = rel
-            .file_name()
-            .and_then(cstring_from_osstr)
-            .ok_or(BackendError::Invalid)?;
-        let rc = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), 0o755) };
+        let rc = unsafe { libc::mkdirat(pfd, name_c.as_ptr(), 0o755) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::AlreadyExists {
@@ -6055,20 +6231,8 @@ impl FsBackend for HostFsBackend {
                     None => Err(BackendError::Io),
                 };
             }
-        } else {
-            let flags = libc::O_RDONLY
-                | libc::O_DIRECTORY
-                | libc::O_CLOEXEC
-                | libc::O_NONBLOCK
-                | libc::O_NOFOLLOW;
-            let raw = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0) };
-            if raw >= 0 {
-                let fd = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
-                let generation = crate::fs_resolve_cache::current_dir_generation();
-                self.publish_dir_fd(rel, &fd, generation);
-            }
         }
-        self.clear_whiteout_normalized(&normalized);
+        self.clear_whiteout_normalized(rel.as_path());
         crate::fs_resolve_cache::bump_generation();
         Ok(())
     }
@@ -6344,21 +6508,42 @@ impl FsBackend for HostFsBackend {
     }
 
     fn remove_entry_checked(&self, path: &str) -> Result<bool, BackendError> {
-        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        let (parent_fd, leaf_c) = match self.namei_leaf(rel) {
-            Some(pair) => pair,
-            None => return Ok(false),
+        let rel_norm = NormalizedRelPath::from_normalized_relative(rel.to_path_buf());
+        self.remove_entry_at(None, None, &rel_norm, false)
+    }
+
+    fn remove_entry_at(
+        &self,
+        parent_fd: Option<&std::os::fd::OwnedFd>,
+        leaf_c: Option<&std::ffi::CStr>,
+        rel: &NormalizedRelPath,
+        is_dir: bool,
+    ) -> Result<bool, BackendError> {
+        use std::os::fd::AsRawFd;
+        let _mutation = self.archive_mutation_gate.mutation();
+        let fallback_pair;
+        let (pfd, name_c) = if let (Some(fd), Some(name)) = (parent_fd, leaf_c) {
+            (fd.as_raw_fd(), name)
+        } else {
+            fallback_pair = match self.namei_leaf(rel.as_path()) {
+                Some(pair) => pair,
+                None => return Ok(false),
+            };
+            (fallback_pair.0.as_raw_fd(), fallback_pair.1.as_c_str())
         };
-        let mut rc = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0) };
-        let mut removed_dir = false;
-        if rc != 0 {
+
+        let mut rc = if is_dir {
+            unsafe { libc::unlinkat(pfd, name_c.as_ptr(), libc::AT_REMOVEDIR) }
+        } else {
+            unsafe { libc::unlinkat(pfd, name_c.as_ptr(), 0) }
+        };
+        let mut removed_dir = is_dir;
+        if rc != 0 && !is_dir {
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if err == libc::EISDIR || err == libc::EPERM {
-                rc = unsafe {
-                    libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), libc::AT_REMOVEDIR)
-                };
+                rc = unsafe { libc::unlinkat(pfd, name_c.as_ptr(), libc::AT_REMOVEDIR) };
                 if rc == 0 {
                     removed_dir = true;
                 }
@@ -6366,34 +6551,23 @@ impl FsBackend for HostFsBackend {
         }
         if rc == 0 {
             crate::fs_resolve_cache::bump_generation();
-            // Only a DIRECTORY removal can leave another host process serving a
-            // cached dirfd for a path that a later mkdir re-creates as a
-            // different inode, so only that case pays the shared
-            // `bump_dir_generation` (see `fs_resolve_cache::current_dir_generation`).
-            // Removing a SYMLINK cannot: `dir_fd_for_hops` walks with
-            // `O_NOFOLLOW`, so no cached entry is ever reached through one, and
-            // the `fstatat` this path used to spend proving the leaf was a
-            // symlink bought nothing but the same global invalidation.
             if removed_dir {
-                // Only a DIRECTORY removal can leave a sibling host process
-                // serving a cached dirfd for a path a later `mkdir` re-creates
-                // as a different inode, so only that case pays the shared
-                // generation bump. Removing a SYMLINK cannot:
-                // `dir_fd_for_hops` walks with `O_NOFOLLOW`, so no cached entry
-                // is ever reached through one — and the `fstatat` this path
-                // used to spend proving the leaf was a symlink bought nothing
-                // but the same global invalidation.
-                let generation = crate::fs_resolve_cache::bump_dir_generation();
-                self.evict_dir_cache_subtree_restamping(rel, generation);
+                let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+                self.dir_gen_for(parent)
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.dir_gen_for(rel.as_path())
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.evict_dir_cache_subtree(rel.as_path());
+                self.evict_stat_cache_subtree(rel.as_path());
             } else {
-                self.evict_dir_cache_subtree(rel);
+                self.evict_dir_cache_subtree(rel.as_path());
                 if self.use_stat_cache {
-                    self.stat_cache.lock().remove(rel);
+                    self.stat_cache.lock().remove(rel.as_path());
                 }
             }
             #[cfg(not(target_os = "macos"))]
             {
-                remove_link_xattr_sidecars(self, rel);
+                remove_link_xattr_sidecars(self, rel.as_path());
             }
             return Ok(true);
         }
@@ -6552,52 +6726,68 @@ impl FsBackend for HostFsBackend {
     }
 
     fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
-        let _mutation = self.archive_mutation_gate.mutation();
         let src = normalize(from).ok_or(BackendError::Invalid)?;
         let dst = normalize(to).ok_or(BackendError::Invalid)?;
-        let src_rel = Self::rel_path(&src).ok_or(BackendError::Invalid)?;
-        let dst_rel = Self::rel_path(&dst).ok_or(BackendError::Invalid)?;
-        let (src_parent_fd, src_leaf) = match self.namei_leaf(src_rel) {
-            Some(pair) => pair,
-            None => return Ok(false),
+        let src_rel = NormalizedRelPath::from_normalized_relative(src);
+        let dst_rel = NormalizedRelPath::from_normalized_relative(dst);
+        self.rename_overlay_entry_at(None, None, &src_rel, None, None, &dst_rel)
+    }
+
+    fn rename_overlay_entry_at(
+        &self,
+        src_parent_fd: Option<&std::os::fd::OwnedFd>,
+        src_leaf_c: Option<&std::ffi::CStr>,
+        src_rel: &NormalizedRelPath,
+        dst_parent_fd: Option<&std::os::fd::OwnedFd>,
+        dst_leaf_c: Option<&std::ffi::CStr>,
+        dst_rel: &NormalizedRelPath,
+    ) -> Result<bool, BackendError> {
+        use std::os::fd::AsRawFd;
+        let _mutation = self.archive_mutation_gate.mutation();
+
+        let src_fallback;
+        let (src_pfd, src_name_c) = if let (Some(fd), Some(name)) = (src_parent_fd, src_leaf_c) {
+            (fd.as_raw_fd(), name)
+        } else {
+            src_fallback = match self.namei_leaf(src_rel.as_path()) {
+                Some(pair) => pair,
+                None => return Ok(false),
+            };
+            (src_fallback.0.as_raw_fd(), src_fallback.1.as_c_str())
         };
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::fstatat(
-                src_parent_fd.as_raw_fd(),
-                src_leaf.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
+
+        let dst_fallback_fd;
+        let dst_fallback_name;
+        let (dst_pfd, dst_name_c) = if let (Some(fd), Some(name)) = (dst_parent_fd, dst_leaf_c) {
+            (fd.as_raw_fd(), name)
+        } else {
+            dst_fallback_fd = self
+                .ensure_parent_dirs(dst_rel.as_path())
+                .map_err(|_| BackendError::Io)?;
+            dst_fallback_name = dst_rel
+                .file_name()
+                .and_then(cstring_from_osstr)
+                .ok_or(BackendError::Invalid)?;
+            (dst_fallback_fd.as_raw_fd(), dst_fallback_name.as_c_str())
         };
+
+        let rc =
+            unsafe { libc::renameat(src_pfd, src_name_c.as_ptr(), dst_pfd, dst_name_c.as_ptr()) };
         if rc != 0 {
-            return Ok(false);
-        }
-        let dst_parent_fd = self
-            .ensure_parent_dirs(dst_rel)
-            .map_err(|_| BackendError::Io)?;
-        let dst_leaf = dst_rel
-            .file_name()
-            .and_then(cstring_from_osstr)
-            .ok_or(BackendError::Invalid)?;
-        let rc = unsafe {
-            libc::renameat(
-                src_parent_fd.as_raw_fd(),
-                src_leaf.as_ptr(),
-                dst_parent_fd.as_raw_fd(),
-                dst_leaf.as_ptr(),
-            )
-        };
-        if rc != 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::ENOENT {
+                return Ok(false);
+            }
             return Err(BackendError::Io);
         }
+
         #[cfg(not(target_os = "macos"))]
         {
-            remove_link_xattr_sidecars(self, dst_rel);
+            remove_link_xattr_sidecars(self, dst_rel.as_path());
             for key in ["uid", "gid", "socket"] {
                 if let (Some(s), Some(d)) = (
-                    link_xattr_sidecar_rel(src_rel, key),
-                    link_xattr_sidecar_rel(dst_rel, key),
+                    link_xattr_sidecar_rel(src_rel.as_path(), key),
+                    link_xattr_sidecar_rel(dst_rel.as_path(), key),
                 ) {
                     if let (Some((sp, sl)), Some(dp)) =
                         (self.namei_leaf(&s), self.ensure_parent_dirs(&d))
@@ -6616,12 +6806,23 @@ impl FsBackend for HostFsBackend {
                 }
             }
         }
+
         crate::fs_resolve_cache::bump_generation();
         crate::fs_resolve_cache::bump_dir_generation();
-        self.drop_dir_cache();
-        if self.use_stat_cache {
-            self.drop_stat_cache_after_rename();
-        }
+        let src_parent = src_rel.parent().unwrap_or_else(|| Path::new(""));
+        let dst_parent = dst_rel.parent().unwrap_or_else(|| Path::new(""));
+        self.dir_gen_for(src_parent)
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.dir_gen_for(dst_parent)
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.dir_gen_for(src_rel.as_path())
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.dir_gen_for(dst_rel.as_path())
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.evict_dir_cache_subtree(src_rel.as_path());
+        self.evict_dir_cache_subtree(dst_rel.as_path());
+        self.evict_stat_cache_subtree(src_rel.as_path());
+        self.evict_stat_cache_subtree(dst_rel.as_path());
         Ok(true)
     }
 
@@ -9468,6 +9669,66 @@ mod tests {
             walked <= 2,
             "a warm dir_cache must cost no host path-walk opens; measured \
              {walked} walk opens across {ops} warm guest operations"
+        );
+    }
+
+    /// Running 1,000 warm operations under a 4-deep directory tree must
+    /// bound host path-walk opens to <= 1 per operation and ensure cache eviction
+    /// visits <= (evicted entries + log n) keys per eviction (ordered BTreeMap range
+    /// removal instead of O(cache) linear scans and re-stamping).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn warm_dir_cache_1000_ops_under_4_deep_tree_bounds_opens_and_eviction_visits() {
+        let scratch_root = tempfile::TempDir::new().unwrap();
+        let b = HostFsBackend::new_in(scratch_root.path()).unwrap();
+        b.make_dir("/l1").unwrap();
+        b.make_dir("/l1/l2").unwrap();
+        b.make_dir("/l1/l2/l3").unwrap();
+        b.make_dir("/l1/l2/l3/l4").unwrap();
+
+        // Populate sibling directories so cache size n is non-trivial (> 60 entries).
+        for s in 0..64 {
+            let sib = format!("/l1/l2/l3/sib{s}");
+            b.make_dir(&sib).unwrap();
+            b.dir_fd_for(Path::new(sib.trim_start_matches('/')))
+                .unwrap();
+        }
+
+        // Warm the parent directory of our target workload.
+        b.dir_fd_for(Path::new("l1/l2/l3/l4")).unwrap();
+
+        let n = b.dir_cache.lock().len() as u64;
+        let log_n = (64 - n.leading_zeros()).max(1) as u64;
+
+        b.reset_path_walk_host_opens();
+        b.reset_cache_eviction_visited_keys();
+
+        // 250 cycles of (mkdir, create_file, remove_file, rmdir) = 1,000 warm operations.
+        const CYCLES: u64 = 250;
+        for i in 0..CYCLES {
+            let dir = format!("/l1/l2/l3/l4/d{i}");
+            let file = format!("{dir}/f");
+            b.make_dir(&dir).unwrap();
+            b.create_file(&file).unwrap();
+            assert!(b.remove_entry(&file));
+            assert!(b.remove_entry(&dir));
+        }
+
+        let total_ops = CYCLES * 4;
+        let walked_opens = b.path_walk_host_opens();
+        assert!(
+            walked_opens <= total_ops,
+            "expected <= 1 host open per operation on warm cache; got {walked_opens} for {total_ops} ops"
+        );
+
+        let visited_keys = b.cache_eviction_visited_keys();
+        // Each of the 250 cycles does 2 removals (file + dir).
+        // For each eviction, range scan visits at most (evicted + 1) keys <= (evicted + log n).
+        let total_evictions = CYCLES * 2;
+        let max_expected_visits = total_evictions * (1 + log_n);
+        assert!(
+            visited_keys <= max_expected_visits,
+            "eviction visits {visited_keys} exceeded bound {max_expected_visits} for {total_evictions} evictions (n={n}, log_n={log_n})"
         );
     }
 
