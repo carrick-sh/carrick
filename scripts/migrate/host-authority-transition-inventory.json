@@ -14041,18 +14041,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor/pool.rs:1177 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor/pool.rs:1196 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
     "review_id": "HA-000588",
     "source": {
-      "byte_end": 44257,
-      "byte_start": 44232,
+      "byte_end": 44651,
+      "byte_start": 44626,
       "column": 30,
       "column_end": 55,
       "column_start": 30,
       "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
-      "line": 1177,
-      "line_end": 1177,
-      "line_start": 1177
+      "line": 1196,
+      "line_end": 1196,
+      "line_start": 1196
     }
   },
   {
