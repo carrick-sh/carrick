@@ -111,32 +111,122 @@ impl From<(GuestVa, usize)> for MappingExtent {
 /// Row identity is still authenticated per lookup by `row_projection_is_current`
 /// and the owner-generation checks; ordering only decides which row is offered.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Partitions live rows by width class `c = ceil(log2(size))` into per-class
+/// start-keyed maps, so candidate discovery probes each active class over its
+/// own radius rather than walking the whole index when a wide row exists.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct TaskMappingClassIndex {
+    pub(crate) by_class_start: std::collections::BTreeMap<(u32, u64), Vec<u64>>,
+    pub(crate) class_counts: std::collections::BTreeMap<u32, usize>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl TaskMappingClassIndex {
+    pub(crate) fn new() -> Self {
+        Self {
+            by_class_start: std::collections::BTreeMap::new(),
+            class_counts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Which size class a window of `size` bytes belongs to: the exponent
+    /// of the smallest power of two that can hold it, so every member of class
+    /// `c` has `size <= 1 << c`.
+    pub(crate) fn class(size: u64) -> u32 {
+        match size.max(1).checked_next_power_of_two() {
+            Some(rounded) => rounded.ilog2(),
+            None => u64::BITS,
+        }
+    }
+
+    /// The widest window any member of class `c` can have.
+    pub(crate) fn class_radius(class: u32) -> u64 {
+        if class >= u64::BITS {
+            u64::MAX
+        } else {
+            1_u64 << class
+        }
+    }
+
+    pub(crate) fn insert(&mut self, start_key: u64, size: u64, va_start: u64) {
+        let class = Self::class(size);
+        self.by_class_start
+            .entry((class, start_key))
+            .or_default()
+            .push(va_start);
+        *self.class_counts.entry(class).or_default() += 1;
+    }
+
+    pub(crate) fn remove(&mut self, start_key: u64, size: u64, va_start: u64) {
+        let class = Self::class(size);
+        if let Some(rows) = self.by_class_start.get_mut(&(class, start_key)) {
+            if let Some(at) = rows.iter().position(|&v| v == va_start) {
+                rows.swap_remove(at);
+            }
+            if rows.is_empty() {
+                self.by_class_start.remove(&(class, start_key));
+            }
+        }
+        if let std::collections::btree_map::Entry::Occupied(mut count) =
+            self.class_counts.entry(class)
+        {
+            *count.get_mut() = count.get().saturating_sub(1);
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.by_class_start.clear();
+        self.class_counts.clear();
+    }
+
+    /// Collect candidate guest VA starts for rows overlapping `[extent_start, extent_start + extent_length)`.
+    pub(crate) fn candidate_starts_overlapping(
+        &self,
+        extent_start: u64,
+        extent_length: u64,
+        out: &mut Vec<GuestVa>,
+    ) {
+        if extent_length == 0 {
+            return;
+        }
+        let extent_end = extent_start.checked_add(extent_length);
+        let upper = match extent_end {
+            Some(end) => end.saturating_sub(1),
+            None => u64::MAX,
+        };
+        for &class in self.class_counts.keys() {
+            let radius = Self::class_radius(class);
+            let lower = extent_start.saturating_sub(radius.saturating_sub(1));
+            for (&(_class, _start_key), starts) in
+                self.by_class_start.range((class, lower)..=(class, upper))
+            {
+                for &va_start in starts {
+                    out.push(GuestVa(va_start));
+                }
+            }
+        }
+    }
+}
+
+/// The per-task mapping table: sorted by construction, non-overlapping, and
+/// coalescing.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default)]
 pub(crate) struct TaskMappingIndex {
     live: std::collections::BTreeMap<GuestVa, HvfMappedRegion>,
     /// Rows an overlapping insert displaced. Retained only so that displacing
     /// a row never changes when its handles drop.
     shadowed: Vec<HvfMappedRegion>,
-    /// Live rows ordered by stage-2 IPA base, `(row.ipa, row.start)` naming the
-    /// `live` key. Rows may share an IPA (a fork peer keeps the same physical
-    /// frame at another VA), so this is a set, not a map from IPA to row.
-    ///
-    /// This exists because the raw-IPA lookup the page-table walk does on EVERY
-    /// fault (`diagnostic_fault_page_tables` -> `host_ptr` ->
-    /// `mapping_for_ipa_range`) wants the page-table root row, which is
-    /// published early at a LOW guest VA. A reverse walk of the VA-ordered map
-    /// reaches it LAST, so without this index that lookup stays a full-table
-    /// scan -- and a reverse `BTreeMap` walk costs several times more per row
-    /// than the contiguous vector this type replaced, which measured as a NET
-    /// 1.39x REGRESSION (docs/perf-results/2026-09-08-mapping-index-measurement.md).
-    by_ipa: std::collections::BTreeSet<(u64, u64)>,
-    /// Live rows ordered by physical stage-2 IPA base, `(row.physical_ipa, row.start)`.
-    by_physical: std::collections::BTreeSet<(u64, u64)>,
-    /// How many live rows have each semantic `size`. Only the largest matters: it bounds
-    /// how far below a queried IPA a row that still covers it can begin.
-    ipa_span_counts: std::collections::BTreeMap<u64, usize>,
-    /// How many live rows have each `physical_size`.
-    physical_span_counts: std::collections::BTreeMap<u64, usize>,
+    /// Live rows partitioned by width class and ordered by stage-2 IPA base,
+    /// `(class, row.ipa)` naming `row.start` in `live`.
+    by_ipa: TaskMappingClassIndex,
+    /// Live rows partitioned by width class and ordered by physical stage-2 IPA base,
+    /// `(class, row.physical_ipa)` naming `row.start` in `live`.
+    by_physical: TaskMappingClassIndex,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -145,26 +235,26 @@ impl TaskMappingIndex {
         Self {
             live: std::collections::BTreeMap::new(),
             shadowed: Vec::new(),
-            by_ipa: std::collections::BTreeSet::new(),
-            by_physical: std::collections::BTreeSet::new(),
-            ipa_span_counts: std::collections::BTreeMap::new(),
-            physical_span_counts: std::collections::BTreeMap::new(),
+            by_ipa: TaskMappingClassIndex::new(),
+            by_physical: TaskMappingClassIndex::new(),
         }
     }
 
     /// Publish one row into the live map and both ordered views. Every live
     /// insertion goes through here so the IPA view cannot drift.
     fn live_insert(&mut self, region: HvfMappedRegion) {
-        self.by_ipa.insert((region.ipa, region.start));
-        self.by_physical.insert((region.physical_ipa, region.start));
-        let span = region.size as u64;
-        *self.ipa_span_counts.entry(span).or_insert(0) += 1;
-        let phys_span = region.physical_size as u64;
-        *self.physical_span_counts.entry(phys_span).or_insert(0) += 1;
-        if let Some(previous) = self.live.insert(GuestVa(region.start), region) {
+        if let Some(previous) = self.live.remove(&GuestVa(region.start)) {
             // A same-start replacement: retire the row that left.
             self.forget_ipa_entry(&previous);
         }
+        self.by_ipa
+            .insert(region.ipa, region.size as u64, region.start);
+        self.by_physical.insert(
+            region.physical_ipa,
+            region.physical_size as u64,
+            region.start,
+        );
+        self.live.insert(GuestVa(region.start), region);
     }
 
     /// Take one row out of the live map and both ordered views.
@@ -175,42 +265,9 @@ impl TaskMappingIndex {
     }
 
     fn forget_ipa_entry(&mut self, row: &HvfMappedRegion) {
-        self.by_ipa.remove(&(row.ipa, row.start));
-        self.by_physical.remove(&(row.physical_ipa, row.start));
-        let span = row.size as u64;
-        if let std::collections::btree_map::Entry::Occupied(mut span_entry) =
-            self.ipa_span_counts.entry(span)
-        {
-            *span_entry.get_mut() -= 1;
-            if *span_entry.get() == 0 {
-                span_entry.remove();
-            }
-        }
-        let phys_span = row.physical_size as u64;
-        if let std::collections::btree_map::Entry::Occupied(mut span_entry) =
-            self.physical_span_counts.entry(phys_span)
-        {
-            *span_entry.get_mut() -= 1;
-            if *span_entry.get() == 0 {
-                span_entry.remove();
-            }
-        }
-    }
-
-    /// The largest `size` any live row has, or 0 when there are none.
-    fn max_ipa_span(&self) -> u64 {
-        self.ipa_span_counts
-            .last_key_value()
-            .map(|(span, _)| *span)
-            .unwrap_or_default()
-    }
-
-    /// The largest `physical_size` any live row has, or 0 when there are none.
-    fn max_physical_span(&self) -> u64 {
-        self.physical_span_counts
-            .last_key_value()
-            .map(|(span, _)| *span)
-            .unwrap_or_default()
+        self.by_ipa.remove(row.ipa, row.size as u64, row.start);
+        self.by_physical
+            .remove(row.physical_ipa, row.physical_size as u64, row.start);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -445,12 +502,10 @@ impl TaskMappingIndex {
     /// those extents can contain, applying `predicate` to them. Rows matching
     /// `predicate` are removed.
     ///
-    /// For [`MappingExtent::Ipa`], candidate discovery searches BOTH `by_ipa`
-    /// (semantic projection, windowed by [`Self::max_ipa_span`]) and `by_physical`
-    /// (physical stage-2 owner extent, windowed by [`Self::max_physical_span`]).
-    /// This guarantees that whether the queried extent is a semantic projection or
-    /// a physical lease extent, all candidate rows intersecting the extent are
-    /// discovered in sublinear time without requiring containment assumptions.
+    /// For [`MappingExtent::Ipa`], candidate discovery queries both width-class
+    /// partitioned indexes (`by_ipa` and `by_physical`) over per-class radii.
+    /// This guarantees that all candidate rows intersecting the extent are
+    /// discovered in sublinear time without whole-table scans caused by wide rows.
     pub(crate) fn remove_rows_matching_in_ranges<F>(
         &mut self,
         ranges: &[MappingExtent],
@@ -463,7 +518,7 @@ impl TaskMappingIndex {
             return 0;
         }
 
-        let mut candidate_keys = std::collections::BTreeSet::new();
+        let mut candidate_keys = Vec::new();
 
         for range in ranges {
             match range {
@@ -475,18 +530,18 @@ impl TaskMappingIndex {
                     let va_end = va_start.checked_add(*length);
                     if let Some((&key, row)) = self.live.range(..start).next_back() {
                         if row.end > va_start {
-                            candidate_keys.insert(key);
+                            candidate_keys.push(key);
                         }
                     }
                     match va_end {
                         Some(end) => {
                             for (&key, _) in self.live.range(*start..GuestVa(end)) {
-                                candidate_keys.insert(key);
+                                candidate_keys.push(key);
                             }
                         }
                         None => {
                             for (&key, _) in self.live.range(*start..) {
-                                candidate_keys.insert(key);
+                                candidate_keys.push(key);
                             }
                         }
                     }
@@ -495,53 +550,25 @@ impl TaskMappingIndex {
                     if *length == 0 {
                         continue;
                     }
-                    let ipa_start = *base;
-                    let ipa_end = ipa_start.checked_add(*length);
-                    let floor = ipa_start.saturating_sub(self.max_ipa_span());
-                    let ceil = ipa_end
-                        .and_then(|e| e.checked_add(self.max_ipa_span()))
-                        .unwrap_or(u64::MAX);
-                    let range_bounds = if ceil < u64::MAX {
-                        (
-                            std::ops::Bound::Included((floor, 0)),
-                            std::ops::Bound::Excluded((ceil, 0)),
-                        )
-                    } else {
-                        (
-                            std::ops::Bound::Included((floor, 0)),
-                            std::ops::Bound::Unbounded,
-                        )
-                    };
-                    for &(_row_ipa, start) in self.by_ipa.range(range_bounds) {
-                        candidate_keys.insert(GuestVa(start));
-                    }
-                    let floor_phys = ipa_start.saturating_sub(self.max_physical_span());
-                    let ceil_phys = ipa_end
-                        .and_then(|e| e.checked_add(self.max_physical_span()))
-                        .unwrap_or(u64::MAX);
-                    let range_bounds_phys = if ceil_phys < u64::MAX {
-                        (
-                            std::ops::Bound::Included((floor_phys, 0)),
-                            std::ops::Bound::Excluded((ceil_phys, 0)),
-                        )
-                    } else {
-                        (
-                            std::ops::Bound::Included((floor_phys, 0)),
-                            std::ops::Bound::Unbounded,
-                        )
-                    };
-                    for &(_phys_ipa, start) in self.by_physical.range(range_bounds_phys) {
-                        candidate_keys.insert(GuestVa(start));
-                    }
+                    self.by_ipa
+                        .candidate_starts_overlapping(*base, *length, &mut candidate_keys);
+                    self.by_physical.candidate_starts_overlapping(
+                        *base,
+                        *length,
+                        &mut candidate_keys,
+                    );
                 }
             }
         }
 
+        candidate_keys.sort_unstable();
+        candidate_keys.dedup();
+
         let mut doomed_live = Vec::new();
         for key in candidate_keys {
             if let Some(row) = self.live.get(&key) {
+                note_task_mapping_row_visited();
                 if ranges.iter().any(|r| r.overlaps_region(row)) {
-                    note_task_mapping_row_visited();
                     if predicate(row) {
                         doomed_live.push(key);
                     }
@@ -581,8 +608,6 @@ impl TaskMappingIndex {
         self.shadowed.clear();
         self.by_ipa.clear();
         self.by_physical.clear();
-        self.ipa_span_counts.clear();
-        self.physical_span_counts.clear();
     }
 
     /// Total row count, live and displaced.
@@ -726,39 +751,49 @@ impl TaskMappingIndex {
     /// Rows that can cover `[ipa, ipa + length)` in the stage-2 IPA domain,
     /// nearest-IPA first, then the displaced rows.
     ///
-    /// A row covers the query only if `row.ipa <= ipa`, so the walk starts at
-    /// the query and descends; no row beginning more than `max_ipa_span` below
-    /// it can still reach it, which ends the walk. Where the old reverse
-    /// vector scan visited every row to find the page-table root, this visits
-    /// the rows whose IPA is actually near the one asked for.
+    /// A row covers the query only if `row.ipa <= ipa`, probed across active
+    /// size classes within each class's radius.
     pub(crate) fn candidates_for_ipa_range(
         &self,
         ipa: u64,
         length: u64,
     ) -> impl Iterator<Item = &HvfMappedRegion> {
-        let floor = ipa.saturating_sub(self.max_ipa_span());
-        self.by_ipa
-            .range(..=(ipa, u64::MAX))
-            .rev()
-            .inspect(|_| note_task_mapping_row_visited())
-            .take_while(move |(row_ipa, _)| *row_ipa >= floor)
-            .filter_map(|(_, start)| self.live.get(&GuestVa(*start)))
-            .filter(move |row| {
-                row.ipa
-                    .checked_add(row.size as u64)
-                    .is_some_and(|limit| ipa >= row.ipa && ipa.saturating_add(length) <= limit)
-            })
-            .chain(
-                self.shadowed
-                    .iter()
-                    .rev()
-                    .inspect(|_| note_task_mapping_row_visited())
-                    .filter(move |row| {
-                        row.ipa.checked_add(row.size as u64).is_some_and(|limit| {
-                            ipa >= row.ipa && ipa.saturating_add(length) <= limit
-                        })
-                    }),
-            )
+        let mut candidates = Vec::new();
+        if let Some(end) = ipa.checked_add(length) {
+            for &class in self.by_ipa.class_counts.keys() {
+                let radius = TaskMappingClassIndex::class_radius(class);
+                if radius < length {
+                    continue;
+                }
+                let lower = end.saturating_sub(radius);
+                for (&(_class, _row_ipa), starts) in self
+                    .by_ipa
+                    .by_class_start
+                    .range((class, lower)..=(class, ipa))
+                {
+                    for &start in starts {
+                        note_task_mapping_row_visited();
+                        if let Some(row) = self.live.get(&GuestVa(start)) {
+                            if row.ipa <= ipa && end <= row.ipa.saturating_add(row.size as u64) {
+                                candidates.push(row);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.ipa.cmp(&a.ipa).then_with(|| b.start.cmp(&a.start)));
+        candidates.into_iter().chain(
+            self.shadowed
+                .iter()
+                .rev()
+                .inspect(|_| note_task_mapping_row_visited())
+                .filter(move |row| {
+                    row.ipa
+                        .checked_add(row.size as u64)
+                        .is_some_and(|limit| ipa >= row.ipa && ipa.saturating_add(length) <= limit)
+                }),
+        )
     }
 
     /// The row covering `[va, va + length)`, or `None`.
@@ -1605,6 +1640,17 @@ mod task_mapping_index_tests {
 
         assert_eq!(index.live_len(), N as usize);
 
+        // One large 32 GiB row (e.g. sparse arena reservation)
+        let arena_va = 0x1000_0000_0000_u64;
+        let arena_ipa = 0x8000_0000_0000_u64;
+        const ARENA_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+        let mut arena =
+            thread_sibling_tests::mapped_region(arena_va, arena_va + ARENA_SIZE, arena_ipa);
+        arena.owner_generation = N + 1;
+        index.insert(arena);
+
+        assert_eq!(index.live_len(), (N + 1) as usize);
+
         // Test 1: Remove one extent by VA in the middle of 4,096 rows.
         let target_idx = 2048_u64;
         let target_va = va_base + target_idx * 0x20_0000;
@@ -1613,7 +1659,7 @@ mod task_mapping_index_tests {
         let before_va = hot_path_rows_scanned(HotPathScan::TaskMappings);
         let removed = index.remove_rows_matching_in_ranges(&[extent_va], |_| true);
         assert_eq!(removed, 1, "target row must be removed");
-        assert_eq!(index.live_len(), (N - 1) as usize);
+        assert_eq!(index.live_len(), N as usize);
 
         let visited_va = hot_path_rows_scanned(HotPathScan::TaskMappings) - before_va;
         assert!(
@@ -1629,12 +1675,85 @@ mod task_mapping_index_tests {
         let before_ipa = hot_path_rows_scanned(HotPathScan::TaskMappings);
         let removed_ipa = index.remove_rows_matching_in_ranges(&[extent_ipa], |_| true);
         assert_eq!(removed_ipa, 1, "target row must be removed by IPA");
-        assert_eq!(index.live_len(), (N - 2) as usize);
+        assert_eq!(index.live_len(), (N - 1) as usize);
 
         let visited_ipa = hot_path_rows_scanned(HotPathScan::TaskMappings) - before_ipa;
         assert!(
-            visited_ipa <= 4,
-            "keyed IPA removal on N=4096 rows must visit O(1 + log N) rows, visited {visited_ipa}"
+            visited_ipa <= 1 + 40,
+            "keyed IPA removal on N=4096 rows plus 32 GiB arena must visit <= (matches + classes), visited {visited_ipa}"
         );
+    }
+
+    #[test]
+    fn task_mapping_class_index_class_computation() {
+        assert_eq!(TaskMappingClassIndex::class(0), 0);
+        assert_eq!(TaskMappingClassIndex::class_radius(0), 1);
+
+        assert_eq!(TaskMappingClassIndex::class(1), 0);
+        assert_eq!(TaskMappingClassIndex::class_radius(0), 1);
+
+        assert_eq!(TaskMappingClassIndex::class(2), 1);
+        assert_eq!(TaskMappingClassIndex::class_radius(1), 2);
+
+        assert_eq!(TaskMappingClassIndex::class(0x1000), 12);
+        assert_eq!(TaskMappingClassIndex::class_radius(12), 0x1000);
+
+        assert_eq!(TaskMappingClassIndex::class(0x1001), 13);
+        assert_eq!(TaskMappingClassIndex::class_radius(13), 0x2000);
+
+        const ARENA_32G: u64 = 32 * 1024 * 1024 * 1024;
+        assert_eq!(TaskMappingClassIndex::class(ARENA_32G), 35);
+        assert_eq!(TaskMappingClassIndex::class_radius(35), ARENA_32G);
+
+        assert_eq!(TaskMappingClassIndex::class(u64::MAX), 64);
+        assert_eq!(TaskMappingClassIndex::class_radius(64), u64::MAX);
+    }
+
+    #[test]
+    fn task_mapping_class_index_insert_remove_clear() {
+        let mut index = TaskMappingClassIndex::new();
+        index.insert(0x1000, 0x1000, 0x5000);
+        index.insert(0x1000, 0x1000, 0x6000);
+        index.insert(0x2000, 0x2000, 0x7000);
+
+        assert_eq!(index.class_counts.get(&12), Some(&2));
+        assert_eq!(index.class_counts.get(&13), Some(&1));
+
+        let mut candidates = Vec::new();
+        index.candidate_starts_overlapping(0x1000, 0x1000, &mut candidates);
+        candidates.sort_unstable();
+        assert_eq!(candidates, vec![GuestVa(0x5000), GuestVa(0x6000)]);
+
+        index.remove(0x1000, 0x1000, 0x5000);
+        assert_eq!(index.class_counts.get(&12), Some(&1));
+
+        index.remove(0x1000, 0x1000, 0x6000);
+        assert_eq!(index.class_counts.get(&12), None);
+        assert!(!index.by_class_start.contains_key(&(12, 0x1000)));
+
+        index.clear();
+        assert!(index.class_counts.is_empty());
+        assert!(index.by_class_start.is_empty());
+    }
+
+    #[test]
+    fn task_mapping_class_index_huge_row_does_not_probe_small_rows() {
+        let mut index = TaskMappingClassIndex::new();
+        const ARENA_32G: u64 = 32 * 1024 * 1024 * 1024;
+        let arena_ipa = 0x8000_0000_0000_u64;
+        index.insert(arena_ipa, ARENA_32G, 0x1000_0000_0000);
+
+        let base_ipa = 0x9b00_0000_0000_u64;
+        for i in 0..4096_u64 {
+            let ipa = base_ipa + i * 0x20_0000;
+            let va = 0x6000_0000_0000 + i * 0x20_0000;
+            index.insert(ipa, 0x1000, va);
+        }
+
+        let target_ipa = base_ipa + 1024 * 0x20_0000;
+        let mut candidates = Vec::new();
+        index.candidate_starts_overlapping(target_ipa, 0x1000, &mut candidates);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], GuestVa(0x6000_0000_0000 + 1024 * 0x20_0000));
     }
 }
