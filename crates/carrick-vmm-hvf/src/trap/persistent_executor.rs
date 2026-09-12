@@ -822,11 +822,9 @@ impl HvfVmState {
 
     /// M:N reclaim — WAKE side. Recreate this executor's vCPU in the EXISTING VM
     /// when it was locally parked. A live destination executor is retained as-is;
-    /// the caller overlays only Kernel-owned typed task state. The CALLER must hold
-    /// `fork_quiesce::topology_lock` so `vcpu_create` cannot race a concurrent
-    /// fork's `hv_vm_destroy`/`create`. Writes the recreated vCPU back through
-    /// `vcpu` via `std::mem::replace` + `forget` of the old (already-destroyed)
-    /// handle (no applevisor Drop).
+    /// the caller overlays only Kernel-owned typed task state. Writes the recreated
+    /// vCPU back through `vcpu` via `std::mem::replace` + `forget` of the old
+    /// (already-destroyed) handle (no applevisor Drop).
     ///
     /// WIRED — see [`reclaim_park`](Self::reclaim_park): reached via the HVF
     /// engine override `ThreadedEngine::rebind_to_slot`
@@ -1251,10 +1249,7 @@ impl HvfVmState {
         spec: &PersistentExecutorSpec,
     ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
         spec.carrier_mappings.audit()?;
-        let vm = rebuilt_vm_cell()
-            .lock()
-            .clone()
-            .unwrap_or_else(|| spec.vm.clone());
+        let vm = spec.vm.clone();
         let vcpu = create_vcpu(&vm)?;
         enable_el0_counter_access(vcpu.id());
         let state = HvfVmState {
@@ -1419,14 +1414,6 @@ impl HvfVmState {
             cow_identity,
         } = spec;
 
-        // The spec captured `vm` at clone time. If a fork rebuilt the VM since
-        // then (the spec's `vm` was destroyed), create the vCPU in the CURRENT
-        // VM that the fork published instead — otherwise vcpu_create hits
-        // HV_BUSY on a torn-down VM. Between forks the published cell holds the
-        // live VM; with no fork yet it's empty and the spec's `vm` is current.
-        // The caller holds `fork_quiesce::topology_lock()`, so this read can't
-        // race a fork's republish.
-        let vm = rebuilt_vm_cell().lock().clone().unwrap_or(vm);
         let vcpu = create_vcpu(&vm)?;
         enable_el0_counter_access(vcpu.id());
 
@@ -1502,5 +1489,46 @@ impl HvfVmState {
             std::sync::Arc::clone(&self.carrier_foreign_mm_transport),
         )?;
         Ok(ProcessSpec::new((*self._vm).clone(), plan))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_no_non_test_hv_vm_destroy_call_and_no_rebuilt_vm_cell_in_persistent_executor() {
+        let executor_source = include_str!("persistent_executor.rs")
+            .split("mod tests {")
+            .next()
+            .expect("persistent_executor source before tests");
+        assert!(
+            !executor_source.contains(concat!("rebuilt_", "vm_cell")),
+            "persistent_executor.rs must not read or reference rebuilt_vm_cell"
+        );
+
+        let crate_sources = concat!(
+            include_str!("persistent_executor.rs"),
+            include_str!("../trap.rs"),
+            include_str!("carrier_custody.rs"),
+            include_str!("execve_rebuild.rs"),
+            include_str!("mapping_plan.rs"),
+            include_str!("cow_engine.rs"),
+            include_str!("../hvf_aarch64_engine.rs"),
+            include_str!("../fork_coord.rs"),
+            include_str!("../fork_quiesce.rs"),
+        );
+        assert_eq!(
+            crate_sources
+                .matches(concat!("applevisor_sys::hv_vm_", "destroy()"))
+                .count(),
+            0,
+            "no non-test raw hv_vm_destroy call may exist in these modules"
+        );
+        assert_eq!(
+            crate_sources
+                .matches(concat!("inventory_hv_vm_", "destroy()"))
+                .count(),
+            1,
+            "inventory_hv_vm_destroy appears only in the custody wrapper"
+        );
     }
 }
