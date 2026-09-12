@@ -43,20 +43,31 @@ use crate::vmm::{MsrInstall, WindowPlan, WindowRegion, X86Reg, X86Seg, X86Vcpu};
 //   bit  15    = G   (granularity)
 //   bit  16    = unusable (1 = segment is not usable)
 
-/// Pack a long-mode segment access-rights word. Eight by-position fields mirror
-/// the descriptor bit layout (Intel SDM vol. 3 §24.4.1); a struct would obscure
-/// the encoding.
-#[allow(clippy::too_many_arguments)]
-const fn seg_ar(
-    type_: u32,
-    s: u32,
-    dpl: u32,
-    present: u32,
-    l: u32,
-    db: u32,
-    g: u32,
-    unusable: u32,
-) -> u32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegArFields {
+    pub(crate) type_: u32,
+    pub(crate) s: u32,
+    pub(crate) dpl: u32,
+    pub(crate) present: u32,
+    pub(crate) l: u32,
+    pub(crate) db: u32,
+    pub(crate) g: u32,
+    pub(crate) unusable: u32,
+}
+
+/// Pack a long-mode segment access-rights word from its descriptor fields
+/// (Intel SDM vol. 3 §24.4.1).
+const fn seg_ar(fields: SegArFields) -> u32 {
+    let SegArFields {
+        type_,
+        s,
+        dpl,
+        present,
+        l,
+        db,
+        g,
+        unusable,
+    } = fields;
     (type_ & 0xF)
         | (s << 4)
         | (dpl << 5)
@@ -89,52 +100,70 @@ pub struct LongModeSegmentState {
 pub fn long_mode_segment_state() -> LongModeSegmentState {
     LongModeSegmentState {
         // User CS64: GDT[4] sel 0x23, DPL3, L=1, exec/read/accessed.
-        cs_ar: seg_ar(
-            CODE_SEG_TYPE,
-            1,
-            3,
-            1,
-            /*l*/ 1,
-            /*db*/ 0,
-            /*g*/ 1,
-            0,
-        ),
+        cs_ar: seg_ar(SegArFields {
+            type_: CODE_SEG_TYPE,
+            s: 1,
+            dpl: 3,
+            present: 1,
+            l: 1,
+            db: 0,
+            g: 1,
+            unusable: 0,
+        }),
         // User SS/DS/ES/FS/GS: GDT[3] sel 0x1B, DPL3, data/write/accessed, db=1.
-        data_ar: seg_ar(
-            DATA_SEG_TYPE,
-            1,
-            3,
-            1,
-            /*l*/ 0,
-            /*db*/ 1,
-            /*g*/ 1,
-            0,
-        ),
+        data_ar: seg_ar(SegArFields {
+            type_: DATA_SEG_TYPE,
+            s: 1,
+            dpl: 3,
+            present: 1,
+            l: 0,
+            db: 1,
+            g: 1,
+            unusable: 0,
+        }),
         // Kernel CS64/SS used while parked in the LSTAR stub before SYSRETQ.
-        kernel_cs_ar: seg_ar(
-            CODE_SEG_TYPE,
-            1,
-            0,
-            1,
-            /*l*/ 1,
-            /*db*/ 0,
-            /*g*/ 1,
-            0,
-        ),
-        kernel_data_ar: seg_ar(
-            DATA_SEG_TYPE,
-            1,
-            0,
-            1,
-            /*l*/ 0,
-            /*db*/ 1,
-            /*g*/ 1,
-            0,
-        ),
+        kernel_cs_ar: seg_ar(SegArFields {
+            type_: CODE_SEG_TYPE,
+            s: 1,
+            dpl: 0,
+            present: 1,
+            l: 1,
+            db: 0,
+            g: 1,
+            unusable: 0,
+        }),
+        kernel_data_ar: seg_ar(SegArFields {
+            type_: DATA_SEG_TYPE,
+            s: 1,
+            dpl: 0,
+            present: 1,
+            l: 0,
+            db: 1,
+            g: 1,
+            unusable: 0,
+        }),
         // TR: minimal valid 32-bit busy TSS (type 11, system, DPL0, present, g=1).
-        tr_ar: seg_ar(11, /*s*/ 0, 0, 1, 0, 0, 1, 0),
+        tr_ar: seg_ar(SegArFields {
+            type_: 11,
+            s: 0,
+            dpl: 0,
+            present: 1,
+            l: 0,
+            db: 0,
+            g: 1,
+            unusable: 0,
+        }),
         // LDTR: unusable.
-        ldtr_ar: seg_ar(0, 0, 0, 0, 0, 0, 0, /*unusable*/ 1),
+        ldtr_ar: seg_ar(SegArFields {
+            type_: 0,
+            s: 0,
+            dpl: 0,
+            present: 0,
+            l: 0,
+            db: 0,
+            g: 0,
+            unusable: 1,
+        }),
         gdt_limit: (X8664GuestArch::bootstrap_sysregs().gdt.len() as u32) * 8 - 1,
     }
 }
@@ -944,7 +973,16 @@ mod tests {
     #[test]
     fn seg_ar_packs_user_cs() {
         // type=0xB, S=1, DPL=3, P=1, L=1, G=1 → 0x0000_A0FB
-        let ar = seg_ar(CODE_SEG_TYPE, 1, 3, 1, 1, 0, 1, 0);
+        let ar = seg_ar(SegArFields {
+            type_: CODE_SEG_TYPE,
+            s: 1,
+            dpl: 3,
+            present: 1,
+            l: 1,
+            db: 0,
+            g: 1,
+            unusable: 0,
+        });
         assert_eq!(ar & 0xF, 0xB, "type");
         assert_ne!(ar & (1 << 4), 0, "S");
         assert_eq!((ar >> 5) & 0x3, 3, "DPL");

@@ -178,20 +178,30 @@ pub struct FaultMemoryRecord {
 
 const _: () = assert!(std::mem::size_of::<FaultMemoryRecord>() == 64);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FaultMemoryRecordFields {
+    pub vector: u64,
+    pub error_code: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rsp: u64,
+    pub rflags: u64,
+    pub saved_rax: u64,
+    pub cr2: u64,
+}
+
 impl FaultMemoryRecord {
-    // One argument per record field (the x86 fault frame); a builder would only
-    // add ceremony.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        vector: u64,
-        error_code: u64,
-        rip: u64,
-        cs: u64,
-        rsp: u64,
-        rflags: u64,
-        saved_rax: u64,
-        cr2: u64,
-    ) -> Self {
+    pub fn new(fields: FaultMemoryRecordFields) -> Self {
+        let FaultMemoryRecordFields {
+            vector,
+            error_code,
+            rip,
+            cs,
+            rsp,
+            rflags,
+            saved_rax,
+            cr2,
+        } = fields;
         Self {
             vector,
             error_code,
@@ -706,7 +716,16 @@ mod tests {
 
     #[test]
     fn memory_record_decodes_packed_bytes() {
-        let record = FaultMemoryRecord::new(14, 0x22, 0x44, 0x66, 0x88, 0xaa, 0xcc, 0xee);
+        let record = FaultMemoryRecord::new(FaultMemoryRecordFields {
+            vector: 14,
+            error_code: 0x22,
+            rip: 0x44,
+            cs: 0x66,
+            rsp: 0x88,
+            rflags: 0xaa,
+            saved_rax: 0xcc,
+            cr2: 0xee,
+        });
         let decoded =
             FaultMemoryRecord::from_bytes(bytes_of(&record)).expect("decode packed memory record");
 
