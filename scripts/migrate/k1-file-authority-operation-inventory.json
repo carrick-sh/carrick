@@ -220,7 +220,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/dispatcher.rs",
-      "line": 57,
+      "line": 59,
       "categories": [
         "mapping"
       ],
@@ -12153,7 +12153,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/core.rs",
-      "line": 1930,
+      "line": 1933,
       "categories": [
         "mapping"
       ],
@@ -18093,7 +18093,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 2962,
+      "line": 2975,
       "categories": [
         "mapping"
       ],
