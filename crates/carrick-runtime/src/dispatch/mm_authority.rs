@@ -29,6 +29,7 @@ pub(crate) struct DispatchMmAuthority {
     pub(crate) mutation_coordinator: Arc<mm_mutation::MmMutationCoordinator>,
     pub(in crate::dispatch) guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     pub(in crate::dispatch) pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
+    pub(in crate::dispatch) fork_quiesce: Arc<carrick_thread::fork_quiesce::ForkQuiesce>,
     /// The `guest_realtime_epoch()` under which THIS MM's vvar
     /// `VVAR_OFF_REALTIME_OFF_NS` word was last stamped by the dispatcher
     /// (`SyscallDispatcher::sync_vvar_realtime_offset`). The vvar page is per
@@ -55,6 +56,7 @@ impl DispatchMmAuthority {
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
+            fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -67,6 +69,7 @@ impl DispatchMmAuthority {
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
+            fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -87,6 +90,7 @@ impl DispatchMmAuthority {
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
+            fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(
                 self.vvar_realtime_epoch
                     .load(std::sync::atomic::Ordering::Acquire),
@@ -114,6 +118,7 @@ impl DispatchMmAuthority {
                 mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
                 guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
                 pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
+                fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
                 // Never stamped: the child inherits the parent's vvar content
                 // through the COW split, and re-stamps on its next syscall
                 // only once a `clock_settime` has moved the global epoch.
@@ -161,6 +166,7 @@ impl DispatchMmAuthority {
             mutation_coordinator: Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id)),
             guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
+            fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             vvar_realtime_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
@@ -201,6 +207,10 @@ impl DispatchMmAuthority {
 
     pub(crate) fn pt_quiesce(&self) -> &Arc<carrick_thread::fork_quiesce::PtQuiesce> {
         &self.pt_quiesce
+    }
+
+    pub(crate) fn fork_quiesce(&self) -> &Arc<carrick_thread::fork_quiesce::ForkQuiesce> {
+        &self.fork_quiesce
     }
 
     #[cfg(test)]

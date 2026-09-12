@@ -433,6 +433,7 @@ pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
 
 pub(crate) trait ProductionHvpatchLoopPoll: Send {
     fn pt_quiesce(&self) -> Arc<crate::fork_quiesce::PtQuiesce>;
+    fn fork_quiesce(&self) -> Arc<crate::fork_quiesce::ForkQuiesce>;
 
     fn poll(
         &mut self,
@@ -4095,8 +4096,10 @@ where
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        let _current_mm =
-            carrick_thread::fork_quiesce::bind_current_mm_quiesce(self.kernel.pt_quiesce());
+        let _current_mm = carrick_thread::fork_quiesce::bind_current_mm_quiesce(
+            self.kernel.pt_quiesce(),
+            self.kernel.fork_quiesce(),
+        );
         match self.poll_with_engine(engine, control) {
             Err(ProductionHvpatchPollError::Runtime(error)) => {
                 match self.take_pending_exec_terminal() {
@@ -4139,6 +4142,10 @@ where
 {
     fn pt_quiesce(&self) -> Arc<crate::fork_quiesce::PtQuiesce> {
         self.kernel.pt_quiesce()
+    }
+
+    fn fork_quiesce(&self) -> Arc<crate::fork_quiesce::ForkQuiesce> {
+        self.kernel.fork_quiesce()
     }
 
     fn poll(
@@ -4494,8 +4501,10 @@ impl<E: 'static> HvpatchLoopJob<E> {
         let Some(production) = job.production.as_mut() else {
             return executor::ExecutorExit::InvalidState;
         };
-        let _current_mm =
-            carrick_thread::fork_quiesce::bind_current_mm_quiesce(production.pt_quiesce());
+        let _current_mm = carrick_thread::fork_quiesce::bind_current_mm_quiesce(
+            production.pt_quiesce(),
+            production.fork_quiesce(),
+        );
         let exit = production.poll(engine, control);
         job.suspended = match exit {
             executor::ExecutorExit::BlockedContinuation { .. }

@@ -526,9 +526,7 @@ impl KernelState {
         inherited_hvpatch_runtime: Option<Arc<HvpatchRuntimeDirectory>>,
         child_exit_signal: Option<i32>,
     ) -> Self {
-        let process_fork_barrier = hvpatch_process
-            .as_ref()
-            .map(|_| Arc::new(crate::fork_quiesce::QuiesceBarrier::new()));
+        let process_fork_barrier = hvpatch_process.as_ref().map(|_| dispatcher.fork_quiesce());
         let crash_capture = hvpatch_process
             .as_ref()
             .map(|_| Arc::new(crate::kernel::CrashCaptureAuthority::default()));
@@ -559,6 +557,10 @@ impl KernelState {
 
     pub(crate) fn pt_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::PtQuiesce> {
         self.dispatcher.pt_quiesce()
+    }
+
+    pub(crate) fn fork_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::ForkQuiesce> {
+        self.dispatcher.fork_quiesce()
     }
 
     pub(crate) fn install_control_exec_runtime(
