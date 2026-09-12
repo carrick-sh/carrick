@@ -911,7 +911,7 @@ impl HvfVmState {
                     // New descriptors and inventory are committed, but the new
                     // alias is not registered yet. Retire only the old rows.
                     // All ordinary allocation failures preceded this boundary.
-                    self.commit_process_alias_retirement(start, semantic_len, retirement)
+                    self.commit_process_alias_retirement(start, semantic_len, retirement, &registry)
                         .unwrap_or_else(|error| {
                             carrick_fatal!(
                                 "hvpatch::host_alias",
@@ -4178,7 +4178,10 @@ impl HvfVmState {
         // syscall set, whose runtime dispatch already owns the process-wide
         // MM exclusion across invalidate + TLBI + this backend retirement.
         let prepared = self.prepare_process_alias_retirement(va, len)?;
-        self.commit_process_alias_retirement(va, len, prepared)
+        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+            crate::fork_quiesce::frame_registry_lock().lock(),
+        );
+        self.commit_process_alias_retirement(va, len, prepared, &registry)
     }
 
     /// Prepare while the caller holds topology exclusion. Dropping this value
@@ -4252,12 +4255,21 @@ impl HvfVmState {
     }
 
     /// Consume a retirement under the same topology exclusion as preparation.
+    /// `registry` is the caller's live frame-registry leaf hold: the commit
+    /// publishes into the carrier-wide shared-frame registry, so it must run
+    /// under that leaf, and it must never take the leaf itself — a caller that
+    /// already holds it (the private-file materialize path publishes a
+    /// replacement under its own guard and retires the displaced rows from
+    /// inside that section) would deadlock on the non-reentrant mutex, which
+    /// is exactly how the 2026-09-12 `mmap` wedge happened.
     pub(crate) fn commit_process_alias_retirement(
         &mut self,
         va: u64,
         len: usize,
         prepared: PreparedProcessAliasRetirement,
+        registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
     ) -> Result<(), TrapError> {
+        let _ = registry;
         let authority = self.cow_authority.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no inventory authority".to_owned())
         })?;
@@ -4297,9 +4309,6 @@ impl HvfVmState {
             }
             return Ok(());
         };
-        let _registry = crate::fork_quiesce::FrameRegistryGuard::new(
-            crate::fork_quiesce::frame_registry_lock().lock(),
-        );
         if let Err(error) = authority.apply(reservation.commit(())) {
             // Name the retirement, not just the id that failed. This abort used
             // to print one MappingId and nothing else, which cannot distinguish
