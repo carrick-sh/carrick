@@ -5555,7 +5555,7 @@ mod tests {
             .expect("new pool close/join rollback");
         assert!(proof < start && start < activate && activate < rollback && rollback < shutdown);
 
-        let executor_source = include_str!("executor.rs");
+        let executor_source = include_str!("executor/binding.rs");
         let worker_prepare = executor_source
             .split_once("fn prepare_hvpatch_submission")
             .expect("worker-held HVPatch preparation API")
@@ -5617,7 +5617,7 @@ mod tests {
         // production caller; the persistent executor owns preemption itself
         // through its own `need_resched` flag, so the invariant is asserted
         // where it now lives.
-        let executor_source = include_str!("executor.rs");
+        let executor_source = include_str!("executor/pool.rs");
         assert!(
             executor_source.contains("self.need_resched.store(true, Ordering::Release);"),
             "the persistent executor must own its own preemption request"
