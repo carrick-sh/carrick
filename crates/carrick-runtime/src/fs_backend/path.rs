@@ -110,16 +110,16 @@ impl std::ops::Deref for NormalizedRelPath {
 /// `None` only if the bytes contain an interior NUL (impossible for a real
 /// path component).
 #[cfg(unix)]
-pub(super) fn cstring_from_osstr(os: &std::ffi::OsStr) -> Option<std::ffi::CString> {
+pub(crate) fn cstring_from_osstr(os: &std::ffi::OsStr) -> Option<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(os.as_bytes()).ok()
 }
 
-pub(super) fn io_error_to_linux_errno(error: std::io::Error) -> LinuxErrno {
+pub(crate) fn io_error_to_linux_errno(error: std::io::Error) -> LinuxErrno {
     crate::host_to_linux_errno(error.raw_os_error().unwrap_or(libc::EIO))
 }
 
-pub(super) fn open_host_watch_fd(path: &Path) -> Result<i32, LinuxErrno> {
+pub(crate) fn open_host_watch_fd(path: &Path) -> Result<i32, LinuxErrno> {
     let cpath = cstring_from_osstr(path.as_os_str()).ok_or(crate::linux_abi::LINUX_EINVAL)?;
     #[cfg(target_os = "macos")]
     let host_flags = libc::O_EVTONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
@@ -136,7 +136,7 @@ pub(super) fn open_host_watch_fd(path: &Path) -> Result<i32, LinuxErrno> {
     Ok(fd)
 }
 
-pub(super) fn dup_host_watch_fd(fd: i32) -> Result<i32, LinuxErrno> {
+pub(crate) fn dup_host_watch_fd(fd: i32) -> Result<i32, LinuxErrno> {
     let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if dup < 0 {
         let raw = std::io::Error::last_os_error()
@@ -147,7 +147,7 @@ pub(super) fn dup_host_watch_fd(fd: i32) -> Result<i32, LinuxErrno> {
     Ok(dup)
 }
 
-pub(super) fn child_name(prefix: &Path, candidate: &Path) -> Option<String> {
+pub(crate) fn child_name(prefix: &Path, candidate: &Path) -> Option<String> {
     let stripped = candidate.strip_prefix(prefix).ok()?;
     let mut components = stripped.components();
     let first = components.next()?;
