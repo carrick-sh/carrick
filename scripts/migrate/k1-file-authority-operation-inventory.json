@@ -25,7 +25,7 @@
     "description_backing": 7,
     "epoll": 39,
     "stream": 19,
-    "mapping": 80,
+    "mapping": 81,
     "lifecycle": 9
   },
   "entries": [
@@ -12008,21 +12008,21 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 726,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// guest-read-only description: Darwin caps a shared file mapping's",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 6405,
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "line": 5409,
       "categories": [
         "mapping"
       ],
       "text": "// O_RDWR (not the guest access mode) so HVF can mmap the result with",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "line": 722,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// guest-read-only description: Darwin caps a shared file mapping's",
       "scope_kind": "production_callsite"
     },
     {
