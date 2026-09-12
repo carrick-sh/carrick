@@ -3168,6 +3168,20 @@ mod pt_pause_tests {
         barrier.end_fork();
     }
 
+    #[test]
+    fn two_parents_fork_concurrently() {
+        let barrier: &'static crate::fork_quiesce::QuiesceBarrier =
+            Box::leak(Box::new(crate::fork_quiesce::QuiesceBarrier::new()));
+        let gate = Arc::new(CloneAdmissionGate::default());
+        let parent_a = try_begin_hvpatch_process_fork_with_admission(barrier, tid(10), &gate);
+        assert!(matches!(parent_a, ProcessForkStart::Admitted { .. }));
+        let parent_b = try_begin_hvpatch_process_fork_with_admission(barrier, tid(20), &gate);
+        assert!(
+            matches!(parent_b, ProcessForkStart::Admitted { .. }),
+            "two parents on distinct MMs must fork concurrently without Busy"
+        );
+    }
+
     /// A second process fork arriving inside a sibling fork's transient
     /// admission close releases the barrier token it won and reports the
     /// close's epoch so the caller can park on it; only exec/exit closes
