@@ -5398,18 +5398,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:472 in `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected bare run-elf host executable fallback used by `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:487 in `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`, `std::fs::read` accesses only the selected bare run-elf host executable fallback used by `run_rootfs_elf_with_hvf_args_and_dispatcher_debug`.",
     "review_id": "HA-000239",
     "source": {
-      "byte_end": 19018,
-      "byte_start": 19005,
+      "byte_end": 19499,
+      "byte_start": 19486,
       "column": 40,
       "column_end": 53,
       "column_start": 40,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 472,
-      "line_end": 472,
-      "line_start": 472
+      "line": 487,
+      "line_end": 487,
+      "line_start": 487
     }
   },
   {
@@ -5425,18 +5425,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:2214 in `rosetta_binary_bytes`, `std::fs::read` accesses only the fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:2218 in `rosetta_binary_bytes`, `std::fs::read` accesses only the fixed installed Rosetta interpreter object used by `rosetta_binary_bytes`.",
     "review_id": "HA-000240",
     "source": {
-      "byte_end": 96513,
-      "byte_start": 96500,
+      "byte_end": 96726,
+      "byte_start": 96713,
       "column": 25,
       "column_end": 38,
       "column_start": 25,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 2214,
-      "line_end": 2214,
-      "line_start": 2214
+      "line": 2218,
+      "line_end": 2218,
+      "line_start": 2218
     }
   },
   {
@@ -15314,18 +15314,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:1152 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:1156 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
     "review_id": "HA-000637",
     "source": {
-      "byte_end": 47283,
-      "byte_start": 47261,
+      "byte_end": 47496,
+      "byte_start": 47474,
       "column": 17,
       "column_end": 39,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1152,
-      "line_end": 1152,
-      "line_start": 1152
+      "line": 1156,
+      "line_end": 1156,
+      "line_start": 1156
     }
   },
   {
