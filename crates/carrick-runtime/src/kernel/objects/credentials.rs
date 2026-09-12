@@ -24,6 +24,20 @@ pub struct Credentials {
     supplementary_groups_override: Option<Vec<NsGid>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CredentialsValues {
+    pub id: CredentialsId,
+    pub ruid: NsUid,
+    pub euid: NsUid,
+    pub suid: NsUid,
+    pub rgid: NsGid,
+    pub egid: NsGid,
+    pub sgid: NsGid,
+    pub fsuid: NsUid,
+    pub fsgid: NsGid,
+    pub umask: u32,
+}
+
 impl Credentials {
     pub const fn root(id: CredentialsId) -> Self {
         Self {
@@ -41,30 +55,18 @@ impl Credentials {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub const fn from_values(
-        id: CredentialsId,
-        ruid: NsUid,
-        euid: NsUid,
-        suid: NsUid,
-        rgid: NsGid,
-        egid: NsGid,
-        sgid: NsGid,
-        fsuid: NsUid,
-        fsgid: NsGid,
-        umask: u32,
-    ) -> Self {
+    pub const fn from_values(values: CredentialsValues) -> Self {
         Self {
-            id,
-            ruid,
-            euid,
-            suid,
-            rgid,
-            egid,
-            sgid,
-            fsuid,
-            fsgid,
-            umask,
+            id: values.id,
+            ruid: values.ruid,
+            euid: values.euid,
+            suid: values.suid,
+            rgid: values.rgid,
+            egid: values.egid,
+            sgid: values.sgid,
+            fsuid: values.fsuid,
+            fsgid: values.fsgid,
+            umask: values.umask,
             supplementary_groups_override: None,
         }
     }
@@ -158,5 +160,38 @@ impl Credentials {
         self.fsgid = source.fsgid;
         self.umask = source.umask;
         self.supplementary_groups_override = source.supplementary_groups_override.clone();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_from_values_constructs_exact_fields() {
+        let id = CredentialsId::from_registry_allocation(std::num::NonZeroU64::MIN);
+        let creds = Credentials::from_values(CredentialsValues {
+            id,
+            ruid: NsUid::new(1000),
+            euid: NsUid::new(1001),
+            suid: NsUid::new(1002),
+            rgid: NsGid::new(2000),
+            egid: NsGid::new(2001),
+            sgid: NsGid::new(2002),
+            fsuid: NsUid::new(1003),
+            fsgid: NsGid::new(2003),
+            umask: 0o027,
+        });
+        assert_eq!(creds.id, id);
+        assert_eq!(creds.ruid, NsUid::new(1000));
+        assert_eq!(creds.euid, NsUid::new(1001));
+        assert_eq!(creds.suid, NsUid::new(1002));
+        assert_eq!(creds.rgid, NsGid::new(2000));
+        assert_eq!(creds.egid, NsGid::new(2001));
+        assert_eq!(creds.sgid, NsGid::new(2002));
+        assert_eq!(creds.fsuid, NsUid::new(1003));
+        assert_eq!(creds.fsgid, NsGid::new(2003));
+        assert_eq!(creds.umask, 0o027);
+        assert_eq!(creds.supplementary_groups_override, None);
     }
 }
