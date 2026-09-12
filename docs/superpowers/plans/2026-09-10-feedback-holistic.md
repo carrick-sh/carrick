@@ -411,3 +411,18 @@ commits and is re-checked at the next vet.
   three copies of the parent-resolution logic, `.ok()`-swallowed dirfd
   errors and no red-first numbers — re-tasked; syscall-names and
   fatal-residue are in director verification for landing.
+- Landed and pushed 2026-09-11 (evening): alias-newest-index (width-class
+  alias containment index, legacy maps deleted), alias-retain-index (keyed
+  extent removal with the physical index the review demanded), fatal-residue
+  (27 raw aborts → carrick_fatal! or a test helper; the 10 left sit in the
+  split files), syscall-names (`carrick_abi::syscall::nr` typed constants;
+  mem.rs arms still literal until its split lands), hostfs-amplification
+  (one `*at` host call per mutation on the dentry-held parent, ordered
+  caches, per-directory generations; red-first 1,250→250 host opens and
+  34,500→500 eviction visits per 1,000 ops). The perf effect of the three
+  clusters is unmeasured until the host is quiet: next paired run is
+  compile/tarfile/importlib against the pinned 3c8dbee5b686c49d binary.
+  Splits in flight (third turns): operations 11.8K→6.1K, mem 10.3K→8.3K,
+  objects 10.2K→8.8K, executor 10.8K→6.8K, continuation 0 commits (ordered
+  to commit). tma 101→66 allows. Per-mm plan: Task 1 tests and Task 2
+  guards verified and queued to land.
