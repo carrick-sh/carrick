@@ -971,9 +971,6 @@ pub(super) enum ProcessForkRetrySubscription {
     Lease {
         _subscription: carrick_hal::VcpuLeaseChangeSubscription,
     },
-    Topology {
-        _subscription: carrick_thread::fork_quiesce::TopologyReleaseSubscription,
-    },
     Reservation {
         _subscription: Option<crate::kernel::ReservationChangeSubscription>,
     },
@@ -1697,17 +1694,26 @@ where
             };
         let coordinator = kernel.dispatcher.mm_mutation_coordinator();
         let parent_mm_id = parent_context.shared().mm().id();
-        let mut install_authority =
+        let install_authority =
             acquire_mm_stage1_authority(mm_executor, self.this_tid, PtPauseBudget::DEFAULT);
-        if let Err(install_failure) = install_authority.as_ref() {
-            tracing::warn!(
-                ?install_failure,
-                "dispatcher fork install could not pause the parent MM; fork(2) = EAGAIN"
-            );
-            return Ok(PreparedInProcessFork::Complete(Some(
-                crate::linux_abi::LINUX_EAGAIN.guest_retval(),
-            )));
-        }
+        let mut parent_authority = match install_authority {
+            Ok(authority) => authority,
+            Err(install_failure) => {
+                tracing::warn!(
+                    ?install_failure,
+                    "dispatcher fork install could not pause the parent MM; fork(2) = EAGAIN"
+                );
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
+            }
+        };
+        let parent_mutation = match &mut parent_authority {
+            MmStage1Authority::Sole(sole) => {
+                crate::dispatch::mm_mutation::from_sole_executor(sole, coordinator, parent_mm_id)
+            }
+            MmStage1Authority::Paused(pause) => crate::dispatch::mm_mutation::from_pt_pause(pause),
+        };
         let mut inventory_transaction = None;
         let mut inventory_reserve =
             |frame_candidates: usize,
@@ -1737,43 +1743,11 @@ where
             HvpatchProcessInventoryPreparation::Copied(&mut inventory_reserve)
         };
         // The reservation and its complete bounded storage exist before this
-        // topology lock. Keep it local until every guest-pointer/pidfd preflight
+        // MM transaction. Keep it local until every guest-pointer/pidfd preflight
         // succeeds, so EFAULT cannot occupy the backend's one process slot.
-        let topology = loop {
-            let observed = crate::fork_quiesce::topology_release_generation();
-            if let Some(topology) = crate::fork_quiesce::try_acquire_topology_lock(
-                carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
-                parent_process.pid(),
-                self.this_tid.raw(),
-            ) {
-                break topology;
-            }
-            let wake_scheduler = Arc::clone(&scheduler);
-            match crate::fork_quiesce::subscribe_topology_release(
-                observed,
-                Arc::new(move |_| {
-                    let _ = if is_external_exec {
-                        wake_scheduler.wake_control(wake_thread)
-                    } else {
-                        wake_scheduler.wake(wake_thread)
-                    };
-                }),
-            ) {
-                carrick_thread::fork_quiesce::TopologyReleaseEnrollment::Ready(_) => continue,
-                carrick_thread::fork_quiesce::TopologyReleaseEnrollment::Subscribed(
-                    subscription,
-                ) => {
-                    return Ok(PreparedInProcessFork::Retry {
-                        request,
-                        coordinator: None,
-                        external_exec,
-                        _subscription: ProcessForkRetrySubscription::Topology {
-                            _subscription: subscription,
-                        },
-                    });
-                }
-            }
-        };
+        // Task 4: replaced try_acquire_topology_lock and subscribe_topology_release with
+        // parent_mutation.begin_transaction().
+        let topology = parent_mutation.begin_transaction();
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::ProcessAllocate,
             fork_stage_started,
@@ -1911,47 +1885,17 @@ where
 
         // Install the child's MM under the page-table authority taken above,
         // before the topology lock.
-        let child_dispatcher = install_authority.as_mut().ok().map(|authority| {
-            let mutation = match authority {
-                MmStage1Authority::Sole(sole) => crate::dispatch::mm_mutation::from_sole_executor(
-                    sole,
-                    coordinator,
-                    parent_mm_id,
-                ),
-                MmStage1Authority::Paused(pause) => {
-                    crate::dispatch::mm_mutation::from_pt_pause(pause)
-                }
-            };
-            let permit = mutation.host_alias_permit();
-            kernel.dispatcher.fork_clone_with_prepared_mm_authorized(
-                parent_mm_id,
-                child_mm_id,
-                parent_process.pid() as u32,
-                child_pid as u32,
-                prepared_dispatch_mm,
-                &permit,
-            )
-        });
-        let install_failure = install_authority.as_ref().err().copied();
-        drop(install_authority);
-        let mut child_dispatcher = match child_dispatcher {
-            Some(Ok(dispatcher)) => dispatcher,
-            None => {
-                tracing::warn!(
-                    ?install_failure,
-                    "dispatcher fork install could not pause the parent MM; fork(2) = EAGAIN"
-                );
-                if let Err(error) =
-                    ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
-                {
-                    return Err(ops.fail_stop(error));
-                }
-                rollback_pidfd(installed_pidfd);
-                return Ok(PreparedInProcessFork::Complete(Some(
-                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
-                )));
-            }
-            Some(Err(error)) => {
+        let permit = parent_mutation.host_alias_permit();
+        let mut child_dispatcher = match kernel.dispatcher.fork_clone_with_prepared_mm_authorized(
+            parent_mm_id,
+            child_mm_id,
+            parent_process.pid() as u32,
+            child_pid as u32,
+            prepared_dispatch_mm,
+            &permit,
+        ) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
                 tracing::warn!(
                     ?error,
                     "dispatcher fork install rejected stale parent revision; fork(2) = EAGAIN"
@@ -2100,6 +2044,8 @@ where
             });
         }
         drop(topology);
+        drop(parent_mutation);
+        drop(parent_authority);
 
         fork_stage_started = Instant::now();
         let published = match prepared_fork.commit() {
@@ -2989,20 +2935,21 @@ mod pt_pause_tests {
             .find(".reserve_frame_inventory(")
             .expect("fork reserves frame inventory");
         let topology_at = prepare
-            .find("try_acquire_topology_lock(")
-            .expect("fork takes the topology lock");
+            .find("parent_mutation.begin_transaction()")
+            .expect("fork takes the mm transaction guard");
         assert!(
             authority_at < reserve_at,
             "authority must precede the inventory reservation"
         );
         assert!(
             authority_at < topology_at,
-            "authority must precede the topology lock"
+            "authority must precede the mm transaction"
         );
         assert!(prepare.contains("MmStage1Authority::Paused(pause)"));
         assert!(prepare.contains("mm_mutation::from_pt_pause(pause)"));
         assert!(!prepare.contains("with_sole_mm_stage1"));
         assert!(!prepare.contains("lost sole exact-MM authority"));
+        assert!(!prepare.contains("try_acquire_topology_lock("));
     }
 
     #[test]
