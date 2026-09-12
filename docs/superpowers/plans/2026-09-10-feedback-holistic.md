@@ -700,3 +700,13 @@ commits and is re-checked at the next vet.
   Runnable. Round 2 brief: revert the gate, make the loser path terminal
   exactly (invalidate + dequeue), retire at drain finish only what is not
   already terminal.
+- 2026-09-12 15:20, probe gate on the rebuilt main b25f3b2d7f52c045
+  (Task 5 + fork-quiesce fix): 44/46 — `execfromthread` (the open
+  teardown defect, round 2 running) and `conformance_container_gate`
+  AGAIN with `child_comm_visible=false` and NO `child_renamed=` line: the
+  gate selects the MUSL dedicated-probe target
+  (`selected_dedicated_probe_target(&ARM64)`), and only the gnu
+  `container_gate` had been rebuilt. Lesson for the probe-rebuild step:
+  rebuild BOTH `aarch64-unknown-linux-{musl,gnu}` (the musl one in
+  `rust:alpine`) or the gate keeps running the old binary. musl probe
+  rebuilt; `conformance_container_gate` alone on the same binary: PASS.
