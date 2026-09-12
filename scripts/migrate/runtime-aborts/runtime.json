@@ -1680,7 +1680,7 @@
       "domain": "kernel::zombie_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-runtime/src/kernel/objects/task.rs",
       "function": "advance_job_control_stop_invalidation_generation",
       "ordinal_in_function": 1,
       "fingerprint": "9f358b788a5845a340158ca0b8ac5f33f9871adc5078fd9a952de7cfb403a8f4",
@@ -1691,7 +1691,7 @@
       "domain": "kernel::job_control"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-runtime/src/kernel/objects/task.rs",
       "function": "advance_ptrace_stop_generation",
       "ordinal_in_function": 1,
       "fingerprint": "3bcdc5729a3f7a1ee875ba9f8f1c40b3d07c7b3e1de996e82ab219355f9cfa3a",
