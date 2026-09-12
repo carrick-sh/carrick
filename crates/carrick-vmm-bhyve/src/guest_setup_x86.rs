@@ -1974,29 +1974,8 @@ pub fn carrick_boot_gdt_bytes() -> Vec<u8> {
 ///   see `rax = 0`; zeroing RAX after the pushes (but before iretq) delivers
 ///   that. The boot ELF `_start` ignores the inbound RAX, so the boot call site
 ///   passes `false`.
-#[allow(clippy::too_many_arguments)]
-pub fn msr_init_blob(
-    lstar: u64,
-    star: u64,
-    sfmask: u64,
-    user_rip: u64,
-    user_rsp: u64,
-    user_rflags: u64,
-    clear_rax: bool,
-    entry_rdx: u64,
-    entry_rcx: u64,
-) -> Vec<u8> {
-    carrick_x86::msr_init_blob(carrick_x86::MsrInitBlob {
-        lstar,
-        star,
-        sfmask,
-        user_rip,
-        user_rsp,
-        user_rflags,
-        clear_rax,
-        entry_rdx,
-        entry_rcx,
-    })
+pub fn msr_init_blob(spec: carrick_x86::MsrInitBlob) -> Vec<u8> {
+    carrick_x86::msr_init_blob(spec)
 }
 
 // ─── T6: BhyveGuestRam PML4 map specs ────────────────────────────────────────
@@ -2189,11 +2168,11 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
     // LSTAR trampoline VA at ring-3. The trampoline immediately issues the
     // doorbell OUT + sysretq, so user_rip = LINUX_EL0_TRAMPOLINE_BASE.
     // user_rsp = the stack top GPA (ring-3 RSP after iretq).
-    let blob = msr_init_blob(
-        regs.lstar,
-        regs.star,
-        regs.sfmask,
-        LINUX_EL0_TRAMPOLINE_BASE, // ring-3 RIP after iretq
+    let blob = msr_init_blob(carrick_x86::MsrInitBlob {
+        lstar: regs.lstar,
+        star: regs.star,
+        sfmask: regs.sfmask,
+        user_rip: LINUX_EL0_TRAMPOLINE_BASE, // ring-3 RIP after iretq
         // T7 RSP fix: with CR0.PG=1 the vCPU is in paged mode when iretq runs,
         // so RSP in the iretq frame is a guest VIRTUAL address (not a GPA).
         // The stack window maps VA [LINUX_STACK_TOP-LINUX_STACK_SIZE,
@@ -2201,12 +2180,12 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
         // ring-3 RSP is the stack-top VA = LINUX_STACK_TOP (rounded down 16-byte
         // aligned).  Using stack_top_gpa here would #PF on the first `push`
         // because that GPA is not mapped at itself in the PML4.
-        LINUX_STACK_TOP, // ring-3 RSP after iretq (guest VA, not GPA)
-        regs.rflags,     // RFLAGS (0x2)
-        false,           // M1 trampoline path ignores the inbound RAX
-        0,               // entry RDX (process entry: 0 for static, matches prior)
-        0,               // entry RCX
-    );
+        user_rsp: LINUX_STACK_TOP, // ring-3 RSP after iretq (guest VA, not GPA)
+        user_rflags: regs.rflags,  // RFLAGS (0x2)
+        clear_rax: false,          // M1 trampoline path ignores the inbound RAX
+        entry_rdx: 0,              // entry RDX (process entry: 0 for static, matches prior)
+        entry_rcx: 0,              // entry RCX
+    });
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
 
     // Carrick 5-entry GDT image.
@@ -2389,17 +2368,17 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
     vm.mmap_memseg(0, VM_SEGID_SYSMEM, X86_MEM_SIZE, PROT_RWX)?;
 
     // Kernel artifacts.
-    let blob = msr_init_blob(
-        regs.lstar,
-        regs.star,
-        regs.sfmask,
-        M1_BLOB_VA,      // ring-3 RIP: entry of the M1 user code
-        LINUX_STACK_TOP, // ring-3 RSP (guest VA)
-        regs.rflags,
-        false, // M1 user code ignores the inbound RAX
-        0,     // entry RDX (boot)
-        0,     // entry RCX (boot)
-    );
+    let blob = msr_init_blob(carrick_x86::MsrInitBlob {
+        lstar: regs.lstar,
+        star: regs.star,
+        sfmask: regs.sfmask,
+        user_rip: M1_BLOB_VA,      // ring-3 RIP: entry of the M1 user code
+        user_rsp: LINUX_STACK_TOP, // ring-3 RSP (guest VA)
+        user_rflags: regs.rflags,
+        clear_rax: false, // M1 user code ignores the inbound RAX
+        entry_rdx: 0,     // entry RDX (boot)
+        entry_rcx: 0,     // entry RCX (boot)
+    });
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
     write_gpa(&vm, X86_GDT_GPA, &carrick_boot_gdt_bytes())?;
     write_gpa(&vm, X86_LSTAR_GPA, &entry_trampoline_bytes())?;
@@ -2674,17 +2653,17 @@ pub fn bring_up_x86_elf(
 
     // Ring-0 MSR init blob: WRMSRs LSTAR/STAR/SFMASK, then iretqs to entry_rip
     // at ring-3 with initial_rsp as the stack pointer.
-    let blob = msr_init_blob(
-        regs.lstar,
-        regs.star,
-        regs.sfmask,
-        entry_rip,   // ring-3 RIP: ELF entry point
-        initial_rsp, // ring-3 RSP: initial stack from with_linux_initial_stack
-        regs.rflags,
-        false, // the ELF `_start` ignores the inbound RAX
-        0,     // entry RDX (process entry: 0 for a static binary)
-        0,     // entry RCX
-    );
+    let blob = msr_init_blob(carrick_x86::MsrInitBlob {
+        lstar: regs.lstar,
+        star: regs.star,
+        sfmask: regs.sfmask,
+        user_rip: entry_rip,   // ring-3 RIP: ELF entry point
+        user_rsp: initial_rsp, // ring-3 RSP: initial stack from with_linux_initial_stack
+        user_rflags: regs.rflags,
+        clear_rax: false, // the ELF `_start` ignores the inbound RAX
+        entry_rdx: 0,     // entry RDX (process entry: 0 for a static binary)
+        entry_rcx: 0,     // entry RCX
+    });
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
 
     write_gpa(&vm, X86_GDT_GPA, &carrick_boot_gdt_bytes())?;
@@ -3028,21 +3007,21 @@ pub fn program_x86_vcpu_longmode_entry(
     blob.push(0x48); // REX.W ┐ mov rsp, imm64(ring0_rsp)
     blob.push(0xBC); //       ┘
     blob.extend_from_slice(&ring0_rsp.to_le_bytes());
-    blob.extend_from_slice(&msr_init_blob(
-        regs.lstar,
-        regs.star,
-        regs.sfmask,
-        child_rip,
-        child_rsp,
-        regs.rflags,
-        true,
+    blob.extend_from_slice(&msr_init_blob(carrick_x86::MsrInitBlob {
+        lstar: regs.lstar,
+        star: regs.star,
+        sfmask: regs.sfmask,
+        user_rip: child_rip,
+        user_rsp: child_rsp,
+        user_rflags: regs.rflags,
+        clear_rax: true,
         // The clone/clone3 child inherits the parent's RDX (glibc clone3's child
         // fn ptr → `call *%rdx`) and RCX (post-syscall return RIP). The blob's
         // WRMSR/XSETBV setup zeroes both; restore them so the child does not
         // `call *0` and #PF at RIP=0 (the bhyve Go bring-up crash).
-        snap.gpr[GPR_IDX_RDX],
-        snap.gpr[GPR_IDX_RCX],
-    ));
+        entry_rdx: snap.gpr[GPR_IDX_RDX],
+        entry_rcx: snap.gpr[GPR_IDX_RCX],
+    }));
     write_gpa(vm, blob_gpa, &blob)?;
 
     // Inherit the parent's integer state. We do NOT call restore_x86_bhyve here
@@ -3888,17 +3867,17 @@ mod tests {
     #[test]
     fn msr_init_blob_structure() {
         let regs = X8664GuestArch::bootstrap_sysregs();
-        let blob = msr_init_blob(
-            regs.lstar,
-            regs.star,
-            regs.sfmask,
-            0x1000,
-            0x2000,
-            0x2,
-            false,
-            0,
-            0,
-        );
+        let blob = msr_init_blob(carrick_x86::MsrInitBlob {
+            lstar: regs.lstar,
+            star: regs.star,
+            sfmask: regs.sfmask,
+            user_rip: 0x1000,
+            user_rsp: 0x2000,
+            user_rflags: 0x2,
+            clear_rax: false,
+            entry_rdx: 0,
+            entry_rcx: 0,
+        });
         assert!(!blob.is_empty(), "blob must be non-empty");
         // Fits well under the per-sibling 256-byte slot: the ring-0 scratch RSP
         // is the slot top and its <=5 pushes (~40B) reach +216, so the code must
@@ -3967,7 +3946,17 @@ mod tests {
     /// positions in the push sequence (after the three WRMSRs).
     #[test]
     fn msr_init_blob_encodes_ring3_selectors() {
-        let blob = msr_init_blob(0, 0, 0, 0, 0, 0x2, false, 0, 0);
+        let blob = msr_init_blob(carrick_x86::MsrInitBlob {
+            lstar: 0,
+            star: 0,
+            sfmask: 0,
+            user_rip: 0,
+            user_rsp: 0,
+            user_rflags: 0x2,
+            clear_rax: false,
+            entry_rdx: 0,
+            entry_rcx: 0,
+        });
         // The iretq frame's first push is the SS selector: `push imm32` (0x68)
         // followed by USER_SS_SEL (LE). Search for it rather than asserting a
         // fixed offset — the pre-frame setup (3 WRMSRs, then the MXCSR mask and
@@ -3986,8 +3975,28 @@ mod tests {
     /// child must see `rax = 0` after the iretq.
     #[test]
     fn msr_init_blob_clear_rax_emits_xor_before_iretq() {
-        let with = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true, 0, 0);
-        let without = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, false, 0, 0);
+        let with = msr_init_blob(carrick_x86::MsrInitBlob {
+            lstar: 0,
+            star: 0,
+            sfmask: 0,
+            user_rip: 0x1000,
+            user_rsp: 0x2000,
+            user_rflags: 0x2,
+            clear_rax: true,
+            entry_rdx: 0,
+            entry_rcx: 0,
+        });
+        let without = msr_init_blob(carrick_x86::MsrInitBlob {
+            lstar: 0,
+            star: 0,
+            sfmask: 0,
+            user_rip: 0x1000,
+            user_rsp: 0x2000,
+            user_rflags: 0x2,
+            clear_rax: false,
+            entry_rdx: 0,
+            entry_rcx: 0,
+        });
         assert_eq!(
             with.len(),
             without.len() + 2,
@@ -4021,7 +4030,17 @@ mod tests {
     fn msr_init_blob_restores_entry_rdx_rcx_before_iretq() {
         let rdx = 0x1122_3344_5566_7788u64;
         let rcx = 0xCAFE_F00D_DEAD_BEEFu64;
-        let blob = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true, rdx, rcx);
+        let blob = msr_init_blob(carrick_x86::MsrInitBlob {
+            lstar: 0,
+            star: 0,
+            sfmask: 0,
+            user_rip: 0x1000,
+            user_rsp: 0x2000,
+            user_rflags: 0x2,
+            clear_rax: true,
+            entry_rdx: rdx,
+            entry_rcx: rcx,
+        });
         let n = blob.len();
         assert_eq!(&blob[n - 2..], &[0x48, 0xCF], "ends with iretq");
         let mut expect = vec![0x48, 0xBA]; // mov rdx, imm64
