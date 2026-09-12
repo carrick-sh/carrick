@@ -16,7 +16,7 @@
 //! `paired` rendezvous through `/gate/<role>.ready` / `.scanned` so both
 //! containers scan `/proc` while the other's child is alive. Exits 7 (alpha)
 //! or 9 (beta) so the harness can prove independent exit statuses.
-use conformance_probes::reap;
+use conformance_probes::{pipe2, reap};
 use std::io::Write;
 
 const READY_TIMEOUT_MS: u64 = 60_000;
@@ -47,6 +47,21 @@ fn wait_for(path: &str) -> bool {
         waited += 100;
     }
     false
+}
+
+/// Wait (bounded) for one byte on `fd`; false on timeout, EOF or error.
+fn wait_for_byte(fd: i32, timeout_ms: u64) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms as libc::c_int) };
+    if ready != 1 {
+        return false;
+    }
+    let mut byte = 0u8;
+    unsafe { libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1) == 1 }
 }
 
 fn proc_comms() -> Vec<String> {
@@ -99,18 +114,27 @@ fn main() {
     let peer_marker = format!("/etc/carrick-gate-{peer}");
     let own_marker_written = std::fs::write(&own_marker, b"1\n").is_ok();
 
-    // A child with a distinctive comm, alive while the peer scans /proc.
+    // A child with a distinctive comm, alive while the peer scans /proc. The
+    // child reports its rename over a pipe and the parent waits for that byte
+    // (bounded) before scanning: until `prctl` has run the child still carries
+    // the parent's comm, so an unsynchronized scan turns "the child was not
+    // scheduled yet" into a false `child_comm_visible=false` under host load.
+    let (renamed_rd, renamed_wr) = pipe2();
     let child = unsafe { libc::fork() };
     if child == 0 {
         let name = std::ffi::CString::new(my_comm.clone()).unwrap();
         unsafe {
             libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
+            libc::write(renamed_wr, b"1".as_ptr() as *const libc::c_void, 1);
         }
         loop {
             unsafe { libc::pause() };
         }
     }
     let child_forked = child > 0;
+    unsafe { libc::close(renamed_wr) };
+    let child_renamed = child_forked && wait_for_byte(renamed_rd, READY_TIMEOUT_MS);
+    unsafe { libc::close(renamed_rd) };
     if paired {
         let _ = std::fs::write(format!("/gate/{role}.ready"), b"1\n");
     }
@@ -135,7 +159,7 @@ fn main() {
          foreign_marker_visible={foreign_marker_visible}\nchild_comm_visible={child_comm_visible}\n\
          foreign_proc_visible={foreign_proc_visible}\npeer_ready={peer_ready}\n\
          mmap_arena_ok={mmap_arena_ok}\ngetpid_again={pid_again}\n\
-         proc_status_pid={proc_status_pid}\n"
+         proc_status_pid={proc_status_pid}\nchild_renamed={child_renamed}\n"
     );
     print!("{lines}");
     if let Ok(mut file) = std::fs::File::create(format!("/gate/{role}.report")) {
