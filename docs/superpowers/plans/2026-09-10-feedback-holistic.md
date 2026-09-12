@@ -661,3 +661,28 @@ commits and is re-checked at the next vet.
     poll — that is a second defect on top of the lost publication.
   Reaped by hand after capture; the gate resumed. OPEN, not yet
   attributed to a change (first occurrence in ~10 gates today).
+- 2026-09-12 14:40, forkexecstorm wedge ATTRIBUTED and FIXED (c40654c00):
+  `carrick debug lldb-run` on the current main wedged 2/3 (fatal-hold
+  capture `target/perf/perf2x-sep12/fes/fes-new-2`: vfork child pid 120
+  `Blocked(HostWait)` at generation 2 after a `quiesced` boundary, never
+  claimed again) and 0/3 on the pre-Task-6 binary, which instead showed the
+  pre-existing exec-teardown fatal 1/3. Mechanism: with the per-mm barrier a
+  vfork/CLONE_VM child shares its parent's fork barrier; the child read
+  `is_quiescing()==true`, the forker lowered the flag and published both
+  `Released` events, THEN the child read the generation and subscribed —
+  nothing publishes again until the next fork's `Raised`, which consumes the
+  one-shot listener whose callback only acted on `Released`. Fix: a
+  subscription while the flag is low answers `Ready(Released)` under the
+  publication lock, and the parked executor's callback wakes on any event
+  (the run-loop top re-checks and re-parks). Receipt on 205612529c3c967d:
+  forkexecstorm ×6 under lldb-run, 0 wedges; the 2 failures are the
+  pre-existing `hvpatch::mm_authority` fatal (registration-cleanup dropping
+  an Active inventory), the class `exec-sibling-settle` addresses.
+- 2026-09-12 14:45, per-mm Task 5 LANDED (ac96a1959) after a round-2
+  review: per-scope `AliasScopeBucket` now the single owner of rows, replay
+  set and version chains (carrier-global `replay_mappings()` and
+  `alias_version_registry()` deleted; the 3-lock order collapsed to the one
+  alias registry lock), `FrameRegistryGuard::acquire` measures the leaf wait
+  for the USDT, red test visits 128,064 → ≤74 rows on retirement. Live
+  receipts (probe gate, multiprocessing row, paired scorecard) pending on
+  the rebuilt main.
