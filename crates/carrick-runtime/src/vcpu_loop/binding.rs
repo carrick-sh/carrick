@@ -957,57 +957,12 @@ where
             }
         };
         let terminal_mm = terminal_context.shared().mm().id();
-        let mut admitted_mm_executor = None;
-        let mm_executor: &mut crate::dispatch::MmExecutorParticipation = match self
-            .state
-            .guest_execution
-            .as_mut()
-            .filter(|p| p.mm_id() == terminal_mm)
-        {
-            Some(participation) => participation,
-            None => match self.kernel.dispatcher.enter_mm_executor() {
-                Ok(entered) => admitted_mm_executor.insert(entered),
-                Err(failure) => {
-                    tracing::error!(%failure, "admit exact-MM terminal retirement authority");
-                    let outcome = match terminal {
-                        PersistentTerminal::Error(error) => Err(error),
-                        _ => Err(RuntimeError::CarrierFailed(format!(
-                            "admit exact-MM terminal retirement authority failed: {failure}"
-                        ))),
-                    };
-                    return self.finish(outcome);
-                }
-            },
-        };
-        let coordinator = self.kernel.dispatcher.mm_mutation_coordinator();
-        let mut terminal_authority = match super::quiesce::acquire_mm_stage1_authority(
-            mm_executor,
-            self.state.this_tid,
-            super::quiesce::PtPauseBudget::DEFAULT,
-        ) {
-            Ok(authority) => authority,
-            Err(failure) => {
-                tracing::error!(?failure, "acquire exact-MM terminal authority");
-                let outcome = match terminal {
-                    PersistentTerminal::Error(error) => Err(error),
-                    _ => Err(RuntimeError::CarrierFailed(format!(
-                        "acquire exact-MM terminal authority failed: {failure:?}"
-                    ))),
-                };
-                return self.finish(outcome);
-            }
-        };
-        let terminal_mutation = match &mut terminal_authority {
-            super::quiesce::MmStage1Authority::Sole(sole) => {
-                crate::dispatch::mm_mutation::from_sole_executor(sole, coordinator, terminal_mm)
-            }
-            super::quiesce::MmStage1Authority::Paused(pause) => {
-                crate::dispatch::mm_mutation::from_pt_pause(pause)
-            }
-        };
-        // Task 4: replaced try_acquire_topology_lock and subscribe_topology_release with
-        // terminal_mutation.begin_transaction().
-        let topology = terminal_mutation.begin_transaction();
+        // The terminal retirement edits no live stage-1 table (see
+        // `mm_mutation::terminal_process_transaction`): it takes the
+        // transaction depth and, inside, the registry leaf — never a
+        // page-table pause, which elected a drain over sibling executors
+        // exit_group had already put beyond kicking.
+        let topology = crate::dispatch::mm_mutation::terminal_process_transaction();
         let owns_final_mm = process
             .owns_final_mm_edge(terminal_context.task().key())
             .unwrap_or_else(|failure| {
@@ -1241,9 +1196,6 @@ where
         );
         drop(owner_set_edit);
         drop(topology);
-        drop(terminal_mutation);
-        drop(terminal_authority);
-        drop(admitted_mm_executor);
         self.kernel.publish_process_terminal(terminal_publication);
         self.finish(terminal.into_result())
     }
@@ -6440,8 +6392,12 @@ mod tests {
             .find(".hold_owner_set_edit(terminal_context.task().key())")
             .expect("exit admits its owner-set edit");
         let topology_at = finalize
-            .find("terminal_mutation.begin_transaction()")
-            .expect("exit takes the mm transaction guard");
+            .find("mm_mutation::terminal_process_transaction()")
+            .expect("exit takes the terminal mm transaction guard");
+        assert!(
+            !finalize.contains("acquire_mm_stage1_authority("),
+            "exit must not elect a stage-1 pause: sibling executors are beyond kicking after exit_group"
+        );
         let publish_at = finalize
             .find(".publish_exit_status(")
             .expect("exit publishes into the kernel graph");
