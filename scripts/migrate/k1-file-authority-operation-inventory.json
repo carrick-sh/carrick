@@ -17400,7 +17400,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5384,
+      "line": 5424,
       "categories": [
         "mapping"
       ],
@@ -17409,7 +17409,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5392,
+      "line": 5432,
       "categories": [
         "mapping"
       ],
@@ -17418,7 +17418,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5408,
+      "line": 5448,
       "categories": [
         "mapping"
       ],
