@@ -90,6 +90,7 @@ use crate::linux_abi::{
     LINUX_MSG_NOSIGNAL, LINUX_POLLRDHUP,
 };
 use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
+use carrick_abi::syscall::nr;
 
 syscall_table! {
     /// Per-module syscall routing for the `net` subsystem (Task A1).
@@ -99,38 +100,38 @@ syscall_table! {
     /// the other modules' tables. Add a `net` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_net;
-    19 => eventfd2,
-    20 => epoll_create1,
-    carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE => x86_epoll_create,
-    21 => epoll_ctl,
-    22 => epoll_pwait,
-    441 => epoll_pwait2,
+    nr::EVENTFD2 => eventfd2,
+    nr::EPOLL_CREATE1 => epoll_create1,
+    nr::CARRICK_PRIVATE_X86_EPOLL_CREATE => x86_epoll_create,
+    nr::EPOLL_CTL => epoll_ctl,
+    nr::EPOLL_PWAIT => epoll_pwait,
+    nr::EPOLL_PWAIT2 => epoll_pwait2,
     // x86_64 poll(2): shares the ppoll handler, which branches on the
     // canonical number to read arg2 as an INT timeout_ms (not a *timespec).
-    carrick_abi::CARRICK_PRIVATE_X86_POLL => ppoll,
+    nr::CARRICK_PRIVATE_X86_POLL => ppoll,
     // x86_64 select(2): shares the pselect6 handler, which branches on the
     // canonical number to read the timeout as a *timeval (not *timespec).
-    carrick_abi::CARRICK_PRIVATE_X86_SELECT => pselect6,
-    72 => pselect6,
-    73 => ppoll,
-    198 => socket,
-    199 => socketpair,
-    200 => bind,
-    201 => listen,
-    202 => accept,
-    203 => connect,
-    204 => getsockname,
-    205 => getpeername,
-    206 => sendto,
-    207 => recvfrom,
-    208 => setsockopt,
-    209 => getsockopt,
-    210 => shutdown,
-    211 => sendmsg,
-    212 => recvmsg,
-    242 => accept4,
-    243 => sys_recvmmsg,
-    269 => sys_sendmmsg,
+    nr::CARRICK_PRIVATE_X86_SELECT => pselect6,
+    nr::PSELECT6 => pselect6,
+    nr::PPOLL => ppoll,
+    nr::SOCKET => socket,
+    nr::SOCKETPAIR => socketpair,
+    nr::BIND => bind,
+    nr::LISTEN => listen,
+    nr::ACCEPT => accept,
+    nr::CONNECT => connect,
+    nr::GETSOCKNAME => getsockname,
+    nr::GETPEERNAME => getpeername,
+    nr::SENDTO => sendto,
+    nr::RECVFROM => recvfrom,
+    nr::SETSOCKOPT => setsockopt,
+    nr::GETSOCKOPT => getsockopt,
+    nr::SHUTDOWN => shutdown,
+    nr::SENDMSG => sendmsg,
+    nr::RECVMSG => recvmsg,
+    nr::ACCEPT4 => accept4,
+    nr::RECVMMSG => sys_recvmmsg,
+    nr::SENDMMSG => sys_sendmmsg,
 }
 
 pub(super) fn host_sockaddr_to_socket_addr(bytes: &[u8]) -> Option<std::net::SocketAddr> {

@@ -58,6 +58,7 @@ use std::time::Instant;
 
 use super::*;
 
+use carrick_abi::syscall::nr;
 use carrick_abi::{
     LINUX_ENOSPC, LINUX_PERF_ATTR_SIZE_SUPPORTED, LINUX_PERF_ATTR_SIZE_VER0,
     LINUX_PERF_COUNT_SW_CPU_CLOCK, LINUX_PERF_COUNT_SW_DUMMY, LINUX_PERF_COUNT_SW_TASK_CLOCK,
@@ -72,7 +73,7 @@ syscall_table! {
     /// Per-module syscall routing for perf events. `resolve_handler` in
     /// `dispatch/mod.rs` chains this with the other modules' tables.
     pub(crate) fn dispatch_perf;
-    241 => perf_event_open,
+    nr::PERF_EVENT_OPEN => perf_event_open,
 }
 
 /// The software events carrick backs with an honest measurement source.

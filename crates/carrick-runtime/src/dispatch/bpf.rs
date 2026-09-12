@@ -49,13 +49,14 @@ use carrick_abi::bpf::{
     BPF_INSN_SIZE, BPF_MAX_REG, BpfCmd, BpfElemAttr, BpfInsn, BpfMapCreateAttr, BpfMapType,
     BpfProgLoadAttr, BpfProgType, BpfUpdateFlags, LINUX_BPF_MAXINSNS,
 };
+use carrick_abi::syscall::nr;
 use std::collections::BTreeMap;
 
 syscall_table! {
     /// Routing for `bpf(2)` (canonical/aarch64 280; x86_64 321 remaps at the
     /// GuestArch seam).
     pub(crate) fn dispatch_bpf;
-    280 => bpf,
+    nr::BPF => bpf,
 }
 
 /// The attr prefix carrick reads: through `kern_version`@40 (the last

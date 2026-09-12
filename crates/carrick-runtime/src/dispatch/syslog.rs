@@ -35,11 +35,12 @@ pub const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
 pub const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
 pub const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
 pub const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+use carrick_abi::syscall::nr;
 
 syscall_table! {
     /// Routing for the syslog syscall family.
     pub(crate) fn dispatch_syslog;
-    116 => syslog,
+    nr::SYSLOG => syslog,
 }
 
 impl SyscallDispatcher {

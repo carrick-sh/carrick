@@ -10,6 +10,7 @@
 pub(crate) use super::dispatcher::IpcView;
 use super::*;
 use crate::linux_abi::LinuxErrno;
+use carrick_abi::syscall::nr;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -18,12 +19,12 @@ syscall_table! {
     /// `resolve_handler` in `dispatch/mod.rs` chains this with the other
     /// modules' tables. (x86_64 maps 240–245 → 180–185 at the GuestArch seam.)
     pub(crate) fn dispatch_mqueue;
-    180 => mq_open,
-    181 => mq_unlink,
-    182 => mq_timedsend,
-    183 => mq_timedreceive,
-    184 => mq_notify,
-    185 => mq_getsetattr,
+    nr::MQ_OPEN => mq_open,
+    nr::MQ_UNLINK => mq_unlink,
+    nr::MQ_TIMEDSEND => mq_timedsend,
+    nr::MQ_TIMEDRECEIVE => mq_timedreceive,
+    nr::MQ_NOTIFY => mq_notify,
+    nr::MQ_GETSETATTR => mq_getsetattr,
 }
 
 /// Defaults from mq_overview(7) / the `/proc/sys/fs/mqueue` values carrick

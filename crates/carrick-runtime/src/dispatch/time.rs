@@ -48,6 +48,7 @@ use carrick_timer_core::TimerSpecNs;
 use std::time::Duration;
 
 use super::*;
+use carrick_abi::syscall::nr;
 
 syscall_table! {
     /// Per-module syscall routing for the `time` subsystem (Task A1).
@@ -57,32 +58,32 @@ syscall_table! {
     /// the other modules' tables. Add a `time` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_time;
-    85 => timerfd_create,
-    86 => timerfd_settime,
-    87 => timerfd_gettime,
-    101 => nanosleep,
-    102 => getitimer,
-    103 => setitimer,
-    107 => timer_create,
-    108 => timer_gettime,
-    109 => timer_getoverrun,
-    110 => timer_settime,
-    111 => timer_delete,
-    112 => clock_settime,
-    113 => clock_gettime,
-    114 => clock_getres,
-    115 => clock_nanosleep,
-    carrick_abi::CARRICK_PRIVATE_X86_ALARM => x86_alarm,
-    carrick_abi::CARRICK_PRIVATE_X86_TIME => x86_time,
-    153 => times,
-    163 => getrlimit,
-    165 => getrusage,
-    169 => gettimeofday,
-    170 => settimeofday,
-    171 => adjtimex,
-    179 => sysinfo,
-    261 => prlimit64,
-    266 => clock_adjtime,
+    nr::TIMERFD_CREATE => timerfd_create,
+    nr::TIMERFD_SETTIME => timerfd_settime,
+    nr::TIMERFD_GETTIME => timerfd_gettime,
+    nr::NANOSLEEP => nanosleep,
+    nr::GETITIMER => getitimer,
+    nr::SETITIMER => setitimer,
+    nr::TIMER_CREATE => timer_create,
+    nr::TIMER_GETTIME => timer_gettime,
+    nr::TIMER_GETOVERRUN => timer_getoverrun,
+    nr::TIMER_SETTIME => timer_settime,
+    nr::TIMER_DELETE => timer_delete,
+    nr::CLOCK_SETTIME => clock_settime,
+    nr::CLOCK_GETTIME => clock_gettime,
+    nr::CLOCK_GETRES => clock_getres,
+    nr::CLOCK_NANOSLEEP => clock_nanosleep,
+    nr::CARRICK_PRIVATE_X86_ALARM => x86_alarm,
+    nr::CARRICK_PRIVATE_X86_TIME => x86_time,
+    nr::TIMES => times,
+    nr::GETRLIMIT => getrlimit,
+    nr::GETRUSAGE => getrusage,
+    nr::GETTIMEOFDAY => gettimeofday,
+    nr::SETTIMEOFDAY => settimeofday,
+    nr::ADJTIMEX => adjtimex,
+    nr::SYSINFO => sysinfo,
+    nr::PRLIMIT64 => prlimit64,
+    nr::CLOCK_ADJTIME => clock_adjtime,
 }
 
 /// Pack a timer's `(value, interval)` ns pair into a `LinuxItimerspec` (the

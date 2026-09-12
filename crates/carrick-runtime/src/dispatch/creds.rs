@@ -40,6 +40,7 @@
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
 use crate::linux_abi::LinuxErrno;
+use carrick_abi::syscall::nr;
 use carrick_abi::{NsGid, NsUid};
 use carrick_fatal::carrick_fatal;
 
@@ -51,29 +52,29 @@ syscall_table! {
     /// the other modules' tables. Add a `creds` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_creds;
-    90 => capget,
-    91 => capset,
-    140 => setpriority,
-    141 => getpriority,
-    143 => setregid,
-    144 => setgid,
-    145 => setreuid,
-    146 => setuid,
-    147 => setresuid,
-    148 => getresuid,
-    149 => setresgid,
-    150 => getresgid,
-    158 => getgroups,
-    166 => umask,
-    151 => sys_setfsuid,
-    152 => sys_setfsgid,
-    159 => sys_setgroups,
-    172 => sys_getpid,
-    173 => sys_getppid,
-    174 => sys_getuid,
-    175 => sys_geteuid,
-    176 => sys_getgid,
-    177 => sys_getegid,
+    nr::CAPGET => capget,
+    nr::CAPSET => capset,
+    nr::SETPRIORITY => setpriority,
+    nr::GETPRIORITY => getpriority,
+    nr::SETREGID => setregid,
+    nr::SETGID => setgid,
+    nr::SETREUID => setreuid,
+    nr::SETUID => setuid,
+    nr::SETRESUID => setresuid,
+    nr::GETRESUID => getresuid,
+    nr::SETRESGID => setresgid,
+    nr::GETRESGID => getresgid,
+    nr::GETGROUPS => getgroups,
+    nr::UMASK => umask,
+    nr::SETFSUID => sys_setfsuid,
+    nr::SETFSGID => sys_setfsgid,
+    nr::SETGROUPS => sys_setgroups,
+    nr::GETPID => sys_getpid,
+    nr::GETPPID => sys_getppid,
+    nr::GETUID => sys_getuid,
+    nr::GETEUID => sys_geteuid,
+    nr::GETGID => sys_getgid,
+    nr::GETEGID => sys_getegid,
 }
 
 fn is_self_priority_target(who: i32) -> bool {
