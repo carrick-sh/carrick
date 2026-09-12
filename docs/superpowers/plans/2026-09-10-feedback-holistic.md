@@ -439,3 +439,14 @@ commits and is re-checked at the next vet.
   Continuation split: the worker produced no commit in three turns; the
   director committed its compiled `quantum` submodule (12.1K → 10.5K) and
   started a fresh conversation on the same worktree.
+- Per-mm Task 3 LANDED (393340069): mmap alias install and the COW/
+  materialize paths publish frames under `FrameRegistryGuard` (a leaf)
+  instead of the carrier topology mutex; fork, exec and exit also take the
+  leaf around their frame-inventory reservation/retirement steps so the
+  two sides keep excluding each other on the shared-frame registry until
+  Task 4 removes the mutex from those transactions. Landing note: the
+  abort ledger refused fingerprint drift on the fatal statements the guard
+  now wraps (binding.rs exit retirement #5–#7, exec.rs drive_execve #3,
+  mod.rs redispatch alias install) — re-blessed with sink/domain asserted
+  equal per row (that refusal is the review gate working as designed).
+  The executor-lane retirement site is Task 4's.
