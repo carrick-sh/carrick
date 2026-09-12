@@ -412,3 +412,21 @@ mod tests {
         });
     }
 }
+
+/// The transaction for a process's terminal retirement
+/// (`finalize_persistent_process_terminal`), which edits no live stage-1
+/// table: the final owner retires the mm whole (no task can run it again)
+/// and a non-owner only publishes its own retirement rows. It needs the
+/// transaction depth (the executor-boundary invariant) and the registry
+/// leaf its callers take, not a page-table pause. Electing a pause there
+/// drained sibling executors that `exit_group` had already put beyond
+/// kicking — `UnkickableExecutor` → `CarrierFailed`, or a hang — on every
+/// threaded Go process exit (2026-09-12). This and
+/// `MmMutationGuard::begin_transaction` are the only two construction
+/// paths; the source-shape test in `mm_authority.rs` pins both.
+pub fn terminal_process_transaction() -> MmTransactionGuard<'static> {
+    MmTransactionGuard {
+        depth: carrick_thread::fork_quiesce::TopologyDepth::acquire(),
+        _guard: PhantomData,
+    }
+}

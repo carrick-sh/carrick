@@ -943,7 +943,7 @@ mod mm_transaction_tests {
 
         assert_eq!(
             observed_matches, expected_matches,
-            "MmTransactionGuard must have exactly one construction path across workspace crates: MmMutationGuard::begin_transaction in mm_mutation.rs"
+            "MmTransactionGuard is constructed only inside mm_mutation.rs (MmMutationGuard::begin_transaction and terminal_process_transaction); no other crate or module may build one: mm_mutation.rs"
         );
 
         let mutation_source =
@@ -959,6 +959,22 @@ mod mm_transaction_tests {
             mutation_source.contains(&expected_snippet_lf)
                 || mutation_source.contains(&expected_snippet_crlf),
             "MmTransactionGuard construction site must be inside MmMutationGuard::begin_transaction"
+        );
+        let terminal_snippet_lf = format!(
+            "pub fn terminal_process_transaction() -> MmTransactionGuard<'static> {{\n    {struct_init_pattern}"
+        );
+        let terminal_snippet_crlf = format!(
+            "pub fn terminal_process_transaction() -> MmTransactionGuard<'static> {{\r\n    {struct_init_pattern}"
+        );
+        assert!(
+            mutation_source.contains(&terminal_snippet_lf)
+                || mutation_source.contains(&terminal_snippet_crlf),
+            "the terminal-retirement transaction must be the second and last construction site"
+        );
+        assert_eq!(
+            mutation_source.matches(struct_init_pattern).count(),
+            2,
+            "exactly two MmTransactionGuard construction sites: begin_transaction and terminal_process_transaction"
         );
     }
 }
