@@ -914,6 +914,14 @@
       "rationale": "Host thread-local cell INTERNAL_OPEN_DEPTH in crates/carrick-runtime/src/fanotify.rs maintaining per-host-thread execution state for the carrier."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "symbol": "EXCLUSIVE_ARCHIVE_GATES",
+      "fingerprint": "f2d82442711502ce92f2b201cce414a32749146c1a91c11fb4843e7483c3a8a4",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local cell EXCLUSIVE_ARCHIVE_GATES in crates/carrick-runtime/src/fs_backend.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "fast_fs_enabled::CARRICK_FAST_FS",
@@ -992,14 +1000,6 @@
       "fingerprint": "5e774260b6700d3db8ed18e8ac5d4651fd2d3e3e1d370a6f5e653f7235b5c507",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static scratch_cleanup_sender::SENDER in crates/carrick-runtime/src/fs_backend/host.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "EXCLUSIVE_ARCHIVE_GATES",
-      "fingerprint": "f2d82442711502ce92f2b201cce414a32749146c1a91c11fb4843e7483c3a8a4",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local cell EXCLUSIVE_ARCHIVE_GATES in crates/carrick-runtime/src/fs_backend.rs maintaining per-host-thread execution state for the carrier."
     },
     {
       "kind": "static",
