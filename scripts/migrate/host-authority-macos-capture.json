@@ -8766,15 +8766,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 82342,
-        "byte_start": 82326,
+        "byte_end": 82494,
+        "byte_start": 82478,
         "column": 39,
         "column_end": 55,
         "column_start": 39,
         "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-        "line": 2055,
-        "line_end": 2055,
-        "line_start": 2055
+        "line": 2059,
+        "line_end": 2059,
+        "line_start": 2059
       }
     },
     {
@@ -8786,15 +8786,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 90953,
-        "byte_start": 90937,
+        "byte_end": 91105,
+        "byte_start": 91089,
         "column": 47,
         "column_end": 63,
         "column_start": 47,
         "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-        "line": 2270,
-        "line_end": 2270,
-        "line_start": 2270
+        "line": 2274,
+        "line_end": 2274,
+        "line_start": 2274
       }
     },
     {
@@ -10430,15 +10430,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 181633,
-        "byte_start": 181608,
+        "byte_end": 181865,
+        "byte_start": 181840,
         "column": 35,
         "column_end": 60,
         "column_start": 35,
         "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-        "line": 4293,
-        "line_end": 4293,
-        "line_start": 4293
+        "line": 4300,
+        "line_end": 4300,
+        "line_start": 4300
       }
     },
     {
@@ -11486,9 +11486,9 @@
       }
     }
   ],
-  "rows_sha256": "e597c3104da2693d10044b1c33b60e3af9e96449004b35935b70bfdb34f952a2",
+  "rows_sha256": "81ad437dee7cc584f9e324c8b1e2c40086743771bda6a7988276fc22318daca4",
   "schema": 1,
-  "source_head": "874056e251857742c3f1b8bf565174cf93683978",
+  "source_head": "fadb76c3a4ee21937efb3e62e5920e7a8bbbc2a4",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
