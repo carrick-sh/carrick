@@ -5667,3 +5667,6 @@ pub(crate) struct FrameCowTrigger {
     far: u64,
     ttbr0: u64,
 }
+
+#[cfg(test)]
+pub(crate) mod tests;
