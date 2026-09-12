@@ -1823,7 +1823,7 @@
       "domain": "kernel::child_reaping"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/thread.rs",
       "function": "PreparedThreadClone::commit",
       "ordinal_in_function": 1,
       "fingerprint": "ff51fd853427c91afa74b951d0b74ab14e59690a79fc3e51ee8b59d909b7bcff",
