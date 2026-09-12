@@ -174,39 +174,54 @@ pub(crate) enum FaultSignalDisposition {
     Terminate(i32),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FaultSignal {
+    pub signum: i32,
+    pub si_code: i32,
+    pub si_addr: u64,
+    pub interrupted_pc: Option<u64>,
+}
+
+impl From<crate::kernel::objects::PtraceSynchronousFault> for FaultSignal {
+    fn from(fault: crate::kernel::objects::PtraceSynchronousFault) -> Self {
+        Self {
+            signum: fault.signal.raw(),
+            si_code: fault.si_code,
+            si_addr: fault.si_addr,
+            interrupted_pc: fault.interrupted_pc,
+        }
+    }
+}
+
 /// Apply Linux's synchronous-fault signal rules to any syscall trap adapter.
 /// Backend-specific code resolves paging first, then calls this helper with the
 /// final signal triple and decides how to terminate its host process.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
     context: &crate::kernel::KernelContext,
     this_tid: ThreadId,
-    signum: i32,
-    si_code: i32,
-    si_addr: u64,
-    interrupted_pc: Option<u64>,
+    fault: FaultSignal,
 ) -> Result<FaultSignalDisposition, RuntimeError> {
-    crate::probes::signal_deliver(this_tid.raw(), signum);
-    if let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum)
+    crate::probes::signal_deliver(this_tid.raw(), fault.signum);
+    if let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(fault.signum)
         && crate::exec_helpers::stop_for_ptrace_fault(
             dispatcher,
             crate::kernel::objects::PtraceSynchronousFault {
                 signal,
-                si_code,
-                si_addr,
-                interrupted_pc,
+                si_code: fault.si_code,
+                si_addr: fault.si_addr,
+                interrupted_pc: fault.interrupted_pc,
             },
         )
     {
         return Ok(FaultSignalDisposition::Stopped);
     }
-    crate::exec_helpers::stop_for_debug_signal(signum);
+    crate::exec_helpers::stop_for_debug_signal(fault.signum);
 
-    let action = dispatcher.registered_signal_handler(context, signum);
-    if dispatcher.signal_blocked(context, this_tid, signum) || action.is_none() {
-        return Ok(FaultSignalDisposition::Terminate(signum));
+    let action = dispatcher.registered_signal_handler(context, fault.signum);
+    if dispatcher.signal_blocked(context, this_tid, fault.signum) || action.is_none() {
+        return Ok(FaultSignalDisposition::Terminate(fault.signum));
     }
     // INVARIANT: the `action.is_none()` arm above returned, so this is `Some`.
     #[allow(clippy::unwrap_used)]
@@ -223,17 +238,17 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
         None
     };
     let saved_sigmask = dispatcher
-        .enter_signal_handler(context, this_tid, signum, action)
+        .enter_signal_handler(context, this_tid, fault.signum, action)
         .raw();
     match trap.inject_signal(carrick_hal::SignalInjection {
-        signum,
+        signum: fault.signum,
         handler: action.sa_handler,
         sa_restorer: restorer,
         pending_syscall_retval: None,
-        interrupted_pc,
+        interrupted_pc: fault.interrupted_pc,
         altstack,
         saved_sigmask,
-        fault_siginfo: Some((si_code, si_addr)),
+        fault_siginfo: Some((fault.si_code, fault.si_addr)),
         queued_siginfo: None,
         restart_syscall: false,
     }) {
@@ -253,26 +268,22 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
 /// own saved PC. ISA-neutral: aarch64 lowers `EL0Fault` to this via
 /// [`lower_el0_fault`]; x86 backends emit `GuestFault` directly (CR2 →
 /// `fault_addr`).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     kernel: &Kernel,
     context: &crate::kernel::KernelContext,
     engine: &mut E,
     this_tid: ThreadId,
     fatal_image_generation: u64,
-    mut signum: i32,
-    mut si_code: i32,
-    si_addr: u64,
-    interrupted_pc: Option<u64>,
+    mut fault: FaultSignal,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     let dispatcher = &kernel.dispatcher;
     const SIGSEGV: i32 = 11;
     const SIGBUS: i32 = 7;
     const BUS_ADRERR: i32 = 2;
-    if signum == SIGSEGV && dispatcher.mmap_fault_is_sigbus(si_addr) {
-        signum = SIGBUS;
-        si_code = BUS_ADRERR;
+    if fault.signum == SIGSEGV && dispatcher.mmap_fault_is_sigbus(fault.si_addr) {
+        fault.signum = SIGBUS;
+        fault.si_code = BUS_ADRERR;
     }
     // Capture the forked-child flag up front so the `terminate` closure does not
     // borrow `engine` — it is now also called in the inject-failure arm below,
@@ -289,23 +300,14 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
             image_generation: fatal_image_generation,
             tid: context.thread().key().tid,
             signo: signum,
-            code: si_code,
-            addr: si_addr,
+            code: fault.si_code,
+            addr: fault.si_addr,
         });
         let result = assemble_run_result(kernel, 128 + signum, Some(signum), traps, false);
         Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))))
     };
 
-    match inject_fault_signal(
-        engine,
-        dispatcher,
-        context,
-        this_tid,
-        signum,
-        si_code,
-        si_addr,
-        interrupted_pc,
-    )? {
+    match inject_fault_signal(engine, dispatcher, context, this_tid, fault)? {
         FaultSignalDisposition::Stopped => Ok(None),
         FaultSignalDisposition::Injected => Ok(None),
         FaultSignalDisposition::Terminate(signum) => terminate(signum),
@@ -503,8 +505,13 @@ pub(crate) fn signal_progress_is_zero_for_executor_boundary() -> bool {
     SIGNAL_PROGRESS.with(|progress| progress.get() == 0)
 }
 
-/// Drain whatever signal is sitting in the host pending slot and dispatch it to
-/// the guest. Returns `Ok(None)` when nothing was pending.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SignalRestartContext {
+    pub last_syscall_retval: Option<i64>,
+    pub interrupted_pc: Option<u64>,
+    pub continuation_restart: Option<bool>,
+}
+
 pub(crate) fn deliver_pending_signal<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
@@ -520,10 +527,12 @@ where
         trap,
         dispatcher,
         context,
-        last_syscall_retval,
+        SignalRestartContext {
+            last_syscall_retval,
+            interrupted_pc,
+            continuation_restart: None,
+        },
         tid,
-        interrupted_pc,
-        None,
     )
 }
 
@@ -531,35 +540,21 @@ pub(crate) fn deliver_pending_signal_with_restart<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
     context: &crate::kernel::KernelContext,
-    last_syscall_retval: Option<i64>,
+    restart: SignalRestartContext,
     tid: ThreadId,
-    interrupted_pc: Option<u64>,
-    continuation_restart: Option<bool>,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
 where
     T: SyscallTrap,
 {
-    deliver_signal_with_restart(
-        trap,
-        dispatcher,
-        context,
-        last_syscall_retval,
-        tid,
-        interrupted_pc,
-        continuation_restart,
-        None,
-    )
+    deliver_signal_with_restart(trap, dispatcher, context, restart, tid, None)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver_reserved_signal_with_restart<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
     context: &crate::kernel::KernelContext,
-    last_syscall_retval: Option<i64>,
+    restart: SignalRestartContext,
     tid: ThreadId,
-    interrupted_pc: Option<u64>,
-    continuation_restart: Option<bool>,
     reserved: crate::vcpu_loop::continuation::ReservedSignal,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
 where
@@ -575,36 +570,30 @@ where
         action.sa_handler != carrick_abi::LINUX_SIG_DFL
             && action.sa_handler != carrick_abi::LINUX_SIG_IGN
     };
-    let result = deliver_signal_with_restart(
-        trap,
-        dispatcher,
-        context,
-        last_syscall_retval,
-        tid,
-        interrupted_pc,
-        continuation_restart,
-        Some(&reserved),
-    );
+    let result =
+        deliver_signal_with_restart(trap, dispatcher, context, restart, tid, Some(&reserved));
     if !caught {
         reserved.restore_persistent_after_default_action();
     }
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn deliver_signal_with_restart<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
     context: &crate::kernel::KernelContext,
-    last_syscall_retval: Option<i64>,
+    restart: SignalRestartContext,
     tid: ThreadId,
-    interrupted_pc: Option<u64>,
-    continuation_restart: Option<bool>,
     reserved: Option<&crate::vcpu_loop::continuation::ReservedSignal>,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
 where
     T: SyscallTrap,
 {
+    let SignalRestartContext {
+        last_syscall_retval,
+        interrupted_pc,
+        continuation_restart,
+    } = restart;
     // Drain the cross-process explicit-signal ring into pending state, so the
     // normal delivery below runs each with the sender's identity.
     if reserved.is_none() {
@@ -917,10 +906,12 @@ mod tests {
             &mut trap,
             &dispatcher,
             &context,
-            Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+            SignalRestartContext {
+                last_syscall_retval: Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+                interrupted_pc: None,
+                continuation_restart: Some(true),
+            },
             ThreadId::synthetic_for_tests(context.thread().key().tid.raw()),
-            None,
-            Some(true),
             reserved,
         )
         .expect("reserved delivery")
@@ -974,10 +965,12 @@ mod tests {
                 &mut NoopTrap::default(),
                 &dispatcher,
                 &context,
-                Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+                SignalRestartContext {
+                    last_syscall_retval: Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+                    interrupted_pc: None,
+                    continuation_restart: Some(false),
+                },
                 ThreadId::synthetic_for_tests(pid),
-                None,
-                Some(false),
                 reserved,
             )
             .expect("reserved default delivery")
@@ -1020,10 +1013,12 @@ mod tests {
             &mut NoopTrap::default(),
             &dispatcher,
             &context,
-            Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+            SignalRestartContext {
+                last_syscall_retval: Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+                interrupted_pc: None,
+                continuation_restart: Some(false),
+            },
             ThreadId::synthetic_for_tests(context.thread().key().tid.raw()),
-            None,
-            Some(false),
             reserved,
         )
         .expect("reserved default delivery")
@@ -1094,10 +1089,12 @@ mod tests {
                 &dispatcher,
                 &context,
                 tid,
-                crate::linux_abi::LINUX_SIGSEGV,
-                2,
-                0xfeed_0000,
-                Some(0x4000),
+                FaultSignal {
+                    signum: crate::linux_abi::LINUX_SIGSEGV,
+                    si_code: 2,
+                    si_addr: 0xfeed_0000,
+                    interrupted_pc: Some(0x4000),
+                },
             );
             let stopped_before_delivery =
                 matches!(disposition, Ok(FaultSignalDisposition::Stopped));
@@ -1145,10 +1142,12 @@ mod tests {
                 &dispatcher,
                 &context,
                 tid,
-                crate::linux_abi::LINUX_SIGSEGV,
-                2,
-                0xfeed_4000,
-                Some(0x4000_1234),
+                FaultSignal {
+                    signum: crate::linux_abi::LINUX_SIGSEGV,
+                    si_code: 2,
+                    si_addr: 0xfeed_4000,
+                    interrupted_pc: Some(0x4000_1234),
+                },
             ),
             Ok(FaultSignalDisposition::Injected)
         ));
@@ -1165,10 +1164,12 @@ mod tests {
                 &dispatcher,
                 &context,
                 tid,
-                crate::linux_abi::LINUX_SIGSEGV,
-                2,
-                0xfeed_4000,
-                Some(0x4000_1234),
+                FaultSignal {
+                    signum: crate::linux_abi::LINUX_SIGSEGV,
+                    si_code: 2,
+                    si_addr: 0xfeed_4000,
+                    interrupted_pc: Some(0x4000_1234),
+                },
             ),
             Ok(FaultSignalDisposition::Terminate(
                 crate::linux_abi::LINUX_SIGSEGV
@@ -1187,10 +1188,12 @@ mod tests {
                 &dispatcher,
                 &context,
                 tid,
-                crate::linux_abi::LINUX_SIGSEGV,
-                2,
-                0xfeed_4000,
-                Some(0x4000_1234),
+                FaultSignal {
+                    signum: crate::linux_abi::LINUX_SIGSEGV,
+                    si_code: 2,
+                    si_addr: 0xfeed_4000,
+                    interrupted_pc: Some(0x4000_1234),
+                },
             ),
             Ok(FaultSignalDisposition::Terminate(
                 crate::linux_abi::LINUX_SIGSEGV
@@ -1291,10 +1294,12 @@ mod tests {
                 &mut trap,
                 &dispatcher,
                 &context,
-                Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+                SignalRestartContext {
+                    last_syscall_retval: Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+                    interrupted_pc: None,
+                    continuation_restart: Some(expected),
+                },
                 tid,
-                None,
-                Some(expected),
             )
             .expect("handler injection")
             .expect("pending handler");

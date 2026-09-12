@@ -410,7 +410,7 @@ pub(crate) use signal::is_default_ignore_signal;
 #[cfg(test)]
 pub(crate) use signal::upgrade_protection_si_code;
 use signal::{
-    deliver_fault_signal, deliver_pending_signal_with_restart,
+    SignalRestartContext, deliver_fault_signal, deliver_pending_signal_with_restart,
     deliver_reserved_signal_with_restart, lower_el0_fault,
 };
 pub(crate) use signal::{
@@ -2135,25 +2135,26 @@ pub(super) fn service_signals_threaded<E: ThreadedEngine>(
     {
         let restart =
             continuation_restart.map(|decision| decision == continuation::RestartDecision::Restart);
+        let restart_ctx = SignalRestartContext {
+            last_syscall_retval,
+            interrupted_pc,
+            continuation_restart: restart,
+        };
         let action = match reserved_signal {
             Some(reserved) => deliver_reserved_signal_with_restart(
                 engine,
                 &kernel.dispatcher,
                 context,
-                last_syscall_retval,
+                restart_ctx,
                 this_tid,
-                interrupted_pc,
-                restart,
                 reserved,
             )?,
             None => deliver_pending_signal_with_restart(
                 engine,
                 &kernel.dispatcher,
                 context,
-                last_syscall_retval,
+                restart_ctx,
                 this_tid,
-                interrupted_pc,
-                restart,
             )?,
         };
         if let Some(action) = action {
