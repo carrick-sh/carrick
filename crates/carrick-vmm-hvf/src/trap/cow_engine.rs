@@ -2655,9 +2655,13 @@ impl HvfTaskState {
                     );
                 }
             }
-            self.mappings.retain(|mapping| {
-                !mapped_region_matches_retired_inventory_extent(mapping, split.old.into())
-            });
+            self.mappings.remove_rows_matching_in_ranges(
+                &[MappingExtent::Ipa(
+                    split.old.stage2_base,
+                    split.old.stage2_length,
+                )],
+                |mapping| mapped_region_matches_retired_inventory_extent(mapping, split.old.into()),
+            );
         }
         let Some(cow_extent) = std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE) else {
             carrick_fatal!(
@@ -4406,9 +4410,10 @@ impl HvfVmState {
                     alias,
                 );
             }
-            self.mappings.retain(|mapping| {
-                !mapped_region_matches_retired_inventory_extent(mapping, retired[0])
-            });
+            self.mappings
+                .remove_rows_matching_in_ranges(&[MappingExtent::Ipa(ipa, length)], |mapping| {
+                    mapped_region_matches_retired_inventory_extent(mapping, retired[0])
+                });
         }
         self.split_local_rows_for_unmap(va, len);
         let mut armed = self.cow_armed.lock();
