@@ -515,3 +515,18 @@ commits and is re-checked at the next vet.
   trace before any fix; the probe spins a sibling vCPU with no syscalls
   while the main thread mprotects/munmaps, i.e. exactly the per-mm pause
   path Task 4 touched.
+- REGRESSION found by the sep12 measurement block: on every binary from
+  the Task 4 landing (5149bba88) onward, `python3 -m test
+  test_multiprocessing_main_handling` on the `--fs host` cpython image
+  wedges at interpreter startup — the per-task syscall-flow trace shows
+  pid 1 parked in `openat` (nr 56, AT_FDCWD, O_CLOEXEC) after 2,557 completed
+  syscalls; the event ring holds only pid 1's fd churn (no fork yet); all 18
+  executors idle in `RunQueue::take`; the kernel debug server times out.
+  Core: `target/perf/perf2x-sep12/mp-wedge-14703.core` (+ `mp-wedge-bt.txt`,
+  `mp-wedge-ring.txt`, `mp-wedge-flow.out`). Trivial guests (`python3 -c`,
+  `/bin/sh -c echo`) and every probe lane pass on the same binary; the
+  pre-cluster control binary (3c8dbee5b686c49d, 541a575ff) runs the row in
+  7 s. Bisect in progress between 541a575ff and 5149bba88 with signed
+  builds, filesystem landings (hostfs-amplification fe9ceb4d6, fs_backend
+  split 32d32d44a) first. The sep12 measurement block is void until this is
+  fixed; the stall watch's guest threshold is being lowered to 10 minutes.
