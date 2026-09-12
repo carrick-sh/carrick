@@ -2632,7 +2632,7 @@ pub(crate) mod tests {
     ) -> RealProductionCowFixture {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::{
             FixtureShape, InitialInventoryIdentity, ProductionCarrierForeignCowCustody,
-            ProductionCarrierForeignCowHarness, TEST_VA,
+            ProductionCarrierForeignCowHarness, ProductionCarrierForeignCowInstallArgs, TEST_VA,
         };
 
         let (_stage1_pool, stage1) =
@@ -2687,17 +2687,19 @@ pub(crate) mod tests {
         let carrier = ProductionCarrierForeignCowHarness::install(
             carrier_custody,
             &projected,
-            shape,
-            InitialInventoryIdentity {
-                root_mapping,
-                root_frame,
-                data_mapping,
-                data_frame,
+            ProductionCarrierForeignCowInstallArgs {
+                shape,
+                inventory: InitialInventoryIdentity {
+                    root_mapping,
+                    root_frame,
+                    data_mapping,
+                    data_frame,
+                },
+                authority,
+                identity,
+                ordinal: registry_id as u64,
+                initial_bytes: *b"same",
             },
-            authority,
-            identity,
-            registry_id as u64,
-            *b"same",
         )
         .expect("install production carrier foreign COW transport");
         child

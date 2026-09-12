@@ -1225,18 +1225,27 @@ pub(crate) fn attest_foreign_identity_write_receipt(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct ForeignWriteRequest {
+    pub va: carrick_guest_mem::GuestVa,
+    pub len: usize,
+    pub deadline: std::time::Instant,
+    pub deferred: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
+}
+
 pub(crate) fn materialize_foreign_pristine_write(
     lease: &CarrierForeignMmReadLease,
     lease_guard: &mut CarrierLeaseState,
     invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
     invocation: &carrick_hal::ForeignMmInvocation,
     requested: &CarrierForeignMmSnapshot,
-    va: carrick_guest_mem::GuestVa,
-    len: usize,
-    deadline: std::time::Instant,
-    deferred: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
+    request: ForeignWriteRequest,
 ) -> Result<CarrierForeignCowReceipt, carrick_hal::ForeignMmTransportError> {
+    let ForeignWriteRequest {
+        va,
+        len,
+        deadline,
+        deferred,
+    } = request;
     const PAGE: usize = 4096;
     let start = va.raw() & !(PAGE as u64 - 1);
     let end = start
@@ -1337,18 +1346,20 @@ pub(crate) fn materialize_foreign_pristine_write(
     Ok(receipt)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize_foreign_private_file_write(
     lease: &CarrierForeignMmReadLease,
     lease_guard: &mut CarrierLeaseState,
     invalidator: &mut dyn carrick_hal::ForeignMmInvalidator,
     invocation: &carrick_hal::ForeignMmInvocation,
     requested: &CarrierForeignMmSnapshot,
-    va: carrick_guest_mem::GuestVa,
-    len: usize,
-    deadline: std::time::Instant,
-    deferred: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
+    request: ForeignWriteRequest,
 ) -> Result<CarrierForeignCowReceipt, carrick_hal::ForeignMmTransportError> {
+    let ForeignWriteRequest {
+        va,
+        len,
+        deadline,
+        deferred,
+    } = request;
     const PAGE: usize = 4096;
     let start = va.raw() & !(PAGE as u64 - 1);
     let end = start
@@ -1518,10 +1529,12 @@ pub(crate) fn perform_foreign_cow_transaction(
                         invalidator,
                         invocation,
                         requested,
-                        va,
-                        len,
-                        deadline,
-                        std::sync::Arc::clone(deferred),
+                        ForeignWriteRequest {
+                            va,
+                            len,
+                            deadline,
+                            deferred: std::sync::Arc::clone(deferred),
+                        },
                     );
                 }
                 if let Some(deferred) = deferred.as_ref()
@@ -1533,10 +1546,12 @@ pub(crate) fn perform_foreign_cow_transaction(
                         invalidator,
                         invocation,
                         requested,
-                        va,
-                        len,
-                        deadline,
-                        std::sync::Arc::clone(deferred),
+                        ForeignWriteRequest {
+                            va,
+                            len,
+                            deadline,
+                            deferred: std::sync::Arc::clone(deferred),
+                        },
                     );
                 }
                 // Not COW-armed: the page is already PRIVATE to this mm — one
@@ -2708,6 +2723,15 @@ pub mod foreign_cow_test_support {
         }
     }
 
+    pub struct ProductionCarrierForeignCowInstallArgs {
+        pub shape: FixtureShape,
+        pub inventory: InitialInventoryIdentity,
+        pub authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        pub identity: carrick_hal::FrameCowIdentity,
+        pub ordinal: u64,
+        pub initial_bytes: [u8; 4],
+    }
+
     pub struct ProductionCarrierForeignCowHarness {
         transport: CarrierForeignMmTransport,
         state: std::sync::Arc<MmAccessState>,
@@ -2715,17 +2739,19 @@ pub mod foreign_cow_test_support {
     }
 
     impl ProductionCarrierForeignCowHarness {
-        #[allow(clippy::too_many_arguments)]
         pub fn install(
             custody: ProductionCarrierForeignCowCustody,
             snapshot: &dyn carrick_hal::ForeignMmSnapshot,
-            shape: FixtureShape,
-            inventory: InitialInventoryIdentity,
-            authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
-            identity: carrick_hal::FrameCowIdentity,
-            ordinal: u64,
-            initial_bytes: [u8; 4],
+            args: ProductionCarrierForeignCowInstallArgs,
         ) -> Result<Self, String> {
+            let ProductionCarrierForeignCowInstallArgs {
+                shape,
+                inventory,
+                authority,
+                identity,
+                ordinal,
+                initial_bytes,
+            } = args;
             if snapshot.binding().stage1_root() != shape.stage1_root
                 || snapshot.mapping_ids().len() != 2
                 || !snapshot.mapping_ids().contains(&inventory.root_mapping)
