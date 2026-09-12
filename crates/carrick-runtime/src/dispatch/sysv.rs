@@ -855,6 +855,16 @@ impl Default for SysvProcessAttachments {
     }
 }
 
+struct MsgReceiveRequest<'a> {
+    id: MsgQueueId,
+    creds: &'a crate::kernel::Credentials,
+    msgp: u64,
+    msgsz: usize,
+    wanted: MsgType,
+    flags: MsgOpFlags,
+    operator: i32,
+}
+
 struct SysvIpcService;
 
 impl SysvIpcService {
@@ -886,18 +896,11 @@ impl SysvIpcService {
         msg_queue_try_send(id, creds, msg_type, payload, operator)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn msgrcv<M: CurrentMmMemory>(
         cx: &mut SyscallCtx<M>,
-        id: MsgQueueId,
-        creds: &crate::kernel::Credentials,
-        msgp: u64,
-        msgsz: usize,
-        wanted: MsgType,
-        flags: MsgOpFlags,
-        operator: i32,
+        req: MsgReceiveRequest<'_>,
     ) -> Result<Option<usize>, LinuxErrno> {
-        msg_queue_receive(cx, id, creds, msgp, msgsz, wanted, flags, operator)
+        msg_queue_receive(cx, req)
     }
 
     fn msgctl<M: CurrentMmMemory>(
@@ -1309,9 +1312,7 @@ fn write_all_at_fd(fd: i32, buf: &[u8], offset: libc::off_t) -> Result<(), Linux
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_msg_queue_progress(
-    fd: i32,
+struct MsgQueueProgress {
     cbytes: u64,
     qnum: u64,
     stime: u64,
@@ -1320,16 +1321,22 @@ fn write_msg_queue_progress(
     lspid: i32,
     lrpid: i32,
     head: usize,
-) -> Result<(), LinuxErrno> {
+}
+
+fn write_msg_queue_progress(fd: i32, progress: MsgQueueProgress) -> Result<(), LinuxErrno> {
     let mut buf = [0u8; MSG_OFF_HEAD + 8 - MSG_OFF_CBYTES];
-    wr_u64(&mut buf, 0, cbytes);
-    wr_u64(&mut buf, MSG_OFF_QNUM - MSG_OFF_CBYTES, qnum);
-    wr_u64(&mut buf, MSG_OFF_STIME - MSG_OFF_CBYTES, stime);
-    wr_u64(&mut buf, MSG_OFF_RTIME - MSG_OFF_CBYTES, rtime);
-    wr_u64(&mut buf, MSG_OFF_CTIME - MSG_OFF_CBYTES, ctime);
-    wr_i32(&mut buf, MSG_OFF_LSPID - MSG_OFF_CBYTES, lspid);
-    wr_i32(&mut buf, MSG_OFF_LRPID - MSG_OFF_CBYTES, lrpid);
-    wr_u64(&mut buf, MSG_OFF_HEAD - MSG_OFF_CBYTES, head as u64);
+    wr_u64(&mut buf, 0, progress.cbytes);
+    wr_u64(&mut buf, MSG_OFF_QNUM - MSG_OFF_CBYTES, progress.qnum);
+    wr_u64(&mut buf, MSG_OFF_STIME - MSG_OFF_CBYTES, progress.stime);
+    wr_u64(&mut buf, MSG_OFF_RTIME - MSG_OFF_CBYTES, progress.rtime);
+    wr_u64(&mut buf, MSG_OFF_CTIME - MSG_OFF_CBYTES, progress.ctime);
+    wr_i32(&mut buf, MSG_OFF_LSPID - MSG_OFF_CBYTES, progress.lspid);
+    wr_i32(&mut buf, MSG_OFF_LRPID - MSG_OFF_CBYTES, progress.lrpid);
+    wr_u64(
+        &mut buf,
+        MSG_OFF_HEAD - MSG_OFF_CBYTES,
+        progress.head as u64,
+    );
     write_all_at_fd(fd, &buf, MSG_OFF_CBYTES as libc::off_t)
 }
 
@@ -1683,17 +1690,19 @@ impl MsgQueueLock {
         write_all_at_fd(self.fd, &rec, append_offset as libc::off_t)?;
         write_msg_queue_progress(
             self.fd,
-            queue.cbytes.saturating_add(payload.len() as u64),
-            queue.qnum.saturating_add(1),
-            unix_now_secs(),
-            queue.rtime,
-            queue.ctime,
-            operator,
-            queue.lrpid,
-            if queue.qnum == 0 {
-                MSG_QUEUE_HEADER_SIZE
-            } else {
-                head
+            MsgQueueProgress {
+                cbytes: queue.cbytes.saturating_add(payload.len() as u64),
+                qnum: queue.qnum.saturating_add(1),
+                stime: unix_now_secs(),
+                rtime: queue.rtime,
+                ctime: queue.ctime,
+                lspid: operator,
+                lrpid: queue.lrpid,
+                head: if queue.qnum == 0 {
+                    MSG_QUEUE_HEADER_SIZE
+                } else {
+                    head
+                },
             },
         )
     }
@@ -1734,26 +1743,30 @@ impl MsgQueueLock {
                 .host_syscall_errno()?;
             write_msg_queue_progress(
                 self.fd,
-                next_cbytes,
-                next_qnum,
-                queue.stime,
-                unix_now_secs(),
-                queue.ctime,
-                queue.lspid,
-                operator,
-                MSG_QUEUE_HEADER_SIZE,
+                MsgQueueProgress {
+                    cbytes: next_cbytes,
+                    qnum: next_qnum,
+                    stime: queue.stime,
+                    rtime: unix_now_secs(),
+                    ctime: queue.ctime,
+                    lspid: queue.lspid,
+                    lrpid: operator,
+                    head: MSG_QUEUE_HEADER_SIZE,
+                },
             )?;
         } else {
             write_msg_queue_progress(
                 self.fd,
-                next_cbytes,
-                next_qnum,
-                queue.stime,
-                unix_now_secs(),
-                queue.ctime,
-                queue.lspid,
-                operator,
-                next_head,
+                MsgQueueProgress {
+                    cbytes: next_cbytes,
+                    qnum: next_qnum,
+                    stime: queue.stime,
+                    rtime: unix_now_secs(),
+                    ctime: queue.ctime,
+                    lspid: queue.lspid,
+                    lrpid: operator,
+                    head: next_head,
+                },
             )?;
         }
         if next_qnum > 0 && next_head >= MSG_QUEUE_COMPACT_HEAD_THRESHOLD {
@@ -3033,7 +3046,18 @@ impl<'a> IpcView<'a> {
                 });
             let mut saw_would_block = false;
             loop {
-                match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator) {
+                match SysvIpcService::msgrcv(
+                    cx,
+                    MsgReceiveRequest {
+                        id: msqid,
+                        creds: &creds,
+                        msgp: msgp.0,
+                        msgsz: sz,
+                        wanted: msgtyp,
+                        flags,
+                        operator,
+                    },
+                ) {
                     Ok(Some(received)) => {
                         return Ok(DispatchOutcome::returned_len(received)?);
                     }
@@ -3046,8 +3070,18 @@ impl<'a> IpcView<'a> {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         if let Ok(token) = SysvWaitState::for_queue(msqid) {
-                            match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator)
-                            {
+                            match SysvIpcService::msgrcv(
+                                cx,
+                                MsgReceiveRequest {
+                                    id: msqid,
+                                    creds: &creds,
+                                    msgp: msgp.0,
+                                    msgsz: sz,
+                                    wanted: msgtyp,
+                                    flags,
+                                    operator,
+                                },
+                            ) {
                                 Ok(Some(received)) => {
                                     return Ok(DispatchOutcome::returned_len(received)?);
                                 }
@@ -3504,17 +3538,19 @@ fn selected_msg_index(messages: &[MsgRecord], wanted: MsgType, flags: MsgOpFlags
     best.map(|(idx, _)| idx)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn msg_queue_receive<M: CurrentMmMemory>(
     cx: &mut SyscallCtx<M>,
-    id: MsgQueueId,
-    creds: &crate::kernel::Credentials,
-    msgp: u64,
-    msgsz: usize,
-    wanted: MsgType,
-    flags: MsgOpFlags,
-    operator: i32,
+    req: MsgReceiveRequest<'_>,
 ) -> Result<Option<usize>, LinuxErrno> {
+    let MsgReceiveRequest {
+        id,
+        creds,
+        msgp,
+        msgsz,
+        wanted,
+        flags,
+        operator,
+    } = req;
     let path = lookup_msg_queue_path(id)?;
     let lock = MsgQueueLock::acquire_cached(&path)?;
     let (queue_header, head, _) = lock.read_header()?;
