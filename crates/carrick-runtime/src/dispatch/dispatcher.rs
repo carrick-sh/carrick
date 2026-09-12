@@ -130,6 +130,15 @@ impl Default for SyscallDispatcher {
     }
 }
 
+struct ForkCloneObservedArgs<'a> {
+    observed_parent_mm_id: crate::kernel::MmId,
+    observed_child_mm_id: crate::kernel::MmId,
+    parent_guest_pid: u32,
+    child_guest_pid: u32,
+    prepared_mm: PreparedDispatchMmFork,
+    permit: &'a mm_mutation::HostAliasPermit<'a>,
+}
+
 impl SyscallDispatcher {
     pub fn new() -> Self {
         Self::new_with_host_resolver(None)
@@ -429,12 +438,14 @@ impl SyscallDispatcher {
         permit: &mm_mutation::HostAliasPermit<'_>,
     ) -> Result<Self, crate::kernel::SnapshotError> {
         self.fork_clone_with_prepared_mm_authorized_observed(
-            observed_parent_mm_id,
-            observed_child_mm_id,
-            parent_guest_pid,
-            child_guest_pid,
-            prepared_mm,
-            permit,
+            ForkCloneObservedArgs {
+                observed_parent_mm_id,
+                observed_child_mm_id,
+                parent_guest_pid,
+                child_guest_pid,
+                prepared_mm,
+                permit,
+            },
             |_| {},
         )
     }
@@ -460,17 +471,19 @@ impl SyscallDispatcher {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn fork_clone_with_prepared_mm_authorized_observed(
         &self,
-        observed_parent_mm_id: crate::kernel::MmId,
-        observed_child_mm_id: crate::kernel::MmId,
-        parent_guest_pid: u32,
-        child_guest_pid: u32,
-        prepared_mm: PreparedDispatchMmFork,
-        permit: &mm_mutation::HostAliasPermit<'_>,
+        args: ForkCloneObservedArgs<'_>,
         mut observe_install: impl FnMut(bool),
     ) -> Result<Self, crate::kernel::SnapshotError> {
+        let ForkCloneObservedArgs {
+            observed_parent_mm_id,
+            observed_child_mm_id,
+            parent_guest_pid,
+            child_guest_pid,
+            prepared_mm,
+            permit,
+        } = args;
         if observed_parent_mm_id != prepared_mm.parent_mm_id
             || observed_child_mm_id != prepared_mm.child_mm_id
         {
@@ -531,12 +544,14 @@ impl SyscallDispatcher {
     ) -> Result<Self, crate::kernel::SnapshotError> {
         mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
             self.fork_clone_with_prepared_mm_authorized_observed(
-                observed_parent_mm_id,
-                observed_child_mm_id,
-                parent_guest_pid,
-                child_guest_pid,
-                prepared_mm,
-                permit,
+                ForkCloneObservedArgs {
+                    observed_parent_mm_id,
+                    observed_child_mm_id,
+                    parent_guest_pid,
+                    child_guest_pid,
+                    prepared_mm,
+                    permit,
+                },
                 observe_install,
             )
         })
