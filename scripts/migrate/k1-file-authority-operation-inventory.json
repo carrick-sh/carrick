@@ -17427,7 +17427,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 445,
+      "line": 446,
       "categories": [
         "mapping"
       ],
@@ -17436,7 +17436,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 2053,
+      "line": 2054,
       "categories": [
         "epoll"
       ],
@@ -17445,7 +17445,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 2063,
+      "line": 2064,
       "categories": [
         "epoll"
       ],
@@ -17454,7 +17454,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 2069,
+      "line": 2070,
       "categories": [
         "epoll"
       ],
@@ -17463,7 +17463,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 2088,
+      "line": 2089,
       "categories": [
         "epoll"
       ],
@@ -17472,7 +17472,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5459,
+      "line": 5460,
       "categories": [
         "epoll"
       ],
@@ -17481,7 +17481,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5487,
+      "line": 5488,
       "categories": [
         "epoll"
       ],
@@ -17490,7 +17490,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5527,
+      "line": 5528,
       "categories": [
         "epoll"
       ],
@@ -17499,7 +17499,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5534,
+      "line": 5535,
       "categories": [
         "epoll"
       ],
@@ -17508,7 +17508,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5539,
+      "line": 5540,
       "categories": [
         "epoll"
       ],
@@ -17517,7 +17517,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5543,
+      "line": 5544,
       "categories": [
         "epoll"
       ],
@@ -17526,7 +17526,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5589,
+      "line": 5590,
       "categories": [
         "epoll"
       ],
@@ -17535,7 +17535,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 5591,
+      "line": 5592,
       "categories": [
         "epoll"
       ],
@@ -17544,7 +17544,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6005,
+      "line": 6006,
       "categories": [
         "epoll"
       ],
@@ -17553,7 +17553,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6018,
+      "line": 6019,
       "categories": [
         "epoll"
       ],
@@ -17562,7 +17562,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6025,
+      "line": 6026,
       "categories": [
         "epoll"
       ],
@@ -17571,7 +17571,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6030,
+      "line": 6031,
       "categories": [
         "epoll"
       ],
@@ -17580,7 +17580,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6034,
+      "line": 6035,
       "categories": [
         "epoll"
       ],
@@ -17589,7 +17589,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6081,
+      "line": 6082,
       "categories": [
         "epoll"
       ],
@@ -17598,7 +17598,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
-      "line": 6084,
+      "line": 6085,
       "categories": [
         "epoll"
       ],
