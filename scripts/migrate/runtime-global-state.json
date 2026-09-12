@@ -1458,22 +1458,6 @@
       "rationale": "OnceLock cache of the CARRICK_MAX_WALL_MS trap-watchdog wall window in trap_watchdog_wall_window (crates/carrick-runtime/src/vcpu_loop/binding.rs); carrier-wide configuration read once."
     },
     {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "symbol": "tests::event_future_cancelled_observation_drains_inflight_operation_safely::CHILD_MARKER",
-      "fingerprint": "2fc33e88ecfb6489095a7a8292084be2bee3e9e18881e727efb05342750f7c9a",
-      "classification": "test_only",
-      "rationale": "Read only by the cfg(test) bounded self-spawn regression to select its exact owned child body; the parent kills and reaps that child on a failed deadline."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "symbol": "tests::lock_ordering_opposing_locks_rendezvous_completes_without_deadlock::CHILD_MARKER",
-      "fingerprint": "2fc33e88ecfb6489095a7a8292084be2bee3e9e18881e727efb05342750f7c9a",
-      "classification": "test_only",
-      "rationale": "Read only by the cfg(test) bounded self-spawn regression to select its exact owned child body; the parent kills and reaps that child on a failed deadline."
-    },
-    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "symbol": "NEXT_CONTINUATION_ID",
@@ -1499,27 +1483,43 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "symbol": "tests::incoming_drain_waker_clone_runs_outside_registration_locks::VTABLE",
-      "fingerprint": "0eafa4b75689653182cfb4e78b2bb94eef95e2eba05242d45a43658f7f58bbeb",
-      "classification": "test_only",
-      "rationale": "Immutable RawWakerVTable in a cfg(test) callback-lock regression; carries no mutable process or guest state."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "symbol": "tests::incoming_task_waker_clone_runs_outside_registration_locks::VTABLE",
-      "fingerprint": "0eafa4b75689653182cfb4e78b2bb94eef95e2eba05242d45a43658f7f58bbeb",
-      "classification": "test_only",
-      "rationale": "Immutable RawWakerVTable in a cfg(test) callback-lock regression; carries no mutable process or guest state."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs",
       "symbol": "NEXT_RUNNER_JOB_ID",
       "fingerprint": "fec5516a1c3b36f64558f4b6f2e518a7079351a7f20371dd20f558d9dda99d7e",
       "classification": "monotonic_allocator",
       "rationale": "Carrier-wide monotonic allocator NEXT_RUNNER_JOB_ID in crates/carrick-runtime/src/vcpu_loop/continuation.rs generating unique IDs across the host process."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "symbol": "event_future_cancelled_observation_drains_inflight_operation_safely::CHILD_MARKER",
+      "fingerprint": "f2196b97922c18c843b5e8b263cc01e6548e67f5c5949e88399767be84c1d622",
+      "classification": "test_only",
+      "rationale": "Read only by the cfg(test) bounded self-spawn regression to select its exact owned child body; the parent kills and reaps that child on a failed deadline."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "symbol": "lock_ordering_opposing_locks_rendezvous_completes_without_deadlock::CHILD_MARKER",
+      "fingerprint": "f2196b97922c18c843b5e8b263cc01e6548e67f5c5949e88399767be84c1d622",
+      "classification": "test_only",
+      "rationale": "Read only by the cfg(test) bounded self-spawn regression to select its exact owned child body; the parent kills and reaps that child on a failed deadline."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "symbol": "incoming_drain_waker_clone_runs_outside_registration_locks::VTABLE",
+      "fingerprint": "01d31cdf861fb3951fb83b9ba4cc3267501e131b3b379559f0f60ddfe5f40a54",
+      "classification": "test_only",
+      "rationale": "Immutable RawWakerVTable in a cfg(test) callback-lock regression; carries no mutable process or guest state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "symbol": "incoming_task_waker_clone_runs_outside_registration_locks::VTABLE",
+      "fingerprint": "01d31cdf861fb3951fb83b9ba4cc3267501e131b3b379559f0f60ddfe5f40a54",
+      "classification": "test_only",
+      "rationale": "Immutable RawWakerVTable in a cfg(test) callback-lock regression; carries no mutable process or guest state."
     },
     {
       "kind": "env_var_os",
