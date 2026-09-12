@@ -1243,19 +1243,19 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/signal.rs",
       "symbol": "post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG",
       "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/kernel/operations.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/kernel/operations/signal.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/signal.rs",
       "symbol": "post_signal_to_task_key::CARRICK_SIG_DEBUG",
       "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_SIG_DEBUG read in post_signal_to_task_key::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/kernel/operations.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_SIG_DEBUG read in post_signal_to_task_key::CARRICK_SIG_DEBUG (crates/carrick-runtime/src/kernel/operations/signal.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
