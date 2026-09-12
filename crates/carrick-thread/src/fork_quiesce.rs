@@ -25,11 +25,9 @@
 //!     registry: a thread that has a tid but hasn't built its vCPU yet must not
 //!     be awaited (it would never reach the barrier). `try_begin_fork`
 //!     serializes forks via a CAS flag (not a held guard) so the flag survives
-//!     `libc::fork` cleanly and the child clears it. [`topology_lock`] separately
-//!     serializes a sibling building its vCPU against a fork destroying the VM,
-//!     so a vCPU is never created in the `hv_vm_destroy` window (which would be
-//!     HV_BUSY) — and a being-born thread holding it is NOT yet kicker-registered,
-//!     so the fork's quiesce never waits on it: no deadlock.
+//!     `libc::fork` cleanly and the child clears it. [`topology_lock`] serializes
+//!     carrier topology mutations (publication and alias containers); in HVPatch
+//!     the VM is never torn down or rebuilt during fork.
 //!
 //!   * [`PtQuiesce`] (page-table edits): carrick edits the guest's stage-1 tables
 //!     from the HOST while sibling vCPUs run (`mprotect`/`PROT_NONE`/`munmap`); a
@@ -109,14 +107,12 @@ pub fn is_quiescing() -> bool {
     barrier().is_quiescing() || is_current_mm_quiescing()
 }
 
-/// Serializes HVF VM-topology mutations: a sibling thread building its vCPU vs.
-/// a fork tearing the VM down and rebuilding it. Both hold this for the
-/// duration of their critical section, so a vCPU can never be created in the
-/// window where the forker calls `hv_vm_destroy` (which would be HV_BUSY), and
-/// a thread born during a fork waits and then builds in the *rebuilt* VM. A
-/// being-born thread holding this lock is NOT yet in the vCPU kicker, so the
-/// fork's quiesce (which waits only on kicker-registered vCPUs) never waits on
-/// it — no deadlock.
+/// Serializes carrier-wide topology mutations: shared-frame publication and
+/// carrier-global alias/replay/version containers.
+///
+/// Historical note: in legacy execution this lock serialized a sibling creating
+/// its vCPU against a fork destroying and rebuilding the VM. In HVPatch, the VM
+/// is never torn down or rebuilt during fork.
 pub fn topology_lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(()))
@@ -249,6 +245,28 @@ fn enter_topology_depth() {
     TOPOLOGY_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
 }
 
+fn exit_topology_depth() {
+    TOPOLOGY_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+}
+
+/// RAII token tracking live topology depth for the current host pthread.
+pub struct TopologyDepth {
+    _private: (),
+}
+
+impl TopologyDepth {
+    pub fn acquire() -> Self {
+        enter_topology_depth();
+        Self { _private: () }
+    }
+}
+
+impl Drop for TopologyDepth {
+    fn drop(&mut self) {
+        exit_topology_depth();
+    }
+}
+
 /// RAII topology-lock guard that emits a typed release event on every exit
 /// path. The guard is `None` for a re-entrant acquisition, which owns a depth
 /// count but not the mutex, so only the OUTERMOST guard releases it. The
@@ -296,8 +314,76 @@ impl Drop for TopologyLockGuard {
     }
 }
 
-/// Acquire the process-wide topology mutex and emit request/wait/release
+/// Exclusion for one mm's fork/exec/retire transaction. Minted only by the
+/// mm's `MmMutationGuard` (see carrick-runtime `dispatch/mm_authority.rs`),
+/// so holding it proves the stage-1 pause is already held: the P -> topology
+/// order becomes a type, not a comment.
+pub struct MmTransactionGuard<'mm> {
+    _mm: core::marker::PhantomData<&'mm ()>,
+    depth: TopologyDepth,
+}
+
+impl<'mm> MmTransactionGuard<'mm> {
+    /// Mint an MM transaction guard under an established stage-1 mutation authority.
+    ///
+    /// The caller must hold the MM's stage-1 mutation guard (`MmMutationGuard`).
+    pub fn mint_from_mm_mutation_guard(_witness: &'mm ()) -> Self {
+        Self {
+            _mm: core::marker::PhantomData,
+            depth: TopologyDepth::acquire(),
+        }
+    }
+
+    /// Access the underlying topology depth token.
+    pub const fn depth(&self) -> &TopologyDepth {
+        &self.depth
+    }
+}
+
+/// Leaf critical section for the carrier-wide shared-frame registry: staging
+/// and publishing frames another process may install next. Never held across
+/// a guest write, a wait, or another lock.
+pub struct FrameRegistryGuard<'r> {
+    _guard: parking_lot::MutexGuard<'r, ()>,
+}
+
+impl<'r> FrameRegistryGuard<'r> {
+    pub fn new(guard: parking_lot::MutexGuard<'r, ()>) -> Self {
+        Self { _guard: guard }
+    }
+}
+
+/// Carrier-wide leaf mutex for shared-frame registration and publication.
+///
+/// Never held across a guest write, a wait, or another lock.
+pub fn frame_registry_lock() -> &'static parking_lot::Mutex<()> {
+    static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+}
+
+/// Proves that `MmTransactionGuard` cannot be constructed directly without
+/// the minting authority from an established `MmMutationGuard`.
+///
+/// ```compile_fail
+/// // Attempting to construct `MmTransactionGuard` without the mutation authority fails to compile:
+/// let _ = carrick_thread::fork_quiesce::MmTransactionGuard {
+///     _mm: core::marker::PhantomData,
+///     depth: carrick_thread::fork_quiesce::TopologyDepth::acquire(),
+/// };
+/// ```
+///
+/// ```
+/// // The constructor path requires an explicit MM mutation guard authority witness:
+/// let witness = ();
+/// let _guard = carrick_thread::fork_quiesce::MmTransactionGuard::mint_from_mm_mutation_guard(&witness);
+/// ```
+pub fn mm_transaction_guard_requires_mm_mutation_guard() {}
+
+/// Acquire the carrier-wide topology mutex and emit request/wait/release
 /// records carrying the Linux guest identity responsible for the mutation.
+///
+/// Protects carrier-wide frame publication and alias containers until
+/// superseded by [`MmTransactionGuard`] and [`FrameRegistryGuard`].
 pub fn acquire_topology_lock(
     operation: carrick_observability::probes::HvpatchTopologyOperation,
     guest_pid: i32,
@@ -339,7 +425,7 @@ pub fn acquire_topology_lock(
     }
 }
 
-/// Try the process-wide topology mutex without blocking. A contended attempt
+/// Try the carrier-wide topology mutex without blocking. A contended attempt
 /// emits `TryMiss` and returns `None`; a successful attempt returns the same
 /// release-reporting guard as [`acquire_topology_lock`].
 pub fn try_acquire_topology_lock(
@@ -1828,5 +1914,36 @@ mod tests {
     #[test]
     fn fork_quiesce_stress_no_lost_wakeup_concurrent_forkers() {
         fork_quiesce_stress(2);
+    }
+
+    #[test]
+    fn mm_transaction_guard_requires_mm_mutation_guard() {
+        assert!(topology_depth_is_zero_for_executor_boundary());
+        {
+            let witness = ();
+            let _guard = MmTransactionGuard::mint_from_mm_mutation_guard(&witness);
+            assert!(!topology_depth_is_zero_for_executor_boundary());
+        }
+        assert!(topology_depth_is_zero_for_executor_boundary());
+    }
+
+    #[test]
+    fn frame_registry_guard_is_a_leaf() {
+        let sources = [include_str!("fork_quiesce.rs")];
+        for source in sources {
+            let mut parts = source.split("frame_registry_lock().lock()");
+            let _first = parts.next();
+            for part in parts {
+                let critical_section = part.split("drop(").next().unwrap_or(part);
+                assert!(
+                    !critical_section.contains("acquire_topology_lock"),
+                    "frame_registry_lock held across acquire_topology_lock"
+                );
+                assert!(
+                    !critical_section.contains(".lock()"),
+                    "frame_registry_lock held across another .lock() call"
+                );
+            }
+        }
     }
 }

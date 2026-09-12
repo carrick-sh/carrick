@@ -1900,6 +1900,14 @@
     {
       "kind": "static",
       "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "symbol": "frame_registry_lock::LOCK",
+      "fingerprint": "7591890473bb9a5bc03a88eb2a65918999e2e57ac56bb115190a368cb5b36a1e",
+      "classification": "carrier_infra",
+      "rationale": "carrier-scoped: frames shared across mms"
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
       "symbol": "pt_barrier::B",
       "fingerprint": "f4764aca872ac7fc4b06284226e5ed4a403e4cd714ef1fe540b351626d7de25a",
       "classification": "carrier_infra",
