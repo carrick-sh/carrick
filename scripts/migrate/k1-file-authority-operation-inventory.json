@@ -17426,17 +17426,17 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 4848,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 445,
       "categories": [
         "mapping"
       ],
-      "text": "let io_uring_source = include_str!(\"../dispatch/ioring.rs\");",
+      "text": "let io_uring_source = include_str!(\"../../dispatch/ioring.rs\");",
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 6478,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 2053,
       "categories": [
         "epoll"
       ],
@@ -17444,8 +17444,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 6488,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 2063,
       "categories": [
         "epoll"
       ],
@@ -17453,8 +17453,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 6494,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 2069,
       "categories": [
         "epoll"
       ],
@@ -17462,8 +17462,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 6514,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 2088,
       "categories": [
         "epoll"
       ],
@@ -17471,8 +17471,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 9900,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 5459,
       "categories": [
         "epoll"
       ],
@@ -17480,8 +17480,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 9928,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 5487,
       "categories": [
         "epoll"
       ],
@@ -17489,8 +17489,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 9968,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 5527,
       "categories": [
         "epoll"
       ],
@@ -17498,8 +17498,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 9975,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 5534,
       "categories": [
         "epoll"
       ],
@@ -17507,8 +17507,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 9980,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 5539,
       "categories": [
         "epoll"
       ],
@@ -17516,8 +17516,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 9984,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 5543,
       "categories": [
         "epoll"
       ],
@@ -17525,8 +17525,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 10030,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 5589,
       "categories": [
         "epoll"
       ],
@@ -17534,8 +17534,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 10032,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 5591,
       "categories": [
         "epoll"
       ],
@@ -17543,8 +17543,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 10446,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 6005,
       "categories": [
         "epoll"
       ],
@@ -17552,8 +17552,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 10459,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 6018,
       "categories": [
         "epoll"
       ],
@@ -17561,8 +17561,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 10466,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 6025,
       "categories": [
         "epoll"
       ],
@@ -17570,8 +17570,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 10471,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 6030,
       "categories": [
         "epoll"
       ],
@@ -17579,8 +17579,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 10475,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 6034,
       "categories": [
         "epoll"
       ],
@@ -17588,8 +17588,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 10522,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 6081,
       "categories": [
         "epoll"
       ],
@@ -17597,8 +17597,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "line": 10525,
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs",
+      "line": 6084,
       "categories": [
         "epoll"
       ],
