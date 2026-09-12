@@ -1874,8 +1874,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4673,
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 326,
       "categories": [
         "description_guard"
       ],
@@ -1885,8 +1885,8 @@
       "migration_family": "create_install"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4700,
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 353,
       "categories": [
         "description_guard"
       ],
@@ -1896,8 +1896,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4785,
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 200,
       "categories": [
         "description_guard"
       ],
@@ -1907,8 +1907,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4930,
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 345,
       "categories": [
         "description_backing",
         "mapping"
@@ -1919,8 +1919,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5426,
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 841,
       "categories": [
         "description_guard"
       ],
@@ -1930,8 +1930,8 @@
       "migration_family": "slot_description_mutation"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6163,
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1578,
       "categories": [
         "description_guard"
       ],
@@ -1941,8 +1941,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6170,
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1585,
       "categories": [
         "description_guard"
       ],
@@ -1952,8 +1952,8 @@
       "migration_family": "create_install"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6185,
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1600,
       "categories": [
         "description_guard"
       ],
@@ -1963,8 +1963,8 @@
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6498,
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1913,
       "categories": [
         "description_guard"
       ],
@@ -1975,7 +1975,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1133,
+      "line": 876,
       "categories": [
         "table_guard"
       ],
@@ -1986,7 +1986,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1300,
+      "line": 1043,
       "categories": [
         "table_guard"
       ],
@@ -1997,7 +1997,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1315,
+      "line": 1058,
       "categories": [
         "table_guard"
       ],
@@ -2008,7 +2008,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1340,
+      "line": 1083,
       "categories": [
         "table_guard"
       ],
@@ -2019,7 +2019,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1390,
+      "line": 1133,
       "categories": [
         "table_guard"
       ],
@@ -2030,7 +2030,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1461,
+      "line": 1204,
       "categories": [
         "description_guard"
       ],
@@ -2041,18 +2041,18 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1605,
+      "line": 1272,
       "categories": [
         "table_guard"
       ],
       "text": "dispatcher.captured_file_table().write_open_files().insert(",
       "scope_kind": "test_or_definition",
-      "enclosing_function": "install_host_file_fd",
+      "enclosing_function": "install_host_file_fd_with_source",
       "migration_family": "inspect_misc"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1825,
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 432,
       "categories": [
         "table_guard"
       ],
