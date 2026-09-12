@@ -17651,8 +17651,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-      "line": 1141,
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/settlement.rs",
+      "line": 188,
       "categories": [
         "mapping"
       ],
