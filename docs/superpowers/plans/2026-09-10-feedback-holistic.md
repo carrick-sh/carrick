@@ -450,3 +450,16 @@ commits and is re-checked at the next vet.
   mod.rs redispatch alias install) — re-blessed with sink/domain asserted
   equal per row (that refusal is the review gate working as designed).
   The executor-lane retirement site is Task 4's.
+- Landed and pushed (late night): split-objects (10,187 → 2,851; six
+  submodules), split-fs-backend (10,821 → 1,035; host/memory/path/tests),
+  split-mem (12,097 → 2,318; brk/madvise/vma/fault/backing/mmap with
+  per-submodule tests). Landing note for split-mem: the reconciler
+  refuses rows whose OWNER changed, not just their position — membarrier
+  became `MemView::membarrier` in mem/madvise.rs, mmap's call sites moved
+  to mem/mmap.rs with identical texts (ambiguous 1:N), and a test helper
+  was renamed to its `_with_source` delegate; re-keyed by hand with the
+  reason in the commit. Every file the 2026-09-11 vet listed above 10K
+  lines is now under 3K except continuation.rs (restart in progress).
+  tma at 101 → 32 allows (17 commits) is landing; `syscall-names-mem`
+  dispatched to finish the memory tables and delete the literal-arm macro
+  variant now that the split has landed.
