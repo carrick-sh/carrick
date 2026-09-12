@@ -721,3 +721,32 @@ commits and is re-checked at the next vet.
   TIMEOUT in the scorecard; the `exec-sibling-settle` round-2 fix is the
   candidate cure and is queued for its live receipt right after the
   measurement window.
+- 2026-09-12 16:20, go-net_http hang CAPTURED with a core (`carrick debug
+  lldb-run`, deadline dump `target/perf/perf2x-sep12/nhwedge/nhw-2/`,
+  core `nhw-2.25013.core`, kernel snapshot timed out = registry lock
+  held). It is a LOCK-ORDER DEADLOCK downstream of the exec-teardown
+  class, not a lost wake: after an `AddressSpaceRetired` claim failure the
+  loser binding's detached retirement runs
+  (`HvpatchTaskBinding::retire_detached_address_space` →
+  `retire_task_state_process_mappings_inner` [frame inventory +
+  `frames.lock()`] → `retire_global_frame_host_owner_if_generation_in_using`
+  [global_frame_host_owners] → `finalize_terminal_stage2_record_using` →
+  `release_global_frame_ipa` → blocked on the IPA allocator mutex);
+  meanwhile three executors hold `alias_registry()` inside
+  `mapping_for_range_in` and block on `global_frame_host_owners` from the
+  `newest_containing_ipa` match closure (`global_frame_host_owner_matches_in`),
+  two more wait for `alias_registry()` (a `nanosleep` guest read and a
+  sparse-extent materialize), the exec thread waits for the frame
+  inventory in `exec_authority_fingerprint`, one executor waits in the
+  mm census, and one is parked in the page-table quiesce. Lock shapes
+  (alias→owners in `mapping_for_range_in`; inventory→frames→owners→
+  allocator in detached retirement) predate Task 5 (same code at
+  `ac96a1959^`); the candidate raised how often the retirement path runs.
+  Bisect (`nhbisect/`): pre-Task-5 binary 4/4 pass, current main 1 of 4
+  so far. Two fixes are on the table: (1) `exec-sibling-settle` round 2
+  makes losers retire exactly instead of through the detached path;
+  (2) the lock order itself must be made acyclic — never call into
+  `global_frame_host_owners` from under `alias_registry()` (collect the
+  candidate aliases, release, then authenticate), and never release to
+  the IPA allocator while holding the owners map. (2) is the real fix
+  and is a director task once (1) lands.
