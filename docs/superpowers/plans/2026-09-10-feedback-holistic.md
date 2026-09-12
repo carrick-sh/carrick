@@ -470,3 +470,11 @@ commits and is re-checked at the next vet.
   foreign_mm.rs the Task 3 `drop(registry)` beside tma's new
   `CowInventoryLifecycleScope` binding. Long-lived worker branches over a
   fast-moving main pay this at landing; land smaller batches sooner.
+- tma LANDED (4308621ca): 101 → 32 `too_many_arguments` allows over 17
+  commits (CLI/embed/conformance, file_authority, dispatch/execution,
+  observability probes, runtime.rs, vcpu_loop signal/mod/binding, trap,
+  vfs/inotify). Remaining 32 are a bounded follow-up on fresh main.
+  Per-mm Task 4 (`mm-transactions`: fork/exec/exit/unmap hold their mm's
+  transaction guard plus the registry leaf; the carrier mutex loses its
+  production callers) dispatched now that Task 3, the executor split and
+  tma are all on main.
