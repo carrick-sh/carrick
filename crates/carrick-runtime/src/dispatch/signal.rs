@@ -52,6 +52,7 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
+use carrick_abi::syscall::nr;
 use carrick_fatal::carrick_fatal;
 
 syscall_table! {
@@ -62,19 +63,19 @@ syscall_table! {
     /// the other modules' tables. Add a `signal` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_signal;
-    74 => signalfd4,
-    129 => kill,
-    130 => tkill,
-    131 => tgkill,
-    132 => sigaltstack,
-    133 => rt_sigsuspend,
-    134 => rt_sigaction,
-    135 => rt_sigprocmask,
-    136 => rt_sigpending,
-    137 => rt_sigtimedwait,
-    138 => rt_sigqueueinfo,
-    139 => rt_sigreturn,
-    240 => rt_tgsigqueueinfo,
+    nr::SIGNALFD4 => signalfd4,
+    nr::KILL => kill,
+    nr::TKILL => tkill,
+    nr::TGKILL => tgkill,
+    nr::SIGALTSTACK => sigaltstack,
+    nr::RT_SIGSUSPEND => rt_sigsuspend,
+    nr::RT_SIGACTION => rt_sigaction,
+    nr::RT_SIGPROCMASK => rt_sigprocmask,
+    nr::RT_SIGPENDING => rt_sigpending,
+    nr::RT_SIGTIMEDWAIT => rt_sigtimedwait,
+    nr::RT_SIGQUEUEINFO => rt_sigqueueinfo,
+    nr::RT_SIGRETURN => rt_sigreturn,
+    nr::RT_TGSIGQUEUEINFO => rt_tgsigqueueinfo,
 }
 use crate::linux_abi::LinuxSiginfo;
 use carrick_abi::{SigBlockMask, SigSet};

@@ -35,6 +35,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 pub(crate) mod lock_authority;
 #[cfg(doctest)]
 pub mod lock_authority;
+use carrick_abi::syscall::nr;
 pub(crate) use lock_authority::SysvProcessGuard;
 
 syscall_table! {
@@ -45,22 +46,22 @@ syscall_table! {
     /// the other modules' tables. Add a `sysv` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_sysv;
-    186 => msgget,
-    187 => msgctl,
-    188 => msgrcv,
-    189 => msgsnd,
-    190 => semget,
-    191 => semctl,
-    192 => semtimedop,
-    193 => semop,
-    194 => shmget,
-    195 => shmctl,
+    nr::MSGGET => msgget,
+    nr::MSGCTL => msgctl,
+    nr::MSGRCV => msgrcv,
+    nr::MSGSND => msgsnd,
+    nr::SEMGET => semget,
+    nr::SEMCTL => semctl,
+    nr::SEMTIMEDOP => semtimedop,
+    nr::SEMOP => semop,
+    nr::SHMGET => shmget,
+    nr::SHMCTL => shmctl,
 }
 
 mutation_syscall_table! {
     pub(crate) fn dispatch_sysv_mutation;
-    196 => shmat,
-    197 => shmdt,
+    nr::SHMAT => shmat,
+    nr::SHMDT => shmdt,
 }
 
 // Linux aarch64 `struct msqid64_ds` field offsets (asm-generic/msgbuf.h):

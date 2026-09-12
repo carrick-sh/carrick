@@ -30,6 +30,7 @@ use crate::keyring::{
 use carrick_abi::keyring::{
     KeyPerm, KeyRequestDefault, KeyRight, KeySerial, KeySpec, KeyctlOp, LINUX_KEY_DESC_MAX_LEN,
 };
+use carrick_abi::syscall::nr;
 use carrick_abi::{LINUX_EACCES, LINUX_ENOKEY, LINUX_EOPNOTSUPP};
 
 syscall_table! {
@@ -37,9 +38,9 @@ syscall_table! {
     /// bolted onto `dispatch_proc`) because the three syscalls share one
     /// subsystem and one set of helpers.
     pub(crate) fn dispatch_keys;
-    217 => add_key,
-    218 => request_key,
-    219 => keyctl,
+    nr::ADD_KEY => add_key,
+    nr::REQUEST_KEY => request_key,
+    nr::KEYCTL => keyctl,
 }
 
 /// The calling thread's view of the keyring world for the duration of ONE

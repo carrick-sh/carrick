@@ -77,19 +77,20 @@ use crate::linux_abi::{
     LINUX_MOVE_MOUNT_VALID_FLAGS, LINUX_OPEN_TREE_CLOEXEC, LINUX_OPEN_TREE_CLONE,
     LINUX_OPEN_TREE_VALID_FLAGS,
 };
+use carrick_abi::syscall::nr;
 
 syscall_table! {
     /// Per-module routing for the new mount API. Chained from
     /// `resolve_handler` in `dispatch/mod.rs`. The numbers are the unified
     /// post-424 syscall space (identical on aarch64 and x86_64).
     pub(crate) fn dispatch_mount_api;
-    428 => open_tree,
-    429 => move_mount,
-    430 => fsopen,
-    431 => fsconfig,
-    432 => fsmount,
-    433 => fspick,
-    442 => mount_setattr,
+    nr::OPEN_TREE => open_tree,
+    nr::MOVE_MOUNT => move_mount,
+    nr::FSOPEN => fsopen,
+    nr::FSCONFIG => fsconfig,
+    nr::FSMOUNT => fsmount,
+    nr::FSPICK => fspick,
+    nr::MOUNT_SETATTR => mount_setattr,
 }
 
 /// Filesystem types `fsopen(2)` recognises — kept in lockstep with the
