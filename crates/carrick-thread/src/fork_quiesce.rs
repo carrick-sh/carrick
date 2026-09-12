@@ -935,6 +935,20 @@ impl QuiesceBarrier {
                 kind: publication.kind,
             });
         }
+        // The caller read `is_quiescing()==true` BEFORE reading the generation
+        // it passes here; `end_quiesce`/`end_fork` can lower the flag and
+        // publish both `Released` events in between, leaving the generation
+        // current and the flag low. Parking then waits for a release that has
+        // already happened, and the next fork's `Raised` consumes the one-shot
+        // listener (forkexecstorm wedge, 2026-09-12). The flag is published
+        // before the release event under this same lock, so reading it here is
+        // exact: low means released.
+        if !self.quiescing.load(Ordering::SeqCst) {
+            return QuiesceEnrollment::Ready(QuiesceEvent {
+                generation: publication.generation,
+                kind: QuiesceEventKind::Released,
+            });
+        }
         let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
         if id == 0 || id == u64::MAX {
             carrick_fatal!(
@@ -1470,6 +1484,9 @@ mod tests {
         let barrier = Arc::new(QuiesceBarrier::new());
         let callbacks = Arc::new(AtomicUsize::new(0));
         let callback_count = Arc::clone(&callbacks);
+        // A subscription only parks while a quiesce is in progress (a low flag
+        // answers `Ready`), so raise it first.
+        barrier.set_quiescing();
         let subscription = match barrier.subscribe_quiesce(
             barrier.publication_generation(),
             Arc::new(move |_| {
@@ -1480,6 +1497,7 @@ mod tests {
             QuiesceEnrollment::Ready(_) => panic!("stable generation must subscribe"),
         };
         drop(subscription);
+        barrier.end_quiesce();
         barrier.set_quiescing();
         barrier.end_quiesce();
         assert_eq!(callbacks.load(Ordering::SeqCst), 0);
@@ -1887,6 +1905,36 @@ mod tests {
         drop(guard);
         right_worker.join().unwrap();
         wrong_worker.join().unwrap();
+    }
+
+    /// The forkexecstorm wedge (2026-09-12, core `probe-wedge-16307`): a
+    /// vfork child read `is_quiescing()==true`, the forker then lowered the
+    /// flag and published both `Released` events, and only THEN did the child
+    /// read the generation and subscribe. Nothing would publish again until
+    /// the next fork's `Raised`, which consumed the one-shot listener, so the
+    /// child stayed `Blocked(HostWait)` forever. A subscription taken while
+    /// the flag is already low must answer `Ready` from the publication lock,
+    /// never park a waiter for a release that already happened.
+    #[test]
+    fn subscribe_after_release_is_ready_even_when_the_generation_matches() {
+        let barrier = Arc::new(QuiesceBarrier::new());
+        barrier.set_quiescing();
+        barrier.end_quiesce();
+        let observed = barrier.publication_generation();
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_cb = Arc::clone(&fired);
+        match barrier.subscribe_quiesce(
+            observed,
+            Arc::new(move |_| fired_cb.store(true, Ordering::SeqCst)),
+        ) {
+            QuiesceEnrollment::Ready(event) => {
+                assert_eq!(event.kind, QuiesceEventKind::Released);
+            }
+            QuiesceEnrollment::Subscribed(_) => {
+                panic!("a subscription taken after end_quiesce must be Ready, not parked");
+            }
+        }
+        assert!(!fired.load(Ordering::SeqCst));
     }
 
     #[test]

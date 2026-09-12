@@ -1563,12 +1563,17 @@ where
         loop {
             let observed = barrier.publication_generation();
             let wake_scheduler = Arc::clone(&scheduler);
+            // Wake on ANY event, not only `Released`: the barrier's listeners
+            // are one-shot and every publication consumes them, so a `Raised`
+            // from the next fork on this (per-mm, so vfork/CLONE_VM-shared)
+            // barrier would otherwise eat the subscription and the `Released`
+            // that follows would reach nobody -- the forkexecstorm wedge. A
+            // spurious wake costs one trip through this loop, which re-checks
+            // `is_quiescing()` and re-parks.
             let enrollment = barrier.subscribe_quiesce(
                 observed,
-                Arc::new(move |event| {
-                    if event.kind == carrick_thread::fork_quiesce::QuiesceEventKind::Released {
-                        let _ = wake_scheduler.wake(thread);
-                    }
+                Arc::new(move |_event| {
+                    let _ = wake_scheduler.wake(thread);
                 }),
             );
             match enrollment {
@@ -5322,6 +5327,41 @@ mod tests {
     use carrick_guest_mem::GuestMemory;
     use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
+
+    /// The forkexecstorm wedge: the parked executor's barrier callback woke
+    /// only on `Released`, while `publish_quiesce_event` consumes every
+    /// one-shot listener on ANY event. A `Raised` from the next fork on a
+    /// shared per-mm barrier therefore ate the subscription and the waiter
+    /// never saw the `Released` that followed. The callback must wake on any
+    /// event; the run-loop top re-checks `is_quiescing()` and re-parks.
+    #[test]
+    fn process_quiesce_callback_wakes_on_any_barrier_event() {
+        let source = include_str!("binding.rs");
+        let start = source
+            .find("fn suspend_for_process_quiesce(")
+            .expect("suspend_for_process_quiesce");
+        let end = source[start..]
+            .find("fn suspend_for_job_control(")
+            .map(|offset| start + offset)
+            .expect("suspend_for_job_control");
+        let body = &source[start..end];
+        let callback = body
+            .find("barrier.subscribe_quiesce(")
+            .expect("the barrier subscription");
+        let callback_end = body[callback..]
+            .find("}),")
+            .map(|offset| callback + offset)
+            .expect("the subscription callback closes");
+        let callback_body = &body[callback..callback_end];
+        assert!(
+            !callback_body.contains("event.kind"),
+            "the quiesce wake callback must not filter on the event kind: a Raised event consumes the one-shot listener"
+        );
+        assert!(
+            callback_body.contains("wake_scheduler.wake(thread)"),
+            "the quiesce wake callback must wake the parked thread"
+        );
+    }
 
     #[test]
     fn guest_run_accounting_uses_non_aliasing_engine_receipts() {
