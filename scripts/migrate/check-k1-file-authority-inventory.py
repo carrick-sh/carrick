@@ -41,7 +41,11 @@ PATTERNS = {
 # `Vec::splice` on the semantic VMA vector (`VmaMap`) is std vector surgery,
 # not a pipe/stream transfer; the "stream" word match would otherwise record
 # it as a K1 stream site and force a false classification at every landing.
-NON_AUTHORITY_TEXT = (re.compile(r"\bself\.vmas\.splice\("),)
+NON_AUTHORITY_TEXT = (
+    re.compile(r"\bself\.vmas\.splice\("),
+    re.compile(r"\bmod\s+mmap;"),
+    re.compile(r'include_str!\("mmap\.rs"\)'),
+)
 
 
 def brace_deltas(source: str) -> list[int]:
