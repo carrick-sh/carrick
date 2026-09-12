@@ -1614,7 +1614,7 @@
       "domain": "kernel::file_table_gate"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-runtime/src/kernel/objects/process.rs",
       "function": "Mm::replace_io_uring_mappings",
       "ordinal_in_function": 1,
       "fingerprint": "9246e4fe4c24869050836e40438c18720face1ebb55bfb9158fe61192845c0fe",
@@ -1658,7 +1658,7 @@
       "domain": "kernel::process_group_generation"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-runtime/src/kernel/objects/process.rs",
       "function": "Zombie::from_task",
       "ordinal_in_function": 1,
       "fingerprint": "8aea0a65ad68f742c0067dda239660e06424303b86c1f533392364be91b4c5c2",
@@ -1669,7 +1669,7 @@
       "domain": "kernel::zombie_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-runtime/src/kernel/objects/process.rs",
       "function": "Zombie::from_task",
       "ordinal_in_function": 2,
       "fingerprint": "708a0945c05fbfec777eb64b3244da040dffa828643009930c714fc9a4aa88ab",
