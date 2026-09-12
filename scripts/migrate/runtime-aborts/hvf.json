@@ -876,7 +876,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::commit_process_alias_retirement",
       "ordinal_in_function": 1,
-      "fingerprint": "6437f4320e19b0f83157566e875ad71bdd11b0ed9de954e71283a9049141bed9",
+      "fingerprint": "cb85086ebf650aeb738d172594935676e4258f48287b4dd8e25f6bc35806a27a",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::host_alias",
       "rationale": "Global alias registry mutated unexpectedly under topology lock during alias unregistration, corrupting planned alias and stage-2 lease retirement.",
