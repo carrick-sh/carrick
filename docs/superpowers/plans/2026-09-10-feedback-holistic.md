@@ -554,3 +554,18 @@ commits and is re-checked at the next vet.
   block is rerunning on that binary; Task 6 and the allows round dispatch
   after it. Leaf rule for Tasks 5–6, now in the plan memory: a callee
   never locks the frame-registry leaf; it receives the guard.
+- Second Task 4 defect, found by the sep12 scorecard rerun and fixed
+  forward (3e69641b5): `go-net_http` hung [blocked] at four workers (twice)
+  and, standalone, died with `acquire exact-MM terminal authority failed:
+  UnkickableExecutor` → `CarrierFailed` at test 754/1,388 — the exit path
+  had been made to elect a stage-1 pause over sibling executors that
+  `exit_group` had already put beyond kicking. The terminal retirement
+  edits no live stage-1 table, so it now mints its transaction from
+  `mm_mutation::terminal_process_transaction()` (depth + registry leaf, no
+  pause); the exit shape test forbids `acquire_mm_stage1_authority` there.
+  Attribution: pre-Task-4 pinned binaries pass 1,388/1,388, the Task 4
+  binary dies at 754. Receipts on the rebuilt binary 4843f86387c98083:
+  go-net_http PASS ×3 (1,388 each), multiprocessing SUCCESS 6.4 s,
+  `just conformance-probes` EXIT 0 (target/perf/probes-exitfix-sep12.log).
+  Embed tests restructured around one carrier (cf5c08042). Measurement
+  block re-armed on this binary; Task 6 and the allows round follow it.
