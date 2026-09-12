@@ -1837,9 +1837,11 @@ fn brk_waits_for_host_alias_idle() {
                 SyscallRequest::new(SYS_BRK, SyscallArgs([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
-                registry.main_tid(),
-                &registry,
-                &crate::thread::FutexTable::new(),
+                crate::dispatch::ThreadCtx::new(
+                    registry.main_tid(),
+                    &registry,
+                    &crate::thread::FutexTable::new(),
+                ),
             )
             .expect("brk dispatch while alias install is pending");
     });
@@ -1862,9 +1864,11 @@ fn msync_waits_for_host_alias_idle() {
                 ),
                 &mut memory,
                 &reporter,
-                registry.main_tid(),
-                &registry,
-                &crate::thread::FutexTable::new(),
+                crate::dispatch::ThreadCtx::new(
+                    registry.main_tid(),
+                    &registry,
+                    &crate::thread::FutexTable::new(),
+                ),
             )
             .expect("msync dispatch while alias install is pending");
     });
@@ -1895,9 +1899,11 @@ fn mincore_waits_for_host_alias_idle() {
                 ),
                 &mut memory,
                 &reporter,
-                registry.main_tid(),
-                &registry,
-                &crate::thread::FutexTable::new(),
+                crate::dispatch::ThreadCtx::new(
+                    registry.main_tid(),
+                    &registry,
+                    &crate::thread::FutexTable::new(),
+                ),
             )
             .expect("mincore dispatch while alias install is pending");
     });

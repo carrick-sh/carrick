@@ -614,9 +614,11 @@ pub(crate) fn threaded_memory_call(
             request,
             memory,
             reporter,
-            registry.main_tid(),
-            registry,
-            &crate::thread::FutexTable::new(),
+            crate::dispatch::ThreadCtx::new(
+                registry.main_tid(),
+                registry,
+                &crate::thread::FutexTable::new(),
+            ),
         )
         .expect("threaded memory dispatch")
 }
