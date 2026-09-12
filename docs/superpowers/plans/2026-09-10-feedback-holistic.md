@@ -530,3 +530,18 @@ commits and is re-checked at the next vet.
   builds, filesystem landings (hostfs-amplification fe9ceb4d6, fs_backend
   split 32d32d44a) first. The sep12 measurement block is void until this is
   fixed; the stall watch's guest threshold is being lowered to 10 minutes.
+- Post-mortem of the openat wedge (owner: post-mortem first, bisect second):
+  the core's `bt all` had ONE non-idle thread — `carrick-executor-4` in
+  `RawMutex::lock_slow` under `commit_process_alias_retirement`, reached
+  from `mmap` → `materialize_private_file_backing` →
+  `materialize_sparse_mmap_extent_inner` (holding `FrameRegistryGuard`
+  since Task 3) → `publish_replacing`. Task 4's unmap step (6ede8db7d)
+  made the commit take `frame_registry_lock()` again: a self-deadlock on
+  the non-reentrant leaf, on every private file-backed `mmap` that
+  replaces live rows (Python loading `_bz2`). My first stack summary had
+  filtered `parking_lot` frames and reported "all executors idle", which
+  cost an hour of bisect builds that then converged on the same commit.
+  Fix forward: the commit takes the caller's `&FrameRegistryGuard` as
+  proof and never locks the leaf (the rule is now the signature); shape
+  test red on 5149bba88, green after; live receipt = the row completing on
+  the rebuilt binary, then the full probe gate.
