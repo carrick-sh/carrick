@@ -3904,50 +3904,50 @@ struct AliasPublicationReceipt {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct AliasPublicationVersionId {
-    owner: HvpatchCarrierTaskStateKey,
-    ordinal: u32,
+pub(crate) struct AliasPublicationVersionId {
+    pub(crate) owner: HvpatchCarrierTaskStateKey,
+    pub(crate) ordinal: u32,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
-struct OwnedAliasVersion {
-    id: AliasPublicationVersionId,
-    value: AliasBacking,
-    epoch: u64,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnedAliasVersion {
+    pub(crate) id: AliasPublicationVersionId,
+    pub(crate) value: AliasBacking,
+    pub(crate) epoch: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
-struct AliasVersionChain {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AliasVersionChain {
     // The `(start, ipa, scope)` tuple is the map key; it is deliberately not
     // duplicated into the value, so the key and the row can never disagree.
-    base: Option<AliasBacking>,
-    versions: Vec<OwnedAliasVersion>,
+    pub(crate) base: Option<AliasBacking>,
+    pub(crate) versions: Vec<OwnedAliasVersion>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-type AliasVersionKey = (u64, u64, AliasOwnershipScope);
+pub(crate) type AliasVersionKey = (u64, u64, AliasOwnershipScope);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn alias_version_key(alias: &AliasBacking) -> AliasVersionKey {
+pub(crate) fn alias_version_key(alias: &AliasBacking) -> AliasVersionKey {
     (alias.start, alias.ipa, alias.ownership_scope)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
-struct OwnedReplayVersion {
-    id: AliasPublicationVersionId,
-    value: ReplayMappingKey,
-    epoch: u64,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OwnedReplayVersion {
+    pub(crate) id: AliasPublicationVersionId,
+    pub(crate) value: ReplayMappingKey,
+    pub(crate) epoch: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
-struct ReplayVersionChain {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReplayVersionChain {
     // `physical_ipa` is the map key; see `AliasVersionChain`.
-    base: Vec<ReplayMappingKey>,
-    versions: Vec<OwnedReplayVersion>,
+    pub(crate) base: Vec<ReplayMappingKey>,
+    pub(crate) versions: Vec<OwnedReplayVersion>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3961,15 +3961,15 @@ struct ReplayVersionChain {
 /// `retiring_one_owner_does_not_scan_foreign_alias_rows`). The version indexes
 /// exist so `AliasPublicationReceipt::retire_exact` can find the chain owning
 /// a version id without walking every chain's version list.
-#[derive(Default)]
-#[cfg_attr(test, derive(Clone, Debug, Eq, PartialEq))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AliasVersionRegistry {
-    aliases: std::collections::BTreeMap<AliasVersionKey, AliasVersionChain>,
-    replays: std::collections::BTreeMap<u64, ReplayVersionChain>,
-    alias_epochs: std::collections::BTreeMap<AliasVersionKey, u64>,
-    replay_epochs: std::collections::BTreeMap<u64, u64>,
-    alias_version_owner: std::collections::BTreeMap<AliasPublicationVersionId, AliasVersionKey>,
-    replay_version_owner: std::collections::BTreeMap<AliasPublicationVersionId, u64>,
+    pub(crate) aliases: std::collections::BTreeMap<AliasVersionKey, AliasVersionChain>,
+    pub(crate) replays: std::collections::BTreeMap<u64, ReplayVersionChain>,
+    pub(crate) alias_epochs: std::collections::BTreeMap<AliasVersionKey, u64>,
+    pub(crate) replay_epochs: std::collections::BTreeMap<u64, u64>,
+    pub(crate) alias_version_owner:
+        std::collections::BTreeMap<AliasPublicationVersionId, AliasVersionKey>,
+    pub(crate) replay_version_owner: std::collections::BTreeMap<AliasPublicationVersionId, u64>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
