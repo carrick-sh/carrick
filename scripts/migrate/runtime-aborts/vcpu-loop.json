@@ -26,7 +26,7 @@
       "domain": "vcpu_loop::continuation_registry"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs",
       "function": "HvpatchTaskBinding::service_pending_cow_invalidation",
       "ordinal_in_function": 1,
       "fingerprint": "94389326d92b882169f44bc69c90601e71cbb9e73e092c0b415b7bcf6f5a47e2",
@@ -37,7 +37,7 @@
       "domain": "hvpatch::mm_authority"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs",
       "function": "HvpatchTaskBinding::cow_invalidation_observer",
       "ordinal_in_function": 1,
       "fingerprint": "3f9954a5ba7531f8e5492994d8ad43f44ec2c048987c9ad525a9c0aeaef12798",
@@ -48,7 +48,7 @@
       "domain": "hvpatch::mm_authority"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs",
       "function": "HvpatchTaskBinding::foreign_stage1_identity",
       "ordinal_in_function": 1,
       "fingerprint": "d961a718d6878003aecd345c85f5bf5ffa1c743e5206894817eab65157904e0f",
@@ -59,7 +59,7 @@
       "domain": "hvpatch::mm_authority"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs",
       "function": "ProcessDrain::excluding",
       "ordinal_in_function": 1,
       "fingerprint": "bcf50e9b0120bb3418c554d8d77003bd756a9a3a42cad44534318b2dd8882860",
@@ -70,7 +70,7 @@
       "domain": "vcpu_loop::process_drain"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs",
       "function": "ProcessDrain::for_scheduler",
       "ordinal_in_function": 1,
       "fingerprint": "3f202964f75001d557b06c9260fce0307b3316a6715434a97be975728524609d",
