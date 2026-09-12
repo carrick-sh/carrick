@@ -582,3 +582,7 @@ commits and is re-checked at the next vet.
   `alias-retain-r2` dispatched with a red-first huge-row visit-count test.
   The other four rows improved in the same rep (tarfile 0.74x, importlib
   0.89x, multiprocessing 0.94x, net_http 0.94x paired).
+- Attribution confirmed by pinned binaries (standalone compile row):
+  541a575ff 14.3 s; 5f4b957fd (alias-newest + alias-retain landed) 182.8 s;
+  fe9ceb4d6 174.0 s; 5149bba88 wedges (the openat deadlock). The 12x is
+  the alias-retain-index landing's widest-row window.
