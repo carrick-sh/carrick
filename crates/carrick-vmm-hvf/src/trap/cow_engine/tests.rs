@@ -359,3 +359,54 @@ fn alias_retirement_commit_takes_the_callers_registry_guard_and_never_locks_the_
         );
     }
 }
+
+/// The go-net_http deadlock (2026-09-12, core `target/perf/perf2x-sep12/
+/// nhwedge/nhw-2`): executors held `alias_registry()` inside
+/// `mapping_for_range_in` while the match closure authenticated the row's
+/// frame owner through `global_frame_host_owner_matches_in`, which takes
+/// `global_frame_host_owners`; a detached address-space retirement held that
+/// owners map (plus the frame inventory) and waited on the IPA allocator —
+/// a cycle. Lock order: the alias registry is a LEAF for lookups. A query
+/// under it may only run pure geometry/scope predicates; frame-owner
+/// authentication (`global_frame_host_owner_matches_in`,
+/// `global_frame_region_owner_matches_in`, any `custody` access) runs on the
+/// returned candidates after the lock is released.
+#[test]
+fn alias_registry_queries_never_authenticate_frame_owners_under_the_lock() {
+    let cow_engine_src = include_str!("../cow_engine.rs");
+    let mut offenders = Vec::new();
+    let mut search = 0;
+    while let Some(found) = cow_engine_src[search..].find("alias_registry()") {
+        let start = search + found;
+        let rest = &cow_engine_src[start..];
+        let Some(lock_at) = rest.find(".lock()") else {
+            break;
+        };
+        if lock_at > 64 {
+            search = start + 16;
+            continue;
+        }
+        let statement_end = rest.find(';').unwrap_or(rest.len());
+        let statement = &rest[..statement_end];
+        let line = cow_engine_src[..start].matches('\n').count() + 1;
+        for needle in [
+            "global_frame_host_owner_matches_in",
+            "global_frame_region_owner_matches_in",
+            "alias_is_live",
+            "region_is_live",
+            "custody",
+        ] {
+            if statement.contains(needle) {
+                offenders.push(format!(
+                    "line {line}: `{needle}` inside an alias_registry().lock() statement"
+                ));
+            }
+        }
+        search = start + 16;
+    }
+    assert!(
+        offenders.is_empty(),
+        "frame-owner authentication must run outside the alias registry lock:\n{}",
+        offenders.join("\n")
+    );
+}

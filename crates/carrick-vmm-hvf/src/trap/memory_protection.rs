@@ -388,6 +388,77 @@ impl AliasClassIndex {
         newest.map(|(_, alias)| alias)
     }
 
+    /// Every row containing `probe` that `matches`, NEWEST FIRST (highest
+    /// insertion sequence first) — the order `newest_containing` selects in.
+    ///
+    /// Lock order: the alias registry is a leaf for lookups. Frame-owner
+    /// authentication (`global_frame_host_owner_matches_in`) takes the
+    /// carrier's owners map, which a detached retirement holds while it waits
+    /// on the IPA allocator; running it inside a query closure deadlocked the
+    /// go-net_http row (2026-09-12). Callers take these candidates, RELEASE the
+    /// registry lock, then authenticate.
+    pub(crate) fn containing_candidates(
+        &self,
+        probe: u64,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Vec<AliasBacking> {
+        let mut found: Vec<(u64, AliasBacking)> = Vec::new();
+        for class in self.class_counts.keys() {
+            let radius = Self::class_radius(*class);
+            let lower = probe.saturating_sub(radius.saturating_sub(1));
+            for (&(_class, start_key), rows) in
+                self.by_class_start.range((*class, lower)..=(*class, probe))
+            {
+                note_alias_state_rows_scanned(rows.len());
+                for &(seq, alias) in rows {
+                    if probe < start_key.saturating_add(alias.size as u64) && matches(&alias) {
+                        found.push((seq, alias));
+                    }
+                }
+            }
+        }
+        found.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        found.into_iter().map(|(_, alias)| alias).collect()
+    }
+
+    /// Every row whose start lies strictly inside `(start, end)` and that
+    /// `matches`, ordered by ascending start (ties by insertion sequence) —
+    /// so the first candidate that survives the caller's authentication is
+    /// exactly what `first_matching_start_between` would have answered with
+    /// that authentication folded into `matches`. See `containing_candidates`
+    /// for why authentication must not run under the registry lock.
+    pub(crate) fn matching_starts_between_candidates(
+        &self,
+        start: u64,
+        end: u64,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Vec<AliasBacking> {
+        if start >= end {
+            return Vec::new();
+        }
+        let (Some(lower), Some(upper)) = (start.checked_add(1), end.checked_sub(1)) else {
+            return Vec::new();
+        };
+        if lower > upper {
+            return Vec::new();
+        }
+        let mut found: Vec<(u64, u64, AliasBacking)> = Vec::new();
+        for class in self.class_counts.keys() {
+            for (&(_class, alias_start), rows) in
+                self.by_class_start.range((*class, lower)..=(*class, upper))
+            {
+                note_alias_state_rows_scanned(rows.len());
+                for &(seq, alias) in rows {
+                    if matches(&alias) {
+                        found.push((alias_start, seq, alias));
+                    }
+                }
+            }
+        }
+        found.sort_by_key(|(start, seq, _)| (*start, *seq));
+        found.into_iter().map(|(_, _, alias)| alias).collect()
+    }
+
     pub(crate) fn oldest_containing(
         &self,
         probe: u64,
@@ -770,6 +841,16 @@ impl AliasRegistry {
         self.ipa_classes.newest_containing(ipa, matches)
     }
 
+    /// Candidates for `newest_containing_ipa`, newest first; the caller
+    /// authenticates frame owners AFTER releasing the registry lock.
+    pub(crate) fn containing_ipa_candidates(
+        &self,
+        ipa: u64,
+        matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Vec<AliasBacking> {
+        self.ipa_classes.containing_candidates(ipa, matches)
+    }
+
     /// Private rows owned by one process whose exact physical stage-2 extent
     /// fully contains `[physical_ipa, physical_ipa + physical_len)`.
     ///
@@ -1065,6 +1146,25 @@ impl AliasRegistry {
             .filter(|(_, alias)| matches(alias))
             .max_by_key(|(seq, _)| *seq)
             .map(|(_, alias)| *alias)
+    }
+
+    /// Candidates for `newest_matching_for_process`, newest first; the
+    /// caller authenticates frame owners AFTER releasing the registry lock.
+    pub(crate) fn matching_for_process_candidates(
+        &self,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Vec<AliasBacking> {
+        let mut found: Vec<(u64, AliasBacking)> =
+            Self::process_visible_scopes(mm_root_slot, container_root)
+                .into_iter()
+                .flat_map(|scope| self.scope_rows(scope))
+                .filter(|(_, alias)| matches(alias))
+                .map(|(seq, alias)| (*seq, *alias))
+                .collect();
+        found.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        found.into_iter().map(|(_, alias)| alias).collect()
     }
 
     #[cfg(test)]
@@ -1597,6 +1697,24 @@ impl AliasRegistry {
             })
     }
 
+    /// Candidates for `first_matching_process_alias_start_between`, ascending
+    /// by start; the caller authenticates frame owners AFTER releasing the
+    /// registry lock and takes the first survivor's start.
+    pub(crate) fn matching_process_alias_starts_between_candidates(
+        &self,
+        start: u64,
+        end: u64,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Vec<AliasBacking> {
+        self.va_classes
+            .matching_starts_between_candidates(start, end, |alias| {
+                alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                    && matches(alias)
+            })
+    }
+
     /// The newest alias visible to the process whose guest-VA window contains `va`.
     /// Bounded by the live VA size-class index.
     pub(crate) fn newest_process_alias_containing_va(
@@ -1607,6 +1725,23 @@ impl AliasRegistry {
         mut matches: impl FnMut(&AliasBacking) -> bool,
     ) -> Option<AliasBacking> {
         self.va_classes.newest_containing(va, |alias| {
+            alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+                && va >= alias.start
+                && va < alias.start.saturating_add(alias.size as u64)
+                && matches(alias)
+        })
+    }
+
+    /// Candidates for `newest_process_alias_containing_va`, newest first; the
+    /// caller authenticates frame owners AFTER releasing the registry lock.
+    pub(crate) fn process_alias_containing_va_candidates(
+        &self,
+        va: u64,
+        mm_root_slot: Option<(u64, u64)>,
+        container_root: ContainerRootToken,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Vec<AliasBacking> {
+        self.va_classes.containing_candidates(va, |alias| {
             alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
                 && va >= alias.start
                 && va < alias.start.saturating_add(alias.size as u64)
