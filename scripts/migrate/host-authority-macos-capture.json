@@ -8766,15 +8766,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 83449,
-        "byte_start": 83433,
+        "byte_end": 82342,
+        "byte_start": 82326,
         "column": 39,
         "column_end": 55,
         "column_start": 39,
         "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-        "line": 2080,
-        "line_end": 2080,
-        "line_start": 2080
+        "line": 2055,
+        "line_end": 2055,
+        "line_start": 2055
       }
     },
     {
@@ -8786,15 +8786,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 92060,
-        "byte_start": 92044,
+        "byte_end": 90953,
+        "byte_start": 90937,
         "column": 47,
         "column_end": 63,
         "column_start": 47,
         "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-        "line": 2295,
-        "line_end": 2295,
-        "line_start": 2295
+        "line": 2270,
+        "line_end": 2270,
+        "line_start": 2270
       }
     },
     {
@@ -11506,9 +11506,9 @@
       }
     }
   ],
-  "rows_sha256": "644364d28c4cbd6e43b3a4b068507ab0f44af6ea047396a620311c854e9a6f60",
+  "rows_sha256": "de1e376e8aa9379ed34064acf8bc582b8ca56d618298ece522e52e4e21495b17",
   "schema": 1,
-  "source_head": "0cdb8eeff9115dfda2ee8bc1adbe325de5e7fff3",
+  "source_head": "af5cda2f9fe39ce41246298cc068c0e7e64b2d2c",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
