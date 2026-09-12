@@ -497,45 +497,6 @@ pub(crate) fn service_owner_thread_commands<E: PersistentExecutor>(
     }
 }
 
-pub(crate) fn acquire_process_retire_topology_lock_servicing<E: PersistentExecutor>(
-    pid: i32,
-    tid: i32,
-    backend: &mut E,
-    executor: ExecutorId,
-    commands: &mpsc::Receiver<WorkerCommand>,
-    boundary: &WorkerBoundaryAudit,
-    receipts: &ReceiptLog,
-) -> Result<(carrick_thread::fork_quiesce::TopologyLockGuard, bool), String> {
-    let mut deferred_stop = false;
-    let mut recorded_retry = false;
-    let mut backoff = std::time::Duration::from_micros(50);
-    let max_backoff = std::time::Duration::from_millis(5);
-    loop {
-        if let Some(guard) = carrick_thread::fork_quiesce::try_acquire_topology_lock(
-            carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
-            pid,
-            tid,
-        ) {
-            return Ok((guard, deferred_stop));
-        }
-        if !recorded_retry {
-            receipts.record(
-                executor,
-                ExecutorPoolEvent::TopologyRetrying {
-                    operation:
-                        carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
-                },
-            );
-            recorded_retry = true;
-        }
-        let stop_seen =
-            service_owner_thread_commands(backend, executor, commands, boundary, receipts)?;
-        deferred_stop |= stop_seen;
-        std::thread::sleep(backoff);
-        backoff = (backoff * 2).min(max_backoff);
-    }
-}
-
 pub(crate) fn fail_running(
     scheduler: &Scheduler,
     running: RunnableThread,
