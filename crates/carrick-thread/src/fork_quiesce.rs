@@ -57,21 +57,22 @@ mod probes {
     pub fn pt_pause_end(_tid: i32) {}
 }
 
-/// Process-wide barrier (one HVF VM per process). Reachable from the run loop,
-/// `handle_fork`, AND the blocking-wait predicates (futex / io_wait) so a parked
-/// thread returns to its run-loop top when a quiesce begins.
-pub fn barrier() -> &'static QuiesceBarrier {
-    static B: OnceLock<QuiesceBarrier> = OnceLock::new();
-    B.get_or_init(QuiesceBarrier::new)
+/// MM-scoped fork barrier and quiesce coordinator.
+pub type ForkQuiesce = QuiesceBarrier;
+
+#[derive(Clone)]
+struct CurrentMmQuiesceState {
+    pt: Arc<PtQuiesce>,
+    fork: Arc<ForkQuiesce>,
 }
 
 thread_local! {
-    static CURRENT_MM_QUIESCE: std::cell::RefCell<Option<Arc<PtQuiesce>>> = const { std::cell::RefCell::new(None) };
+    static CURRENT_MM_QUIESCE: std::cell::RefCell<Option<CurrentMmQuiesceState>> = const { std::cell::RefCell::new(None) };
 }
 
-/// RAII token that binds the current thread's MM-scoped stage-1 quiesce barrier.
+/// RAII token that binds the current thread's MM-scoped quiesce barriers.
 pub struct CurrentMmQuiesceGuard {
-    prev: Option<Arc<PtQuiesce>>,
+    prev: Option<CurrentMmQuiesceState>,
 }
 
 impl Drop for CurrentMmQuiesceGuard {
@@ -83,28 +84,49 @@ impl Drop for CurrentMmQuiesceGuard {
     }
 }
 
-/// Bind the current thread's MM-scoped stage-1 page table quiesce barrier.
-pub fn bind_current_mm_quiesce(barrier: Arc<PtQuiesce>) -> CurrentMmQuiesceGuard {
-    let prev = CURRENT_MM_QUIESCE.with(|cell| cell.borrow_mut().replace(barrier));
+/// Bind the current thread's MM-scoped stage-1 page table quiesce barrier and fork quiesce barrier.
+pub fn bind_current_mm_quiesce(
+    pt_quiesce: Arc<PtQuiesce>,
+    fork_quiesce: Arc<ForkQuiesce>,
+) -> CurrentMmQuiesceGuard {
+    let next = CurrentMmQuiesceState {
+        pt: pt_quiesce,
+        fork: fork_quiesce,
+    };
+    let prev = CURRENT_MM_QUIESCE.with(|cell| cell.borrow_mut().replace(next));
     CurrentMmQuiesceGuard { prev }
 }
 
 /// Returns the current thread's bound MM-scoped stage-1 quiesce barrier, if any.
 pub fn current_mm_quiesce() -> Option<Arc<PtQuiesce>> {
-    CURRENT_MM_QUIESCE.with(|cell| cell.borrow().clone())
+    CURRENT_MM_QUIESCE.with(|cell| cell.borrow().as_ref().map(|s| Arc::clone(&s.pt)))
+}
+
+/// Returns the current thread's bound MM-scoped fork quiesce barrier, if any.
+pub fn current_mm_fork_quiesce() -> Option<Arc<ForkQuiesce>> {
+    CURRENT_MM_QUIESCE.with(|cell| cell.borrow().as_ref().map(|s| Arc::clone(&s.fork)))
 }
 
 /// Returns true if the current thread's MM is currently quiescing for a stage-1 edit.
 pub fn is_current_mm_quiescing() -> bool {
-    CURRENT_MM_QUIESCE.with(|cell| cell.borrow().as_ref().is_some_and(|pt| pt.is_quiescing()))
+    CURRENT_MM_QUIESCE.with(|cell| cell.borrow().as_ref().is_some_and(|s| s.pt.is_quiescing()))
 }
 
-/// True while a fork quiesce is in progress, or the current thread's MM is
-/// quiescing for a stage-1 page-table edit. Blocking waits OR this into their
-/// wake predicate so they return (spurious EINTR) and reach the run-loop-top
-/// barrier instead of re-parking.
+/// Returns true if the current thread's MM is currently quiescing for a fork.
+pub fn is_current_mm_fork_quiescing() -> bool {
+    CURRENT_MM_QUIESCE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|s| s.fork.is_quiescing())
+    })
+}
+
+/// True while a fork quiesce is in progress for the current thread's MM, or the
+/// current thread's MM is quiescing for a stage-1 page-table edit. Blocking waits
+/// OR this into their wake predicate so they return (spurious EINTR) and reach
+/// the run-loop-top barrier instead of re-parking.
 pub fn is_quiescing() -> bool {
-    barrier().is_quiescing() || is_current_mm_quiescing()
+    is_current_mm_fork_quiescing() || is_current_mm_quiescing()
 }
 
 /// Serializes carrier-wide topology mutations: shared-frame publication and
@@ -1913,17 +1935,27 @@ mod tests {
     #[test]
     fn fork_in_one_mm_does_not_park_executors_of_another() {
         let mm_a = Arc::new(PtQuiesce::new());
+        let fork_a = Arc::new(ForkQuiesce::new());
         let mm_b = Arc::new(PtQuiesce::new());
+        let fork_b = Arc::new(ForkQuiesce::new());
 
         let t1 = std::thread::spawn(move || {
-            let _guard_a = bind_current_mm_quiesce(mm_a);
-            barrier().set_quiescing();
+            let _guard_a = bind_current_mm_quiesce(mm_a, Arc::clone(&fork_a));
+            fork_a.set_quiescing();
+            assert!(
+                is_quiescing(),
+                "executor bound to MM A must report quiescing"
+            );
             let t2 = std::thread::spawn(move || {
-                let _guard_b = bind_current_mm_quiesce(mm_b);
+                let _guard_b = bind_current_mm_quiesce(mm_b, Arc::clone(&fork_b));
                 !is_quiescing()
             });
             let executor_b_not_quiescing = t2.join().unwrap();
-            barrier().end_quiesce();
+            fork_a.end_quiesce();
+            assert!(
+                !is_quiescing(),
+                "executor bound to MM A must report not quiescing after end_quiesce"
+            );
             executor_b_not_quiescing
         });
 

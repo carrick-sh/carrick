@@ -57,6 +57,7 @@ pub struct Mm {
     legacy_aio_contexts: RwLock<BTreeSet<crate::dispatch::LegacyAioContextId>>,
     next_legacy_aio_context: AtomicU64,
     pt_quiesce: Arc<carrick_thread::fork_quiesce::PtQuiesce>,
+    fork_quiesce: Arc<carrick_thread::fork_quiesce::ForkQuiesce>,
     revision: ObjectRevision,
 }
 
@@ -74,6 +75,7 @@ impl Mm {
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
+            fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             revision: ObjectRevision::new(),
         }
     }
@@ -88,6 +90,7 @@ impl Mm {
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
+            fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             revision: ObjectRevision::new(),
         }
     }
@@ -103,6 +106,7 @@ impl Mm {
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
+            fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             revision: ObjectRevision::new(),
         }
     }
@@ -117,12 +121,17 @@ impl Mm {
             legacy_aio_contexts: RwLock::new(BTreeSet::new()),
             next_legacy_aio_context: AtomicU64::new(1),
             pt_quiesce: Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new()),
+            fork_quiesce: Arc::new(carrick_thread::fork_quiesce::ForkQuiesce::new()),
             revision: ObjectRevision::new(),
         }
     }
 
     pub fn pt_quiesce(&self) -> &Arc<carrick_thread::fork_quiesce::PtQuiesce> {
         &self.pt_quiesce
+    }
+
+    pub fn fork_quiesce(&self) -> &Arc<carrick_thread::fork_quiesce::ForkQuiesce> {
+        &self.fork_quiesce
     }
 
     #[cfg(test)]

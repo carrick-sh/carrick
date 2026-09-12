@@ -1067,6 +1067,10 @@ impl SyscallDispatcher {
         Arc::clone(self.mm_authority().pt_quiesce())
     }
 
+    pub(crate) fn fork_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::ForkQuiesce> {
+        Arc::clone(self.mm_authority().fork_quiesce())
+    }
+
     #[cfg(test)]
     fn host_alias_transactions(&self) -> Arc<HostAliasTransactions> {
         Arc::clone(&self.mm_authority().host_alias_transactions)
