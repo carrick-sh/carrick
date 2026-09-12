@@ -17661,15 +17661,6 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 147,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping: carrick_hal::MappingId,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
       "line": 162,
       "categories": [
         "mapping"
@@ -17679,16 +17670,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 174,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 190,
+      "line": 177,
       "categories": [
         "mapping"
       ],
@@ -17697,7 +17679,25 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 209,
+      "line": 189,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 205,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping: carrick_hal::MappingId,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+      "line": 224,
       "categories": [
         "mapping"
       ],
@@ -17706,7 +17706,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 217,
+      "line": 232,
       "categories": [
         "mapping"
       ],
@@ -17715,7 +17715,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 391,
+      "line": 406,
       "categories": [
         "mapping"
       ],
@@ -17724,7 +17724,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 421,
+      "line": 436,
       "categories": [
         "mapping"
       ],
@@ -17733,7 +17733,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 428,
+      "line": 443,
       "categories": [
         "mapping"
       ],
@@ -17742,7 +17742,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 446,
+      "line": 461,
       "categories": [
         "mapping"
       ],
@@ -17751,7 +17751,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 464,
+      "line": 479,
       "categories": [
         "mapping"
       ],
@@ -17760,7 +17760,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 476,
+      "line": 491,
       "categories": [
         "mapping"
       ],
@@ -17769,7 +17769,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 489,
+      "line": 504,
       "categories": [
         "mapping"
       ],
@@ -17778,7 +17778,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 497,
+      "line": 512,
       "categories": [
         "mapping"
       ],
@@ -17787,7 +17787,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 506,
+      "line": 521,
       "categories": [
         "mapping"
       ],
@@ -17796,7 +17796,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 520,
+      "line": 535,
       "categories": [
         "mapping"
       ],
@@ -17805,7 +17805,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 526,
+      "line": 541,
       "categories": [
         "mapping"
       ],
@@ -17814,7 +17814,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 534,
+      "line": 549,
       "categories": [
         "mapping"
       ],
@@ -17823,7 +17823,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 541,
+      "line": 556,
       "categories": [
         "mapping"
       ],
@@ -17832,7 +17832,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 666,
+      "line": 681,
       "categories": [
         "mapping"
       ],
@@ -17841,7 +17841,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 667,
+      "line": 682,
       "categories": [
         "mapping"
       ],
@@ -17850,7 +17850,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 668,
+      "line": 683,
       "categories": [
         "mapping"
       ],
@@ -17859,7 +17859,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 669,
+      "line": 684,
       "categories": [
         "mapping"
       ],
@@ -17868,7 +17868,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 670,
+      "line": 685,
       "categories": [
         "mapping"
       ],
@@ -17877,7 +17877,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 671,
+      "line": 686,
       "categories": [
         "mapping"
       ],
@@ -17886,7 +17886,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 803,
+      "line": 818,
       "categories": [
         "mapping"
       ],
@@ -17895,7 +17895,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 856,
+      "line": 871,
       "categories": [
         "mapping"
       ],
@@ -17904,7 +17904,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 907,
+      "line": 922,
       "categories": [
         "mapping"
       ],
@@ -17913,7 +17913,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1061,
+      "line": 1076,
       "categories": [
         "mapping"
       ],
