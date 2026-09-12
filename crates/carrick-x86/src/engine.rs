@@ -1288,20 +1288,19 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         self.vm.map_host_alias(va, ipa, len, payload, backing)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn inject_signal(
-        &mut self,
-        signum: i32,
-        handler: u64,
-        sa_restorer: u64,
-        pending_syscall_retval: Option<i64>,
-        interrupted_pc: Option<u64>,
-        altstack: Option<(u64, u64)>,
-        saved_sigmask: u64,
-        fault_siginfo: Option<(i32, u64)>,
-        queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
-        restart_syscall: bool,
-    ) -> Result<(), TrapError> {
+    fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
+        let carrick_hal::SignalInjection {
+            signum,
+            handler,
+            sa_restorer,
+            pending_syscall_retval,
+            interrupted_pc,
+            altstack,
+            saved_sigmask,
+            fault_siginfo,
+            queued_siginfo,
+            restart_syscall,
+        } = signal;
         // The interrupted RFLAGS, saved into the frame's eflags and restored
         // verbatim by rt_sigreturn (x86 has no privilege-latched SPSR analogue).
         let pstate_source = self
