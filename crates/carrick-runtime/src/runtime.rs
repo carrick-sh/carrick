@@ -3078,7 +3078,7 @@ mod tests {
             ("dispatch/sysv.rs", [1, 0, 3]),
             ("dispatch/tests.rs", [2, 0, 0]),
             ("exec_stamps.rs", [1, 0, 0]),
-            ("fs_backend.rs", [1, 0, 0]),
+            ("fs_backend/tests.rs", [1, 0, 0]),
             // Task 7's budget-one proof self-spawns this exact unit test in an
             // isolated process so it can install the process-global vCPU
             // scheduler before any sibling test initializes the OnceLock.
@@ -3088,7 +3088,7 @@ mod tests {
             // One cfg(test)-only helper self-spawns the exact lock-order or
             // terminal-retirement regression, bounds it, and reaps its child.
             // No production process creation is added by this test containment.
-            ("vcpu_loop/continuation.rs", [0, 0, 1]),
+            ("vcpu_loop/continuation/tests.rs", [0, 0, 1]),
             // This unit test self-spawns to isolate a process-global abort
             // boundary while proving pending exec error preservation. It is
             // not production host-process-per-guest architecture.

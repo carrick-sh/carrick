@@ -4008,18 +4008,17 @@ thread_local! {
     static TASK_MAPPING_ROWS_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Account one linear pass over the CARRIER-GLOBAL alias / replay / version
-/// state.
+/// Account one linear pass over the alias / replay / version state.
 ///
 /// This exists so an algorithmic-complexity regression is a TEST FAILURE
-/// rather than a timing observation. The alias registry, the replay set and
-/// the alias version chains are carrier-global containers that hold rows
-/// belonging to every live guest process, and a per-process operation that
-/// scans them is O(all processes) — the `docs/identity-and-scope-domains.md`
-/// scope-domain defect. Measured on 2026-08-30, that made guest process exit
-/// cost 38.7 ms of globally serialized topology-lock hold with 1,000 children
-/// live, decaying monotonically to 5.3 ms as they drained: an O(N^2) exit path
-/// that `futexforkrequeue` could not reap inside its 40 s bound.
+/// rather than a timing observation. Replay sets and alias version chains
+/// are partitioned per alias scope in `AliasScopeBucket`, while historical
+/// carrier-global alias containers held rows belonging to every live guest process.
+/// A per-process operation that scans foreign rows is O(all processes) — the
+/// `docs/identity-and-scope-domains.md` scope-domain defect. Measured on 2026-08-30,
+/// that made guest process exit cost 38.7 ms of globally serialized topology-lock hold
+/// with 1,000 children live, decaying monotonically to 5.3 ms as they drained: an O(N^2)
+/// exit path that `futexforkrequeue` could not reap inside its 40 s bound.
 ///
 /// A wall-clock assertion for that shape is load-sensitive and would be
 /// excluded from CI within a week. A visited-row count is deterministic, so

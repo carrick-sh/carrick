@@ -1419,6 +1419,8 @@ mod tests {
             "yield_now",
             "thread::sleep",
             ".close_for_fork(",
+            "try_acquire_topology_lock",
+            "subscribe_topology_release",
         ] {
             assert!(
                 !fork.contains(prohibited),
@@ -1437,8 +1439,7 @@ mod tests {
             "if is_external_exec || request.clone_parent",
             "PreparedInProcessFork::Retry",
             "subscribe_lease_drain",
-            "try_acquire_topology_lock",
-            "subscribe_topology_release",
+            "parent_mutation.begin_transaction()",
             "fork_barrier_participants",
         ] {
             assert!(
