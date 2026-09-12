@@ -490,3 +490,14 @@ queue behind each other. A CPython `multiprocessing` parent is threaded
   arbiter for shared frames, which is why the registry guard wraps exactly
   the publication step. Task 0's trace decides ordering of Tasks 3–6 by
   where the wait time actually sits.
+
+## Measurement note (2026-09-12, after Task 4)
+
+`hvpatch-phase4-topology-lock.d` on the multiprocessing row recorded zero
+events (`empty=1`) and `hvpatch-fork-wait-roundtrip.d` recorded `pairs=0`:
+both key on the `carrick*:::hvpatch-topology-lock` USDT firings, which now
+have no production site. That is Task 4 working, and it also blinds the two
+instruments. Task 5 must fire the same append-only operation ids from
+`MmTransactionGuard` (per-mm hold) and `FrameRegistryGuard` (leaf hold)
+acquisitions so the scripts measure the new authorities, and the fork-wait
+script's anchors must be re-qualified live before its numbers are cited.
