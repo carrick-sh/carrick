@@ -5,7 +5,7 @@
 //! `CARRICK_LAST_FATAL` so post-mortem core dumps retain the exact domain and
 //! reason.
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 pub const CARRICK_FATAL_MAGIC: u64 = 0x4341_5252_4641_544c; // "CARRFATL"
 pub const MAX_DOMAIN_LEN: usize = 64;
@@ -66,6 +66,43 @@ pub type FatalHook = fn(&'static str, &str);
 
 static FATAL_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static FATAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static DEBUGGER_HOLD_SECS: AtomicU32 = AtomicU32::new(0);
+
+/// Hold the process alive for `secs` seconds on the fatal path -- after the
+/// fatal line and `CARRICK_LAST_FATAL` are written, before the hook and the
+/// abort -- so a debugger can attach and save a core of the exact failing
+/// graph. Zero (the default) disables the hold.
+///
+/// Why: `carrick debug lldb-run` attaches at its deadline, so an invariant
+/// abort that fires first leaves only stderr. The hold line names the host pid
+/// to attach to (`sudo lldb -p <pid> -o "process save-core ..."`).
+pub fn arm_debugger_hold(secs: u32) {
+    DEBUGGER_HOLD_SECS.store(secs, Ordering::Release);
+}
+
+/// Format the hold line without heap allocation and sleep for the armed hold.
+fn hold_for_debugger() {
+    let secs = DEBUGGER_HOLD_SECS.load(Ordering::Acquire);
+    if secs == 0 {
+        return;
+    }
+    let mut line_buf = [0u8; 128];
+    let mut writer = SliceWriter {
+        buf: &mut line_buf,
+        len: 0,
+    };
+    let pid = unsafe { libc::getpid() };
+    let _ = core::fmt::Write::write_fmt(
+        &mut writer,
+        format_args!("carrick fatal: holding {secs} s for a debugger (pid {pid})\n"),
+    );
+    let len = writer.len;
+    write_stderr(&line_buf[..len]);
+    let mut remaining = secs;
+    while remaining > 0 {
+        remaining = unsafe { libc::sleep(remaining) };
+    }
+}
 
 /// Register an optional callback invoked on the fatal crash path before aborting.
 ///
@@ -193,6 +230,8 @@ pub fn fatal(domain: &'static str, args: core::fmt::Arguments<'_>) -> ! {
     record.message[..msg_len].copy_from_slice(msg_bytes);
     record.message[msg_len..].fill(0);
 
+    hold_for_debugger();
+
     let hook_ptr = FATAL_HOOK.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !hook_ptr.is_null() {
         let hook: FatalHook = unsafe { core::mem::transmute(hook_ptr) };
@@ -286,6 +325,44 @@ mod tests {
         assert!(msg.starts_with("prefix: xxxx"));
         assert!(line_len <= 1280);
         assert_eq!(line_buf[line_len - 1], b'\n');
+    }
+
+    #[test]
+    fn debugger_hold_delays_the_abort_and_names_the_pid() {
+        if std::env::var("CARRICK_FATAL_TEST_MODE").as_deref() == Ok("hold") {
+            arm_debugger_hold(2);
+            carrick_fatal!("hold_domain", "hold test: {}", 1);
+        }
+        let current_exe = std::env::current_exe().expect("current exe");
+        let started = std::time::Instant::now();
+        let output = std::process::Command::new(&current_exe)
+            .arg("debugger_hold_delays_the_abort_and_names_the_pid")
+            .arg("--nocapture")
+            .env("CARRICK_FATAL_TEST_MODE", "hold")
+            .output()
+            .expect("run child");
+        let elapsed = started.elapsed();
+        assert!(
+            !output.status.success(),
+            "child must still abort after the hold"
+        );
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(output.status.signal(), Some(libc::SIGABRT));
+        }
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2),
+            "the hold must delay the abort by the armed seconds, elapsed={elapsed:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("carrick fatal [hold_domain]: hold test: 1\n"),
+            "fatal line must be written BEFORE the hold so the operator sees it: {stderr}"
+        );
+        assert!(
+            stderr.contains("carrick fatal: holding 2 s for a debugger (pid "),
+            "hold line must name the seconds and the pid to attach to: {stderr}"
+        );
     }
 
     #[test]

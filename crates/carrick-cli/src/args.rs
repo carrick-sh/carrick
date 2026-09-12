@@ -1041,6 +1041,12 @@ pub(crate) enum DebugCommand {
         /// observed. Diagnostic-only; normal runs are unaffected.
         #[arg(long = "stop-on-signal")]
         stop_on_signal: Option<i32>,
+        /// Seconds a `carrick_fatal!` abort holds the carrier alive so lldb can
+        /// attach and save a core of the failing graph (the child runs with
+        /// `CARRICK_FATAL_HOLD_SECS`; the hold line in the guest log triggers
+        /// the dump at once). Defaults to `--deadline-seconds`; `0` disables.
+        #[arg(long = "fatal-hold-seconds")]
+        fatal_hold_seconds: Option<u64>,
         /// Arguments for `carrick run` after `--`, excluding the `run` word.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,

@@ -335,6 +335,7 @@ dependencies = [
  "bollard",
  "camino",
  "carrick-engine",
+ "carrick-fatal",
  "carrick-host-bsd",
  "carrick-image",
  "carrick-runtime",
