@@ -394,3 +394,20 @@ commits and is re-checked at the next vet.
   per carrier. Tasks 1 and 2 dispatched (`mm-two-process-tests`,
   `mm-topology-guards`); Tasks 3–6 wait for the split/perf landings that
   own the same files; Task 0 (traces) runs on the next quiet host.
+- Worker round 1 (90 min budgets) outcomes: alias-retain-index and
+  alias-newest-index done and reviewed. Review finding on alias-retain: the
+  keyed removal discovered candidates by the SEMANTIC IPA index while the
+  retirement predicate matches the PHYSICAL stage-2 extent; the worker's
+  red-first differential test against an unconstrained full-walk reference
+  failed (`ref=5 keyed=6`, a missed row), and an explicit
+  projection-inside-physical-extent assertion failed an existing custody
+  test, so a `by_physical` index now feeds discovery too (de7e8fde0). On
+  alias-newest: the legacy `by_va_start`/`by_ipa_start` maps were kept
+  beside the class index (double maintenance); deleted in 6d625c8bc.
+  The five splits each committed one submodule before the budget and were
+  re-tasked to continue at green boundaries; tma deleted 9/101 allows (CLI
+  only) and continues into the runtime; hostfs-amplification landed the
+  right shape but with a `serves_dentry_cache()` if/else (a second path),
+  three copies of the parent-resolution logic, `.ok()`-swallowed dirfd
+  errors and no red-first numbers — re-tasked; syscall-names and
+  fatal-residue are in director verification for landing.
