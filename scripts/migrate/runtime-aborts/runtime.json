@@ -1757,7 +1757,7 @@
       "domain": "kernel::thread_retirement"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/session.rs",
       "function": "Kernel::initialize_launch_controlling_tty",
       "ordinal_in_function": 1,
       "fingerprint": "dd5c19cb1be241c48359148f3766f722f2d6415936624bfb4a3c0a1fe2187340",
@@ -1768,7 +1768,7 @@
       "domain": "kernel::tty_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/session.rs",
       "function": "Kernel::initialize_launch_controlling_tty",
       "ordinal_in_function": 2,
       "fingerprint": "1f89c1300b7d2eb9a2f7e178b20d38c121ba1a77d0a600a889076ab2ad7a0807",
@@ -1779,7 +1779,7 @@
       "domain": "kernel::tty_identity"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/session.rs",
       "function": "Kernel::set_process_group",
       "ordinal_in_function": 1,
       "fingerprint": "e716380b6db7bfc3decd6c4dedf9dd7ec88c6144e11c1b6ed1e9f2d2a37accdc",
