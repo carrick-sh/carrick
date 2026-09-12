@@ -107,19 +107,33 @@ pub(crate) struct V2ProfileAuthority {
     preflight: Option<crate::quiet_host::QuietHostReceipt>,
 }
 
+#[derive(Debug)]
+pub(crate) struct V2ProfileAuthorityArgs<'a, I> {
+    pub(crate) profile: TraceProfileKind,
+    pub(crate) os_build: &'a str,
+    pub(crate) program_sha256: &'a str,
+    pub(crate) birth_qualification_sha256: &'a str,
+    pub(crate) terminal_qualification_sha256: &'a str,
+    pub(crate) terminal_qualifications: I,
+    pub(crate) amplification_target: Option<crate::amplification_profile::NativeShapeTarget>,
+    pub(crate) preflight: Option<crate::quiet_host::QuietHostReceipt>,
+}
+
 #[allow(dead_code)]
 impl V2ProfileAuthority {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_for_profile(
-        profile: TraceProfileKind,
-        os_build: &str,
-        program_sha256: &str,
-        birth_qualification_sha256: &str,
-        terminal_qualification_sha256: &str,
-        terminal_qualifications: impl IntoIterator<Item = (String, String, String)>,
-        amplification_target: Option<crate::amplification_profile::NativeShapeTarget>,
-        preflight: Option<crate::quiet_host::QuietHostReceipt>,
+        args: V2ProfileAuthorityArgs<'_, impl IntoIterator<Item = (String, String, String)>>,
     ) -> Result<Self> {
+        let V2ProfileAuthorityArgs {
+            profile,
+            os_build,
+            program_sha256,
+            birth_qualification_sha256,
+            terminal_qualification_sha256,
+            terminal_qualifications,
+            amplification_target,
+            preflight,
+        } = args;
         if profile != TraceProfileKind::NativeAmplification {
             bail!("profile {:?} does not use native launch authority", profile);
         }

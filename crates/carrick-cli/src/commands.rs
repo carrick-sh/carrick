@@ -460,10 +460,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             push,
             context,
         } => {
-            run_build(
-                &store, tag, file, build_arg, no_cache, cache, cache_repo, platform, output, push,
+            run_build(BuildArgs {
+                store: &store,
+                tag,
+                file,
+                build_arg,
+                no_cache,
+                cache,
+                cache_repo,
+                platform,
+                output,
+                push,
                 context,
-            )?;
+            })?;
         }
         Commands::Run {
             run_args,
@@ -684,16 +693,16 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             env,
             container,
             command,
-        } => crate::lifecycle::exec(
-            store.clone(),
-            &container,
+        } => crate::lifecycle::exec(crate::lifecycle::ExecArgs {
+            store: store.clone(),
+            spec: &container,
             command,
             interactive,
             tty,
             user,
             workdir,
             env,
-        )?,
+        })?,
         Commands::DispatchSyscall {
             number,
             args,
@@ -1793,6 +1802,21 @@ const KANIKO_IMAGE: &str = "gcr.io/kaniko-project/executor:v1.24.0";
 /// `RepoTags`, which is what `carrick load` then tags the image as).
 const DEFAULT_BUILD_TAG: &str = "carrick-build:latest";
 
+#[derive(Debug)]
+pub(crate) struct BuildArgs<'a> {
+    pub(crate) store: &'a ImageStore,
+    pub(crate) tag: Option<String>,
+    pub(crate) file: std::path::PathBuf,
+    pub(crate) build_arg: Vec<String>,
+    pub(crate) no_cache: bool,
+    pub(crate) cache: bool,
+    pub(crate) cache_repo: Option<String>,
+    pub(crate) platform: Option<String>,
+    pub(crate) output: Option<std::path::PathBuf>,
+    pub(crate) push: bool,
+    pub(crate) context: std::path::PathBuf,
+}
+
 /// `carrick build` — a thin wrapper that builds a Dockerfile by running the real
 /// kaniko executor as a carrick guest, then loads the result into the store.
 ///
@@ -1801,20 +1825,20 @@ const DEFAULT_BUILD_TAG: &str = "carrick-build:latest";
 /// (the server-as-translator pattern: shell out to our own binary, inheriting
 /// stdio so kaniko's progress streams live) and then either lets kaniko push or
 /// ingests the resulting tar with [`ImageStore::load_docker_archive`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_build(
-    store: &ImageStore,
-    tag: Option<String>,
-    file: std::path::PathBuf,
-    build_arg: Vec<String>,
-    no_cache: bool,
-    cache: bool,
-    cache_repo: Option<String>,
-    platform: Option<String>,
-    output: Option<std::path::PathBuf>,
-    push: bool,
-    context: std::path::PathBuf,
-) -> anyhow::Result<()> {
+pub(crate) fn run_build(args: BuildArgs<'_>) -> anyhow::Result<()> {
+    let BuildArgs {
+        store,
+        tag,
+        file,
+        build_arg,
+        no_cache,
+        cache,
+        cache_repo,
+        platform,
+        output,
+        push,
+        context,
+    } = args;
     if push && output.is_some() {
         bail!("--output cannot be combined with --push");
     }
@@ -1879,18 +1903,18 @@ pub(crate) fn run_build(
     };
     let out_path = out_dir.as_ref().map(|d| d.path().to_path_buf());
 
-    let argv = kaniko_run_argv(
-        "carrick",
-        &context_copy.to_string_lossy(),
-        out_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        &dockerfile_rel,
-        &destination,
-        &build_arg,
+    let argv = kaniko_run_argv(KanikoRunArgs {
+        carrick_bin: "carrick",
+        context_abs: &context_copy.to_string_lossy(),
+        out_dir: out_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        dockerfile_rel: &dockerfile_rel,
+        destination: &destination,
+        build_args: &build_arg,
         no_cache,
         cache,
-        cache_repo.as_deref(),
-        platform.as_deref(),
-    );
+        cache_repo: cache_repo.as_deref(),
+        platform: platform.as_deref(),
+    });
 
     let image_index = argv
         .iter()
@@ -2100,19 +2124,51 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
 /// Cache flag priority: `no_cache` wins over `cache`. Only one of
 /// `--cache=false` or `--cache=true` is ever emitted. `cache_repo` is only
 /// meaningful (and only emitted) when `cache` is set and `no_cache` is not.
-#[allow(clippy::too_many_arguments)]
-fn kaniko_run_argv(
-    carrick_bin: &str,
-    context_abs: &str,
+#[derive(Debug)]
+struct KanikoRunArgs<'a> {
+    carrick_bin: &'a str,
+    context_abs: &'a str,
     out_dir: Option<String>,
-    dockerfile_rel: &str,
-    destination: &str,
-    build_args: &[String],
+    dockerfile_rel: &'a str,
+    destination: &'a str,
+    build_args: &'a [String],
     no_cache: bool,
     cache: bool,
-    cache_repo: Option<&str>,
-    platform: Option<&str>,
-) -> Vec<String> {
+    cache_repo: Option<&'a str>,
+    platform: Option<&'a str>,
+}
+
+#[cfg(test)]
+impl<'a> Default for KanikoRunArgs<'a> {
+    fn default() -> Self {
+        Self {
+            carrick_bin: "carrick",
+            context_abs: "/ctx",
+            out_dir: None,
+            dockerfile_rel: "Dockerfile",
+            destination: "app:latest",
+            build_args: &[],
+            no_cache: false,
+            cache: false,
+            cache_repo: None,
+            platform: None,
+        }
+    }
+}
+
+fn kaniko_run_argv(args: KanikoRunArgs<'_>) -> Vec<String> {
+    let KanikoRunArgs {
+        carrick_bin,
+        context_abs,
+        out_dir,
+        dockerfile_rel,
+        destination,
+        build_args,
+        no_cache,
+        cache,
+        cache_repo,
+        platform,
+    } = args;
     let mut argv: Vec<String> = vec![
         carrick_bin.to_owned(),
         "run".to_owned(),
@@ -2374,18 +2430,15 @@ mod tests {
 
     #[test]
     fn kaniko_argv_no_push_maps_flags() {
-        let argv = kaniko_run_argv(
-            "/usr/local/bin/carrick",
-            "/abs/context",
-            Some("/tmp/out".to_owned()),
-            "Dockerfile",
-            "app",
-            &["X=1".to_owned()],
-            false,
-            false,
-            None,
-            None,
-        );
+        let argv = kaniko_run_argv(KanikoRunArgs {
+            carrick_bin: "/usr/local/bin/carrick",
+            context_abs: "/abs/context",
+            out_dir: Some("/tmp/out".to_owned()),
+            dockerfile_rel: "Dockerfile",
+            destination: "app",
+            build_args: &["X=1".to_owned()],
+            ..Default::default()
+        });
         assert_eq!(
             argv,
             vec![
@@ -2420,18 +2473,13 @@ mod tests {
 
     #[test]
     fn kaniko_argv_push_omits_out_mount_and_no_push() {
-        let argv = kaniko_run_argv(
-            "carrick",
-            "/ctx",
-            None,
-            "docker/Dockerfile.prod",
-            "registry.example.com/app:v2",
-            &[],
-            true,
-            false,
-            None,
-            Some("linux/amd64"),
-        );
+        let argv = kaniko_run_argv(KanikoRunArgs {
+            dockerfile_rel: "docker/Dockerfile.prod",
+            destination: "registry.example.com/app:v2",
+            no_cache: true,
+            platform: Some("linux/amd64"),
+            ..Default::default()
+        });
         // No /out mount, no --no-push, no --tar-path on the push path.
         assert!(!argv.iter().any(|a| a == "--no-push"));
         assert!(!argv.iter().any(|a| a == "--tar-path"));
@@ -2473,31 +2521,16 @@ mod tests {
     #[test]
     fn kaniko_argv_never_uses_new_run() {
         // no-push path
-        let no_push = kaniko_run_argv(
-            "carrick",
-            "/ctx",
-            Some("/tmp/out".to_owned()),
-            "Dockerfile",
-            "app",
-            &[],
-            false,
-            false,
-            None,
-            None,
-        );
+        let no_push = kaniko_run_argv(KanikoRunArgs {
+            out_dir: Some("/tmp/out".to_owned()),
+            destination: "app",
+            ..Default::default()
+        });
         // push path
-        let push = kaniko_run_argv(
-            "carrick",
-            "/ctx",
-            None,
-            "Dockerfile",
-            "app",
-            &[],
-            false,
-            false,
-            None,
-            None,
-        );
+        let push = kaniko_run_argv(KanikoRunArgs {
+            destination: "app",
+            ..Default::default()
+        });
         for argv in [&no_push, &push] {
             assert!(
                 !argv.iter().any(|a| a == "--use-new-run"),
@@ -2510,18 +2543,10 @@ mod tests {
     /// `--cache=false`.
     #[test]
     fn kaniko_argv_cache_no_repo() {
-        let argv = kaniko_run_argv(
-            "carrick",
-            "/ctx",
-            None,
-            "Dockerfile",
-            "app:latest",
-            &[],
-            false, // no_cache
-            true,  // cache
-            None,  // cache_repo
-            None,
-        );
+        let argv = kaniko_run_argv(KanikoRunArgs {
+            cache: true,
+            ..Default::default()
+        });
         assert!(
             argv.iter().any(|a| a == "--cache=true"),
             "expected --cache=true in {argv:?}"
@@ -2540,18 +2565,11 @@ mod tests {
     /// `--cache-repo localhost:5000/cache` appear in argv.
     #[test]
     fn kaniko_argv_cache_with_repo() {
-        let argv = kaniko_run_argv(
-            "carrick",
-            "/ctx",
-            None,
-            "Dockerfile",
-            "app:latest",
-            &[],
-            false,                        // no_cache
-            true,                         // cache
-            Some("localhost:5000/cache"), // cache_repo
-            None,
-        );
+        let argv = kaniko_run_argv(KanikoRunArgs {
+            cache: true,
+            cache_repo: Some("localhost:5000/cache"),
+            ..Default::default()
+        });
         assert!(
             argv.iter().any(|a| a == "--cache=true"),
             "expected --cache=true in {argv:?}"
@@ -2570,18 +2588,12 @@ mod tests {
     /// `--no-cache --cache` (both) → `--cache=false` wins; no `--cache=true`.
     #[test]
     fn kaniko_argv_no_cache_wins_over_cache() {
-        let argv = kaniko_run_argv(
-            "carrick",
-            "/ctx",
-            None,
-            "Dockerfile",
-            "app:latest",
-            &[],
-            true, // no_cache
-            true, // cache
-            Some("localhost:5000/cache"),
-            None,
-        );
+        let argv = kaniko_run_argv(KanikoRunArgs {
+            no_cache: true,
+            cache: true,
+            cache_repo: Some("localhost:5000/cache"),
+            ..Default::default()
+        });
         assert!(
             argv.iter().any(|a| a == "--cache=false"),
             "expected --cache=false in {argv:?}"
@@ -2595,18 +2607,7 @@ mod tests {
     /// Default (no cache flags) → no `--cache=*` emitted at all.
     #[test]
     fn kaniko_argv_default_no_cache_flags() {
-        let argv = kaniko_run_argv(
-            "carrick",
-            "/ctx",
-            None,
-            "Dockerfile",
-            "app:latest",
-            &[],
-            false, // no_cache
-            false, // cache
-            None,
-            None,
-        );
+        let argv = kaniko_run_argv(KanikoRunArgs::default());
         assert!(
             !argv.iter().any(|a| a.starts_with("--cache")),
             "unexpected cache flag in {argv:?}"

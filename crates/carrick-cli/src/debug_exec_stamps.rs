@@ -797,10 +797,9 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 mod tests {
     use super::*;
 
-    #[allow(clippy::too_many_arguments)]
-    fn line(
+    struct TestStampLine<'a> {
         pid: u32,
-        phase: &str,
+        phase: &'a str,
         mono_ns: u64,
         process_ns: u64,
         thread_ns: u64,
@@ -808,39 +807,114 @@ mod tests {
         link_id: u64,
         related_status: i32,
         related_ns: u64,
-    ) -> String {
-        let valid = if phase == "wait-reaped" || phase == "run-complete" {
+    }
+
+    fn line(args: TestStampLine<'_>) -> String {
+        let valid = if args.phase == "wait-reaped" || args.phase == "run-complete" {
             15
         } else {
             7
         };
         format!(
-            "EXECSTAMP2|pid={pid}|phase={phase}|valid={valid}|mono_ns={mono_ns}|\
-             process_user_ns={process_ns}|process_system_ns=0|thread_user_ns={thread_ns}|\
-             thread_system_ns=0|related_pid={related_pid}|link_id={link_id}|\
-             related_status={related_status}|related_user_ns={related_ns}|related_system_ns=0\n"
+            "EXECSTAMP2|pid={}|phase={}|valid={valid}|mono_ns={}|\
+             process_user_ns={}|process_system_ns=0|thread_user_ns={}|\
+             thread_system_ns=0|related_pid={}|link_id={}|\
+             related_status={}|related_user_ns={}|related_system_ns=0\n",
+            args.pid,
+            args.phase,
+            args.mono_ns,
+            args.process_ns,
+            args.thread_ns,
+            args.related_pid,
+            args.link_id,
+            args.related_status,
+            args.related_ns
         )
+    }
+
+    fn simple_line(pid: u32, phase: &str, mono_ns: u64, process_ns: u64, thread_ns: u64) -> String {
+        line(TestStampLine {
+            pid,
+            phase,
+            mono_ns,
+            process_ns,
+            thread_ns,
+            related_pid: 0,
+            link_id: 0,
+            related_status: 0,
+            related_ns: 0,
+        })
     }
 
     fn complete_fixture() -> String {
         let mut text = String::new();
-        text += &line(100, "clone-enter", 100, 100, 50, 0, 1, 0, 0);
-        text += &line(200, "fork-child-start", 110, 5, 5, 100, 1, 0, 0);
-        text += &line(100, "clone-parent-return", 120, 120, 70, 200, 1, 0, 0);
-        text += &line(200, "execve-dispatch", 130, 15, 15, 0, 0, 0, 0);
-        text += &line(200, "capsule-prepare", 140, 20, 20, 0, 0, 0, 0);
-        text += &line(200, "pre-exec", 150, 30, 30, 0, 0, 0, 0);
-        text += &line(200, "main-entry", 170, 50, 50, 0, 0, 0, 0);
-        text += &line(200, "probes-ready", 175, 55, 55, 0, 0, 0, 0);
-        text += &line(200, "resume-entry", 180, 60, 60, 0, 0, 0, 0);
-        text += &line(200, "dispatcher-ready", 185, 65, 65, 0, 0, 0, 0);
-        text += &line(200, "image-mapped", 190, 70, 70, 0, 0, 0, 0);
-        text += &line(200, "runtime-ready", 200, 80, 80, 0, 0, 0, 0);
-        text += &line(200, "exit-begin", 300, 150, 150, 0, 0, 0, 0);
-        text += &line(200, "runtime-return", 310, 160, 160, 0, 0, 0, 0);
-        text += &line(200, "pre-host-exit", 315, 165, 165, 0, 0, 0, 0);
-        text += &line(100, "wait-reaped", 320, 130, 80, 200, 0, 0, 180);
-        text += &line(10, "run-complete", 400, 30, 30, 0, 0, 0, 220);
+        text += &line(TestStampLine {
+            pid: 100,
+            phase: "clone-enter",
+            mono_ns: 100,
+            process_ns: 100,
+            thread_ns: 50,
+            related_pid: 0,
+            link_id: 1,
+            related_status: 0,
+            related_ns: 0,
+        });
+        text += &line(TestStampLine {
+            pid: 200,
+            phase: "fork-child-start",
+            mono_ns: 110,
+            process_ns: 5,
+            thread_ns: 5,
+            related_pid: 100,
+            link_id: 1,
+            related_status: 0,
+            related_ns: 0,
+        });
+        text += &line(TestStampLine {
+            pid: 100,
+            phase: "clone-parent-return",
+            mono_ns: 120,
+            process_ns: 120,
+            thread_ns: 70,
+            related_pid: 200,
+            link_id: 1,
+            related_status: 0,
+            related_ns: 0,
+        });
+        text += &simple_line(200, "execve-dispatch", 130, 15, 15);
+        text += &simple_line(200, "capsule-prepare", 140, 20, 20);
+        text += &simple_line(200, "pre-exec", 150, 30, 30);
+        text += &simple_line(200, "main-entry", 170, 50, 50);
+        text += &simple_line(200, "probes-ready", 175, 55, 55);
+        text += &simple_line(200, "resume-entry", 180, 60, 60);
+        text += &simple_line(200, "dispatcher-ready", 185, 65, 65);
+        text += &simple_line(200, "image-mapped", 190, 70, 70);
+        text += &simple_line(200, "runtime-ready", 200, 80, 80);
+        text += &simple_line(200, "exit-begin", 300, 150, 150);
+        text += &simple_line(200, "runtime-return", 310, 160, 160);
+        text += &simple_line(200, "pre-host-exit", 315, 165, 165);
+        text += &line(TestStampLine {
+            pid: 100,
+            phase: "wait-reaped",
+            mono_ns: 320,
+            process_ns: 130,
+            thread_ns: 80,
+            related_pid: 200,
+            link_id: 0,
+            related_status: 0,
+            related_ns: 180,
+        });
+        text += &line(TestStampLine {
+            pid: 10,
+            phase: "run-complete",
+            mono_ns: 400,
+            process_ns: 30,
+            thread_ns: 30,
+            related_pid: 0,
+            link_id: 0,
+            related_status: 0,
+            related_ns: 220,
+        });
         text
     }
 
@@ -883,23 +957,23 @@ mod tests {
     #[test]
     fn missing_exec_phase_fails_closed() {
         let fixture =
-            complete_fixture().replace(&line(200, "image-mapped", 190, 70, 70, 0, 0, 0, 0), "");
+            complete_fixture().replace(&simple_line(200, "image-mapped", 190, 70, 70), "");
         assert!(parse_report(&fixture, 1_000).is_err());
     }
 
     #[test]
     fn reaped_child_without_exported_exit_lifecycle_fails_closed() {
         let fixture = complete_fixture()
-            .replace(&line(200, "exit-begin", 300, 150, 150, 0, 0, 0, 0), "")
-            .replace(&line(200, "runtime-return", 310, 160, 160, 0, 0, 0, 0), "")
-            .replace(&line(200, "pre-host-exit", 315, 165, 165, 0, 0, 0, 0), "");
+            .replace(&simple_line(200, "exit-begin", 300, 150, 150), "")
+            .replace(&simple_line(200, "runtime-return", 310, 160, 160), "")
+            .replace(&simple_line(200, "pre-host-exit", 315, 165, 165), "");
         assert!(parse_report(&fixture, 1_000).is_err());
     }
 
     #[test]
     fn duplicate_terminal_lifecycle_stamp_fails_closed() {
         let mut fixture = complete_fixture();
-        fixture += &line(200, "runtime-return", 311, 161, 161, 0, 0, 0, 0);
+        fixture += &simple_line(200, "runtime-return", 311, 161, 161);
         assert!(parse_report(&fixture, 1_000).is_err());
     }
 }

@@ -194,18 +194,28 @@ fn run_client(client: &Path, port: u16) -> Option<Metrics> {
     Some(Metrics::parse(&s))
 }
 
+pub struct CrossBoundaryRequest<'a> {
+    pub root: &'a Path,
+    pub bin: &'a PathBuf,
+    pub case: &'a PerfCase,
+    pub reps: usize,
+    pub warm: usize,
+    pub cooldown: Duration,
+    pub date: &'a str,
+}
+
 /// Measure a cross-boundary case across native/carrick/docker, append rows, and
 /// return them. `date` is YYYY-MM-DD for the JSONL filename.
-#[allow(clippy::too_many_arguments)]
-pub fn run_cross_boundary(
-    root: &Path,
-    bin: &PathBuf,
-    case: &PerfCase,
-    reps: usize,
-    warm: usize,
-    cooldown: Duration,
-    date: &str,
-) -> Vec<ResultRow> {
+pub fn run_cross_boundary(req: CrossBoundaryRequest<'_>) -> Vec<ResultRow> {
+    let CrossBoundaryRequest {
+        root,
+        bin,
+        case,
+        reps,
+        warm,
+        cooldown,
+        date,
+    } = req;
     use base64::Engine as _;
     let server_probe = root.join(format!(
         "conformance-probes/target/aarch64-unknown-linux-musl/release/{}",
