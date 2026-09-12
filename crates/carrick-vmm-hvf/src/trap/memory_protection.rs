@@ -196,6 +196,160 @@ pub(crate) type AliasExactFirstIndex = std::collections::BTreeMap<
     std::collections::BTreeMap<(u64, u64), (u64, AliasBacking)>,
 >;
 
+/// Width-class partitioned start-keyed index for interval containment and overlap queries.
+///
+/// Lookups ask "the row registered LAST (or FIRST) whose window contains probe"
+/// or "rows whose windows overlap [start, end)". Keying by `(class, start)` where
+/// `class = ceil(log2(size))` bounds each class's walk by that class's own widest
+/// member: the dense run of small (e.g. 4 KiB) rows is searched over one page,
+/// and rare wide rows (e.g. 32 GiB arenas) are searched over their own width but only
+/// against the few rows in that class. Candidate selection is O(log n + answers)
+/// across active classes (<= 40 classes), eliminating full scans across thousands
+/// of irrelevant rows.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct AliasClassIndex {
+    pub(crate) by_class_start: std::collections::BTreeMap<(u32, u64), Vec<(u64, AliasBacking)>>,
+    pub(crate) class_counts: std::collections::BTreeMap<u32, usize>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl AliasClassIndex {
+    /// Which size class a window of `size` bytes belongs to: the exponent
+    /// of the smallest power of two that can hold it, so every member of class
+    /// `c` has `size <= 1 << c`.
+    pub(crate) fn class(size: u64) -> u32 {
+        match size.max(1).checked_next_power_of_two() {
+            Some(rounded) => rounded.ilog2(),
+            None => u64::BITS,
+        }
+    }
+
+    /// The widest window any member of class `c` can have.
+    pub(crate) fn class_radius(class: u32) -> u64 {
+        if class >= u64::BITS {
+            u64::MAX
+        } else {
+            1_u64 << class
+        }
+    }
+
+    pub(crate) fn insert(&mut self, start_key: u64, seq: u64, alias: AliasBacking) {
+        let class = Self::class(alias.size as u64);
+        self.by_class_start
+            .entry((class, start_key))
+            .or_default()
+            .push((seq, alias));
+        *self.class_counts.entry(class).or_default() += 1;
+    }
+
+    pub(crate) fn remove(&mut self, start_key: u64, seq: u64, alias: AliasBacking) {
+        let class = Self::class(alias.size as u64);
+        if let Some(rows) = self.by_class_start.get_mut(&(class, start_key)) {
+            if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
+                rows.remove(at);
+            }
+            if rows.is_empty() {
+                self.by_class_start.remove(&(class, start_key));
+            }
+        }
+        if let std::collections::btree_map::Entry::Occupied(mut count) =
+            self.class_counts.entry(class)
+        {
+            *count.get_mut() = count.get().saturating_sub(1);
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.by_class_start.clear();
+        self.class_counts.clear();
+    }
+
+    pub(crate) fn widest_window(&self) -> u64 {
+        self.class_counts
+            .keys()
+            .next_back()
+            .copied()
+            .map_or(0, Self::class_radius)
+    }
+
+    pub(crate) fn window_rows(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> impl Iterator<Item = &(u64, AliasBacking)> + '_ {
+        self.class_counts
+            .keys()
+            .copied()
+            .flat_map(move |class| {
+                let radius = Self::class_radius(class);
+                let lower = start.saturating_sub(radius.saturating_sub(1));
+                (lower < end).then_some(((class, lower), (class, end)))
+            })
+            .flat_map(move |(from, to)| {
+                self.by_class_start.range(from..to).flat_map(|(_, rows)| {
+                    note_alias_state_rows_scanned(rows.len());
+                    rows.iter()
+                })
+            })
+    }
+
+    pub(crate) fn newest_containing(
+        &self,
+        probe: u64,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        let mut newest: Option<(u64, AliasBacking)> = None;
+        for class in self.class_counts.keys() {
+            let radius = Self::class_radius(*class);
+            let lower = probe.saturating_sub(radius.saturating_sub(1));
+            for (&(_class, start_key), rows) in
+                self.by_class_start.range((*class, lower)..=(*class, probe))
+            {
+                note_alias_state_rows_scanned(rows.len());
+                for &(seq, alias) in rows {
+                    if newest.as_ref().is_none_or(|&(best_seq, _)| seq > best_seq)
+                        && probe < start_key.saturating_add(alias.size as u64)
+                        && matches(&alias)
+                    {
+                        newest = Some((seq, alias));
+                    }
+                }
+            }
+        }
+        newest.map(|(_, alias)| alias)
+    }
+
+    pub(crate) fn oldest_containing(
+        &self,
+        probe: u64,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        let mut oldest: Option<(u64, AliasBacking)> = None;
+        for class in self.class_counts.keys() {
+            let radius = Self::class_radius(*class);
+            let lower = probe.saturating_sub(radius.saturating_sub(1));
+            for (&(_class, start_key), rows) in
+                self.by_class_start.range((*class, lower)..=(*class, probe))
+            {
+                note_alias_state_rows_scanned(rows.len());
+                for &(seq, alias) in rows {
+                    if oldest.as_ref().is_none_or(|&(best_seq, _)| seq < best_seq)
+                        && probe < start_key.saturating_add(alias.size as u64)
+                        && matches(&alias)
+                    {
+                        oldest = Some((seq, alias));
+                    }
+                }
+            }
+        }
+        oldest.map(|(_, alias)| alias)
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct AliasRegistry {
@@ -211,15 +365,7 @@ pub(crate) struct AliasRegistry {
     /// Maintained total of every bucket's length; see [`Self::len`].
     pub(crate) rows: usize,
     /// Rows keyed by guest-VA window start, and by IPA window start.
-    ///
-    /// Three lookups ask "the row registered LAST whose window contains X"
-    /// without a scope to narrow by: `lookup_live_alias_by_va_any_scope`, the
-    /// IPA mapping lookup, and the shared-futex location lookup. Answering
-    /// those by walking every bucket is O(all live processes) per call on
-    /// paths a guest hits per fault and per futex operation — 23.3% of carrier
-    /// CPU once the bigger scans were gone. A row can contain X only if it
-    /// starts in `[X - widest, X]`, so these turn the walk into a bounded
-    /// range query; the exact containment test is unchanged.
+    /// Maintained for exact start lookup (`promote_exact_first_keys`) and structural testing.
     pub(crate) by_va_start: std::collections::BTreeMap<u64, Vec<(u64, AliasBacking)>>,
     pub(crate) by_ipa_start: std::collections::BTreeMap<u64, Vec<(u64, AliasBacking)>>,
     /// Exact physical stage-2 start index used by delayed owner retirement.
@@ -239,37 +385,17 @@ pub(crate) struct AliasRegistry {
     /// foreign process can never widen another mm's lookup.
     pub(crate) physical_size_counts_by_scope:
         std::collections::BTreeMap<AliasOwnershipScope, std::collections::BTreeMap<u64, usize>>,
-    /// The VA-window rows again, bucketed by window SIZE CLASS.
-    ///
-    /// Six call sites ask one question -- "which rows' guest-VA windows can
-    /// overlap this probe range" -- and they used to ask it as
-    /// `by_va_start.range(probe - widest_va .. end)` against a MONOTONE global
-    /// maximum window width. That made the walk length a property of the
-    /// POPULATION rather than of the answer: one live wide mapping widened the
-    /// window for every later query, and every materialized extent added a row
-    /// inside it. `docs/perf-results/2026-09-08-mapping-index-census.md`
-    /// measured that on the cpython-compile reducer at 341 visited rows per
-    /// first-touch fault at depth 100,000 rising to 847 at depth 800,000 --
-    /// 111 million rows in one run, 532x what the ordered mapping index
-    /// visited, and the last super-linear term on that path.
+    /// The VA-window and IPA-window rows, bucketed by window SIZE CLASS.
     ///
     /// Keying by `(class, start)` where `class = ceil(log2(size))` bounds each
-    /// class's walk by that class's OWN widest member: the dense run of
-    /// page-sized rows is searched over one page, and the rare wide row is
-    /// searched over its own width but only against the few rows its size.
-    /// The exact overlap test each caller applies is unchanged; only the
-    /// candidate set shrinks, and it shrinks to a superset of the answer.
-    pub(crate) by_va_class_start: std::collections::BTreeMap<(u32, u64), Vec<(u64, AliasBacking)>>,
-    /// Exact multiset of live VA size classes. Exact, not a high-water mark,
-    /// for the reason `physical_size_counts_by_scope` already records: a
-    /// monotone maximum is poisoned forever by one huge row that has since
-    /// retired. It also enumerates the classes a query must visit.
-    pub(crate) va_class_counts: std::collections::BTreeMap<u32, usize>,
-    /// Widest IPA window ever indexed. Only ever grows: a stale-wide bound
-    /// makes a query walk further than needed, never miss a row. The VA axis
-    /// carried the same shape until the census above; this axis was not
-    /// measured hot and keeps it.
-    pub(crate) widest_ipa: u64,
+    /// class's walk by that class's own widest member: the dense run of
+    /// small (e.g. 4 KiB) rows is searched over one page, and rare wide rows
+    /// (e.g. 32 GiB arenas) are searched over their own width but only
+    /// against the few rows in that class. This makes interval containment
+    /// queries O(log n + answers) across active classes (<= 40 classes),
+    /// eliminating carrier CPU hotspots in futex resolution and alias lookup.
+    pub(crate) va_classes: AliasClassIndex,
+    pub(crate) ipa_classes: AliasClassIndex,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -398,17 +524,12 @@ impl AliasRegistry {
             .entry(alias.start)
             .or_default()
             .push((seq, alias));
-        let class = Self::va_window_class(alias.size as u64);
-        self.by_va_class_start
-            .entry((class, alias.start))
-            .or_default()
-            .push((seq, alias));
-        *self.va_class_counts.entry(class).or_default() += 1;
+        self.va_classes.insert(alias.start, seq, alias);
         self.by_ipa_start
             .entry(alias.ipa)
             .or_default()
             .push((seq, alias));
-        self.widest_ipa = self.widest_ipa.max(alias.size as u64);
+        self.ipa_classes.insert(alias.ipa, seq, alias);
         self.by_physical_start
             .entry(alias.physical_ipa)
             .or_default()
@@ -434,23 +555,7 @@ impl AliasRegistry {
                 self.by_va_start.remove(&alias.start);
             }
         }
-        let class = Self::va_window_class(alias.size as u64);
-        if let Some(rows) = self.by_va_class_start.get_mut(&(class, alias.start)) {
-            if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
-                rows.remove(at);
-            }
-            if rows.is_empty() {
-                self.by_va_class_start.remove(&(class, alias.start));
-            }
-        }
-        if let std::collections::btree_map::Entry::Occupied(mut count) =
-            self.va_class_counts.entry(class)
-        {
-            *count.get_mut() = count.get().saturating_sub(1);
-            if *count.get() == 0 {
-                count.remove();
-            }
-        }
+        self.va_classes.remove(alias.start, seq, alias);
         if let Some(rows) = self.by_ipa_start.get_mut(&alias.ipa) {
             if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
                 rows.remove(at);
@@ -459,6 +564,7 @@ impl AliasRegistry {
                 self.by_ipa_start.remove(&alias.ipa);
             }
         }
+        self.ipa_classes.remove(alias.ipa, seq, alias);
         if let Some(rows) = self.by_physical_start.get_mut(&alias.physical_ipa) {
             if let Some(at) = rows.iter().position(|row| *row == (seq, alias)) {
                 rows.remove(at);
@@ -498,14 +604,13 @@ impl AliasRegistry {
     /// constructed directly rather than through the mutators.
     pub(crate) fn reindex(&mut self) {
         self.by_va_start.clear();
-        self.by_va_class_start.clear();
-        self.va_class_counts.clear();
+        self.va_classes.clear();
         self.by_ipa_start.clear();
+        self.ipa_classes.clear();
         self.by_physical_start.clear();
         self.by_scope_physical_start.clear();
         self.physical_size_counts_by_scope.clear();
         self.exact_first_by_scope.clear();
-        self.widest_ipa = 0;
         let rows: Vec<(u64, AliasBacking)> = self
             .by_scope
             .values()
@@ -519,16 +624,6 @@ impl AliasRegistry {
         }
     }
 
-    /// Which size class a VA window of `size` bytes belongs to: the exponent
-    /// of the smallest power of two that can hold it, so every member of class
-    /// `c` has `size <= 1 << c`.
-    pub(crate) fn va_window_class(size: u64) -> u32 {
-        match size.max(1).checked_next_power_of_two() {
-            Some(rounded) => rounded.ilog2(),
-            None => u64::BITS,
-        }
-    }
-
     /// The widest VA window any LIVE row can have: the radius of the largest
     /// live size class. Reported by the per-fault mapping-index census as the
     /// bound the containment queries actually pay, so the probe keeps naming
@@ -536,70 +631,17 @@ impl AliasRegistry {
     /// `widest_va` -- except that this one shrinks again when the wide row
     /// retires.
     pub(crate) fn widest_va_window(&self) -> u64 {
-        self.va_class_counts
-            .keys()
-            .next_back()
-            .copied()
-            .map_or(0, Self::va_window_class_radius)
-    }
-
-    /// The widest window any member of class `c` can have.
-    pub(crate) fn va_window_class_radius(class: u32) -> u64 {
-        if class >= u64::BITS {
-            u64::MAX
-        } else {
-            1_u64 << class
-        }
+        self.va_classes.widest_window()
     }
 
     /// Every row whose guest-VA window can overlap `[start, end)`, in
     /// unspecified order, each visited at most once.
-    ///
-    /// THE VA-axis candidate query. It is a superset of the answer -- callers
-    /// keep their own exact overlap or containment test, which this does not
-    /// change -- but the superset is bounded per size class by that class's
-    /// own widest member rather than by the widest row in the registry. See
-    /// [`Self::by_va_class_start`] for the measurement that motivated it.
     pub(crate) fn va_window_rows(
         &self,
         start: u64,
         end: u64,
     ) -> impl Iterator<Item = &(u64, AliasBacking)> + '_ {
-        self.va_class_counts
-            .keys()
-            .copied()
-            .flat_map(move |class| {
-                let radius = Self::va_window_class_radius(class);
-                let lower = start.saturating_sub(radius.saturating_sub(1));
-                // A row of this class beginning below `lower` ends at or below
-                // `start`, and one beginning at or above `end` starts past the
-                // range; neither can overlap.
-                (lower < end).then_some(((class, lower), (class, end)))
-            })
-            .flat_map(move |(from, to)| {
-                self.by_va_class_start
-                    .range(from..to)
-                    .flat_map(|(_, rows)| {
-                        note_alias_state_rows_scanned(rows.len());
-                        rows.iter()
-                    })
-            })
-    }
-
-    /// The row registered LAST whose window contains `probe`, among the rows
-    /// an index keyed by window start holds.
-    pub(crate) fn newest_containing(
-        index: &std::collections::BTreeMap<u64, Vec<(u64, AliasBacking)>>,
-        widest: u64,
-        probe: u64,
-        mut matches: impl FnMut(&AliasBacking) -> bool,
-    ) -> Option<AliasBacking> {
-        index
-            .range(probe.saturating_sub(widest)..=probe)
-            .flat_map(|(_, rows)| rows)
-            .filter(|(_, alias)| matches(alias))
-            .max_by_key(|(seq, _)| *seq)
-            .map(|(_, alias)| *alias)
+        self.va_classes.window_rows(start, end)
     }
 
     /// [`Self::newest_matching`] for a predicate that requires the row's
@@ -607,12 +649,9 @@ impl AliasRegistry {
     pub(crate) fn newest_containing_va(
         &self,
         va: u64,
-        mut matches: impl FnMut(&AliasBacking) -> bool,
+        matches: impl FnMut(&AliasBacking) -> bool,
     ) -> Option<AliasBacking> {
-        self.va_window_rows(va, va.saturating_add(1))
-            .filter(|(_, alias)| matches(alias))
-            .max_by_key(|(seq, _)| *seq)
-            .map(|(_, alias)| *alias)
+        self.va_classes.newest_containing(va, matches)
     }
 
     /// [`Self::oldest_matching`] for a predicate that requires the row's IPA
@@ -620,14 +659,9 @@ impl AliasRegistry {
     pub(crate) fn oldest_containing_ipa(
         &self,
         ipa: u64,
-        mut matches: impl FnMut(&AliasBacking) -> bool,
+        matches: impl FnMut(&AliasBacking) -> bool,
     ) -> Option<AliasBacking> {
-        self.by_ipa_start
-            .range(ipa.saturating_sub(self.widest_ipa)..=ipa)
-            .flat_map(|(_, rows)| rows)
-            .filter(|(_, alias)| matches(alias))
-            .min_by_key(|(seq, _)| *seq)
-            .map(|(_, alias)| *alias)
+        self.ipa_classes.oldest_containing(ipa, matches)
     }
 
     /// [`Self::newest_matching`] for a predicate that requires the row's IPA
@@ -637,7 +671,7 @@ impl AliasRegistry {
         ipa: u64,
         matches: impl FnMut(&AliasBacking) -> bool,
     ) -> Option<AliasBacking> {
-        Self::newest_containing(&self.by_ipa_start, self.widest_ipa, ipa, matches)
+        self.ipa_classes.newest_containing(ipa, matches)
     }
 
     /// Private rows owned by one process whose exact physical stage-2 extent
@@ -737,13 +771,12 @@ impl AliasRegistry {
         self.by_scope.clear();
         self.exact_first_by_scope.clear();
         self.by_va_start.clear();
-        self.by_va_class_start.clear();
-        self.va_class_counts.clear();
+        self.va_classes.clear();
         self.by_ipa_start.clear();
+        self.ipa_classes.clear();
         self.by_physical_start.clear();
         self.by_scope_physical_start.clear();
         self.physical_size_counts_by_scope.clear();
-        self.widest_ipa = 0;
         self.rows = 0;
         // `next_seq` is deliberately NOT reset: sequence numbers are identity
         // for ordering comparisons that may outlive a clear.
@@ -1433,7 +1466,7 @@ impl AliasRegistry {
     }
 
     /// The newest alias visible to the process whose guest-VA window contains `va`.
-    /// Bounded by `by_va_start.range(va - widest_va ..= va)`.
+    /// Bounded by the live VA size-class index.
     pub(crate) fn newest_process_alias_containing_va(
         &self,
         va: u64,
@@ -1441,21 +1474,12 @@ impl AliasRegistry {
         container_root: ContainerRootToken,
         mut matches: impl FnMut(&AliasBacking) -> bool,
     ) -> Option<AliasBacking> {
-        let mut newest: Option<(u64, AliasBacking)> = None;
-        for &(seq, alias) in self.va_window_rows(va, va.saturating_add(1)) {
-            if alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
+        self.va_classes.newest_containing(va, |alias| {
+            alias_matches_process_scope(alias.ownership_scope, mm_root_slot, container_root)
                 && va >= alias.start
                 && va < alias.start.saturating_add(alias.size as u64)
-                && matches(&alias)
-            {
-                match newest {
-                    None => newest = Some((seq, alias)),
-                    Some((best_seq, _)) if seq > best_seq => newest = Some((seq, alias)),
-                    _ => {}
-                }
-            }
-        }
-        newest.map(|(_, alias)| alias)
+                && matches(alias)
+        })
     }
 
     /// Insert a single row into buckets and indices with an explicit sequence.
@@ -2787,5 +2811,195 @@ impl AliasRemapLimiter {
         }
         *attempts += 1;
         true
+    }
+}
+
+#[cfg(test)]
+mod alias_differential_tests {
+    use super::*;
+
+    struct SimpleRng(u64);
+    impl SimpleRng {
+        fn new(seed: u64) -> Self {
+            Self(if seed == 0 {
+                0xdead_beef_cafe_babe
+            } else {
+                seed
+            })
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn gen_range(&mut self, min: u64, max: u64) -> u64 {
+            if min >= max {
+                return min;
+            }
+            min + (self.next_u64() % (max - min))
+        }
+    }
+
+    fn reference_newest_containing(
+        index: &std::collections::BTreeMap<u64, Vec<(u64, AliasBacking)>>,
+        widest: u64,
+        probe: u64,
+        mut matches: impl FnMut(&AliasBacking) -> bool,
+    ) -> Option<AliasBacking> {
+        index
+            .range(probe.saturating_sub(widest)..=probe)
+            .flat_map(|(_, rows)| rows)
+            .filter(|(_, alias)| matches(alias))
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, alias)| *alias)
+    }
+
+    fn make_alias(va: u64, ipa: u64, size: usize, scope: AliasOwnershipScope) -> AliasBacking {
+        AliasBacking {
+            start: va,
+            ipa,
+            host_addr: 0x4000_0000 + (va as usize),
+            size,
+            physical_ipa: ipa,
+            physical_host_addr: 0x4000_0000 + (ipa as usize),
+            physical_size: size,
+            perms: 3,
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: scope,
+            inventory_backing: InventoryBackingIdentity::Private(1),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 1,
+        }
+    }
+
+    #[test]
+    fn differential_newest_containing_matches_reference() {
+        let mut rng = SimpleRng::new(0x1234_5678_9abc_def0);
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x5000_0000,
+            size: 0x4000,
+        };
+
+        let widths: [usize; 16] = [
+            1,
+            16,
+            64,
+            512,
+            4096,
+            16384,
+            65536,
+            128 * 1024,
+            1024 * 1024,
+            2 * 1024 * 1024,
+            16 * 1024 * 1024,
+            64 * 1024 * 1024,
+            256 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            16 * 1024 * 1024 * 1024,
+            32 * 1024 * 1024 * 1024,
+        ];
+
+        let mut registry = AliasRegistry::default();
+        let mut row_endpoints = Vec::new();
+        let mut max_width = 0u64;
+
+        for i in 0..300u64 {
+            let width = widths[(rng.next_u64() as usize) % widths.len()];
+            max_width = max_width.max(width as u64);
+            let start = if i % 10 == 0 && !row_endpoints.is_empty() {
+                row_endpoints[(rng.next_u64() as usize) % row_endpoints.len()]
+            } else {
+                rng.gen_range(0x1000_0000, 0x10_0000_0000)
+            };
+            let alias = make_alias(start, start, width, scope);
+            registry.push(alias);
+            row_endpoints.push(start);
+            if let Some(end) = start.checked_add(width as u64) {
+                row_endpoints.push(end);
+            }
+        }
+
+        let mut probes = Vec::with_capacity(6000);
+        for &pt in &row_endpoints {
+            probes.push(pt.saturating_sub(1));
+            probes.push(pt);
+            probes.push(pt.saturating_add(1));
+            probes.push(pt.saturating_add(4096));
+        }
+        while probes.len() < 5500 {
+            probes.push(rng.gen_range(0, 0x18_0000_0000));
+        }
+        probes.push(0);
+        probes.push(1);
+        probes.push(u64::MAX - 1);
+        probes.push(u64::MAX);
+
+        for probe in probes {
+            let contains_ipa = |alias: &AliasBacking| {
+                probe >= alias.ipa && probe < alias.ipa.saturating_add(alias.size as u64)
+            };
+            let reference =
+                reference_newest_containing(&registry.by_ipa_start, max_width, probe, contains_ipa);
+            let actual = registry.newest_containing_ipa(probe, contains_ipa);
+            assert_eq!(
+                actual, reference,
+                "differential query mismatch at probe 0x{probe:x}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_count_bounded_by_classes_and_matching_rows() {
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x5000_0000,
+            size: 0x4000,
+        };
+        let mut registry = AliasRegistry::default();
+
+        // One 32 GiB row
+        let huge_start = 0x1000_0000u64;
+        let huge_size = 32usize * 1024 * 1024 * 1024;
+        registry.push(make_alias(huge_start, huge_start, huge_size, scope));
+
+        // 4,096 small (4 KiB) rows starting inside the 32 GiB extent
+        let small_base = 0x2000_0000u64;
+        let small_size = 4096usize;
+        for i in 0..4096u64 {
+            let start = small_base + i * (small_size as u64);
+            registry.push(make_alias(start, start, small_size, scope));
+        }
+
+        // A probe that hits a small row near the end of the small row cluster
+        let target_small_idx = 4000u64;
+        let probe = small_base + target_small_idx * (small_size as u64) + 64;
+
+        let before = alias_state_rows_scanned();
+        let contains_ipa = |alias: &AliasBacking| {
+            probe >= alias.ipa && probe < alias.ipa.saturating_add(alias.size as u64)
+        };
+        let found = registry.newest_containing_ipa(probe, contains_ipa);
+        assert!(found.is_some());
+        let examined = alias_state_rows_scanned() - before;
+
+        // The probe hits exactly 2 rows: the small row and the 32 GiB row.
+        // There are 2 classes (4 KiB = class 12, 32 GiB = class 35).
+        // Examined candidates must be <= (rows containing it + classes), which is <= 4,
+        // and certainly not thousands.
+        let rows_containing = 2u64;
+        let classes = 2u64;
+        assert!(
+            examined <= rows_containing + classes,
+            "examined {examined} candidates, expected <= {}",
+            rows_containing + classes
+        );
+        assert!(
+            examined < 100,
+            "examined {examined} candidates, expected not thousands"
+        );
     }
 }
