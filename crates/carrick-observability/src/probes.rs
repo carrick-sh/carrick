@@ -504,19 +504,32 @@ pub enum HvpatchGuestLifecycleError {
     InvalidPredecessorIdentity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchGuestLifecycleArgs {
+    pub phase: HvpatchGuestLifecyclePhase,
+    pub pid: i32,
+    pub ppid: i32,
+    pub tid: i32,
+    pub asid: u32,
+    pub task_serial: u64,
+    pub parent_serial: u64,
+    pub mm: u64,
+    pub detail: i64,
+}
+
 impl HvpatchGuestLifecycle {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        phase: HvpatchGuestLifecyclePhase,
-        pid: i32,
-        ppid: i32,
-        tid: i32,
-        asid: u32,
-        task_serial: u64,
-        parent_serial: u64,
-        mm: u64,
-        detail: i64,
-    ) -> Result<Self, HvpatchGuestLifecycleError> {
+    pub fn new(args: HvpatchGuestLifecycleArgs) -> Result<Self, HvpatchGuestLifecycleError> {
+        let HvpatchGuestLifecycleArgs {
+            phase,
+            pid,
+            ppid,
+            tid,
+            asid,
+            task_serial,
+            parent_serial,
+            mm,
+            detail,
+        } = args;
         if pid <= 0 || tid <= 0 {
             return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
         }
@@ -661,27 +674,29 @@ pub struct HvpatchMappingIndexCensus {
     nanos: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchMappingIndexCensusArgs {
+    pub far: u64,
+    pub live_rows: u64,
+    pub shadowed_rows: u64,
+    pub rows_visited: u64,
+    pub alias_rows: u64,
+    pub alias_rows_visited: u64,
+    pub widest_va_window: u64,
+    pub nanos: u64,
+}
+
 impl HvpatchMappingIndexCensus {
-    #[allow(clippy::too_many_arguments)]
-    pub const fn new(
-        far: u64,
-        live_rows: u64,
-        shadowed_rows: u64,
-        rows_visited: u64,
-        alias_rows: u64,
-        alias_rows_visited: u64,
-        widest_va_window: u64,
-        nanos: u64,
-    ) -> Self {
+    pub const fn new(args: HvpatchMappingIndexCensusArgs) -> Self {
         Self {
-            far,
-            live_rows,
-            shadowed_rows,
-            rows_visited,
-            alias_rows,
-            alias_rows_visited,
-            widest_va_window,
-            nanos,
+            far: args.far,
+            live_rows: args.live_rows,
+            shadowed_rows: args.shadowed_rows,
+            rows_visited: args.rows_visited,
+            alias_rows: args.alias_rows,
+            alias_rows_visited: args.alias_rows_visited,
+            widest_va_window: args.widest_va_window,
+            nanos: args.nanos,
         }
     }
 
@@ -861,19 +876,32 @@ pub struct HvpatchFrameCowTrigger {
     ttbr0: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchFrameCowTriggerArgs {
+    pub class: HvpatchFrameCowTriggerClass,
+    pub pid: i32,
+    pub tid: i32,
+    pub mm: u64,
+    pub asid: u32,
+    pub va: u64,
+    pub syndrome: u64,
+    pub far: u64,
+    pub ttbr0: u64,
+}
+
 impl HvpatchFrameCowTrigger {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        class: HvpatchFrameCowTriggerClass,
-        pid: i32,
-        tid: i32,
-        mm: u64,
-        asid: u32,
-        va: u64,
-        syndrome: u64,
-        far: u64,
-        ttbr0: u64,
-    ) -> Result<Self, HvpatchGuestLifecycleError> {
+    pub fn new(args: HvpatchFrameCowTriggerArgs) -> Result<Self, HvpatchGuestLifecycleError> {
+        let HvpatchFrameCowTriggerArgs {
+            class,
+            pid,
+            tid,
+            mm,
+            asid,
+            va,
+            syndrome,
+            far,
+            ttbr0,
+        } = args;
         if pid <= 0 || tid <= 0 {
             return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
         }
@@ -953,21 +981,36 @@ pub struct HvpatchFrameCow {
     new_ipa: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchFrameCowArgs {
+    pub phase: HvpatchFrameCowPhase,
+    pub intent: HvpatchFrameCowIntent,
+    pub pid: i32,
+    pub tid: i32,
+    pub mm: u64,
+    pub asid: u32,
+    pub va: u64,
+    pub old_frame: u64,
+    pub new_frame: u64,
+    pub old_ipa: u64,
+    pub new_ipa: u64,
+}
+
 impl HvpatchFrameCow {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        phase: HvpatchFrameCowPhase,
-        intent: HvpatchFrameCowIntent,
-        pid: i32,
-        tid: i32,
-        mm: u64,
-        asid: u32,
-        va: u64,
-        old_frame: u64,
-        new_frame: u64,
-        old_ipa: u64,
-        new_ipa: u64,
-    ) -> Result<Self, HvpatchGuestLifecycleError> {
+    pub fn new(args: HvpatchFrameCowArgs) -> Result<Self, HvpatchGuestLifecycleError> {
+        let HvpatchFrameCowArgs {
+            phase,
+            intent,
+            pid,
+            tid,
+            mm,
+            asid,
+            va,
+            old_frame,
+            new_frame,
+            old_ipa,
+            new_ipa,
+        } = args;
         if pid <= 0 || tid <= 0 {
             return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
         }
@@ -1056,20 +1099,34 @@ pub struct HvpatchForkFrameShare {
     length: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchForkFrameShareArgs {
+    pub pid: i32,
+    pub tid: i32,
+    pub mm: u64,
+    pub asid: u32,
+    pub kind: HvpatchForkFrameKind,
+    pub parent_mapping: u64,
+    pub child_mapping: u64,
+    pub frame: u64,
+    pub ipa: u64,
+    pub length: u64,
+}
+
 impl HvpatchForkFrameShare {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        pid: i32,
-        tid: i32,
-        mm: u64,
-        asid: u32,
-        kind: HvpatchForkFrameKind,
-        parent_mapping: u64,
-        child_mapping: u64,
-        frame: u64,
-        ipa: u64,
-        length: u64,
-    ) -> Result<Self, HvpatchGuestLifecycleError> {
+    pub fn new(args: HvpatchForkFrameShareArgs) -> Result<Self, HvpatchGuestLifecycleError> {
+        let HvpatchForkFrameShareArgs {
+            pid,
+            tid,
+            mm,
+            asid,
+            kind,
+            parent_mapping,
+            child_mapping,
+            frame,
+            ipa,
+            length,
+        } = args;
         if pid <= 0 || tid <= 0 {
             return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
         }
@@ -2214,17 +2271,17 @@ mod hvpatch_guest_probe_abi {
 
     #[test]
     fn lifecycle_event_keeps_guest_identity_and_phase_typed() {
-        let event = HvpatchGuestLifecycle::new(
-            HvpatchGuestLifecyclePhase::Fork,
-            123,
-            100,
-            123,
-            7,
-            42,
-            41,
-            9,
-            0,
-        )
+        let event = HvpatchGuestLifecycle::new(HvpatchGuestLifecycleArgs {
+            phase: HvpatchGuestLifecyclePhase::Fork,
+            pid: 123,
+            ppid: 100,
+            tid: 123,
+            asid: 7,
+            task_serial: 42,
+            parent_serial: 41,
+            mm: 9,
+            detail: 0,
+        })
         .expect("valid guest lifecycle event");
         assert_eq!(event.phase(), HvpatchGuestLifecyclePhase::Fork);
         assert_eq!(event.pid(), 123);
@@ -2243,77 +2300,77 @@ mod hvpatch_guest_probe_abi {
     fn lifecycle_event_rejects_ambiguous_identity() {
         // No task serial.
         assert!(
-            HvpatchGuestLifecycle::new(
-                HvpatchGuestLifecyclePhase::Fork,
-                123,
-                100,
-                123,
-                7,
-                0,
-                41,
-                9,
-                0,
-            )
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecycleArgs {
+                phase: HvpatchGuestLifecyclePhase::Fork,
+                pid: 123,
+                ppid: 100,
+                tid: 123,
+                asid: 7,
+                task_serial: 0,
+                parent_serial: 41,
+                mm: 9,
+                detail: 0,
+            })
             .is_err()
         );
         // No mm.
         assert!(
-            HvpatchGuestLifecycle::new(
-                HvpatchGuestLifecyclePhase::Fork,
-                123,
-                100,
-                123,
-                7,
-                42,
-                41,
-                0,
-                0,
-            )
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecycleArgs {
+                phase: HvpatchGuestLifecyclePhase::Fork,
+                pid: 123,
+                ppid: 100,
+                tid: 123,
+                asid: 7,
+                task_serial: 42,
+                parent_serial: 41,
+                mm: 0,
+                detail: 0,
+            })
             .is_err()
         );
         // A parent pid with no parent serial, and the reverse: the two must
         // agree about whether a parent exists.
         assert!(
-            HvpatchGuestLifecycle::new(
-                HvpatchGuestLifecyclePhase::Fork,
-                123,
-                100,
-                123,
-                7,
-                42,
-                0,
-                9,
-                0,
-            )
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecycleArgs {
+                phase: HvpatchGuestLifecyclePhase::Fork,
+                pid: 123,
+                ppid: 100,
+                tid: 123,
+                asid: 7,
+                task_serial: 42,
+                parent_serial: 0,
+                mm: 9,
+                detail: 0,
+            })
             .is_err()
         );
         assert!(
-            HvpatchGuestLifecycle::new(
-                HvpatchGuestLifecyclePhase::Root,
-                123,
-                0,
-                123,
-                7,
-                42,
-                41,
-                9,
-                0,
-            )
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecycleArgs {
+                phase: HvpatchGuestLifecyclePhase::Root,
+                pid: 123,
+                ppid: 0,
+                tid: 123,
+                asid: 7,
+                task_serial: 42,
+                parent_serial: 41,
+                mm: 9,
+                detail: 0,
+            })
             .is_err()
         );
         // A root with neither is exact.
         assert!(
-            HvpatchGuestLifecycle::new(
-                HvpatchGuestLifecyclePhase::Root,
-                123,
-                0,
-                123,
-                7,
-                42,
-                0,
-                9,
-                0,
-            )
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecycleArgs {
+                phase: HvpatchGuestLifecyclePhase::Root,
+                pid: 123,
+                ppid: 0,
+                tid: 123,
+                asid: 7,
+                task_serial: 42,
+                parent_serial: 0,
+                mm: 9,
+                detail: 0,
+            })
             .is_ok()
         );
     }
@@ -2332,26 +2389,46 @@ mod hvpatch_guest_probe_abi {
     #[test]
     fn lifecycle_event_rejects_non_linux_identity_values() {
         assert!(
-            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Root, 0, 0, 1, 1, 1, 0, 1, 0,)
-                .is_err()
-        );
-        assert!(
-            HvpatchGuestLifecycle::new(
-                HvpatchGuestLifecyclePhase::ThreadStart,
-                1,
-                0,
-                0,
-                1,
-                1,
-                0,
-                1,
-                0,
-            )
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecycleArgs {
+                phase: HvpatchGuestLifecyclePhase::Root,
+                pid: 0,
+                ppid: 0,
+                tid: 1,
+                asid: 1,
+                task_serial: 1,
+                parent_serial: 0,
+                mm: 1,
+                detail: 0,
+            })
             .is_err()
         );
         assert!(
-            HvpatchGuestLifecycle::new(HvpatchGuestLifecyclePhase::Exec, 1, 0, 1, 0, 1, 0, 1, 0,)
-                .is_err()
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecycleArgs {
+                phase: HvpatchGuestLifecyclePhase::ThreadStart,
+                pid: 1,
+                ppid: 0,
+                tid: 0,
+                asid: 1,
+                task_serial: 1,
+                parent_serial: 0,
+                mm: 1,
+                detail: 0,
+            })
+            .is_err()
+        );
+        assert!(
+            HvpatchGuestLifecycle::new(HvpatchGuestLifecycleArgs {
+                phase: HvpatchGuestLifecyclePhase::Exec,
+                pid: 1,
+                ppid: 0,
+                tid: 1,
+                asid: 0,
+                task_serial: 1,
+                parent_serial: 0,
+                mm: 1,
+                detail: 0,
+            })
+            .is_err()
         );
     }
 
@@ -2619,18 +2696,18 @@ mod hvpatch_guest_probe_abi {
 
     #[test]
     fn fork_frame_receipt_keeps_mapping_frame_and_mm_identity_together() {
-        let event = HvpatchForkFrameShare::new(
-            123,
-            100,
-            9,
-            7,
-            HvpatchForkFrameKind::PrivateCow,
-            41,
-            42,
-            17,
-            0xa0_0000_0000,
-            0x4000,
-        )
+        let event = HvpatchForkFrameShare::new(HvpatchForkFrameShareArgs {
+            pid: 123,
+            tid: 100,
+            mm: 9,
+            asid: 7,
+            kind: HvpatchForkFrameKind::PrivateCow,
+            parent_mapping: 41,
+            child_mapping: 42,
+            frame: 17,
+            ipa: 0xa0_0000_0000,
+            length: 0x4000,
+        })
         .expect("complete fork-frame receipt");
         assert_eq!(event.pid(), 123);
         assert_eq!(event.tid(), 100);
@@ -2643,18 +2720,18 @@ mod hvpatch_guest_probe_abi {
         assert_eq!(event.ipa(), 0xa0_0000_0000);
         assert_eq!(event.length(), 0x4000);
         assert!(
-            HvpatchForkFrameShare::new(
-                123,
-                100,
-                0,
-                7,
-                HvpatchForkFrameKind::PrivateCow,
-                41,
-                42,
-                17,
-                0xa0_0000_0000,
-                0x4000,
-            )
+            HvpatchForkFrameShare::new(HvpatchForkFrameShareArgs {
+                pid: 123,
+                tid: 100,
+                mm: 0,
+                asid: 7,
+                kind: HvpatchForkFrameKind::PrivateCow,
+                parent_mapping: 41,
+                child_mapping: 42,
+                frame: 17,
+                ipa: 0xa0_0000_0000,
+                length: 0x4000,
+            })
             .is_err(),
             "a zero mm must fail closed rather than serialize ambiguous proof"
         );
@@ -7749,22 +7826,33 @@ mod real {
         carrick_usdt::vcpu__fault__gprs!(|| args());
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn native_x86_fault(
-        pc: u64,
-        fault_address: u64,
-        rsp: u64,
-        rax: u64,
-        rcx: u64,
-        rdx: u64,
-        rdi: u64,
-        rsi: u64,
-        r8: u64,
-        rflags: u64,
-    ) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct NativeX86FaultArgs {
+        pub pc: u64,
+        pub fault_address: u64,
+        pub rsp: u64,
+        pub rax: u64,
+        pub rcx: u64,
+        pub rdx: u64,
+        pub rdi: u64,
+        pub rsi: u64,
+        pub r8: u64,
+        pub rflags: u64,
+    }
+
+    pub fn native_x86_fault(args: NativeX86FaultArgs) {
         let pid = std::process::id();
-        carrick_usdt::native__x86__fault!(|| (pid, pc, fault_address, rsp, rcx, rflags));
-        carrick_usdt::native__x86__fault__regs!(|| (pid, rax, rdx, rdi, rsi, r8));
+        carrick_usdt::native__x86__fault!(|| (
+            pid,
+            args.pc,
+            args.fault_address,
+            args.rsp,
+            args.rcx,
+            args.rflags
+        ));
+        carrick_usdt::native__x86__fault__regs!(|| (
+            pid, args.rax, args.rdx, args.rdi, args.rsi, args.r8
+        ));
     }
 
     pub fn native_x86_fault_stack(rbp: u64, stack_words: [u64; 4]) {
@@ -8433,21 +8521,21 @@ mod stub {
     stub!(native_x86_pc(pc: u64, rsp: u64, rdi: u64, rbp: u64, stack_word: u64));
     stub!(native_x86_resolve(source: u64, target: u64, rsp: u64, rdi: u64, rbp: u64));
 
-    #[allow(clippy::too_many_arguments, dead_code, unused_variables)]
-    #[inline(always)]
-    pub fn native_x86_fault(
-        pc: u64,
-        fault_address: u64,
-        rsp: u64,
-        rax: u64,
-        rcx: u64,
-        rdx: u64,
-        rdi: u64,
-        rsi: u64,
-        r8: u64,
-        rflags: u64,
-    ) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct NativeX86FaultArgs {
+        pub pc: u64,
+        pub fault_address: u64,
+        pub rsp: u64,
+        pub rax: u64,
+        pub rcx: u64,
+        pub rdx: u64,
+        pub rdi: u64,
+        pub rsi: u64,
+        pub r8: u64,
+        pub rflags: u64,
     }
+
+    stub!(native_x86_fault(args: NativeX86FaultArgs));
 
     /// Scalar payload for the opt-in native-x86 xstate transition probes
     /// (mirrors `real::NativeX86XstateProbe` field-for-field).
@@ -8523,7 +8611,6 @@ mod stub {
         points
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn guest_mem_copy(
         _direction: u32,
         _address: u64,

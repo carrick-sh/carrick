@@ -1317,16 +1317,18 @@ impl HvfTaskState {
                 }
             }
             let event = carrick_observability::probes::HvpatchForkFrameShare::new(
-                identity.linux_pid,
-                identity.linux_tid,
-                identity.mm,
-                u32::from(identity.asid),
-                receipt.kind,
-                receipt.parent_mapping.raw(),
-                receipt.child_mapping.raw(),
-                receipt.frame.raw(),
-                receipt.ipa,
-                receipt.length,
+                carrick_observability::probes::HvpatchForkFrameShareArgs {
+                    pid: identity.linux_pid,
+                    tid: identity.linux_tid,
+                    mm: identity.mm,
+                    asid: u32::from(identity.asid),
+                    kind: receipt.kind,
+                    parent_mapping: receipt.parent_mapping.raw(),
+                    child_mapping: receipt.child_mapping.raw(),
+                    frame: receipt.frame.raw(),
+                    ipa: receipt.ipa,
+                    length: receipt.length,
+                },
             )
             .unwrap_or_else(|error| {
                 carrick_fatal!(
