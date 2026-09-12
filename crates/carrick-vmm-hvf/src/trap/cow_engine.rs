@@ -4171,20 +4171,12 @@ impl HvfVmState {
             self.split_local_rows_for_unmap(va, len);
             return Ok(());
         }
-        let identity = self.cow_identity.ok_or_else(|| {
+        let _identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no mm identity".to_owned())
         })?;
         // `GuestMemory::unmap_range` is reached only from the mmap-family
         // syscall set, whose runtime dispatch already owns the process-wide
-        // page-table pause across invalidate + TLBI + this backend retirement.
-        // Acquiring the same non-reentrant pause here deadlocks the coordinator
-        // against itself as soon as the mm has a sibling vCPU.
-        let _topology = crate::fork_quiesce::acquire_topology_lock(
-            carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
-            identity.linux_pid,
-            identity.linux_tid,
-        );
-
+        // MM exclusion across invalidate + TLBI + this backend retirement.
         let prepared = self.prepare_process_alias_retirement(va, len)?;
         self.commit_process_alias_retirement(va, len, prepared)
     }
@@ -4284,7 +4276,7 @@ impl HvfVmState {
         if actual_leases != planned_leases {
             carrick_fatal!(
                 "hvpatch::host_alias",
-                "HVPatch alias registry changed under topology lock: planned={planned_leases:?} actual={actual_leases:?}"
+                "HVPatch alias registry changed under the mm guard: planned={planned_leases:?} actual={actual_leases:?}"
             );
         }
         record_alias_unmap_lifecycle(
@@ -4305,6 +4297,9 @@ impl HvfVmState {
             }
             return Ok(());
         };
+        let _registry = crate::fork_quiesce::FrameRegistryGuard::new(
+            crate::fork_quiesce::frame_registry_lock().lock(),
+        );
         if let Err(error) = authority.apply(reservation.commit(())) {
             // Name the retirement, not just the id that failed. This abort used
             // to print one MappingId and nothing else, which cannot distinguish
