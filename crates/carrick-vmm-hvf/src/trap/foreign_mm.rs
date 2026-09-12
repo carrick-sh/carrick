@@ -1486,14 +1486,8 @@ pub(crate) fn perform_foreign_cow_transaction(
     if !runtime.persistent_vm_lifecycle {
         return Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable);
     }
-    // The runtime already holds exact-MM page-table exclusion.  This is the
-    // inner topology/alias phase only; foreign COW must never reacquire the
-    // frame-COW quiesce or wait HostAlias -> PtPause.
-    let _topology = crate::fork_quiesce::acquire_topology_lock(
-        carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
-        runtime.identity.linux_pid,
-        runtime.identity.linux_tid,
-    );
+    // The runtime already holds exact-MM page-table exclusion. Foreign COW
+    // must never reacquire the frame-COW quiesce or wait HostAlias -> PtPause.
     let range_end = va
         .raw()
         .checked_add(len as u64)
@@ -1989,6 +1983,9 @@ pub(crate) fn perform_foreign_cow_transaction(
             "global frame host owner was not found in registry with matching generation and host mapping pointer prior to foreign COW publication"
         );
     }
+    let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+        crate::fork_quiesce::frame_registry_lock().lock(),
+    );
     let (apply_receipt, kernel_proof, authenticated_owner_generation) = match runtime
         .authority
         .apply_foreign_cow(
@@ -2072,6 +2069,7 @@ pub(crate) fn perform_foreign_cow_transaction(
             )
         })
     };
+    drop(registry);
     record_cow_inventory_lifecycle(
         CowDiagnosticLifecycleKind::InventoryRemoved,
         CowDiagnosticLifecycleSite::ForeignCowCommit,
