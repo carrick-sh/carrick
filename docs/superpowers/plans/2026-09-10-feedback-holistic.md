@@ -764,3 +764,22 @@ commits and is re-checked at the next vet.
   the `ProcessTerminalLoser` arm must leave its kernel thread terminal.
   The worktree `agy-exec-sibling-settle-sep12` is kept as evidence
   (tests + the two arms' shape); nothing from it lands as is.
+- 2026-09-12 16:45, exec-teardown class FIXED by the director (f509fd91f):
+  root cause was not ordering but membership — `finish_persistent_process_handles`
+  drained the surviving job's own handle and nothing re-enrolled it, so a
+  process that had exec'd once had no leader in its next drain. Live
+  receipts on e10430349adb11eb under lldb-run: execfromthread eight-way
+  ×3 = 24/24 clean (was 1/24 aborts on main, 22/24 bad on the worker
+  rounds), forkexecstorm 6/6, and ZERO `AddressSpaceRetired` claim
+  failures across all runs (before: 1–2 per net_http run). go-net_http
+  4 runs: 2 PASS, 2 deadline hangs of two shapes, neither the exec class:
+  (a) `dfnh-1` the lock-order deadlock already recorded at 16:20 (ten
+  executors on one mutex, no claim failure this time — it is reachable
+  from ordinary retirement, not only the exec loser path); (b) `dfnh-2`
+  hung AFTER `PASS` at process exit with one executor inside host
+  `close(2)` dropping a temporary `Kqueue` in
+  `dispatch::net::lifecycle::host_stream_socket_rdhup` under
+  `epoll_pwait` (snapshot authority busy) — a distinct host-boundary hang
+  to post-mortem next. The worker branch `agy-exec-sibling-settle-sep12`
+  is superseded (its loser-arm tests remain a reference for the Busy
+  arms); worktree to be removed.
