@@ -586,3 +586,12 @@ commits and is re-checked at the next vet.
   541a575ff 14.3 s; 5f4b957fd (alias-newest + alias-retain landed) 182.8 s;
   fe9ceb4d6 174.0 s; 5149bba88 wedges (the openat deadlock). The 12x is
   the alias-retain-index landing's widest-row window.
+- Compile regression FIXED and landed (874056e25): `TaskMappingIndex`
+  discovery is partitioned by width class (`TaskMappingClassIndex`,
+  mirroring `AliasClassIndex`); red-first huge-row test (32 GiB row +
+  4,096 small rows: thousands of visits before, 1 after), 2,000-case
+  differential green. Live receipt on d286e85eabab67f4: the compile row
+  standalone 7.86 s wall / 7.05 s user — vs 14.3 s on the pre-cluster
+  control and 175.6 s on the regressed binary — the keyed retirement now
+  pays off (≈1.8x faster than base on this row). Probe gate rerunning;
+  paired scorecard to be rerun on this binary.
