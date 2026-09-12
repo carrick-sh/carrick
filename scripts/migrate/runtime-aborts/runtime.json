@@ -105,7 +105,7 @@
       "domain": "dispatch::deferred_anonymous_fork"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mem/brk.rs",
       "function": "MemView<'a>::brk",
       "ordinal_in_function": 1,
       "fingerprint": "c3af1011b19cfbfbc57dccb894cf9f12f148f1ec12a538a6df6e608e845bb6a0",
@@ -116,7 +116,7 @@
       "domain": "dispatch::brk"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mem/brk.rs",
       "function": "MemView<'a>::brk",
       "ordinal_in_function": 2,
       "fingerprint": "c3af1011b19cfbfbc57dccb894cf9f12f148f1ec12a538a6df6e608e845bb6a0",
@@ -127,7 +127,7 @@
       "domain": "dispatch::brk"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mem/brk.rs",
       "function": "MemView<'a>::brk",
       "ordinal_in_function": 3,
       "fingerprint": "c3af1011b19cfbfbc57dccb894cf9f12f148f1ec12a538a6df6e608e845bb6a0",
