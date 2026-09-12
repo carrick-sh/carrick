@@ -4496,6 +4496,16 @@ fn bless_probe_oracle() {
         {
             continue;
         }
+        if lane.platform != same_isa_lane().platform {
+            // A bless is a Linux oracle recording; a foreign-platform
+            // container on this host is Rosetta, not Linux, and has hung
+            // this step for hours. Bless that lane on a native host.
+            eprintln!(
+                "SKIP-BLESS {}: foreign platform {} — bless on a native host",
+                lane.label, lane.platform
+            );
+            continue;
+        }
         for set in lane.probe_sets {
             if requested_libc
                 .as_deref()
