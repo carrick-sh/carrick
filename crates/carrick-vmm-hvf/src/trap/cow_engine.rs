@@ -821,22 +821,28 @@ impl HvfVmState {
             // invisible to `mapping_for_range` on this sibling until the later
             // protection commit, so authenticate the process-shared physical owner
             // directly before allocating a second overlapping frame.
-            let live_alias_end = alias_registry()
+            // Lock order: candidates under the registry lock, owner
+            // authentication after it is released (see
+            // `AliasClassIndex::containing_candidates`).
+            let live_alias_candidates = alias_registry()
                 .lock()
-                .newest_process_alias_containing_va(
+                .process_alias_containing_va_candidates(
                     start,
                     self.mm_root_slot,
                     self.container_root,
-                    |alias| {
-                        global_frame_host_owner_matches_in(
-                            self.custody(),
-                            alias.physical_ipa,
-                            alias.physical_size as u64,
-                            alias.physical_host_addr,
-                            alias.owner_generation,
-                        )
-                    },
-                )
+                    |_| true,
+                );
+            let live_alias_end = live_alias_candidates
+                .into_iter()
+                .find(|alias| {
+                    global_frame_host_owner_matches_in(
+                        self.custody(),
+                        alias.physical_ipa,
+                        alias.physical_size as u64,
+                        alias.physical_host_addr,
+                        alias.owner_generation,
+                    )
+                })
                 .map(|alias| alias.start.saturating_add(alias.size as u64));
             if let Some(alias_end) = live_alias_end {
                 return Ok(alias_end.min(end));
@@ -855,23 +861,27 @@ impl HvfVmState {
                     .first_start_between(GuestVa(start), GuestVa(end), |mapping| {
                         global_frame_region_owner_matches_in(custody, mapping)
                     });
-            let next_alias = alias_registry()
+            let next_alias_candidates = alias_registry()
                 .lock()
-                .first_matching_process_alias_start_between(
+                .matching_process_alias_starts_between_candidates(
                     start,
                     end,
                     self.mm_root_slot,
                     self.container_root,
-                    |alias| {
-                        global_frame_host_owner_matches_in(
-                            self.custody(),
-                            alias.physical_ipa,
-                            alias.physical_size as u64,
-                            alias.physical_host_addr,
-                            alias.owner_generation,
-                        )
-                    },
+                    |_| true,
                 );
+            let next_alias = next_alias_candidates
+                .into_iter()
+                .find(|alias| {
+                    global_frame_host_owner_matches_in(
+                        self.custody(),
+                        alias.physical_ipa,
+                        alias.physical_size as u64,
+                        alias.physical_host_addr,
+                        alias.owner_generation,
+                    )
+                })
+                .map(|alias| alias.start);
             next_local
                 .into_iter()
                 .chain(next_alias)
@@ -4936,7 +4946,9 @@ impl HvfTaskState {
                 mapping_ipa.checked_add(semantic_va - mapping_start) == Some(ipa)
             }
         };
-        if let Some(alias) = alias_registry().lock().newest_matching_for_process(
+        // Geometry under the registry lock; owner authentication on the
+        // released candidates (lock order, see `containing_candidates`).
+        let alias_candidates = alias_registry().lock().matching_for_process_candidates(
             self.mm_root_slot,
             self.container_root,
             |alias| {
@@ -4955,24 +4967,23 @@ impl HvfTaskState {
                         <= alias
                             .physical_ipa
                             .saturating_add(alias.physical_size as u64)
-                    && if self.persistent_vm_lifecycle
-                        && is_reusable_global_frame_extent(
-                            alias.physical_ipa,
-                            alias.physical_size as u64,
-                        )
-                    {
-                        global_frame_host_owner_matches_in(
-                            custody,
-                            alias.physical_ipa,
-                            alias.physical_size as u64,
-                            alias.physical_host_addr,
-                            alias.owner_generation,
-                        )
-                    } else {
-                        alias_backing_is_live(alias.physical_host_addr)
-                    }
             },
-        ) {
+        );
+        if let Some(alias) = alias_candidates.into_iter().find(|alias| {
+            if self.persistent_vm_lifecycle
+                && is_reusable_global_frame_extent(alias.physical_ipa, alias.physical_size as u64)
+            {
+                global_frame_host_owner_matches_in(
+                    custody,
+                    alias.physical_ipa,
+                    alias.physical_size as u64,
+                    alias.physical_host_addr,
+                    alias.owner_generation,
+                )
+            } else {
+                alias_backing_is_live(alias.physical_host_addr)
+            }
+        }) {
             let offset = usize::try_from(physical_ipa - alias.physical_ipa).ok()?;
             if self.persistent_vm_lifecycle
                 && is_reusable_global_frame_extent(alias.physical_ipa, alias.physical_size as u64)
@@ -5204,27 +5215,35 @@ impl HvfTaskState {
             {
                 return Some(mapping.view());
             }
-            if let Some(alias) = alias_registry().lock().newest_containing_ipa(ipa, |alias| {
-                // A fork peer can retain the same physical frame at a
-                // different VA. Its live IPA is not a semantic mapping for
-                // this MM: copy offsets and sparse-materialization bounds
-                // must come from the requested VA's exact translation.
-                alias_matches_process_scope(
-                    alias.ownership_scope,
-                    self.mm_root_slot,
-                    self.container_root,
-                ) && address >= alias.start
-                    && address.checked_add(length as u64).is_some_and(|end| {
-                        alias
-                            .start
-                            .checked_add(alias.size as u64)
-                            .is_some_and(|limit| end <= limit)
-                    })
-                    && alias.ipa.checked_add(address - alias.start) == Some(ipa)
-                    && ipa >= alias.ipa
-                    && ipa < alias.ipa.saturating_add(alias.size as u64)
-                    && alias_is_live(alias)
-            }) {
+            // Geometry under the registry lock; `alias_is_live` (the
+            // carrier's owners map) only on the released candidates.
+            let alias_candidates =
+                alias_registry()
+                    .lock()
+                    .containing_ipa_candidates(ipa, |alias| {
+                        // A fork peer can retain the same physical frame at a
+                        // different VA. Its live IPA is not a semantic mapping for
+                        // this MM: copy offsets and sparse-materialization bounds
+                        // must come from the requested VA's exact translation.
+                        alias_matches_process_scope(
+                            alias.ownership_scope,
+                            self.mm_root_slot,
+                            self.container_root,
+                        ) && address >= alias.start
+                            && address.checked_add(length as u64).is_some_and(|end| {
+                                alias
+                                    .start
+                                    .checked_add(alias.size as u64)
+                                    .is_some_and(|limit| end <= limit)
+                            })
+                            && alias.ipa.checked_add(address - alias.start) == Some(ipa)
+                            && ipa >= alias.ipa
+                            && ipa < alias.ipa.saturating_add(alias.size as u64)
+                    });
+            if let Some(alias) = alias_candidates
+                .into_iter()
+                .find(|alias| alias_is_live(alias))
+            {
                 return Some(MappingView::from_alias(&alias));
             }
             return None;
@@ -5288,19 +5307,25 @@ impl HvfTaskState {
             return Some(mapping.view());
         }
         if !self.protections.range_no_access(address, length) {
-            if let Some(alias) = alias_registry().lock().newest_process_alias_containing_va(
-                address,
-                self.mm_root_slot,
-                self.container_root,
-                |alias| {
-                    address.checked_add(length as u64).is_some_and(|end| {
-                        alias
-                            .start
-                            .checked_add(alias.size as u64)
-                            .is_some_and(|limit| end <= limit)
-                    }) && alias_is_live(alias)
-                },
-            ) {
+            let alias_candidates = alias_registry()
+                .lock()
+                .process_alias_containing_va_candidates(
+                    address,
+                    self.mm_root_slot,
+                    self.container_root,
+                    |alias| {
+                        address.checked_add(length as u64).is_some_and(|end| {
+                            alias
+                                .start
+                                .checked_add(alias.size as u64)
+                                .is_some_and(|limit| end <= limit)
+                        })
+                    },
+                );
+            if let Some(alias) = alias_candidates
+                .into_iter()
+                .find(|alias| alias_is_live(alias))
+            {
                 return Some(MappingView::from_alias(&alias));
             }
         }
