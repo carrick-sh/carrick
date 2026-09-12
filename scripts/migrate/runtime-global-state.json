@@ -1651,7 +1651,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/binding.rs",
       "symbol": "VFORK_ACTIVATION_HOOK",
       "fingerprint": "fbba5cbdfd1fe6923542b013fe8828c2b3a6774ecdf07765037c1b61e2c8a642",
       "classification": "test_only",
