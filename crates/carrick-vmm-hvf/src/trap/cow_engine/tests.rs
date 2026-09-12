@@ -34,7 +34,7 @@ fn frame_publication_sites_contain_no_carrier_topology_lock() {
         .nth(1)
         .expect("materialize_retired_reuse exists");
     let materialize_retired_body = materialize_retired
-        .split("pub(crate) fn mapping_for_range(")
+        .split("pub(crate) fn publish_shared_repoint(")
         .next()
         .expect("materialize_retired_reuse body end");
     assert!(
@@ -48,7 +48,7 @@ fn frame_publication_sites_contain_no_carrier_topology_lock() {
         .nth(1)
         .expect("perform_frame_cow exists");
     let perform_cow_body = perform_cow
-        .split("pub(crate) fn handle_data_abort(")
+        .split("pub(crate) fn refresh_fork_process_state_in(")
         .next()
         .expect("perform_frame_cow body end");
     assert!(

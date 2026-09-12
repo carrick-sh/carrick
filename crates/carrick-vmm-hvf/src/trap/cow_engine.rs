@@ -769,11 +769,6 @@ impl HvfVmState {
             self.carrier_vm_custody(),
             identity,
         )?;
-        let _topology = crate::fork_quiesce::acquire_topology_lock(
-            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
-            identity.linux_pid,
-            identity.linux_tid,
-        );
         let end = if replacing {
             // Eligibility was screened before exact-MM quiescence. Recheck
             // under topology exclusion before bypassing the hole checks: a
@@ -899,6 +894,9 @@ impl HvfVmState {
         } else {
             None
         };
+        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+            crate::fork_quiesce::frame_registry_lock().lock(),
+        );
         let published = sparse_materialization::publish_replacing(
             &publication,
             start,
@@ -920,6 +918,7 @@ impl HvfVmState {
                 }
             },
         )?;
+        drop(registry);
         let page_granular_arm = published.page_granular_arm;
         let semantic_ipa = published.region.ipa;
         for ext in published.extension_regions {
@@ -1085,7 +1084,7 @@ impl HvfVmState {
             )));
         }
 
-        let identity = self.cow_identity.ok_or_else(|| {
+        let _identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch retained reuse has no bound mm identity".to_owned())
         })?;
         let authority = self.cow_authority.clone().ok_or_else(|| {
@@ -1094,11 +1093,6 @@ impl HvfVmState {
         let _quiesce = authority.quiesce().map_err(|error| {
             TrapError::Hypervisor(format!("quiesce HVPatch retained reuse: {error}"))
         })?;
-        let _topology = crate::fork_quiesce::acquire_topology_lock(
-            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
-            identity.linux_pid,
-            identity.linux_tid,
-        );
 
         // Another sibling may have repaired the leaf while this thread waited.
         let retained_ipa = self
@@ -1374,12 +1368,16 @@ impl HvfVmState {
                 "retained reuse stage-1 TLBI failed: {error}"
             );
         }
+        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+            crate::fork_quiesce::frame_registry_lock().lock(),
+        );
         if let Err(error) = authority.apply(reservation.commit(())) {
             carrick_fatal!(
                 "hvpatch::frame_inventory",
                 "retained reuse inventory commit failed: {error}"
             );
         }
+        drop(registry);
         owner_rollback.commit();
 
         match authority.mapping_is_live(
@@ -1878,16 +1876,10 @@ impl HvfTaskState {
         let authority = self.cow_authority.clone().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch frame COW has no inventory authority".to_owned())
         })?;
-        // Lock order matches every runtime page-table editor: pause sibling
-        // walkers first, then serialize shared HVF stage-2/alias topology.
+        // Pause sibling walkers first before inspecting or mutating MM COW state.
         let _quiesce = authority.quiesce().map_err(|error| {
             TrapError::Hypervisor(format!("quiesce HVPatch frame COW: {error}"))
         })?;
-        let _topology = crate::fork_quiesce::acquire_topology_lock(
-            carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
-            identity.linux_pid,
-            identity.linux_tid,
-        );
 
         // Another vCPU of this mm may have won while we waited for topology.
         // Take only what the fault path needs. This used to CLONE the whole
@@ -2555,6 +2547,9 @@ impl HvfTaskState {
             );
         }
         emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Stage1Published);
+        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+            crate::fork_quiesce::frame_registry_lock().lock(),
+        );
         if let Err(error) = authority.apply(reservation.commit(())) {
             carrick_fatal!(
                 "hvpatch::frame_inventory",
@@ -2578,6 +2573,7 @@ impl HvfTaskState {
                 );
             })
         };
+        drop(registry);
         record_cow_inventory_lifecycle(
             CowDiagnosticLifecycleKind::InventoryRemoved,
             CowDiagnosticLifecycleSite::CowCommit,
