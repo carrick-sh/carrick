@@ -1909,4 +1909,28 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn fork_in_one_mm_does_not_park_executors_of_another() {
+        let mm_a = Arc::new(PtQuiesce::new());
+        let mm_b = Arc::new(PtQuiesce::new());
+
+        let t1 = std::thread::spawn(move || {
+            let _guard_a = bind_current_mm_quiesce(mm_a);
+            barrier().set_quiescing();
+            let t2 = std::thread::spawn(move || {
+                let _guard_b = bind_current_mm_quiesce(mm_b);
+                !is_quiescing()
+            });
+            let executor_b_not_quiescing = t2.join().unwrap();
+            barrier().end_quiesce();
+            executor_b_not_quiescing
+        });
+
+        let executor_b_not_quiescing = t1.join().unwrap();
+        assert!(
+            executor_b_not_quiescing,
+            "fork in MM A must not report quiescing on executor bound to MM B"
+        );
+    }
 }
