@@ -3973,7 +3973,7 @@ pub(crate) struct AliasVersionRegistry {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn alias_version_registry() -> &'static parking_lot::Mutex<AliasVersionRegistry> {
+pub(crate) fn alias_version_registry() -> &'static parking_lot::Mutex<AliasVersionRegistry> {
     static CELL: std::sync::OnceLock<parking_lot::Mutex<AliasVersionRegistry>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| parking_lot::Mutex::new(AliasVersionRegistry::default()))

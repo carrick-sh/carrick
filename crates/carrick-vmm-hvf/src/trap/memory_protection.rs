@@ -416,6 +416,50 @@ impl AliasClassIndex {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RetiredRows {
+    pub(crate) aliases: Vec<AliasBacking>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl RetiredRows {
+    pub(crate) fn new(aliases: Vec<AliasBacking>) -> Self {
+        Self { aliases }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.aliases.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.aliases.is_empty()
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<AliasBacking> {
+        self.aliases
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for RetiredRows {
+    type Target = [AliasBacking];
+
+    fn deref(&self) -> &Self::Target {
+        &self.aliases
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl IntoIterator for RetiredRows {
+    type Item = AliasBacking;
+    type IntoIter = std::vec::IntoIter<AliasBacking>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.aliases.into_iter()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct AliasRegistry {
     pub(crate) by_scope: std::collections::BTreeMap<AliasOwnershipScope, Vec<(u64, AliasBacking)>>,
@@ -1031,6 +1075,18 @@ impl AliasRegistry {
             self.index_remove(seq, alias);
         }
         rows.into_iter().map(|(_, alias)| alias).collect()
+    }
+
+    /// Retire all rows belonging to `scope`.
+    ///
+    /// In the unpartitioned carrier-global design, retirement walks the
+    /// carrier-global replay set and version containers across all processes.
+    pub(crate) fn retire_scope(&mut self, scope: AliasOwnershipScope) -> RetiredRows {
+        let replay = replay_mappings().lock();
+        let versions = alias_version_registry().lock();
+        note_alias_state_rows_scanned(replay.len() + versions.aliases.len() + self.rows);
+        let aliases = self.remove_scope(scope);
+        RetiredRows::new(aliases)
     }
 
     /// Retain within one scope, returning the removed rows oldest first.
@@ -3025,6 +3081,38 @@ mod alias_differential_tests {
         assert!(
             examined < 100,
             "examined {examined} candidates, expected not thousands"
+        );
+    }
+
+    #[test]
+    fn exit_cost_is_bounded_by_own_rows() {
+        let mut registry = AliasRegistry::default();
+        let mut target_scope = None;
+        for s in 0..1000u64 {
+            let scope = AliasOwnershipScope::MmRootSlot {
+                base: 0x1000_0000_0000 + s * 0x1000_0000,
+                size: 0x4000,
+            };
+            if s == 500 {
+                target_scope = Some(scope);
+            }
+            for r in 0..64u64 {
+                let va = 0x2000_0000 + r * 0x1000;
+                let ipa = 0x6000_0000_0000 + s * 0x1000_0000 + r * 0x1000;
+                registry.push(make_alias(va, ipa, 0x1000, scope));
+            }
+        }
+        let target_scope = target_scope.expect("target scope");
+        let before = alias_state_rows_scanned();
+        let retired = registry.retire_scope(target_scope);
+        let examined = alias_state_rows_scanned() - before;
+        assert!(!retired.is_empty());
+        assert_eq!(retired.len(), 64);
+        assert_eq!(retired.into_vec().len(), 64);
+        let bound = 64 + (1000f64).log2().ceil() as u64;
+        assert!(
+            examined <= bound,
+            "retiring one scope visited {examined} rows; expected <= {bound}"
         );
     }
 }
