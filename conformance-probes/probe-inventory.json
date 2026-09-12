@@ -699,6 +699,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "forkstorm": {
+    "class": "workload",
+    "excluded": false,
+    "runner": "generic"
+  },
   "fsescapeguard": {
     "class": "conformance",
     "excluded": false,
