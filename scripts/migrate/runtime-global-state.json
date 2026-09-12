@@ -915,55 +915,55 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "fast_fs_enabled::CARRICK_FAST_FS",
       "fingerprint": "96ca06b880ff8098bca574f0a3b5def3654a1571488e234607b5a7c5407728de",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FAST_FS read in fast_fs_enabled::CARRICK_FAST_FS (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_FAST_FS read in fast_fs_enabled::CARRICK_FAST_FS (crates/carrick-runtime/src/fs_backend/host.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "overlay_enabled::CARRICK_FS_OVERLAY",
       "fingerprint": "3ae130f3fa0fc49685d6010a720265b73ebdd58b2faf96171d676b30949c0f40",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FS_OVERLAY read in overlay_enabled::CARRICK_FS_OVERLAY (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_FS_OVERLAY read in overlay_enabled::CARRICK_FS_OVERLAY (crates/carrick-runtime/src/fs_backend/host.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "stat_cache_enabled::CARRICK_FS_STATCACHE",
       "fingerprint": "b16c7c1b5f4416fbfbeb65325342c905d6bb273050817180ef0318d722c2294a",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FS_STATCACHE read in stat_cache_enabled::CARRICK_FS_STATCACHE (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_FS_STATCACHE read in stat_cache_enabled::CARRICK_FS_STATCACHE (crates/carrick-runtime/src/fs_backend/host.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "default_scratch_root::HOME",
       "fingerprint": "acfd587978b264cd239ffe761be7c7c1d9743018e8f0e8e0d5ca0beab221b5d2",
       "classification": "config_debug",
-      "rationale": "Environment variable HOME read in default_scratch_root::HOME (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable HOME read in default_scratch_root::HOME (crates/carrick-runtime/src/fs_backend/host.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "default_scratch_root::TMPDIR",
       "fingerprint": "394164c8b4a8b59042322562ebc871f687aa9d65310d19e7a33627c7b6f3fe8c",
       "classification": "config_debug",
-      "rationale": "Environment variable TMPDIR read in default_scratch_root::TMPDIR (crates/carrick-runtime/src/fs_backend.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable TMPDIR read in default_scratch_root::TMPDIR (crates/carrick-runtime/src/fs_backend/host.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "ANON_FD_COUNTER",
       "fingerprint": "265b5d787ac9fe2eaac10f158c9096a6db3f0e2931b862923ba6e07e6df5e9df",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator ANON_FD_COUNTER in crates/carrick-runtime/src/fs_backend.rs generating unique IDs across the host process."
+      "rationale": "Carrier-wide monotonic allocator ANON_FD_COUNTER in crates/carrick-runtime/src/fs_backend/host.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "HOST_XATTR_READS",
       "fingerprint": "7c214600b35d2b01f0bc7f2b286479655384d920343399de997e2bad88e5cd0b",
       "classification": "test_only",
@@ -971,27 +971,27 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "SCRATCH_TRASH_COUNTER",
       "fingerprint": "92c5d908834616fd3d825a5e0292fda831ccec7847a2de821006e56cac0003e3",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator SCRATCH_TRASH_COUNTER in crates/carrick-runtime/src/fs_backend.rs generating unique IDs across the host process."
+      "rationale": "Carrier-wide monotonic allocator SCRATCH_TRASH_COUNTER in crates/carrick-runtime/src/fs_backend/host.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "host_umask::HOST_UMASK",
       "fingerprint": "a3d209ef8cddc394e3f52a16455105d2d8f926d36d2e4619c8062bc332d2925a",
       "classification": "host_kernel_object",
-      "rationale": "Carrier process file-creation mask (Darwin per-process umask) read once in host_umask::HOST_UMASK (crates/carrick-runtime/src/fs_backend.rs); it describes the host carrier, never a guest task, whose umask lives in the kernel graph."
+      "rationale": "Carrier process file-creation mask (Darwin per-process umask) read once in host_umask::HOST_UMASK (crates/carrick-runtime/src/fs_backend/host.rs); it describes the host carrier, never a guest task, whose umask lives in the kernel graph."
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
       "symbol": "scratch_cleanup_sender::SENDER",
       "fingerprint": "5e774260b6700d3db8ed18e8ac5d4651fd2d3e3e1d370a6f5e653f7235b5c507",
       "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static scratch_cleanup_sender::SENDER in crates/carrick-runtime/src/fs_backend.rs maintaining host process lifecycle or VM resources."
+      "rationale": "Carrier-wide host infrastructure static scratch_cleanup_sender::SENDER in crates/carrick-runtime/src/fs_backend/host.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "thread_local",
