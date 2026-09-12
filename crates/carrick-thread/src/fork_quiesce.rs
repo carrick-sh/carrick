@@ -241,6 +241,11 @@ pub fn topology_depth_is_zero_for_executor_boundary() -> bool {
     TOPOLOGY_DEPTH.with(|depth| depth.get() == 0)
 }
 
+/// Current topology depth held by the calling host pthread.
+pub fn topology_depth() -> u32 {
+    TOPOLOGY_DEPTH.with(|depth| depth.get())
+}
+
 fn enter_topology_depth() {
     TOPOLOGY_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
 }
@@ -314,32 +319,6 @@ impl Drop for TopologyLockGuard {
     }
 }
 
-/// Exclusion for one mm's fork/exec/retire transaction. Minted only by the
-/// mm's `MmMutationGuard` (see carrick-runtime `dispatch/mm_authority.rs`),
-/// so holding it proves the stage-1 pause is already held: the P -> topology
-/// order becomes a type, not a comment.
-pub struct MmTransactionGuard<'mm> {
-    _mm: core::marker::PhantomData<&'mm ()>,
-    depth: TopologyDepth,
-}
-
-impl<'mm> MmTransactionGuard<'mm> {
-    /// Mint an MM transaction guard under an established stage-1 mutation authority.
-    ///
-    /// The caller must hold the MM's stage-1 mutation guard (`MmMutationGuard`).
-    pub fn mint_from_mm_mutation_guard(_witness: &'mm ()) -> Self {
-        Self {
-            _mm: core::marker::PhantomData,
-            depth: TopologyDepth::acquire(),
-        }
-    }
-
-    /// Access the underlying topology depth token.
-    pub const fn depth(&self) -> &TopologyDepth {
-        &self.depth
-    }
-}
-
 /// Leaf critical section for the carrier-wide shared-frame registry: staging
 /// and publishing frames another process may install next. Never held across
 /// a guest write, a wait, or another lock.
@@ -361,29 +340,11 @@ pub fn frame_registry_lock() -> &'static parking_lot::Mutex<()> {
     LOCK.get_or_init(|| parking_lot::Mutex::new(()))
 }
 
-/// Proves that `MmTransactionGuard` cannot be constructed directly without
-/// the minting authority from an established `MmMutationGuard`.
-///
-/// ```compile_fail
-/// // Attempting to construct `MmTransactionGuard` without the mutation authority fails to compile:
-/// let _ = carrick_thread::fork_quiesce::MmTransactionGuard {
-///     _mm: core::marker::PhantomData,
-///     depth: carrick_thread::fork_quiesce::TopologyDepth::acquire(),
-/// };
-/// ```
-///
-/// ```
-/// // The constructor path requires an explicit MM mutation guard authority witness:
-/// let witness = ();
-/// let _guard = carrick_thread::fork_quiesce::MmTransactionGuard::mint_from_mm_mutation_guard(&witness);
-/// ```
-pub fn mm_transaction_guard_requires_mm_mutation_guard() {}
-
 /// Acquire the carrier-wide topology mutex and emit request/wait/release
 /// records carrying the Linux guest identity responsible for the mutation.
 ///
 /// Protects carrier-wide frame publication and alias containers until
-/// superseded by [`MmTransactionGuard`] and [`FrameRegistryGuard`].
+/// superseded by per-MM transaction authority and [`FrameRegistryGuard`].
 pub fn acquire_topology_lock(
     operation: carrick_observability::probes::HvpatchTopologyOperation,
     guest_pid: i32,
@@ -1917,13 +1878,15 @@ mod tests {
     }
 
     #[test]
-    fn mm_transaction_guard_requires_mm_mutation_guard() {
+    fn topology_depth_tracks_executor_boundary() {
+        assert_eq!(topology_depth(), 0);
         assert!(topology_depth_is_zero_for_executor_boundary());
         {
-            let witness = ();
-            let _guard = MmTransactionGuard::mint_from_mm_mutation_guard(&witness);
+            let _depth = TopologyDepth::acquire();
+            assert_eq!(topology_depth(), 1);
             assert!(!topology_depth_is_zero_for_executor_boundary());
         }
+        assert_eq!(topology_depth(), 0);
         assert!(topology_depth_is_zero_for_executor_boundary());
     }
 
