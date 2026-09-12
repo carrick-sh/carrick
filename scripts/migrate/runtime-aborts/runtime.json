@@ -1636,7 +1636,7 @@
       "domain": "kernel::object_revision"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
       "function": "PendingQueue::entries",
       "ordinal_in_function": 1,
       "fingerprint": "f06278cfa5448cf220a8768099cdf847e2ff3fdc0a35c10f278221c5d574fa00",

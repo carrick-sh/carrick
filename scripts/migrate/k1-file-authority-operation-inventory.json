@@ -17,7 +17,7 @@
     "epoll": 158,
     "stream": 121,
     "mapping": 726,
-    "lifecycle": 6
+    "lifecycle": 9
   },
   "files": {
     "table_guard": 24,
@@ -26,7 +26,7 @@
     "epoll": 39,
     "stream": 19,
     "mapping": 79,
-    "lifecycle": 5
+    "lifecycle": 6
   },
   "entries": [
     {
@@ -14852,665 +14852,35 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 113,
-      "categories": [
-        "mapping"
-      ],
-      "text": "pub(super) io_uring_mappings: Vec<crate::dispatch::ioring::IoUringMappingSnapshot>,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 138,
-      "categories": [
-        "mapping"
-      ],
-      "text": "io_uring_mappings: RwLock<Vec<crate::dispatch::ioring::IoUringMapping>>,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 213,
-      "categories": [
-        "mapping"
-      ],
-      "text": ") -> RwLockReadGuard<'_, Vec<crate::dispatch::ioring::IoUringMapping>> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 221,
-      "categories": [
-        "mapping"
-      ],
-      "text": "replacement: Option<crate::dispatch::ioring::IoUringMapping>,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 231,
-      "categories": [
-        "mapping"
-      ],
-      "text": "for mapping in mappings.drain(..) {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 232,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping_start = mapping.start;",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 233,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping_end = mapping.end;",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 235,
-      "categories": [
-        "mapping"
-      ],
-      "text": "retained.push(mapping);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 239,
-      "categories": [
-        "mapping"
-      ],
-      "text": "retained.push(mapping.fragment(mapping_start, start));",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 242,
-      "categories": [
-        "mapping"
-      ],
-      "text": "retained.push(mapping.fragment(end, mapping_end));",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 248,
-      "categories": [
-        "mapping"
-      ],
-      "text": "retained.sort_unstable_by_key(|mapping| mapping.start);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 260,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".any(|mapping| mapping.start < end && start < mapping.end)",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 316,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".map(crate::dispatch::ioring::IoUringMapping::snapshot)",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 318,
-      "categories": [
-        "mapping"
-      ],
-      "text": "io_uring_mappings.sort_unstable_by_key(|mapping| mapping.start);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 465,
+      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
+      "line": 49,
       "categories": [
         "lifecycle"
       ],
-      "text": "fn for_fork_copy(id: SighandId, parent: &Self) -> Self {",
-      "scope_kind": "test_or_definition"
+      "text": "pub(super) fn for_fork_copy(id: SighandId, parent: &Self) -> Self {",
+      "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 473,
+      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
+      "line": 57,
       "categories": [
         "lifecycle"
       ],
       "text": "pub(crate) fn for_exec(id: SighandId, caller: &Self) -> Self {",
-      "scope_kind": "test_or_definition"
+      "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 573,
-      "categories": [
-        "epoll"
-      ],
-      "text": "Epoll,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 588,
-      "categories": [
-        "mapping"
-      ],
-      "text": "IoUring,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 608,
-      "categories": [
-        "mapping"
-      ],
-      "text": "IoUring(crate::dispatch::ioring::IoUringDescriptionSnapshot),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 615,
-      "categories": [
-        "mapping"
-      ],
-      "text": "Self::IoUring(_) => FileDescriptionBackingKind::IoUring,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 622,
-      "categories": [
-        "mapping"
-      ],
-      "text": "Self::IoUring(_) => &[],",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 628,
-      "categories": [
-        "stream"
-      ],
-      "text": "/// external readiness state (such as staged splice pushback buffers and nested",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 629,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// synthetic epoll child interests) without coupling backings directly to the",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 699,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// Snapshot the description identities registered by an epoll backing.",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 700,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// `None` means this is not an epoll description. Callers receive owned",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 716,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// Level readiness for `interest`, in epoll's domain. This is the ONE",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 783,
-      "categories": [
-        "epoll"
-      ],
-      "text": "Epoll(Mutex<BTreeMap<FileDescriptionId, Weak<FileDescription>>>),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 786,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// Open-file-description identity. Epoll edges are weak and stable-keyed so",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1340,
-      "categories": [
-        "epoll"
-      ],
-      "text": "pub fn epoll(id: FileDescriptionId) -> Self {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1343,
-      "categories": [
-        "epoll"
-      ],
-      "text": "kind: FileDescriptionKind::Epoll(Mutex::new(BTreeMap::new())),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1359,
-      "categories": [
-        "epoll"
-      ],
-      "text": "FileDescriptionKind::Epoll(_) => true,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1367,
-      "categories": [
-        "epoll"
-      ],
-      "text": "FileDescriptionKind::Epoll(interests) => Some(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1396,
-      "categories": [
-        "epoll"
-      ],
-      "text": "FileDescriptionKind::Epoll(_) => LinuxEpollEvents::empty(),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1432,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// The live epoll descriptions holding a registration whose target is",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1435,
-      "categories": [
-        "epoll"
-      ],
-      "text": "/// no other epoll instance can hold a registration naming it.",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1544,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let FileDescriptionKind::Epoll(interests) = &self.kind else {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1560,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let FileDescriptionKind::Epoll(interests) = &self.kind else {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1587,
-      "categories": [
-        "epoll"
-      ],
-      "text": "let is_epoll = state.kind() == FileDescriptionBackingKind::Epoll;",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1608,
-      "categories": [
-        "epoll"
-      ],
-      "text": "FileDescriptionKind::Epoll(interests) => {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1961,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "epoll_wake_registry: crate::dispatch::EpollWakeRegistry,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1978,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "epoll_wake_registry: crate::dispatch::new_epoll_wake_registry(),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1986,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "pub(super) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 1991,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let epoll_wake_registry = Arc::clone(&parent.epoll_wake_registry);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2000,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "epoll_wake_registry,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2012,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "fn for_exec(id: FileTableId, caller: &Self) -> Self {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2029,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let epoll_wake_registry = Arc::clone(&caller.epoll_wake_registry);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2052,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "epoll_wake_registry,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2096,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "(0..3).contains(&raw) && !self.lock_closed_stdio()[raw as usize]",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2212,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn read_open_files(&self) -> RwLockReadGuard<'_, FileSlotMap> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2216,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn write_open_files(&self) -> FileTableWriteGuard<'_> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2229,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn lock_next_fd(&self) -> FileTableMutexGuard<'_, i32> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2233,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn lock_stdio_cloexec(&self) -> FileTableMutexGuard<'_, [bool; 3]> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2237,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn lock_closed_stdio(&self) -> FileTableMutexGuard<'_, [bool; 3]> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2241,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn read_fd_open_paths(&self) -> RwLockReadGuard<'_, HashMap<i32, String>> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2245,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn write_fd_open_paths(&self) -> FileTableRwWriteGuard<'_, HashMap<i32, String>> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2250,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "let mut fd_open_paths = self.write_fd_open_paths();",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2263,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn read_epoll_fds(&self) -> RwLockReadGuard<'_, BTreeSet<i32>> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2267,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn write_epoll_fds(&self) -> FileTableRwWriteGuard<'_, BTreeSet<i32>> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2271,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "pub(crate) fn epoll_wake_registry(&self) -> &crate::dispatch::EpollWakeRegistry {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2272,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "&self.epoll_wake_registry",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 2570,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "fn for_fork_copy(id: FsContextId, parent: &Self) -> Self {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 3076,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "Arc::new(Sighand::for_fork_copy(ids.sighand_id()?, &parent.sighand))",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 3107,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "sighand: Arc::new(Sighand::for_exec(ids.sighand_id()?, &caller.sighand)),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 3207,
+      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
+      "line": 489,
       "categories": [
         "lifecycle"
       ],
       "text": "pub(crate) fn for_exec(caller: &Self) -> Self {",
-      "scope_kind": "test_or_definition"
+      "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 3403,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "CloneObjectMode::Copy => Arc::new(FileTable::for_fork_copy(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 3410,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "CloneObjectMode::Copy => Arc::new(FsContext::for_fork_copy(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 3425,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "pub(super) fn for_exec(caller: &Self, ids: &ObjectIdRegistry) -> Result<Self, ObjectIdError> {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 3427,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "Arc::new(FileTable::for_exec(ids.file_table_id()?, &caller.files)),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 5273,
-      "categories": [
-        "lifecycle"
-      ],
-      "text": "signal_state: Mutex::new(ThreadSignalState::for_exec(&caller.signal_state())),",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8614,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// mapping and the final live group record have both disappeared.",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8760,
-      "categories": [
-        "epoll"
-      ],
-      "text": "#[error(\"file description {0:?} is not an epoll instance\")]",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8762,
-      "categories": [
-        "epoll"
-      ],
-      "text": "#[error(\"epoll file description {0:?} cannot monitor itself\")]",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 8764,
-      "categories": [
-        "epoll"
-      ],
-      "text": "#[error(\"nested epoll target {0:?} is rejected by the K1 object model\")]",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9211,
+      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
+      "line": 1198,
       "categories": [
         "lifecycle"
       ],
@@ -15518,8 +14888,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9215,
+      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
+      "line": 1202,
       "categories": [
         "lifecycle"
       ],
@@ -15527,8 +14897,8 @@
       "scope_kind": "test_or_definition"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9316,
+      "file": "crates/carrick-runtime/src/kernel/objects/signal.rs",
+      "line": 1303,
       "categories": [
         "lifecycle"
       ],
@@ -15537,7 +14907,637 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9494,
+      "line": 119,
+      "categories": [
+        "mapping"
+      ],
+      "text": "pub(super) io_uring_mappings: Vec<crate::dispatch::ioring::IoUringMappingSnapshot>,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 144,
+      "categories": [
+        "mapping"
+      ],
+      "text": "io_uring_mappings: RwLock<Vec<crate::dispatch::ioring::IoUringMapping>>,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 219,
+      "categories": [
+        "mapping"
+      ],
+      "text": ") -> RwLockReadGuard<'_, Vec<crate::dispatch::ioring::IoUringMapping>> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 227,
+      "categories": [
+        "mapping"
+      ],
+      "text": "replacement: Option<crate::dispatch::ioring::IoUringMapping>,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 237,
+      "categories": [
+        "mapping"
+      ],
+      "text": "for mapping in mappings.drain(..) {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 238,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping_start = mapping.start;",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 239,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping_end = mapping.end;",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 241,
+      "categories": [
+        "mapping"
+      ],
+      "text": "retained.push(mapping);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 245,
+      "categories": [
+        "mapping"
+      ],
+      "text": "retained.push(mapping.fragment(mapping_start, start));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 248,
+      "categories": [
+        "mapping"
+      ],
+      "text": "retained.push(mapping.fragment(end, mapping_end));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 254,
+      "categories": [
+        "mapping"
+      ],
+      "text": "retained.sort_unstable_by_key(|mapping| mapping.start);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 266,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".any(|mapping| mapping.start < end && start < mapping.end)",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 322,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".map(crate::dispatch::ioring::IoUringMapping::snapshot)",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 324,
+      "categories": [
+        "mapping"
+      ],
+      "text": "io_uring_mappings.sort_unstable_by_key(|mapping| mapping.start);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 454,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Epoll,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 469,
+      "categories": [
+        "mapping"
+      ],
+      "text": "IoUring,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 489,
+      "categories": [
+        "mapping"
+      ],
+      "text": "IoUring(crate::dispatch::ioring::IoUringDescriptionSnapshot),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 496,
+      "categories": [
+        "mapping"
+      ],
+      "text": "Self::IoUring(_) => FileDescriptionBackingKind::IoUring,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 503,
+      "categories": [
+        "mapping"
+      ],
+      "text": "Self::IoUring(_) => &[],",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 509,
+      "categories": [
+        "stream"
+      ],
+      "text": "/// external readiness state (such as staged splice pushback buffers and nested",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 510,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// synthetic epoll child interests) without coupling backings directly to the",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 580,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Snapshot the description identities registered by an epoll backing.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 581,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// `None` means this is not an epoll description. Callers receive owned",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 597,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Level readiness for `interest`, in epoll's domain. This is the ONE",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 664,
+      "categories": [
+        "epoll"
+      ],
+      "text": "Epoll(Mutex<BTreeMap<FileDescriptionId, Weak<FileDescription>>>),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 667,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// Open-file-description identity. Epoll edges are weak and stable-keyed so",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1221,
+      "categories": [
+        "epoll"
+      ],
+      "text": "pub fn epoll(id: FileDescriptionId) -> Self {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1224,
+      "categories": [
+        "epoll"
+      ],
+      "text": "kind: FileDescriptionKind::Epoll(Mutex::new(BTreeMap::new())),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1240,
+      "categories": [
+        "epoll"
+      ],
+      "text": "FileDescriptionKind::Epoll(_) => true,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1248,
+      "categories": [
+        "epoll"
+      ],
+      "text": "FileDescriptionKind::Epoll(interests) => Some(",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1277,
+      "categories": [
+        "epoll"
+      ],
+      "text": "FileDescriptionKind::Epoll(_) => LinuxEpollEvents::empty(),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1313,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// The live epoll descriptions holding a registration whose target is",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1316,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// no other epoll instance can hold a registration naming it.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1425,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let FileDescriptionKind::Epoll(interests) = &self.kind else {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1441,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let FileDescriptionKind::Epoll(interests) = &self.kind else {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1468,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let is_epoll = state.kind() == FileDescriptionBackingKind::Epoll;",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1489,
+      "categories": [
+        "epoll"
+      ],
+      "text": "FileDescriptionKind::Epoll(interests) => {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1842,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "epoll_wake_registry: crate::dispatch::EpollWakeRegistry,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1859,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "epoll_wake_registry: crate::dispatch::new_epoll_wake_registry(),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1867,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "pub(super) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1872,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let epoll_wake_registry = Arc::clone(&parent.epoll_wake_registry);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1881,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "epoll_wake_registry,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1893,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "fn for_exec(id: FileTableId, caller: &Self) -> Self {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1910,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let epoll_wake_registry = Arc::clone(&caller.epoll_wake_registry);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1933,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "epoll_wake_registry,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 1977,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "(0..3).contains(&raw) && !self.lock_closed_stdio()[raw as usize]",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2093,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn read_open_files(&self) -> RwLockReadGuard<'_, FileSlotMap> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2097,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn write_open_files(&self) -> FileTableWriteGuard<'_> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2110,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn lock_next_fd(&self) -> FileTableMutexGuard<'_, i32> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2114,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn lock_stdio_cloexec(&self) -> FileTableMutexGuard<'_, [bool; 3]> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2118,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn lock_closed_stdio(&self) -> FileTableMutexGuard<'_, [bool; 3]> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2122,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn read_fd_open_paths(&self) -> RwLockReadGuard<'_, HashMap<i32, String>> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2126,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn write_fd_open_paths(&self) -> FileTableRwWriteGuard<'_, HashMap<i32, String>> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2131,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "let mut fd_open_paths = self.write_fd_open_paths();",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2144,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn read_epoll_fds(&self) -> RwLockReadGuard<'_, BTreeSet<i32>> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2148,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn write_epoll_fds(&self) -> FileTableRwWriteGuard<'_, BTreeSet<i32>> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2152,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "pub(crate) fn epoll_wake_registry(&self) -> &crate::dispatch::EpollWakeRegistry {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2153,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "&self.epoll_wake_registry",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2451,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "fn for_fork_copy(id: FsContextId, parent: &Self) -> Self {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2698,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "Arc::new(Sighand::for_fork_copy(ids.sighand_id()?, &parent.sighand))",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2729,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "sighand: Arc::new(Sighand::for_exec(ids.sighand_id()?, &caller.sighand)),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2774,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "CloneObjectMode::Copy => Arc::new(FileTable::for_fork_copy(",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2781,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "CloneObjectMode::Copy => Arc::new(FsContext::for_fork_copy(",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2796,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "pub(super) fn for_exec(caller: &Self, ids: &ObjectIdRegistry) -> Result<Self, ObjectIdError> {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 2798,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "Arc::new(FileTable::for_exec(ids.file_table_id()?, &caller.files)),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 4644,
+      "categories": [
+        "lifecycle"
+      ],
+      "text": "signal_state: Mutex::new(ThreadSignalState::for_exec(&caller.signal_state())),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 7537,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// mapping and the final live group record have both disappeared.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 7683,
+      "categories": [
+        "epoll"
+      ],
+      "text": "#[error(\"file description {0:?} is not an epoll instance\")]",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 7685,
+      "categories": [
+        "epoll"
+      ],
+      "text": "#[error(\"epoll file description {0:?} cannot monitor itself\")]",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 7687,
+      "categories": [
+        "epoll"
+      ],
+      "text": "#[error(\"nested epoll target {0:?} is rejected by the K1 object model\")]",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "line": 8234,
       "categories": [
         "epoll"
       ],
@@ -15546,7 +15546,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9495,
+      "line": 8235,
       "categories": [
         "epoll"
       ],
@@ -15555,7 +15555,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9497,
+      "line": 8237,
       "categories": [
         "epoll"
       ],
@@ -15564,7 +15564,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9498,
+      "line": 8238,
       "categories": [
         "epoll"
       ],
@@ -15573,7 +15573,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9505,
+      "line": 8245,
       "categories": [
         "epoll"
       ],
@@ -15582,7 +15582,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9506,
+      "line": 8246,
       "categories": [
         "epoll"
       ],
@@ -15591,7 +15591,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9509,
+      "line": 8249,
       "categories": [
         "epoll"
       ],
@@ -15600,7 +15600,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9512,
+      "line": 8252,
       "categories": [
         "epoll"
       ],
@@ -15609,7 +15609,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9515,
+      "line": 8255,
       "categories": [
         "epoll"
       ],
@@ -15618,7 +15618,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9517,
+      "line": 8257,
       "categories": [
         "epoll"
       ],
@@ -15627,7 +15627,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9563,
+      "line": 8303,
       "categories": [
         "lifecycle"
       ],
@@ -15636,7 +15636,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9647,
+      "line": 8387,
       "categories": [
         "table_guard"
       ],
@@ -15645,7 +15645,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9659,
+      "line": 8399,
       "categories": [
         "table_guard"
       ],
@@ -15654,7 +15654,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9762,
+      "line": 8502,
       "categories": [
         "table_guard"
       ],
@@ -15663,7 +15663,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9825,
+      "line": 8565,
       "categories": [
         "table_guard"
       ],
@@ -15672,7 +15672,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/objects.rs",
-      "line": 9866,
+      "line": 8606,
       "categories": [
         "table_guard"
       ],
