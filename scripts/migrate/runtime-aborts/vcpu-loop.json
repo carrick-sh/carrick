@@ -290,7 +290,7 @@
       "domain": "kernel::scheduler_rollback"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
       "function": "ReceiptLog::record",
       "ordinal_in_function": 1,
       "fingerprint": "6894ee4c88d68d4bcb330966ef120859d95272d0a0e73703729c50ac43eb58d4",
@@ -301,7 +301,7 @@
       "domain": "vcpu_loop::executor_receipt_log"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
       "function": "PoolControl::register_worker",
       "ordinal_in_function": 1,
       "fingerprint": "29d1e3cafc3d59a226b4c81f11991e218d2edcf3c41ece8f5c857f95537aad59",
@@ -312,7 +312,7 @@
       "domain": "vcpu_loop::executor_control"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
       "function": "ExecutorPool<F,R>::start",
       "ordinal_in_function": 1,
       "fingerprint": "a4b1a52e0c626ea46c224aad932a35e4a9fe6fbeb3576d04e803f491d9b9056f",
@@ -323,7 +323,7 @@
       "domain": "vcpu_loop::executor_pool"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
       "function": "ExecutorPool<F,R>::start",
       "ordinal_in_function": 2,
       "fingerprint": "a4b1a52e0c626ea46c224aad932a35e4a9fe6fbeb3576d04e803f491d9b9056f",
@@ -334,7 +334,7 @@
       "domain": "vcpu_loop::executor_pool"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
       "function": "ExecutorPool<F,R>::shutdown",
       "ordinal_in_function": 1,
       "fingerprint": "e38c4f8de9647042579fa22def9a7b0b8541313ec5048de748101bfcd56c0ffc",
@@ -1599,7 +1599,7 @@
       "domain": "kernel::scheduler"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
       "function": "DebugAuxProviderPublication::commit",
       "ordinal_in_function": 1,
       "fingerprint": "e55468c605481c9a0d26df043ae6b983f6cc84dabdbd602d397c3c6bff0c440e",

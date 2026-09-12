@@ -1635,7 +1635,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
       "symbol": "configured_bound_executors::CARRICK_BOUND_EXECUTORS",
       "fingerprint": "24ec3e21b53638b48f187def34df0e03f263e9a25089abf7932463b94a42e92c",
       "classification": "config_debug",
@@ -1643,7 +1643,7 @@
     },
     {
       "kind": "env_var",
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
       "symbol": "configured_spare_executors::CARRICK_SPARE_EXECUTORS",
       "fingerprint": "42e302bc90efd233ad13b83fa844d65b448c00696e81df3c19e4adbbb6db277d",
       "classification": "config_debug",
