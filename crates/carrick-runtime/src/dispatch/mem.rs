@@ -68,6 +68,8 @@ pub(crate) mod mmap;
 #[cfg(test)]
 pub(crate) use madvise::MadviseRangeMeta;
 
+use carrick_abi::syscall::nr;
+
 syscall_table! {
     /// Per-module syscall routing for the `mem` subsystem (Task A1).
     ///
@@ -76,31 +78,31 @@ syscall_table! {
     /// the other modules' tables. Add a `mem` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_mem;
-    213 => readahead,
-    223 => fadvise64,
-    425 => io_uring_setup,
-    426 => io_uring_enter,
-    427 => io_uring_register,
-    283 => sys_membarrier,
-    282 => userfaultfd,
+    nr::READAHEAD => readahead,
+    nr::FADVISE64 => fadvise64,
+    nr::IO_URING_SETUP => io_uring_setup,
+    nr::IO_URING_ENTER => io_uring_enter,
+    nr::IO_URING_REGISTER => io_uring_register,
+    nr::MEMBARRIER => sys_membarrier,
+    nr::USERFAULTFD => userfaultfd,
 }
 
 mutation_syscall_table! {
     pub(crate) fn dispatch_mem_mutation;
-    214 => brk,
-    215 => munmap,
-    216 => mremap,
-    222 => mmap,
-    226 => mprotect,
-    227 => msync,
-    228 => mlock,
-    229 => munlock,
-    230 => mlockall,
-    231 => munlockall,
-    232 => mincore,
-    233 => madvise,
-    234 => remap_file_pages,
-    284 => mlock2,
+    nr::BRK => brk,
+    nr::MUNMAP => munmap,
+    nr::MREMAP => mremap,
+    nr::MMAP => mmap,
+    nr::MPROTECT => mprotect,
+    nr::MSYNC => msync,
+    nr::MLOCK => mlock,
+    nr::MUNLOCK => munlock,
+    nr::MLOCKALL => mlockall,
+    nr::MUNLOCKALL => munlockall,
+    nr::MINCORE => mincore,
+    nr::MADVISE => madvise,
+    nr::REMAP_FILE_PAGES => remap_file_pages,
+    nr::MLOCK2 => mlock2,
 }
 
 /// Dispatcher-owned, revisioned wrapper around the sole production memory/VMA
