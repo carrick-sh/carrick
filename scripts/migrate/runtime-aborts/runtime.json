@@ -171,7 +171,7 @@
       "domain": "dispatch::host_alias"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mem/fault.rs",
       "function": "MemView<'a>::commit_mmap_growdown",
       "ordinal_in_function": 1,
       "fingerprint": "c4aea678c7339eddb29b575dc610fe1fdefdacc38c9009b78c4519df38144ab1",
@@ -182,7 +182,7 @@
       "domain": "dispatch::mmap_growdown"
     },
     {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mem/fault.rs",
       "function": "MemView<'a>::commit_resident_fault",
       "ordinal_in_function": 1,
       "fingerprint": "8ef51523a78b2acdc6d56763f5b12cea108ab4d90518b2c34508cb6d09ed1e09",
