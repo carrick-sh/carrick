@@ -670,15 +670,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 329511,
-        "byte_start": 329499,
+        "byte_end": 328173,
+        "byte_start": 328161,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 7346,
-        "line_end": 7346,
-        "line_start": 7346
+        "line": 7325,
+        "line_end": 7325,
+        "line_start": 7325
       }
     },
     {
@@ -691,15 +691,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 332142,
-        "byte_start": 332130,
+        "byte_end": 330804,
+        "byte_start": 330792,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 7392,
-        "line_end": 7392,
-        "line_start": 7392
+        "line": 7371,
+        "line_end": 7371,
+        "line_start": 7371
       }
     },
     {
@@ -712,15 +712,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 334459,
-        "byte_start": 334447,
+        "byte_end": 333121,
+        "byte_start": 333109,
         "column": 25,
         "column_end": 37,
         "column_start": 25,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 7433,
-        "line_end": 7433,
-        "line_start": 7433
+        "line": 7412,
+        "line_end": 7412,
+        "line_start": 7412
       }
     },
     {
@@ -10470,15 +10470,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 182260,
-        "byte_start": 182235,
+        "byte_end": 182462,
+        "byte_start": 182437,
         "column": 35,
         "column_end": 60,
         "column_start": 35,
         "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-        "line": 4305,
-        "line_end": 4305,
-        "line_start": 4305
+        "line": 4308,
+        "line_end": 4308,
+        "line_start": 4308
       }
     },
     {
@@ -11526,9 +11526,9 @@
       }
     }
   ],
-  "rows_sha256": "7a328a979a3923126f8969aed9c31ead86a8a574fd67a9068f3778f2958e9fde",
+  "rows_sha256": "5706ac814c5a96606852de7973cfbc21e00a4ae26a3cb3bba45290ac1cc7ad5c",
   "schema": 1,
-  "source_head": "c40654c000aa9bf91abaa46bfe6a5cdfdc923c1a",
+  "source_head": "33c190265b2979988fff2f2496da7649d1ffa463",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
