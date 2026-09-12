@@ -1615,6 +1615,9 @@ where
                     .map(Some);
                 }
             };
+            let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+                crate::fork_quiesce::frame_registry_lock().lock(),
+            );
             let retired = match old_capacity {
                 None => None,
                 Some(old_capacity) => {
@@ -1681,6 +1684,7 @@ where
                 )
                 .map(Some);
             }
+            drop(registry);
             Some(abandon)
         } else {
             None
@@ -1833,6 +1837,9 @@ where
         // frame-inventory authority lock.
         drop(_hvpatch_topology);
         if let Some(process) = kernel.hvpatch_process.as_ref() {
+            let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+                crate::fork_quiesce::frame_registry_lock().lock(),
+            );
             let Some((retired_commit, fallback_replacement_commit)) =
                 backend_publication_gate.take_after_replace(|| engine.take_exec_inventory())
             else {
@@ -1904,6 +1911,7 @@ where
                     .map(Some);
                 }
             }
+            drop(registry);
         }
         #[cfg(test)]
         self.fail_exec_terminal_context_for_test(ExecTerminalContextFailpoint::BeforeKernelCommit)?;

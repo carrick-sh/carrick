@@ -130,7 +130,7 @@ fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
 
     // 2. exec retirement apply & replacement apply in vcpu_loop/exec.rs
     let exec_apply_block = exec_src
-        .split("if let Some(process) = kernel.hvpatch_process.as_ref() {")
+        .split("drop(_hvpatch_topology);")
         .nth(1)
         .expect("exec apply block exists")
         .split("#[cfg(test)]")
@@ -150,7 +150,7 @@ fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
     // 3. detached address space retirement apply in vcpu_loop/binding.rs
     let binding_apply_block = binding_src
         .split("fn apply_detached_address_space_retirement(")
-        .nth(1)
+        .nth(2)
         .expect("apply_detached_address_space_retirement exists")
         .split("fn apply_detached_address_space_retirement_with_receipt(")
         .next()
@@ -163,7 +163,7 @@ fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
 
     let binding_apply_receipt_block = binding_src
         .split("fn apply_detached_address_space_retirement_with_receipt(")
-        .nth(1)
+        .nth(2)
         .expect("apply_detached_address_space_retirement_with_receipt exists")
         .split("pub(crate) struct HvpatchLoopJob<E>")
         .next()
@@ -201,7 +201,7 @@ fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
 
     // 6. exec reservation in vcpu_loop/exec.rs
     let exec_reserve_block = exec_src
-        .split("let retired = match old_capacity {")
+        .split("let replacement_capacity = match carrick_hal::FrameEventCapacity::for_event_count(")
         .nth(1)
         .expect("exec reservation exists")
         .split("Some(abandon)")

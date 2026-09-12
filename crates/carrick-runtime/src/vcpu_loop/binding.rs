@@ -1011,6 +1011,9 @@ where
                 );
             });
         if owns_final_mm {
+            let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+                crate::fork_quiesce::frame_registry_lock().lock(),
+            );
             let capacity = carrick_hal::FrameEventCapacity::for_event_count(
                 carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
             )
@@ -1044,6 +1047,7 @@ where
                         "arm persistent failure inventory failed: {failure}"
                     );
                 });
+            drop(registry);
         }
         let prepared_core = match &terminal {
             PersistentTerminal::Outcome { prepared_core, .. } => prepared_core.as_deref(),
@@ -4365,8 +4369,11 @@ where
         &mut self,
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<(), TrapError> {
+        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+            crate::fork_quiesce::frame_registry_lock().lock(),
+        );
         let (kernel, mm) = self.take_terminal_inventory_authority()?;
-        kernel
+        let result = kernel
             .frame_inventory()
             .apply(mm, commit)
             .map(|_| ())
@@ -4374,7 +4381,9 @@ where
                 TrapError::Hypervisor(format!(
                     "publish detached terminal inventory retirement: {error}"
                 ))
-            })
+            });
+        drop(registry);
+        result
     }
 
     /// The same publication, but returning the authenticated receipt a published
@@ -4383,8 +4392,11 @@ where
         &mut self,
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError> {
+        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+            crate::fork_quiesce::frame_registry_lock().lock(),
+        );
         let (kernel, mm) = self.take_terminal_inventory_authority()?;
-        kernel
+        let result = kernel
             .frame_inventory()
             .apply_retirement_with_receipt(mm, commit)
             .map(|(_, receipt)| receipt)
@@ -4392,7 +4404,9 @@ where
                 TrapError::Hypervisor(format!(
                     "publish detached terminal inventory retirement receipt: {error}"
                 ))
-            })
+            });
+        drop(registry);
+        result
     }
 }
 

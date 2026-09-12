@@ -1714,6 +1714,9 @@ where
              mapping_candidates: usize,
              capacity: carrick_hal::FrameEventCapacity|
              -> Result<carrick_hal::FrameInventoryReservation, RuntimeError> {
+                let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+                    crate::fork_quiesce::frame_registry_lock().lock(),
+                );
                 let reservation = parent_process
                     .kernel_graph()
                     .reserve_frame_inventory(frame_candidates, mapping_candidates, capacity)
@@ -1723,6 +1726,7 @@ where
                         ))
                     })?;
                 inventory_transaction = Some(reservation.transaction());
+                drop(registry);
                 Ok(reservation)
             };
         let inventory_preparation = if shares_mm {
@@ -2241,6 +2245,9 @@ where
             return Err(ops.fail_stop(error));
         }
         if !shares_mm {
+            let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+                crate::fork_quiesce::frame_registry_lock().lock(),
+            );
             ops.apply_inventory(&task_backend, child_context.kernel(), child_mm_id)
                 .unwrap_or_else(|error| {
                     tracing::error!(child_pid, %error, "apply process child frame inventory");
@@ -2250,6 +2257,7 @@ where
                         child_mm_id
                     );
                 });
+            drop(registry);
         }
         ops.activate_child(&mut task_backend)
             .unwrap_or_else(|error| {
