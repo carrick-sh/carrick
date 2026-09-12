@@ -70,21 +70,36 @@ pub(crate) fn apply_alias_frame_inventory(
 ///
 /// Returns the carrier-terminal error the arm completes with; every later job
 /// wait in this carrier is answered by the same recorded abort.
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct RefuseAliasInstallSpec {
+    pub(crate) site: crate::kernel::debug::HvpatchAliasInstallSite,
+    pub(crate) guest_pid: i32,
+    pub(crate) guest_tid: i32,
+    pub(crate) va: u64,
+    pub(crate) len: u64,
+    pub(crate) prot: u64,
+    pub(crate) shared: bool,
+    pub(crate) prot_none: bool,
+    pub(crate) error: String,
+    pub(crate) frame: Option<carrick_hal::FrameId>,
+}
+
 pub(crate) fn refuse_alias_install(
     kernel: &Kernel,
     context: &crate::kernel::KernelContext,
-    site: crate::kernel::debug::HvpatchAliasInstallSite,
-    guest_pid: i32,
-    guest_tid: i32,
-    va: u64,
-    len: u64,
-    prot: u64,
-    shared: bool,
-    prot_none: bool,
-    error: String,
-    frame: Option<carrick_hal::FrameId>,
+    spec: RefuseAliasInstallSpec,
 ) -> RuntimeError {
+    let RefuseAliasInstallSpec {
+        site,
+        guest_pid,
+        guest_tid,
+        va,
+        len,
+        prot,
+        shared,
+        prot_none,
+        error,
+        frame,
+    } = spec;
     let pending_reservation = frame
         .and_then(|frame| {
             context
