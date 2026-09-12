@@ -1272,7 +1272,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 3,
-      "fingerprint": "c70401373788556fe3b6fbf8dbf37379967209ecb794ee25e2a2fe0a6f821af5",
+      "fingerprint": "53c786cacfd782f7ff676815fa37f2cfbcf8e5764ee5ba978d16c771712ec25d",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_coordinator",
       "rationale": "Publishing a second unique vCPU lease-drain guard into one ProcessForkCoordinator indicates a corrupt fork state transition and would lose one registration freeze authority.",
