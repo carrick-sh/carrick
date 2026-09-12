@@ -3158,15 +3158,6 @@ pub(crate) fn global_frame_region_owner_matches(mapping: &HvfMappedRegion) -> bo
 pub(crate) type ReplayMappingKey = (u64, usize, usize, u64, u64);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn replay_mappings()
--> &'static parking_lot::Mutex<std::collections::BTreeSet<ReplayMappingKey>> {
-    static CELL: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::BTreeSet<ReplayMappingKey>>,
-    > = std::sync::OnceLock::new();
-    CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeSet::new()))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn replay_mapping_key(backing: AliasBacking) -> ReplayMappingKey {
     (
         backing.physical_ipa,
@@ -3179,26 +3170,49 @@ pub(crate) fn replay_mapping_key(backing: AliasBacking) -> ReplayMappingKey {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn forget_replay_extent(ipa: u64, size: usize) {
-    let mut replay = replay_mappings().lock();
-    let _registry = alias_registry().lock();
-    let doomed: Vec<ReplayMappingKey> = replay
-        .range((ipa, 0, 0, 0, 0)..=(ipa, usize::MAX, usize::MAX, u64::MAX, u64::MAX))
-        .filter(|(_, mapped_size, _, _, _)| *mapped_size == size)
-        .copied()
+    let mut registry = alias_registry().lock();
+    let mut candidate_scopes: std::collections::BTreeSet<AliasOwnershipScope> = registry
+        .physical_start_rows(ipa)
+        .iter()
+        .filter(|(_, alias)| alias.physical_size == size)
+        .map(|(_, alias)| alias.ownership_scope)
         .collect();
-    if doomed.is_empty() {
-        return;
+    if candidate_scopes.is_empty() {
+        for (scope, bucket) in &registry.by_scope {
+            if bucket
+                .replay
+                .range((ipa, 0, 0, 0, 0)..=(ipa, usize::MAX, usize::MAX, u64::MAX, u64::MAX))
+                .any(|(_, mapped_size, _, _, _)| *mapped_size == size)
+            {
+                candidate_scopes.insert(*scope);
+            }
+        }
     }
-    for row in &doomed {
-        replay.remove(row);
+    for scope in candidate_scopes {
+        if let Some(bucket) = registry.by_scope.get_mut(&scope) {
+            let doomed: Vec<ReplayMappingKey> = bucket
+                .replay
+                .range((ipa, 0, 0, 0, 0)..=(ipa, usize::MAX, usize::MAX, u64::MAX, u64::MAX))
+                .filter(|(_, mapped_size, _, _, _)| *mapped_size == size)
+                .copied()
+                .collect();
+            if doomed.is_empty() {
+                continue;
+            }
+            for row in &doomed {
+                bucket.replay.remove(row);
+            }
+            scoped_alias_epoch_update(&mut bucket.versions, None, &[ipa], &bucket.replay);
+        }
     }
-    let mut versions = alias_version_registry().lock();
-    scoped_alias_epoch_update(&mut versions, None, &[ipa], &replay);
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn clear_replay_mappings() {
-    mutate_external_alias_state(|replay, _| replay.clear());
+    let mut registry = alias_registry().lock();
+    for bucket in registry.by_scope.values_mut() {
+        bucket.replay.clear();
+    }
 }
 
 /// Diagnostic: lazy-alias re-map count (the `debug-stats` feature logs every 256th).
@@ -3214,14 +3228,15 @@ pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// distant VA that aliases the same physical frame.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn register_shared_alias(b: AliasBacking) {
-    // Same replay -> alias -> version lock order as every other writer.
-    let mut replay = replay_mappings().lock();
+    // Single lock over alias_registry() guarding rows, replay set, and version chains.
     let mut registry = alias_registry().lock();
+    let scope = b.ownership_scope;
     let key = replay_mapping_key(b);
+    let bucket = registry.by_scope.entry(scope).or_default();
     let replay_rows_changed = {
         let mut had_other = false;
         let mut had_exact = false;
-        for row in replay.range(
+        for row in bucket.replay.range(
             (b.physical_ipa, 0, 0, 0, 0)
                 ..=(b.physical_ipa, usize::MAX, usize::MAX, u64::MAX, u64::MAX),
         ) {
@@ -3234,19 +3249,13 @@ pub(crate) fn register_shared_alias(b: AliasBacking) {
         had_other || !had_exact
     };
     if replay_rows_changed {
-        // At most a handful of rows share one physical IPA. `BTreeSet::retain`
-        // still walks the WHOLE set to find them, so remove exactly the rows
-        // the range query names.
-        for row in replay_rows_for_ipa(&replay, b.physical_ipa) {
-            replay.remove(&row);
+        for row in replay_rows_for_ipa(&bucket.replay, b.physical_ipa) {
+            bucket.replay.remove(&row);
         }
-        replay.insert(key);
+        bucket.replay.insert(key);
     }
-    // Bucket-scoped: this used to scan every live process's alias rows to find
-    // one exact semantic identity, on a path every shared-alias registration takes.
     let old_entry = registry.upsert_by_key(b);
     let entry_changed = old_entry != Some(b);
-    let mut versions = alias_version_registry().lock();
     let mut replay_ipas: Vec<u64> = Vec::new();
     if replay_rows_changed || entry_changed {
         replay_ipas.push(b.physical_ipa);
@@ -3257,11 +3266,12 @@ pub(crate) fn register_shared_alias(b: AliasBacking) {
     {
         replay_ipas.push(old.physical_ipa);
     }
+    let bucket = registry.by_scope.entry(scope).or_default();
     scoped_alias_epoch_update(
-        &mut versions,
+        &mut bucket.versions,
         entry_changed.then_some((alias_version_key(&b), Some(b))),
         &replay_ipas,
-        &replay,
+        &bucket.replay,
     );
 }
 
@@ -3296,16 +3306,14 @@ pub(crate) struct RetiredProjectionCleanup {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
 pub(crate) fn remove_rows_for_retired_stage2_projection(
-    replay: &mut std::collections::BTreeSet<ReplayMappingKey>,
     registry: &mut AliasRegistry,
     retired: RetiredStage2Projection,
 ) -> RetiredProjectionCleanup {
-    remove_rows_for_retired_stage2_projections(replay, registry, &[retired])
+    remove_rows_for_retired_stage2_projections(registry, &[retired])
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn remove_rows_for_retired_stage2_projections(
-    replay: &mut std::collections::BTreeSet<ReplayMappingKey>,
     registry: &mut AliasRegistry,
     retired: &[RetiredStage2Projection],
 ) -> RetiredProjectionCleanup {
@@ -3336,15 +3344,21 @@ pub(crate) fn remove_rows_for_retired_stage2_projections(
                 cleanup.preserved_reused_aliases.push(alias);
             }
         }
-        for row in replay_rows_for_ipa(replay, physical_ipa) {
-            if row.1 as u64 != physical_length {
-                continue;
+        for bucket in registry.by_scope.values_mut() {
+            let mut removed_from_scope = Vec::new();
+            for row in replay_rows_for_ipa(&bucket.replay, physical_ipa) {
+                if row.1 as u64 != physical_length {
+                    continue;
+                }
+                if owners.contains(&(row.2, row.4)) {
+                    removed_from_scope.push(row);
+                } else {
+                    cleanup.preserved_reused_replay.push(row);
+                }
             }
-            if owners.contains(&(row.2, row.4)) {
-                replay.remove(&row);
+            for row in removed_from_scope {
+                bucket.replay.remove(&row);
                 cleanup.removed_replay.push(row);
-            } else {
-                cleanup.preserved_reused_replay.push(row);
             }
         }
     }

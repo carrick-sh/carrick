@@ -2284,14 +2284,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "symbol": "alias_version_registry::CELL",
-      "fingerprint": "456b68190b77415a62ca701807e2d176e137ccd1bd4117df7a80bb2fb591b7eb",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static alias_version_registry::CELL in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "atomic_permit_enabled::FLAG",
       "fingerprint": "a42ed3f133b220232348fdef79a8bf15a84b1d62f1165931d1dd78f4a4624ce8",
       "classification": "config_debug",
@@ -2616,14 +2608,6 @@
       "fingerprint": "f4855a08a380b4c60abb46c0f00e505b122867a957c56b196dbdde915090ecaa",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static global_frame_ipa_allocator::ALLOCATOR in crates/carrick-vmm-hvf/src/trap/global_frame.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
-      "symbol": "replay_mappings::CELL",
-      "fingerprint": "5db43974bf444a888d1331cd1d12fa3ebe33196f2a4283becf742635c03e705f",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-wide host infrastructure static replay_mappings::CELL in crates/carrick-vmm-hvf/src/trap/global_frame.rs maintaining host process lifecycle or VM resources."
     },
     {
       "kind": "env_var_os",

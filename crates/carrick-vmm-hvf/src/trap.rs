@@ -3899,7 +3899,7 @@ fn abort_prepared_task_and_carrier(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Default)]
 struct AliasPublicationReceipt {
-    versions: Vec<AliasPublicationVersionId>,
+    versions: Vec<(AliasOwnershipScope, AliasPublicationVersionId)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3951,16 +3951,7 @@ pub(crate) struct ReplayVersionChain {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-/// Carrier-global alias/replay version state, keyed on every axis it is
-/// looked up by.
-///
-/// These were `Vec`s scanned with `iter().position(..)` / `iter().find(..)`.
-/// Because the containers are carrier-global but the lookups are per-process,
-/// every guest process exit paid a scan proportional to every OTHER live
-/// process — the O(N^2) exit path measured on 2026-08-30 (see
-/// `retiring_one_owner_does_not_scan_foreign_alias_rows`). The version indexes
-/// exist so `AliasPublicationReceipt::retire_exact` can find the chain owning
-/// a version id without walking every chain's version list.
+/// Per-scope alias/replay version state, keyed on every axis it is looked up by.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AliasVersionRegistry {
     pub(crate) aliases: std::collections::BTreeMap<AliasVersionKey, AliasVersionChain>,
@@ -3970,13 +3961,6 @@ pub(crate) struct AliasVersionRegistry {
     pub(crate) alias_version_owner:
         std::collections::BTreeMap<AliasPublicationVersionId, AliasVersionKey>,
     pub(crate) replay_version_owner: std::collections::BTreeMap<AliasPublicationVersionId, u64>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn alias_version_registry() -> &'static parking_lot::Mutex<AliasVersionRegistry> {
-    static CELL: std::sync::OnceLock<parking_lot::Mutex<AliasVersionRegistry>> =
-        std::sync::OnceLock::new();
-    CELL.get_or_init(|| parking_lot::Mutex::new(AliasVersionRegistry::default()))
 }
 
 /// Hot paths whose cost must be a function of the operation, not of the
@@ -4215,35 +4199,22 @@ fn retire_process_aliases(
     container_root: ContainerRootToken,
     global_keep: impl FnMut(&AliasBacking) -> bool,
 ) {
-    // Same replay -> alias -> version lock order as receipt publication and
-    // retirement, and as `mutate_external_alias_state`.
-    let replay = replay_mappings().lock();
+    // Replay sets and version chains live in AliasScopeBucket; only the
+    // alias_registry() lock is held.
     let mut registry = alias_registry().lock();
-    let mut versions = alias_version_registry().lock();
-    retire_process_aliases_in(
-        &mut registry,
-        &replay,
-        &mut versions,
-        mm_root_slot,
-        container_root,
-        global_keep,
-    );
+    retire_process_aliases_in(&mut registry, mm_root_slot, container_root, global_keep);
 }
 
 /// The body of [`retire_process_aliases`], against explicitly supplied
 /// authorities rather than the process-global ones.
 ///
-/// Taking the three structures as parameters is what makes the complexity
-/// contract testable: `retiring_one_owner_does_not_scan_foreign_alias_rows`
-/// measures visited rows, and driving the carrier-global registry made that
-/// measurement depend on whatever other tests happened to be running (observed
-/// failing roughly one run in three). A per-process operation should not need
-/// process-global state to be exercised, and now it does not.
+/// Taking the registry as a parameter is what makes the complexity contract
+/// testable: `retiring_one_owner_does_not_scan_foreign_alias_rows` measures
+/// visited rows, and driving the carrier-global registry made that measurement
+/// depend on whatever other tests happened to be running.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_process_aliases_in(
     registry: &mut AliasRegistry,
-    replay: &std::collections::BTreeSet<ReplayMappingKey>,
-    versions: &mut AliasVersionRegistry,
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
     mut global_keep: impl FnMut(&AliasBacking) -> bool,
@@ -4253,7 +4224,7 @@ pub(crate) fn retire_process_aliases_in(
     let mut dropped_global_order = Vec::new();
     let mut seen_global_keys = std::collections::BTreeSet::new();
 
-    let removed_owned = registry.remove_scope(owned_scope);
+    let removed_owned = registry.retire_scope(owned_scope).into_vec();
     let removed_global = registry.retain_in_scope(AliasOwnershipScope::Global, |alias| {
         let key = alias_version_key(alias);
         let survives = global_keep(alias);
@@ -4263,106 +4234,67 @@ pub(crate) fn retire_process_aliases_in(
         }
         survives
     });
-    note_alias_state_rows_scanned(removed_owned.len() + removed_global.len());
-    note_alias_state_rows_scanned(replay.len() + versions.aliases.len());
-
-    // Affected keys, in first-seen order, with their effective row beforehand and afterwards.
-    // Removing a whole scope leaves every key in it with no successor; the
-    // `Global` half keeps the generic path's first-occurrence semantics for
-    // duplicate keys exactly.
-    let mut affected: Vec<(AliasVersionKey, Option<AliasBacking>)> = Vec::new();
-    let mut seen_keys = std::collections::BTreeSet::new();
-    for alias in &removed_owned {
-        let key = alias_version_key(alias);
-        if seen_keys.insert(key) {
-            affected.push((key, None));
-        }
-    }
-    for key in dropped_global_order {
-        let before = dropped_global_first[&key];
-        let after = registry.find_by_key(key.0, key.1, key.2);
-        if after == Some(before) {
-            continue;
-        }
-        affected.push((key, after));
-    }
-    let global_first_before = dropped_global_first;
-
-    let mut affected_physical: Vec<u64> = Vec::new();
-    let mut affected_physical_seen: std::collections::BTreeSet<u64> =
-        std::collections::BTreeSet::new();
-    for (key, after) in affected {
-        let before_rows = if key.2 == owned_scope {
-            removed_owned
-                .iter()
-                .find(|alias| alias_version_key(alias) == key)
-                .copied()
-        } else {
-            global_first_before.get(&key).copied()
-        };
-        for alias in before_rows.into_iter().chain(after) {
-            if affected_physical_seen.insert(alias.physical_ipa) {
-                affected_physical.push(alias.physical_ipa);
+    if !removed_global.is_empty() {
+        note_alias_state_rows_scanned(removed_global.len());
+        if let Some(global_bucket) = registry.by_scope.get_mut(&AliasOwnershipScope::Global) {
+            for key in dropped_global_order {
+                let before = dropped_global_first[&key];
+                let after = global_bucket
+                    .rows
+                    .iter()
+                    .find(|(_, a)| alias_version_key(a) == key)
+                    .map(|(_, a)| *a);
+                if after == Some(before) {
+                    continue;
+                }
+                bump_version_epoch(&mut global_bucket.versions.alias_epochs, key).unwrap_or_else(
+                    || {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "external alias mutation epoch exhausted"
+                        );
+                    },
+                );
+                for id in reset_alias_chain(&mut global_bucket.versions.aliases, key, after) {
+                    global_bucket.versions.alias_version_owner.remove(&id);
+                }
+                let physical_ipa = before.physical_ipa;
+                bump_version_epoch(&mut global_bucket.versions.replay_epochs, physical_ipa)
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::host_alias",
+                            "external replay mutation epoch exhausted"
+                        );
+                    });
+                let base = replay_rows_for_ipa(&global_bucket.replay, physical_ipa);
+                for id in
+                    reset_replay_chain(&mut global_bucket.versions.replays, physical_ipa, base)
+                {
+                    global_bucket.versions.replay_version_owner.remove(&id);
+                }
             }
-        }
-        bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::host_alias",
-                "external alias mutation epoch exhausted"
-            );
-        });
-        for id in reset_alias_chain(&mut versions.aliases, key, after) {
-            versions.alias_version_owner.remove(&id);
-        }
-    }
-
-    // A retirement never touches the replay set, so the generic path's
-    // replay-side diff can only report the IPAs the alias changes already imply.
-    for physical_ipa in affected_physical {
-        bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::host_alias",
-                "external replay mutation epoch exhausted"
-            );
-        });
-        let base = replay_rows_for_ipa(replay, physical_ipa);
-        for id in reset_replay_chain(&mut versions.replays, physical_ipa, base) {
-            versions.replay_version_owner.remove(&id);
         }
     }
     RetiredRows::new(removed_owned)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn mutate_external_alias_state<R>(
-    mutate: impl FnOnce(&mut std::collections::BTreeSet<ReplayMappingKey>, &mut AliasRegistry) -> R,
-) -> R {
-    // All external writers use the same replay -> alias -> version lock order
-    // as receipt publication/retirement. A mutation becomes the new effective
-    // base and invalidates every older receipt version for the touched key.
-    let mut replay = replay_mappings().lock();
+fn mutate_external_alias_state<R>(mutate: impl FnOnce(&mut AliasRegistry) -> R) -> R {
+    // Replay sets and version chains live in AliasScopeBucket; only the
+    // alias_registry() lock is held. A mutation becomes the new effective
+    // base and invalidates older receipt versions for touched keys.
     let mut registry = alias_registry().lock();
-    let mut versions = alias_version_registry().lock();
-    mutate_external_alias_state_in(&mut replay, &mut registry, &mut versions, mutate)
+    mutate_external_alias_state_in(&mut registry, mutate)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn mutate_external_alias_state_in<R>(
-    replay: &mut std::collections::BTreeSet<ReplayMappingKey>,
     registry: &mut AliasRegistry,
-    versions: &mut AliasVersionRegistry,
-    mutate: impl FnOnce(&mut std::collections::BTreeSet<ReplayMappingKey>, &mut AliasRegistry) -> R,
+    mutate: impl FnOnce(&mut AliasRegistry) -> R,
 ) -> R {
-    let replay_before = replay.clone();
     let registry_before = registry.clone();
-    let result = mutate(replay, registry);
+    let result = mutate(registry);
 
-    // Index the FIRST alias per (start, ipa, scope) on each side once. The previous
-    // shape rescanned the whole registry per key (two linear `find`s plus a
-    // linear key dedup), which was O(aliases^2) per mutation and made every
-    // process retirement in a 1000-process exit storm pay hundreds of
-    // milliseconds inside this function. First-occurrence indexing preserves
-    // the historical `find`-first semantics for duplicate keys exactly.
     note_alias_state_rows_scanned(registry_before.len() + registry.len());
     let mut before_by_key = std::collections::BTreeMap::new();
     for alias in registry_before.iter() {
@@ -4385,68 +4317,74 @@ fn mutate_external_alias_state_in<R>(
             alias_keys.push(key);
         }
     }
-    let mut affected_physical_ipas = Vec::new();
-    let mut affected_physical_set = std::collections::BTreeSet::new();
+    let mut affected_physical_ipas_by_scope: std::collections::BTreeMap<
+        AliasOwnershipScope,
+        std::collections::BTreeSet<u64>,
+    > = std::collections::BTreeMap::new();
     for key in alias_keys {
         let before = before_by_key.get(&key).copied();
         let after = after_by_key.get(&key).copied();
         if before == after {
             continue;
         }
+        let scope = key.2;
         for alias in before.into_iter().chain(after) {
-            if affected_physical_set.insert(alias.physical_ipa) {
-                affected_physical_ipas.push(alias.physical_ipa);
-            }
+            affected_physical_ipas_by_scope
+                .entry(scope)
+                .or_default()
+                .insert(alias.physical_ipa);
         }
-        bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
+        let bucket = registry.by_scope.entry(scope).or_default();
+        bump_version_epoch(&mut bucket.versions.alias_epochs, key).unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::host_alias",
                 "external alias mutation epoch exhausted"
             );
         });
-        for id in reset_alias_chain(&mut versions.aliases, key, after) {
-            versions.alias_version_owner.remove(&id);
+        for id in reset_alias_chain(&mut bucket.versions.aliases, key, after) {
+            bucket.versions.alias_version_owner.remove(&id);
         }
     }
-    // Group both replay sides by physical IPA once, then compare per key.
-    // The previous shape filtered BOTH whole sets per replay row (and did a
-    // linear `contains` on the affected list), the replay half of the same
-    // O(n^2) mutation cost. BTreeSet iteration is sorted, so the grouped
-    // per-IPA vectors are byte-identical to the filtered ones.
-    note_alias_state_rows_scanned(replay_before.len() + replay.len());
-    let mut replay_before_by_ipa: std::collections::BTreeMap<u64, Vec<ReplayMappingKey>> =
-        std::collections::BTreeMap::new();
-    for row in replay_before.iter() {
-        replay_before_by_ipa.entry(row.0).or_default().push(*row);
-    }
-    let mut replay_after_by_ipa: std::collections::BTreeMap<u64, Vec<ReplayMappingKey>> =
-        std::collections::BTreeMap::new();
-    for row in replay.iter() {
-        replay_after_by_ipa.entry(row.0).or_default().push(*row);
-    }
-    for ipa in replay_before_by_ipa
+    let all_scopes: std::collections::BTreeSet<_> = registry_before
+        .by_scope
         .keys()
-        .chain(replay_after_by_ipa.keys())
+        .chain(registry.by_scope.keys())
         .copied()
-        .collect::<std::collections::BTreeSet<_>>()
-    {
-        if !affected_physical_set.contains(&ipa)
-            && replay_before_by_ipa.get(&ipa) != replay_after_by_ipa.get(&ipa)
-        {
-            affected_physical_set.insert(ipa);
-            affected_physical_ipas.push(ipa);
+        .collect();
+    for scope in all_scopes {
+        let before_replay = registry_before.by_scope.get(&scope).map(|b| &b.replay);
+        let after_replay = registry.by_scope.get(&scope).map(|b| &b.replay);
+        let empty_set = std::collections::BTreeSet::new();
+        let before_set = before_replay.unwrap_or(&empty_set);
+        let after_set = after_replay.unwrap_or(&empty_set);
+        note_alias_state_rows_scanned(before_set.len() + after_set.len());
+        for row in before_set.iter().chain(after_set.iter()) {
+            let physical_ipa = row.0;
+            let before_rows = replay_rows_for_ipa(before_set, physical_ipa);
+            let after_rows = replay_rows_for_ipa(after_set, physical_ipa);
+            if before_rows != after_rows {
+                affected_physical_ipas_by_scope
+                    .entry(scope)
+                    .or_default()
+                    .insert(physical_ipa);
+            }
         }
     }
-    for physical_ipa in affected_physical_ipas {
-        bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::host_alias",
-                "external replay mutation epoch exhausted"
+    for (scope, physical_ipas) in affected_physical_ipas_by_scope {
+        let bucket = registry.by_scope.entry(scope).or_default();
+        for physical_ipa in physical_ipas {
+            let after_rows = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+            bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa).unwrap_or_else(
+                || {
+                    carrick_fatal!(
+                        "hvpatch::host_alias",
+                        "external replay mutation epoch exhausted"
+                    );
+                },
             );
-        });
-        let base = replay_rows_for_ipa(replay, physical_ipa);
-        for id in reset_replay_chain(&mut versions.replays, physical_ipa, base) {
-            versions.replay_version_owner.remove(&id);
+            for id in reset_replay_chain(&mut bucket.versions.replays, physical_ipa, after_rows) {
+                bucket.versions.replay_version_owner.remove(&id);
+            }
         }
     }
     result
@@ -4454,18 +4392,15 @@ fn mutate_external_alias_state_in<R>(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn mutate_known_external_alias_state<R>(
-    affected: impl FnOnce(
-        &std::collections::BTreeSet<ReplayMappingKey>,
-        &AliasRegistry,
-    ) -> (Vec<AliasVersionKey>, Vec<u64>),
-    mutate: impl FnOnce(&mut std::collections::BTreeSet<ReplayMappingKey>, &mut AliasRegistry) -> R,
+    affected: impl FnOnce(&AliasRegistry) -> (Vec<AliasVersionKey>, Vec<u64>),
+    mutate: impl FnOnce(&mut AliasRegistry) -> R,
 ) -> R {
-    // Same lock order as receipt publication. Unlike the generic external
-    // mutator, the caller identifies the bounded keys it can change, so no
-    // carrier-wide registry/replay clone or diff is required on COW/exec.
-    let mut replay = replay_mappings().lock();
+    // Replay sets and version chains live in AliasScopeBucket; only the
+    // alias_registry() lock is held. Unlike the generic external mutator,
+    // the caller identifies the bounded keys it can change, so no carrier-wide
+    // registry clone or diff is required on COW/exec.
     let mut registry = alias_registry().lock();
-    let (alias_keys, replay_ipas) = affected(&replay, &registry);
+    let (alias_keys, replay_ipas) = affected(&registry);
     let alias_keys = alias_keys
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -4476,41 +4411,55 @@ fn mutate_known_external_alias_state<R>(
         .iter()
         .map(|&(start, ipa, scope)| ((start, ipa, scope), registry.find_by_key(start, ipa, scope)))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let replay_before = replay_ipas
-        .iter()
-        .map(|&ipa| (ipa, replay_rows_for_ipa(&replay, ipa)))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let result = mutate(&mut replay, &mut registry);
-    let mut versions = alias_version_registry().lock();
+    let mut replay_before =
+        std::collections::BTreeMap::<(AliasOwnershipScope, u64), Vec<ReplayMappingKey>>::new();
+    for &ipa in &replay_ipas {
+        for (&scope, bucket) in &registry.by_scope {
+            let rows = replay_rows_for_ipa(&bucket.replay, ipa);
+            if !rows.is_empty() {
+                replay_before.insert((scope, ipa), rows);
+            }
+        }
+    }
+    let result = mutate(&mut registry);
     for &(start, ipa, scope) in &alias_keys {
         let key = (start, ipa, scope);
         let after = registry.find_by_key(start, ipa, scope);
         if alias_before.get(&key).copied().flatten() == after {
             continue;
         }
-        bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
+        let bucket = registry.by_scope.entry(scope).or_default();
+        bump_version_epoch(&mut bucket.versions.alias_epochs, key).unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::host_alias",
                 "external alias mutation epoch exhausted"
             );
         });
-        for id in reset_alias_chain(&mut versions.aliases, key, after) {
-            versions.alias_version_owner.remove(&id);
+        for id in reset_alias_chain(&mut bucket.versions.aliases, key, after) {
+            bucket.versions.alias_version_owner.remove(&id);
         }
     }
-    for physical_ipa in replay_ipas {
-        let after = replay_rows_for_ipa(&replay, physical_ipa);
-        if replay_before.get(&physical_ipa) == Some(&after) {
-            continue;
-        }
-        bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::host_alias",
-                "external replay mutation epoch exhausted"
+    for &physical_ipa in &replay_ipas {
+        for (&scope, bucket) in registry.by_scope.iter_mut() {
+            let after = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+            let before = replay_before.get(&(scope, physical_ipa));
+            if before.is_none() && after.is_empty() {
+                continue;
+            }
+            if before.map(Vec::as_slice) == Some(&after) {
+                continue;
+            }
+            bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa).unwrap_or_else(
+                || {
+                    carrick_fatal!(
+                        "hvpatch::host_alias",
+                        "external replay mutation epoch exhausted"
+                    );
+                },
             );
-        });
-        for id in reset_replay_chain(&mut versions.replays, physical_ipa, after) {
-            versions.replay_version_owner.remove(&id);
+            for id in reset_replay_chain(&mut bucket.versions.replays, physical_ipa, after) {
+                bucket.versions.replay_version_owner.remove(&id);
+            }
         }
     }
     result
@@ -4559,27 +4508,34 @@ impl AliasPublicationReceipt {
         owner: HvpatchCarrierTaskStateKey,
         aliases: &[AliasBacking],
     ) -> Result<Self, TrapError> {
-        let mut replay = replay_mappings().lock();
         let mut registry = alias_registry().lock();
-        let mut versions = alias_version_registry().lock();
-        // Keyed, not linear-scanned: publishing k aliases used to cost O(k^2)
-        // here before it even reached the registry.
         let mut alias_increments = std::collections::BTreeMap::<AliasVersionKey, u64>::new();
-        let mut replay_increments = std::collections::BTreeMap::<u64, u64>::new();
+        let mut replay_increments =
+            std::collections::BTreeMap::<(AliasOwnershipScope, u64), u64>::new();
         for alias in aliases {
             let count = alias_increments
                 .entry(alias_version_key(alias))
                 .or_insert(0);
             *count = count.checked_add(1).unwrap_or(u64::MAX);
-            let count = replay_increments.entry(alias.physical_ipa).or_insert(0);
+            let count = replay_increments
+                .entry((alias.ownership_scope, alias.physical_ipa))
+                .or_insert(0);
             *count = count.checked_add(1).unwrap_or(u64::MAX);
         }
         let alias_exhausted = alias_increments.iter().any(|(key, count)| {
-            let current = versions.alias_epochs.get(key).copied().unwrap_or(0);
+            let current = registry
+                .by_scope
+                .get(&key.2)
+                .and_then(|b| b.versions.alias_epochs.get(key).copied())
+                .unwrap_or(0);
             current.checked_add(*count).is_none()
         });
-        let replay_exhausted = replay_increments.iter().any(|(ipa, count)| {
-            let current = versions.replay_epochs.get(ipa).copied().unwrap_or(0);
+        let replay_exhausted = replay_increments.iter().any(|((scope, ipa), count)| {
+            let current = registry
+                .by_scope
+                .get(scope)
+                .and_then(|b| b.versions.replay_epochs.get(ipa).copied())
+                .unwrap_or(0);
             current.checked_add(*count).is_none()
         });
         if aliases.len() > u32::MAX as usize || alias_exhausted || replay_exhausted {
@@ -4593,16 +4549,26 @@ impl AliasPublicationReceipt {
                 TrapError::Hypervisor("alias publication ordinal exhausted".to_owned())
             })?;
             let id = AliasPublicationVersionId { owner, ordinal };
+            let scope = alias.ownership_scope;
             let alias_key = alias_version_key(alias);
-            let alias_epoch = bump_version_epoch(&mut versions.alias_epochs, alias_key)
-                .ok_or_else(|| TrapError::Hypervisor("alias version epoch exhausted".to_owned()))?;
-            let replay_epoch = bump_version_epoch(&mut versions.replay_epochs, alias.physical_ipa)
-                .ok_or_else(|| {
-                    TrapError::Hypervisor("replay version epoch exhausted".to_owned())
-                })?;
             let alias_base = registry.find_by_key(alias.start, alias.ipa, alias.ownership_scope);
-            let replay_base = replay_rows_for_ipa(&replay, alias.physical_ipa);
-            versions
+            let replay_key = replay_mapping_key(*alias);
+            let replay_base = registry
+                .by_scope
+                .get(&scope)
+                .map(|b| replay_rows_for_ipa(&b.replay, alias.physical_ipa))
+                .unwrap_or_default();
+            let _ = registry.upsert_by_key(*alias);
+            let bucket = registry.by_scope.entry(scope).or_default();
+            let alias_epoch = bump_version_epoch(&mut bucket.versions.alias_epochs, alias_key)
+                .ok_or_else(|| TrapError::Hypervisor("alias version epoch exhausted".to_owned()))?;
+            let replay_epoch =
+                bump_version_epoch(&mut bucket.versions.replay_epochs, alias.physical_ipa)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("replay version epoch exhausted".to_owned())
+                    })?;
+            bucket
+                .versions
                 .aliases
                 .entry(alias_key)
                 .or_insert_with(|| AliasVersionChain {
@@ -4615,8 +4581,9 @@ impl AliasPublicationReceipt {
                     value: *alias,
                     epoch: alias_epoch,
                 });
-            versions.alias_version_owner.insert(id, alias_key);
-            versions
+            bucket.versions.alias_version_owner.insert(id, alias_key);
+            bucket
+                .versions
                 .replays
                 .entry(alias.physical_ipa)
                 .or_insert_with(|| ReplayVersionChain {
@@ -4626,34 +4593,42 @@ impl AliasPublicationReceipt {
                 .versions
                 .push(OwnedReplayVersion {
                     id,
-                    value: replay_mapping_key(*alias),
+                    value: replay_key,
                     epoch: replay_epoch,
                 });
-            versions.replay_version_owner.insert(id, alias.physical_ipa);
-            for row in replay_rows_for_ipa(&replay, alias.physical_ipa) {
-                replay.remove(&row);
+            bucket
+                .versions
+                .replay_version_owner
+                .insert(id, alias.physical_ipa);
+            for row in replay_rows_for_ipa(&bucket.replay, alias.physical_ipa) {
+                if row != replay_key {
+                    bucket.replay.remove(&row);
+                }
             }
-            replay.insert(replay_mapping_key(*alias));
-            let _ = registry.upsert_by_key(*alias);
-            receipt.versions.push(id);
+            bucket.replay.insert(replay_key);
+            receipt.versions.push((scope, id));
         }
         Ok(receipt)
     }
 
     fn retire_exact(self) {
-        let mut replay = replay_mappings().lock();
         let mut registry = alias_registry().lock();
-        let mut versions = alias_version_registry().lock();
-        // Simulate exact-key mutations while walking the version chains, then
-        // rebuild each affected scope once. Mutating the scope Vec for every
-        // receipt row made retiring k aliases O(k * rows-in-mm).
         let mut pending_alias_values =
             std::collections::BTreeMap::<AliasVersionKey, Option<AliasBacking>>::new();
         let mut alias_mutations = Vec::<(AliasVersionKey, Option<AliasBacking>)>::new();
-        for id in self.versions.into_iter().rev() {
-            if let Some(chain_key) = versions.alias_version_owner.remove(&id) {
-                let (start, ipa, scope) = chain_key;
-                let chain = versions
+        for (scope, id) in self.versions.into_iter().rev() {
+            let AliasRegistry {
+                by_scope,
+                exact_first_by_scope,
+                ..
+            } = &mut *registry;
+            let Some(bucket) = by_scope.get_mut(&scope) else {
+                continue;
+            };
+            if let Some(chain_key) = bucket.versions.alias_version_owner.remove(&id) {
+                let (start, ipa, key_scope) = chain_key;
+                let chain = bucket
+                    .versions
                     .aliases
                     .get_mut(&chain_key)
                     .unwrap_or_else(|| {
@@ -4677,16 +4652,21 @@ impl AliasPublicationReceipt {
                 let base = chain.base;
                 let previous = chain.versions.last().map(|version| version.value);
                 let empty = chain.versions.is_empty();
-                let current_epoch = versions.alias_epochs.get(&chain_key).copied();
+                let current_epoch = bucket.versions.alias_epochs.get(&chain_key).copied();
                 let current_value = pending_alias_values
                     .get(&chain_key)
                     .copied()
-                    .unwrap_or_else(|| registry.find_by_key(start, ipa, scope));
+                    .unwrap_or_else(|| {
+                        exact_first_by_scope
+                            .get(&key_scope)
+                            .and_then(|exact| exact.get(&(start, ipa)))
+                            .map(|(_, entry)| *entry)
+                    });
                 if was_top
                     && current_epoch == Some(removed.epoch)
                     && current_value == Some(removed.value)
                 {
-                    let mm_root_slot = match scope {
+                    let mm_root_slot = match key_scope {
                         AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
                         AliasOwnershipScope::Global | AliasOwnershipScope::ContainerRoot(_) => None,
                     };
@@ -4711,7 +4691,7 @@ impl AliasPublicationReceipt {
                             previous,
                         );
                     }
-                    bump_version_epoch(&mut versions.alias_epochs, chain_key)
+                    bump_version_epoch(&mut bucket.versions.alias_epochs, chain_key)
                         .unwrap_or_else(|| {
                             carrick_fatal!(
                                 "hvpatch::host_alias",
@@ -4720,11 +4700,12 @@ impl AliasPublicationReceipt {
                         });
                 }
                 if empty {
-                    versions.aliases.remove(&chain_key);
+                    bucket.versions.aliases.remove(&chain_key);
                 }
             }
-            if let Some(physical_ipa) = versions.replay_version_owner.remove(&id) {
-                let chain = versions
+            if let Some(physical_ipa) = bucket.versions.replay_version_owner.remove(&id) {
+                let chain = bucket
+                    .versions
                     .replays
                     .get_mut(&physical_ipa)
                     .unwrap_or_else(|| {
@@ -4748,19 +4729,19 @@ impl AliasPublicationReceipt {
                 let base = chain.base.clone();
                 let previous = chain.versions.last().map(|version| version.value);
                 let empty = chain.versions.is_empty();
-                let current_epoch = versions.replay_epochs.get(&physical_ipa).copied();
-                let current = replay_rows_for_ipa(&replay, physical_ipa);
+                let current_epoch = bucket.versions.replay_epochs.get(&physical_ipa).copied();
+                let current = replay_rows_for_ipa(&bucket.replay, physical_ipa);
                 if was_top && current_epoch == Some(removed.epoch) && current == vec![removed.value]
                 {
                     for row in current {
-                        replay.remove(&row);
+                        bucket.replay.remove(&row);
                     }
                     if let Some(previous) = previous {
-                        replay.insert(previous);
+                        bucket.replay.insert(previous);
                     } else {
-                        replay.extend(base);
+                        bucket.replay.extend(base);
                     }
-                    bump_version_epoch(&mut versions.replay_epochs, physical_ipa)
+                    bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa)
                         .unwrap_or_else(|| {
                             carrick_fatal!(
                                 "hvpatch::host_alias",
@@ -4769,13 +4750,10 @@ impl AliasPublicationReceipt {
                         });
                 }
                 if empty {
-                    versions.replays.remove(&physical_ipa);
+                    bucket.versions.replays.remove(&physical_ipa);
                 }
             }
         }
-        // Multiple receipt rows may version the same key. Keep only its final
-        // simulated value, ordered by that key's last mutation so restored
-        // rows receive the same relative insertion order as the old loop.
         let mut final_alias_mutations =
             std::collections::BTreeMap::<AliasVersionKey, (usize, Option<AliasBacking>)>::new();
         for (order, (key, replacement)) in alias_mutations.into_iter().enumerate() {

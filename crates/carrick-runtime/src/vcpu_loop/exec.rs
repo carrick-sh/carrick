@@ -1615,8 +1615,10 @@ where
                     .map(Some);
                 }
             };
-            let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-                crate::fork_quiesce::frame_registry_lock().lock(),
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
+                process.pid(),
+                self.this_tid.raw(),
             );
             let retired = match old_capacity {
                 None => None,
@@ -1900,8 +1902,10 @@ where
         drop(mm_authority);
         drop(admitted_mm_executor);
         if let Some(process) = kernel.hvpatch_process.as_ref() {
-            let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-                crate::fork_quiesce::frame_registry_lock().lock(),
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
+                process.pid(),
+                self.this_tid.raw(),
             );
             let Some((retired_commit, fallback_replacement_commit)) =
                 backend_publication_gate.take_after_replace(|| engine.take_exec_inventory())

@@ -212,26 +212,12 @@ pub struct FrameRegistryGuard<'r> {
 }
 
 impl<'r> FrameRegistryGuard<'r> {
-    pub fn new(guard: parking_lot::MutexGuard<'r, ()>) -> Self {
-        Self::with_operation(
-            guard,
-            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
-        )
-    }
-
-    pub fn with_operation(
-        guard: parking_lot::MutexGuard<'r, ()>,
-        operation: carrick_observability::probes::HvpatchTopologyOperation,
-    ) -> Self {
-        Self::with_identity(guard, operation, 0, 0)
-    }
-
-    pub fn with_identity(
-        guard: parking_lot::MutexGuard<'r, ()>,
+    pub fn acquire(
         operation: carrick_observability::probes::HvpatchTopologyOperation,
         guest_pid: i32,
         guest_tid: i32,
-    ) -> Self {
+    ) -> FrameRegistryGuard<'static> {
+        let requested_at = Instant::now();
         emit_topology_lock(
             operation,
             carrick_observability::probes::HvpatchTopologyPhase::Requested,
@@ -239,18 +225,47 @@ impl<'r> FrameRegistryGuard<'r> {
             guest_tid,
             0,
         );
+        let guard = frame_registry_lock().lock();
         emit_topology_lock(
             operation,
             carrick_observability::probes::HvpatchTopologyPhase::Acquired,
             guest_pid,
             guest_tid,
-            0,
+            topology_elapsed_ns(requested_at),
         );
-        Self {
+        FrameRegistryGuard {
             _guard: guard,
             operation,
             guest_pid,
             guest_tid,
+            acquired_at: Instant::now(),
+        }
+    }
+
+    /// Construct a guard around an already-held lock without measuring wait time.
+    ///
+    /// This is intended only for tests or contexts where the lock is already held.
+    /// Does not measure wait time.
+    pub fn new(guard: parking_lot::MutexGuard<'r, ()>) -> Self {
+        emit_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+            carrick_observability::probes::HvpatchTopologyPhase::Requested,
+            0,
+            0,
+            0,
+        );
+        emit_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+            carrick_observability::probes::HvpatchTopologyPhase::Acquired,
+            0,
+            0,
+            0,
+        );
+        Self {
+            _guard: guard,
+            operation: carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+            guest_pid: 0,
+            guest_tid: 0,
             acquired_at: Instant::now(),
         }
     }

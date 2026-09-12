@@ -29,15 +29,21 @@ mod alias_remap_limiter_tests {
             owner_generation: 0,
         };
         let key = replay_mapping_key(backing);
-        replay_mappings().lock().insert(key);
+        alias_registry()
+            .lock()
+            .by_scope
+            .entry(backing.ownership_scope)
+            .or_default()
+            .replay
+            .insert(key);
 
         // The exact installed marker returns before touching Hypervisor.framework.
         let result = unsafe { inventory_hv_vm_map_replay(backing) };
         assert_eq!(result, 0);
-        assert!(replay_mappings().lock().contains(&key));
+        assert!(alias_registry().lock().contains_replay(&key));
 
         forget_replay_extent(backing.ipa, backing.size);
-        assert!(!replay_mappings().lock().contains(&key));
+        assert!(!alias_registry().lock().contains_replay(&key));
     }
 
     #[test]
@@ -78,17 +84,18 @@ mod alias_remap_limiter_tests {
         register_shared_alias(original);
         register_shared_alias(replacement);
 
-        let replay = replay_mappings().lock();
-        assert!(!replay.contains(&replay_mapping_key(original)));
-        assert!(replay.contains(&replay_mapping_key(replacement)));
+        let registry = alias_registry().lock();
+        assert!(!registry.contains_replay(&replay_mapping_key(original)));
+        assert!(registry.contains_replay(&replay_mapping_key(replacement)));
         assert_eq!(
-            replay
+            registry
+                .all_replay_mappings()
                 .iter()
                 .filter(|(ipa, _, _, _, _)| *ipa == original.ipa)
                 .count(),
             1
         );
-        drop(replay);
+        drop(registry);
         forget_replay_extent(original.ipa, original.size);
         alias_registry()
             .lock()

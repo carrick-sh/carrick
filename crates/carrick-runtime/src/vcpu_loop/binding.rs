@@ -975,8 +975,10 @@ where
                 );
             });
         if owns_final_mm {
-            let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-                crate::fork_quiesce::frame_registry_lock().lock(),
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+                process.pid(),
+                terminal_context.task().key().id.raw(),
             );
             let capacity = carrick_hal::FrameEventCapacity::for_event_count(
                 carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
@@ -4345,8 +4347,17 @@ where
         &mut self,
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<(), TrapError> {
-        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-            crate::fork_quiesce::frame_registry_lock().lock(),
+        let tid = self.state.this_tid.raw();
+        let pid = self
+            .kernel
+            .hvpatch_process
+            .as_ref()
+            .map(|process| process.pid())
+            .unwrap_or(tid);
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+            pid,
+            tid,
         );
         let (kernel, mm) = self.take_terminal_inventory_authority()?;
         let result = kernel
@@ -4368,8 +4379,17 @@ where
         &mut self,
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError> {
-        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-            crate::fork_quiesce::frame_registry_lock().lock(),
+        let tid = self.state.this_tid.raw();
+        let pid = self
+            .kernel
+            .hvpatch_process
+            .as_ref()
+            .map(|process| process.pid())
+            .unwrap_or(tid);
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+            pid,
+            tid,
         );
         let (kernel, mm) = self.take_terminal_inventory_authority()?;
         let result = kernel

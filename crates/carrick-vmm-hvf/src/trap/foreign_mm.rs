@@ -1998,8 +1998,10 @@ pub(crate) fn perform_foreign_cow_transaction(
             "global frame host owner was not found in registry with matching generation and host mapping pointer prior to foreign COW publication"
         );
     }
-    let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-        crate::fork_quiesce::frame_registry_lock().lock(),
+    let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+        carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
+        runtime.identity.linux_pid,
+        runtime.identity.linux_tid,
     );
     let (apply_receipt, kernel_proof, authenticated_owner_generation) = match runtime
         .authority
@@ -2125,8 +2127,8 @@ pub(crate) fn perform_foreign_cow_transaction(
     if retired_old_stage2 {
         let retired = [RetiredStage2Projection::from(split.old)];
         let cleanup = mutate_known_external_alias_state(
-            |_, aliases| retired_projection_mutation_keys(aliases, &retired, &[]),
-            |replay, aliases| remove_rows_for_retired_stage2_projections(replay, aliases, &retired),
+            |aliases| retired_projection_mutation_keys(aliases, &retired, &[]),
+            |aliases| remove_rows_for_retired_stage2_projections(aliases, &retired),
         );
         for alias in cleanup.removed_aliases {
             record_cow_alias_lifecycle(

@@ -150,6 +150,7 @@ impl<'authority> MmMutationGuard<'authority> {
                     0,
                 );
                 let depth = carrick_thread::fork_quiesce::TopologyDepth::acquire();
+                // Depth acquisition is non-blocking (atomic thread counter), so Acquired elapsed_ns is 0.
                 carrick_thread::fork_quiesce::emit_topology_lock(
                     self.operation,
                     carrick_observability::probes::HvpatchTopologyPhase::Acquired,
@@ -490,6 +491,7 @@ pub fn terminal_process_transaction() -> MmTransactionGuard<'static> {
                 0,
             );
             let depth = carrick_thread::fork_quiesce::TopologyDepth::acquire();
+            // Depth acquisition is non-blocking (atomic thread counter), so Acquired elapsed_ns is 0.
             carrick_thread::fork_quiesce::emit_topology_lock(
                 operation,
                 carrick_observability::probes::HvpatchTopologyPhase::Acquired,

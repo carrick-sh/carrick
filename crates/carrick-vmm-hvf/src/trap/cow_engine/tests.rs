@@ -103,7 +103,8 @@ fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
 
     let assert_guard_precedes = |block: &str, target_call: &str, context: &str| {
         let guard_pos = block
-            .find("FrameRegistryGuard::new(")
+            .find("FrameRegistryGuard::acquire(")
+            .or_else(|| block.find("FrameRegistryGuard::new("))
             .unwrap_or_else(|| panic!("{context}: block must bind FrameRegistryGuard"));
         let call_pos = block
             .find(target_call)
@@ -181,7 +182,8 @@ fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
         .and_then(|prefix| prefix.rsplit("if !shares_mm {").next())
         .expect("quiesce apply_inventory block exists");
     assert!(
-        quiesce_apply_block.contains("FrameRegistryGuard::new("),
+        quiesce_apply_block.contains("FrameRegistryGuard::acquire(")
+            || quiesce_apply_block.contains("FrameRegistryGuard::new("),
         "quiesce.rs apply_inventory block must bind FrameRegistryGuard"
     );
 
