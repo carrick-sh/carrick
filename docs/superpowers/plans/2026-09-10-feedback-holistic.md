@@ -380,3 +380,17 @@ commits and is re-checked at the next vet.
   workers finish): per-task syscall flow / executor claim sequence during
   the row to name what serializes fork+exec children (carrier topology lock,
   PtQuiesce election, fork admission, vCPU leases are the candidates).
+- Rearchitecture plan for the parallelism defect written and pushed:
+  `docs/superpowers/plans/2026-09-11-per-mm-topology-authority.md`
+  (measure first; two-process red-first tests; typed per-mm and leaf
+  registry authorities replace the carrier topology mutex site by site;
+  per-mm alias containers; per-parent-mm fork flag and coordinator;
+  exposed-CPU policy decision; paired-scorecard acceptance). Research
+  facts behind it: the page-table pause is already per mm (mm-scope,
+  09-07); no production `hv_vm_destroy` exists, so the mutex's founding
+  reason is dead; fork holds it ~4 ms mean, exec ~1.6 ms, exit across a
+  ~265-line transaction; the fork barrier's `quiescing` flag is one
+  carrier-global bool every executor reads; one process-fork coordinator
+  per carrier. Tasks 1 and 2 dispatched (`mm-two-process-tests`,
+  `mm-topology-guards`); Tasks 3–6 wait for the split/perf landings that
+  own the same files; Task 0 (traces) runs on the next quiet host.
