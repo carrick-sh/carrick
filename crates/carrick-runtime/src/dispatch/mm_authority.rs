@@ -14,6 +14,8 @@ use super::{
 };
 use super::{mem, mm_mutation};
 
+pub use super::mm_mutation::MmTransactionGuard;
+
 /// Dispatcher-side authority for one Linux MM.
 ///
 /// Every dispatcher still owns process-private signal, fd, proc, and control
@@ -838,5 +840,125 @@ impl crate::kernel::VmaSnapshotSource for DispatchMmAuthority {
             return Err(crate::kernel::SnapshotError::ChangedDuringObservation);
         }
         publish()
+    }
+}
+
+#[cfg(test)]
+mod mm_transaction_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn begin_transaction_increments_and_decrements_topology_depth() {
+        let mm_id = crate::kernel::MmId::from_registry_allocation(
+            std::num::NonZeroU64::new(42).expect("nonzero MM id"),
+        );
+        let coordinator = Arc::new(mm_mutation::MmMutationCoordinator::new(mm_id));
+        assert_eq!(carrick_thread::fork_quiesce::topology_depth(), 0);
+        assert!(carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary());
+
+        mm_mutation::test_support::with_guard(coordinator, |guard| {
+            assert_eq!(carrick_thread::fork_quiesce::topology_depth(), 0);
+            assert!(carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary());
+            {
+                let tx = guard.begin_transaction();
+                assert_eq!(carrick_thread::fork_quiesce::topology_depth(), 1);
+                assert!(
+                    !carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary()
+                );
+                {
+                    let tx_nested = guard.begin_transaction();
+                    assert_eq!(carrick_thread::fork_quiesce::topology_depth(), 2);
+                    assert!(
+                        !carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary(
+                        )
+                    );
+                    drop(tx_nested);
+                }
+                assert_eq!(carrick_thread::fork_quiesce::topology_depth(), 1);
+                assert!(
+                    !carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary()
+                );
+                drop(tx);
+            }
+            assert_eq!(carrick_thread::fork_quiesce::topology_depth(), 0);
+            assert!(carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary());
+        });
+
+        assert_eq!(carrick_thread::fork_quiesce::topology_depth(), 0);
+        assert!(carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary());
+    }
+
+    #[test]
+    fn mm_transaction_guard_construction_is_only_begin_transaction() {
+        fn visit_rs_files(root: &Path, current: &Path, files: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(current).expect("read directory") {
+                let entry = entry.expect("directory entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    visit_rs_files(root, &path, files);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path.strip_prefix(root).expect("strip prefix").to_owned());
+                }
+            }
+        }
+
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates directory");
+        let mut rs_files = Vec::new();
+        visit_rs_files(crates_dir, crates_dir, &mut rs_files);
+        assert!(
+            !rs_files.is_empty(),
+            "must find crate source files in workspace"
+        );
+
+        let struct_init_pattern = concat!("MmTransaction", "Guard {");
+        let associated_call_pattern = concat!("MmTransaction", "Guard::");
+
+        let mut observed_matches = BTreeSet::new();
+        for relative in rs_files {
+            let full_path = crates_dir.join(&relative);
+            let content = std::fs::read_to_string(&full_path).expect("read source file");
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//")
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with('*')
+                {
+                    continue;
+                }
+                if line.contains(struct_init_pattern) || line.contains(associated_call_pattern) {
+                    observed_matches
+                        .insert((relative.to_string_lossy().into_owned(), trimmed.to_owned()));
+                }
+            }
+        }
+
+        let expected_matches = BTreeSet::from([(
+            "carrick-runtime/src/dispatch/mm_mutation.rs".to_string(),
+            concat!("MmTransaction", "Guard {").to_string(),
+        )]);
+
+        assert_eq!(
+            observed_matches, expected_matches,
+            "MmTransactionGuard must have exactly one construction path across workspace crates: MmMutationGuard::begin_transaction in mm_mutation.rs"
+        );
+
+        let mutation_source =
+            std::fs::read_to_string(crates_dir.join("carrick-runtime/src/dispatch/mm_mutation.rs"))
+                .expect("read mm_mutation.rs");
+        let expected_snippet_lf = format!(
+            "pub fn begin_transaction(&self) -> MmTransactionGuard<'_> {{\n        {struct_init_pattern}"
+        );
+        let expected_snippet_crlf = format!(
+            "pub fn begin_transaction(&self) -> MmTransactionGuard<'_> {{\r\n        {struct_init_pattern}"
+        );
+        assert!(
+            mutation_source.contains(&expected_snippet_lf)
+                || mutation_source.contains(&expected_snippet_crlf),
+            "MmTransactionGuard construction site must be inside MmMutationGuard::begin_transaction"
+        );
     }
 }

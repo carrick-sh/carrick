@@ -126,6 +126,17 @@ impl MmMutationGuard<'_> {
         }
     }
 
+    /// Begin a topology transaction under this MM mutation authority.
+    ///
+    /// The transaction borrows the mutation guard so it cannot outlive
+    /// the stage-1 page-table exclusion.
+    pub fn begin_transaction(&self) -> MmTransactionGuard<'_> {
+        MmTransactionGuard {
+            depth: carrick_thread::fork_quiesce::TopologyDepth::acquire(),
+            _guard: PhantomData,
+        }
+    }
+
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
     pub(crate) fn authorizes(&self, coordinator: &Arc<MmMutationCoordinator>, mm: MmId) -> bool {
         self.mm == mm && self.coordinator.mm == mm && Arc::ptr_eq(&self.coordinator, coordinator)
@@ -300,6 +311,22 @@ impl HostAliasPermit<'_> {
     }
 }
 
+/// Exclusion for one MM's fork/exec/retire transaction. Minted only by the
+/// MM's `MmMutationGuard` (`begin_transaction`), so holding it proves the
+/// stage-1 pause is already held: the P -> topology order becomes a type,
+/// not a comment.
+pub struct MmTransactionGuard<'guard> {
+    depth: carrick_thread::fork_quiesce::TopologyDepth,
+    _guard: PhantomData<&'guard MmMutationGuard<'guard>>,
+}
+
+impl<'guard> MmTransactionGuard<'guard> {
+    /// Access the underlying topology depth token.
+    pub const fn depth(&self) -> &carrick_thread::fork_quiesce::TopologyDepth {
+        &self.depth
+    }
+}
+
 pub(crate) struct HostAliasCoordinatorGuard<'permit> {
     coordinator: Arc<MmMutationCoordinator>,
     _permit: PhantomData<&'permit ()>,
@@ -360,7 +387,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostAliasPermit, MmMutationCoordinator, MmMutationGuard};
+    use super::{HostAliasPermit, MmMutationCoordinator, MmMutationGuard, MmTransactionGuard};
     use crate::kernel::MmId;
     use static_assertions::assert_not_impl_any;
     use std::num::NonZeroU64;
@@ -368,6 +395,7 @@ mod tests {
 
     assert_not_impl_any!(MmMutationGuard<'static>: Clone, Copy);
     assert_not_impl_any!(HostAliasPermit<'static>: Clone, Copy);
+    assert_not_impl_any!(MmTransactionGuard<'static>: Clone, Copy);
 
     fn mm(raw: u64) -> MmId {
         MmId::from_registry_allocation(NonZeroU64::new(raw).expect("nonzero MM id"))
