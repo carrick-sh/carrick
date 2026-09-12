@@ -111,7 +111,9 @@ pub(crate) struct MutationDispatchRoute<'guard, 'authority, 'lease> {
     pub(crate) lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
 }
 
-impl NormalizedDispatchRoute for MutationDispatchRoute<'_, '_, '_> {
+impl<'guard, 'authority, 'lease> NormalizedDispatchRoute
+    for MutationDispatchRoute<'guard, 'authority, 'lease>
+{
     fn dispatch<M: CurrentMmMemory>(
         &mut self,
         dispatcher: &SyscallDispatcher,
@@ -157,9 +159,9 @@ impl SyscallDispatcher {
         })
     }
 
-    pub(crate) fn dispatch_normalized_with_lease(
+    pub(crate) fn dispatch_normalized_with_lease<M: CurrentMmMemory>(
         &self,
-        mut ctx: SyscallCtx<'_, impl CurrentMmMemory>,
+        mut ctx: SyscallCtx<'_, M>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_handler(ctx.request.number.raw())?;
         let canonical_nr = ctx.request.number.raw();
@@ -176,9 +178,9 @@ impl SyscallDispatcher {
         Some(outcome)
     }
 
-    pub(crate) fn dispatch_normalized_mutation<'authority, 'lease>(
+    pub(crate) fn dispatch_normalized_mutation<'authority, 'lease, M: CurrentMmMemory>(
         &self,
-        mut ctx: MutationSyscallCtx<'_, 'authority, 'lease, impl CurrentMmMemory>,
+        mut ctx: MutationSyscallCtx<'_, 'authority, 'lease, M>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_mutation_handler(ctx.request.number.raw())?;
         Some(resources::with_captured_resources(ctx.kernel, || {
