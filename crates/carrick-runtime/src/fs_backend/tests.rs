@@ -2117,7 +2117,7 @@ fn host_resolve_following_enforces_symlink_hop_limit() {
 /// This test reproduces the exact pattern (seed in parent, read
 /// in `libc::fork` child) to nail down whether cap-std's openat
 /// against an inherited dir fd returns the right bytes.
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 #[test]
 fn host_backend_survives_libc_fork_for_etc_hosts() {
     let (b, scratch) = host_backend();
