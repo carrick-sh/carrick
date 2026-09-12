@@ -5454,11 +5454,11 @@ mod tests {
             .find("apply_alias_frame_inventory(&kernel_context, commit)")
             .expect("the arm publishes the alias inventory");
         let release = tail
-            .find("drop(topology);")
-            .expect("the arm releases the topology lock after the commit is taken");
+            .find("drop(registry);")
+            .expect("the arm releases the registry guard after the commit is taken");
         assert!(
             publish < release,
-            "alias inventory publication must complete under the AliasMap topology lock"
+            "alias inventory publication must complete under the leaf registry guard"
         );
     }
 
