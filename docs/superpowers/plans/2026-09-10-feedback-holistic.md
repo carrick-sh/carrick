@@ -463,3 +463,10 @@ commits and is re-checked at the next vet.
   tma at 101 → 32 allows (17 commits) is landing; `syscall-names-mem`
   dispatched to finish the memory tables and delete the literal-arm macro
   variant now that the split has landed.
+- tma landing note: a 17-commit branch rebased over the mem split, Task 3
+  and alias landings needed three hand resolutions — main's moved test
+  block (kept main's layout and re-applied the four `ThreadCtx::new`
+  call-site edits where the tests now live), and in cow_engine.rs and
+  foreign_mm.rs the Task 3 `drop(registry)` beside tma's new
+  `CowInventoryLifecycleScope` binding. Long-lived worker branches over a
+  fast-moving main pay this at landing; land smaller batches sooner.
