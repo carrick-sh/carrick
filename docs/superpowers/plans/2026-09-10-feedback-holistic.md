@@ -686,3 +686,17 @@ commits and is re-checked at the next vet.
   for the USDT, red test visits 128,064 → ≤74 rows on retirement. Live
   receipts (probe gate, multiprocessing row, paired scorecard) pending on
   the rebuilt main.
+- 2026-09-12 15:05, `exec-sibling-settle` round 1 REJECTED by the live run
+  (binary 9f5b2f04ea7a6215, execfromthread eight-way × 3 under lldb-run):
+  15/24 kernel aborts (liveness: exec owner stuck, graph drained) and 5/24
+  stalls with no guest output — snapshot `ess/esseft-1-7`: the exec'ing
+  worker `Blocked(ChildState)` in `ExecSiblingDrain` with nobody left to
+  wake it. Cause: the added `is_ready` gate on `Running/SwitchingOut`
+  siblings has no wake (members publish their completion INSIDE their
+  last poll, before the executor settles them). The leak itself is at the
+  `PersistentThreadExitDisposition::Busy` arms in `binding.rs`: a removed
+  sibling whose `exit_thread` is `Busy` under a reservation finishes as
+  `ProcessTerminalLoser` with `ThreadDone` and leaves its kernel `Thread`
+  Runnable. Round 2 brief: revert the gate, make the loser path terminal
+  exactly (invalidate + dequeue), retire at drain finish only what is not
+  already terminal.
