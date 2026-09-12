@@ -750,3 +750,17 @@ commits and is re-checked at the next vet.
   candidate aliases, release, then authenticate), and never release to
   the IPA allocator while holding the owners map. (2) is the real fix
   and is a director task once (1) lands.
+- 2026-09-12 16:30, `exec-sibling-settle` round 2 REJECTED by the live run
+  (binary 1d5bc8f43833ead0, execfromthread eight-way × 3): 22/24 bad —
+  liveness aborts (exec owner stranded, graph drained) and the worker's
+  own new `carrick_fatal!("sibling thread LinuxTid(2) was still Running …
+  after sibling drain completed")`, which PROVES the window the design
+  must close: a member publishes its `LogicalJobCompletion` inside its
+  last poll, BEFORE its executor settles the claim, so "drain ready" does
+  not mean "siblings settled". Conclusion: this is a director runtime
+  fix, not another worker round — completion must mean SETTLED (publish
+  the member completion from the executor's terminal settlement, after
+  `settle_exited`/retire, or make the drain subscribe to settlement), and
+  the `ProcessTerminalLoser` arm must leave its kernel thread terminal.
+  The worktree `agy-exec-sibling-settle-sep12` is kept as evidence
+  (tests + the two arms' shape); nothing from it lands as is.
