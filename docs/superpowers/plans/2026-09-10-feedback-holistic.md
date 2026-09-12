@@ -783,3 +783,15 @@ commits and is re-checked at the next vet.
   to post-mortem next. The worker branch `agy-exec-sibling-settle-sep12`
   is superseded (its loser-arm tests remain a reference for the Busy
   arms); worktree to be removed.
+- 2026-09-12 17:00, alias lock-order deadlock FIXED (e4e632c07): the
+  alias registry is now a leaf for lookups — the five queries that
+  authenticated frame owners inside their match closure
+  (`mapping_for_range_in` IPA and VA arms, both
+  `materialize_sparse_mmap_extent_inner` bounds, the physical COW source
+  lookup) take candidates under the lock and authenticate on the released
+  result, preserving selection order (source-shape test names any
+  regression). Receipt on d8fbd6a94562b880: go-net_http ×8 under lldb-run
+  = 8/8 PASS, zero claim failures (before: 4/10 hangs on the drain-fix
+  binary, 2/3 TIMEOUT paired at w4). Probe gate + paired five-row
+  re-measure (`measure-sep12c.sh`, cand d8fbd6a94562b880 vs base
+  3c8dbee5b686c49d) queued behind it.
