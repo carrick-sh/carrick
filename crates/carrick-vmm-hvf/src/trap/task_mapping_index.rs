@@ -18,6 +18,68 @@ pub(crate) enum MappingRowRef {
     Shadowed(usize),
 }
 
+/// An extent in either guest virtual address (VA) space or stage-2 intermediate
+/// physical address (IPA) space, used to bound keyed removals.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MappingExtent {
+    Va(GuestVa, u64),
+    Ipa(u64, u64),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MappingExtent {
+    pub(crate) fn overlaps_region(&self, region: &HvfMappedRegion) -> bool {
+        match self {
+            Self::Va(start, length) => {
+                if *length == 0 {
+                    return false;
+                }
+                let va_start = start.0;
+                let va_end = va_start.checked_add(*length);
+                match va_end {
+                    Some(end) => region.start < end && region.end > va_start,
+                    None => region.end > va_start,
+                }
+            }
+            Self::Ipa(base, length) => {
+                if *length == 0 {
+                    return false;
+                }
+                let ipa_start = *base;
+                let ipa_end = ipa_start.checked_add(*length);
+                let row_ipa_end = region.ipa.saturating_add(region.size as u64);
+                let phys_end = region
+                    .physical_ipa
+                    .saturating_add(region.physical_size as u64);
+                let matches_ipa = match ipa_end {
+                    Some(end) => region.ipa < end && row_ipa_end > ipa_start,
+                    None => row_ipa_end > ipa_start,
+                };
+                let matches_phys = match ipa_end {
+                    Some(end) => region.physical_ipa < end && phys_end > ipa_start,
+                    None => phys_end > ipa_start,
+                };
+                matches_ipa || matches_phys
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl From<(GuestVa, u64)> for MappingExtent {
+    fn from((va, len): (GuestVa, u64)) -> Self {
+        Self::Va(va, len)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl From<(GuestVa, usize)> for MappingExtent {
+    fn from((va, len): (GuestVa, usize)) -> Self {
+        Self::Va(va, len as u64)
+    }
+}
+
 /// The per-task mapping table: sorted by construction, non-overlapping, and
 /// coalescing.
 ///
@@ -91,7 +153,8 @@ impl TaskMappingIndex {
     /// insertion goes through here so the IPA view cannot drift.
     fn live_insert(&mut self, region: HvfMappedRegion) {
         self.by_ipa.insert((region.ipa, region.start));
-        *self.ipa_span_counts.entry(region.size as u64).or_insert(0) += 1;
+        let span = region.size.max(region.physical_size) as u64;
+        *self.ipa_span_counts.entry(span).or_insert(0) += 1;
         if let Some(previous) = self.live.insert(GuestVa(region.start), region) {
             // A same-start replacement: retire the row that left.
             self.forget_ipa_entry(&previous);
@@ -107,12 +170,13 @@ impl TaskMappingIndex {
 
     fn forget_ipa_entry(&mut self, row: &HvfMappedRegion) {
         self.by_ipa.remove(&(row.ipa, row.start));
-        if let std::collections::btree_map::Entry::Occupied(mut span) =
-            self.ipa_span_counts.entry(row.size as u64)
+        let span = row.size.max(row.physical_size) as u64;
+        if let std::collections::btree_map::Entry::Occupied(mut span_entry) =
+            self.ipa_span_counts.entry(span)
         {
-            *span.get_mut() -= 1;
-            if *span.get() == 0 {
-                span.remove();
+            *span_entry.get_mut() -= 1;
+            if *span_entry.get() == 0 {
+                span_entry.remove();
             }
         }
     }
@@ -165,6 +229,65 @@ impl TaskMappingIndex {
     #[cfg(not(debug_assertions))]
     #[inline(always)]
     fn assert_invariants(&self) {}
+
+    /// Strict ordering and non-overlap of the live map checked incrementally
+    /// around a removed row's immediate neighbours in debug builds.
+    #[cfg(debug_assertions)]
+    fn assert_invariants_after_removal(&self, key: GuestVa) {
+        let prev = self.live.range(..key).next_back();
+        let next = self.live.range(key..).next();
+        if let Some((prev_va, prev_row)) = prev {
+            debug_assert_eq!(
+                prev_va.0, prev_row.start,
+                "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
+                prev_va.0, prev_row.start
+            );
+            debug_assert!(
+                prev_row.start < prev_row.end,
+                "TaskMappingIndex row must be non-empty: [0x{:x}, 0x{:x})",
+                prev_row.start,
+                prev_row.end
+            );
+            if let Some((next_va, next_row)) = next {
+                debug_assert_eq!(
+                    next_va.0, next_row.start,
+                    "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
+                    next_va.0, next_row.start
+                );
+                debug_assert!(
+                    next_row.start < next_row.end,
+                    "TaskMappingIndex row must be non-empty: [0x{:x}, 0x{:x})",
+                    next_row.start,
+                    next_row.end
+                );
+                debug_assert!(
+                    prev_row.end <= next_row.start,
+                    "TaskMappingIndex rows must be strictly increasing and non-overlapping after removal: \
+                     [0x{:x}, 0x{:x}) then [0x{:x}, 0x{:x})",
+                    prev_row.start,
+                    prev_row.end,
+                    next_row.start,
+                    next_row.end
+                );
+            }
+        } else if let Some((next_va, next_row)) = next {
+            debug_assert_eq!(
+                next_va.0, next_row.start,
+                "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
+                next_va.0, next_row.start
+            );
+            debug_assert!(
+                next_row.start < next_row.end,
+                "TaskMappingIndex row must be non-empty: [0x{:x}, 0x{:x})",
+                next_row.start,
+                next_row.end
+            );
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    fn assert_invariants_after_removal(&self, _key: GuestVa) {}
 
     /// Publish `region`, coalescing it into an adjacent row when the two
     /// describe the same extent of the same VMA.
@@ -292,6 +415,116 @@ impl TaskMappingIndex {
         }
         self.shadowed.retain(|row| predicate(row));
         self.assert_invariants();
+    }
+
+    /// Keyed removal API: for a set of VA and/or IPA extents, visits ONLY the rows
+    /// those extents can contain, applying `predicate` to them. Rows matching
+    /// `predicate` are removed.
+    pub(crate) fn remove_rows_matching_in_ranges<F>(
+        &mut self,
+        ranges: &[MappingExtent],
+        mut predicate: F,
+    ) -> usize
+    where
+        F: FnMut(&HvfMappedRegion) -> bool,
+    {
+        if ranges.is_empty() || self.is_empty() {
+            return 0;
+        }
+
+        let mut candidate_keys = std::collections::BTreeSet::new();
+
+        for range in ranges {
+            match range {
+                MappingExtent::Va(start, length) => {
+                    if *length == 0 {
+                        continue;
+                    }
+                    let va_start = start.0;
+                    let va_end = va_start.checked_add(*length);
+                    if let Some((&key, row)) = self.live.range(..start).next_back() {
+                        if row.end > va_start {
+                            candidate_keys.insert(key);
+                        }
+                    }
+                    match va_end {
+                        Some(end) => {
+                            for (&key, _) in self.live.range(*start..GuestVa(end)) {
+                                candidate_keys.insert(key);
+                            }
+                        }
+                        None => {
+                            for (&key, _) in self.live.range(*start..) {
+                                candidate_keys.insert(key);
+                            }
+                        }
+                    }
+                }
+                MappingExtent::Ipa(base, length) => {
+                    if *length == 0 {
+                        continue;
+                    }
+                    let ipa_start = *base;
+                    let ipa_end = ipa_start.checked_add(*length);
+                    let floor = ipa_start.saturating_sub(self.max_ipa_span());
+                    let ceil = ipa_end
+                        .and_then(|e| e.checked_add(self.max_ipa_span()))
+                        .unwrap_or(u64::MAX);
+                    let range_bounds = if ceil < u64::MAX {
+                        (
+                            std::ops::Bound::Included((floor, 0)),
+                            std::ops::Bound::Excluded((ceil, 0)),
+                        )
+                    } else {
+                        (
+                            std::ops::Bound::Included((floor, 0)),
+                            std::ops::Bound::Unbounded,
+                        )
+                    };
+                    for &(_row_ipa, start) in self.by_ipa.range(range_bounds) {
+                        candidate_keys.insert(GuestVa(start));
+                    }
+                }
+            }
+        }
+
+        let mut doomed_live = Vec::new();
+        for key in candidate_keys {
+            if let Some(row) = self.live.get(&key) {
+                if ranges.iter().any(|r| r.overlaps_region(row)) {
+                    note_task_mapping_row_visited();
+                    if predicate(row) {
+                        doomed_live.push(key);
+                    }
+                }
+            }
+        }
+
+        let mut removed_count = 0;
+        for key in doomed_live {
+            if self.live_remove(&key).is_some() {
+                self.assert_invariants_after_removal(key);
+                removed_count += 1;
+            }
+        }
+
+        let mut idx = 0;
+        while idx < self.shadowed.len() {
+            let overlaps = ranges
+                .iter()
+                .any(|r| r.overlaps_region(&self.shadowed[idx]));
+            if overlaps {
+                note_task_mapping_row_visited();
+                if predicate(&self.shadowed[idx]) {
+                    self.shadowed.remove(idx);
+                    removed_count += 1;
+                    continue;
+                }
+            }
+            idx += 1;
+        }
+
+        removed_count
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1159,6 +1392,174 @@ mod task_mapping_index_tests {
                 .count(),
             0,
             "a query below every row must offer nothing",
+        );
+    }
+
+    struct SimpleRng(u64);
+
+    impl SimpleRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn gen_range(&mut self, min: u64, max: u64) -> u64 {
+            if min >= max {
+                return min;
+            }
+            min + (self.next_u64() % (max - min))
+        }
+    }
+
+    fn make_test_region(start: u64, size: u64, ipa: u64, generation: u64) -> HvfMappedRegion {
+        let mut region = thread_sibling_tests::mapped_region(start, start + size, ipa);
+        region.owner_generation = generation;
+        region.physical_ipa = ipa;
+        region.physical_size = size as usize;
+        region
+    }
+
+    #[test]
+    fn differential_keyed_removal_matches_full_walk_retain_2000_cases() {
+        let mut rng = SimpleRng::new(0xc001_cafe_d00d_feed);
+        const CASES: usize = 2000;
+        let base_va = 0x6000_0000_u64;
+        let base_ipa = 0x9b00_0000_u64;
+
+        for case in 0..CASES {
+            let mut reference = TaskMappingIndex::new();
+            let mut keyed = TaskMappingIndex::new();
+
+            let num_rows = rng.gen_range(2, 20);
+            for _ in 0..num_rows {
+                let page_idx = rng.gen_range(0, 40);
+                let page_count = rng.gen_range(1, 6);
+                let start = base_va + page_idx * 0x1000;
+                let size = page_count * 0x1000;
+                let ipa = base_ipa + page_idx * 0x1000;
+                let generation = rng.gen_range(1, 5);
+
+                let r1 = make_test_region(start, size, ipa, generation);
+                let r2 = make_test_region(start, size, ipa, generation);
+                reference.insert(r1);
+                keyed.insert(r2);
+            }
+
+            let is_va = rng.next_u64() % 2 == 0;
+            let q_page = rng.gen_range(0, 45);
+            let q_count = rng.gen_range(1, 8);
+            let extent = if is_va {
+                let q_va = base_va + q_page * 0x1000;
+                let q_len = q_count * 0x1000;
+                MappingExtent::Va(GuestVa(q_va), q_len)
+            } else {
+                let q_ipa = base_ipa + q_page * 0x1000;
+                let q_len = q_count * 0x1000;
+                MappingExtent::Ipa(q_ipa, q_len)
+            };
+
+            let pred_kind = case % 4;
+            let target_gen = rng.gen_range(1, 5);
+            let predicate = move |m: &HvfMappedRegion| match pred_kind {
+                0 => true,
+                1 => m.owner_generation % 2 == 0,
+                2 => m.size > 0x1000,
+                _ => m.owner_generation == target_gen,
+            };
+
+            reference.retain(|m| !(extent.overlaps_region(m) && predicate(m)));
+            keyed.remove_rows_matching_in_ranges(&[extent], predicate);
+
+            assert_eq!(
+                reference.len(),
+                keyed.len(),
+                "case {case} ({extent:?}): total row count mismatch, ref={} keyed={}",
+                reference.len(),
+                keyed.len()
+            );
+            assert_eq!(
+                reference.live_len(),
+                keyed.live_len(),
+                "case {case} ({extent:?}): live row count mismatch, ref={} keyed={}",
+                reference.live_len(),
+                keyed.live_len()
+            );
+            assert_eq!(
+                reference.shadowed_len(),
+                keyed.shadowed_len(),
+                "case {case} ({extent:?}): shadowed row count mismatch, ref={} keyed={}",
+                reference.shadowed_len(),
+                keyed.shadowed_len()
+            );
+            let ref_rows: Vec<(u64, u64, u64, u64)> = reference
+                .iter()
+                .map(|m| (m.start, m.end, m.ipa, m.owner_generation))
+                .collect();
+            let keyed_rows: Vec<(u64, u64, u64, u64)> = keyed
+                .iter()
+                .map(|m| (m.start, m.end, m.ipa, m.owner_generation))
+                .collect();
+            assert_eq!(
+                ref_rows, keyed_rows,
+                "case {case} ({extent:?}): row contents mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn visit_count_for_extent_removal_is_sublinear_in_4096_rows() {
+        let mut index = TaskMappingIndex::new();
+        const N: u64 = 4096;
+        let va_base = 0x6000_0000_0000_u64;
+        let ipa_base = 0x9b00_0000_0000_u64;
+
+        // Insert N=4,096 non-coalescing rows (spaced by 2 MiB, distinct owner generations).
+        for i in 0..N {
+            let va = va_base + i * 0x20_0000;
+            let ipa = ipa_base + i * 0x20_0000;
+            let mut row = thread_sibling_tests::mapped_region(va, va + 0x1000, ipa);
+            row.owner_generation = i + 1;
+            index.insert(row);
+        }
+
+        assert_eq!(index.live_len(), N as usize);
+
+        // Test 1: Remove one extent by VA in the middle of 4,096 rows.
+        let target_idx = 2048_u64;
+        let target_va = va_base + target_idx * 0x20_0000;
+        let extent_va = MappingExtent::Va(GuestVa(target_va), 0x1000);
+
+        let before_va = hot_path_rows_scanned(HotPathScan::TaskMappings);
+        let removed = index.remove_rows_matching_in_ranges(&[extent_va], |_| true);
+        assert_eq!(removed, 1, "target row must be removed");
+        assert_eq!(index.live_len(), (N - 1) as usize);
+
+        let visited_va = hot_path_rows_scanned(HotPathScan::TaskMappings) - before_va;
+        assert!(
+            visited_va <= 3,
+            "keyed VA removal on N=4096 rows must visit O(1 + log N) rows, visited {visited_va}"
+        );
+
+        // Test 2: Remove one extent by IPA in the middle of the remaining rows.
+        let target_idx_2 = 1024_u64;
+        let target_ipa_2 = ipa_base + target_idx_2 * 0x20_0000;
+        let extent_ipa = MappingExtent::Ipa(target_ipa_2, 0x1000);
+
+        let before_ipa = hot_path_rows_scanned(HotPathScan::TaskMappings);
+        let removed_ipa = index.remove_rows_matching_in_ranges(&[extent_ipa], |_| true);
+        assert_eq!(removed_ipa, 1, "target row must be removed by IPA");
+        assert_eq!(index.live_len(), (N - 2) as usize);
+
+        let visited_ipa = hot_path_rows_scanned(HotPathScan::TaskMappings) - before_ipa;
+        assert!(
+            visited_ipa <= 4,
+            "keyed IPA removal on N=4096 rows must visit O(1 + log N) rows, visited {visited_ipa}"
         );
     }
 }
