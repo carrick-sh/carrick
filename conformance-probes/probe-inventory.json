@@ -700,7 +700,7 @@
     "runner": "generic"
   },
   "forkstorm": {
-    "class": "workload",
+    "class": "performance",
     "excluded": false,
     "runner": "generic"
   },
