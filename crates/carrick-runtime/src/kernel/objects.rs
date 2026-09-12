@@ -32,8 +32,11 @@ use super::ids::{
 };
 use super::netns::{NetNs, NsProxy, UtsNs};
 use super::operations::KernelOperationError;
-use super::registry::{IdRegistry, ProcessGroupClaim, SessionClaim};
 use carrick_fatal::carrick_fatal;
+
+pub mod session;
+
+pub use self::session::{ProcessGroup, Session};
 
 static NEXT_FILE_SLOT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -8571,78 +8574,7 @@ impl SignalAuthority {
     }
 }
 
-static NEXT_PROCESS_GROUP_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug)]
-pub struct ProcessGroup {
-    id: ProcessGroupId,
-    session: SessionId,
-    generation: u64,
-    _claim: ProcessGroupClaim,
-}
-
-impl ProcessGroup {
-    pub fn new(
-        id: ProcessGroupId,
-        session: SessionId,
-        registry: &IdRegistry,
-        claim: ProcessGroupClaim,
-    ) -> Result<Self, ObjectGraphError> {
-        if claim.raw() != id.raw() || !claim.belongs_to(registry) {
-            return Err(ObjectGraphError::ProcessGroupClaimMismatch);
-        }
-        let generation = NEXT_PROCESS_GROUP_GENERATION.fetch_add(1, Ordering::Relaxed);
-        if generation == 0 || generation == u64::MAX {
-            carrick_fatal!(
-                "kernel::process_group_generation",
-                "monotone process-group generation exhausted"
-            );
-        }
-        Ok(Self {
-            id,
-            session,
-            generation,
-            _claim: claim,
-        })
-    }
-
-    pub const fn id(&self) -> ProcessGroupId {
-        self.id
-    }
-
-    pub const fn session(&self) -> SessionId {
-        self.session
-    }
-
-    /// Monotonic object generation. Unlike the numeric PGID, this never follows
-    /// a later process group that reuses the same id.
-    pub(crate) const fn generation(&self) -> u64 {
-        self.generation
-    }
-}
-
-#[derive(Debug)]
-pub struct Session {
-    id: SessionId,
-    _claim: SessionClaim,
-}
-
-impl Session {
-    pub fn new(
-        id: SessionId,
-        registry: &IdRegistry,
-        claim: SessionClaim,
-    ) -> Result<Self, ObjectGraphError> {
-        if claim.raw() != id.raw() || !claim.belongs_to(registry) {
-            return Err(ObjectGraphError::SessionClaimMismatch);
-        }
-        Ok(Self { id, _claim: claim })
-    }
-
-    pub const fn id(&self) -> SessionId {
-        self.id
-    }
-}
+pub(super) static NEXT_PROCESS_GROUP_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
@@ -8851,8 +8783,8 @@ mod tests {
             assert_eq!(hasher.finish(), u64::from(value as u32));
         }
     }
+    use crate::kernel::ClonePlan;
     use crate::kernel::container::{LaunchContext, RunId};
-    use crate::kernel::{ClonePlan, IdRegistry};
 
     struct Fixture {
         ids: ObjectIdRegistry,
@@ -9616,29 +9548,6 @@ mod tests {
     }
 
     #[test]
-    fn group_claim_from_another_registry_is_rejected() {
-        let owner = IdRegistry::new();
-        let foreign = IdRegistry::new();
-        let (owner_task, owner_reservation) = owner.reserve_task().expect("owner task");
-        let owner_task_claim = owner_reservation.commit();
-        let (foreign_task, foreign_reservation) = foreign.reserve_task().expect("foreign task");
-        let foreign_task_claim = foreign_reservation.commit();
-        assert_eq!(owner_task.raw(), foreign_task.raw());
-        let group = ProcessGroupId::from_leader(owner_task);
-        let session = SessionId::from_leader(owner_task);
-        let foreign_claim = foreign
-            .claim_process_group(ProcessGroupId::from_leader(foreign_task))
-            .expect("foreign group claim");
-
-        assert!(matches!(
-            ProcessGroup::new(group, session, &owner, foreign_claim),
-            Err(ObjectGraphError::ProcessGroupClaimMismatch)
-        ));
-        drop(owner_task_claim);
-        drop(foreign_task_claim);
-    }
-
-    #[test]
     fn fork_shares_description_pushback_cell() {
         let ids = ObjectIdRegistry::new();
         let parent = FileTable::new(ids.file_table_id().expect("parent table ID"));
@@ -9748,27 +9657,6 @@ mod tests {
         done_rx.recv().expect("mutation released");
         worker.join().expect("mutation worker");
         assert_eq!(*table.lock_next_fd(), 4096);
-    }
-
-    #[test]
-    fn group_and_session_objects_hold_typed_namespace_claims() {
-        let ids = IdRegistry::new();
-        let (task_id, task_reservation) = ids.reserve_task().expect("task reservation");
-        let task_claim = task_reservation.commit();
-        let group_id = ProcessGroupId::from_leader(task_id);
-        let session_id = SessionId::from_leader(task_id);
-        let group_claim = ids.claim_process_group(group_id).expect("group claim");
-        let session_claim = ids.claim_session(session_id).expect("session claim");
-        let group =
-            ProcessGroup::new(group_id, session_id, &ids, group_claim).expect("group object");
-        let session = Session::new(session_id, &ids, session_claim).expect("session object");
-
-        drop(task_claim);
-        assert!(ids.is_reserved_number(task_id.raw()));
-        drop(group);
-        assert!(ids.is_reserved_number(task_id.raw()));
-        drop(session);
-        assert!(!ids.is_reserved_number(task_id.raw()));
     }
 
     #[test]
