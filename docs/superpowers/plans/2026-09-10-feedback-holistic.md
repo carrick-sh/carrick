@@ -569,3 +569,16 @@ commits and is re-checked at the next vet.
   `just conformance-probes` EXIT 0 (target/perf/probes-exitfix-sep12.log).
   Embed tests restructured around one carrier (cf5c08042). Measurement
   block re-armed on this binary; Task 6 and the allows round follow it.
+- PERF REGRESSION found by the rerun scorecard: cpython-compile 17.5 s →
+  175.9 s at four workers and 14.3 s → 175.6 s standalone (173 s user
+  CPU) on the fixed binary. Carrier CPU ranking on the row: 95.5% under
+  `TaskMappingIndex::remove_rows_matching_in_ranges`, 90.8% as its own
+  leaf — the alias-retain-index landing (e91947203) bounded candidate
+  discovery by the WIDEST live row (`max_ipa_span`/`max_physical_span`),
+  so one large row makes every munmap walk the whole index with a
+  BTreeSet insert per key: worse than the linear `retain` it replaced,
+  hidden by tests that generate uniformly small rows. Same class the
+  alias-newest fix closed with width-class partitions; worker
+  `alias-retain-r2` dispatched with a red-first huge-row visit-count test.
+  The other four rows improved in the same rep (tarfile 0.74x, importlib
+  0.89x, multiprocessing 0.94x, net_http 0.94x paired).
