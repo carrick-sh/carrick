@@ -12135,7 +12135,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/inotify.rs",
-      "line": 1524,
+      "line": 1533,
       "categories": [
         "epoll"
       ],
@@ -18282,7 +18282,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vfs/proc.rs",
-      "line": 5634,
+      "line": 5680,
       "categories": [
         "mapping"
       ],
