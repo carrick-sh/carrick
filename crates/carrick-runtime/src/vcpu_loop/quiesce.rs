@@ -1356,7 +1356,7 @@ where
         if quiesce_required && !coordinator.quiesced {
             process_barrier.set_quiescing();
             coordinator.quiesced = true;
-            self.kicker.kick_all_except(self.this_tid);
+            fork_participants.kick_participants(&*self.kicker);
             self.futex.notify_signal_pending();
             self.platform_futex.notify_signal_pending();
             kernel.signal_arrival.wake_all_waiters();
@@ -1388,7 +1388,7 @@ where
                         crate::linux_abi::LINUX_EAGAIN.guest_retval(),
                     )));
                 }
-                self.kicker.kick_all_except(self.this_tid);
+                fork_participants.kick_participants(&*self.kicker);
                 self.futex.notify_signal_pending();
                 self.platform_futex.notify_signal_pending();
                 kernel.signal_arrival.wake_all_waiters();

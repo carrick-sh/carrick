@@ -139,16 +139,23 @@ fn saturating_fork_sibling_count_for_probe(count: usize) -> u32 {
 #[derive(Debug)]
 pub(crate) struct ForkBarrierParticipants {
     siblings: BTreeSet<ThreadKey>,
+    sibling_tids: Vec<carrick_hal::ThreadId>,
 }
 
 impl ForkBarrierParticipants {
     pub(crate) fn requires_quiesce(&self) -> bool {
-        self.siblings.iter().next().is_some()
+        !self.siblings.is_empty()
     }
 
     #[cfg(test)]
     pub(crate) fn contains_sibling(&self, key: ThreadKey) -> bool {
         self.siblings.contains(&key)
+    }
+
+    pub(crate) fn kick_participants(&self, kicker: &(impl carrick_hal::VcpuRegistry + ?Sized)) {
+        for &tid in &self.sibling_tids {
+            kicker.kick(tid);
+        }
     }
 
     /// Exact durable sibling cardinality solely for the existing USDT probe.
@@ -2012,12 +2019,17 @@ impl Task {
                 thread: owner,
             });
         }
+        let mut siblings = BTreeSet::new();
+        let mut sibling_tids = Vec::new();
+        for (key, thread_ref) in threads.values() {
+            if *key != owner {
+                siblings.insert(*key);
+                sibling_tids.push(thread_ref.registry_id());
+            }
+        }
         Ok(ForkBarrierParticipants {
-            siblings: threads
-                .values()
-                .map(|(key, _)| *key)
-                .filter(|key| *key != owner)
-                .collect(),
+            siblings,
+            sibling_tids,
         })
     }
 
