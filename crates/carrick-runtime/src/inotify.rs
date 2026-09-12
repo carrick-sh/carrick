@@ -1242,11 +1242,13 @@ impl InotifyRegistry {
         if !from_name.is_empty() {
             dispatch_in(
                 &by_path,
-                from_parent,
-                carrick_abi::LINUX_IN_MOVED_FROM,
-                is_dir,
-                Some(from_name.as_bytes()),
-                false,
+                &InotifyDispatchEvent {
+                    path: from_parent,
+                    mask: carrick_abi::LINUX_IN_MOVED_FROM,
+                    is_dir,
+                    name: Some(from_name.as_bytes()),
+                    child_unlinked: false,
+                },
                 &mut cookie_for,
                 &mut fired_oneshot,
             );
@@ -1254,11 +1256,13 @@ impl InotifyRegistry {
         if !to_name.is_empty() {
             dispatch_in(
                 &by_path,
-                to_parent,
-                carrick_abi::LINUX_IN_MOVED_TO,
-                is_dir,
-                Some(to_name.as_bytes()),
-                false,
+                &InotifyDispatchEvent {
+                    path: to_parent,
+                    mask: carrick_abi::LINUX_IN_MOVED_TO,
+                    is_dir,
+                    name: Some(to_name.as_bytes()),
+                    child_unlinked: false,
+                },
                 &mut cookie_for,
                 &mut fired_oneshot,
             );
@@ -1286,11 +1290,13 @@ impl InotifyRegistry {
             let mut const_cookie = |_: &std::sync::Arc<InotifyState>| cookie;
             dispatch_in(
                 &by_path,
-                path,
-                mask,
-                is_dir,
-                name,
-                child_unlinked,
+                &InotifyDispatchEvent {
+                    path,
+                    mask,
+                    is_dir,
+                    name,
+                    child_unlinked,
+                },
                 &mut const_cookie,
                 &mut fired_oneshot,
             );
@@ -1322,30 +1328,33 @@ struct OneshotFire {
     wd: i32,
 }
 
-/// Deliver one event to every watch registered on `path`, filtered by each
+struct InotifyDispatchEvent<'a> {
+    path: &'a str,
+    mask: u32,
+    is_dir: bool,
+    name: Option<&'a [u8]>,
+    child_unlinked: bool,
+}
+
+/// Deliver one event to every watch registered on `event.path`, filtered by each
 /// watch's requested mask, drawing the cookie from `cookie_for`. Free function
 /// so both [`InotifyRegistry::dispatch`] and `notify_move` can share it while
 /// holding the read lock. Any `IN_ONESHOT` watch that fires is pushed to
 /// `fired_oneshot` for the caller to retire once the lock is released.
-#[allow(clippy::too_many_arguments)]
 fn dispatch_in(
     by_path: &HashMap<String, Vec<RegisteredWatch>>,
-    path: &str,
-    mask: u32,
-    is_dir: bool,
-    name: Option<&[u8]>,
-    child_unlinked: bool,
+    event: &InotifyDispatchEvent<'_>,
     cookie_for: &mut dyn FnMut(&std::sync::Arc<InotifyState>) -> u32,
     fired_oneshot: &mut Vec<OneshotFire>,
 ) {
-    let Some(watches) = by_path.get(path) else {
+    let Some(watches) = by_path.get(event.path) else {
         return;
     };
     for watch in watches {
         // IN_EXCL_UNLINK: once a child is unlinked from the watched directory, a
         // watch carrying this flag stops receiving its events (inotify12 #2).
         // Watches without the flag keep getting them (the default).
-        if child_unlinked && watch.mask & carrick_abi::LINUX_IN_EXCL_UNLINK != 0 {
+        if event.child_unlinked && watch.mask & carrick_abi::LINUX_IN_EXCL_UNLINK != 0 {
             continue;
         }
         // The kernel reports only the bits the watch asked for, EXCEPT the
@@ -1354,17 +1363,17 @@ fn dispatch_in(
         // this an `IN_ALL_EVENTS` watch — whose mask excludes IN_IGNORED
         // (0x8000) — would have its auto-removal IN_IGNORED filtered out
         // (inotify04 asserts exactly that IN_IGNORED).
-        let delivered = (mask & watch.mask) | (mask & UNCONDITIONAL_EVENT_BITS);
+        let delivered = (event.mask & watch.mask) | (event.mask & UNCONDITIONAL_EVENT_BITS);
         if delivered == 0 {
             continue;
         }
-        let out_mask = if is_dir {
+        let out_mask = if event.is_dir {
             delivered | carrick_abi::LINUX_IN_ISDIR
         } else {
             delivered
         };
         let cookie = cookie_for(&watch.state);
-        watch.state.enqueue(watch.wd, out_mask, cookie, name);
+        watch.state.enqueue(watch.wd, out_mask, cookie, event.name);
         // IN_ONESHOT: the watch is removed after its first delivered event.
         if watch.mask & carrick_abi::LINUX_IN_ONESHOT != 0 {
             fired_oneshot.push(OneshotFire {

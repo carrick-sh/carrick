@@ -223,6 +223,43 @@ impl Default for DentryCache {
     }
 }
 
+struct InsertDirParams<'a> {
+    id: DentryId,
+    dir_gen: Arc<AtomicU64>,
+    upper_dir_fd: Option<Arc<OwnedFd>>,
+    lower_dir_fd: Option<Arc<OwnedFd>>,
+    parent_id: DentryId,
+    name: &'a str,
+    path: &'a str,
+    dev: u64,
+    ino: u64,
+}
+
+struct ConstructPositiveParams<'a> {
+    parent_id: DentryId,
+    name: &'a str,
+    parent_dir_gen: u64,
+    parent_fd: &'a Arc<OwnedFd>,
+    name_c: &'a CString,
+    st: &'a libc::stat,
+    full_path: &'a str,
+    rel_full: &'a str,
+    is_lower: bool,
+    backend: &'a dyn FsBackend,
+    rootfs: Option<&'a RootFs>,
+}
+
+struct FillComponentParams<'a> {
+    parent_id: DentryId,
+    name: &'a str,
+    parent_dir_gen: u64,
+    upper_parent_fd: Option<&'a Arc<OwnedFd>>,
+    lower_parent_fd: Option<&'a Arc<OwnedFd>>,
+    current_dir_path: &'a str,
+    backend: &'a dyn FsBackend,
+    rootfs: Option<&'a RootFs>,
+}
+
 impl DentryCache {
     pub fn new(is_shared: bool) -> Self {
         let eviction_enabled = std::env::var("CARRICK_DENTRY_EVICT")
@@ -881,16 +918,16 @@ impl DentryCache {
 
             let node = match dentry_node {
                 Some(pos) => pos,
-                None => self.fill_component(
-                    current_id,
+                None => self.fill_component(FillComponentParams {
+                    parent_id: current_id,
                     name,
                     parent_dir_gen,
-                    upper_fd.as_ref(),
-                    lower_fd.as_ref(),
-                    &current_dir_path,
+                    upper_parent_fd: upper_fd.as_ref(),
+                    lower_parent_fd: lower_fd.as_ref(),
+                    current_dir_path: &current_dir_path,
                     backend,
                     rootfs,
-                )?,
+                })?,
             };
 
             let leaf_parent_fd = if node.is_lower {
@@ -1028,19 +1065,18 @@ impl DentryCache {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn insert_dir(
-        &self,
-        id: DentryId,
-        dir_gen: Arc<AtomicU64>,
-        upper_dir_fd: Option<Arc<OwnedFd>>,
-        lower_dir_fd: Option<Arc<OwnedFd>>,
-        parent_id: DentryId,
-        name: &str,
-        path: &str,
-        dev: u64,
-        ino: u64,
-    ) {
+    fn insert_dir(&self, params: InsertDirParams<'_>) {
+        let InsertDirParams {
+            id,
+            dir_gen,
+            upper_dir_fd,
+            lower_dir_fd,
+            parent_id,
+            name,
+            path,
+            dev,
+            ino,
+        } = params;
         if !self.eviction_enabled {
             if self.dirs.read().len() >= 4096 {
                 let mut entries = self.entries.write();
@@ -1275,21 +1311,23 @@ impl DentryCache {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn construct_positive_from_stat(
         &self,
-        parent_id: DentryId,
-        name: &str,
-        parent_dir_gen: u64,
-        parent_fd: &Arc<OwnedFd>,
-        name_c: &CString,
-        st: &libc::stat,
-        full_path: &str,
-        rel_full: &str,
-        is_lower: bool,
-        backend: &dyn FsBackend,
-        rootfs: Option<&RootFs>,
+        params: ConstructPositiveParams<'_>,
     ) -> Result<PositiveDentry, LinuxErrno> {
+        let ConstructPositiveParams {
+            parent_id,
+            name,
+            parent_dir_gen,
+            parent_fd,
+            name_c,
+            st,
+            full_path,
+            rel_full,
+            is_lower,
+            backend,
+            rootfs,
+        } = params;
         let mode_type = st.st_mode as u32 & libc::S_IFMT as u32;
         let real_stat = if is_lower {
             rootfs.and_then(|rf| rf.immutable_backend()).and_then(|b| {
@@ -1434,17 +1472,17 @@ impl DentryCache {
             };
             let new_dir_id = DentryId(self.next_dentry_id.fetch_add(1, Ordering::Relaxed));
             let child_dir_gen = Arc::new(AtomicU64::new(1));
-            self.insert_dir(
-                new_dir_id,
-                child_dir_gen.clone(),
-                child_upper_dir_fd,
-                child_lower_dir_fd,
+            self.insert_dir(InsertDirParams {
+                id: new_dir_id,
+                dir_gen: child_dir_gen.clone(),
+                upper_dir_fd: child_upper_dir_fd,
+                lower_dir_fd: child_lower_dir_fd,
                 parent_id,
                 name,
-                full_path,
-                st.st_dev as u64,
-                st.st_ino,
-            );
+                path: full_path,
+                dev: st.st_dev as u64,
+                ino: st.st_ino,
+            });
             let on_disk_mode = st.st_mode as u32 & 0o7777;
             let (mode, uid, gid) = if let Some(ref rs) = real_stat {
                 (rs.mode, rs.uid, rs.gid)
@@ -1547,18 +1585,20 @@ impl DentryCache {
     }
 
     /// Helper to fill a missing component using the backend and rootfs.
-    #[allow(clippy::too_many_arguments)]
     fn fill_component(
         &self,
-        parent_id: DentryId,
-        name: &str,
-        parent_dir_gen: u64,
-        upper_parent_fd: Option<&Arc<OwnedFd>>,
-        lower_parent_fd: Option<&Arc<OwnedFd>>,
-        current_dir_path: &str,
-        backend: &dyn FsBackend,
-        rootfs: Option<&RootFs>,
+        params: FillComponentParams<'_>,
     ) -> Result<PositiveDentry, LinuxErrno> {
+        let FillComponentParams {
+            parent_id,
+            name,
+            parent_dir_gen,
+            upper_parent_fd,
+            lower_parent_fd,
+            current_dir_path,
+            backend,
+            rootfs,
+        } = params;
         let full_path = if current_dir_path == "/" {
             format!("/{}", name)
         } else {
@@ -1605,19 +1645,19 @@ impl DentryCache {
                 return Err(LINUX_ENOENT);
             }
             if rc == 0 {
-                return self.construct_positive_from_stat(
+                return self.construct_positive_from_stat(ConstructPositiveParams {
                     parent_id,
                     name,
                     parent_dir_gen,
                     parent_fd,
-                    &name_c,
-                    &st,
-                    &full_path,
+                    name_c: &name_c,
+                    st: &st,
+                    full_path: &full_path,
                     rel_full,
-                    /* is_lower = */ false,
+                    is_lower: false,
                     backend,
                     rootfs,
-                );
+                });
             }
         } else if let Some(rs) = backend.real_stat(&full_path, false) {
             let symlink_target = if rs.kind == RootFsEntryKind::Symlink {
@@ -1672,17 +1712,17 @@ impl DentryCache {
                     }
                     None => None,
                 };
-                self.insert_dir(
-                    new_dir_id,
-                    child_dir_gen.clone(),
-                    child_upper_dir_fd,
-                    child_lower_dir_fd,
+                self.insert_dir(InsertDirParams {
+                    id: new_dir_id,
+                    dir_gen: child_dir_gen.clone(),
+                    upper_dir_fd: child_upper_dir_fd,
+                    lower_dir_fd: child_lower_dir_fd,
                     parent_id,
                     name,
-                    &full_path,
-                    0,
-                    rs.ino,
-                );
+                    path: &full_path,
+                    dev: 0,
+                    ino: rs.ino,
+                });
                 (Some(new_dir_id), Some(child_dir_gen))
             } else {
                 (None, None)
@@ -1770,17 +1810,17 @@ impl DentryCache {
                     }
                     None => None,
                 };
-                self.insert_dir(
-                    new_dir_id,
-                    child_dir_gen.clone(),
-                    child_upper_dir_fd,
-                    child_lower_dir_fd,
+                self.insert_dir(InsertDirParams {
+                    id: new_dir_id,
+                    dir_gen: child_dir_gen.clone(),
+                    upper_dir_fd: child_upper_dir_fd,
+                    lower_dir_fd: child_lower_dir_fd,
                     parent_id,
                     name,
-                    &full_path,
-                    0,
-                    1,
-                );
+                    path: &full_path,
+                    dev: 0,
+                    ino: 1,
+                });
                 (Some(new_dir_id), Some(child_dir_gen))
             } else {
                 (None, None)
@@ -1844,19 +1884,19 @@ impl DentryCache {
                     )
                 };
                 if rc == 0 {
-                    return self.construct_positive_from_stat(
+                    return self.construct_positive_from_stat(ConstructPositiveParams {
                         parent_id,
                         name,
                         parent_dir_gen,
-                        lower_fd,
-                        &name_c,
-                        &st,
-                        &full_path,
+                        parent_fd: lower_fd,
+                        name_c: &name_c,
+                        st: &st,
+                        full_path: &full_path,
                         rel_full,
-                        /* is_lower = */ true,
+                        is_lower: true,
                         backend,
                         rootfs,
-                    );
+                    });
                 } else {
                     let dirs = self.dirs.read();
                     if let Some(d) = dirs.get(&parent_id) {
@@ -1936,17 +1976,17 @@ impl DentryCache {
                         }
                         None => None,
                     };
-                    self.insert_dir(
-                        new_dir_id,
-                        child_dir_gen.clone(),
-                        child_upper_dir_fd,
-                        child_lower_dir_fd,
+                    self.insert_dir(InsertDirParams {
+                        id: new_dir_id,
+                        dir_gen: child_dir_gen.clone(),
+                        upper_dir_fd: child_upper_dir_fd,
+                        lower_dir_fd: child_lower_dir_fd,
                         parent_id,
                         name,
-                        &full_path,
+                        path: &full_path,
                         dev,
                         ino,
-                    );
+                    });
                     (Some(new_dir_id), Some(child_dir_gen))
                 } else {
                     (None, None)
