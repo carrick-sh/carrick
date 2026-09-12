@@ -490,3 +490,28 @@ commits and is re-checked at the next vet.
   `too_many_arguments` allows, and the quiet-host measurements (Task 0
   traces, the two-process red numbers, paired A/B of the three landed perf
   clusters against 3c8dbee5b686c49d).
+- 2026-09-12 morning: per-mm Task 4 LANDED (5149bba88): fork, exec, exit
+  and unmap hold their mm's `MmTransactionGuard` (minted from the stage-1
+  authority) plus the registry leaf; the executor-lane retirement backoff
+  helper is deleted; `acquire_topology_lock` has no production caller.
+  Landing needed the abort-ledger re-bless (fatal statements re-tokened by
+  the guard) and dropping the retired host-authority rows of the deleted
+  helper by hand. split-continuation-r3 LANDED (28d625f3f): continuation.rs
+  12,097 → 2,176 with quantum/tests/wait_service/readiness submodules —
+  every file the vet listed above 10K lines is now under 3K.
+- Probe-gate stall (7h47m): on a cache miss the legacy harness ran the
+  amd64:musl lane's probe live under a Rosetta container (the stale
+  ppollwaitset amd64 oracle had been deleted on 09-11), which never
+  returned. Fixed forward (13aad0ba8): a live Docker oracle is attempted
+  only for the host's own ISA; a foreign-platform miss is Unblessed
+  (report-only NOTE) and must be blessed on a native amd64 host
+  (root@carrick-x86 / willow VM 210). The `--platform linux/amd64` path in
+  `bless_probe_oracle` is the same class and is next.
+- OPEN observation: `tlbibroadcast` (arm64 musl) TIMED OUT at 45 s with
+  empty stdout once in the Task 4 gate, under a concurrent worker build and
+  eight gate workers; 3/3 PASS in isolation on the same binary, gnu lane
+  passed in the gate. Load-coupled, not dismissed: if the full gate rerun
+  reproduces it, take a core of the carrier and the per-task syscall-flow
+  trace before any fix; the probe spins a sibling vCPU with no syscalls
+  while the main thread mprotects/munmaps, i.e. exactly the per-mm pause
+  path Task 4 touched.
