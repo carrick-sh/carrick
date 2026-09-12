@@ -501,3 +501,21 @@ instruments. Task 5 must fire the same append-only operation ids from
 `MmTransactionGuard` (per-mm hold) and `FrameRegistryGuard` (leaf hold)
 acquisitions so the scripts measure the new authorities, and the fork-wait
 script's anchors must be re-qualified live before its numbers are cited.
+
+## Measurement (2026-09-12, binary 56fe7daa3cd2d54d = main 9c04adc56, quiet host)
+
+- Task 1 acceptance: `children_run_concurrently` PASSED (0.60 s for four
+  400 ms spinners; serialized would be ~1.6 s) — child processes run in
+  parallel after Task 4. `fault_latency_is_independent_of_sibling_fork`
+  failed on a TEST defect (second `Carrier::new()` while the first was
+  alive → `CarrierAlreadyActive`, after a 472 s alone phase); restructured
+  around one carrier with an 8-round fault loop, rerun pending.
+- Task 0 traces: the topology-lock instrument records `empty=1` (no
+  carrier-mutex site left — Task 5 re-attaches the USDT to the guards);
+  the fork-wait trace on the multiprocessing row now pairs 293 forks:
+  fork mean 1.35 ms, child lifetime mean 79.7 ms, reap mean 59.5 ms.
+- Exposed CPUs 4 vs 10 on the multiprocessing row: 6.53 s vs 6.55 s wall
+  (10.2 s user + 2.6 s sys both) — the CPU count is not the limiter;
+  parallelism is ~1.95 cores (was 1.3 before Task 4; Docker ~5 of 10 in
+  2.9 s). The row is now ~2.2x Docker at one worker; the remaining
+  serialization is Task 6's (fork flag/coordinator) and Task 5's.
