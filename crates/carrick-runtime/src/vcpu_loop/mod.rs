@@ -1760,10 +1760,8 @@ where
                                 "HVPatch alias inventory has no process context".to_owned(),
                             )
                         })?;
-                        let topology = crate::fork_quiesce::acquire_topology_lock(
-                            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
-                            process.pid(),
-                            self.this_tid.raw(),
+                        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
+                            crate::fork_quiesce::frame_registry_lock().lock(),
                         );
                         if let Err(error) = engine.begin_alias_inventory(reservation) {
                             let abandoned = kernel_context
@@ -1797,7 +1795,7 @@ where
                                 .frame_inventory()
                                 .abandon(inventory_transaction);
                             debug_assert!(abandoned);
-                            drop(topology);
+                            drop(registry);
                             drop(install);
                             tracing::error!(
                                 va = format_args!("{:#x}", va.raw()),
@@ -1837,7 +1835,7 @@ where
                             ));
                         };
                         // Publish to the kernel frame-inventory authority BEFORE
-                        // releasing the topology lock. Staging above made a fresh
+                        // releasing the registry guard. Staging above made a fresh
                         // shared-file frame visible to every later installer of the
                         // same file through the backend's shared-frame registry
                         // (`stage_mapping_in`: `frames.shared.entry(backing)`), and
@@ -1848,14 +1846,12 @@ where
                         // was refused with `UnreservedFrame`: the silent rc=134
                         // carrier abort of 2026-09-08 (go-build reducer, and the
                         // MAP_SHARED two-process reducer 4/4). Holding the
-                        // lock across the apply makes publication order equal to
-                        // staging order, which is the invariant the registry
-                        // reuse relies on. Lock order is unchanged: the AliasUnmap
-                        // retirement already publishes under this lock, and the
-                        // authority mutex is a leaf (`frame_inventory.rs` never
-                        // calls out while holding it).
+                        // guard across the apply makes publication order equal to
+                        // staging order, as the registry reuse relies on. Lock order
+                        // is unchanged: the authority mutex is a leaf
+                        // (`frame_inventory.rs` never calls out while holding it).
                         let published = apply_alias_frame_inventory(&kernel_context, commit);
-                        drop(topology);
+                        drop(registry);
                         if let Err(error) = published {
                             return Err(refuse(
                                 Site::InventoryPublish,
