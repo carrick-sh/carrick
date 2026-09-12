@@ -20,12 +20,12 @@
     "lifecycle": 16
   },
   "files": {
-    "table_guard": 24,
-    "description_guard": 37,
+    "table_guard": 25,
+    "description_guard": 38,
     "description_backing": 7,
     "epoll": 39,
     "stream": 19,
-    "mapping": 81,
+    "mapping": 87,
     "lifecycle": 9
   },
   "entries": [
@@ -4326,8 +4326,2106 @@
       "scope_kind": "test_or_definition"
     },
     {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 38,
+      "categories": [
+        "mapping"
+      ],
+      "text": "libc::mmap(",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 62,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"Darwin must cap max_protection of an O_RDONLY MAP_SHARED mapping (granted={granted} errno={errno})\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 77,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"an O_RDWR-backed MAP_SHARED mapping must accept PROT_WRITE (errno={errno})\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 112,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 159,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// real identity host mapping.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 264,
+      "categories": [
+        "mapping"
+      ],
+      "text": "panic!(\"private host-file mmap must succeed, got {outcome:?}\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 275,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"a lowered mapping must not be eagerly materialized\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 319,
+      "categories": [
+        "mapping"
+      ],
+      "text": "panic!(\"lazy private host-file mmap must succeed, got {outcome:?}\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 324,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"mmap must retain the file recipe without invoking backing publication\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 334,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"mmap must retain exactly one deferred file recipe\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 339,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"mmap must leave the semantic file view stage-1-invalid until first access\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 406,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// (best-effort pread, errors left the zeroed buffer), and mmap",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 432,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "dispatcher.captured_file_table().write_open_files().insert(",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 491,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// MAP_SHARED file mapping legitimately publishes via the alias transaction",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 512,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"control mapping must still succeed, got {outcome:?}\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 584,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"hatched mapping must still succeed, got {outcome:?}\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 1439,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 1538,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 1610,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 1664,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 1718,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 1776,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 1805,
+      "categories": [
+        "mapping"
+      ],
+      "text": "entered_tx.send(()).expect(\"report mapping admission\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 1815,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"sibling mapping dispatch raced an installing host alias\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing/tests.rs",
+      "line": 1821,
+      "categories": [
+        "mapping"
+      ],
+      "text": "thread.join().expect(\"join sibling mapping dispatch\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 66,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// makes an mmap/protection failure a no-op for the prior VMA and every",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 82,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// The mapping is backed by a `memfd_secret(2)` fd: its pages are",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 114,
+      "categories": [
+        "mapping"
+      ],
+      "text": "for mapping in image.file_mappings().iter().filter(|m| !m.path.is_empty()) {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 116,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let start = mapping.start.max(region.start);",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 117,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let end = mapping.end.min(region.end);",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 486,
+      "categories": [
+        "mapping"
+      ],
+      "text": "for mapping in mappings.drain(..) {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 487,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if end <= mapping.start || start >= mapping.end {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 488,
+      "categories": [
+        "mapping"
+      ],
+      "text": "next.push(mapping);",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 491,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if mapping.start < start {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 492,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mut left = mapping.clone();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 496,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if end < mapping.end {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 497,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mut right = mapping;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 505,
+      "categories": [
+        "mapping"
+      ],
+      "text": "next.sort_by_key(|mapping| (mapping.start, mapping.end));",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 522,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Darwin caps a `MAP_SHARED` file mapping's `max_protection` at the backing",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 525,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// `protection` the mapping was created with. `hv_vm_map` then refuses the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 529,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// discriminator: a `PROT_READ` mapping of an `O_RDWR` fd maps fine.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 533,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// guest-read-only description normally fails this check; the mmap alias path",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 540,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// overlay's copy-up. Such a mapping falls back to the snapshot path instead",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 541,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// \u2014 observationally equivalent for a read-only mapping of a layer that",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 770,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".sort_by_key(|mapping| (mapping.start, mapping.end));",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 812,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// bytes. The destination starts zeroed, so EOF supplies the Linux mapping's",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 974,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// throughout this synchronous mapping operation.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 1102,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// True iff `[start, start+len)` touches a live secretmem mapping \u2014 used",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 1138,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Remove every dispatcher-owned mmap classification for a committed range.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 1142,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// `pub(super)` is intentional: SysV `shmdt` owns an mmap-classified host",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 1151,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// True iff a live MAP_SHARED, PROT_WRITE mapping backed by `description`",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "line": 1218,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".sort_by_key(|mapping| (mapping.start, mapping.end));",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise/tests.rs",
+      "line": 72,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// never drive the residency-vec allocation past the actual mapping (the",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise/tests.rs",
+      "line": 245,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"MAP_LOCKED must populate the mapping\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 89,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Derive `madvise` range validity + properties from carrick's mapping",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 315,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// checked FIRST (EBADF), THEN the mapping type (EINVAL).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 326,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(desc) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 332,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// (eventfd/timerfd/epoll/\u2026) all lack one and are EINVAL.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 353,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let is_fifo = match open_file.description.read().as_deref() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 410,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// io_uring (WS-H4-B1). setup allocates the rings in the guest arena and",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 412,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mmap path); enter drains the SQ ring. register is ENOSYS for now (the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 439,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// before anything else). CPython's mmap.flush(offset, size) calls",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 712,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A read-only mapping must NOT be written (would SIGBUS the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 713,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// runtime); a MAP_SHARED mapping must NOT be written either \u2014",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 714,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// for a shared FILE mapping zero_backing writes straight",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 716,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// MADV_DONTNEED on a shared mapping does not zero (the next",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 744,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// anonymous mapping starts: not resident, and resident",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 757,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// This mapping stays readable; its next",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
+      "line": 780,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mapping (file- or anon-backed) \u2192 EINVAL.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 8,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Why a guest `mmap` was refused \u2014 and whether the guest can work that out",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 12,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// glibc's `dlopen` renders any failed segment mapping as the single line",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 16,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// had been running on this lane. Every refusal in [`mmap`](SyscallDispatcher)",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 19,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// [`SyscallDispatcher::mmap`]: SyscallDispatcher",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 54,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// The guest's `mmap` arguments exactly as they arrived, captured before any",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 71,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Every `mmap` error return goes through here; there is deliberately no",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 102,
+      "categories": [
+        "mapping"
+      ],
+      "text": "target: \"carrick::mmap\",",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 113,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"mmap refused: invalid request\",",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 118,
+      "categories": [
+        "mapping"
+      ],
+      "text": "target: \"carrick::mmap\",",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 129,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"mmap refused: carrick internal limit\",",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 139,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mm_mutation fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 179,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Linux validates the fd FIRST for a file mapping: ksys_mmap_pgoff",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 186,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"file mapping on a descriptor that is not open\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 191,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// merely that a mapping was file-backed. Preserve the guest path",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 192,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// before the mapping branches borrow or duplicate the descriptor.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 200,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 228,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// treats MAP_DROPPABLE as a private anon mapping, so default the type",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 266,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// `mmap` and `mprotect` differ here, and `memflagmatrix` asserts",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 268,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// while `mmap` IGNORES them and maps the range with whatever known",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 270,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// `prot = 1 << 28`). carrick rejected them in both, so a mapping",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 340,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// io_uring mappings are ordinary MAP_SHARED host aliases. The file",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 345,
+      "categories": [
+        "description_backing",
+        "mapping"
+      ],
+      "text": ".concrete_backing::<crate::dispatch::ioring::IoUringBacking>()",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 354,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"offset does not name an io_uring region\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 364,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"io_uring mapping must be MAP_SHARED and cover exactly its region\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 370,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"MAP_FIXED_NOREPLACE over a live io_uring mapping\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 376,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"io_uring backing descriptor could not be duplicated\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 383,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"alias IPA arena exhausted (io_uring mapping)\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 395,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"io_uring mapping end overflows the address space\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 406,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = crate::dispatch::ioring::IoUringMapping {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 421,
+      "categories": [
+        "mapping"
+      ],
+      "text": "path: \"anon_inode:[io_uring]\".to_owned(),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 435,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 457,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// An O_PATH descriptor is not open for I/O \u2014 mmap on it returns",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 464,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap of an O_PATH descriptor\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 475,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap of a write-only descriptor\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 480,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mprotect(2) EACCES ceiling: a MAP_SHARED mapping of a file opened",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 485,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// into this answer \u2014 and recorded on the mapping because the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 507,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// shared, writable mapping \u2014 Linux returns EPERM (memfd_create01",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 508,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// check_mmap_fail). A private (MAP_PRIVATE) writable mapping is fine:",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 525,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"shared writable mapping of a write-sealed memfd\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 531,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// MAP_PRIVATE mmap with EINVAL (memfdsecret probe",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 541,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"MAP_PRIVATE mapping of a memfd_secret fd\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 562,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"mmap\",",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 574,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"MAP_FIXED_NOREPLACE over a live mapping\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 597,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// backends atomically replace the host mapping with MAP_PRIVATE anon.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 686,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// could hand active guest leaves to another mapping.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 742,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Repoint succeeded, so the prior mapping cannot be restored.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 807,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// file's page cache LIVE, via an aliased stage-2 mapping at a fresh",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 808,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// high VA. `mmap(MAP_SHARED, fd)` on the host means guest writes hit",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 810,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// a sibling mapping of the same file) and inherited across fork,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 824,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// snapshot path below computes it: a mapping of a memfd sealed",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 826,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// a later mprotect(PROT_WRITE); a writable mapping of an",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 841,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.write();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 844,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// have a host inode the guest mapping can view live.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 856,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// error deep inside the VMM backend: the mapping",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 890,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mapping, so this is the only way a later",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 938,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// The stage-1 mapping still covers EXACTLY the guest's",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 945,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"alias IPA arena exhausted (shared file mapping)\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 966,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Host mmap prot MUST match the guest's request (and thus the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 976,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mmap and wedged the guest. Linux maps such files fine (the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 978,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// `mmap(fd, n, prot=PROT_READ|PROT_EXEC)`), and so must we.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 990,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Host-side EFAULT gate for a PROT_NONE file mapping. The",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 992,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// the live host file mapping succeeds; publishing here would",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 996,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1117,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// to a PROT_READ anon-shared mapping silently succeeds",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1121,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// the eager arena (mirrors the file-mmap arm); the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1138,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// inaccessible mapping to observe the first touch.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1178,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"protection publication failed (shared anonymous mapping)\",",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1258,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"length exceeds the entire mmap address-space arena\")",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1260,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"no free address-space region: mmap arena exhausted\")",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1276,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Move-3 E1: an eligible MAP_PRIVATE file mmap lowers to ONE host",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1277,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// file-backed `MAP_PRIVATE|MAP_FIXED` mapping (demand-paged from",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1281,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// faults inside guest mmap service windows",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1285,
+      "categories": [
+        "mapping"
+      ],
+      "text": "//   * Private only (a Shared mapping's stores must reach the file);",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1303,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// materialized for a mapping about to demand-page), and the actual",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1306,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// failed mmap still leaves a MAP_FIXED target's prior mapping",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1319,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// is stage-1-invalidated (no-access) and a PROT_NONE mmap is not",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1321,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// and leaves the prior mapping's bytes \u2014 which then surface after",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1332,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"anonymous-reuse scrub failed (mmap arena)\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1341,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// valid+RW again, and a PROT_NONE mmap must actually fault. No-op",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1354,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// (bhyve) records a reservation across the WHOLE mmap arena,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1365,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"PROT_NONE reservation failed in the mmap arena\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1375,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"mmap locked range population failed\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1453,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"protection publication failed (anonymous mapping)\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1463,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"mmap locked range population failed\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1483,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// carrick publishes a mapping valid up front, so the guest's",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1552,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A MAP_SHARED mapping of a memfd sealed F_SEAL_WRITE is created",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1556,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A live MAP_SHARED, PROT_WRITE mapping of an (unsealed) memfd \u2014 its",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1578,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let path = match open_file.description.read().as_deref() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1585,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "if let Some(mut open) = open_file.description.write() {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1600,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let Some(open) = open_file.description.read() else {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1615,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"file length lookup failed during mmap populate\",",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1653,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"file read failed during mmap populate\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1721,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap of a pipe or FIFO\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1730,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap of a non-zero synthetic device\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1739,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap of packet ring with non-zero offset\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1747,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap of packet socket without ring\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1754,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap size does not match packet ring size\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1764,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Spec(\"mmap of a descriptor with no mappable backing\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1774,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// it here would leave a ghost live mapping when an identity-host",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1777,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Guest-chosen mmap addresses outside Carrick's low identity arenas",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1782,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// being relocated into the low mmap arena.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1790,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"mmap\",",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1830,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// host mapping and every subrange protection successful.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1838,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1889,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mapping now that every fallible pre-step has passed. On backend",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1890,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// refusal (alignment, ownership, may-execute, linux4k, host mmap",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1896,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// a fresh failure would break mmap's failure atomicity exactly",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1913,
+      "categories": [
+        "description_guard"
+      ],
+      "text": "let open = open_file.description.read();",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 1999,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"anonymous-reuse scrub failed (mmap arena)\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2018,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// loading the mapping, not a guest write. The dynamic loader often",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2042,
+      "categories": [
+        "mapping"
+      ],
+      "text": "MmapRefusal::Internal(\"file content could not be copied into the mapping\"),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2109,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A file-backed mapping's content is loaded eagerly (above), and",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2275,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A canonical alias-window guest VA is a dynamic alias mapping:",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2278,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// is owed), a MAP_FIXED mapping at a guest-chosen high VA (Apple",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2296,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// alias stage-1 sub-table (each MAP_SHARED file mapping took",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2393,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// `man 2 mremap`: a zero `old_size` asks for a NEW mapping of the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2394,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// same pages, which is only meaningful for a shareable mapping and",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2468,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Relocation below moves a mapping by COPYING it. That is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2469,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// correct for a PRIVATE mapping and wrong for a shared one:",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2472,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// reason the grow path refuses to move a shared mapping. Keep",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2480,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// for a mapping whose pages come from a file.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2530,
+      "categories": [
+        "mapping"
+      ],
+      "text": "match host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2822,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A shared mapping cannot be grown by copying it somewhere bigger:",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2851,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// File length and mapping offset behind a live MAP_SHARED alias, if",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2876,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// range \u2014 which is strictly better than re-establishing the mapping,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2888,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Where SIGBUS starts inside the GROWN mapping. The growth is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2896,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Offset within the mapping at which SIGBUS starts, when the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2897,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mapping ALREADY ends past its file's EOF. Read off the bus records",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2898,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// the original `mmap` published rather than re-derived from a",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2905,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// timed out with no output past the mmap).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2940,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// see. Same hatch as the mmap BUS line above.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2967,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// The mapping is not in the mmap arena: it's a MAP_SHARED file",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2969,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// region. CPython's mmap.resize() shrinks both of these",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2970,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// (test_mmap test_basic on a file mapping, test_resize_past_pos",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 2998,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// to 0x7d0001, and then grows the mapping to 0x7d0000 \u2014 all",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3031,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Same translation as the mmap path: PROT_EXEC is dropped",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3047,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mmap then fails the transaction aborts and the guest has",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3048,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// lost the source mapping, where Linux would have kept it \u2014",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3051,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// file map moves with the mapping; read it before the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3093,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// and a chance to lose coherence \u2014 and give the mapping the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3129,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// child, a second mmap of the same object) still sees this",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3130,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mapping's stores.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3184,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// needs this mapping's protection published over it",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3186,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// otherwise a store to a read-only mapping's new pages",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3294,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// free_regions (a future mmap reuse zero-fills it).",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3335,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A MAP_SHARED file mapping that already ends past its file's EOF,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3341,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// \"Past EOF\" is read off the bus records the original mmap",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3344,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// by now. If the mapping's LAST byte already faults SIGBUS then the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3425,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// `mmap` publishes it: no access, then the bus record that",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3467,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// bump pointer and so has no stage-1 mapping, which is exactly",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3469,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// mapping over it instead HUNG the guest (the backend tries to",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3547,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// allocator seam `mmap(MAP_FIXED)` uses, so the free list and",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3549,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// telling both is what once let a live mapping be scrubbed.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3795,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// alias window is deliberately given no backing at `mmap` time",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3807,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// sees no backing, reads that as \"no mapping\", and answers",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3831,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3882,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A shared mapping of a F_SEAL_WRITE memfd cannot be upgraded to",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3887,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// A MAP_SHARED mapping of a read-only file cannot be upgraded to",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3938,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// page tables. In the private mmap arena a failed edit is",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3948,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// protection must be edited just like the mmap arena below.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3956,
+      "categories": [
+        "mapping"
+      ],
+      "text": "\"mprotect failed to publish mmap-arena protection\"",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 3960,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// THE SECOND MARK POINT. `mmap` is the first: together they are",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 4008,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// concurrent host-mapping path. Either backend must fail the",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
+      "line": 4099,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// MAP_SHARED mapping; carrick does not emulate nonlinear remapping, so",
+      "scope_kind": "production_callsite"
+    },
+    {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 109,
+      "line": 9,
       "categories": [
         "mapping"
       ],
@@ -4336,7 +6434,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 118,
+      "line": 18,
       "categories": [
         "stream"
       ],
@@ -4345,34 +6443,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 183,
-      "categories": [
-        "mapping"
-      ],
-      "text": "libc::mmap(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 207,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"Darwin must cap max_protection of an O_RDONLY MAP_SHARED mapping (granted={granted} errno={errno})\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 222,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"an O_RDWR-backed MAP_SHARED mapping must accept PROT_WRITE (errno={errno})\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 540,
+      "line": 354,
       "categories": [
         "mapping"
       ],
@@ -4381,16 +6452,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 848,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 921,
+      "line": 664,
       "categories": [
         "mapping"
       ],
@@ -4399,7 +6461,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 936,
+      "line": 679,
       "categories": [
         "mapping"
       ],
@@ -4408,11 +6470,47 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 975,
+      "line": 718,
       "categories": [
         "mapping"
       ],
       "text": "assert_partial_reason(&reporter, \"mmap\", \"shared write-exec\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+      "line": 876,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "dispatcher.captured_file_table().write_open_files().insert(",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+      "line": 1043,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "dispatcher.captured_file_table().write_open_files().insert(",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+      "line": 1058,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "dispatcher.captured_file_table().write_open_files().insert(",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+      "line": 1083,
+      "categories": [
+        "table_guard"
+      ],
+      "text": "dispatcher.captured_file_table().write_open_files().insert(",
       "scope_kind": "test_or_definition"
     },
     {
@@ -4426,43 +6524,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1300,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "dispatcher.captured_file_table().write_open_files().insert(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1315,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "dispatcher.captured_file_table().write_open_files().insert(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1340,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "dispatcher.captured_file_table().write_open_files().insert(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1390,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "dispatcher.captured_file_table().write_open_files().insert(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1461,
+      "line": 1204,
       "categories": [
         "description_guard"
       ],
@@ -4471,16 +6533,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1502,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// real identity host mapping.",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1605,
+      "line": 1272,
       "categories": [
         "table_guard"
       ],
@@ -4489,124 +6542,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1657,
-      "categories": [
-        "mapping"
-      ],
-      "text": "panic!(\"private host-file mmap must succeed, got {outcome:?}\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1668,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"a lowered mapping must not be eagerly materialized\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1712,
-      "categories": [
-        "mapping"
-      ],
-      "text": "panic!(\"lazy private host-file mmap must succeed, got {outcome:?}\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1717,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"mmap must retain the file recipe without invoking backing publication\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1727,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"mmap must retain exactly one deferred file recipe\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1732,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"mmap must leave the semantic file view stage-1-invalid until first access\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1799,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// (best-effort pread, errors left the zeroed buffer), and mmap",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1825,
-      "categories": [
-        "table_guard"
-      ],
-      "text": "dispatcher.captured_file_table().write_open_files().insert(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1884,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// MAP_SHARED file mapping legitimately publishes via the alias transaction",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1905,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"control mapping must still succeed, got {outcome:?}\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1944,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// a `MAP_PRIVATE` file mapping keeps BOTH a COW'd (written) page and a",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 1967,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let p = libc::mmap(",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 2038,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"hatched mapping must still succeed, got {outcome:?}\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 3787,
+      "line": 2092,
       "categories": [
         "mapping"
       ],
@@ -4615,7 +6551,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 3926,
+      "line": 2231,
       "categories": [
         "mapping"
       ],
@@ -4624,7 +6560,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 3947,
+      "line": 2252,
       "categories": [
         "mapping"
       ],
@@ -4633,7 +6569,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 4342,
+      "line": 2647,
       "categories": [
         "mapping"
       ],
@@ -4642,7 +6578,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 4374,
+      "line": 2679,
       "categories": [
         "mapping"
       ],
@@ -4651,7 +6587,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 4386,
+      "line": 2691,
       "categories": [
         "mapping"
       ],
@@ -4660,7 +6596,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 4690,
+      "line": 2995,
       "categories": [
         "mapping"
       ],
@@ -4669,7 +6605,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 4874,
+      "line": 3179,
       "categories": [
         "mapping"
       ],
@@ -4678,7 +6614,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 4963,
+      "line": 3268,
       "categories": [
         "mapping"
       ],
@@ -4687,7 +6623,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 5065,
+      "line": 3370,
       "categories": [
         "mapping"
       ],
@@ -4696,7 +6632,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 5254,
+      "line": 3508,
       "categories": [
         "mapping"
       ],
@@ -4705,7 +6641,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 5893,
+      "line": 3753,
       "categories": [
         "mapping"
       ],
@@ -4714,7 +6650,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 5895,
+      "line": 3755,
       "categories": [
         "mapping"
       ],
@@ -4723,25 +6659,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6295,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"MAP_LOCKED must populate the mapping\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6332,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// never drive the residency-vec allocation past the actual mapping (the",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6463,
+      "line": 4028,
       "categories": [
         "mapping"
       ],
@@ -4750,7 +6668,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6596,
+      "line": 4161,
       "categories": [
         "mapping"
       ],
@@ -4759,7 +6677,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6676,
+      "line": 4241,
       "categories": [
         "mapping"
       ],
@@ -4768,7 +6686,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6682,
+      "line": 4247,
       "categories": [
         "mapping"
       ],
@@ -4777,7 +6695,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6689,
+      "line": 4254,
       "categories": [
         "mapping"
       ],
@@ -4786,7 +6704,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6727,
+      "line": 4292,
       "categories": [
         "mapping"
       ],
@@ -4795,7 +6713,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6733,
+      "line": 4298,
       "categories": [
         "mapping"
       ],
@@ -4804,7 +6722,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6738,
+      "line": 4303,
       "categories": [
         "mapping"
       ],
@@ -4813,7 +6731,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6751,
+      "line": 4316,
       "categories": [
         "mapping"
       ],
@@ -4822,88 +6740,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 6981,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7080,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7152,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7206,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7260,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7318,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7347,
-      "categories": [
-        "mapping"
-      ],
-      "text": "entered_tx.send(()).expect(\"report mapping admission\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7357,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"sibling mapping dispatch raced an installing host alias\"",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7363,
-      "categories": [
-        "mapping"
-      ],
-      "text": "thread.join().expect(\"join sibling mapping dispatch\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7475,
+      "line": 4348,
       "categories": [
         "mapping"
       ],
@@ -4912,7 +6749,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7495,
+      "line": 4368,
       "categories": [
         "mapping"
       ],
@@ -4921,7 +6758,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7529,
+      "line": 4402,
       "categories": [
         "mapping"
       ],
@@ -4930,7 +6767,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7573,
+      "line": 4446,
       "categories": [
         "mapping"
       ],
@@ -4939,7 +6776,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7589,
+      "line": 4462,
       "categories": [
         "mapping"
       ],
@@ -4948,7 +6785,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7621,
+      "line": 4494,
       "categories": [
         "mapping"
       ],
@@ -4957,7 +6794,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7640,
+      "line": 4513,
       "categories": [
         "mapping"
       ],
@@ -4966,7 +6803,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7652,
+      "line": 4525,
       "categories": [
         "mapping"
       ],
@@ -4975,7 +6812,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7816,
+      "line": 4689,
       "categories": [
         "mapping"
       ],
@@ -4984,7 +6821,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7820,
+      "line": 4693,
       "categories": [
         "mapping"
       ],
@@ -4993,7 +6830,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7832,
+      "line": 4705,
       "categories": [
         "mapping"
       ],
@@ -5002,7 +6839,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7833,
+      "line": 4706,
       "categories": [
         "mapping"
       ],
@@ -5011,7 +6848,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7840,
+      "line": 4713,
       "categories": [
         "mapping"
       ],
@@ -5020,7 +6857,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 7845,
+      "line": 4718,
       "categories": [
         "mapping"
       ],
@@ -5029,7 +6866,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 8151,
+      "line": 4963,
       "categories": [
         "mapping"
       ],
@@ -5038,7 +6875,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 8186,
+      "line": 4998,
       "categories": [
         "mapping"
       ],
@@ -5047,7 +6884,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 8192,
+      "line": 5004,
       "categories": [
         "mapping"
       ],
@@ -5056,7 +6893,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9538,
+      "line": 5708,
       "categories": [
         "mapping"
       ],
@@ -5065,7 +6902,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9559,
+      "line": 5729,
       "categories": [
         "mapping"
       ],
@@ -5074,7 +6911,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9738,
+      "line": 5908,
       "categories": [
         "mapping"
       ],
@@ -5083,7 +6920,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9750,
+      "line": 5920,
       "categories": [
         "mapping"
       ],
@@ -5092,7 +6929,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9751,
+      "line": 5921,
       "categories": [
         "mapping"
       ],
@@ -5101,7 +6938,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9778,
+      "line": 5948,
       "categories": [
         "mapping"
       ],
@@ -5110,7 +6947,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9814,
+      "line": 5984,
       "categories": [
         "mapping"
       ],
@@ -5119,7 +6956,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9819,
+      "line": 5989,
       "categories": [
         "mapping"
       ],
@@ -5128,7 +6965,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9823,
+      "line": 5993,
       "categories": [
         "mapping"
       ],
@@ -5137,7 +6974,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9826,
+      "line": 5996,
       "categories": [
         "mapping"
       ],
@@ -5146,7 +6983,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9846,
+      "line": 6016,
       "categories": [
         "mapping"
       ],
@@ -5155,7 +6992,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9850,
+      "line": 6020,
       "categories": [
         "mapping"
       ],
@@ -5164,7 +7001,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9861,
+      "line": 6031,
       "categories": [
         "mapping"
       ],
@@ -5173,12 +7010,102 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
-      "line": 9902,
+      "line": 6072,
       "categories": [
         "mapping"
       ],
       "text": "// 2. Non-fixed mmap with hint inside the 16 TiB reservation.",
       "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+      "line": 6161,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// a `MAP_PRIVATE` file mapping keeps BOTH a COW'd (written) page and a",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+      "line": 6184,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let p = libc::mmap(",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
+      "line": 776,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Whether a mapping counts toward `RLIMIT_DATA` (proc(5) `VmData`): private,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
+      "line": 785,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// writable mapping in the visible boot image (`.data`/`.bss`) and the dynamic",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
+      "line": 813,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// Exact Linux-visible mapping metadata used by the live core publisher.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
+      "line": 816,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// mappings supply the committed pieces of the hidden mmap arena.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
+      "line": 943,
+      "categories": [
+        "mapping"
+      ],
+      "text": "for mapping in file_mappings {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
+      "line": 944,
+      "categories": [
+        "mapping"
+      ],
+      "text": "if mapping.start < end && mapping.end > start {",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
+      "line": 945,
+      "categories": [
+        "mapping"
+      ],
+      "text": "boundaries.push(mapping.start.max(start));",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
+      "line": 946,
+      "categories": [
+        "mapping"
+      ],
+      "text": "boundaries.push(mapping.end.min(end));",
+      "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
@@ -5227,7 +7154,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 83,
+      "line": 93,
       "categories": [
         "mapping"
       ],
@@ -5236,97 +7163,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 102,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Why a guest `mmap` was refused \u2014 and whether the guest can work that out",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 106,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// glibc's `dlopen` renders any failed segment mapping as the single line",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 110,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// had been running on this lane. Every refusal in [`mmap`](SyscallDispatcher)",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 113,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// [`SyscallDispatcher::mmap`]: SyscallDispatcher",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 148,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// The guest's `mmap` arguments exactly as they arrived, captured before any",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 165,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Every `mmap` error return goes through here; there is deliberately no",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 196,
-      "categories": [
-        "mapping"
-      ],
-      "text": "target: \"carrick::mmap\",",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 207,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"mmap refused: invalid request\",",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 212,
-      "categories": [
-        "mapping"
-      ],
-      "text": "target: \"carrick::mmap\",",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 223,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"mmap refused: carrick internal limit\",",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1048,
+      "line": 297,
       "categories": [
         "mapping"
       ],
@@ -5335,7 +7172,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1059,
+      "line": 308,
       "categories": [
         "mapping"
       ],
@@ -5344,7 +7181,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1062,
+      "line": 311,
       "categories": [
         "mapping"
       ],
@@ -5353,7 +7190,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1071,
+      "line": 320,
       "categories": [
         "mapping"
       ],
@@ -5362,7 +7199,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1077,
+      "line": 326,
       "categories": [
         "mapping"
       ],
@@ -5371,7 +7208,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1084,
+      "line": 333,
       "categories": [
         "mapping"
       ],
@@ -5380,7 +7217,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1099,
+      "line": 348,
       "categories": [
         "mapping"
       ],
@@ -5389,7 +7226,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1147,
+      "line": 396,
       "categories": [
         "mapping"
       ],
@@ -5398,7 +7235,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1148,
+      "line": 397,
       "categories": [
         "mapping"
       ],
@@ -5407,7 +7244,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1156,
+      "line": 405,
       "categories": [
         "mapping"
       ],
@@ -5416,7 +7253,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1167,
+      "line": 416,
       "categories": [
         "mapping"
       ],
@@ -5425,7 +7262,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1169,
+      "line": 418,
       "categories": [
         "mapping"
       ],
@@ -5434,7 +7271,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1171,
+      "line": 420,
       "categories": [
         "mapping"
       ],
@@ -5443,7 +7280,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1173,
+      "line": 422,
       "categories": [
         "mapping"
       ],
@@ -5452,7 +7289,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1187,
+      "line": 436,
       "categories": [
         "mapping"
       ],
@@ -5461,7 +7298,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1269,
+      "line": 512,
       "categories": [
         "mapping"
       ],
@@ -5470,7 +7307,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1299,
+      "line": 542,
       "categories": [
         "mapping"
       ],
@@ -5479,7 +7316,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1302,
+      "line": 545,
       "categories": [
         "mapping"
       ],
@@ -5488,7 +7325,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1347,
+      "line": 594,
       "categories": [
         "mapping"
       ],
@@ -5497,7 +7334,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1351,
+      "line": 598,
       "categories": [
         "mapping"
       ],
@@ -5506,7 +7343,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1368,
+      "line": 615,
       "categories": [
         "mapping"
       ],
@@ -5515,7 +7352,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1418,
+      "line": 665,
       "categories": [
         "mapping"
       ],
@@ -5524,7 +7361,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1528,
+      "line": 745,
       "categories": [
         "stream"
       ],
@@ -5533,7 +7370,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1532,
+      "line": 749,
       "categories": [
         "mapping"
       ],
@@ -5542,7 +7379,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1560,
+      "line": 777,
       "categories": [
         "stream"
       ],
@@ -5551,7 +7388,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 1852,
+      "line": 915,
       "categories": [
         "mapping"
       ],
@@ -5560,286 +7397,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2093,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Whether a mapping counts toward `RLIMIT_DATA` (proc(5) `VmData`): private,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2102,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// writable mapping in the visible boot image (`.data`/`.bss`) and the dynamic",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2130,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Exact Linux-visible mapping metadata used by the live core publisher.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2133,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// mappings supply the committed pieces of the hidden mmap arena.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2260,
-      "categories": [
-        "mapping"
-      ],
-      "text": "for mapping in file_mappings {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2261,
-      "categories": [
-        "mapping"
-      ],
-      "text": "if mapping.start < end && mapping.end > start {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2262,
-      "categories": [
-        "mapping"
-      ],
-      "text": "boundaries.push(mapping.start.max(start));",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2263,
-      "categories": [
-        "mapping"
-      ],
-      "text": "boundaries.push(mapping.end.min(end));",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2507,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// makes an mmap/protection failure a no-op for the prior VMA and every",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2523,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// The mapping is backed by a `memfd_secret(2)` fd: its pages are",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2555,
-      "categories": [
-        "mapping"
-      ],
-      "text": "for mapping in image.file_mappings().iter().filter(|m| !m.path.is_empty()) {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2557,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let start = mapping.start.max(region.start);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2558,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let end = mapping.end.min(region.end);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2922,
-      "categories": [
-        "mapping"
-      ],
-      "text": "for mapping in mappings.drain(..) {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2923,
-      "categories": [
-        "mapping"
-      ],
-      "text": "if end <= mapping.start || start >= mapping.end {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2924,
-      "categories": [
-        "mapping"
-      ],
-      "text": "next.push(mapping);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2927,
-      "categories": [
-        "mapping"
-      ],
-      "text": "if mapping.start < start {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2928,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mut left = mapping.clone();",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2932,
-      "categories": [
-        "mapping"
-      ],
-      "text": "if end < mapping.end {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2933,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mut right = mapping;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2941,
-      "categories": [
-        "mapping"
-      ],
-      "text": "next.sort_by_key(|mapping| (mapping.start, mapping.end));",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2953,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Darwin caps a `MAP_SHARED` file mapping's `max_protection` at the backing",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2956,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// `protection` the mapping was created with. `hv_vm_map` then refuses the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2960,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// discriminator: a `PROT_READ` mapping of an `O_RDWR` fd maps fine.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2964,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// guest-read-only description normally fails this check; the mmap alias path",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2971,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// overlay's copy-up. Such a mapping falls back to the snapshot path instead",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 2972,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// \u2014 observationally equivalent for a read-only mapping of a layer that",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3235,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".sort_by_key(|mapping| (mapping.start, mapping.end));",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3277,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// bytes. The destination starts zeroed, so EOF supplies the Linux mapping's",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3439,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// throughout this synchronous mapping operation.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3500,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Derive `madvise` range validity + properties from carrick's mapping",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3620,
+      "line": 1071,
       "categories": [
         "mapping"
       ],
@@ -5848,7 +7406,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3622,
+      "line": 1073,
       "categories": [
         "mapping"
       ],
@@ -5857,7 +7415,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3629,
+      "line": 1080,
       "categories": [
         "mapping"
       ],
@@ -5866,7 +7424,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3663,
+      "line": 1114,
       "categories": [
         "mapping"
       ],
@@ -5875,7 +7433,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3700,
+      "line": 1151,
       "categories": [
         "mapping"
       ],
@@ -5884,52 +7442,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3787,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// True iff `[start, start+len)` touches a live secretmem mapping \u2014 used",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3823,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// Remove every dispatcher-owned mmap classification for a committed range.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3827,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// `pub(super)` is intentional: SysV `shmdt` owns an mmap-classified host",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3836,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// True iff a live MAP_SHARED, PROT_WRITE mapping backed by `description`",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 3903,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".sort_by_key(|mapping| (mapping.start, mapping.end));",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4030,
+      "line": 1180,
       "categories": [
         "mapping"
       ],
@@ -5938,7 +7451,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4052,
+      "line": 1202,
       "categories": [
         "mapping"
       ],
@@ -5947,7 +7460,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4081,
+      "line": 1231,
       "categories": [
         "mapping"
       ],
@@ -5956,7 +7469,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4082,
+      "line": 1232,
       "categories": [
         "mapping"
       ],
@@ -5965,7 +7478,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4087,
+      "line": 1237,
       "categories": [
         "mapping"
       ],
@@ -5974,7 +7487,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4088,
+      "line": 1238,
       "categories": [
         "mapping"
       ],
@@ -5983,7 +7496,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4089,
+      "line": 1239,
       "categories": [
         "mapping"
       ],
@@ -5992,7 +7505,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4090,
+      "line": 1240,
       "categories": [
         "mapping"
       ],
@@ -6001,7 +7514,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4094,
+      "line": 1244,
       "categories": [
         "mapping"
       ],
@@ -6010,7 +7523,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4099,
+      "line": 1249,
       "categories": [
         "mapping"
       ],
@@ -6019,7 +7532,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4123,
+      "line": 1273,
       "categories": [
         "mapping"
       ],
@@ -6028,7 +7541,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4126,
+      "line": 1276,
       "categories": [
         "mapping"
       ],
@@ -6037,7 +7550,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4134,
+      "line": 1284,
       "categories": [
         "mapping"
       ],
@@ -6046,7 +7559,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4135,
+      "line": 1285,
       "categories": [
         "mapping"
       ],
@@ -6055,7 +7568,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4136,
+      "line": 1286,
       "categories": [
         "mapping"
       ],
@@ -6064,7 +7577,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4137,
+      "line": 1287,
       "categories": [
         "mapping"
       ],
@@ -6073,7 +7586,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4304,
+      "line": 1333,
       "categories": [
         "mapping"
       ],
@@ -6082,7 +7595,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4325,
+      "line": 1354,
       "categories": [
         "mapping"
       ],
@@ -6091,7 +7604,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4405,
+      "line": 1434,
       "categories": [
         "mapping"
       ],
@@ -6100,7 +7613,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4409,
+      "line": 1438,
       "categories": [
         "mapping"
       ],
@@ -6109,7 +7622,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4425,
+      "line": 1454,
       "categories": [
         "mapping"
       ],
@@ -6118,1520 +7631,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4662,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// checked FIRST (EBADF), THEN the mapping type (EINVAL).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4673,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(desc) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4679,
-      "categories": [
-        "epoll"
-      ],
-      "text": "// (eventfd/timerfd/epoll/\u2026) all lack one and are EINVAL.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4700,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let is_fifo = match open_file.description.read().as_deref() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4724,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mm_mutation fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4764,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Linux validates the fd FIRST for a file mapping: ksys_mmap_pgoff",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4771,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"file mapping on a descriptor that is not open\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4776,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// merely that a mapping was file-backed. Preserve the guest path",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4777,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// before the mapping branches borrow or duplicate the descriptor.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4785,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4813,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// treats MAP_DROPPABLE as a private anon mapping, so default the type",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4851,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// `mmap` and `mprotect` differ here, and `memflagmatrix` asserts",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4853,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// while `mmap` IGNORES them and maps the range with whatever known",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4855,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// `prot = 1 << 28`). carrick rejected them in both, so a mapping",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4925,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// io_uring mappings are ordinary MAP_SHARED host aliases. The file",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4930,
-      "categories": [
-        "description_backing",
-        "mapping"
-      ],
-      "text": ".concrete_backing::<crate::dispatch::ioring::IoUringBacking>()",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4939,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"offset does not name an io_uring region\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4949,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"io_uring mapping must be MAP_SHARED and cover exactly its region\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4955,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"MAP_FIXED_NOREPLACE over a live io_uring mapping\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4961,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"io_uring backing descriptor could not be duplicated\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4968,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"alias IPA arena exhausted (io_uring mapping)\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4980,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"io_uring mapping end overflows the address space\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 4991,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = crate::dispatch::ioring::IoUringMapping {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5006,
-      "categories": [
-        "mapping"
-      ],
-      "text": "path: \"anon_inode:[io_uring]\".to_owned(),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5020,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5042,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// An O_PATH descriptor is not open for I/O \u2014 mmap on it returns",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5049,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"mmap of an O_PATH descriptor\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5060,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"mmap of a write-only descriptor\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5065,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mprotect(2) EACCES ceiling: a MAP_SHARED mapping of a file opened",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5070,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// into this answer \u2014 and recorded on the mapping because the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5092,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// shared, writable mapping \u2014 Linux returns EPERM (memfd_create01",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5093,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// check_mmap_fail). A private (MAP_PRIVATE) writable mapping is fine:",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5110,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"shared writable mapping of a write-sealed memfd\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5116,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// MAP_PRIVATE mmap with EINVAL (memfdsecret probe",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5126,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"MAP_PRIVATE mapping of a memfd_secret fd\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5147,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"mmap\",",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5159,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"MAP_FIXED_NOREPLACE over a live mapping\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5182,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// backends atomically replace the host mapping with MAP_PRIVATE anon.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5271,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// could hand active guest leaves to another mapping.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5327,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Repoint succeeded, so the prior mapping cannot be restored.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5392,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// file's page cache LIVE, via an aliased stage-2 mapping at a fresh",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5393,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// high VA. `mmap(MAP_SHARED, fd)` on the host means guest writes hit",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5395,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// a sibling mapping of the same file) and inherited across fork,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5409,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// snapshot path below computes it: a mapping of a memfd sealed",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5411,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// a later mprotect(PROT_WRITE); a writable mapping of an",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5426,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.write();",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5429,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// have a host inode the guest mapping can view live.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5441,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// error deep inside the VMM backend: the mapping",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5475,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mapping, so this is the only way a later",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5523,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// The stage-1 mapping still covers EXACTLY the guest's",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5530,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"alias IPA arena exhausted (shared file mapping)\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5551,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Host mmap prot MUST match the guest's request (and thus the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5561,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mmap and wedged the guest. Linux maps such files fine (the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5563,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// `mmap(fd, n, prot=PROT_READ|PROT_EXEC)`), and so must we.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5575,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Host-side EFAULT gate for a PROT_NONE file mapping. The",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5577,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// the live host file mapping succeeds; publishing here would",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5581,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5702,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// to a PROT_READ anon-shared mapping silently succeeds",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5706,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// the eager arena (mirrors the file-mmap arm); the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5723,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// inaccessible mapping to observe the first touch.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5763,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"protection publication failed (shared anonymous mapping)\",",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5843,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"length exceeds the entire mmap address-space arena\")",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5845,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"no free address-space region: mmap arena exhausted\")",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5861,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Move-3 E1: an eligible MAP_PRIVATE file mmap lowers to ONE host",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5862,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// file-backed `MAP_PRIVATE|MAP_FIXED` mapping (demand-paged from",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5866,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// faults inside guest mmap service windows",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5870,
-      "categories": [
-        "mapping"
-      ],
-      "text": "//   * Private only (a Shared mapping's stores must reach the file);",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5888,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// materialized for a mapping about to demand-page), and the actual",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5891,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// failed mmap still leaves a MAP_FIXED target's prior mapping",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5904,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// is stage-1-invalidated (no-access) and a PROT_NONE mmap is not",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5906,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// and leaves the prior mapping's bytes \u2014 which then surface after",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5917,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"anonymous-reuse scrub failed (mmap arena)\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5926,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// valid+RW again, and a PROT_NONE mmap must actually fault. No-op",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5939,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// (bhyve) records a reservation across the WHOLE mmap arena,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5950,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"PROT_NONE reservation failed in the mmap arena\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 5960,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"mmap locked range population failed\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6038,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"protection publication failed (anonymous mapping)\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6048,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"mmap locked range population failed\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6068,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// carrick publishes a mapping valid up front, so the guest's",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6137,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A MAP_SHARED mapping of a memfd sealed F_SEAL_WRITE is created",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6141,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A live MAP_SHARED, PROT_WRITE mapping of an (unsealed) memfd \u2014 its",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6163,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let path = match open_file.description.read().as_deref() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6170,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "if let Some(mut open) = open_file.description.write() {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6185,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let Some(open) = open_file.description.read() else {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6200,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"file length lookup failed during mmap populate\",",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6238,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"file read failed during mmap populate\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6306,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"mmap of a pipe or FIFO\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6315,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"mmap of a non-zero synthetic device\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6324,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"mmap of packet ring with non-zero offset\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6332,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"mmap of packet socket without ring\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6339,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"mmap size does not match packet ring size\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6349,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Spec(\"mmap of a descriptor with no mappable backing\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6359,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// it here would leave a ghost live mapping when an identity-host",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6362,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Guest-chosen mmap addresses outside Carrick's low identity arenas",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6367,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// being relocated into the low mmap arena.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6375,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"mmap\",",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6415,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// host mapping and every subrange protection successful.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6423,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6474,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mapping now that every fallible pre-step has passed. On backend",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6475,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// refusal (alignment, ownership, may-execute, linux4k, host mmap",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6481,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// a fresh failure would break mmap's failure atomicity exactly",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6498,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "let open = open_file.description.read();",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6584,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"anonymous-reuse scrub failed (mmap arena)\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6603,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// loading the mapping, not a guest write. The dynamic loader often",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6627,
-      "categories": [
-        "mapping"
-      ],
-      "text": "MmapRefusal::Internal(\"file content could not be copied into the mapping\"),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6694,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A file-backed mapping's content is loaded eagerly (above), and",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6860,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A canonical alias-window guest VA is a dynamic alias mapping:",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6863,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// is owed), a MAP_FIXED mapping at a guest-chosen high VA (Apple",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6881,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// alias stage-1 sub-table (each MAP_SHARED file mapping took",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 6946,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// before anything else). CPython's mmap.flush(offset, size) calls",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7169,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// `man 2 mremap`: a zero `old_size` asks for a NEW mapping of the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7170,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// same pages, which is only meaningful for a shareable mapping and",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7244,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Relocation below moves a mapping by COPYING it. That is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7245,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// correct for a PRIVATE mapping and wrong for a shared one:",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7248,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// reason the grow path refuses to move a shared mapping. Keep",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7256,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// for a mapping whose pages come from a file.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7306,
-      "categories": [
-        "mapping"
-      ],
-      "text": "match host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7598,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A shared mapping cannot be grown by copying it somewhere bigger:",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7627,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// File length and mapping offset behind a live MAP_SHARED alias, if",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7652,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// range \u2014 which is strictly better than re-establishing the mapping,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7664,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Where SIGBUS starts inside the GROWN mapping. The growth is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7672,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Offset within the mapping at which SIGBUS starts, when the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7673,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mapping ALREADY ends past its file's EOF. Read off the bus records",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7674,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// the original `mmap` published rather than re-derived from a",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7681,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// timed out with no output past the mmap).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7716,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// see. Same hatch as the mmap BUS line above.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7743,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// The mapping is not in the mmap arena: it's a MAP_SHARED file",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7745,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// region. CPython's mmap.resize() shrinks both of these",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7746,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// (test_mmap test_basic on a file mapping, test_resize_past_pos",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7774,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// to 0x7d0001, and then grows the mapping to 0x7d0000 \u2014 all",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7807,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// Same translation as the mmap path: PROT_EXEC is dropped",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7823,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mmap then fails the transaction aborts and the guest has",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7824,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// lost the source mapping, where Linux would have kept it \u2014",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7827,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// file map moves with the mapping; read it before the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7869,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// and a chance to lose coherence \u2014 and give the mapping the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7905,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// child, a second mmap of the same object) still sees this",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7906,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mapping's stores.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7960,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// needs this mapping's protection published over it",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 7962,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// otherwise a store to a read-only mapping's new pages",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8070,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// free_regions (a future mmap reuse zero-fills it).",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8111,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A MAP_SHARED file mapping that already ends past its file's EOF,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8117,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// \"Past EOF\" is read off the bus records the original mmap",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8120,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// by now. If the mapping's LAST byte already faults SIGBUS then the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8201,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// `mmap` publishes it: no access, then the bus record that",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8243,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// bump pointer and so has no stage-1 mapping, which is exactly",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8245,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mapping over it instead HUNG the guest (the backend tries to",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8323,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// allocator seam `mmap(MAP_FIXED)` uses, so the free list and",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8325,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// telling both is what once let a live mapping be scrubbed.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8571,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// alias window is deliberately given no backing at `mmap` time",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8583,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// sees no backing, reads that as \"no mapping\", and answers",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8607,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".publish(HostAliasCommit::mmap(HostAliasMmapCommit {",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8658,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A shared mapping of a F_SEAL_WRITE memfd cannot be upgraded to",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8663,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A MAP_SHARED mapping of a read-only file cannot be upgraded to",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8714,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// page tables. In the private mmap arena a failed edit is",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8724,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// protection must be edited just like the mmap arena below.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8732,
-      "categories": [
-        "mapping"
-      ],
-      "text": "\"mprotect failed to publish mmap-arena protection\"",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8736,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// THE SECOND MARK POINT. `mmap` is the first: together they are",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8784,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// concurrent host-mapping path. Either backend must fail the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8904,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// A read-only mapping must NOT be written (would SIGBUS the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8905,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// runtime); a MAP_SHARED mapping must NOT be written either \u2014",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8906,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// for a shared FILE mapping zero_backing writes straight",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8908,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// MADV_DONTNEED on a shared mapping does not zero (the next",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8936,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// anonymous mapping starts: not resident, and resident",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8949,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// This mapping stays readable; its next",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 8972,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mapping (file- or anon-backed) \u2192 EINVAL.",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9044,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// MAP_SHARED mapping; carrick does not emulate nonlinear remapping, so",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9082,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// io_uring (WS-H4-B1). setup allocates the rings in the guest arena and",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9084,
-      "categories": [
-        "mapping"
-      ],
-      "text": "// mmap path); enter drains the SQ ring. register is ENOSYS for now (the",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9171,
+      "line": 1565,
       "categories": [
         "mapping"
       ],
@@ -7640,7 +7640,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9179,
+      "line": 1573,
       "categories": [
         "mapping"
       ],
@@ -7649,7 +7649,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9180,
+      "line": 1574,
       "categories": [
         "mapping"
       ],
@@ -7658,7 +7658,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9220,
+      "line": 1614,
       "categories": [
         "mapping"
       ],
@@ -7667,7 +7667,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9538,
+      "line": 1799,
       "categories": [
         "mapping"
       ],
@@ -7676,7 +7676,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9562,
+      "line": 1823,
       "categories": [
         "mapping"
       ],
@@ -7685,7 +7685,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 9697,
+      "line": 1909,
       "categories": [
         "mapping"
       ],
@@ -7694,7 +7694,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 10113,
+      "line": 2301,
       "categories": [
         "mapping"
       ],
@@ -7703,7 +7703,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "line": 10116,
+      "line": 2304,
       "categories": [
         "mapping"
       ],
@@ -7748,7 +7748,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 705,
+      "line": 684,
       "categories": [
         "mapping"
       ],
@@ -7757,7 +7757,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 886,
+      "line": 865,
       "categories": [
         "epoll"
       ],
@@ -7766,7 +7766,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 888,
+      "line": 867,
       "categories": [
         "epoll"
       ],
@@ -7775,7 +7775,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 893,
+      "line": 872,
       "categories": [
         "stream"
       ],
@@ -7784,7 +7784,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 904,
+      "line": 883,
       "categories": [
         "epoll"
       ],
@@ -7793,7 +7793,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 907,
+      "line": 886,
       "categories": [
         "epoll"
       ],
@@ -7802,7 +7802,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 910,
+      "line": 889,
       "categories": [
         "epoll"
       ],
@@ -7811,7 +7811,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 918,
+      "line": 897,
       "categories": [
         "epoll"
       ],
@@ -7820,7 +7820,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 951,
+      "line": 930,
       "categories": [
         "epoll"
       ],
@@ -7829,7 +7829,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 958,
+      "line": 937,
       "categories": [
         "epoll"
       ],
@@ -7838,7 +7838,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 969,
+      "line": 948,
       "categories": [
         "epoll"
       ],
@@ -7847,7 +7847,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 970,
+      "line": 949,
       "categories": [
         "epoll"
       ],
@@ -7856,7 +7856,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1011,
+      "line": 990,
       "categories": [
         "epoll"
       ],
@@ -7865,7 +7865,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1013,
+      "line": 992,
       "categories": [
         "epoll"
       ],
@@ -7874,7 +7874,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1016,
+      "line": 995,
       "categories": [
         "epoll"
       ],
@@ -7883,7 +7883,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1021,
+      "line": 1000,
       "categories": [
         "epoll"
       ],
@@ -7892,7 +7892,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1493,
+      "line": 1472,
       "categories": [
         "table_guard"
       ],
@@ -7901,7 +7901,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1603,
+      "line": 1582,
       "categories": [
         "mapping"
       ],
@@ -7910,7 +7910,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1608,
+      "line": 1587,
       "categories": [
         "mapping"
       ],
@@ -7919,7 +7919,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 1973,
+      "line": 1952,
       "categories": [
         "description_guard"
       ],
@@ -7928,7 +7928,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2001,
+      "line": 1980,
       "categories": [
         "description_guard"
       ],
@@ -7937,7 +7937,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2074,
+      "line": 2053,
       "categories": [
         "description_guard"
       ],
@@ -7946,7 +7946,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/mod.rs",
-      "line": 2103,
+      "line": 2082,
       "categories": [
         "epoll"
       ],
