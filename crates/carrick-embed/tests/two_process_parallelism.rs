@@ -61,13 +61,15 @@ impl std::fmt::Display for GuestResult {
     }
 }
 
-fn forkstorm_binary() -> PathBuf {
+fn perf_forkstorm_binary() -> PathBuf {
     let root = common::repo_root();
-    let musl = root.join("conformance-probes/target/aarch64-unknown-linux-musl/release/forkstorm");
+    let musl =
+        root.join("conformance-probes/target/aarch64-unknown-linux-musl/release/perf_forkstorm");
     if musl.is_file() {
         return musl;
     }
-    let gnu = root.join("conformance-probes/target/aarch64-unknown-linux-gnu/release/forkstorm");
+    let gnu =
+        root.join("conformance-probes/target/aarch64-unknown-linux-gnu/release/perf_forkstorm");
     if gnu.is_file() {
         return gnu;
     }
@@ -109,7 +111,7 @@ fn assert_run_ok(outcome: &Result<ContainerResult, EmbedError>) {
 }
 
 fn configure_container(builder: ContainerBuilder, cmd: &[&str]) -> ContainerBuilder {
-    let binary = forkstorm_binary();
+    let binary = perf_forkstorm_binary();
     let p_dir = binary.parent().map(Path::to_path_buf).unwrap_or_else(|| {
         common::repo_root().join("conformance-probes/target/aarch64-unknown-linux-musl/release")
     });
@@ -259,7 +261,7 @@ fn fault_p99(out: impl AsRef<str>) -> u64 {
 fn children_run_concurrently() {
     // 4 children x 400 ms of spinning; with 4 exposed CPUs the wall time is
     // ~400 ms when they run in parallel and ~1600 ms when serialized.
-    let out = run_guest(&["/p/forkstorm", "busy", "4", "400"]);
+    let out = run_guest(&["/p/perf_forkstorm", "busy", "4", "400"]);
     let wall_ms: u64 = field(&out, "wall_ms");
     assert!(
         wall_ms < 800,
@@ -271,10 +273,10 @@ fn children_run_concurrently() {
 fn fault_latency_is_independent_of_sibling_fork() {
     // Process A: fork storm (200 forks). Process B: fault loop. B's p99
     // round latency with A running must stay within 3x of B alone.
-    let alone = fault_p99(run_guest(&["/p/forkstorm", "faulter", "50"]));
+    let alone = fault_p99(run_guest(&["/p/perf_forkstorm", "faulter", "50"]));
     let (a, b) = run_two_guests(
-        &["/p/forkstorm", "busy", "200", "5"],
-        &["/p/forkstorm", "faulter", "50"],
+        &["/p/perf_forkstorm", "busy", "200", "5"],
+        &["/p/perf_forkstorm", "faulter", "50"],
     );
     assert!(a.exit_ok());
     let contended = fault_p99(b);
