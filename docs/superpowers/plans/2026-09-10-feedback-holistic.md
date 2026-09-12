@@ -710,3 +710,14 @@ commits and is re-checked at the next vet.
   rebuild BOTH `aarch64-unknown-linux-{musl,gnu}` (the musl one in
   `rust:alpine`) or the gate keeps running the old binary. musl probe
   rebuilt; `conformance_container_gate` alone on the same binary: PASS.
+- 2026-09-12 15:45, paired re-measure (`measure-sep12b.sh`, cand
+  b25f3b2d7f52c045 vs base 3c8dbee5b686c49d) cand-w4-r2: go-net_http
+  TIMEOUT at the 540 s budget after ONE `executor failed a claimed task
+  … reason=AddressSpaceRetired` (`target/perf/perf2x-sep12/measwedge/
+  conf-22902-c00.err`) — the exec-from-thread teardown class (Go
+  `os/exec` execs from a non-leader thread) surfacing on a real ecosystem
+  row, not only the probe: the loser thread's stale Runnable state leaves
+  a child unreaped and the test waits forever. Row counted as one
+  TIMEOUT in the scorecard; the `exec-sibling-settle` round-2 fix is the
+  candidate cure and is queued for its live receipt right after the
+  measurement window.
