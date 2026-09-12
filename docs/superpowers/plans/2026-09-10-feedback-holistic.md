@@ -478,3 +478,15 @@ commits and is re-checked at the next vet.
   transaction guard plus the registry leaf; the carrier mutex loses its
   production callers) dispatched now that Task 3, the executor split and
   tma are all on main.
+- Landed and pushed (early 2026-09-12): split-continuation quantum
+  submodule (12,097 → 10,549; the global-state ledger keys statics by
+  file, so `NEXT_RUNNER_JOB_ID` was re-homed by hand) and
+  syscall-names-mem (decc8aca0: every routing arm now names its
+  `nr::` constant; the literal-arm macro variant and its
+  `#[allow(unreachable_code)]` are gone; a routing characterization
+  fixture pins the handler set). Running: `mm-transactions` (per-mm Task
+  4) and `split-continuation-r3` (three named moves: tests, wait service,
+  readiness). Still queued behind them: Task 6, the 32 remaining
+  `too_many_arguments` allows, and the quiet-host measurements (Task 0
+  traces, the two-process red numbers, paired A/B of the three landed perf
+  clusters against 3c8dbee5b686c49d).
