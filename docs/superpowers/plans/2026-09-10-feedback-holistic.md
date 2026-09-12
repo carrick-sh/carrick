@@ -599,3 +599,9 @@ commits and is re-checked at the next vet.
   11:33"): 40/40 MATCH; every targeted row faster paired — compile 0.58,
   tarfile 0.68, importlib 0.82, multiprocessing 0.90, net_http 0.90;
   importlib ≤2x at one worker. Task 6 and the allows round dispatching.
+- 2026-09-12 12:35: per-mm Task 6 landed and pushed (4242d0229) — fork
+  quiesce is per parent mm, fork kicks only sibling threads; receipts in
+  the per-mm plan's Measurement section (mp 6.94 s, net_http 8/8 PASS,
+  fault-latency embed test 154 s→37 s). Probe gate running on the pinned
+  main e32d0b3e1851faef; Task 5 (per-mm alias containers, delete the
+  carrier topology mutex) dispatched; `tma-r2-sep12` still running.
