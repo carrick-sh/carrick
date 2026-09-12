@@ -1634,6 +1634,14 @@
       "rationale": "Test-only child sentinel owned by the pending-exec regression's self-spawn; it selects the isolated child half because the tested abort is process-global, prevents recursive spawning, and is absent from production builds."
     },
     {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/binding.rs",
+      "symbol": "VFORK_ACTIVATION_HOOK",
+      "fingerprint": "fbba5cbdfd1fe6923542b013fe8828c2b3a6774ecdf07765037c1b61e2c8a642",
+      "classification": "test_only",
+      "rationale": "Test-only fixture or lock VFORK_ACTIVATION_HOOK in crates/carrick-runtime/src/vcpu_loop/executor.rs scoped strictly to test harness execution."
+    },
+    {
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
       "symbol": "configured_bound_executors::CARRICK_BOUND_EXECUTORS",
@@ -1648,14 +1656,6 @@
       "fingerprint": "42e302bc90efd233ad13b83fa844d65b448c00696e81df3c19e4adbbb6db277d",
       "classification": "config_debug",
       "rationale": "Bisection hatch for the spare-executor budget (2 x nproc by default, `=0` to disable). Read once when the carrier starts its executor pool; it sizes host threads only and cannot select or overwrite container-owned state. The backend's vCPU ceiling remains the real bound."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor/binding.rs",
-      "symbol": "VFORK_ACTIVATION_HOOK",
-      "fingerprint": "fbba5cbdfd1fe6923542b013fe8828c2b3a6774ecdf07765037c1b61e2c8a642",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or lock VFORK_ACTIVATION_HOOK in crates/carrick-runtime/src/vcpu_loop/executor.rs scoped strictly to test harness execution."
     },
     {
       "kind": "static",
