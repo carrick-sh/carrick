@@ -17400,7 +17400,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5413,
+      "line": 5423,
       "categories": [
         "mapping"
       ],
@@ -17409,7 +17409,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5421,
+      "line": 5431,
       "categories": [
         "mapping"
       ],
@@ -17418,7 +17418,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5437,
+      "line": 5447,
       "categories": [
         "mapping"
       ],
@@ -17643,7 +17643,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/exec.rs",
-      "line": 1969,
+      "line": 2022,
       "categories": [
         "mapping"
       ],
@@ -18075,7 +18075,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 1332,
+      "line": 1329,
       "categories": [
         "epoll"
       ],
@@ -18084,7 +18084,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 1664,
+      "line": 1661,
       "categories": [
         "mapping"
       ],
@@ -18093,7 +18093,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 2983,
+      "line": 2929,
       "categories": [
         "mapping"
       ],
