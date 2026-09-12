@@ -481,6 +481,7 @@ violation (e.g. lost wake, dead child, poisoned lock, generation mismatch), it i
 - **Never ignore or silently swallow carrier invariant violations**: aborting creates a core dump for post-mortem analysis.
 - **Never use raw `std::process::abort()`**: raw abort carries no diagnosis into the core, and buffered stdout/stderr may not flush.
 - Always route fatal aborts through `carrick_fatal!(domain, ...)`. The macro formats into a non-allocating stack buffer, writes `carrick fatal [<domain>]: <msg>\n` directly to stderr (fd 2) via `libc::write`, fires any pre-abort hook registered via `carrick_fatal::set_hook`, publishes the event into the static `CARRICK_LAST_FATAL` record, and aborts via `std::process::abort()`.
+- To take a core of the exact failing graph, set `CARRICK_FATAL_HOLD_SECS=<n>` on the `carrick run` you are reproducing under: after the fatal line and `CARRICK_LAST_FATAL` are written the carrier prints `carrick fatal: holding <n> s for a debugger (pid <host pid>)` and sleeps before the hook and the abort, so `sudo lldb -p <pid> -o "process save-core <file>" -o "thread backtrace all" -o detach` captures it. `carrick debug lldb-run` attaches only at its deadline, which an invariant abort beats. Diagnostic only; unset or `0` leaves the fatal path unchanged.
 
 #### Format of `CARRICK_LAST_FATAL`
 The record is stored in a static global `CARRICK_LAST_FATAL` (crate `carrick-fatal`):

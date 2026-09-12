@@ -172,16 +172,20 @@ pub(crate) fn run_debug(
             lldb_plugin,
             no_core,
             stop_on_signal,
+            fatal_hold_seconds,
             command,
         } => {
             let status = run_lldb_deadline(
                 command,
-                deadline_seconds,
+                LldbRunTriggers {
+                    deadline_seconds,
+                    stop_on_signal,
+                    fatal_hold_seconds: fatal_hold_seconds.unwrap_or(deadline_seconds),
+                },
                 out_dir,
                 run_id,
                 lldb_plugin,
                 no_core,
-                stop_on_signal,
             )?;
             std::process::exit(status);
         }
@@ -243,15 +247,30 @@ fn run_lldb_snapshot(
     Ok(())
 }
 
+/// Timing and trigger settings of one `carrick debug lldb-run`.
+#[derive(Clone, Copy, Debug)]
+struct LldbRunTriggers {
+    /// Seconds before lldb attaches to a still-running guest.
+    deadline_seconds: u64,
+    /// Linux signal whose delivery SIGSTOPs the dying guest process first.
+    stop_on_signal: Option<i32>,
+    /// Seconds a `carrick_fatal!` holds the carrier alive for the dump; 0 disables.
+    fatal_hold_seconds: u64,
+}
+
 fn run_lldb_deadline(
     mut run_args: Vec<String>,
-    deadline_seconds: u64,
+    triggers: LldbRunTriggers,
     out_dir: PathBuf,
     run_id_arg: Option<String>,
     lldb_plugin_arg: Option<PathBuf>,
     no_core: bool,
-    stop_on_signal: Option<i32>,
 ) -> anyhow::Result<i32> {
+    let LldbRunTriggers {
+        deadline_seconds,
+        stop_on_signal,
+        fatal_hold_seconds,
+    } = triggers;
     if run_args.is_empty() {
         bail!("debug lldb-run needs `-- <carrick run args>`");
     }
@@ -282,15 +301,7 @@ fn run_lldb_deadline(
     let exe = std::env::current_exe().context("failed to resolve current carrick binary path")?;
     let lldb_plugin = lldb_plugin_arg.unwrap_or_else(default_lldb_plugin_path);
 
-    write_manifest(
-        &manifest,
-        &run_id,
-        deadline_seconds,
-        stop_on_signal,
-        &exe,
-        &lldb_plugin,
-        &run_args,
-    )?;
+    write_manifest(&manifest, &run_id, triggers, &exe, &lldb_plugin, &run_args)?;
 
     let guest = File::create(&guest_log)
         .with_context(|| format!("failed to create {}", guest_log.display()))?;
@@ -307,6 +318,11 @@ fn run_lldb_deadline(
     if let Some(signum) = stop_on_signal {
         command.env("CARRICK_DEBUG_STOP_ON_SIGNAL", signum.to_string());
     }
+    if fatal_hold_seconds > 0 {
+        // A `carrick_fatal!` beats the deadline. Hold the carrier alive so the
+        // hold line below can trigger the dump; the abort still follows.
+        command.env("CARRICK_FATAL_HOLD_SECS", fatal_hold_seconds.to_string());
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn {} run", exe.display()))?;
@@ -319,12 +335,36 @@ fn run_lldb_deadline(
 
     let deadline = Duration::from_secs(deadline_seconds);
     let started = Instant::now();
+    let mut guest_log_tail = GuestLogTail::default();
+    let mut fatal_dumped = false;
     loop {
         if let Some(status) = child
             .try_wait()
             .context("failed to poll carrick run child")?
         {
             return Ok(exit_code(status));
+        }
+        if fatal_hold_seconds > 0
+            && !fatal_dumped
+            && let Some(held_pid) = guest_log_tail.fatal_hold_pid(&guest_log)?
+        {
+            fatal_dumped = true;
+            let why = "fatal-hold";
+            eprintln!(
+                "carrick debug lldb-run: fatal hold observed on pid {held_pid}; dumping lldb diagnostics"
+            );
+            dump_lldb(&LldbDumpContext {
+                run_id: &run_id,
+                why,
+                exe: &exe,
+                lldb_plugin: &lldb_plugin,
+                out_dir: &out_dir,
+                lldb_log: &lldb_log,
+                ps_log: &ps_log,
+                no_core,
+            })?;
+            // The held carrier aborts on its own when the hold expires; keep
+            // polling so the natural exit status is what this command returns.
         }
         if let Some(signum) = stop_on_signal {
             let pids = collect_scoped_processes(&run_id)?;
@@ -364,6 +404,53 @@ fn run_lldb_deadline(
     }
 }
 
+/// Incremental reader of the guest log: remembers how far it has read so each
+/// poll scans only the new bytes for the fatal hold line.
+#[derive(Default)]
+struct GuestLogTail {
+    offset: u64,
+    partial: Vec<u8>,
+}
+
+impl GuestLogTail {
+    fn fatal_hold_pid(&mut self, guest_log: &Path) -> anyhow::Result<Option<libc::pid_t>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match File::open(guest_log) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to open {}", guest_log.display()));
+            }
+        };
+        file.seek(SeekFrom::Start(self.offset))
+            .with_context(|| format!("failed to seek {}", guest_log.display()))?;
+        let mut fresh = Vec::new();
+        file.read_to_end(&mut fresh)
+            .with_context(|| format!("failed to read {}", guest_log.display()))?;
+        self.offset += fresh.len() as u64;
+        self.partial.extend_from_slice(&fresh);
+        let mut found = None;
+        while let Some(newline) = self.partial.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.partial.drain(..=newline).collect();
+            if found.is_none() {
+                found = parse_fatal_hold_pid(&String::from_utf8_lossy(&line));
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// Parse `carrick fatal: holding <n> s for a debugger (pid <pid>)` -- the line
+/// `carrick_fatal::arm_debugger_hold` writes before sleeping -- into the host
+/// pid to attach to.
+fn parse_fatal_hold_pid(line: &str) -> Option<libc::pid_t> {
+    let rest = line.trim().strip_prefix("carrick fatal: holding ")?;
+    let (_, pid_part) = rest.split_once(" s for a debugger (pid ")?;
+    let digits = pid_part.strip_suffix(')')?;
+    digits.parse::<libc::pid_t>().ok()
+}
+
 fn find_run_name(args: &[String]) -> anyhow::Result<Option<String>> {
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
@@ -397,16 +484,21 @@ fn generated_run_id() -> String {
 fn write_manifest(
     path: &Path,
     run_id: &str,
-    deadline_seconds: u64,
-    stop_on_signal: Option<i32>,
+    triggers: LldbRunTriggers,
     exe: &Path,
     lldb_plugin: &Path,
     run_args: &[String],
 ) -> anyhow::Result<()> {
+    let LldbRunTriggers {
+        deadline_seconds,
+        stop_on_signal,
+        fatal_hold_seconds,
+    } = triggers;
     let mut file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     writeln!(file, "run_id={run_id}")?;
     writeln!(file, "deadline_seconds={deadline_seconds}")?;
+    writeln!(file, "fatal_hold_seconds={fatal_hold_seconds}")?;
     writeln!(
         file,
         "stop_on_signal={}",
@@ -1014,8 +1106,66 @@ fn run_container_gate(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_esr_el1, lldb_eventring_capture_command, modified_memory_core_command};
+    use super::{
+        decode_esr_el1, lldb_eventring_capture_command, modified_memory_core_command,
+        parse_fatal_hold_pid,
+    };
     use std::path::Path;
+
+    #[test]
+    fn fatal_hold_line_names_the_carrier_pid_to_attach() {
+        assert_eq!(
+            parse_fatal_hold_pid("carrick fatal: holding 120 s for a debugger (pid 48213)"),
+            Some(48213)
+        );
+        assert_eq!(
+            parse_fatal_hold_pid(
+                "carrick fatal [hvpatch::mm_authority]: drop HVPatch MM authority"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_fatal_hold_pid("holding 3 s for a debugger (pid x)"),
+            None
+        );
+    }
+
+    /// An invariant abort beats the deadline, so lldb-run must arm the fatal
+    /// hold on the child and dump the moment the hold line appears in the
+    /// guest log -- otherwise the only evidence of a `carrick_fatal!` is
+    /// stderr (execfromthread under eight-way load, 2026-09-12: one abort in
+    /// 24 lldb-runs, zero cores).
+    #[test]
+    fn deadline_capture_dumps_on_the_fatal_hold_before_the_deadline() {
+        let source = include_str!("debug.rs");
+        let start = source
+            .find("fn run_lldb_deadline(")
+            .expect("run_lldb_deadline");
+        let end = source[start..]
+            .find("fn find_run_name(")
+            .map(|offset| start + offset)
+            .expect("find_run_name");
+        let body = &source[start..end];
+        assert!(
+            body.contains(".env(\"CARRICK_FATAL_HOLD_SECS\""),
+            "the child `carrick run` must be armed with the fatal hold"
+        );
+        let hold_dump = body
+            .find("why = \"fatal-hold\"")
+            .or_else(|| body.find("\"fatal-hold\""))
+            .expect("a fatal-hold dump site");
+        let deadline_dump = body
+            .find("deadline-{deadline_seconds}s")
+            .expect("the deadline dump site");
+        assert!(
+            hold_dump < deadline_dump,
+            "the fatal-hold dump must be checked before the deadline dump in the poll loop"
+        );
+        assert!(
+            body.contains("parse_fatal_hold_pid("),
+            "the poll loop must tail the guest log for the hold line"
+        );
+    }
 
     #[test]
     fn lldb_core_capture_keeps_modified_guest_and_runtime_memory() {
