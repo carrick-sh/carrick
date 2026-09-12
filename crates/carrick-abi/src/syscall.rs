@@ -709,5 +709,21 @@ mod tests {
                 assert_eq!(sc.name, name, "mismatched name for number {}", nr.raw());
             }
         }
+
+        // Canonical 0..=500 consistency: every assigned number round-trips by name
+        for nr in 0..=500 {
+            if let Some(sc) = lookup_aarch64(nr) {
+                assert_eq!(sc.number, nr, "mismatched number for {}", sc.name);
+                let sc_by_name = lookup_aarch64_by_name(sc.name);
+                assert!(
+                    sc_by_name.is_some(),
+                    "missing by-name entry for {}",
+                    sc.name
+                );
+                if let Some(sc2) = sc_by_name {
+                    assert_eq!(sc2.number, nr, "name lookup yielded different number");
+                }
+            }
+        }
     }
 }

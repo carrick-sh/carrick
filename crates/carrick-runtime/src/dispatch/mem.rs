@@ -2316,3 +2316,58 @@ pub(super) fn mmap_request_uses_alias(
 #[cfg(test)]
 #[path = "mem/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod routing_characterization_tests {
+    use super::*;
+
+    /// Characterization fixture captured on base commit before converting
+    /// memory dispatch tables to `carrick_abi::syscall::nr::*` constants.
+    ///
+    /// The literal tables on base routed exactly these canonical numbers:
+    /// - `dispatch_mem`: 213, 223, 282, 283, 425, 426, 427.
+    /// - `dispatch_mem_mutation`: 214, 215, 216, 222, 226, 227, 228, 229,
+    ///   230, 231, 232, 233, 234, 284.
+    const BASE_MEM_HANDLED_NUMBERS: &[u64] = &[213, 223, 282, 283, 425, 426, 427];
+
+    const BASE_MEM_MUTATION_HANDLED_NUMBERS: &[u64] = &[
+        214, 215, 216, 222, 226, 227, 228, 229, 230, 231, 232, 233, 234, 284,
+    ];
+
+    #[test]
+    fn mem_routing_matches_canonical_fixture_0_to_500() {
+        let expected_mem_set: std::collections::BTreeSet<u64> =
+            BASE_MEM_HANDLED_NUMBERS.iter().copied().collect();
+        let expected_mem_mut_set: std::collections::BTreeSet<u64> =
+            BASE_MEM_MUTATION_HANDLED_NUMBERS.iter().copied().collect();
+
+        let mut actual_mem_set = std::collections::BTreeSet::new();
+        let mut actual_mem_mut_set = std::collections::BTreeSet::new();
+
+        for nr in 0..=500 {
+            if dispatch_mem::<LinearMemory>(nr).is_some() {
+                actual_mem_set.insert(nr);
+                assert!(
+                    resolve_handler::<LinearMemory>(nr).is_some(),
+                    "resolve_handler failed to chain dispatch_mem for {nr}"
+                );
+            }
+            if dispatch_mem_mutation::<LinearMemory>(nr).is_some() {
+                actual_mem_mut_set.insert(nr);
+                assert!(
+                    resolve_mutation_handler::<LinearMemory>(nr).is_some(),
+                    "resolve_mutation_handler failed to chain dispatch_mem_mutation for {nr}"
+                );
+            }
+        }
+
+        assert_eq!(
+            actual_mem_set, expected_mem_set,
+            "dispatch_mem handler set mismatch across 0..=500"
+        );
+        assert_eq!(
+            actual_mem_mut_set, expected_mem_mut_set,
+            "dispatch_mem_mutation handler set mismatch across 0..=500"
+        );
+    }
+}
