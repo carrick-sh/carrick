@@ -435,11 +435,11 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
       "symbol": "mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED",
       "fingerprint": "19774f51dd70100293a802b7f7ba9b5ca4a3e9815e728ed56850b06e97bb3e2c",
       "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_MMAP_FILE_BACKED read in mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
+      "rationale": "Environment variable CARRICK_MMAP_FILE_BACKED read in mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED (crates/carrick-runtime/src/dispatch/mem/backing.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "env_var_os",
