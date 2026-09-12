@@ -407,7 +407,8 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
     // that variant is added anywhere earlier in the file (the diagnostic
     // renderer did exactly that), and a test that reaims is worse than no
     // test. This region is exactly the reactor body.
-    let record_reactor = continuation_source
+    let wait_service_source = include_str!("wait_service.rs");
+    let record_reactor = wait_service_source
         .split("fn run_reactor")
         .nth(1)
         .and_then(|tail| tail.split("impl Drop for CarrierWaitServiceInner").next())
@@ -3595,7 +3596,7 @@ fn the_reactor_work_set_answers_exactly_what_a_full_scan_would() {
 /// asserted rather than left to review.
 #[test]
 fn every_registration_mutation_goes_through_the_indexed_mutators() {
-    let source = include_str!("../continuation.rs");
+    let source = include_str!("wait_service.rs");
     let production = source
         .split("#[cfg(test)]\nmod tests {")
         .next()
