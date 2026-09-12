@@ -385,13 +385,27 @@ where
         dispatcher,
         argv,
         env,
-        max_traps,
-        debug_state_path,
-        None,
+        RunRootfsElfExecutionOptions {
+            max_traps,
+            debug_state_path,
+            ownership: None,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct RunElfExecutionOptions<'a> {
+    pub max_traps: usize,
+    pub debug_state_path: Option<&'a PathBuf>,
+    pub carrier: crate::carrier::CarrierRuntime,
+    pub lease: crate::carrier::CarrierLease,
+}
+
+pub(crate) struct RunRootfsElfExecutionOptions<'a> {
+    pub max_traps: usize,
+    pub debug_state_path: Option<&'a PathBuf>,
+    pub ownership: Option<(crate::carrier::CarrierRuntime, crate::carrier::CarrierLease)>,
+}
+
 #[cfg(feature = "fs-memory")]
 pub(crate) fn run_rootfs_elf_with_hvf_args_and_dispatcher_debug_on<A, E>(
     path: impl AsRef<Path>,
@@ -399,10 +413,7 @@ pub(crate) fn run_rootfs_elf_with_hvf_args_and_dispatcher_debug_on<A, E>(
     dispatcher: SyscallDispatcher,
     argv: A,
     env: E,
-    max_traps: usize,
-    debug_state_path: Option<&PathBuf>,
-    carrier: crate::carrier::CarrierRuntime,
-    lease: crate::carrier::CarrierLease,
+    options: RunElfExecutionOptions<'_>,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
@@ -414,27 +425,31 @@ where
         dispatcher,
         argv,
         env,
-        max_traps,
-        debug_state_path,
-        Some((carrier, lease)),
+        RunRootfsElfExecutionOptions {
+            max_traps: options.max_traps,
+            debug_state_path: options.debug_state_path,
+            ownership: Some((options.carrier, options.lease)),
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_rootfs_elf_with_hvf_args_and_dispatcher_debug_owned<A, E>(
     path: impl AsRef<Path>,
     rootfs: &RootFs,
     dispatcher: SyscallDispatcher,
     argv: A,
     env: E,
-    max_traps: usize,
-    debug_state_path: Option<&PathBuf>,
-    ownership: Option<(crate::carrier::CarrierRuntime, crate::carrier::CarrierLease)>,
+    options: RunRootfsElfExecutionOptions<'_>,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    let RunRootfsElfExecutionOptions {
+        max_traps,
+        debug_state_path,
+        ownership,
+    } = options;
     let path = path.as_ref();
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
@@ -501,48 +516,37 @@ where
 /// PT_INTERP are loaded via `dispatcher.read_exec_file` — the same
 /// overlay-first reader used by the guest-runtime execve path — so no
 /// in-memory `RootFs` is required.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_elf_from_dispatcher_debug_on<A, E>(
     path: &str,
     dispatcher: SyscallDispatcher,
     argv: A,
     env: E,
-    max_traps: usize,
-    debug_state_path: Option<&PathBuf>,
-    carrier: crate::carrier::CarrierRuntime,
-    lease: crate::carrier::CarrierLease,
+    options: RunElfExecutionOptions<'_>,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    run_elf_from_dispatcher_debug_owned(
-        path,
-        dispatcher,
-        argv,
-        env,
-        max_traps,
-        debug_state_path,
-        carrier,
-        lease,
-    )
+    run_elf_from_dispatcher_debug_owned(path, dispatcher, argv, env, options)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_elf_from_dispatcher_debug_owned<A, E>(
     path: &str,
     dispatcher: SyscallDispatcher,
     argv: A,
     env: E,
-    max_traps: usize,
-    debug_state_path: Option<&PathBuf>,
-    carrier: crate::carrier::CarrierRuntime,
-    lease: crate::carrier::CarrierLease,
+    options: RunElfExecutionOptions<'_>,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    let RunElfExecutionOptions {
+        max_traps,
+        debug_state_path,
+        carrier,
+        lease,
+    } = options;
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
     // Docker accepts a bare entrypoint command (`carrick run alpine ls`); resolve
@@ -2516,32 +2520,8 @@ impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
         self.trap.process_exit_cleanup()
     }
-    #[allow(clippy::too_many_arguments)]
-    fn inject_signal(
-        &mut self,
-        signum: i32,
-        handler: u64,
-        sa_restorer: u64,
-        pending_syscall_retval: Option<i64>,
-        interrupted_pc: Option<u64>,
-        altstack: Option<(u64, u64)>,
-        saved_sigmask: u64,
-        fault_siginfo: Option<(i32, u64)>,
-        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-        restart_syscall: bool,
-    ) -> Result<(), TrapError> {
-        self.trap.inject_signal(
-            signum,
-            handler,
-            sa_restorer,
-            pending_syscall_retval,
-            interrupted_pc,
-            altstack,
-            saved_sigmask,
-            fault_siginfo,
-            queued_siginfo,
-            restart_syscall,
-        )
+    fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
+        self.trap.inject_signal(signal)
     }
     fn last_syscall_nr(&self) -> Option<u64> {
         self.trap.last_syscall_nr()
@@ -2648,19 +2628,9 @@ mod tests {
             Ok(())
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn inject_signal(
             &mut self,
-            _signum: i32,
-            _handler: u64,
-            _sa_restorer: u64,
-            _pending_syscall_retval: Option<i64>,
-            _interrupted_pc: Option<u64>,
-            _altstack: Option<(u64, u64)>,
-            _saved_sigmask: u64,
-            _fault_siginfo: Option<(i32, u64)>,
-            _queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-            _restart_syscall: bool,
+            _signal: carrick_hal::SignalInjection,
         ) -> Result<(), TrapError> {
             Ok(())
         }

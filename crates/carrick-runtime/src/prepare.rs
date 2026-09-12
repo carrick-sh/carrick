@@ -41,7 +41,7 @@ use crate::interactive_supervisor::InteractiveSession;
 use crate::kernel::container::LaunchContext;
 use crate::network::RuntimeNetwork;
 #[cfg(feature = "platform-macos")]
-use crate::runtime::run_elf_from_dispatcher_debug_on;
+use crate::runtime::{RunElfExecutionOptions, run_elf_from_dispatcher_debug_on};
 use crate::runtime::{RunResult, RuntimeError};
 use crate::vfs::{BindVfs, HostResolverSnapshot, Vfs};
 
@@ -666,10 +666,12 @@ impl PreparedRun {
                     dispatcher,
                     argv,
                     env,
-                    max_traps,
-                    debug_state_path.as_ref(),
-                    carrier,
-                    carrier_lease,
+                    RunElfExecutionOptions {
+                        max_traps,
+                        debug_state_path: debug_state_path.as_ref(),
+                        carrier,
+                        lease: carrier_lease,
+                    },
                 ),
                 "failed to run ELF from dispatcher",
             ),
@@ -681,10 +683,12 @@ impl PreparedRun {
                     dispatcher,
                     argv,
                     env,
-                    max_traps,
-                    debug_state_path.as_ref(),
-                    carrier,
-                    carrier_lease,
+                    RunElfExecutionOptions {
+                        max_traps,
+                        debug_state_path: debug_state_path.as_ref(),
+                        carrier,
+                        lease: carrier_lease,
+                    },
                 ),
                 "failed to run rootfs ELF",
             ),

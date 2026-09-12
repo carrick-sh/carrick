@@ -225,18 +225,18 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     let saved_sigmask = dispatcher
         .enter_signal_handler(context, this_tid, signum, action)
         .raw();
-    match trap.inject_signal(
+    match trap.inject_signal(carrick_hal::SignalInjection {
         signum,
-        action.sa_handler,
-        restorer,
-        None,
+        handler: action.sa_handler,
+        sa_restorer: restorer,
+        pending_syscall_retval: None,
         interrupted_pc,
         altstack,
         saved_sigmask,
-        Some((si_code, si_addr)),
-        None,
-        false,
-    ) {
+        fault_siginfo: Some((si_code, si_addr)),
+        queued_siginfo: None,
+        restart_syscall: false,
+    }) {
         Ok(()) => Ok(FaultSignalDisposition::Injected),
         Err(TrapError::SignalDeliveryFault) => Ok(FaultSignalDisposition::Terminate(11)),
         Err(error) => Err(error.into()),
@@ -787,18 +787,18 @@ where
                 });
                 queued_siginfo
             };
-            match trap.inject_signal(
-                pending,
-                action.sa_handler,
-                restorer,
-                last_syscall_retval,
+            match trap.inject_signal(carrick_hal::SignalInjection {
+                signum: pending,
+                handler: action.sa_handler,
+                sa_restorer: restorer,
+                pending_syscall_retval: last_syscall_retval,
                 interrupted_pc,
                 altstack,
                 saved_sigmask,
-                None, // SI_USER-shaped (tkill/sysmon); faults use deliver_fault_signal
+                fault_siginfo: None, // SI_USER-shaped (tkill/sysmon); faults use deliver_fault_signal
                 queued_siginfo,
                 restart_syscall,
-            ) {
+            }) {
                 Ok(()) => Ok(Some(PendingSignalAction::ignored())),
                 // Linux force_sigsegv: the signal frame couldn't be written to the
                 // user stack. Terminate the whole thread-group by SIGSEGV (exit
@@ -870,24 +870,12 @@ mod tests {
             Err(TrapError::UnsupportedPlatform)
         }
 
-        fn inject_signal(
-            &mut self,
-            signum: i32,
-            handler: u64,
-            _sa_restorer: u64,
-            _pending_syscall_retval: Option<i64>,
-            interrupted_pc: Option<u64>,
-            _altstack: Option<(u64, u64)>,
-            _saved_sigmask: u64,
-            fault_siginfo: Option<(i32, u64)>,
-            _queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-            restart_syscall: bool,
-        ) -> Result<(), TrapError> {
-            self.restart = restart_syscall;
-            self.delivered_signum = signum;
-            self.delivered_handler = handler;
-            self.delivered_interrupted_pc = interrupted_pc;
-            self.delivered_fault_siginfo = fault_siginfo;
+        fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
+            self.restart = signal.restart_syscall;
+            self.delivered_signum = signal.signum;
+            self.delivered_handler = signal.handler;
+            self.delivered_interrupted_pc = signal.interrupted_pc;
+            self.delivered_fault_siginfo = signal.fault_siginfo;
             Ok(())
         }
 

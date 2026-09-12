@@ -322,18 +322,18 @@ mod execve_tests {
         let handler = 0x4_0000u64;
         let sp_before = engine.get_reg(Reg::Sp).unwrap();
         engine
-            .inject_signal(
-                libc::SIGUSR1,
+            .inject_signal(carrick_hal::SignalInjection {
+                signum: libc::SIGUSR1,
                 handler,
-                0,
-                None,
-                None,
-                None,
-                0,
-                None,
-                None,
-                false,
-            )
+                sa_restorer: 0,
+                pending_syscall_retval: None,
+                interrupted_pc: None,
+                altstack: None,
+                saved_sigmask: 0,
+                fault_siginfo: None,
+                queued_siginfo: None,
+                restart_syscall: false,
+            })
             .expect("inject_signal");
 
         // Syscall path (interrupted_pc = None) redirects ELR_EL1, not live PC.
@@ -372,18 +372,18 @@ mod execve_tests {
         let sigmask = 0x0000_0000_0000_FF00u64;
 
         engine
-            .inject_signal(
-                libc::SIGUSR1,
-                0x4_0000,
-                0,
-                None,
-                None,
-                None,
-                sigmask,
-                None,
-                None,
-                false,
-            )
+            .inject_signal(carrick_hal::SignalInjection {
+                signum: libc::SIGUSR1,
+                handler: 0x4_0000,
+                sa_restorer: 0,
+                pending_syscall_retval: None,
+                interrupted_pc: None,
+                altstack: None,
+                saved_sigmask: sigmask,
+                fault_siginfo: None,
+                queued_siginfo: None,
+                restart_syscall: false,
+            })
             .expect("inject_signal");
         // Simulate the handler clobbering V0 before rt_sigreturn.
         engine.set_vreg(0, 0).unwrap();

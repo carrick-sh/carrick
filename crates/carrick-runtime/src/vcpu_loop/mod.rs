@@ -3095,19 +3095,9 @@ pub(crate) mod tests {
             if self.exec_support { (0, 1) } else { (0, 0) }
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn inject_signal(
             &mut self,
-            _signum: i32,
-            _handler: u64,
-            _sa_restorer: u64,
-            _pending_syscall_retval: Option<i64>,
-            _interrupted_pc: Option<u64>,
-            _altstack: Option<(u64, u64)>,
-            _saved_sigmask: u64,
-            _fault_siginfo: Option<(i32, u64)>,
-            _queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
-            _restart_syscall: bool,
+            _signal: carrick_hal::SignalInjection,
         ) -> Result<(), TrapError> {
             Ok(())
         }

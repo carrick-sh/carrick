@@ -73,6 +73,21 @@ pub type ExecInventoryCommits = (
     Option<crate::FrameInventoryCommit<()>>,
 );
 
+/// Arguments describing a signal to be injected into a guest vCPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalInjection {
+    pub signum: i32,
+    pub handler: u64,
+    pub sa_restorer: u64,
+    pub pending_syscall_retval: Option<i64>,
+    pub interrupted_pc: Option<u64>,
+    pub altstack: Option<(u64, u64)>,
+    pub saved_sigmask: u64,
+    pub fault_siginfo: Option<(i32, u64)>,
+    pub queued_siginfo: Option<LinuxSiginfo>,
+    pub restart_syscall: bool,
+}
+
 /// The trap-engine contract the runtime loop drives: run the vCPU until a
 /// syscall trap, complete/inject/restore around guest syscalls and signals,
 /// and fork/execve the guest address space. Implemented by `HvfTrapEngine`
@@ -194,31 +209,14 @@ pub trait SyscallTrap {
     fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
         Ok(())
     }
-    /// Inject a guest signal frame for `signum`. Writes a `CarrickSigframe` to
-    /// SP_EL0, points the guest's x30 at `sa_restorer`, sets x0 to `signum`,
-    /// and redirects the vCPU's next resumed PC to the user handler. The
+    /// Construct a signal frame on the guest stack and update the vCPU's PC to
+    /// `handler`. The guest returns via the sa_restorer trampoline; the
     /// pre-signal register state is preserved in the frame and recovered by
     /// `restore_from_sigframe` on `rt_sigreturn`.
     ///
-    /// `pending_syscall_retval` is the retval the dispatcher computed for the
-    /// syscall that was just trapped. `interrupted_pc` is `Some(pc)` when
-    /// injecting on a non-syscall kick exit. `altstack` is `Some((ss_sp,
-    /// ss_size))` when the handler was registered `SA_ONSTACK`. See the macOS
-    /// `HvfTrapEngine` impl for the full per-field contract.
-    #[allow(clippy::too_many_arguments)]
-    fn inject_signal(
-        &mut self,
-        signum: i32,
-        handler: u64,
-        sa_restorer: u64,
-        pending_syscall_retval: Option<i64>,
-        interrupted_pc: Option<u64>,
-        altstack: Option<(u64, u64)>,
-        saved_sigmask: u64,
-        fault_siginfo: Option<(i32, u64)>,
-        queued_siginfo: Option<LinuxSiginfo>,
-        restart_syscall: bool,
-    ) -> Result<(), TrapError>;
+    /// See [`SignalInjection`] and the macOS `HvfTrapEngine` impl for the full
+    /// per-field contract.
+    fn inject_signal(&mut self, signal: SignalInjection) -> Result<(), TrapError>;
     /// The Linux syscall number of the most recently dispatched `svc`, used to
     /// decide whether an interrupted syscall is in the SA_RESTART-restartable
     /// set. `None` before the first syscall / on traps with no vCPU.
