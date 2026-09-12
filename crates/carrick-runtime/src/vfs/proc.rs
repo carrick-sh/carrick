@@ -3349,18 +3349,18 @@ fn synthetic_proc_self_stat(ctx: &OpenContext<'_>) -> String {
             )
         }
     };
-    proc_stat_line(
+    proc_stat_line(ProcStatFields {
         pid,
-        &comm,
+        comm: &comm,
         state,
         ppid,
         pgrp,
         session,
-        nthreads,
+        num_threads: nthreads,
         utime_ticks,
         stime_ticks,
         processor,
-    )
+    })
 }
 
 fn proc_self_stat_state_from_threads(
@@ -3374,7 +3374,6 @@ fn proc_self_stat_state_from_threads(
     }) {
         return state;
     }
-
     thread_states
         .iter()
         .filter_map(|(tid, state)| {
@@ -3386,10 +3385,9 @@ fn proc_self_stat_state_from_threads(
         .unwrap_or('R')
 }
 
-#[allow(clippy::too_many_arguments)]
-fn proc_stat_line(
+struct ProcStatFields<'a> {
     pid: u32,
-    comm: &str,
+    comm: &'a str,
     state: char,
     ppid: u32,
     pgrp: u32,
@@ -3398,7 +3396,21 @@ fn proc_stat_line(
     utime_ticks: u64,
     stime_ticks: u64,
     processor: u32,
-) -> String {
+}
+
+fn proc_stat_line(fields: ProcStatFields<'_>) -> String {
+    let ProcStatFields {
+        pid,
+        comm,
+        state,
+        ppid,
+        pgrp,
+        session,
+        num_threads,
+        utime_ticks,
+        stime_ticks,
+        processor,
+    } = fields;
     // Field 14 is utime (user CPU, in clock ticks). It MUST advance: a real test
     // setup spins `do { read } while (utime == 0)` to confirm CPU was consumed
     // before timing the clocks (LTP clock_gettime01) — a hardcoded 0 hangs it
@@ -3428,7 +3440,18 @@ fn proc_stat_line(
 #[cfg(test)]
 #[test]
 fn proc_stat_line_renders_exact_logical_user_and_system_ticks() {
-    let line = proc_stat_line(7, "task", 'R', 1, 7, 7, 1, 17, 19, 2);
+    let line = proc_stat_line(ProcStatFields {
+        pid: 7,
+        comm: "task",
+        state: 'R',
+        ppid: 1,
+        pgrp: 7,
+        session: 7,
+        num_threads: 1,
+        utime_ticks: 17,
+        stime_ticks: 19,
+        processor: 2,
+    });
     let fields: Vec<_> = line.split_whitespace().collect();
     assert_eq!(fields.len(), 52, "proc_pid_stat(5) has 52 fields");
     assert_eq!(fields[13], "17");
@@ -3599,18 +3622,18 @@ fn synthetic_proc_pid_file(
         match rest {
             "stat" => {
                 return Some(
-                    proc_stat_line(
+                    proc_stat_line(ProcStatFields {
                         pid,
-                        name,
-                        thread.state,
-                        identity.ppid,
-                        identity.pgrp,
-                        identity.session,
-                        threads.len().max(1),
-                        cpu_us_to_ticks(thread.user_cpu_us),
-                        cpu_us_to_ticks(thread.system_cpu_us),
-                        thread.processor.map_or(0, carrick_hal::GuestCpuId::as_u32),
-                    )
+                        comm: name,
+                        state: thread.state,
+                        ppid: identity.ppid,
+                        pgrp: identity.pgrp,
+                        session: identity.session,
+                        num_threads: threads.len().max(1),
+                        utime_ticks: cpu_us_to_ticks(thread.user_cpu_us),
+                        stime_ticks: cpu_us_to_ticks(thread.system_cpu_us),
+                        processor: thread.processor.map_or(0, carrick_hal::GuestCpuId::as_u32),
+                    })
                     .into_bytes(),
                 );
             }
@@ -3648,18 +3671,18 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{count}\n",
         };
         return match rest {
             "stat" => Some(
-                proc_stat_line(
+                proc_stat_line(ProcStatFields {
                     pid,
-                    name,
-                    'Z',
-                    zombie.ppid,
-                    zombie.pgrp,
-                    zombie.session,
-                    1,
-                    cpu_us_to_ticks(zombie.user_cpu_us),
-                    cpu_us_to_ticks(zombie.system_cpu_us),
-                    0,
-                )
+                    comm: name,
+                    state: 'Z',
+                    ppid: zombie.ppid,
+                    pgrp: zombie.pgrp,
+                    session: zombie.session,
+                    num_threads: 1,
+                    utime_ticks: cpu_us_to_ticks(zombie.user_cpu_us),
+                    stime_ticks: cpu_us_to_ticks(zombie.system_cpu_us),
+                    processor: 0,
+                })
                 .into_bytes(),
             ),
             "comm" => Some(format!("{name}\n").into_bytes()),
@@ -3697,21 +3720,21 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
         let threads = process.tids.len().max(1);
         return match rest {
             "stat" => Some(
-                proc_stat_line(
+                proc_stat_line(ProcStatFields {
                     pid,
-                    name,
-                    process.state,
-                    process.ppid,
-                    process.pgrp,
-                    process.session,
-                    threads,
-                    cpu_us_to_ticks(process.user_cpu_us),
-                    cpu_us_to_ticks(process.system_cpu_us),
+                    comm: name,
+                    state: process.state,
+                    ppid: process.ppid,
+                    pgrp: process.pgrp,
+                    session: process.session,
+                    num_threads: threads,
+                    utime_ticks: cpu_us_to_ticks(process.user_cpu_us),
+                    stime_ticks: cpu_us_to_ticks(process.system_cpu_us),
                     // A peer PROCESS snapshot carries no per-thread CPU;
                     // its leader's is read through
                     // `/proc/<pid>/task/<tid>/stat`.
-                    0,
-                )
+                    processor: 0,
+                })
                 .into_bytes(),
             ),
             "comm" => Some(format!("{name}\n").into_bytes()),
@@ -3782,18 +3805,18 @@ Threads:\t{threads}\n",
         match rest {
             "stat" => {
                 return Some(
-                    proc_stat_line(
+                    proc_stat_line(ProcStatFields {
                         pid,
-                        &name,
+                        comm: &name,
                         state,
                         ppid,
-                        me,
-                        me,
-                        own_threads.len().max(1),
-                        self_utime_ticks(),
-                        0,
-                        0,
-                    )
+                        pgrp: me,
+                        session: me,
+                        num_threads: own_threads.len().max(1),
+                        utime_ticks: self_utime_ticks(),
+                        stime_ticks: 0,
+                        processor: 0,
+                    })
                     .into_bytes(),
                 );
             }
@@ -3831,7 +3854,21 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         let me = std::process::id();
         let comm = self_comm;
         return match rest {
-            "stat" => Some(proc_stat_line(pid, comm, state, ppid, me, me, 1, 0, 0, 0).into_bytes()),
+            "stat" => Some(
+                proc_stat_line(ProcStatFields {
+                    pid,
+                    comm,
+                    state,
+                    ppid,
+                    pgrp: me,
+                    session: me,
+                    num_threads: 1,
+                    utime_ticks: 0,
+                    stime_ticks: 0,
+                    processor: 0,
+                })
+                .into_bytes(),
+            ),
             "comm" => Some(format!("{comm}\n").into_bytes()),
             "cmdline" => {
                 let mut b = comm.as_bytes().to_vec();
@@ -3915,9 +3952,18 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
         // a single thread (num_threads=1). The multi-threaded-fork warning only
         // reads the caller's OWN /proc/self/stat, which uses the live count.
         "stat" => Some(
-            proc_stat_line(
-                pid, &comm, state, disp_ppid, disp_pgid, disp_pgid, 1, 0, 0, 0,
-            )
+            proc_stat_line(ProcStatFields {
+                pid,
+                comm: &comm,
+                state,
+                ppid: disp_ppid,
+                pgrp: disp_pgid,
+                session: disp_pgid,
+                num_threads: 1,
+                utime_ticks: 0,
+                stime_ticks: 0,
+                processor: 0,
+            })
             .into_bytes(),
         ),
         "comm" => Some(format!("{comm}\n").into_bytes()),
