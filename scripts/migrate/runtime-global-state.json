@@ -1468,14 +1468,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
-      "symbol": "NEXT_REGISTRATION_GENERATION",
-      "fingerprint": "14cccde4761a985c1c26fff30977d44498b737d1a967212c85f34560e03c014f",
-      "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator NEXT_REGISTRATION_GENERATION in crates/carrick-runtime/src/vcpu_loop/continuation.rs generating unique IDs across the host process."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
       "symbol": "NEXT_RESOURCE_GENERATION",
       "fingerprint": "302bfa03219e9cdc7b82cd524c1aa79b535596d7030d7cae596964e5d2e825ec",
       "classification": "monotonic_allocator",
@@ -1520,6 +1512,14 @@
       "fingerprint": "01d31cdf861fb3951fb83b9ba4cc3267501e131b3b379559f0f60ddfe5f40a54",
       "classification": "test_only",
       "rationale": "Immutable RawWakerVTable in a cfg(test) callback-lock regression; carries no mutable process or guest state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/wait_service.rs",
+      "symbol": "NEXT_REGISTRATION_GENERATION",
+      "fingerprint": "14cccde4761a985c1c26fff30977d44498b737d1a967212c85f34560e03c014f",
+      "classification": "monotonic_allocator",
+      "rationale": "Carrier-wide monotonic allocator NEXT_REGISTRATION_GENERATION in crates/carrick-runtime/src/vcpu_loop/continuation/wait_service.rs generating unique IDs across the host process."
     },
     {
       "kind": "env_var_os",
