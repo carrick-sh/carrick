@@ -3584,3 +3584,36 @@ subprocess 2.88, itertools 2.43, go_types 2.39. Load coupling (w4/w1) on
 the candidate: compile 1.53, multiprocessing 1.71, importlib 1.44,
 itertools 1.31, tarfile 1.12 — compile and multiprocessing remain the two
 load-coupled rows the 02:23 entry named.
+
+### 2026-09-12 11:33 — paired five-row scorecard after the per-mm Tasks 1–4 and the three perf clusters
+
+Binary `1586567ad3501d32` (main a70bb5567) vs the pre-cluster pinned
+`3c8dbee5b686c49d`, interleaved paired, w4 x3 alternating then w1, quiet
+host, driver `target/conformance/eco-load/measure-sep12.sh`, rows
+`paired-sep12-*.jsonl`, summary `paired-summary-sep12.py`. **40/40 MATCH.**
+
+| row | base w4 | cand w4 | cand/base (paired, median of 3) | base w1 | cand w1 |
+|---|---|---|---|---|---|
+| cpython-compile | 6.52 | 3.87 | **0.58** | 4.87 | 2.84 |
+| cpython-tarfile | 5.19 | 3.59 | **0.68** | 4.56 | 3.17 |
+| cpython-importlib | 3.03 | 2.56 | 0.82 | 2.12 | **1.96** |
+| cpython-multiprocessing_main_handling | 3.67 | 3.30 | 0.90 | 2.60 | 2.32 |
+| go-net_http | 3.80 | 3.38 | 0.90 | 3.34 | 3.34 |
+
+What moved and why (each named by a profile first, then fixed by
+representation): compile — `TaskMappingIndex` retirement is keyed and
+width-class bounded (the first attempt's widest-row window had made it
+12x WORSE; caught by this scorecard, fixed the same morning); tarfile —
+one host `*at` call per directory mutation on the dentry-held parent and
+ordered caches; importlib — width-class alias containment index;
+multiprocessing and net_http — fork/exec/exit off the carrier topology
+mutex (children now run concurrently: 0.60 s for four 400 ms spinners;
+parallelism ~1.9 cores, was 1.3). Two defects shipped by that work were
+found by this block and fixed before it was accepted: a self-deadlock on
+the frame-registry leaf (private-file mmap) and a stage-1 pause election
+at process exit (threaded Go: CarrierFailed or hang). Still open toward
+the goal: tarfile/compile/net_http/multiprocessing at 3.3–3.9x at w4;
+Task 5/6 of the per-mm plan (per-mm alias containers, per-parent-mm fork
+serializers) are the next structural levers; load coupling (w4/w1) is now
+compile 1.36, tarfile 1.13, importlib 1.31, multiprocessing 1.42,
+net_http 1.01.

@@ -595,3 +595,7 @@ commits and is re-checked at the next vet.
   control and 175.6 s on the regressed binary — the keyed retirement now
   pays off (≈1.8x faster than base on this row). Probe gate rerunning;
   paired scorecard to be rerun on this binary.
+- Item 4 scorecard on the compile-fixed main (ecosystem doc "2026-09-12
+  11:33"): 40/40 MATCH; every targeted row faster paired — compile 0.58,
+  tarfile 0.68, importlib 0.82, multiprocessing 0.90, net_http 0.90;
+  importlib ≤2x at one worker. Task 6 and the allows round dispatching.
