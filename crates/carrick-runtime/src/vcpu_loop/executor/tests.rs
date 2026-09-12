@@ -877,11 +877,7 @@ impl PersistentExecutor for FakeExecutor {
         }
         match self.factory.owner_dirty_mode.load(Ordering::SeqCst) {
             1 => {
-                let guard = carrick_thread::fork_quiesce::acquire_topology_lock(
-                    carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
-                    1,
-                    1,
-                );
+                let guard = carrick_thread::fork_quiesce::TopologyDepth::acquire();
                 self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
             }
             3 => {
@@ -4786,11 +4782,7 @@ fn real_owner_boundary_state_fails_or_resets_and_successor_observes_clean_state(
     let mut backend = BoundaryAuditProbe;
     let boundary = WorkerBoundaryAudit::capture().expect("capture host signal mask baseline");
 
-    let topology = carrick_thread::fork_quiesce::acquire_topology_lock(
-        carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
-        1,
-        1,
-    );
+    let topology = carrick_thread::fork_quiesce::TopologyDepth::acquire();
     assert!(boundary.audit_runtime(&mut backend).is_err());
     drop(topology);
     boundary
@@ -5514,29 +5506,14 @@ fn terminal_retirement_does_not_hold_topology_lock_across_detached_cleanup() {
         .expect("worker must reach detached cleanup gate");
 
     // While detached terminal cleanup is running, the executor does NOT hold
-    // the carrier topology lock. Concurrent attempts to acquire topology
-    // locks for fork or COW must succeed.
-    let try_fork = carrick_thread::fork_quiesce::try_acquire_topology_lock(
-        carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
-        process.pid(),
-        context.thread().key().tid.raw(),
-    );
+    // the carrier frame registry lock. Concurrent attempts to lock the frame
+    // registry must succeed.
+    let try_lock = carrick_thread::fork_quiesce::frame_registry_lock().try_lock();
     assert!(
-        try_fork.is_some(),
-        "while detached terminal cleanup is running, InProcessFork must succeed because carrier topology lock is not held"
+        try_lock.is_some(),
+        "while detached terminal cleanup is running, frame_registry_lock must not be held"
     );
-    drop(try_fork);
-
-    let try_cow = carrick_thread::fork_quiesce::try_acquire_topology_lock(
-        carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
-        process.pid(),
-        context.thread().key().tid.raw(),
-    );
-    assert!(
-        try_cow.is_some(),
-        "while detached terminal cleanup is running, FrameCow must succeed because carrier topology lock is not held"
-    );
-    drop(try_cow);
+    drop(try_lock);
 
     // Release the worker and shut down the pool before asserting
     if let Some(resume) = cleanup.resume_tx.take() {

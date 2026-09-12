@@ -1657,15 +1657,14 @@ where
         }
         let child_mm_id = prepared_fork.child_mm_id();
         // Page-table authority over the PARENT MM comes FIRST, before the
-        // frame-inventory reservation and the backend topology lock, so fork
-        // orders P -> topology exactly like the mmap/munmap/mprotect editors
+        // frame-inventory reservation and the mm transaction, so fork
+        // orders P -> transaction exactly like the mmap/munmap/mprotect editors
         // (`SyscallMmPhase::Mutation` pauses, then `unmap_range` takes the
-        // topology lock for alias teardown). Taking the topology lock first
+        // mm transaction for alias teardown). Taking a topology transaction first
         // and pausing later inverted that order: a sibling `munmap` holding
-        // the pt-barrier coordinator blocked in `acquire_topology_lock(
-        // AliasUnmap)` on the lock this forker held while the forker parked
-        // in the election, and only the 30 s election budget turned the
-        // cycle into fork(2) = EAGAIN instead of a hang (`bt all` of the
+        // the pt-barrier coordinator blocked on the transaction this forker held
+        // while the forker parked in the election, and only the 30 s election
+        // budget turned the cycle into fork(2) = EAGAIN instead of a hang (`bt all` of the
         // stalled carrier, 2026-09-02).
         //
         // Sole exact-MM authority is the cheap arm, but it is only ever
@@ -1745,9 +1744,8 @@ where
         // The reservation and its complete bounded storage exist before this
         // MM transaction. Keep it local until every guest-pointer/pidfd preflight
         // succeeds, so EFAULT cannot occupy the backend's one process slot.
-        // Task 4: replaced try_acquire_topology_lock and subscribe_topology_release with
-        // parent_mutation.begin_transaction().
-        let topology = parent_mutation.begin_transaction();
+        let mut topology = parent_mutation.begin_transaction();
+        topology.set_identity(parent_process.pid(), self.this_tid.raw());
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::ProcessAllocate,
             fork_stage_started,

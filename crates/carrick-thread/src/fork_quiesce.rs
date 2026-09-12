@@ -25,8 +25,7 @@
 //!     registry: a thread that has a tid but hasn't built its vCPU yet must not
 //!     be awaited (it would never reach the barrier). `try_begin_fork`
 //!     serializes forks via a CAS flag (not a held guard) so the flag survives
-//!     `libc::fork` cleanly and the child clears it. [`topology_lock`] serializes
-//!     carrier topology mutations (publication and alias containers); in HVPatch
+//!     `libc::fork` cleanly and the child clears it. In HVPatch
 //!     the VM is never torn down or rebuilt during fork.
 //!
 //!   * [`PtQuiesce`] (page-table edits): carrick edits the guest's stage-1 tables
@@ -44,7 +43,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use carrick_fatal::carrick_fatal;
@@ -129,112 +128,6 @@ pub fn is_quiescing() -> bool {
     is_current_mm_fork_quiescing() || is_current_mm_quiescing()
 }
 
-/// Serializes carrier-wide topology mutations: shared-frame publication and
-/// carrier-global alias/replay/version containers.
-///
-/// Historical note: in legacy execution this lock serialized a sibling creating
-/// its vCPU against a fork destroying and rebuilding the VM. In HVPatch, the VM
-/// is never torn down or rebuilt during fork.
-pub fn topology_lock() -> &'static Mutex<()> {
-    static L: OnceLock<Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(()))
-}
-
-struct TopologyReleaseListener {
-    expected_generation: u64,
-    callback: Arc<dyn Fn(u64) + Send + Sync + 'static>,
-}
-
-#[derive(Default)]
-struct TopologyReleasePublication {
-    generation: u64,
-    listeners: BTreeMap<u64, TopologyReleaseListener>,
-}
-
-fn topology_release_publication() -> &'static Mutex<TopologyReleasePublication> {
-    static PUBLICATION: OnceLock<Mutex<TopologyReleasePublication>> = OnceLock::new();
-    PUBLICATION.get_or_init(|| Mutex::new(TopologyReleasePublication::default()))
-}
-
-static NEXT_TOPOLOGY_LISTENER: AtomicU64 = AtomicU64::new(1);
-
-pub struct TopologyReleaseSubscription {
-    id: u64,
-    expected_generation: u64,
-}
-
-impl Drop for TopologyReleaseSubscription {
-    fn drop(&mut self) {
-        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let mut publication = topology_release_publication().lock().unwrap();
-        if publication
-            .listeners
-            .get(&self.id)
-            .is_some_and(|listener| listener.expected_generation == self.expected_generation)
-        {
-            publication.listeners.remove(&self.id);
-        }
-    }
-}
-
-pub enum TopologyReleaseEnrollment {
-    Ready(u64),
-    Subscribed(TopologyReleaseSubscription),
-}
-
-pub fn topology_release_generation() -> u64 {
-    #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-    topology_release_publication().lock().unwrap().generation
-}
-
-pub fn subscribe_topology_release(
-    expected_generation: u64,
-    callback: Arc<dyn Fn(u64) + Send + Sync + 'static>,
-) -> TopologyReleaseEnrollment {
-    #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-    let mut publication = topology_release_publication().lock().unwrap();
-    if publication.generation != expected_generation {
-        return TopologyReleaseEnrollment::Ready(publication.generation);
-    }
-    let id = NEXT_TOPOLOGY_LISTENER.fetch_add(1, Ordering::Relaxed);
-    if id == 0 || id == u64::MAX {
-        carrick_fatal!(
-            "thread::topology",
-            "topology listener id exhausted or wrapped: id={id}"
-        );
-    }
-    publication.listeners.insert(
-        id,
-        TopologyReleaseListener {
-            expected_generation,
-            callback,
-        },
-    );
-    TopologyReleaseEnrollment::Subscribed(TopologyReleaseSubscription {
-        id,
-        expected_generation,
-    })
-}
-
-fn publish_topology_release() {
-    let (generation, callbacks) = {
-        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-        let mut publication = topology_release_publication().lock().unwrap();
-        publication.generation = publication.generation.checked_add(1).unwrap_or_else(|| {
-            carrick_fatal!("thread::topology", "topology release generation overflow");
-        });
-        let generation = publication.generation;
-        let callbacks = std::mem::take(&mut publication.listeners)
-            .into_values()
-            .map(|listener| listener.callback)
-            .collect::<Vec<_>>();
-        (generation, callbacks)
-    };
-    for callback in callbacks {
-        callback(generation);
-    }
-}
-
 thread_local! {
     /// How many topology-lock guards THIS thread currently holds.
     ///
@@ -247,11 +140,6 @@ thread_local! {
     /// `AliasUnmap`. That turned a recoverable `ENOMEM` into an unkillable
     /// hang, which is the worst possible failure mode.
     static TOPOLOGY_DEPTH: Cell<u32> = const { Cell::new(0) };
-}
-
-/// True while the calling thread already owns the topology lock.
-fn topology_held_by_current_thread() -> bool {
-    TOPOLOGY_DEPTH.with(|depth| depth.get() > 0)
 }
 
 /// Fail-closed executor-boundary observation for the current owner pthread.
@@ -294,23 +182,11 @@ impl Drop for TopologyDepth {
     }
 }
 
-/// RAII topology-lock guard that emits a typed release event on every exit
-/// path. The guard is `None` for a re-entrant acquisition, which owns a depth
-/// count but not the mutex, so only the OUTERMOST guard releases it. The
-/// additional fields are observability-only.
-pub struct TopologyLockGuard {
-    _guard: Option<MutexGuard<'static, ()>>,
-    operation: carrick_observability::probes::HvpatchTopologyOperation,
-    guest_pid: i32,
-    guest_tid: i32,
-    acquired_at: Instant,
-}
-
-fn topology_elapsed_ns(started: Instant) -> u64 {
+pub fn topology_elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-fn emit_topology_lock(
+pub fn emit_topology_lock(
     operation: carrick_observability::probes::HvpatchTopologyOperation,
     phase: carrick_observability::probes::HvpatchTopologyPhase,
     guest_pid: i32,
@@ -324,11 +200,64 @@ fn emit_topology_lock(
     );
 }
 
-impl Drop for TopologyLockGuard {
+/// Leaf critical section for the carrier-wide shared-frame registry: staging
+/// and publishing frames another process may install next. Never held across
+/// a guest write, a wait, or another lock.
+pub struct FrameRegistryGuard<'r> {
+    _guard: parking_lot::MutexGuard<'r, ()>,
+    operation: carrick_observability::probes::HvpatchTopologyOperation,
+    guest_pid: i32,
+    guest_tid: i32,
+    acquired_at: Instant,
+}
+
+impl<'r> FrameRegistryGuard<'r> {
+    pub fn new(guard: parking_lot::MutexGuard<'r, ()>) -> Self {
+        Self::with_operation(
+            guard,
+            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+        )
+    }
+
+    pub fn with_operation(
+        guard: parking_lot::MutexGuard<'r, ()>,
+        operation: carrick_observability::probes::HvpatchTopologyOperation,
+    ) -> Self {
+        Self::with_identity(guard, operation, 0, 0)
+    }
+
+    pub fn with_identity(
+        guard: parking_lot::MutexGuard<'r, ()>,
+        operation: carrick_observability::probes::HvpatchTopologyOperation,
+        guest_pid: i32,
+        guest_tid: i32,
+    ) -> Self {
+        emit_topology_lock(
+            operation,
+            carrick_observability::probes::HvpatchTopologyPhase::Requested,
+            guest_pid,
+            guest_tid,
+            0,
+        );
+        emit_topology_lock(
+            operation,
+            carrick_observability::probes::HvpatchTopologyPhase::Acquired,
+            guest_pid,
+            guest_tid,
+            0,
+        );
+        Self {
+            _guard: guard,
+            operation,
+            guest_pid,
+            guest_tid,
+            acquired_at: Instant::now(),
+        }
+    }
+}
+
+impl Drop for FrameRegistryGuard<'_> {
     fn drop(&mut self) {
-        // Drop the depth before `_guard` releases the mutex, so the counter is
-        // never observed as held by a thread that no longer owns it.
-        TOPOLOGY_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
         emit_topology_lock(
             self.operation,
             carrick_observability::probes::HvpatchTopologyPhase::Released,
@@ -336,21 +265,6 @@ impl Drop for TopologyLockGuard {
             self.guest_tid,
             topology_elapsed_ns(self.acquired_at),
         );
-        drop(self._guard.take());
-        publish_topology_release();
-    }
-}
-
-/// Leaf critical section for the carrier-wide shared-frame registry: staging
-/// and publishing frames another process may install next. Never held across
-/// a guest write, a wait, or another lock.
-pub struct FrameRegistryGuard<'r> {
-    _guard: parking_lot::MutexGuard<'r, ()>,
-}
-
-impl<'r> FrameRegistryGuard<'r> {
-    pub fn new(guard: parking_lot::MutexGuard<'r, ()>) -> Self {
-        Self { _guard: guard }
     }
 }
 
@@ -360,196 +274,6 @@ impl<'r> FrameRegistryGuard<'r> {
 pub fn frame_registry_lock() -> &'static parking_lot::Mutex<()> {
     static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| parking_lot::Mutex::new(()))
-}
-
-/// Acquire the carrier-wide topology mutex and emit request/wait/release
-/// records carrying the Linux guest identity responsible for the mutation.
-///
-/// Protects carrier-wide frame publication and alias containers until
-/// superseded by per-MM transaction authority and [`FrameRegistryGuard`].
-pub fn acquire_topology_lock(
-    operation: carrick_observability::probes::HvpatchTopologyOperation,
-    guest_pid: i32,
-    guest_tid: i32,
-) -> TopologyLockGuard {
-    let requested_at = Instant::now();
-    emit_topology_lock(
-        operation,
-        carrick_observability::probes::HvpatchTopologyPhase::Requested,
-        guest_pid,
-        guest_tid,
-        0,
-    );
-    // A thread that already owns the lock re-enters without touching the mutex;
-    // blocking on it here would deadlock the carrier against itself.
-    let guard = if topology_held_by_current_thread() {
-        None
-    } else {
-        Some(
-            topology_lock()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()),
-        )
-    };
-    enter_topology_depth();
-    emit_topology_lock(
-        operation,
-        carrick_observability::probes::HvpatchTopologyPhase::Acquired,
-        guest_pid,
-        guest_tid,
-        topology_elapsed_ns(requested_at),
-    );
-    TopologyLockGuard {
-        _guard: guard,
-        operation,
-        guest_pid,
-        guest_tid,
-        acquired_at: Instant::now(),
-    }
-}
-
-/// Try the carrier-wide topology mutex without blocking. A contended attempt
-/// emits `TryMiss` and returns `None`; a successful attempt returns the same
-/// release-reporting guard as [`acquire_topology_lock`].
-pub fn try_acquire_topology_lock(
-    operation: carrick_observability::probes::HvpatchTopologyOperation,
-    guest_pid: i32,
-    guest_tid: i32,
-) -> Option<TopologyLockGuard> {
-    let requested_at = Instant::now();
-    emit_topology_lock(
-        operation,
-        carrick_observability::probes::HvpatchTopologyPhase::Requested,
-        guest_pid,
-        guest_tid,
-        0,
-    );
-    let guard = if topology_held_by_current_thread() {
-        None
-    } else {
-        match topology_lock().try_lock() {
-            Ok(guard) => Some(guard),
-            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-            Err(TryLockError::WouldBlock) => {
-                emit_topology_lock(
-                    operation,
-                    carrick_observability::probes::HvpatchTopologyPhase::TryMiss,
-                    guest_pid,
-                    guest_tid,
-                    topology_elapsed_ns(requested_at),
-                );
-                return None;
-            }
-        }
-    };
-    enter_topology_depth();
-    emit_topology_lock(
-        operation,
-        carrick_observability::probes::HvpatchTopologyPhase::Acquired,
-        guest_pid,
-        guest_tid,
-        topology_elapsed_ns(requested_at),
-    );
-    Some(TopologyLockGuard {
-        _guard: guard,
-        operation,
-        guest_pid,
-        guest_tid,
-        acquired_at: Instant::now(),
-    })
-}
-
-#[cfg(test)]
-mod topology_probe_tests {
-    #![allow(clippy::unwrap_used)]
-    use super::*;
-    use carrick_observability::probes::HvpatchTopologyOperation;
-
-    static TOPOLOGY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-    /// True iff a FRESH thread cannot take the process-wide topology mutex.
-    fn excluded_from_another_thread() -> bool {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    try_acquire_topology_lock(HvpatchTopologyOperation::VmRelease, 41, 43).is_none()
-                })
-                .join()
-                .expect("probe thread")
-        })
-    }
-
-    // One test, because every case here contends for the SAME process-wide
-    // mutex; splitting them lets the harness run them concurrently and they
-    // then observe each other's guards rather than their own.
-    #[test]
-    fn topology_guard_excludes_other_threads_and_re_enters_on_the_owning_one() {
-        let _test_lock = TOPOLOGY_TEST_LOCK.lock();
-        let guard = acquire_topology_lock(HvpatchTopologyOperation::InProcessFork, 41, 42);
-        // The lock excludes THREADS, so contention must be observed from a
-        // different thread — asking on the owning thread is re-entry, not
-        // contention.
-        assert!(
-            excluded_from_another_thread(),
-            "try acquisition must report contention while a typed guard is live"
-        );
-        drop(guard);
-        assert!(
-            !excluded_from_another_thread(),
-            "typed guard drop must release the shared topology mutex"
-        );
-
-        // A failed alias install re-enters this lock from its cleanup path
-        // while the vCPU loop still holds it for the enclosing AliasMap. When
-        // re-entry blocked, the carrier wedged forever at 0% CPU instead of
-        // lowering the failure to a guest ENOMEM.
-        let outer = acquire_topology_lock(HvpatchTopologyOperation::AliasMap, 7, 7);
-        let inner = acquire_topology_lock(HvpatchTopologyOperation::AliasUnmap, 7, 7);
-        let reentrant_try = try_acquire_topology_lock(HvpatchTopologyOperation::VmRelease, 7, 7);
-        assert!(
-            reentrant_try.is_some(),
-            "re-entry must also be granted through the non-blocking door"
-        );
-        drop(reentrant_try);
-        drop(inner);
-        assert!(
-            excluded_from_another_thread(),
-            "an inner guard drop must NOT release the mutex the outer guard owns"
-        );
-        drop(outer);
-        assert!(
-            !excluded_from_another_thread(),
-            "the outermost guard drop must release the mutex process-wide"
-        );
-    }
-
-    #[test]
-    fn topology_try_miss_subscribes_to_exact_release_without_blocking() {
-        let _test_lock = TOPOLOGY_TEST_LOCK.lock();
-        let outer = acquire_topology_lock(HvpatchTopologyOperation::InProcessFork, 51, 52);
-        let observed = topology_release_generation();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let waiter = std::thread::spawn(move || {
-            assert!(
-                try_acquire_topology_lock(HvpatchTopologyOperation::InProcessFork, 53, 54)
-                    .is_none()
-            );
-            match subscribe_topology_release(
-                observed,
-                Arc::new(move |generation| {
-                    let _ = tx.send(generation);
-                }),
-            ) {
-                TopologyReleaseEnrollment::Subscribed(subscription) => subscription,
-                TopologyReleaseEnrollment::Ready(_) => panic!("release raced test enrollment"),
-            }
-        });
-        let subscription = waiter.join().unwrap();
-        assert!(rx.try_recv().is_err());
-        drop(outer);
-        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap() > observed);
-        drop(subscription);
-    }
 }
 
 fn exec_owner() -> &'static AtomicI32 {
@@ -1968,10 +1692,6 @@ mod tests {
             let _first = parts.next();
             for part in parts {
                 let critical_section = part.split("drop(").next().unwrap_or(part);
-                assert!(
-                    !critical_section.contains("acquire_topology_lock"),
-                    "frame_registry_lock held across acquire_topology_lock"
-                );
                 assert!(
                     !critical_section.contains(".lock()"),
                     "frame_registry_lock held across another .lock() call"

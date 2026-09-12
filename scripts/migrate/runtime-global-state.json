@@ -1876,14 +1876,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-thread/src/fork_quiesce.rs",
-      "symbol": "NEXT_TOPOLOGY_LISTENER",
-      "fingerprint": "77f49234dba93458d974180c77f1df78a7bccfd9c6e027d7a2b069e3f6dcd70f",
-      "classification": "monotonic_allocator",
-      "rationale": "Process-wide monotonic identity allocator; values are never interpreted as the current container and are not reused."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-thread/src/fork_quiesce.rs",
       "symbol": "exec_owner::OWNER",
       "fingerprint": "93aebe81dfd1262562e7cf4a225185dc3db69b65fecc2ed75b62f39ad939f0de",
       "classification": "carrier_infra",
@@ -1902,30 +1894,6 @@
       "file": "crates/carrick-thread/src/fork_quiesce.rs",
       "symbol": "pt_barrier::B",
       "fingerprint": "f4764aca872ac7fc4b06284226e5ed4a403e4cd714ef1fe540b351626d7de25a",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-thread/src/fork_quiesce.rs",
-      "symbol": "topology_lock::L",
-      "fingerprint": "d5d31275524e8338b7af556763a70a16711eb1a2a91474fd13fa21fd4a15f26f",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-thread/src/fork_quiesce.rs",
-      "symbol": "topology_probe_tests::TOPOLOGY_TEST_LOCK",
-      "fingerprint": "29c1e1aae9c8164c23a54929fa89474de3cd73d0e531142f3487ef0c66a0036b",
-      "classification": "test_only",
-      "rationale": "Test-only fixture or synchronization guard, unreachable from production carrier execution."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-thread/src/fork_quiesce.rs",
-      "symbol": "topology_release_publication::PUBLICATION",
-      "fingerprint": "e60087495444491ef9f360b1093aec9517a20dcdd2ad059bd09030f4b0ee04d4",
       "classification": "carrier_infra",
       "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
     },

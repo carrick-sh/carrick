@@ -1,9 +1,11 @@
 #!/usr/sbin/dtrace -qs
 /*
- * Attribute every shared-HVF topology-lock wait and hold to its Carrick
- * operation and Linux guest identity. This answers which holder class is
- * present when a one-VM exec begins waiting; it does not assume fork is the
- * holder merely because fork snapshots are long.
+ * Attribute every HVPatch topology transaction and frame registry lock wait and
+ * hold to its Carrick operation and Linux guest identity (re-anchored to
+ * MmTransactionGuard per-mm and leaf FrameRegistryGuard following deletion of
+ * the carrier topology mutex). This answers which holder class is present when
+ * a one-VM exec begins waiting; it does not assume fork is the holder merely
+ * because fork snapshots are long.
  *
  * Provider ABI declared by carrick-observability for Darwin/arm64:
  * carrick*:::hvpatch-topology-lock carries five scalar CTF arguments:

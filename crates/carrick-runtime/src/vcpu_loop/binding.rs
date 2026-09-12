@@ -963,7 +963,8 @@ where
         // transaction depth and, inside, the registry leaf — never a
         // page-table pause, which elected a drain over sibling executors
         // exit_group had already put beyond kicking.
-        let topology = crate::dispatch::mm_mutation::terminal_process_transaction();
+        let mut topology = crate::dispatch::mm_mutation::terminal_process_transaction();
+        topology.set_identity(process.pid(), terminal_context.task().key().id.raw());
         let owns_final_mm = process
             .owns_final_mm_edge(terminal_context.task().key())
             .unwrap_or_else(|failure| {

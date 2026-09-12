@@ -2207,7 +2207,7 @@ mod task_only_materializer_tests {
 
     #[test]
     fn executor_preflights_kernel_cpu_before_consuming_task_authority() {
-        let source = include_str!("../../carrick-runtime/src/vcpu_loop/executor.rs");
+        let source = include_str!("../../carrick-runtime/src/vcpu_loop/executor/backend.rs");
         let load = source
             .split_once("impl PersistentExecutor for HvpatchPersistentExecutor")
             .expect("HVPatch executor implementation")

@@ -1776,12 +1776,22 @@ where
                             std::sync::Arc::clone(coordinator),
                             *mm_id,
                         )
+                        .with_operation(
+                            carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
+                        )
                     }
                     super::quiesce::MmStage1Authority::Paused(pause) => {
-                        crate::dispatch::mm_mutation::from_pt_pause(pause)
+                        crate::dispatch::mm_mutation::from_pt_pause(pause).with_operation(
+                            carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
+                        )
                     }
                 });
-        let _hvpatch_topology = mutation.as_ref().map(|m| m.begin_transaction());
+        let mut _hvpatch_topology = mutation.as_ref().map(|m| m.begin_transaction());
+        if let Some(guard) = _hvpatch_topology.as_mut() {
+            if let Some(process) = kernel.hvpatch_process.as_ref() {
+                guard.set_identity(process.pid(), self.this_tid.raw());
+            }
+        }
         emit_runtime_stage(
             carrick_observability::probes::HvpatchExecRuntimeStagePhase::TopologyLock,
             topology_lock_started,

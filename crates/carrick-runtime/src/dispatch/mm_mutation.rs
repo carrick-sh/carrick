@@ -112,11 +112,20 @@ impl MmMutationCoordinator {
 pub struct MmMutationGuard<'authority> {
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
+    operation: carrick_observability::probes::HvpatchTopologyOperation,
     foreign_authority: Option<&'authority mut crate::vcpu_loop::quiesce::FrameCowExactMmGuard>,
     _authority: PhantomData<&'authority mut ()>,
 }
 
-impl MmMutationGuard<'_> {
+impl<'authority> MmMutationGuard<'authority> {
+    pub fn with_operation(
+        mut self,
+        operation: carrick_observability::probes::HvpatchTopologyOperation,
+    ) -> Self {
+        self.operation = operation;
+        self
+    }
+
     /// Borrow the outer authority for one inner host-alias acquisition.
     pub fn host_alias_permit(&self) -> HostAliasPermit<'_> {
         HostAliasPermit {
@@ -132,7 +141,28 @@ impl MmMutationGuard<'_> {
     /// the stage-1 page-table exclusion.
     pub fn begin_transaction(&self) -> MmTransactionGuard<'_> {
         MmTransactionGuard {
-            depth: carrick_thread::fork_quiesce::TopologyDepth::acquire(),
+            depth: {
+                carrick_thread::fork_quiesce::emit_topology_lock(
+                    self.operation,
+                    carrick_observability::probes::HvpatchTopologyPhase::Requested,
+                    0,
+                    0,
+                    0,
+                );
+                let depth = carrick_thread::fork_quiesce::TopologyDepth::acquire();
+                carrick_thread::fork_quiesce::emit_topology_lock(
+                    self.operation,
+                    carrick_observability::probes::HvpatchTopologyPhase::Acquired,
+                    0,
+                    0,
+                    0,
+                );
+                depth
+            },
+            operation: self.operation,
+            guest_pid: 0,
+            guest_tid: 0,
+            acquired_at: std::time::Instant::now(),
             _guard: PhantomData,
         }
     }
@@ -246,6 +276,7 @@ pub(crate) fn from_pt_pause<'authority>(
     MmMutationGuard {
         coordinator,
         mm,
+        operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
         foreign_authority: None,
         _authority: PhantomData,
     }
@@ -263,6 +294,7 @@ pub(crate) fn from_sole_executor<'authority>(
     MmMutationGuard {
         coordinator,
         mm,
+        operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
         foreign_authority: None,
         _authority: PhantomData,
     }
@@ -281,6 +313,7 @@ pub(crate) fn from_frame_cow<'authority>(
     MmMutationGuard {
         coordinator,
         mm,
+        operation: carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
         foreign_authority: Some(authority),
         _authority: PhantomData,
     }
@@ -317,6 +350,10 @@ impl HostAliasPermit<'_> {
 /// not a comment.
 pub struct MmTransactionGuard<'guard> {
     depth: carrick_thread::fork_quiesce::TopologyDepth,
+    operation: carrick_observability::probes::HvpatchTopologyOperation,
+    guest_pid: i32,
+    guest_tid: i32,
+    acquired_at: std::time::Instant,
     _guard: PhantomData<&'guard MmMutationGuard<'guard>>,
 }
 
@@ -324,6 +361,23 @@ impl<'guard> MmTransactionGuard<'guard> {
     /// Access the underlying topology depth token.
     pub const fn depth(&self) -> &carrick_thread::fork_quiesce::TopologyDepth {
         &self.depth
+    }
+
+    pub fn set_identity(&mut self, pid: i32, tid: i32) {
+        self.guest_pid = pid;
+        self.guest_tid = tid;
+    }
+}
+
+impl Drop for MmTransactionGuard<'_> {
+    fn drop(&mut self) {
+        carrick_thread::fork_quiesce::emit_topology_lock(
+            self.operation,
+            carrick_observability::probes::HvpatchTopologyPhase::Released,
+            self.guest_pid,
+            self.guest_tid,
+            carrick_thread::fork_quiesce::topology_elapsed_ns(self.acquired_at),
+        );
     }
 }
 
@@ -426,7 +480,29 @@ mod tests {
 /// paths; the source-shape test in `mm_authority.rs` pins both.
 pub fn terminal_process_transaction() -> MmTransactionGuard<'static> {
     MmTransactionGuard {
-        depth: carrick_thread::fork_quiesce::TopologyDepth::acquire(),
+        depth: {
+            let operation = carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire;
+            carrick_thread::fork_quiesce::emit_topology_lock(
+                operation,
+                carrick_observability::probes::HvpatchTopologyPhase::Requested,
+                0,
+                0,
+                0,
+            );
+            let depth = carrick_thread::fork_quiesce::TopologyDepth::acquire();
+            carrick_thread::fork_quiesce::emit_topology_lock(
+                operation,
+                carrick_observability::probes::HvpatchTopologyPhase::Acquired,
+                0,
+                0,
+                0,
+            );
+            depth
+        },
+        operation: carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+        guest_pid: 0,
+        guest_tid: 0,
+        acquired_at: std::time::Instant::now(),
         _guard: PhantomData,
     }
 }

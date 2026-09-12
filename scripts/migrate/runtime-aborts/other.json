@@ -302,28 +302,6 @@
     },
     {
       "file": "crates/carrick-thread/src/fork_quiesce.rs",
-      "function": "subscribe_topology_release",
-      "ordinal_in_function": 1,
-      "fingerprint": "d51310628b58e7babba5dceb5b5b99b6e2adfa9c9d93b2af9f012dae4a115d8f",
-      "verdict": "carrier_fault",
-      "failure_domain": "thread::topology",
-      "rationale": "Topology release listener ID was zero, violating non-zero invariant.",
-      "sink": "fatal",
-      "domain": "thread::topology"
-    },
-    {
-      "file": "crates/carrick-thread/src/fork_quiesce.rs",
-      "function": "publish_topology_release",
-      "ordinal_in_function": 1,
-      "fingerprint": "3130de4aa194446aab2bc00290f0d22e9446c1d8457c44f3da2d76a0c4b8d2de",
-      "verdict": "carrier_fault",
-      "failure_domain": "thread::topology",
-      "rationale": "Active topology release registration was missing or mismatching during release publication.",
-      "sink": "fatal",
-      "domain": "thread::topology"
-    },
-    {
-      "file": "crates/carrick-thread/src/fork_quiesce.rs",
       "function": "QuiesceBarrier::notify_quiesced_progress",
       "ordinal_in_function": 1,
       "fingerprint": "761e72fc4173294cf22a6a83b90b76b5a0933150017f79e92cd83f6d29faa463",
