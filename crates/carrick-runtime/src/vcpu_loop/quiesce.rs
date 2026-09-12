@@ -3170,12 +3170,22 @@ mod pt_pause_tests {
 
     #[test]
     fn two_parents_fork_concurrently() {
-        let barrier: &'static crate::fork_quiesce::QuiesceBarrier =
-            Box::leak(Box::new(crate::fork_quiesce::QuiesceBarrier::new()));
+        let parent_a_barrier: &'static crate::fork_quiesce::ForkQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::ForkQuiesce::new()));
+        let parent_b_barrier: &'static crate::fork_quiesce::ForkQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::ForkQuiesce::new()));
         let gate = Arc::new(CloneAdmissionGate::default());
-        let parent_a = try_begin_hvpatch_process_fork_with_admission(barrier, tid(10), &gate);
+        let parent_a =
+            try_begin_hvpatch_process_fork_with_admission(parent_a_barrier, tid(10), &gate);
         assert!(matches!(parent_a, ProcessForkStart::Admitted { .. }));
-        let parent_b = try_begin_hvpatch_process_fork_with_admission(barrier, tid(20), &gate);
+        let parent_a_sibling =
+            try_begin_hvpatch_process_fork_with_admission(parent_a_barrier, tid(11), &gate);
+        assert!(
+            matches!(parent_a_sibling, ProcessForkStart::Busy),
+            "a sibling on the same parent MM must observe Busy"
+        );
+        let parent_b =
+            try_begin_hvpatch_process_fork_with_admission(parent_b_barrier, tid(20), &gate);
         assert!(
             matches!(parent_b, ProcessForkStart::Admitted { .. }),
             "two parents on distinct MMs must fork concurrently without Busy"
