@@ -1801,7 +1801,7 @@
       "domain": "kernel::fs_context_publication"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/wait.rs",
       "function": "Kernel::wait_child_matching",
       "ordinal_in_function": 1,
       "fingerprint": "2bf13088d6b40fcfe444997b60af74a0a76d3c23a990a0f43ce03cf7fd19ef41",
@@ -1812,7 +1812,7 @@
       "domain": "kernel::child_reaping"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/operations.rs",
+      "file": "crates/carrick-runtime/src/kernel/operations/wait.rs",
       "function": "Kernel::wait_child_matching",
       "ordinal_in_function": 2,
       "fingerprint": "2bf13088d6b40fcfe444997b60af74a0a76d3c23a990a0f43ce03cf7fd19ef41",
