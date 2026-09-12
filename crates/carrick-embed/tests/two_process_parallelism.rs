@@ -123,11 +123,12 @@ fn configure_container(builder: ContainerBuilder, cmd: &[&str]) -> ContainerBuil
         .mount_readonly(p_dir.to_string_lossy(), "/p")
 }
 
-fn run_guest(cmd: &[&str]) -> GuestResult {
+/// One `Carrier` per test process: a second `carrier_or_fail()` while the first
+/// is alive fails with `CarrierAlreadyActive`, which is what the first run of
+/// this suite hit (2026-09-12). Every phase of a test shares the carrier it
+/// was handed.
+fn run_guest(carrier: &Carrier, cmd: &[&str]) -> GuestResult {
     let _guest = common::guest_lock();
-    let Some(carrier) = carrier_or_fail() else {
-        return GuestResult::empty();
-    };
     let builder = configure_container(carrier.container(common::SMOKE_IMAGE), cmd);
     let outcome = builder.run_blocking();
     assert_run_ok(&outcome);
@@ -137,11 +138,8 @@ fn run_guest(cmd: &[&str]) -> GuestResult {
     GuestResult::from_container_result(result)
 }
 
-fn run_two_guests(cmd_a: &[&str], cmd_b: &[&str]) -> (GuestResult, GuestResult) {
+fn run_two_guests(carrier: &Carrier, cmd_a: &[&str], cmd_b: &[&str]) -> (GuestResult, GuestResult) {
     let _guest = common::guest_lock();
-    let Some(carrier) = carrier_or_fail() else {
-        return (GuestResult::empty(), GuestResult::empty());
-    };
     let builder_a = configure_container(carrier.container(common::SMOKE_IMAGE), cmd_a);
     let builder_b = configure_container(carrier.container(common::SMOKE_IMAGE), cmd_b);
 
@@ -261,7 +259,10 @@ fn fault_p99(out: impl AsRef<str>) -> u64 {
 fn children_run_concurrently() {
     // 4 children x 400 ms of spinning; with 4 exposed CPUs the wall time is
     // ~400 ms when they run in parallel and ~1600 ms when serialized.
-    let out = run_guest(&["/p/perf_forkstorm", "busy", "4", "400"]);
+    let Some(carrier) = carrier_or_fail() else {
+        return;
+    };
+    let out = run_guest(&carrier, &["/p/perf_forkstorm", "busy", "4", "400"]);
     let wall_ms: u64 = field(&out, "wall_ms");
     assert!(
         wall_ms < 800,
@@ -273,10 +274,16 @@ fn children_run_concurrently() {
 fn fault_latency_is_independent_of_sibling_fork() {
     // Process A: fork storm (200 forks). Process B: fault loop. B's p99
     // round latency with A running must stay within 3x of B alone.
-    let alone = fault_p99(run_guest(&["/p/perf_forkstorm", "faulter", "50"]));
+    // 8 rounds of a 64 MiB touch+unmap loop: enough for a p99, and the alone
+    // phase stays in the seconds (50 rounds took 472 s on 2026-09-12).
+    let Some(carrier) = carrier_or_fail() else {
+        return;
+    };
+    let alone = fault_p99(run_guest(&carrier, &["/p/perf_forkstorm", "faulter", "8"]));
     let (a, b) = run_two_guests(
+        &carrier,
         &["/p/perf_forkstorm", "busy", "200", "5"],
-        &["/p/perf_forkstorm", "faulter", "50"],
+        &["/p/perf_forkstorm", "faulter", "8"],
     );
     assert!(a.exit_ok());
     let contended = fault_p99(b);
