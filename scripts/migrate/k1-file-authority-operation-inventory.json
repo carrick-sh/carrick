@@ -15681,7 +15681,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 2961,
+      "line": 2825,
       "categories": [
         "table_guard"
       ],
@@ -15690,7 +15690,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 3417,
+      "line": 3281,
       "categories": [
         "lifecycle"
       ],
@@ -15699,7 +15699,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 3452,
+      "line": 3316,
       "categories": [
         "lifecycle"
       ],
@@ -15708,7 +15708,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 3513,
+      "line": 3377,
       "categories": [
         "lifecycle"
       ],
@@ -15717,7 +15717,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 5910,
+      "line": 5300,
       "categories": [
         "table_guard"
       ],
@@ -15726,7 +15726,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 5941,
+      "line": 5331,
       "categories": [
         "table_guard"
       ],
@@ -15735,7 +15735,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 8247,
+      "line": 7427,
       "categories": [
         "mapping"
       ],
@@ -15744,7 +15744,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 8256,
+      "line": 7436,
       "categories": [
         "mapping"
       ],
@@ -15753,7 +15753,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 8258,
+      "line": 7438,
       "categories": [
         "mapping"
       ],
@@ -15762,7 +15762,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 8290,
+      "line": 7470,
       "categories": [
         "mapping"
       ],
@@ -15771,7 +15771,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/kernel/operations.rs",
-      "line": 8292,
+      "line": 7472,
       "categories": [
         "mapping"
       ],
