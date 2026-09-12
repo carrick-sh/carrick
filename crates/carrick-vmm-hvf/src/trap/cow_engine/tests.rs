@@ -250,47 +250,61 @@ fn fork_exec_exit_and_unmap_sites_contain_no_carrier_topology_lock() {
     let cow_engine_src = include_str!("../cow_engine.rs");
 
     fn strip_tests(src: &str) -> &str {
-        if let Some((prod, _)) = src.split_once("\n#[cfg(test)]\nmod tests") {
-            prod
-        } else if let Some((prod, _)) = src.split_once("\n#[cfg(test)]\npub(crate) mod tests") {
-            prod
-        } else {
-            src
+        for pattern in [
+            "\n#[cfg(test)]\npub(crate) mod tests",
+            "\n#[cfg(test)]\nmod pt_pause_tests",
+            "\n#[cfg(test)]\nmod tests",
+            "\n#[cfg(test)]\npub(crate) fn fail_running_and_retire_for_test",
+        ] {
+            if let Some((prod, _)) = src.split_once(pattern) {
+                return prod;
+            }
         }
+        src
+    }
+
+    fn contains_topology_lock(src: &str) -> bool {
+        strip_tests(src).lines().any(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                return false;
+            }
+            trimmed.contains("acquire_topology_lock(")
+                || trimmed.contains("try_acquire_topology_lock(")
+        })
     }
 
     let mut failures = Vec::new();
-    if strip_tests(&quiesce_src).contains("try_acquire_topology_lock(")
-        || strip_tests(&quiesce_src).contains("acquire_topology_lock(")
-    {
+    if contains_topology_lock(&quiesce_src) {
         failures.push("quiesce.rs production code contains carrier topology lock");
     }
-    if strip_tests(&exec_src).contains("try_acquire_topology_lock(")
-        || strip_tests(&exec_src).contains("acquire_topology_lock(")
-    {
+    if contains_topology_lock(&exec_src) {
         failures.push("exec.rs production code contains carrier topology lock");
     }
-    if strip_tests(&binding_src).contains("try_acquire_topology_lock(")
-        || strip_tests(&binding_src).contains("acquire_topology_lock(")
-    {
+    if contains_topology_lock(&binding_src) {
         failures.push("binding.rs production code contains carrier topology lock");
     }
-    if strip_tests(&executor_settlement_src).contains("try_acquire_topology_lock(")
-        || strip_tests(&executor_settlement_src).contains("acquire_topology_lock(")
-    {
+    if contains_topology_lock(&executor_settlement_src) {
         failures.push("executor/settlement.rs production code contains carrier topology lock");
     }
-    if strip_tests(&executor_src).contains("acquire_process_retire_topology_lock_servicing")
-        || strip_tests(&executor_settlement_src)
-            .contains("acquire_process_retire_topology_lock_servicing")
-    {
+    if strip_tests(&executor_src).lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with("//")
+            && !trimmed.starts_with("/*")
+            && !trimmed.starts_with('*')
+            && trimmed.contains("acquire_process_retire_topology_lock_servicing")
+    }) || strip_tests(&executor_settlement_src).lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with("//")
+            && !trimmed.starts_with("/*")
+            && !trimmed.starts_with('*')
+            && trimmed.contains("acquire_process_retire_topology_lock_servicing")
+    }) {
         failures.push(
             "executor production code contains acquire_process_retire_topology_lock_servicing",
         );
     }
-    if strip_tests(cow_engine_src).contains("try_acquire_topology_lock(")
-        || strip_tests(cow_engine_src).contains("acquire_topology_lock(")
-    {
+    if contains_topology_lock(cow_engine_src) {
         failures.push("cow_engine.rs production code contains carrier topology lock");
     }
     assert!(
