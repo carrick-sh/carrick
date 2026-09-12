@@ -178,6 +178,16 @@ mod epoll_edge_sample_tests {
     }
 }
 
+struct EpollPwaitWaitArgs {
+    open_file: OpenFile,
+    epfd: i32,
+    events_address: u64,
+    guest_abi: LinuxGuestAbi,
+    max_events: usize,
+    timeout_ms: i32,
+    sig_mask: carrick_abi::WaitSigMask,
+}
+
 impl<'a> NetView<'a> {
     fn fd_is_epollable(&self, fd: i32) -> bool {
         let Some(open_file) = self.open_file(fd) else {
@@ -906,18 +916,20 @@ impl<'a> NetView<'a> {
 
     // core stays byte-for-byte identical (one pre-existing unused destructure).
     #[allow(unused_variables)]
-    #[allow(clippy::too_many_arguments)]
     fn epoll_pwait_wait_core<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
-        open_file: OpenFile,
-        epfd: i32,
-        events_address: u64,
-        guest_abi: LinuxGuestAbi,
-        max_events: usize,
-        timeout_ms: i32,
-        sig_mask: carrick_abi::WaitSigMask,
+        args: EpollPwaitWaitArgs,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let EpollPwaitWaitArgs {
+            open_file,
+            epfd,
+            events_address,
+            guest_abi,
+            max_events,
+            timeout_ms,
+            sig_mask,
+        } = args;
         let this = self;
         // Snapshot any already-queued ready events first. `ready` is
         // reassigned on the multiplexer path below (it collects the
@@ -3421,13 +3433,15 @@ impl<'a> NetView<'a> {
             };
             this.epoll_pwait_wait_core(
                 memory,
-                open_file,
-                epfd,
-                events_address,
-                guest_abi,
-                max_events,
-                timeout_ms,
-                sig_mask,
+                EpollPwaitWaitArgs {
+                    open_file,
+                    epfd,
+                    events_address,
+                    guest_abi,
+                    max_events,
+                    timeout_ms,
+                    sig_mask,
+                },
             )
 
         }
@@ -3527,13 +3541,15 @@ impl<'a> NetView<'a> {
             // diverging from epoll_pwait (LTP epoll_pwait01/02/03).
             this.epoll_pwait_wait_core(
                 memory,
-                open_file,
-                epfd,
-                events_address,
-                guest_abi,
-                max_events,
-                timeout_ms,
-                sig_mask,
+                EpollPwaitWaitArgs {
+                    open_file,
+                    epfd,
+                    events_address,
+                    guest_abi,
+                    max_events,
+                    timeout_ms,
+                    sig_mask,
+                },
             )
         }
 
