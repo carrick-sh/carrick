@@ -2085,14 +2085,17 @@ pub(crate) fn perform_foreign_cow_transaction(
         })
     };
     drop(registry);
+    let scope = CowInventoryLifecycleScope {
+        custody: &lease.custody,
+        identity: Some(runtime.identity),
+        mm_root_slot: runtime.mm_root_slot,
+        semantic_va: span.va,
+        semantic_length: span.len as u64,
+    };
     record_cow_inventory_lifecycle(
         CowDiagnosticLifecycleKind::InventoryRemoved,
         CowDiagnosticLifecycleSite::ForeignCowCommit,
-        &lease.custody,
-        Some(runtime.identity),
-        runtime.mm_root_slot,
-        span.va,
-        span.len as u64,
+        &scope,
         split.old_key,
         split.old,
     );
@@ -2100,11 +2103,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         record_cow_inventory_lifecycle(
             CowDiagnosticLifecycleKind::InventoryPublished,
             CowDiagnosticLifecycleSite::ForeignCowCommit,
-            &lease.custody,
-            Some(runtime.identity),
-            runtime.mm_root_slot,
-            span.va,
-            span.len as u64,
+            &scope,
             (fragment.gpa, fragment.length),
             InventoryExtent {
                 frame: split.old.frame,
@@ -2119,11 +2118,7 @@ pub(crate) fn perform_foreign_cow_transaction(
     record_cow_inventory_lifecycle(
         CowDiagnosticLifecycleKind::InventoryPublished,
         CowDiagnosticLifecycleSite::ForeignCowCommit,
-        &lease.custody,
-        Some(runtime.identity),
-        runtime.mm_root_slot,
-        span.va,
-        span.len as u64,
+        &scope,
         split.new_key,
         split.new_extent,
     );

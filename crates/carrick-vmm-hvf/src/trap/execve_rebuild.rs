@@ -1152,15 +1152,18 @@ impl HvfVmState {
                         "stage inventory after HVPatch exec unmap: {error}"
                     );
                 }
+                let scope = CowInventoryLifecycleScope {
+                    custody: &self.carrier_foreign_mm_transport.custody,
+                    identity: self.cow_identity,
+                    mm_root_slot: self.mm_root_slot,
+                    semantic_va: 0,
+                    semantic_length: 0,
+                };
                 for (key, extent) in diagnostic_extents {
                     record_cow_inventory_lifecycle(
                         CowDiagnosticLifecycleKind::InventoryRemoved,
                         CowDiagnosticLifecycleSite::ExecRetirement,
-                        &self.carrier_foreign_mm_transport.custody,
-                        self.cow_identity,
-                        self.mm_root_slot,
-                        0,
-                        0,
+                        &scope,
                         key,
                         extent,
                     );
