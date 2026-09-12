@@ -1,5 +1,9 @@
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
+
 use super::*;
 use crate::linux_abi::LINUX_ENFILE;
+use crate::rootfs::RootFs;
 
 // -- shared scenarios, run against both backends -----------------
 
@@ -316,10 +320,7 @@ fn memory_normalize_strips_root_and_collapses_dots() {
 
 #[test]
 fn hostfs_teardown_has_no_process_creation_surface() {
-    let production = include_str!("../fs_backend.rs")
-        .split("\n#[cfg(test)]\nmod tests")
-        .next()
-        .expect("production source before the test module");
+    let production = include_str!("host.rs");
 
     for forbidden in [
         "spawn_detached_reaper(",
