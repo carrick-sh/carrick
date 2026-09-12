@@ -519,3 +519,11 @@ script's anchors must be re-qualified live before its numbers are cited.
   parallelism is ~1.95 cores (was 1.3 before Task 4; Docker ~5 of 10 in
   2.9 s). The row is now ~2.2x Docker at one worker; the remaining
   serialization is Task 6's (fork flag/coordinator) and Task 5's.
+- 2026-09-12 10:36, binary 77edb0f41b3ff492 (main a263a4edf, both Task 4
+  fixes in): Task 1 acceptance GREEN — `children_run_concurrently` 0.60 s,
+  `fault_latency_is_independent_of_sibling_fork` passes (154 s wall for
+  its alone + contended phases; the 8-round 64 MiB fault loop is still
+  heavy for a gate and should shrink further). Exposed CPUs 4 vs 10 on the
+  multiprocessing row: 6.66 s vs 6.62 s wall, 10.3 s user both — CPU
+  exposure is not the limiter; parallelism ~1.9 cores. Paired five-row
+  scorecard running.
