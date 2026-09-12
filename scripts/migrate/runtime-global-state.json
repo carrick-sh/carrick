@@ -994,20 +994,20 @@
       "rationale": "Carrier-wide host infrastructure static scratch_cleanup_sender::SENDER in crates/carrick-runtime/src/fs_backend.rs maintaining host process lifecycle or VM resources."
     },
     {
-      "kind": "static",
-      "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "symbol": "tests::FS_RLIMIT_TEST_LOCK",
-      "fingerprint": "7773663f610e1202f0096166c01a64cc03201032928b18a2e5395a7ab6b584ef",
-      "classification": "test_only",
-      "rationale": "The cfg(test) mutex serializes host descriptor exhaustion tests that manipulate process rlimits."
-    },
-    {
       "kind": "thread_local",
       "file": "crates/carrick-runtime/src/fs_backend.rs",
       "symbol": "EXCLUSIVE_ARCHIVE_GATES",
       "fingerprint": "f2d82442711502ce92f2b201cce414a32749146c1a91c11fb4843e7483c3a8a4",
       "classification": "carrier_infra",
       "rationale": "Host thread-local cell EXCLUSIVE_ARCHIVE_GATES in crates/carrick-runtime/src/fs_backend.rs maintaining per-host-thread execution state for the carrier."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-runtime/src/fs_backend/tests.rs",
+      "symbol": "FS_RLIMIT_TEST_LOCK",
+      "fingerprint": "ff23d140e02e55b39ed7676ed239c438d8d20f84c00c2783b51158d506282509",
+      "classification": "test_only",
+      "rationale": "The cfg(test) mutex serializes host descriptor exhaustion tests that manipulate process rlimits."
     },
     {
       "kind": "static",
