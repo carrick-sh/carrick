@@ -44,6 +44,11 @@ ROOT = Path(__file__).resolve().parents[2]
 INVENTORY = ROOT / "scripts/migrate/host-authority-transition-inventory.json"
 CAPTURE = ROOT / "scripts/migrate/host-authority-macos-capture.json"
 
+REHOME_FUNCTION_ALIASES: dict[str, str] = {
+    "sweep_orphans": "discover_orphans",
+    "from_existing_dir": "from_existing_root_fd",
+}
+
 
 class RefusedError(Exception):
     """A change that needs review, not a position rebind."""
@@ -244,6 +249,7 @@ def reconcile_host_authority_positions(
             rev_fn = extract_reviewed_enclosing_function(rev)
             if rev_fn is None:
                 raise RefusedError(f"host-authority: could not determine enclosing function from rationale: {rev.get('rationale')}")
+            rev_fn = REHOME_FUNCTION_ALIASES.get(rev_fn, rev_fn)
             key_fn = (rev.get("catalog_id"), rev.get("operation"), rev_fn)
             reviewed_by_fn[key_fn].append(rev)
 
@@ -288,6 +294,13 @@ def reconcile_host_authority_positions(
                 if stale in rationale:
                     old["rationale"] = rationale.replace(stale, fresh_prefix, 1)
                     rebound += 1
+                orig_fn = extract_reviewed_enclosing_function(old)
+                if orig_fn and orig_fn in REHOME_FUNCTION_ALIASES:
+                    target_fn = REHOME_FUNCTION_ALIASES[orig_fn]
+                    old["rationale"] = old["rationale"].replace(f"`{orig_fn}`", f"`{target_fn}`")
+                    evidence = old.get("evidence")
+                    if isinstance(evidence, dict) and "resource" in evidence:
+                        evidence["resource"] = evidence["resource"].replace(f"`{orig_fn}`", f"`{target_fn}`")
                 moved += 1
 
     inventory.sort(key=canonical_row_sort_key)

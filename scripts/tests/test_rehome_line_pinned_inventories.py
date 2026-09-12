@@ -344,6 +344,86 @@ class RehomeInventoriesTests(unittest.TestCase):
         self.assertEqual(up_row["source"]["line"], 2)
         self.assertIn(f"At {rel_b}:2 in `moved_ha_fn`", up_row["rationale"])
 
+    def test_host_authority_aliased_function_rehomes(self):
+        """Host authority row with aliased historical function name re-homes properly."""
+        target_file = self.hvf_src / "target_ha.rs"
+        target_file.write_text(
+            "pub fn discover_orphans() {\n"
+            "    let _ = std::fs::read_dir(\"/tmp\");\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        rel_a = "crates/carrick-vmm-hvf/src/source_ha.rs"
+        rel_b = "crates/carrick-vmm-hvf/src/target_ha.rs"
+
+        cand_data = {
+            "capture_receipt": {"kind": "macos_hvf", "rows": []},
+            "rows": [
+                {
+                    "catalog_id": "HA-CATALOG-FS-READ-DIR",
+                    "operation": "std::fs::read_dir",
+                    "source": {
+                        "file": rel_b,
+                        "line": 2,
+                        "column": 13,
+                        "column_start": 13,
+                        "column_end": 38,
+                        "line_start": 2,
+                        "line_end": 2,
+                        "byte_start": 40,
+                        "byte_end": 65,
+                    },
+                    "expansion": None,
+                    "profiles": ["macos-hvf-default"],
+                }
+            ],
+        }
+        cand_path = self.root / "candidate.json"
+        cand_path.write_text(json.dumps(cand_data, indent=2) + "\n")
+
+        inv_path = self.migrate_dir / "host-authority-transition-inventory.json"
+        cap_path = self.migrate_dir / "host-authority-macos-capture.json"
+        cap_path.write_text(json.dumps({"kind": "macos_hvf", "rows": []}, indent=2) + "\n")
+
+        row = {
+            "catalog_id": "HA-CATALOG-FS-READ-DIR",
+            "operation": "std::fs::read_dir",
+            "classification": "reviewed",
+            "rationale": f"At {rel_a}:10 in `sweep_orphans`, std::fs::read_dir accesses only scratch directory.",
+            "review_id": "HA-000260",
+            "profiles": ["macos-hvf-default"],
+            "evidence": {"authority": "authorized_backing", "resource": "scratch tree used by `sweep_orphans`"},
+            "expansion": None,
+            "source": {
+                "file": rel_a,
+                "line": 10,
+                "column": 13,
+                "column_start": 13,
+                "column_end": 38,
+                "line_start": 10,
+                "line_end": 10,
+                "byte_start": 150,
+                "byte_end": 175,
+            },
+        }
+        inv_path.write_text(json.dumps([row], indent=2) + "\n")
+        rebound = RECONCILE.reconcile_host_authority(
+            candidate_path=cand_path,
+            inventory_path=inv_path,
+            capture_path=cap_path,
+            rehome=True,
+            root=self.root,
+        )
+        self.assertEqual(rebound, 1)
+
+        updated_inv = json.loads(inv_path.read_text())
+        self.assertEqual(len(updated_inv), 1)
+        up_row = updated_inv[0]
+        self.assertEqual(up_row["source"]["file"], rel_b)
+        self.assertEqual(up_row["source"]["line"], 2)
+        self.assertIn(f"At {rel_b}:2 in `discover_orphans`", up_row["rationale"])
+        self.assertIn("used by `discover_orphans`", up_row["evidence"]["resource"])
+
     def test_host_authority_different_operation_refused(self):
         """Host authority candidate with different operation is refused."""
         target_file = self.hvf_src / "target_ha.rs"
