@@ -4240,14 +4240,14 @@ fn retire_process_aliases(
 /// failing roughly one run in three). A per-process operation should not need
 /// process-global state to be exercised, and now it does not.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn retire_process_aliases_in(
+pub(crate) fn retire_process_aliases_in(
     registry: &mut AliasRegistry,
     replay: &std::collections::BTreeSet<ReplayMappingKey>,
     versions: &mut AliasVersionRegistry,
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
     mut global_keep: impl FnMut(&AliasBacking) -> bool,
-) {
+) -> RetiredRows {
     let owned_scope = AliasRegistry::owned_scope(mm_root_slot, container_root);
     let mut dropped_global_first = std::collections::BTreeMap::new();
     let mut dropped_global_order = Vec::new();
@@ -4264,6 +4264,7 @@ fn retire_process_aliases_in(
         survives
     });
     note_alias_state_rows_scanned(removed_owned.len() + removed_global.len());
+    note_alias_state_rows_scanned(replay.len() + versions.aliases.len());
 
     // Affected keys, in first-seen order, with their effective row beforehand and afterwards.
     // Removing a whole scope leaves every key in it with no successor; the
@@ -4329,6 +4330,7 @@ fn retire_process_aliases_in(
             versions.replay_version_owner.remove(&id);
         }
     }
+    RetiredRows::new(removed_owned)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

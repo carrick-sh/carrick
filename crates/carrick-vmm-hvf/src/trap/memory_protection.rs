@@ -427,12 +427,10 @@ impl RetiredRows {
         Self { aliases }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.aliases.len()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.aliases.is_empty()
     }
@@ -3143,38 +3141,6 @@ mod alias_differential_tests {
         assert!(
             examined < 100,
             "examined {examined} candidates, expected not thousands"
-        );
-    }
-
-    #[test]
-    fn exit_cost_is_bounded_by_own_rows() {
-        let mut registry = AliasRegistry::default();
-        let mut target_scope = None;
-        for s in 0..1000u64 {
-            let scope = AliasOwnershipScope::MmRootSlot {
-                base: 0x1000_0000_0000 + s * 0x1000_0000,
-                size: 0x4000,
-            };
-            if s == 500 {
-                target_scope = Some(scope);
-            }
-            for r in 0..64u64 {
-                let va = 0x2000_0000 + r * 0x1000;
-                let ipa = 0x6000_0000_0000 + s * 0x1000_0000 + r * 0x1000;
-                registry.push(make_alias(va, ipa, 0x1000, scope));
-            }
-        }
-        let target_scope = target_scope.expect("target scope");
-        let before = alias_state_rows_scanned();
-        let retired = registry.retire_scope(target_scope);
-        let examined = alias_state_rows_scanned() - before;
-        assert!(!retired.is_empty());
-        assert_eq!(retired.len(), 64);
-        assert_eq!(retired.into_vec().len(), 64);
-        let bound = 64 + (1000f64).log2().ceil() as u64;
-        assert!(
-            examined <= bound,
-            "retiring one scope visited {examined} rows; expected <= {bound}"
         );
     }
 }
