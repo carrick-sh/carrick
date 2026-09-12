@@ -1950,27 +1950,31 @@ pub(crate) fn record_alias_revision(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct CowInventoryLifecycleScope<'a> {
+    pub custody: &'a CarrierVmCustody,
+    pub identity: Option<carrick_hal::FrameCowIdentity>,
+    pub mm_root_slot: Option<(u64, u64)>,
+    pub semantic_va: u64,
+    pub semantic_length: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn record_cow_inventory_lifecycle(
     kind: CowDiagnosticLifecycleKind,
     site: CowDiagnosticLifecycleSite,
-    custody: &CarrierVmCustody,
-    identity: Option<carrick_hal::FrameCowIdentity>,
-    mm_root_slot: Option<(u64, u64)>,
-    semantic_va: u64,
-    semantic_length: u64,
+    scope: &CowInventoryLifecycleScope<'_>,
     logical_key: (u64, u64),
     extent: InventoryExtent,
 ) {
     record_cow_diagnostic_event(CowDiagnosticEvent::Lifecycle {
         kind,
         site,
-        custody: custody as *const CarrierVmCustody as usize,
-        linux_pid: identity.map_or(0, |identity| identity.linux_pid),
-        mm: identity.map_or(0, |identity| identity.mm),
-        mm_root_slot_base: mm_root_slot.map_or(0, |slot| slot.0),
-        semantic_va,
-        semantic_length,
+        custody: scope.custody as *const CarrierVmCustody as usize,
+        linux_pid: scope.identity.map_or(0, |identity| identity.linux_pid),
+        mm: scope.identity.map_or(0, |identity| identity.mm),
+        mm_root_slot_base: scope.mm_root_slot.map_or(0, |slot| slot.0),
+        semantic_va: scope.semantic_va,
+        semantic_length: scope.semantic_length,
         logical_gpa: logical_key.0,
         logical_length: logical_key.1,
         physical_ipa: extent.stage2_base,

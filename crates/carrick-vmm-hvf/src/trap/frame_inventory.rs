@@ -2569,15 +2569,18 @@ impl HvfVmState {
             };
             let candidates =
                 Self::stage_retirement(&mut inventory, &mut reservation, authority.as_ref())?;
+            let scope = CowInventoryLifecycleScope {
+                custody,
+                identity: task.cow_identity,
+                mm_root_slot: task.mm_root_slot,
+                semantic_va: 0,
+                semantic_length: 0,
+            };
             for (key, extent) in diagnostic_extents {
                 record_cow_inventory_lifecycle(
                     CowDiagnosticLifecycleKind::InventoryRemoved,
                     CowDiagnosticLifecycleSite::ProcessRetirement,
-                    custody,
-                    task.cow_identity,
-                    task.mm_root_slot,
-                    0,
-                    0,
+                    &scope,
                     key,
                     extent,
                 );

@@ -102,9 +102,11 @@ pub(crate) fn drive_pending_carrier_vm_cleanup(
     drive_pending_carrier_vm_cleanup_using(
         custody,
         generation,
-        vcpu_id,
-        raw_vm_destroyed,
-        context,
+        PendingCarrierVmCleanupState {
+            vcpu_id,
+            raw_vm_destroyed,
+            context,
+        },
         |id| unsafe { applevisor_sys::hv_vcpu_destroy(id) },
         |custody, generation, context| {
             destroy_vm_with_custody_target(
@@ -118,13 +120,17 @@ pub(crate) fn drive_pending_carrier_vm_cleanup(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct PendingCarrierVmCleanupState<'a> {
+    pub vcpu_id: &'a mut Option<applevisor_sys::hv_vcpu_t>,
+    pub raw_vm_destroyed: &'a mut bool,
+    pub context: &'a str,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn drive_pending_carrier_vm_cleanup_using(
     custody: &std::sync::Arc<CarrierVmCustody>,
     generation: CarrierVmGeneration,
-    vcpu_id: &mut Option<applevisor_sys::hv_vcpu_t>,
-    raw_vm_destroyed: &mut bool,
-    context: &str,
+    state: PendingCarrierVmCleanupState<'_>,
     mut destroy_vcpu: impl FnMut(applevisor_sys::hv_vcpu_t) -> applevisor_sys::hv_return_t,
     mut destroy_vm: impl FnMut(
         &std::sync::Arc<CarrierVmCustody>,
@@ -133,6 +139,11 @@ pub(crate) fn drive_pending_carrier_vm_cleanup_using(
     ) -> Result<(), TrapError>,
     mut finalize_records: impl FnMut(&std::sync::Arc<CarrierVmCustody>) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
+    let PendingCarrierVmCleanupState {
+        vcpu_id,
+        raw_vm_destroyed,
+        context,
+    } = state;
     if let Some(id) = *vcpu_id {
         let rc = destroy_vcpu(id);
         if rc != 0 {
@@ -3277,9 +3288,11 @@ mod carrier_vm_custody_tests {
         let first = super::drive_pending_carrier_vm_cleanup_using(
             &custody,
             generation,
-            &mut vcpu_id,
-            &mut raw_vm_destroyed,
-            "injected cleanup",
+            super::PendingCarrierVmCleanupState {
+                vcpu_id: &mut vcpu_id,
+                raw_vm_destroyed: &mut raw_vm_destroyed,
+                context: "injected cleanup",
+            },
             |_| 0xfae9_4001_u32 as applevisor_sys::hv_return_t,
             |_, _, _| {
                 vm_destroy_calls.set(vm_destroy_calls.get() + 1);
@@ -3298,9 +3311,11 @@ mod carrier_vm_custody_tests {
         let second = super::drive_pending_carrier_vm_cleanup_using(
             &custody,
             generation,
-            &mut vcpu_id,
-            &mut raw_vm_destroyed,
-            "injected cleanup retry",
+            super::PendingCarrierVmCleanupState {
+                vcpu_id: &mut vcpu_id,
+                raw_vm_destroyed: &mut raw_vm_destroyed,
+                context: "injected cleanup retry",
+            },
             |_| 0,
             |custody, generation, _| {
                 vm_destroy_calls.set(vm_destroy_calls.get() + 1);
@@ -3328,9 +3343,11 @@ mod carrier_vm_custody_tests {
         super::drive_pending_carrier_vm_cleanup_using(
             &custody,
             generation,
-            &mut vcpu_id,
-            &mut raw_vm_destroyed,
-            "terminal cleanup retry",
+            super::PendingCarrierVmCleanupState {
+                vcpu_id: &mut vcpu_id,
+                raw_vm_destroyed: &mut raw_vm_destroyed,
+                context: "terminal cleanup retry",
+            },
             |_| panic!("vCPU already destroyed"),
             |_, _, _| panic!("raw VM destroy must not repeat"),
             |custody| {

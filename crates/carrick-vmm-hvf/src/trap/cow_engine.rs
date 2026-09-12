@@ -2581,14 +2581,17 @@ impl HvfTaskState {
             })
         };
         drop(registry);
+        let scope = CowInventoryLifecycleScope {
+            custody,
+            identity: self.cow_identity,
+            mm_root_slot: self.mm_root_slot,
+            semantic_va: span.va,
+            semantic_length: span.len as u64,
+        };
         record_cow_inventory_lifecycle(
             CowDiagnosticLifecycleKind::InventoryRemoved,
             CowDiagnosticLifecycleSite::CowCommit,
-            custody,
-            self.cow_identity,
-            self.mm_root_slot,
-            span.va,
-            span.len as u64,
+            &scope,
             split.old_key,
             split.old,
         );
@@ -2596,11 +2599,7 @@ impl HvfTaskState {
             record_cow_inventory_lifecycle(
                 CowDiagnosticLifecycleKind::InventoryPublished,
                 CowDiagnosticLifecycleSite::CowCommit,
-                custody,
-                self.cow_identity,
-                self.mm_root_slot,
-                span.va,
-                span.len as u64,
+                &scope,
                 (fragment.gpa, fragment.length),
                 InventoryExtent {
                     frame: split.old.frame,
@@ -2616,11 +2615,7 @@ impl HvfTaskState {
             record_cow_inventory_lifecycle(
                 CowDiagnosticLifecycleKind::InventoryPublished,
                 CowDiagnosticLifecycleSite::CowCommit,
-                custody,
-                self.cow_identity,
-                self.mm_root_slot,
-                span.va,
-                span.len as u64,
+                &scope,
                 split.new_key,
                 split.new_extent,
             );
@@ -4352,15 +4347,18 @@ impl HvfVmState {
                 },
             );
         }
+        let scope = CowInventoryLifecycleScope {
+            custody: &custody,
+            identity: Some(identity),
+            mm_root_slot: self.mm_root_slot,
+            semantic_va: va,
+            semantic_length: len as u64,
+        };
         for &(logical_key, extent) in &retirement.mappings {
             record_cow_inventory_lifecycle(
                 CowDiagnosticLifecycleKind::InventoryRemoved,
                 CowDiagnosticLifecycleSite::AliasUnmap,
-                &custody,
-                Some(identity),
-                self.mm_root_slot,
-                va,
-                len as u64,
+                &scope,
                 logical_key,
                 extent,
             );

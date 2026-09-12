@@ -270,7 +270,6 @@ pub(crate) fn fork_mapping_requires_base_translation(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_process_plan(
         &self,
         request: carrick_hal::ProcessForkRequest,
@@ -693,6 +692,13 @@ impl HvfTaskState {
                 let raw = u64::from(mapping.perms);
                 let fork_frame_receipt_kind =
                     fork_frame_receipt_kind(disposition, mapping.start, mapping.size);
+                let scope = CowInventoryLifecycleScope {
+                    custody: &carrier_foreign_mm_transport.custody,
+                    identity: self.cow_identity,
+                    mm_root_slot: self.mm_root_slot,
+                    semantic_va: mapping.start,
+                    semantic_length: mapping.size as u64,
+                };
                 for ((gpa, length), extent) in &inherited {
                     let selected = inherited_inventory_ids.insert(extent.mapping);
                     record_cow_inventory_lifecycle(
@@ -702,11 +708,7 @@ impl HvfTaskState {
                             CowDiagnosticLifecycleKind::ForkDeduplicated
                         },
                         CowDiagnosticLifecycleSite::ForkPlan,
-                        &carrier_foreign_mm_transport.custody,
-                        self.cow_identity,
-                        self.mm_root_slot,
-                        mapping.start,
-                        mapping.size as u64,
+                        &scope,
                         (*gpa, *length),
                         *extent,
                     );
@@ -1333,15 +1335,17 @@ impl HvfTaskState {
         let plan = ProcessSpecPlan::new(
             mappings,
             inventory_mappings,
-            protections,
-            mailbox_slots,
-            syscall_transport,
-            self.persistent_vm_lifecycle,
-            (request.root_slot_base, request.root_slot_size),
-            self.container_root,
-            frame_inventory,
-            std::sync::Arc::new(parking_lot::Mutex::new(child_cow_armed)),
-            carrier_foreign_mm_transport,
+            ProcessSpecPlanContext {
+                protections,
+                mailbox_slots,
+                syscall_transport,
+                persistent_vm_lifecycle: self.persistent_vm_lifecycle,
+                mm_root_slot: (request.root_slot_base, request.root_slot_size),
+                container_root: self.container_root,
+                frame_inventory,
+                cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(child_cow_armed)),
+                carrier_foreign_mm_transport,
+            },
         );
         emit_stage(
             HvpatchForkProcessSpecStagePhase::BackendSpecFinalize,

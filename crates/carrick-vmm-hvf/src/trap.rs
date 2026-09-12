@@ -2515,33 +2515,37 @@ pub struct ProcessSpecPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct ProcessSpecPlanContext {
+    pub(crate) protections: std::sync::Arc<MemoryProtections>,
+    pub(crate) mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    pub(crate) syscall_transport: HvfSyscallTransport,
+    pub(crate) persistent_vm_lifecycle: bool,
+    pub(crate) mm_root_slot: (u64, u64),
+    pub(crate) container_root: ContainerRootToken,
+    pub(crate) frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    pub(crate) cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+    pub(crate) carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ProcessSpecPlan {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         mappings: Vec<ProcessMappingDesc>,
         inventory_mappings: Vec<ProcessInventoryDesc>,
-        protections: std::sync::Arc<MemoryProtections>,
-        mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
-        syscall_transport: HvfSyscallTransport,
-        persistent_vm_lifecycle: bool,
-        mm_root_slot: (u64, u64),
-        container_root: ContainerRootToken,
-        frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
-        cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
-        carrier_foreign_mm_transport: std::sync::Arc<CarrierForeignMmTransport>,
+        context: ProcessSpecPlanContext,
     ) -> Self {
         Self {
             mappings,
             inventory_mappings,
-            protections,
-            mailbox_slots,
-            syscall_transport,
-            persistent_vm_lifecycle,
-            mm_root_slot,
-            container_root,
-            frame_inventory,
-            cow_armed,
-            carrier_foreign_mm_transport,
+            protections: context.protections,
+            mailbox_slots: context.mailbox_slots,
+            syscall_transport: context.syscall_transport,
+            persistent_vm_lifecycle: context.persistent_vm_lifecycle,
+            mm_root_slot: context.mm_root_slot,
+            container_root: context.container_root,
+            frame_inventory: context.frame_inventory,
+            cow_armed: context.cow_armed,
+            carrier_foreign_mm_transport: context.carrier_foreign_mm_transport,
         }
     }
     pub(crate) fn stage_with_reservation_factory(
@@ -6454,11 +6458,13 @@ impl HvfVmState {
                 record_cow_inventory_lifecycle(
                     CowDiagnosticLifecycleKind::InventoryPublished,
                     CowDiagnosticLifecycleSite::ForkMaterialization,
-                    &plan.carrier_foreign_mm_transport.custody,
-                    None,
-                    Some(plan.mm_root_slot),
-                    0,
-                    0,
+                    &CowInventoryLifecycleScope {
+                        custody: &plan.carrier_foreign_mm_transport.custody,
+                        identity: None,
+                        mm_root_slot: Some(plan.mm_root_slot),
+                        semantic_va: 0,
+                        semantic_length: 0,
+                    },
                     (mapping.gpa, mapping.length),
                     staged,
                 );
@@ -6937,11 +6943,13 @@ impl HvfVmState {
                 record_cow_inventory_lifecycle(
                     CowDiagnosticLifecycleKind::InventoryPublished,
                     CowDiagnosticLifecycleSite::ForkMaterialization,
-                    &plan.carrier_foreign_mm_transport.custody,
-                    None,
-                    Some(plan.mm_root_slot),
-                    0,
-                    0,
+                    &CowInventoryLifecycleScope {
+                        custody: &plan.carrier_foreign_mm_transport.custody,
+                        identity: None,
+                        mm_root_slot: Some(plan.mm_root_slot),
+                        semantic_va: 0,
+                        semantic_length: 0,
+                    },
                     (mapping.gpa, mapping.length),
                     staged,
                 );
