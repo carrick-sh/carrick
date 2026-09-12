@@ -522,18 +522,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2184 in `drop`, `libc::getpid` accesses only the active capability-rooted hostfs scratch lifetime used by `drop`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1481 in `drop`, `libc::getpid` accesses only the active capability-rooted hostfs scratch lifetime used by `drop`.",
     "review_id": "HA-000030",
     "source": {
-      "byte_end": 94321,
-      "byte_start": 94309,
+      "byte_end": 70354,
+      "byte_start": 70342,
       "column": 32,
       "column_end": 44,
       "column_start": 32,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2184,
-      "line_end": 2184,
-      "line_start": 2184
+      "line": 1481,
+      "line_end": 1481,
+      "line_start": 1481
     }
   },
   {
@@ -549,18 +549,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2639 in `new_in`, `libc::getpid` accesses only the active capability-rooted hostfs scratch lifetime used by `new_in`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1936 in `new_in`, `libc::getpid` accesses only the active capability-rooted hostfs scratch lifetime used by `new_in`.",
     "review_id": "HA-000031",
     "source": {
-      "byte_end": 110742,
-      "byte_start": 110730,
+      "byte_end": 86775,
+      "byte_start": 86763,
       "column": 33,
       "column_end": 45,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2639,
-      "line_end": 2639,
-      "line_start": 2639
+      "line": 1936,
+      "line_end": 1936,
+      "line_start": 1936
     }
   },
   {
@@ -576,18 +576,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2700 in `from_existing_dir`, `libc::getpid` accesses only the active capability-rooted hostfs scratch lifetime used by `from_existing_dir`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1997 in `from_existing_dir`, `libc::getpid` accesses only the active capability-rooted hostfs scratch lifetime used by `from_existing_dir`.",
     "review_id": "HA-000032",
     "source": {
-      "byte_end": 113806,
-      "byte_start": 113794,
+      "byte_end": 89839,
+      "byte_start": 89827,
       "column": 33,
       "column_end": 45,
       "column_start": 33,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2700,
-      "line_end": 2700,
-      "line_start": 2700
+      "line": 1997,
+      "line_end": 1997,
+      "line_start": 1997
     }
   },
   {
@@ -603,18 +603,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2774 in `native_reexec_authority`, `libc::getpid` accesses only the validated hostfs reexec authority record used by `native_reexec_authority`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2071 in `native_reexec_authority`, `libc::getpid` accesses only the validated hostfs reexec authority record used by `native_reexec_authority`.",
     "review_id": "HA-000033",
     "source": {
-      "byte_end": 117475,
-      "byte_start": 117463,
+      "byte_end": 93508,
+      "byte_start": 93496,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2774,
-      "line_end": 2774,
-      "line_start": 2774
+      "line": 2071,
+      "line_end": 2071,
+      "line_start": 2071
     }
   },
   {
@@ -630,18 +630,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2805 in `attach_for_reexec`, `libc::getpid` accesses only the active capability-rooted hostfs scratch lifetime used by `attach_for_reexec`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2102 in `attach_for_reexec`, `libc::getpid` accesses only the active capability-rooted hostfs scratch lifetime used by `attach_for_reexec`.",
     "review_id": "HA-000034",
     "source": {
-      "byte_end": 118800,
-      "byte_start": 118788,
+      "byte_end": 94833,
+      "byte_start": 94821,
       "column": 38,
       "column_end": 50,
       "column_start": 38,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2805,
-      "line_end": 2805,
-      "line_start": 2805
+      "line": 2102,
+      "line_end": 2102,
+      "line_start": 2102
     }
   },
   {
@@ -657,18 +657,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7100 in `open_anon_fd`, `libc::getpid` accesses only the anonymous regular-file object beneath the capability-rooted hostfs used by `open_anon_fd`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:6397 in `open_anon_fd`, `libc::getpid` accesses only the anonymous regular-file object beneath the capability-rooted hostfs used by `open_anon_fd`.",
     "review_id": "HA-000038",
     "source": {
-      "byte_end": 297382,
-      "byte_start": 297370,
+      "byte_end": 273415,
+      "byte_start": 273403,
       "column": 28,
       "column_end": 40,
       "column_start": 28,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7100,
-      "line_end": 7100,
-      "line_start": 7100
+      "line": 6397,
+      "line_end": 6397,
+      "line_start": 6397
     }
   },
   {
@@ -1984,18 +1984,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2319 in `cleanup_oldest_trash_checkpoint`, `std::fs::File::open` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_oldest_trash_checkpoint` at line 2091.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1616 in `cleanup_oldest_trash_checkpoint`, `std::fs::File::open` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_oldest_trash_checkpoint` at line 2091.",
     "review_id": "HA-000093",
     "source": {
-      "byte_end": 100193,
-      "byte_start": 100174,
+      "byte_end": 76226,
+      "byte_start": 76207,
       "column": 52,
       "column_end": 71,
       "column_start": 52,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2319,
-      "line_end": 2319,
-      "line_start": 2319
+      "line": 1616,
+      "line_end": 1616,
+      "line_start": 1616
     }
   },
   {
@@ -2383,18 +2383,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2564 in `discover_orphans_after_root_lock`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `discover_orphans_after_root_lock`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1861 in `discover_orphans_after_root_lock`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `discover_orphans_after_root_lock`.",
     "review_id": "HA-000110",
     "source": {
-      "byte_end": 107970,
-      "byte_start": 107945,
+      "byte_end": 84003,
+      "byte_start": 83978,
       "column": 30,
       "column_end": 55,
       "column_start": 30,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2564,
-      "line_end": 2564,
-      "line_start": 2564
+      "line": 1861,
+      "line_end": 1861,
+      "line_start": 1861
     }
   },
   {
@@ -2410,18 +2410,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2603 in `new_in`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `new_in`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1900 in `new_in`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `new_in`.",
     "review_id": "HA-000111",
     "source": {
-      "byte_end": 109252,
-      "byte_start": 109227,
+      "byte_end": 85285,
+      "byte_start": 85260,
       "column": 30,
       "column_end": 55,
       "column_start": 30,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2603,
-      "line_end": 2603,
-      "line_start": 2603
+      "line": 1900,
+      "line_end": 1900,
+      "line_start": 1900
     }
   },
   {
@@ -2437,18 +2437,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7935 in `acquire_lockfile`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `acquire_lockfile`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7232 in `acquire_lockfile`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `acquire_lockfile`.",
     "review_id": "HA-000112",
     "source": {
-      "byte_end": 330599,
-      "byte_start": 330574,
+      "byte_end": 306632,
+      "byte_start": 306607,
       "column": 16,
       "column_end": 41,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7935,
-      "line_end": 7935,
-      "line_start": 7935
+      "line": 7232,
+      "line_end": 7232,
+      "line_start": 7232
     }
   },
   {
@@ -2464,18 +2464,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7998 in `sweep_orphans`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7295 in `sweep_orphans`, `std::fs::OpenOptions::new` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
     "review_id": "HA-000113",
     "source": {
-      "byte_end": 333049,
-      "byte_start": 333024,
+      "byte_end": 309082,
+      "byte_start": 309057,
       "column": 24,
       "column_end": 49,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7998,
-      "line_end": 7998,
-      "line_start": 7998
+      "line": 7295,
+      "line_end": 7295,
+      "line_start": 7295
     }
   },
   {
@@ -2945,18 +2945,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2569 in `discover_orphans_after_root_lock`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `discover_orphans_after_root_lock`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1866 in `discover_orphans_after_root_lock`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `discover_orphans_after_root_lock`.",
     "review_id": "HA-000133",
     "source": {
-      "byte_end": 108074,
-      "byte_start": 108070,
+      "byte_end": 84107,
+      "byte_start": 84103,
       "column": 10,
       "column_end": 14,
       "column_start": 10,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2569,
-      "line_end": 2569,
-      "line_start": 2569
+      "line": 1866,
+      "line_end": 1866,
+      "line_start": 1866
     }
   },
   {
@@ -2972,18 +2972,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2608 in `new_in`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `new_in`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1905 in `new_in`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `new_in`.",
     "review_id": "HA-000134",
     "source": {
-      "byte_end": 109376,
-      "byte_start": 109372,
+      "byte_end": 85409,
+      "byte_start": 85405,
       "column": 14,
       "column_end": 18,
       "column_start": 14,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2608,
-      "line_end": 2608,
-      "line_start": 2608
+      "line": 1905,
+      "line_end": 1905,
+      "line_start": 1905
     }
   },
   {
@@ -2999,18 +2999,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7940 in `acquire_lockfile`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `acquire_lockfile`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7237 in `acquire_lockfile`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `acquire_lockfile`.",
     "review_id": "HA-000135",
     "source": {
-      "byte_end": 330703,
-      "byte_start": 330699,
+      "byte_end": 306736,
+      "byte_start": 306732,
       "column": 10,
       "column_end": 14,
       "column_start": 10,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7940,
-      "line_end": 7940,
-      "line_start": 7940
+      "line": 7237,
+      "line_end": 7237,
+      "line_start": 7237
     }
   },
   {
@@ -3026,18 +3026,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:8001 in `sweep_orphans`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7298 in `sweep_orphans`, `std::fs::OpenOptions::open` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
     "review_id": "HA-000136",
     "source": {
-      "byte_end": 333118,
-      "byte_start": 333114,
+      "byte_end": 309151,
+      "byte_start": 309147,
       "column": 14,
       "column_end": 18,
       "column_start": 14,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 8001,
-      "line_end": 8001,
-      "line_start": 8001
+      "line": 7298,
+      "line_end": 7298,
+      "line_start": 7298
     }
   },
   {
@@ -3901,18 +3901,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2247 in `rename_scratch_to_trash`, `std::fs::create_dir_all` accesses only the capability-rooted hostfs scratch cleanup backing used by `rename_scratch_to_trash` at line 2019.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1544 in `rename_scratch_to_trash`, `std::fs::create_dir_all` accesses only the capability-rooted hostfs scratch cleanup backing used by `rename_scratch_to_trash` at line 2019.",
     "review_id": "HA-000175",
     "source": {
-      "byte_end": 97268,
-      "byte_start": 97245,
+      "byte_end": 73301,
+      "byte_start": 73278,
       "column": 8,
       "column_end": 31,
       "column_start": 8,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2247,
-      "line_end": 2247,
-      "line_start": 2247
+      "line": 1544,
+      "line_end": 1544,
+      "line_start": 1544
     }
   },
   {
@@ -3928,18 +3928,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2443 in `cleanup_tree_entries_with_budget`, `std::fs::create_dir_all` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2215.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1740 in `cleanup_tree_entries_with_budget`, `std::fs::create_dir_all` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2215.",
     "review_id": "HA-000176",
     "source": {
-      "byte_end": 103943,
-      "byte_start": 103920,
+      "byte_end": 79976,
+      "byte_start": 79953,
       "column": 31,
       "column_end": 54,
       "column_start": 31,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2443,
-      "line_end": 2443,
-      "line_start": 2443
+      "line": 1740,
+      "line_end": 1740,
+      "line_start": 1740
     }
   },
   {
@@ -3955,18 +3955,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2601 in `new_in`, `std::fs::create_dir_all` accesses only the active capability-rooted hostfs backing tree used by `new_in`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1898 in `new_in`, `std::fs::create_dir_all` accesses only the active capability-rooted hostfs backing tree used by `new_in`.",
     "review_id": "HA-000177",
     "source": {
-      "byte_end": 109110,
-      "byte_start": 109087,
+      "byte_end": 85143,
+      "byte_start": 85120,
       "column": 9,
       "column_end": 32,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2601,
-      "line_end": 2601,
-      "line_start": 2601
+      "line": 1898,
+      "line_end": 1898,
+      "line_start": 1898
     }
   },
   {
@@ -3982,18 +3982,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2763 in `attach_or_create`, `std::fs::create_dir_all` accesses only the active capability-rooted hostfs backing tree used by `attach_or_create`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2060 in `attach_or_create`, `std::fs::create_dir_all` accesses only the active capability-rooted hostfs backing tree used by `attach_or_create`.",
     "review_id": "HA-000178",
     "source": {
-      "byte_end": 117032,
-      "byte_start": 117009,
+      "byte_end": 93065,
+      "byte_start": 93042,
       "column": 9,
       "column_end": 32,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2763,
-      "line_end": 2763,
-      "line_start": 2763
+      "line": 2060,
+      "line_end": 2060,
+      "line_start": 2060
     }
   },
   {
@@ -5824,18 +5824,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2284 in `cleanup_oldest_trash_checkpoint`, `std::fs::read_dir` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_oldest_trash_checkpoint` at line 2056.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1581 in `cleanup_oldest_trash_checkpoint`, `std::fs::read_dir` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_oldest_trash_checkpoint` at line 2056.",
     "review_id": "HA-000257",
     "source": {
-      "byte_end": 98945,
-      "byte_start": 98928,
+      "byte_end": 74978,
+      "byte_start": 74961,
       "column": 47,
       "column_end": 64,
       "column_start": 47,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2284,
-      "line_end": 2284,
-      "line_start": 2284
+      "line": 1581,
+      "line_end": 1581,
+      "line_start": 1581
     }
   },
   {
@@ -5851,18 +5851,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2393 in `cleanup_tree_entries_with_budget`, `std::fs::read_dir` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2165.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1690 in `cleanup_tree_entries_with_budget`, `std::fs::read_dir` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2165.",
     "review_id": "HA-000258",
     "source": {
-      "byte_end": 102161,
-      "byte_start": 102144,
+      "byte_end": 78194,
+      "byte_start": 78177,
       "column": 47,
       "column_end": 64,
       "column_start": 47,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2393,
-      "line_end": 2393,
-      "line_start": 2393
+      "line": 1690,
+      "line_end": 1690,
+      "line_start": 1690
     }
   },
   {
@@ -5878,18 +5878,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7087 in `watch_fds`, `std::fs::read_dir` accesses only the active capability-rooted hostfs backing tree used by `watch_fds`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:6384 in `watch_fds`, `std::fs::read_dir` accesses only the active capability-rooted hostfs backing tree used by `watch_fds`.",
     "review_id": "HA-000259",
     "source": {
-      "byte_end": 296897,
-      "byte_start": 296880,
+      "byte_end": 272930,
+      "byte_start": 272913,
       "column": 22,
       "column_end": 39,
       "column_start": 22,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7087,
-      "line_end": 7087,
-      "line_start": 7087
+      "line": 6384,
+      "line_end": 6384,
+      "line_start": 6384
     }
   },
   {
@@ -5905,18 +5905,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7973 in `sweep_orphans`, `std::fs::read_dir` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7270 in `sweep_orphans`, `std::fs::read_dir` accesses only the active capability-rooted hostfs backing tree used by `sweep_orphans`.",
     "review_id": "HA-000260",
     "source": {
-      "byte_end": 332040,
-      "byte_start": 332023,
+      "byte_end": 308073,
+      "byte_start": 308056,
       "column": 23,
       "column_end": 40,
       "column_start": 23,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7973,
-      "line_end": 7973,
-      "line_start": 7973
+      "line": 7270,
+      "line_end": 7270,
+      "line_start": 7270
     }
   },
   {
@@ -6679,18 +6679,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2450 in `cleanup_tree_entries_with_budget`, `std::fs::remove_dir` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2222.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1747 in `cleanup_tree_entries_with_budget`, `std::fs::remove_dir` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2222.",
     "review_id": "HA-000301",
     "source": {
-      "byte_end": 104159,
-      "byte_start": 104140,
+      "byte_end": 80192,
+      "byte_start": 80173,
       "column": 45,
       "column_end": 64,
       "column_start": 45,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2450,
-      "line_end": 2450,
-      "line_start": 2450
+      "line": 1747,
+      "line_end": 1747,
+      "line_start": 1747
     }
   },
   {
@@ -6973,18 +6973,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2501 in `scratch_cleanup_sender`, `std::fs::remove_dir_all` accesses only the retired capability-rooted scratch tree consumed by the bounded cleanup worker at line 2263.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1798 in `scratch_cleanup_sender`, `std::fs::remove_dir_all` accesses only the retired capability-rooted scratch tree consumed by the bounded cleanup worker at line 2263.",
     "review_id": "HA-000312",
     "source": {
-      "byte_end": 105790,
-      "byte_start": 105767,
+      "byte_end": 81823,
+      "byte_start": 81800,
       "column": 37,
       "column_end": 60,
       "column_start": 37,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2501,
-      "line_end": 2501,
-      "line_start": 2501
+      "line": 1798,
+      "line_end": 1798,
+      "line_start": 1798
     }
   },
   {
@@ -7000,18 +7000,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2513 in `scratch_cleanup_sender`, `std::fs::remove_dir_all` accesses only the orphaned capability-rooted scratch tree consumed by the bounded cleanup worker at line 2267.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1810 in `scratch_cleanup_sender`, `std::fs::remove_dir_all` accesses only the orphaned capability-rooted scratch tree consumed by the bounded cleanup worker at line 2267.",
     "review_id": "HA-000313",
     "source": {
-      "byte_end": 106330,
-      "byte_start": 106307,
+      "byte_end": 82363,
+      "byte_start": 82340,
       "column": 41,
       "column_end": 64,
       "column_start": 41,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2513,
-      "line_end": 2513,
-      "line_start": 2513
+      "line": 1810,
+      "line_end": 1810,
+      "line_start": 1810
     }
   },
   {
@@ -7671,18 +7671,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2384 in `cleanup_tree_entries_with_budget`, `std::fs::remove_file` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2156.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1681 in `cleanup_tree_entries_with_budget`, `std::fs::remove_file` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2156.",
     "review_id": "HA-000338",
     "source": {
-      "byte_end": 101909,
-      "byte_start": 101889,
+      "byte_end": 77942,
+      "byte_start": 77922,
       "column": 49,
       "column_end": 69,
       "column_start": 49,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2384,
-      "line_end": 2384,
-      "line_start": 2384
+      "line": 1681,
+      "line_end": 1681,
+      "line_start": 1681
     }
   },
   {
@@ -7698,18 +7698,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2429 in `cleanup_tree_entries_with_budget`, `std::fs::remove_file` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2201.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1726 in `cleanup_tree_entries_with_budget`, `std::fs::remove_file` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2201.",
     "review_id": "HA-000339",
     "source": {
-      "byte_end": 103426,
-      "byte_start": 103406,
+      "byte_end": 79459,
+      "byte_start": 79439,
       "column": 37,
       "column_end": 57,
       "column_start": 37,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2429,
-      "line_end": 2429,
-      "line_start": 2429
+      "line": 1726,
+      "line_end": 1726,
+      "line_start": 1726
     }
   },
   {
@@ -8131,18 +8131,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2259 in `rename_scratch_to_trash`, `std::fs::rename` accesses only the capability-rooted live scratch tree and its same-parent retired name.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1556 in `rename_scratch_to_trash`, `std::fs::rename` accesses only the capability-rooted live scratch tree and its same-parent retired name.",
     "review_id": "HA-000355",
     "source": {
-      "byte_end": 97749,
-      "byte_start": 97734,
+      "byte_end": 73782,
+      "byte_start": 73767,
       "column": 15,
       "column_end": 30,
       "column_start": 15,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2259,
-      "line_end": 2259,
-      "line_start": 2259
+      "line": 1556,
+      "line_end": 1556,
+      "line_start": 1556
     }
   },
   {
@@ -8158,18 +8158,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2422 in `cleanup_tree_entries_with_budget`, `std::fs::rename` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2194.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1719 in `cleanup_tree_entries_with_budget`, `std::fs::rename` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2194.",
     "review_id": "HA-000356",
     "source": {
-      "byte_end": 103213,
-      "byte_start": 103198,
+      "byte_end": 79246,
+      "byte_start": 79231,
       "column": 35,
       "column_end": 50,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2422,
-      "line_end": 2422,
-      "line_start": 2422
+      "line": 1719,
+      "line_end": 1719,
+      "line_start": 1719
     }
   },
   {
@@ -8185,18 +8185,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2446 in `cleanup_tree_entries_with_budget`, `std::fs::rename` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2218.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1743 in `cleanup_tree_entries_with_budget`, `std::fs::rename` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2218.",
     "review_id": "HA-000357",
     "source": {
-      "byte_end": 104047,
-      "byte_start": 104032,
+      "byte_end": 80080,
+      "byte_start": 80065,
       "column": 39,
       "column_end": 54,
       "column_start": 39,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2446,
-      "line_end": 2446,
-      "line_start": 2446
+      "line": 1743,
+      "line_end": 1743,
+      "line_start": 1743
     }
   },
   {
@@ -8563,18 +8563,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2391 in `cleanup_tree_entries_with_budget`, `std::fs::set_permissions` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2163.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1688 in `cleanup_tree_entries_with_budget`, `std::fs::set_permissions` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2163.",
     "review_id": "HA-000371",
     "source": {
-      "byte_end": 102048,
-      "byte_start": 102024,
+      "byte_end": 78081,
+      "byte_start": 78057,
       "column": 27,
       "column_end": 51,
       "column_start": 27,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2391,
-      "line_end": 2391,
-      "line_start": 2391
+      "line": 1688,
+      "line_end": 1688,
+      "line_start": 1688
     }
   },
   {
@@ -8968,18 +8968,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2380 in `cleanup_tree_entries_with_budget`, `std::fs::symlink_metadata` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2152.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1677 in `cleanup_tree_entries_with_budget`, `std::fs::symlink_metadata` accesses only the capability-rooted hostfs scratch cleanup backing used by `cleanup_tree_entries_with_budget` at line 2152.",
     "review_id": "HA-000392",
     "source": {
-      "byte_end": 101763,
-      "byte_start": 101738,
+      "byte_end": 77796,
+      "byte_start": 77771,
       "column": 48,
       "column_end": 73,
       "column_start": 48,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2380,
-      "line_end": 2380,
-      "line_start": 2380
+      "line": 1677,
+      "line_end": 1677,
+      "line_start": 1677
     }
   },
   {
@@ -8995,18 +8995,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:7045 in `watch_fds`, `std::fs::symlink_metadata` accesses only the active capability-rooted hostfs backing tree used by `watch_fds`.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:6342 in `watch_fds`, `std::fs::symlink_metadata` accesses only the active capability-rooted hostfs backing tree used by `watch_fds`.",
     "review_id": "HA-000393",
     "source": {
-      "byte_end": 295130,
-      "byte_start": 295105,
+      "byte_end": 271163,
+      "byte_start": 271138,
       "column": 24,
       "column_end": 49,
       "column_start": 24,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 7045,
-      "line_end": 7045,
-      "line_start": 7045
+      "line": 6342,
+      "line_end": 6342,
+      "line_start": 6342
     }
   },
   {
@@ -12282,18 +12282,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2254 in `rename_scratch_to_trash`, `std::process::id` accesses only the run-scoped backing-object uniqueness token used by `rename_scratch_to_trash` at line 2026.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1551 in `rename_scratch_to_trash`, `std::process::id` accesses only the run-scoped backing-object uniqueness token used by `rename_scratch_to_trash` at line 2026.",
     "review_id": "HA-000520",
     "source": {
-      "byte_end": 97505,
-      "byte_start": 97489,
+      "byte_end": 73538,
+      "byte_start": 73522,
       "column": 15,
       "column_end": 31,
       "column_start": 15,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2254,
-      "line_end": 2254,
-      "line_start": 2254
+      "line": 1551,
+      "line_end": 1551,
+      "line_start": 1551
     }
   },
   {
@@ -12309,18 +12309,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2419 in `cleanup_tree_entries_with_budget`, `std::process::id` accesses only the run-scoped backing-object uniqueness token used by `cleanup_tree_entries_with_budget` at line 2191.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1716 in `cleanup_tree_entries_with_budget`, `std::process::id` accesses only the run-scoped backing-object uniqueness token used by `cleanup_tree_entries_with_budget` at line 2191.",
     "review_id": "HA-000521",
     "source": {
-      "byte_end": 103119,
-      "byte_start": 103103,
+      "byte_end": 79152,
+      "byte_start": 79136,
       "column": 17,
       "column_end": 33,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2419,
-      "line_end": 2419,
-      "line_start": 2419
+      "line": 1716,
+      "line_end": 1716,
+      "line_start": 1716
     }
   },
   {
@@ -12336,18 +12336,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2441 in `cleanup_tree_entries_with_budget`, `std::process::id` accesses only the run-scoped backing-object uniqueness token used by `cleanup_tree_entries_with_budget` at line 2213.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1738 in `cleanup_tree_entries_with_budget`, `std::process::id` accesses only the run-scoped backing-object uniqueness token used by `cleanup_tree_entries_with_budget` at line 2213.",
     "review_id": "HA-000522",
     "source": {
-      "byte_end": 103863,
-      "byte_start": 103847,
+      "byte_end": 79896,
+      "byte_start": 79880,
       "column": 61,
       "column_end": 77,
       "column_start": 61,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2441,
-      "line_end": 2441,
-      "line_start": 2441
+      "line": 1738,
+      "line_end": 1738,
+      "line_start": 1738
     }
   },
   {
@@ -13717,18 +13717,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:2495 in `scratch_cleanup_sender`, `std::thread::Builder::new` acts only on the bounded carrier-owned scratch cleanup worker used by `scratch_cleanup_sender` at line 2257; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/fs_backend.rs:1792 in `scratch_cleanup_sender`, `std::thread::Builder::new` acts only on the bounded carrier-owned scratch cleanup worker used by `scratch_cleanup_sender` at line 2257; no guest identity selects its host target.",
     "review_id": "HA-000578",
     "source": {
-      "byte_end": 105497,
-      "byte_start": 105472,
+      "byte_end": 81530,
+      "byte_start": 81505,
       "column": 9,
       "column_end": 34,
       "column_start": 9,
       "file": "crates/carrick-runtime/src/fs_backend.rs",
-      "line": 2495,
-      "line_end": 2495,
-      "line_start": 2495
+      "line": 1792,
+      "line_end": 1792,
+      "line_start": 1792
     }
   },
   {
