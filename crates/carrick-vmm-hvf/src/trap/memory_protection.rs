@@ -1085,10 +1085,12 @@ impl AliasRegistry {
             .rows
             .saturating_sub(before)
             .saturating_add(replacement.len());
-        *self
-            .by_scope
-            .get_mut(&scope)
-            .unwrap_or_else(|| std::process::abort()) = replacement.clone();
+        *self.by_scope.get_mut(&scope).unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::host_alias",
+                "missing scope in AliasRegistry::rebuild_scope_rows"
+            );
+        }) = replacement.clone();
         for (seq, alias) in previous {
             self.index_remove(seq, alias);
         }
