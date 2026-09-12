@@ -636,3 +636,28 @@ commits and is re-checked at the next vet.
   (d6db89efc). 96 further lldb-run stress runs reproduced only the 125
   shape (4×, post-mortem JSON, `target/perf/perf2x-sep12/eftcore{3,4}`).
   Fix dispatched as a red-first worker task (brief `exec-sibling-settle`).
+- 2026-09-12 13:53, probe gate on c8e82d013caba451: the in-process shard
+  WEDGED on `arm64:musl:forkexecstorm` (carrier 16307 at 0% CPU for 11
+  min; stall watch fired). Post-mortem FIRST, core + `bt all` + event ring
+  + live kernel snapshot, all in `target/perf/perf2x-sep12/probe-wedge-*`
+  (`probe-wedge-16307.core` is root-owned; read it with `sudo lldb -c`):
+  - kernel graph EMPTY: `carrick debug hvpatch-kernel --run-id
+    embed-signed-15140` (token = sha256(run id)[:32]) shows tasks=[],
+    zombies=[], threads=[], scheduler `provider_absent`; the event ring
+    ends with pid 2 then pid 1 exiting, both `publication=complete`,
+    then settle step 18 (result published) on cells 0x…24db0e0 and
+    0x…24d5320.
+  - every executor idle in `RunQueue::take_row`/`park_spare`; the
+    container thread is in `wait_process_jobs` (180 process jobs — init,
+    the probe, and its vfork+exec storm children) at index 111, parked in
+    `HvpatchLoopResult::wait_supervised` on cell 0x6000024db020 (completion
+    id 394) — a cell nothing published: one storm child's job result was
+    LOST while the guest itself saw all 200 children reaped.
+  - the always-on liveness invariant did NOT fire in 11 min although the
+    graph was empty: either `census()` returned None (Weak<Kernel> dead →
+    `continue`, fail-open forever) or the census read `tasks>0/runnable>0`
+    from a view the debug snapshot does not share. Either way a definitively
+    dead container must become a verdict with evidence, never an infinite
+    poll — that is a second defect on top of the lost publication.
+  Reaped by hand after capture; the gate resumed. OPEN, not yet
+  attributed to a change (first occurrence in ~10 gates today).
