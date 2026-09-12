@@ -94,15 +94,15 @@ impl NormalizedDispatchRoute for OrdinaryDispatchRoute<'_, '_> {
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        dispatcher.dispatch_normalized_with_lease(
+        dispatcher.dispatch_normalized_with_lease(SyscallCtx {
             kernel,
             request,
             memory,
             reporter,
             thread,
-            self.lease,
-            self.mm_executor.take(),
-        )
+            execution_lease: self.lease,
+            mm_executor: self.mm_executor.take(),
+        })
     }
 }
 
@@ -121,9 +121,15 @@ impl NormalizedDispatchRoute for MutationDispatchRoute<'_, '_, '_> {
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        dispatcher.dispatch_normalized_mutation(
-            kernel, request, memory, reporter, thread, self.guard, self.lease,
-        )
+        dispatcher.dispatch_normalized_mutation(MutationSyscallCtx {
+            kernel,
+            request,
+            memory,
+            reporter,
+            thread,
+            mm_mutation: self.guard,
+            execution_lease: self.lease,
+        })
     }
 }
 
@@ -140,32 +146,24 @@ impl SyscallDispatcher {
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        self.dispatch_normalized_with_lease(kernel, request, memory, reporter, thread, None, None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn dispatch_normalized_with_lease(
-        &self,
-        kernel: &crate::kernel::KernelContext,
-        request: SyscallRequest,
-        memory: &mut impl CurrentMmMemory,
-        reporter: &CompatReporter,
-        thread: Option<ThreadCtx>,
-        execution_lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
-        mm_executor: Option<&mut MmExecutorParticipation>,
-    ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        let handler = resolve_handler(request.number.raw())?;
-        let canonical_nr = request.number.raw();
-        let mut ctx = SyscallCtx {
+        self.dispatch_normalized_with_lease(SyscallCtx {
             kernel,
             request,
             memory,
             reporter,
             thread,
-            execution_lease,
-            mm_executor,
-        };
-        let outcome = resources::with_captured_resources(kernel, || handler(self, &mut ctx));
+            execution_lease: None,
+            mm_executor: None,
+        })
+    }
+
+    pub(crate) fn dispatch_normalized_with_lease(
+        &self,
+        mut ctx: SyscallCtx<'_, impl CurrentMmMemory>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        let handler = resolve_handler(ctx.request.number.raw())?;
+        let canonical_nr = ctx.request.number.raw();
+        let outcome = resources::with_captured_resources(ctx.kernel, || handler(self, &mut ctx));
         // Single choke point for the fork-coherent resolve cache: a structural
         // namespace mutation (mkdirat/unlinkat/symlinkat/linkat/renameat/
         // renameat2/mknodat) can change how OTHER paths resolve, so bump the
@@ -178,28 +176,12 @@ impl SyscallDispatcher {
         Some(outcome)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_normalized_mutation<'authority, 'lease>(
         &self,
-        kernel: &crate::kernel::KernelContext,
-        request: SyscallRequest,
-        memory: &mut impl CurrentMmMemory,
-        reporter: &CompatReporter,
-        thread: Option<ThreadCtx>,
-        mm_mutation: &mut mm_mutation::MmMutationGuard<'authority>,
-        execution_lease: Option<&'lease crate::kernel::objects::ThreadExecutionLease>,
+        mut ctx: MutationSyscallCtx<'_, 'authority, 'lease, impl CurrentMmMemory>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        let handler = resolve_mutation_handler(request.number.raw())?;
-        let mut ctx = MutationSyscallCtx {
-            kernel,
-            request,
-            memory,
-            reporter,
-            thread,
-            mm_mutation,
-            execution_lease,
-        };
-        Some(resources::with_captured_resources(kernel, || {
+        let handler = resolve_mutation_handler(ctx.request.number.raw())?;
+        Some(resources::with_captured_resources(ctx.kernel, || {
             handler(self, &mut ctx)
         }))
     }
@@ -218,9 +200,15 @@ impl SyscallDispatcher {
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         mm_mutation::test_support::with_guard(self.mm_mutation_coordinator(), |guard| {
-            self.dispatch_normalized_mutation(
-                kernel, request, memory, reporter, thread, guard, None,
-            )
+            self.dispatch_normalized_mutation(MutationSyscallCtx {
+                kernel,
+                request,
+                memory,
+                reporter,
+                thread,
+                mm_mutation: guard,
+                execution_lease: None,
+            })
         })
     }
 
