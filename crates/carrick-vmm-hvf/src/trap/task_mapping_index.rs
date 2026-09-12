@@ -130,12 +130,13 @@ pub(crate) struct TaskMappingIndex {
     /// than the contiguous vector this type replaced, which measured as a NET
     /// 1.39x REGRESSION (docs/perf-results/2026-09-08-mapping-index-measurement.md).
     by_ipa: std::collections::BTreeSet<(u64, u64)>,
-    /// How many live rows have each `size`. Only the largest matters: it bounds
-    /// how far below a queried IPA a row that still covers it can begin, which
-    /// is what turns the IPA walk from unbounded into a short one. A monotone
-    /// high-water mark would be poisoned forever by one huge arena row, so the
-    /// exact multiset is kept.
+    /// Live rows ordered by physical stage-2 IPA base, `(row.physical_ipa, row.start)`.
+    by_physical: std::collections::BTreeSet<(u64, u64)>,
+    /// How many live rows have each semantic `size`. Only the largest matters: it bounds
+    /// how far below a queried IPA a row that still covers it can begin.
     ipa_span_counts: std::collections::BTreeMap<u64, usize>,
+    /// How many live rows have each `physical_size`.
+    physical_span_counts: std::collections::BTreeMap<u64, usize>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -145,7 +146,9 @@ impl TaskMappingIndex {
             live: std::collections::BTreeMap::new(),
             shadowed: Vec::new(),
             by_ipa: std::collections::BTreeSet::new(),
+            by_physical: std::collections::BTreeSet::new(),
             ipa_span_counts: std::collections::BTreeMap::new(),
+            physical_span_counts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -153,8 +156,11 @@ impl TaskMappingIndex {
     /// insertion goes through here so the IPA view cannot drift.
     fn live_insert(&mut self, region: HvfMappedRegion) {
         self.by_ipa.insert((region.ipa, region.start));
-        let span = region.size.max(region.physical_size) as u64;
+        self.by_physical.insert((region.physical_ipa, region.start));
+        let span = region.size as u64;
         *self.ipa_span_counts.entry(span).or_insert(0) += 1;
+        let phys_span = region.physical_size as u64;
+        *self.physical_span_counts.entry(phys_span).or_insert(0) += 1;
         if let Some(previous) = self.live.insert(GuestVa(region.start), region) {
             // A same-start replacement: retire the row that left.
             self.forget_ipa_entry(&previous);
@@ -170,9 +176,19 @@ impl TaskMappingIndex {
 
     fn forget_ipa_entry(&mut self, row: &HvfMappedRegion) {
         self.by_ipa.remove(&(row.ipa, row.start));
-        let span = row.size.max(row.physical_size) as u64;
+        self.by_physical.remove(&(row.physical_ipa, row.start));
+        let span = row.size as u64;
         if let std::collections::btree_map::Entry::Occupied(mut span_entry) =
             self.ipa_span_counts.entry(span)
+        {
+            *span_entry.get_mut() -= 1;
+            if *span_entry.get() == 0 {
+                span_entry.remove();
+            }
+        }
+        let phys_span = row.physical_size as u64;
+        if let std::collections::btree_map::Entry::Occupied(mut span_entry) =
+            self.physical_span_counts.entry(phys_span)
         {
             *span_entry.get_mut() -= 1;
             if *span_entry.get() == 0 {
@@ -184,6 +200,14 @@ impl TaskMappingIndex {
     /// The largest `size` any live row has, or 0 when there are none.
     fn max_ipa_span(&self) -> u64 {
         self.ipa_span_counts
+            .last_key_value()
+            .map(|(span, _)| *span)
+            .unwrap_or_default()
+    }
+
+    /// The largest `physical_size` any live row has, or 0 when there are none.
+    fn max_physical_span(&self) -> u64 {
+        self.physical_span_counts
             .last_key_value()
             .map(|(span, _)| *span)
             .unwrap_or_default()
@@ -420,6 +444,13 @@ impl TaskMappingIndex {
     /// Keyed removal API: for a set of VA and/or IPA extents, visits ONLY the rows
     /// those extents can contain, applying `predicate` to them. Rows matching
     /// `predicate` are removed.
+    ///
+    /// For [`MappingExtent::Ipa`], candidate discovery searches BOTH `by_ipa`
+    /// (semantic projection, windowed by [`Self::max_ipa_span`]) and `by_physical`
+    /// (physical stage-2 owner extent, windowed by [`Self::max_physical_span`]).
+    /// This guarantees that whether the queried extent is a semantic projection or
+    /// a physical lease extent, all candidate rows intersecting the extent are
+    /// discovered in sublinear time without requiring containment assumptions.
     pub(crate) fn remove_rows_matching_in_ranges<F>(
         &mut self,
         ranges: &[MappingExtent],
@@ -484,6 +515,24 @@ impl TaskMappingIndex {
                     for &(_row_ipa, start) in self.by_ipa.range(range_bounds) {
                         candidate_keys.insert(GuestVa(start));
                     }
+                    let floor_phys = ipa_start.saturating_sub(self.max_physical_span());
+                    let ceil_phys = ipa_end
+                        .and_then(|e| e.checked_add(self.max_physical_span()))
+                        .unwrap_or(u64::MAX);
+                    let range_bounds_phys = if ceil_phys < u64::MAX {
+                        (
+                            std::ops::Bound::Included((floor_phys, 0)),
+                            std::ops::Bound::Excluded((ceil_phys, 0)),
+                        )
+                    } else {
+                        (
+                            std::ops::Bound::Included((floor_phys, 0)),
+                            std::ops::Bound::Unbounded,
+                        )
+                    };
+                    for &(_phys_ipa, start) in self.by_physical.range(range_bounds_phys) {
+                        candidate_keys.insert(GuestVa(start));
+                    }
                 }
             }
         }
@@ -531,7 +580,9 @@ impl TaskMappingIndex {
         self.live.clear();
         self.shadowed.clear();
         self.by_ipa.clear();
+        self.by_physical.clear();
         self.ipa_span_counts.clear();
+        self.physical_span_counts.clear();
     }
 
     /// Total row count, live and displaced.
@@ -1417,11 +1468,18 @@ mod task_mapping_index_tests {
         }
     }
 
-    fn make_test_region(start: u64, size: u64, ipa: u64, generation: u64) -> HvfMappedRegion {
+    fn make_test_region(
+        start: u64,
+        size: u64,
+        ipa: u64,
+        generation: u64,
+        physical_ipa: u64,
+        physical_size: u64,
+    ) -> HvfMappedRegion {
         let mut region = thread_sibling_tests::mapped_region(start, start + size, ipa);
         region.owner_generation = generation;
-        region.physical_ipa = ipa;
-        region.physical_size = size as usize;
+        region.physical_ipa = physical_ipa;
+        region.physical_size = physical_size as usize;
         region
     }
 
@@ -1437,43 +1495,60 @@ mod task_mapping_index_tests {
             let mut keyed = TaskMappingIndex::new();
 
             let num_rows = rng.gen_range(2, 20);
-            for _ in 0..num_rows {
-                let page_idx = rng.gen_range(0, 40);
-                let page_count = rng.gen_range(1, 6);
+            let mut generated_rows = Vec::new();
+            for i in 0..num_rows {
+                let page_idx = i * 4 + rng.gen_range(0, 3);
                 let start = base_va + page_idx * 0x1000;
-                let size = page_count * 0x1000;
                 let ipa = base_ipa + page_idx * 0x1000;
                 let generation = rng.gen_range(1, 5);
 
-                let r1 = make_test_region(start, size, ipa, generation);
-                let r2 = make_test_region(start, size, ipa, generation);
+                // Shape selection:
+                // 0..4: Compound 16 KiB physical owner with 4 KiB projection at offsets 0, 4, 8, 12 KiB
+                // 5: Standard identity mapping
+                // 6: Projection NOT inside physical extent (escapes physical base)
+                let shape = rng.gen_range(0, 7);
+                let (size, physical_ipa, physical_size) = match shape {
+                    0 => (0x1000, ipa, 0x4000),
+                    1 => (0x1000, ipa.saturating_sub(0x1000), 0x4000),
+                    2 => (0x1000, ipa.saturating_sub(0x2000), 0x4000),
+                    3 => (0x1000, ipa.saturating_sub(0x3000), 0x4000),
+                    4 => (0x1000, ipa, 0x1000),
+                    5 => {
+                        let page_count = rng.gen_range(1, 4);
+                        (page_count * 0x1000, ipa, page_count * 0x1000)
+                    }
+                    _ => (0x1000, ipa.saturating_add(0x10_0000), 0x1000),
+                };
+
+                let r1 =
+                    make_test_region(start, size, ipa, generation, physical_ipa, physical_size);
+                let r2 =
+                    make_test_region(start, size, ipa, generation, physical_ipa, physical_size);
                 reference.insert(r1);
                 keyed.insert(r2);
+                generated_rows.push((physical_ipa, physical_size, generation));
             }
 
-            let is_va = rng.next_u64() % 2 == 0;
-            let q_page = rng.gen_range(0, 45);
-            let q_count = rng.gen_range(1, 8);
-            let extent = if is_va {
-                let q_va = base_va + q_page * 0x1000;
-                let q_len = q_count * 0x1000;
-                MappingExtent::Va(GuestVa(q_va), q_len)
-            } else {
-                let q_ipa = base_ipa + q_page * 0x1000;
-                let q_len = q_count * 0x1000;
-                MappingExtent::Ipa(q_ipa, q_len)
+            // Select a target physical extent to retire (either from existing rows or random).
+            let (target_phys_ipa, target_phys_size, target_gen) =
+                if rng.next_u64() % 3 != 0 && !generated_rows.is_empty() {
+                    let pick = (rng.next_u64() as usize) % generated_rows.len();
+                    generated_rows[pick]
+                } else {
+                    let q_page = rng.gen_range(0, 45);
+                    let q_len = rng.gen_range(1, 4) * 0x1000;
+                    (base_ipa + q_page * 0x1000, q_len, rng.gen_range(1, 5))
+                };
+
+            let extent = MappingExtent::Ipa(target_phys_ipa, target_phys_size);
+            let predicate = move |m: &HvfMappedRegion| {
+                (m.physical_ipa, m.physical_size as u64) == (target_phys_ipa, target_phys_size)
+                    && m.owner_generation == target_gen
             };
 
-            let pred_kind = case % 4;
-            let target_gen = rng.gen_range(1, 5);
-            let predicate = move |m: &HvfMappedRegion| match pred_kind {
-                0 => true,
-                1 => m.owner_generation % 2 == 0,
-                2 => m.size > 0x1000,
-                _ => m.owner_generation == target_gen,
-            };
-
-            reference.retain(|m| !(extent.overlaps_region(m) && predicate(m)));
+            // OLD semantics: full-table retain over ALL rows checking only predicate
+            reference.retain(|m| !predicate(m));
+            // NEW semantics: keyed extent removal
             keyed.remove_rows_matching_in_ranges(&[extent], predicate);
 
             assert_eq!(
