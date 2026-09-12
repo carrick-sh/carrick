@@ -4700,7 +4700,7 @@ fn shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily() {
 /// rather than months later inside a workload.
 #[test]
 fn every_mmap_refusal_names_itself() {
-    const SOURCE: &str = include_str!("../mem.rs");
+    const SOURCE: &str = include_str!("mmap.rs");
     let start = SOURCE
         .find("fn mmap(this, cx, requested: GuestPtr,")
         .expect("mmap handler header");

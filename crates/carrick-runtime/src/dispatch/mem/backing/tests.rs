@@ -18,6 +18,7 @@ use carrick_abi::LINUX_PAGE_SIZE;
 use carrick_guest_mem::{Gpa, GuestVa};
 use carrick_hal::trap::{HostAliasBacking, HostAliasOwnedFd, HostAliasSharing};
 use std::cell::Cell;
+use std::os::fd::FromRawFd;
 
 #[test]
 fn readonly_host_fd_cannot_carry_a_writable_shared_file_mapping() {
