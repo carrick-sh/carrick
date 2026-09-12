@@ -1561,6 +1561,87 @@ fn retiring_one_owner_does_not_scan_foreign_alias_rows() {
 }
 
 #[test]
+fn exit_cost_is_bounded_by_own_rows() {
+    let _test_lock = ALIAS_TEST_LOCK.lock();
+    let mut registry = AliasRegistry::default();
+    let mut replay = std::collections::BTreeSet::new();
+    let mut versions = AliasVersionRegistry::default();
+    let directory = HvpatchCarrierTaskStateDirectory::default();
+
+    let mut target_slot = None;
+    for s in 0..1000u64 {
+        let root_slot = (0x1000_0000_0000 + s * 0x1000_0000, 0x4000);
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: root_slot.0,
+            size: root_slot.1,
+        };
+        if s == 500 {
+            target_slot = Some(root_slot);
+        }
+        for r in 0..64u64 {
+            let va = 0x2000_0000 + r * 0x1000;
+            let ipa = 0x6000_0000_0000 + s * 0x1000_0000 + r * 0x1000;
+            let mut row = alias(0x4000_0000 + (r as usize), 1);
+            row.start = va;
+            row.ipa = ipa;
+            row.physical_ipa = ipa;
+            row.ownership_scope = scope;
+            let key = alias_version_key(&row);
+            let rkey = replay_mapping_key(row);
+            replay.insert(rkey);
+            registry.push(row);
+            let id = AliasPublicationVersionId {
+                owner: owner_key(&directory, s + 1, 1),
+                ordinal: r as u32,
+            };
+            versions.aliases.insert(
+                key,
+                AliasVersionChain {
+                    base: Some(row),
+                    versions: vec![OwnedAliasVersion {
+                        id,
+                        value: row,
+                        epoch: 1,
+                    }],
+                },
+            );
+            versions.alias_version_owner.insert(id, key);
+            versions.replays.insert(
+                row.physical_ipa,
+                ReplayVersionChain {
+                    base: vec![rkey],
+                    versions: vec![OwnedReplayVersion {
+                        id,
+                        value: rkey,
+                        epoch: 1,
+                    }],
+                },
+            );
+            versions.replay_version_owner.insert(id, row.physical_ipa);
+        }
+    }
+    let target_slot = target_slot.expect("target slot");
+    let before = alias_state_rows_scanned();
+    let retired = retire_process_aliases_in(
+        &mut registry,
+        &replay,
+        &mut versions,
+        Some(target_slot),
+        ContainerRootToken::ROOT,
+        |_| true,
+    );
+    let examined = alias_state_rows_scanned() - before;
+    assert!(!retired.is_empty());
+    assert_eq!(retired.len(), 64);
+    assert_eq!(retired.into_vec().len(), 64);
+    let bound = 64 + (1000f64).log2().ceil() as u64;
+    assert!(
+        examined <= bound,
+        "retiring one scope visited {examined} rows; expected <= {bound}"
+    );
+}
+
+#[test]
 fn alias_receipt_restores_exact_registry_and_replay_preimages() {
     let _test_lock = ALIAS_TEST_LOCK.lock();
     let preimage = alias(0x1111_0000, 1);
