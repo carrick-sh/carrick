@@ -647,7 +647,7 @@ impl Kernel {
     }
 }
 
-pub(super) fn exact_process_group_members(
+pub(in crate::kernel) fn exact_process_group_members(
     state: &RegistryState,
     container: crate::kernel::container::ContainerId,
     group_id: ProcessGroupId,
@@ -672,7 +672,7 @@ pub(super) fn exact_process_group_members(
     )
 }
 
-pub(super) fn remove_group_member(
+pub(in crate::kernel) fn remove_group_member(
     state: &mut RegistryState,
     group_id: ProcessGroupId,
     session_id: SessionId,
