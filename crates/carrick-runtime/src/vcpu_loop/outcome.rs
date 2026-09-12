@@ -386,12 +386,22 @@ impl HvpatchLoopResult {
     /// thread. A unit fixture publishes its own result before waiting, so the
     /// invariant has nothing to judge and would only add its poll interval.
     #[cfg(test)]
+    #[track_caller]
+    fn expect_test<T>(opt: Option<T>, msg: &str) -> T {
+        assert!(opt.is_some(), "{msg}");
+        match opt {
+            Some(val) => val,
+            None => unreachable!(),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn wait(self) -> Result<VcpuLoopOutcome, RuntimeError> {
         let mut slot = self.state.result.lock();
         while slot.is_none() {
             self.state.ready.wait(&mut slot);
         }
-        slot.take().unwrap_or_else(|| std::process::abort())
+        Self::expect_test(slot.take(), "missing VcpuLoopOutcome in wait")
     }
 
     /// Wait for this job's terminal result under the always-on

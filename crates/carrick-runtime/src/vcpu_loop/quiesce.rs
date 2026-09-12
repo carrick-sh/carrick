@@ -2922,16 +2922,27 @@ mod pt_pause_tests {
         );
     }
 
+    #[track_caller]
+    fn expect_test<T>(opt: Option<T>, msg: &str) -> T {
+        assert!(opt.is_some(), "{msg}");
+        match opt {
+            Some(val) => val,
+            None => unreachable!(),
+        }
+    }
+
     #[test]
     fn process_fork_uses_identity_lease_subscription() {
         let source = include_str!("quiesce.rs");
-        let prepare = source
-            .split("pub(super) fn prepare_in_process_fork")
-            .nth(1)
-            .unwrap_or_else(|| std::process::abort())
+        let prepare = expect_test(
+            expect_test(
+                source.split("pub(super) fn prepare_in_process_fork").nth(1),
+                "prepare_in_process_fork missing from quiesce.rs",
+            )
             .split("\n#[cfg(test)]")
-            .next()
-            .unwrap_or_else(|| std::process::abort());
+            .next(),
+            "prepare_in_process_fork body missing from quiesce.rs",
+        );
 
         assert!(prepare.contains("subscribe_lease_drain"));
         assert!(prepare.contains("ProcessForkRetrySubscription::Lease"));
@@ -2948,13 +2959,15 @@ mod pt_pause_tests {
     #[test]
     fn process_fork_install_pauses_peer_executors_instead_of_eagain() {
         let source = include_str!("quiesce.rs");
-        let prepare = source
-            .split("pub(super) fn prepare_in_process_fork")
-            .nth(1)
-            .unwrap_or_else(|| std::process::abort())
+        let prepare = expect_test(
+            expect_test(
+                source.split("pub(super) fn prepare_in_process_fork").nth(1),
+                "prepare_in_process_fork missing from quiesce.rs",
+            )
             .split("\n#[cfg(test)]")
-            .next()
-            .unwrap_or_else(|| std::process::abort());
+            .next(),
+            "prepare_in_process_fork body missing from quiesce.rs",
+        );
 
         assert!(prepare.contains("acquire_mm_stage1_authority(mm_executor"));
         // Lock order P -> topology: the stage-1 authority is taken before the
@@ -2987,13 +3000,15 @@ mod pt_pause_tests {
     #[test]
     fn shared_mm_fork_admits_against_exec_reservations_before_kernel_publication() {
         let source = include_str!("quiesce.rs");
-        let prepare = source
-            .split("pub(super) fn prepare_in_process_fork")
-            .nth(1)
-            .unwrap_or_else(|| std::process::abort())
+        let prepare = expect_test(
+            expect_test(
+                source.split("pub(super) fn prepare_in_process_fork").nth(1),
+                "prepare_in_process_fork missing from quiesce.rs",
+            )
             .split("\n#[cfg(test)]")
-            .next()
-            .unwrap_or_else(|| std::process::abort());
+            .next(),
+            "prepare_in_process_fork body missing from quiesce.rs",
+        );
 
         // The exec reservation is MM-generation scoped and shared by every
         // vfork sibling; the per-process clone-admission gate cannot observe
@@ -3028,13 +3043,15 @@ mod pt_pause_tests {
     #[test]
     fn fork_reservation_task_busy_is_retried_on_the_reservation_epoch() {
         let source = include_str!("quiesce.rs");
-        let prepare = source
-            .split("pub(super) fn prepare_in_process_fork")
-            .nth(1)
-            .unwrap_or_else(|| std::process::abort())
+        let prepare = expect_test(
+            expect_test(
+                source.split("pub(super) fn prepare_in_process_fork").nth(1),
+                "prepare_in_process_fork missing from quiesce.rs",
+            )
             .split("\n#[cfg(test)]")
-            .next()
-            .unwrap_or_else(|| std::process::abort());
+            .next(),
+            "prepare_in_process_fork body missing from quiesce.rs",
+        );
         let reserve_at = prepare
             .find("let reservation = match reservation_result {")
             .expect("fork matches its kernel reservation result");
@@ -3235,13 +3252,15 @@ mod pt_pause_tests {
     #[test]
     fn deferred_process_fork_parks_on_the_admission_epoch() {
         let source = include_str!("quiesce.rs");
-        let prepare = source
-            .split("pub(super) fn prepare_in_process_fork")
-            .nth(1)
-            .unwrap_or_else(|| std::process::abort())
+        let prepare = expect_test(
+            expect_test(
+                source.split("pub(super) fn prepare_in_process_fork").nth(1),
+                "prepare_in_process_fork missing from quiesce.rs",
+            )
             .split("\n#[cfg(test)]")
-            .next()
-            .unwrap_or_else(|| std::process::abort());
+            .next(),
+            "prepare_in_process_fork body missing from quiesce.rs",
+        );
         assert!(prepare.contains("ProcessForkStart::AdmissionDeferred { observed_epoch }"));
         assert!(prepare.contains("ProcessForkRetrySubscription::Admission"));
         assert!(prepare.contains("kernel.clone_admission.subscribe_change("));

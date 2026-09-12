@@ -6388,16 +6388,29 @@ mod tests {
     /// must be admitted against a sibling's exec reservation exactly as a
     /// shared fork is — before the topology lock, and long before the
     /// kernel exit publication after which a refusal is only an abort.
+    #[track_caller]
+    fn expect_test<T>(opt: Option<T>, msg: &str) -> T {
+        assert!(opt.is_some(), "{msg}");
+        match opt {
+            Some(val) => val,
+            None => unreachable!(),
+        }
+    }
+
     #[test]
     fn process_exit_admits_its_retirement_against_exec_reservations() {
         let source = include_str!("binding.rs");
-        let finalize = source
-            .split("fn finalize_persistent_process_terminal(")
-            .nth(1)
-            .unwrap_or_else(|| std::process::abort())
+        let finalize = expect_test(
+            expect_test(
+                source
+                    .split("fn finalize_persistent_process_terminal(")
+                    .nth(1),
+                "finalize_persistent_process_terminal missing from binding.rs",
+            )
             .split("\n    fn ")
-            .next()
-            .unwrap_or_else(|| std::process::abort());
+            .next(),
+            "finalize_persistent_process_terminal body missing from binding.rs",
+        );
         let hold_at = finalize
             .find(".hold_owner_set_edit(terminal_context.task().key())")
             .expect("exit admits its owner-set edit");
@@ -6441,13 +6454,17 @@ mod tests {
     #[test]
     fn deferred_thread_clone_parks_on_the_admission_epoch() {
         let source = include_str!("binding.rs");
-        let spawn = source
-            .split("fn spawn_persistent_hvpatch_clone_thread")
-            .nth(1)
-            .unwrap_or_else(|| std::process::abort())
+        let spawn = expect_test(
+            expect_test(
+                source
+                    .split("fn spawn_persistent_hvpatch_clone_thread")
+                    .nth(1),
+                "spawn_persistent_hvpatch_clone_thread missing from binding.rs",
+            )
             .split("\n#[cfg(test)]")
-            .next()
-            .unwrap_or_else(|| std::process::abort());
+            .next(),
+            "spawn_persistent_hvpatch_clone_thread body missing from binding.rs",
+        );
         let deferred_at = spawn
             .find("CloneEnrollment::Deferred { observed_epoch }")
             .expect("thread clone handles a deferred enrollment");

@@ -993,7 +993,10 @@ impl ReservationGate {
         {
             let mut waiters = self.waiters.lock();
             let Some(remaining) = waiters.checked_sub(1) else {
-                std::process::abort();
+                carrick_fatal!(
+                    "kernel::reservation_gate",
+                    "ReservationGate test waiter count underflow"
+                );
             };
             *waiters = remaining;
             self.waiters_changed.notify_all();

@@ -2596,8 +2596,21 @@ impl RunnableThread {
     }
 
     #[cfg(test)]
+    #[track_caller]
+    fn expect_test<T>(opt: Option<T>, msg: &str) -> T {
+        assert!(opt.is_some(), "{msg}");
+        match opt {
+            Some(val) => val,
+            None => unreachable!(),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn lease_mut(&mut self) -> &mut ThreadExecutionLease {
-        self.lease.as_mut().unwrap_or_else(|| std::process::abort())
+        Self::expect_test(
+            self.lease.as_mut(),
+            "missing execution lease in RunnableThread::lease_mut",
+        )
     }
 
     pub(crate) fn thread(&self) -> &Arc<Thread> {

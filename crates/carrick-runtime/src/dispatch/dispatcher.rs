@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use carrick_fatal::carrick_fatal;
 use parking_lot::{Mutex, RwLock};
 
 use super::AsyncSignalWakeOwner;
@@ -559,8 +561,10 @@ impl SyscallDispatcher {
         let prepared_mm = self
             .prepare_fork_mm(parent_mm_id, child_mm_id, mm_mode)
             .unwrap_or_else(|error| {
-                tracing::error!(?error, "dispatcher fork preparation failed");
-                std::process::abort()
+                carrick_fatal!(
+                    "dispatch::mm_binding",
+                    "dispatcher fork preparation failed: {error:?}"
+                );
             });
         let child = self
             .fork_clone_with_prepared_mm(
@@ -571,8 +575,10 @@ impl SyscallDispatcher {
                 prepared_mm,
             )
             .unwrap_or_else(|_| {
-                tracing::error!("fork_clone_in_process_with_mm_mode stale revision");
-                std::process::abort()
+                carrick_fatal!(
+                    "dispatch::mm_binding",
+                    "fork_clone_in_process_with_mm_mode stale revision"
+                );
             });
         // This test-only helper does not publish the synthetic child through
         // the kernel graph, where production binds the exact namespace-local
