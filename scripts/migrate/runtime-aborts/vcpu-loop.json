@@ -180,7 +180,7 @@
       "domain": "kernel::fatal_signal_authority"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "restore_worker_vcpu_before_binding_publication",
       "ordinal_in_function": 1,
       "fingerprint": "be79d3763f7154dd24931cff4d94607ae8cc60572cec2822bc00f79e55e24ab9",
@@ -191,7 +191,7 @@
       "domain": "vcpu_loop::executor_lease"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::run_until_boundary",
       "ordinal_in_function": 1,
       "fingerprint": "3437d0ab6b3b257afc71ffab0ec6983527a4bec4d52d68b9993e3eb5d198a7b8",
@@ -202,7 +202,7 @@
       "domain": "vcpu_loop::executor_lease"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::save",
       "ordinal_in_function": 1,
       "fingerprint": "c8a0c1ab0f4aefe07182325d1c643bcb9ab4168f138d5c0440477ff4c2a7af64",
@@ -213,7 +213,7 @@
       "domain": "vcpu_loop::executor_lease"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::save",
       "ordinal_in_function": 2,
       "fingerprint": "a1e7b4c96f22278b16292b91831e98a356d45358748d27e353d57974d884a62c",
@@ -224,7 +224,7 @@
       "domain": "vcpu_loop::executor_lease"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::save",
       "ordinal_in_function": 3,
       "fingerprint": "2930176e8b78b4300e07e1e75f547269487399d7f7ef3df27eedfc6c0c6f45e1",
@@ -235,7 +235,7 @@
       "domain": "vcpu_loop::executor_lease"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::audit_boundary",
       "ordinal_in_function": 1,
       "fingerprint": "1461649c412092c5afc4c56a959edbdf2ac5d95ee47e304f4e08edb005cbd8f7",
@@ -246,7 +246,7 @@
       "domain": "vcpu_loop::executor_lease"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::audit_boundary",
       "ordinal_in_function": 2,
       "fingerprint": "8da631ed73bdd3adcbe86ca469288f850a69e3358662a7004001a5ab3abc365f",
@@ -257,7 +257,7 @@
       "domain": "vcpu_loop::executor_lease"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::destroy",
       "ordinal_in_function": 1,
       "fingerprint": "6d381be811434c4642794c44a58ea2f97380b813f2981690de2242eb51604b7c",
@@ -268,7 +268,7 @@
       "domain": "vcpu_loop::executor_lease"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs",
       "function": "<HvpatchPersistentExecutor as PersistentExecutor>::destroy",
       "ordinal_in_function": 2,
       "fingerprint": "6d381be811434c4642794c44a58ea2f97380b813f2981690de2242eb51604b7c",
