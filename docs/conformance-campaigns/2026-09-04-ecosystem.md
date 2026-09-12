@@ -3617,3 +3617,30 @@ Task 5/6 of the per-mm plan (per-mm alias containers, per-parent-mm fork
 serializers) are the next structural levers; load coupling (w4/w1) is now
 compile 1.36, tarfile 1.13, importlib 1.31, multiprocessing 1.42,
 net_http 1.01.
+
+## 2026-09-12 16:00 — paired scorecard after per-mm Tasks 5+6 and the fork-quiesce fix
+
+Candidate b25f3b2d7f52c045 (main 486e46d8d) vs base 3c8dbee5b686c49d, same
+method as 11:33 (`measure-sep12b.sh`: five rows, w4 ×3 alternating, then
+w1; quiet-gated; ratios are carrick/Docker medians, cand/base is the
+per-rep paired median).
+
+| row | base w4 | cand w4 | cand/base | base w1 | cand w1 | verdicts |
+|---|---|---|---|---|---|---|
+| cpython-compile | 6.82 | 3.47 | 0.51 | 4.95 | 2.61 | all MATCH |
+| cpython-tarfile | 5.41 | 3.41 | 0.64 | 4.47 | 3.08 | all MATCH |
+| cpython-importlib | 3.62 | 2.50 | 0.77 | 2.20 | 1.87 | all MATCH |
+| cpython-multiprocessing_main_handling | 3.93 | 3.08 | 0.79 | 2.59 | 2.18 | all MATCH |
+| go-net_http | 3.99 | (131.85) | — | 3.48 | 3.29 | cand w4: MATCH, TIMEOUT, TIMEOUT |
+
+Against the 11:33 candidate (77edb0f41b3ff492): compile 3.87→3.47,
+tarfile 3.59→3.41, multiprocessing 3.30→3.08, importlib 2.56→2.50 at w4;
+at w1 importlib 1.96→1.87 (under 2x), multiprocessing 2.18, compile 2.61.
+go-net_http timed out at the 540 s budget in two of three w4 reps on the
+candidate (base 3/3 MATCH, cand w1 MATCH at 3.29): each timeout follows one
+`executor failed a claimed task … AddressSpaceRetired` on a Go `os/exec`
+exec-from-thread — the open exec-teardown leak (the loser thread's stale
+Runnable state leaves a child unreaped). The base binary logs the same
+claim failure without hanging, so the candidate has raised the rate at
+which the leak turns into a hang; the `exec-sibling-settle` round-2 fix is
+being verified live on this row before anything else lands.
