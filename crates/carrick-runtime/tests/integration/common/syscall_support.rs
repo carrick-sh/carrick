@@ -14,7 +14,7 @@
 pub use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 pub use carrick_runtime::dispatch::{
     CurrentMmMemory, DispatchOutcome, GuestMemory, LinearMemory, ProcMapSharing, ProcMapsEntry,
-    SyscallDispatcher, SyscallRequest,
+    SyscallDispatcher, SyscallRequest, ThreadCtx,
 };
 pub use carrick_runtime::elf::SegmentPerms;
 pub use carrick_runtime::linux_abi::{
@@ -38,6 +38,14 @@ pub use carrick_runtime::thread::ThreadId;
 /// discipline; production code never fabricates keys).
 pub fn test_tid(raw: i32) -> ThreadId {
     ThreadId::synthetic_for_tests(raw)
+}
+
+pub fn tc<'a>(
+    tid: carrick_runtime::thread::ThreadId,
+    registry: &'a carrick_runtime::thread::ThreadRegistry,
+    futex: &'a carrick_runtime::thread::FutexTable,
+) -> ThreadCtx<'a> {
+    ThreadCtx::new(tid, registry, futex)
 }
 
 /// Install a caught disposition so namespace-init signal protection does not

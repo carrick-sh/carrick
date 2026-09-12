@@ -5369,9 +5369,7 @@ mod tests {
                 SyscallRequest::new(number, SyscallArgs::from(args)),
                 &mut memory,
                 &reporter,
-                caller,
-                &registry,
-                &futex,
+                crate::dispatch::ThreadCtx::new(caller, &registry, &futex),
             )
             .expect("threaded tkill dispatch")
         };
@@ -5810,9 +5808,7 @@ mod tests {
                 ),
                 &mut memory,
                 &reporter,
-                tid,
-                &registry,
-                &futex,
+                crate::dispatch::ThreadCtx::new(tid, &registry, &futex),
             )
             .expect("dispatch rt_sigsuspend");
 

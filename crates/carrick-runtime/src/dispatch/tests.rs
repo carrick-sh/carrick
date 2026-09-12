@@ -2065,9 +2065,11 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                     SyscallRequest::new(20, SyscallArgs::from([0u64; 6])),
                     &mut mem,
                     &reporter,
-                    crate::thread::ThreadId::synthetic_for_tests(1),
-                    &registry,
-                    &futex,
+                    ThreadCtx::new(
+                        crate::thread::ThreadId::synthetic_for_tests(1),
+                        &registry,
+                        &futex,
+                    ),
                 )
                 .expect("epoll_create1");
             returned(out) as u64
@@ -2105,9 +2107,11 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                             ),
                             &mut mem,
                             reporter,
-                            crate::thread::ThreadId::synthetic_for_tests(2),
-                            registry,
-                            futex,
+                            ThreadCtx::new(
+                                crate::thread::ThreadId::synthetic_for_tests(2),
+                                registry,
+                                futex,
+                            ),
                         )
                         .expect("epoll_pwait");
                     match out {
@@ -2164,9 +2168,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                                     SyscallRequest::new(num, SyscallArgs::from(args)),
                                     mem,
                                     reporter,
-                                    tid,
-                                    registry,
-                                    futex,
+                                    ThreadCtx::new(tid, registry, futex),
                                 )
                                 .expect("dispatch")
                         };
@@ -2266,9 +2268,11 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                     SyscallRequest::new(20, SyscallArgs::from([0u64; 6])),
                     &mut mem,
                     &reporter,
-                    crate::thread::ThreadId::synthetic_for_tests(1),
-                    &registry,
-                    &futex,
+                    ThreadCtx::new(
+                        crate::thread::ThreadId::synthetic_for_tests(1),
+                        &registry,
+                        &futex,
+                    ),
                 )
                 .expect("epoll_create1");
             returned(out) as u64
@@ -2306,9 +2310,11 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                             ),
                             &mut mem,
                             reporter,
-                            crate::thread::ThreadId::synthetic_for_tests(2),
-                            registry,
-                            futex,
+                            ThreadCtx::new(
+                                crate::thread::ThreadId::synthetic_for_tests(2),
+                                registry,
+                                futex,
+                            ),
                         )
                         .expect("epoll_pwait");
                     match out {
@@ -2364,9 +2370,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                                     SyscallRequest::new(num, SyscallArgs::from(args)),
                                     mem,
                                     reporter,
-                                    tid,
-                                    registry,
-                                    futex,
+                                    ThreadCtx::new(tid, registry, futex),
                                 )
                                 .expect("dispatch")
                         };
@@ -2409,9 +2413,7 @@ fn mutation_classifier_exactly_matches_the_typed_handler_tables() {
                                     SyscallRequest::new(num, SyscallArgs::from(args)),
                                     mem,
                                     reporter,
-                                    tid,
-                                    registry,
-                                    futex,
+                                    ThreadCtx::new(tid, registry, futex),
                                 )
                                 .expect("dispatch")
                         };
@@ -3896,9 +3898,11 @@ mod hvpatch_in_process_fork_tests {
                 ),
                 &mut memory,
                 &CompatReporter::default(),
-                transport_tid,
-                &registry,
-                &crate::thread::FutexTable::new(),
+                ThreadCtx::new(
+                    transport_tid,
+                    &registry,
+                    &crate::thread::FutexTable::new(),
+                ),
             )
             .unwrap();
 
@@ -4301,9 +4305,7 @@ mod hvpatch_in_process_fork_tests {
                     SyscallRequest::new(number, SyscallArgs::from(args)),
                     memory,
                     &reporter,
-                    tid,
-                    &registry,
-                    &futex,
+                    ThreadCtx::new(tid, &registry, &futex),
                 )
                 .expect("dispatch")
         };
@@ -4408,9 +4410,7 @@ mod hvpatch_in_process_fork_tests {
                         SyscallRequest::new($number, SyscallArgs::from($args)),
                         &mut memory,
                         &reporter,
-                        tid,
-                        &registry,
-                        &futex,
+                        ThreadCtx::new(tid, &registry, &futex),
                     )
                     .expect("dispatch")
             };
@@ -4711,9 +4711,7 @@ mod tests {
                         request,
                         &mut memory,
                         reporter,
-                        tid,
-                        &registry,
-                        &crate::thread::FutexTable::new(),
+                        ThreadCtx::new(tid, &registry, &crate::thread::FutexTable::new()),
                     )
                     .expect("threaded dispatch")
             }
@@ -5223,9 +5221,11 @@ mod container_policy_dispatch_tests {
                 SyscallRequest::new(SYS_KEYCTL, SyscallArgs([0; 6])),
                 &mut memory,
                 &reporter,
-                registry.main_tid(),
-                &registry,
-                &crate::thread::FutexTable::new(),
+                ThreadCtx::new(
+                    registry.main_tid(),
+                    &registry,
+                    &crate::thread::FutexTable::new(),
+                ),
             )
             .expect("threaded dispatch");
         assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_EPERM });
@@ -5244,9 +5244,11 @@ mod container_policy_dispatch_tests {
                 SyscallRequest::new(124, SyscallArgs([0; 6])),
                 &mut memory,
                 &reporter,
-                registry.main_tid(),
-                &registry,
-                &crate::thread::FutexTable::new(),
+                ThreadCtx::new(
+                    registry.main_tid(),
+                    &registry,
+                    &crate::thread::FutexTable::new(),
+                ),
             )
             .expect("threaded sched_yield dispatch");
 
@@ -5432,9 +5434,7 @@ mod container_policy_dispatch_tests {
                 request,
                 &mut memory,
                 &reporter,
-                registry.main_tid(),
-                &registry,
-                &futex,
+                ThreadCtx::new(registry.main_tid(), &registry, &futex),
             ),
             Err(DispatchError::MmMutationPeerExecutor)
         ));
@@ -5448,9 +5448,7 @@ mod container_policy_dispatch_tests {
                     request,
                     &mut memory,
                     &reporter,
-                    registry.main_tid(),
-                    &registry,
-                    &futex,
+                    ThreadCtx::new(registry.main_tid(), &registry, &futex),
                 )
                 .unwrap(),
             DispatchOutcome::Returned {

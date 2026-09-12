@@ -137,127 +137,90 @@ impl SyscallDispatcher {
     }
 
     /// Multi-threaded dispatch through a shared dispatcher reference. Handlers
+    /// Multi-threaded dispatch through a shared dispatcher reference. Handlers
     /// that touch process-wide state must protect that state with subsystem
     /// locks; there is no dispatcher-wide fallback on this path.
-    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_threaded(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
+        thread: ThreadCtx<'_>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        self.dispatch_threaded_with_lease(
-            kernel, request, memory, reporter, tid, registry, futex, None,
-        )
+        self.dispatch_threaded_with_lease(kernel, request, memory, reporter, thread, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_threaded_with_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
+        thread: ThreadCtx<'_>,
         lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.dispatch_threaded_with_executor_and_lease(
-            kernel, request, memory, reporter, tid, registry, futex, lease, None,
+            kernel,
+            request,
+            memory,
+            reporter,
+            thread,
+            OrdinaryDispatchRoute {
+                lease,
+                mm_executor: None,
+            },
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_threaded_with_executor_and_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
-        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
-        mm_executor: Option<&mut MmExecutorParticipation>,
+        thread: ThreadCtx<'_>,
+        route: OrdinaryDispatchRoute<'_, '_>,
     ) -> Result<DispatchOutcome, DispatchError> {
         match self.prepare_syscall(kernel, request, reporter)? {
             PreparedDispatch::Invoke(syscall) => self
                 .dispatch_threaded_prepared_with_executor_and_lease(
-                    kernel,
-                    syscall,
-                    memory,
-                    reporter,
-                    tid,
-                    registry,
-                    futex,
-                    lease,
-                    mm_executor,
+                    kernel, syscall, memory, reporter, thread, route,
                 ),
             PreparedDispatch::Complete { outcome, .. } => Ok(outcome),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_threaded_prepared_with_mm_executor_and_lease(
         &self,
-        executor: &mut MmExecutorParticipation,
         kernel: &crate::kernel::KernelContext,
         syscall: PreparedSyscall,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
-        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+        thread: ThreadCtx<'_>,
+        route: OrdinaryDispatchRoute<'_, '_>,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.dispatch_threaded_prepared_with_executor_and_lease(
-            kernel,
-            syscall,
-            memory,
-            reporter,
-            tid,
-            registry,
-            futex,
-            lease,
-            Some(executor),
+            kernel, syscall, memory, reporter, thread, route,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_threaded_prepared_with_executor_and_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
         syscall: PreparedSyscall,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
-        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
-        mm_executor: Option<&mut MmExecutorParticipation>,
+        thread: ThreadCtx<'_>,
+        route: OrdinaryDispatchRoute<'_, '_>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        self.dispatch_threaded_prepared_with_route(
-            kernel,
-            syscall,
-            memory,
-            reporter,
-            tid,
-            registry,
-            futex,
-            OrdinaryDispatchRoute { lease, mm_executor },
-        )
+        self.dispatch_threaded_prepared_with_route(kernel, syscall, memory, reporter, thread, route)
     }
 
     /// Shared-dispatch semantics under an exact-MM executor participation.
     /// Mutation is admitted only while that participation can lock a real
     /// sole-executor census election. Production multi-vCPU dispatch uses the
     /// same participation and takes a real page-table pause when a peer exists.
-    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_threaded_with_mm_executor(
         &self,
         executor: &mut MmExecutorParticipation,
@@ -265,9 +228,7 @@ impl SyscallDispatcher {
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
+        thread: ThreadCtx<'_>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let authority = self.mm_binding.current.load_full();
         if !executor.authorizes(&authority) || executor.mm_id() != kernel.shared().mm().id() {
@@ -286,14 +247,29 @@ impl SyscallDispatcher {
                             kernel.shared().mm().id(),
                         );
                         self.dispatch_threaded_prepared_mutation_with_lease(
-                            kernel, syscall, memory, reporter, tid, registry, futex, &mut guard,
-                            None,
+                            kernel,
+                            syscall,
+                            memory,
+                            reporter,
+                            thread,
+                            MutationDispatchRoute {
+                                guard: &mut guard,
+                                lease: None,
+                            },
                         )
                     })
                     .ok_or(DispatchError::MmMutationPeerExecutor)?
                 } else {
                     self.dispatch_threaded_prepared_with_mm_executor_and_lease(
-                        executor, kernel, syscall, memory, reporter, tid, registry, futex, None,
+                        kernel,
+                        syscall,
+                        memory,
+                        reporter,
+                        thread,
+                        OrdinaryDispatchRoute {
+                            lease: None,
+                            mm_executor: Some(executor),
+                        },
                     )
                 }
             }
@@ -301,16 +277,13 @@ impl SyscallDispatcher {
     }
 
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_threaded_for_test(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
+        thread: ThreadCtx<'_>,
     ) -> Result<DispatchOutcome, DispatchError> {
         match self.prepare_syscall(kernel, request, reporter)? {
             PreparedDispatch::Complete { outcome, .. } => Ok(outcome),
@@ -319,53 +292,50 @@ impl SyscallDispatcher {
                 {
                     mm_mutation::test_support::with_guard(self.mm_mutation_coordinator(), |guard| {
                         self.dispatch_threaded_prepared_mutation_with_lease(
-                            kernel, syscall, memory, reporter, tid, registry, futex, guard, None,
+                            kernel,
+                            syscall,
+                            memory,
+                            reporter,
+                            thread,
+                            MutationDispatchRoute { guard, lease: None },
                         )
                     })
                 } else {
                     self.dispatch_threaded_prepared_with_executor_and_lease(
-                        kernel, syscall, memory, reporter, tid, registry, futex, None, None,
+                        kernel,
+                        syscall,
+                        memory,
+                        reporter,
+                        thread,
+                        OrdinaryDispatchRoute {
+                            lease: None,
+                            mm_executor: None,
+                        },
                     )
                 }
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_threaded_prepared_mutation_with_lease(
         &self,
         kernel: &crate::kernel::KernelContext,
         syscall: PreparedSyscall,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
-        guard: &mut mm_mutation::MmMutationGuard<'_>,
-        lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
+        thread: ThreadCtx<'_>,
+        route: MutationDispatchRoute<'_, '_, '_>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        self.dispatch_threaded_prepared_with_route(
-            kernel,
-            syscall,
-            memory,
-            reporter,
-            tid,
-            registry,
-            futex,
-            MutationDispatchRoute { guard, lease },
-        )
+        self.dispatch_threaded_prepared_with_route(kernel, syscall, memory, reporter, thread, route)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_threaded_prepared_with_route<R: NormalizedDispatchRoute>(
         &self,
         kernel: &crate::kernel::KernelContext,
         syscall: PreparedSyscall,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
+        thread: ThreadCtx<'_>,
         mut route: R,
     ) -> Result<DispatchOutcome, DispatchError> {
         let request = syscall.request;
@@ -378,33 +348,28 @@ impl SyscallDispatcher {
             tracing::error!("vvar realtime re-stamp failed: {error}");
             return Err(DispatchError::from(error));
         }
-        if let Some(result) = self
-            .dispatch_threaded_independent(kernel, request, memory, reporter, tid, registry, futex)
+        if let Some(result) =
+            self.dispatch_threaded_independent(kernel, request, memory, reporter, thread)
         {
             return result;
         }
         resources::with_captured_resources(kernel, || {
-            self.dispatch_threaded_captured(
-                kernel, request, memory, reporter, tid, registry, futex, &mut route,
-            )
+            self.dispatch_threaded_captured(kernel, request, memory, reporter, thread, &mut route)
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_threaded_captured<R: NormalizedDispatchRoute>(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
+        thread: ThreadCtx<'_>,
         route: &mut R,
     ) -> Result<DispatchOutcome, DispatchError> {
-        if let Some(result) = self.dispatch_threaded_shared(
-            kernel, request, memory, reporter, tid, registry, futex, route,
-        ) {
+        if let Some(result) =
+            self.dispatch_threaded_shared(kernel, request, memory, reporter, thread, route)
+        {
             return result;
         }
 
@@ -422,16 +387,13 @@ impl SyscallDispatcher {
 
     /// Shared threaded dispatch path for subsystems already moved behind
     /// interior locks.
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_threaded_shared<R: NormalizedDispatchRoute>(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
+        thread: ThreadCtx<'_>,
         route: &mut R,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         if request.number.raw() == 64
@@ -455,13 +417,7 @@ impl SyscallDispatcher {
             crate::probes::mem_watch(request.number.raw(), addr, u64::from_le_bytes(le));
         }
 
-        let thread = Some(ThreadCtx {
-            tid,
-            registry,
-            futex,
-        });
-
-        let result = route.dispatch(self, kernel, request, memory, reporter, thread);
+        let result = route.dispatch(self, kernel, request, memory, reporter, Some(thread));
         let outcome = match result {
             Some(r) => match lower_handler_result(r) {
                 Ok(outcome) => outcome,
@@ -486,16 +442,13 @@ impl SyscallDispatcher {
     /// subsystem state. The runtime checks this before taking the serialized
     /// legacy dispatcher path so futex and tid coordination can proceed without
     /// the dispatcher-wide lock.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_threaded_independent(
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
         memory: &mut impl CurrentMmMemory,
         reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
+        thread: ThreadCtx<'_>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         if !threaded_independent_dispatch_supports(request.number.raw()) {
             return None;
@@ -507,7 +460,9 @@ impl SyscallDispatcher {
                         .map(crate::thread::ThreadId::from_guest_supplied_tid);
                 let signum = request.arg(1);
                 if signum <= LINUX_MAX_SIGNUM
-                    && target.is_none_or(|target| target == tid || !registry.is_live(target))
+                    && target.is_none_or(|target| {
+                        target == thread.tid || !thread.registry.is_live(target)
+                    })
                 {
                     return None;
                 }
@@ -518,7 +473,9 @@ impl SyscallDispatcher {
                         .map(crate::thread::ThreadId::from_guest_supplied_tid);
                 let signum = request.arg(2);
                 if signum <= LINUX_MAX_SIGNUM
-                    && target.is_none_or(|target| target == tid || !registry.is_live(target))
+                    && target.is_none_or(|target| {
+                        target == thread.tid || !thread.registry.is_live(target)
+                    })
                 {
                     return None;
                 }
@@ -529,7 +486,7 @@ impl SyscallDispatcher {
         let outcome = match request.number.raw() {
             96 => {
                 let addr = request.arg(0);
-                registry.set_clear_child_tid(tid, addr);
+                thread.registry.set_clear_child_tid(thread.tid, addr);
                 let Some(visible) = u32::try_from(kernel.thread().key().tid.raw())
                     .ok()
                     .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(kernel, tid))
@@ -550,9 +507,9 @@ impl SyscallDispatcher {
                     request,
                     memory,
                     reporter,
-                    futex,
-                    tid,
-                    registry,
+                    thread.futex,
+                    thread.tid,
+                    thread.registry,
                     hvpatch_linux_tid,
                 )
             }
@@ -624,7 +581,7 @@ impl SyscallDispatcher {
                 dispatch_futex_waitv_args(
                     &clock,
                     memory,
-                    Some(futex),
+                    Some(thread.futex),
                     request.arg(0),
                     request.arg(1),
                     request.arg(2),

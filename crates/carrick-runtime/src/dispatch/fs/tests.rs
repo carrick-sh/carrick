@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::dispatch::ThreadCtx;
 use crate::dispatch::dispatcher::FsCrossSubsystem;
 
 fn two_namespaced_roots_for_async_owner() -> (
@@ -4404,9 +4405,7 @@ fn threaded_dispatch_synthetic_device_write_routes_without_unhandled_syscall() {
             ),
             &mut memory,
             &reporter,
-            registry.main_tid(),
-            &registry,
-            &futex,
+            ThreadCtx::new(registry.main_tid(), &registry, &futex),
         )
         .expect("dispatch_threaded write /dev/null");
 
@@ -4440,9 +4439,7 @@ fn threaded_dispatch_synthetic_device_write_routes_without_unhandled_syscall() {
             ),
             &mut memory,
             &reporter,
-            registry.main_tid(),
-            &registry,
-            &futex,
+            ThreadCtx::new(registry.main_tid(), &registry, &futex),
         )
         .expect("dispatch_threaded write /dev/full");
 
@@ -5173,9 +5170,7 @@ fn dispatch_threaded_pipe_reader_write_shared_ebadf_not_enosys() {
             ),
             &mut memory,
             &reporter,
-            registry.main_tid(),
-            &registry,
-            &futex,
+            ThreadCtx::new(registry.main_tid(), &registry, &futex),
         )
         .expect("dispatch_threaded write on pipe read end");
 
@@ -5203,9 +5198,7 @@ fn dispatch_threaded_pipe_reader_write_shared_ebadf_not_enosys() {
             ),
             &mut memory,
             &reporter,
-            registry.main_tid(),
-            &registry,
-            &futex,
+            ThreadCtx::new(registry.main_tid(), &registry, &futex),
         )
         .expect("dispatch_threaded read on pipe write end");
 
@@ -5233,9 +5226,7 @@ fn dispatch_threaded_pipe_reader_write_shared_ebadf_not_enosys() {
             ),
             &mut memory,
             &reporter,
-            registry.main_tid(),
-            &registry,
-            &futex,
+            ThreadCtx::new(registry.main_tid(), &registry, &futex),
         )
         .expect("dispatch_threaded write on pipe write end");
 
@@ -5261,9 +5252,7 @@ fn dispatch_threaded_pipe_reader_write_shared_ebadf_not_enosys() {
             ),
             &mut memory,
             &reporter,
-            registry.main_tid(),
-            &registry,
-            &futex,
+            ThreadCtx::new(registry.main_tid(), &registry, &futex),
         )
         .expect("dispatch_threaded read on pipe read end");
 
