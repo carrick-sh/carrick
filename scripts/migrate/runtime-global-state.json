@@ -459,7 +459,7 @@
     },
     {
       "kind": "thread_local",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "file": "crates/carrick-runtime/src/dispatch/mem/vma.rs",
       "symbol": "VMA_VISIT_COUNT",
       "fingerprint": "1c4d18b8e7c751bce669e8f2b97b9fc31f1e40bb69697754f820f8138a20edcc",
       "classification": "carrier_infra",
