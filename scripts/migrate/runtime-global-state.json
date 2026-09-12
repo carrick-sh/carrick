@@ -1884,14 +1884,6 @@
     {
       "kind": "static",
       "file": "crates/carrick-thread/src/fork_quiesce.rs",
-      "symbol": "barrier::B",
-      "fingerprint": "2e433e2c97a871b68c5900916150b5a265f41f80ec7d5b11c2c694e6e49cc9c7",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
-    },
-    {
-      "kind": "static",
-      "file": "crates/carrick-thread/src/fork_quiesce.rs",
       "symbol": "exec_owner::OWNER",
       "fingerprint": "93aebe81dfd1262562e7cf4a225185dc3db69b65fecc2ed75b62f39ad939f0de",
       "classification": "carrier_infra",
@@ -1941,7 +1933,7 @@
       "kind": "thread_local",
       "file": "crates/carrick-thread/src/fork_quiesce.rs",
       "symbol": "CURRENT_MM_QUIESCE",
-      "fingerprint": "d5a264c79a63b6204c959aec0a18a36c2d09feab9b0108752c577babb66154bf",
+      "fingerprint": "1e01843989a2bb14a349500881d60c428ad7e589ad350a966a7c881c550fe995",
       "classification": "carrier_infra",
       "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
     },
