@@ -1,10 +1,10 @@
 {
   "catalog_sha256": "aa230c66221233fd4f87b931261e33b4975eedfb45efa04d6929a502a7d392ad",
   "diagnostic_counts": {
-    "macos-cli-default": 573,
+    "macos-cli-default": 572,
     "macos-hvf-default": 93,
-    "macos-runtime-default": 446,
-    "merged": 573
+    "macos-runtime-default": 445,
+    "merged": 572
   },
   "executed_profiles": [
     "macos-cli-default",
@@ -10430,15 +10430,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 183236,
-        "byte_start": 183211,
+        "byte_end": 183735,
+        "byte_start": 183710,
         "column": 35,
         "column_end": 60,
         "column_start": 35,
         "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-        "line": 4331,
-        "line_end": 4331,
-        "line_start": 4331
+        "line": 4341,
+        "line_end": 4341,
+        "line_start": 4341
       }
     },
     {
@@ -10959,26 +10959,6 @@
       "operation": "std::thread::sleep",
       "profiles": [
         "macos-cli-default",
-        "macos-runtime-default"
-      ],
-      "source": {
-        "byte_end": 18137,
-        "byte_start": 18119,
-        "column": 9,
-        "column_end": 27,
-        "column_start": 9,
-        "file": "crates/carrick-runtime/src/vcpu_loop/executor/settlement.rs",
-        "line": 534,
-        "line_end": 534,
-        "line_start": 534
-      }
-    },
-    {
-      "catalog_id": "HA-CATALOG-THREAD-SLEEP",
-      "expansion": null,
-      "operation": "std::thread::sleep",
-      "profiles": [
-        "macos-cli-default",
         "macos-hvf-default",
         "macos-runtime-default"
       ],
@@ -11454,15 +11434,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 47523,
-        "byte_start": 47501,
+        "byte_end": 46589,
+        "byte_start": 46567,
         "column": 13,
         "column_end": 35,
         "column_start": 13,
         "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-        "line": 1110,
-        "line_end": 1110,
-        "line_start": 1110
+        "line": 1086,
+        "line_end": 1086,
+        "line_start": 1086
       }
     },
     {
@@ -11506,9 +11486,9 @@
       }
     }
   ],
-  "rows_sha256": "de1e376e8aa9379ed34064acf8bc582b8ca56d618298ece522e52e4e21495b17",
+  "rows_sha256": "5dd7bd0d4011731f4c260452e90288e5c092097a03f7f5ca159b0a7909359d37",
   "schema": 1,
-  "source_head": "af5cda2f9fe39ce41246298cc068c0e7e64b2d2c",
+  "source_head": "b7c0611c4517735beae576c6f4112dad0001e654",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
