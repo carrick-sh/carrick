@@ -49,6 +49,8 @@ use crate::linux_abi::{
     LINUX_S_IFBLK, LINUX_S_IFCHR, LINUX_S_IFMT,
 };
 use crate::rootfs::{RootFs, RootFsEntryKind, RootFsError, RootFsMetadata};
+use std::ffi::CString;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use super::{
@@ -1222,7 +1224,17 @@ impl RootFsVfs {
         // copy/materialise + tombstone path when the source was NOT in
         // the writable backend (Ok(false)) — e.g. a pure-rootfs entry
         // under --fs memory.
-        match self.overlay.rename_overlay_entry(from, to) {
+        let src = self.resolved_parent(from)?;
+        let dst = self.resolved_parent(to)?;
+        let rename_res = self.overlay.rename_overlay_entry_at(
+            src.parent_fd.as_deref(),
+            Some(&src.leaf),
+            &src.rel,
+            dst.parent_fd.as_deref(),
+            Some(&dst.leaf),
+            &dst.rel,
+        );
+        match rename_res {
             Ok(true) => {
                 // Backend moved the entry (contents included). If the
                 // rootfs ALSO has the source path, leave a tombstone so
@@ -1358,6 +1370,43 @@ impl RootFsVfs {
             .map(|m| m.kind == RootFsEntryKind::Directory)
             .unwrap_or(false)
     }
+
+    fn resolved_parent(&self, path: &str) -> Result<ResolvedParent, VfsError> {
+        let path_obj = std::path::Path::new(path);
+        let leaf_os = path_obj.file_name().ok_or(LINUX_ENOENT)?;
+        let leaf_str = leaf_os.to_str().ok_or(LINUX_EINVAL)?;
+        let leaf = CString::new(leaf_str).map_err(|_| LINUX_EINVAL)?;
+        let parent_path = path_obj.parent().and_then(|p| p.to_str()).unwrap_or("/");
+        let parent_path = if parent_path.is_empty() {
+            "/"
+        } else {
+            parent_path
+        };
+        if !self.is_directory(parent_path) {
+            return Err(LINUX_ENOENT);
+        }
+        let parent_fd = if self.overlay.serves_dentry_cache() {
+            Some(self.dentry_cache.get_or_open_dir_fd(
+                parent_path,
+                self.overlay.as_ref(),
+                self.rootfs.as_ref(),
+            )?)
+        } else {
+            None
+        };
+        let rel = crate::fs_backend::NormalizedRelPath::from_normalized_str(path);
+        Ok(ResolvedParent {
+            parent_fd,
+            leaf,
+            rel,
+        })
+    }
+}
+
+pub(crate) struct ResolvedParent {
+    pub parent_fd: Option<Arc<OwnedFd>>,
+    pub leaf: CString,
+    pub rel: crate::fs_backend::NormalizedRelPath,
 }
 
 impl Default for RootFsVfs {
@@ -1702,20 +1751,9 @@ impl Vfs for RootFsVfs {
                 }
             }
         }
-        // Parent must exist as a directory in the layered view.
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            let parent_str = parent.to_string_lossy();
-            let parent_str: &str = if parent_str.is_empty() {
-                "/"
-            } else {
-                parent_str.as_ref()
-            };
-            if !self.is_directory(parent_str) {
-                return Err(LINUX_ENOENT);
-            }
-        }
+        let parent = self.resolved_parent(path)?;
         self.overlay
-            .make_dir(path)
+            .make_dir_at(parent.parent_fd.as_deref(), Some(&parent.leaf), &parent.rel)
             .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         self.dentry_cache.entry_created(path, None);
         Ok(())
@@ -1749,7 +1787,13 @@ impl Vfs for RootFsVfs {
             .and_then(|p| p.to_str())
             .and_then(|p| self.path_inode_identity(p));
         if in_overlay {
-            self.overlay.remove_entry(path);
+            let parent = self.resolved_parent(path)?;
+            let _ = self.overlay.remove_entry_at(
+                parent.parent_fd.as_deref(),
+                Some(&parent.leaf),
+                &parent.rel,
+                false,
+            );
             // Tombstone only if the rootfs also has this path, so a
             // re-create still works.
             let rootfs_has_it = self
@@ -1811,7 +1855,13 @@ impl Vfs for RootFsVfs {
             .and_then(|p| p.to_str())
             .and_then(|p| self.path_inode_identity(p));
         if in_overlay {
-            self.overlay.remove_entry(path);
+            let parent = self.resolved_parent(path)?;
+            let _ = self.overlay.remove_entry_at(
+                parent.parent_fd.as_deref(),
+                Some(&parent.leaf),
+                &parent.rel,
+                true,
+            );
             let rootfs_has_it = self
                 .dentry_cache
                 .lower_has_entry(path, self.rootfs.as_ref());
@@ -2839,6 +2889,12 @@ mod tests {
     fn mkdir_no_parent_is_enoent() {
         let v = RootFsVfs::with_rootfs(rootfs_with_files());
         assert_eq!(v.mkdir("/no-such-parent/sub", 0o755), Err(LINUX_ENOENT));
+    }
+
+    #[test]
+    fn mkdir_file_parent_is_enoent() {
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
+        assert_eq!(v.mkdir("/etc/hosts/sub", 0o755), Err(LINUX_ENOENT));
     }
 
     #[test]
