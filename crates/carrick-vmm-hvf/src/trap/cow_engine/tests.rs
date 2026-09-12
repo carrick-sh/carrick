@@ -84,3 +84,146 @@ fn frame_publication_sites_contain_no_carrier_topology_lock() {
         "install_alias must not acquire the carrier topology lock"
     );
 }
+
+#[test]
+fn frame_inventory_publication_and_retirement_sites_hold_registry_guard() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let vcpu_loop_src =
+        std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/mod.rs"))
+            .expect("read vcpu_loop/mod.rs");
+    let quiesce_src =
+        std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/quiesce.rs"))
+            .expect("read quiesce.rs");
+    let exec_src =
+        std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/exec.rs"))
+            .expect("read exec.rs");
+    let binding_src =
+        std::fs::read_to_string(manifest_dir.join("../carrick-runtime/src/vcpu_loop/binding.rs"))
+            .expect("read binding.rs");
+
+    let assert_guard_precedes = |block: &str, target_call: &str, context: &str| {
+        let guard_pos = block
+            .find("FrameRegistryGuard::new(")
+            .unwrap_or_else(|| panic!("{context}: block must bind FrameRegistryGuard"));
+        let call_pos = block
+            .find(target_call)
+            .unwrap_or_else(|| panic!("{context}: block must contain call to {target_call}"));
+        assert!(
+            guard_pos < call_pos,
+            "{context}: FrameRegistryGuard must precede {target_call}"
+        );
+    };
+
+    // 1. apply_alias_frame_inventory in vcpu_loop/mod.rs (install_alias)
+    let install_alias_block = vcpu_loop_src
+        .split("let install_alias = |permit:")
+        .nth(1)
+        .expect("install_alias exists")
+        .split("break 'service installed;")
+        .next()
+        .expect("install_alias end");
+    assert_guard_precedes(
+        install_alias_block,
+        "apply_alias_frame_inventory(&kernel_context, commit)",
+        "vcpu_loop/mod.rs install_alias",
+    );
+
+    // 2. exec retirement apply & replacement apply in vcpu_loop/exec.rs
+    let exec_apply_block = exec_src
+        .split("if let Some(process) = kernel.hvpatch_process.as_ref() {")
+        .nth(1)
+        .expect("exec apply block exists")
+        .split("#[cfg(test)]")
+        .next()
+        .expect("exec apply block end");
+    assert_guard_precedes(
+        exec_apply_block,
+        ".apply(old_mm_id, retired_commit)",
+        "exec.rs old_mm retirement apply",
+    );
+    assert_guard_precedes(
+        exec_apply_block,
+        "engine.apply_exec_inventory(replacement_mm_id.raw(),",
+        "exec.rs apply_exec_inventory",
+    );
+
+    // 3. detached address space retirement apply in vcpu_loop/binding.rs
+    let binding_apply_block = binding_src
+        .split("fn apply_detached_address_space_retirement(")
+        .nth(1)
+        .expect("apply_detached_address_space_retirement exists")
+        .split("fn apply_detached_address_space_retirement_with_receipt(")
+        .next()
+        .expect("apply_detached_address_space_retirement end");
+    assert_guard_precedes(
+        binding_apply_block,
+        ".apply(mm, commit)",
+        "binding.rs apply_detached_address_space_retirement",
+    );
+
+    let binding_apply_receipt_block = binding_src
+        .split("fn apply_detached_address_space_retirement_with_receipt(")
+        .nth(1)
+        .expect("apply_detached_address_space_retirement_with_receipt exists")
+        .split("pub(crate) struct HvpatchLoopJob<E>")
+        .next()
+        .expect("apply_detached_address_space_retirement_with_receipt end");
+    assert_guard_precedes(
+        binding_apply_receipt_block,
+        ".apply_retirement_with_receipt(mm, commit)",
+        "binding.rs apply_detached_address_space_retirement_with_receipt",
+    );
+
+    // 4. fork apply_inventory in vcpu_loop/quiesce.rs
+    let quiesce_apply_block = quiesce_src
+        .split("ops.apply_inventory(&task_backend, child_context.kernel(), child_mm_id)")
+        .next()
+        .and_then(|prefix| prefix.rsplit("if !shares_mm {").next())
+        .expect("quiesce apply_inventory block exists");
+    assert!(
+        quiesce_apply_block.contains("FrameRegistryGuard::new("),
+        "quiesce.rs apply_inventory block must bind FrameRegistryGuard"
+    );
+
+    // 5. fork reservation in vcpu_loop/quiesce.rs
+    let quiesce_reserve_block = quiesce_src
+        .split("let mut inventory_reserve =")
+        .nth(1)
+        .expect("inventory_reserve exists")
+        .split("let inventory_preparation =")
+        .next()
+        .expect("inventory_reserve end");
+    assert_guard_precedes(
+        quiesce_reserve_block,
+        ".reserve_frame_inventory(frame_candidates, mapping_candidates, capacity)",
+        "quiesce.rs inventory_reserve",
+    );
+
+    // 6. exec reservation in vcpu_loop/exec.rs
+    let exec_reserve_block = exec_src
+        .split("let retired = match old_capacity {")
+        .nth(1)
+        .expect("exec reservation exists")
+        .split("Some(abandon)")
+        .next()
+        .expect("exec reservation end");
+    assert_guard_precedes(
+        exec_reserve_block,
+        "engine.begin_exec_inventory(retired, replacement)",
+        "exec.rs begin_exec_inventory",
+    );
+
+    // 7. exit terminal reservation in vcpu_loop/binding.rs
+    let exit_reserve_block = binding_src
+        .split("if owns_final_mm {")
+        .nth(1)
+        .expect("exit terminal reservation exists")
+        .split("let prepared_core =")
+        .next()
+        .expect("exit terminal reservation end");
+    assert_guard_precedes(
+        exit_reserve_block,
+        "engine\n                .begin_retirement_inventory(reservation)",
+        "binding.rs begin_retirement_inventory",
+    );
+}
