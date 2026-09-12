@@ -699,11 +699,6 @@
     "excluded": false,
     "runner": "generic"
   },
-  "forkstorm": {
-    "class": "performance",
-    "excluded": false,
-    "runner": "generic"
-  },
   "fsescapeguard": {
     "class": "conformance",
     "excluded": false,
@@ -1495,6 +1490,11 @@
     "runner": "generic"
   },
   "perf_fork_scale": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_forkstorm": {
     "class": "performance",
     "excluded": false,
     "runner": "generic"
