@@ -427,10 +427,12 @@ impl RetiredRows {
         Self { aliases }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.aliases.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.aliases.is_empty()
     }
@@ -915,6 +917,17 @@ impl AliasRegistry {
         rows
     }
 
+    pub(crate) fn contains_replay(&self, key: &ReplayMappingKey) -> bool {
+        self.by_scope.values().any(|b| b.replay.contains(key))
+    }
+
+    pub(crate) fn all_replay_mappings(&self) -> std::collections::BTreeSet<ReplayMappingKey> {
+        self.by_scope
+            .values()
+            .flat_map(|b| b.replay.iter().copied())
+            .collect()
+    }
+
     /// Every row in GLOBAL insertion order, oldest first. O(n log n); use
     /// [`Self::scope_rows`] when the question is scoped.
     #[cfg(test)]
@@ -1089,12 +1102,6 @@ impl AliasRegistry {
             self.index_remove(seq, alias);
         }
         self.by_scope.retain(|_, bucket| !bucket.rows.is_empty());
-    }
-
-    /// Remove every row of one scope and return them, oldest first. This is
-    /// the process-retirement primitive: O(that scope's rows), not O(carrier).
-    pub(crate) fn remove_scope(&mut self, scope: AliasOwnershipScope) -> Vec<AliasBacking> {
-        self.retire_scope(scope).into_vec()
     }
 
     /// Retire all rows belonging to `scope`.
@@ -2828,18 +2835,8 @@ pub(crate) fn unregister_alias(
     mm_root_slot: Option<(u64, u64)>,
     container_root: ContainerRootToken,
 ) -> std::collections::BTreeSet<(u64, u64)> {
-    let replay = replay_mappings().lock();
     let mut registry = alias_registry().lock();
-    let mut versions = alias_version_registry().lock();
-    unregister_alias_in(
-        &mut registry,
-        &replay,
-        &mut versions,
-        va,
-        len,
-        mm_root_slot,
-        container_root,
-    )
+    unregister_alias_in(&mut registry, va, len, mm_root_slot, container_root)
 }
 
 /// Invalidate only keys whose effective first alias changed. Replay versions
@@ -2849,8 +2846,6 @@ pub(crate) fn unregister_alias(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn unregister_alias_in(
     registry: &mut AliasRegistry,
-    replay: &std::collections::BTreeSet<ReplayMappingKey>,
-    versions: &mut AliasVersionRegistry,
     va: u64,
     len: usize,
     mm_root_slot: Option<(u64, u64)>,
@@ -2860,12 +2855,19 @@ pub(crate) fn unregister_alias_in(
         return std::collections::BTreeSet::new();
     };
     let mut keys = std::collections::BTreeSet::new();
+    let mut replay_before =
+        std::collections::BTreeMap::<(AliasOwnershipScope, u64), Vec<ReplayMappingKey>>::new();
     for (_, entry) in registry.va_window_rows(va, end) {
         let entry_end = entry.start.saturating_add(entry.size as u64);
         if !alias_matches_process_scope(entry.ownership_scope, mm_root_slot, container_root)
             || entry_end <= va
         {
             continue;
+        }
+        if let Some(bucket) = registry.by_scope.get(&entry.ownership_scope) {
+            replay_before
+                .entry((entry.ownership_scope, entry.physical_ipa))
+                .or_insert_with(|| replay_rows_for_ipa(&bucket.replay, entry.physical_ipa));
         }
         keys.insert(alias_version_key(entry));
         if entry_end > end {
@@ -2883,14 +2885,33 @@ pub(crate) fn unregister_alias_in(
         .map(|key| (key, registry.find_by_key(key.0, key.1, key.2)))
         .collect::<Vec<_>>();
     let retired = unregister_alias_entries(registry, va, len, mm_root_slot, container_root);
-    let mut physical_ipas = std::collections::BTreeSet::new();
+    let mut physical_ipas_by_scope =
+        std::collections::BTreeMap::<AliasOwnershipScope, std::collections::BTreeSet<u64>>::new();
+    for ((scope, physical_ipa), before_rows) in replay_before {
+        let after_rows = registry
+            .by_scope
+            .get(&scope)
+            .map(|b| replay_rows_for_ipa(&b.replay, physical_ipa))
+            .unwrap_or_default();
+        if before_rows != after_rows {
+            physical_ipas_by_scope
+                .entry(scope)
+                .or_default()
+                .insert(physical_ipa);
+        }
+    }
     for (key, old) in before {
         let after = registry.find_by_key(key.0, key.1, key.2);
         if old == after {
             continue;
         }
-        physical_ipas.extend(old.into_iter().chain(after).map(|alias| alias.physical_ipa));
-        bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
+        let scope = key.2;
+        physical_ipas_by_scope
+            .entry(scope)
+            .or_default()
+            .extend(old.into_iter().chain(after).map(|alias| alias.physical_ipa));
+        let bucket = registry.by_scope.entry(scope).or_default();
+        bump_version_epoch(&mut bucket.versions.alias_epochs, key).unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::host_alias",
                 "alias epoch counter exhausted while unregistering alias: key=(0x{:x}, 0x{:x}, {:?})",
@@ -2899,20 +2920,23 @@ pub(crate) fn unregister_alias_in(
                 key.2
             );
         });
-        for id in reset_alias_chain(&mut versions.aliases, key, after) {
-            versions.alias_version_owner.remove(&id);
+        for id in reset_alias_chain(&mut bucket.versions.aliases, key, after) {
+            bucket.versions.alias_version_owner.remove(&id);
         }
     }
-    for physical_ipa in physical_ipas {
-        bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::host_alias",
-                "replay epoch counter exhausted while unregistering alias: physical_ipa=0x{physical_ipa:x}"
-            );
-        });
-        let base = replay_rows_for_ipa(replay, physical_ipa);
-        for id in reset_replay_chain(&mut versions.replays, physical_ipa, base) {
-            versions.replay_version_owner.remove(&id);
+    for (scope, physical_ipas) in physical_ipas_by_scope {
+        let bucket = registry.by_scope.entry(scope).or_default();
+        for physical_ipa in physical_ipas {
+            bump_version_epoch(&mut bucket.versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::host_alias",
+                    "replay epoch counter exhausted while unregistering alias: physical_ipa=0x{physical_ipa:x}"
+                );
+            });
+            let base = replay_rows_for_ipa(&bucket.replay, physical_ipa);
+            for id in reset_replay_chain(&mut bucket.versions.replays, physical_ipa, base) {
+                bucket.versions.replay_version_owner.remove(&id);
+            }
         }
     }
     retired
@@ -2920,7 +2944,7 @@ pub(crate) fn unregister_alias_in(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn clear_alias_registry() {
-    mutate_external_alias_state(|_, registry| registry.clear());
+    alias_registry().lock().clear();
 }
 
 /// Bounds lazy alias remaps per backing IPA, not per guest-run interval.

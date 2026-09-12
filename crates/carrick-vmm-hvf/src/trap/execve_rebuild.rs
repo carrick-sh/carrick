@@ -194,16 +194,16 @@ impl PendingExecStage2Cleanup {
             root_proof = Some(retired_root.proof);
         }
         let (removed_aliases, preserved_aliases) = mutate_known_external_alias_state(
-            |_, registry| {
+            |registry| {
                 retired_projection_mutation_keys(
                     registry,
                     &retired_extents,
                     &self.predecessor_aliases,
                 )
             },
-            |replay, registry| {
+            |registry| {
                 let cleanup =
-                    remove_rows_for_retired_stage2_projections(replay, registry, &retired_extents);
+                    remove_rows_for_retired_stage2_projections(registry, &retired_extents);
                 let mut removed = cleanup.removed_aliases;
                 let mut preserved = cleanup.preserved_reused_aliases;
                 for expected in &self.predecessor_aliases {
@@ -844,7 +844,11 @@ impl HvfVmState {
                 .map(|(&key, &value)| (key, value))
                 .collect(),
         };
-        let replay_mappings = replay_mappings().lock().iter().copied().collect();
+        let replay_mappings = alias_registry()
+            .lock()
+            .all_replay_mappings()
+            .into_iter()
+            .collect();
         ExecAuthorityFingerprint {
             owners,
             inventory_initialized,
@@ -1093,8 +1097,12 @@ impl HvfVmState {
                     if rc == 0
                         && let Some(replay_key) = extent.replay_key()
                     {
-                        mutate_external_alias_state(|replay, _| {
-                            replay.insert(replay_key);
+                        mutate_external_alias_state(|registry| {
+                            let bucket = registry
+                                .by_scope
+                                .entry(AliasOwnershipScope::Global)
+                                .or_default();
+                            bucket.replay.insert(replay_key);
                         });
                     }
                     crate::probes::hvpatch_exec_stage2(

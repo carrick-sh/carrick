@@ -1719,8 +1719,10 @@ where
              mapping_candidates: usize,
              capacity: carrick_hal::FrameEventCapacity|
              -> Result<carrick_hal::FrameInventoryReservation, RuntimeError> {
-                let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-                    crate::fork_quiesce::frame_registry_lock().lock(),
+                let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                    carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+                    parent_process.pid(),
+                    self.this_tid.raw(),
                 );
                 let reservation = parent_process
                     .kernel_graph()
@@ -2189,8 +2191,10 @@ where
             return Err(ops.fail_stop(error));
         }
         if !shares_mm {
-            let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-                crate::fork_quiesce::frame_registry_lock().lock(),
+            let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+                child_pid,
+                child_context.task().key().id.raw(),
             );
             ops.apply_inventory(&task_backend, child_context.kernel(), child_mm_id)
                 .unwrap_or_else(|error| {

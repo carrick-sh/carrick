@@ -229,23 +229,20 @@ fn inventory_fingerprint(inventory: &HvpatchFrameInventory) -> InventoryFingerpr
 }
 
 pub(crate) struct ExternalAliasStateRestore {
-    aliases: Vec<AliasBacking>,
-    replay: std::collections::BTreeSet<ReplayMappingKey>,
+    saved: AliasRegistry,
 }
 
 impl ExternalAliasStateRestore {
     pub(crate) fn capture() -> Self {
-        let replay = replay_mappings().lock().clone();
-        let aliases = alias_registry().lock().ordered();
-        Self { aliases, replay }
+        let saved = alias_registry().lock().clone();
+        Self { saved }
     }
 }
 
 impl Drop for ExternalAliasStateRestore {
     fn drop(&mut self) {
-        mutate_external_alias_state(|replay, aliases| {
-            *replay = std::mem::take(&mut self.replay);
-            aliases.replace_all(std::mem::take(&mut self.aliases));
+        mutate_external_alias_state(|aliases| {
+            *aliases = self.saved.clone();
         });
     }
 }
@@ -8774,7 +8771,7 @@ fn foreign_mm_failure_injection_at_composition_boundaries() {
     };
     register_shared_alias(preexisting_alias);
     let alias_preimage = alias_registry().lock().ordered();
-    let replay_preimage = replay_mappings().lock().clone();
+    let replay_preimage = alias_registry().lock().all_replay_mappings();
     assert!(!alias_preimage.is_empty());
     assert!(!replay_preimage.is_empty());
 
@@ -8910,7 +8907,7 @@ fn foreign_mm_failure_injection_at_composition_boundaries() {
         "failed publication must restore the exact nonempty alias preimage"
     );
     assert_eq!(
-        *replay_mappings().lock(),
+        alias_registry().lock().all_replay_mappings(),
         replay_preimage,
         "failed publication must restore the exact nonempty replay preimage"
     );

@@ -564,16 +564,13 @@ fn injected_alias_and_directory_failures_rollback_before_visibility() {
         assert!(alias_registry().lock().contains(&preimage));
         assert!(!alias_registry().lock().contains(&replacement));
         assert!(
-            replay_mappings()
+            alias_registry()
                 .lock()
-                .contains(&replay_mapping_key(preimage))
+                .contains_replay(&replay_mapping_key(preimage))
         );
         alias_registry().lock().retain(|entry| {
             !(entry.ipa == preimage.ipa && entry.ownership_scope == preimage.ownership_scope)
         });
-        replay_mappings()
-            .lock()
-            .retain(|(ipa, _, _, _, _)| *ipa != preimage.physical_ipa);
     }
 }
 
@@ -802,8 +799,8 @@ fn window_indexed_lookups_match_a_full_scan() {
             .collect()
     });
     check(&registry, "rebuild_scope_rows splitting every row");
-    registry.remove_scope(scope_a);
-    check(&registry, "remove_scope");
+    registry.retire_scope(scope_a);
+    check(&registry, "retire_scope");
     registry.retain(|entry| entry.ownership_scope == AliasOwnershipScope::Global);
     check(&registry, "retain");
 
@@ -864,10 +861,10 @@ fn alias_registry_row_total_tracks_its_buckets() {
         1
     );
     check(&registry, "retain_in_scope");
-    assert_eq!(registry.remove_scope(scope_b).len(), 1);
-    check(&registry, "remove_scope");
-    assert!(registry.remove_scope(scope_b).is_empty());
-    check(&registry, "remove_scope on an absent scope");
+    assert_eq!(registry.retire_scope(scope_b).len(), 1);
+    check(&registry, "retire_scope");
+    assert!(registry.retire_scope(scope_b).is_empty());
+    check(&registry, "retire_scope on an absent scope");
 
     registry.rebuild_scope_rows(scope_a, |rows| {
         // Split every row in two, exactly as a partial unmap does.
@@ -1262,7 +1259,6 @@ fn private_cow_retention_query_ignores_global_and_removed_wide_rows() {
 fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
     let physical = (0x5fff_2200_0000_u64, 0x4000_u64);
     let registry = std::sync::Arc::new(parking_lot::Mutex::new(AliasRegistry::default()));
-    let replay = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::BTreeSet::new()));
     let mut retired = alias(0x7800_0000, 3);
     retired.start = 0x7000_0000;
     retired.ipa = physical.0;
@@ -1276,7 +1272,6 @@ fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
     successor.physical_host_addr = successor.host_addr;
     successor.owner_generation = 42;
     registry.lock().push(retired);
-    replay.lock().insert(replay_mapping_key(retired));
     let old_extent = InventoryExtent {
         frame: carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(91).unwrap()),
         mapping: carrick_hal::MappingId::from_kernel_allocation(
@@ -1295,7 +1290,6 @@ fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
     let allow_delayed_cleanup = std::sync::Arc::new(std::sync::Barrier::new(2));
     let removed = std::thread::scope(|scope| {
         let cleanup_registry = std::sync::Arc::clone(&registry);
-        let cleanup_replay = std::sync::Arc::clone(&replay);
         let cleanup_after_release = std::sync::Arc::clone(&after_old_ipa_release);
         let cleanup_allowed = std::sync::Arc::clone(&allow_delayed_cleanup);
         let cleanup = scope.spawn(move || {
@@ -1304,7 +1298,6 @@ fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
             cleanup_after_release.wait();
             cleanup_allowed.wait();
             remove_rows_for_retired_stage2_projection(
-                &mut cleanup_replay.lock(),
                 &mut cleanup_registry.lock(),
                 old_extent.into(),
             )
@@ -1312,7 +1305,6 @@ fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
 
         after_old_ipa_release.wait();
         registry.lock().push(successor);
-        replay.lock().insert(replay_mapping_key(successor));
         allow_delayed_cleanup.wait();
         cleanup.join().unwrap()
     });
@@ -1325,8 +1317,8 @@ fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
         removed.preserved_reused_replay,
         vec![replay_mapping_key(successor)]
     );
-    assert!(!replay.lock().contains(&replay_mapping_key(retired)));
-    assert!(replay.lock().contains(&replay_mapping_key(successor)));
+    assert!(!registry.contains_replay(&replay_mapping_key(retired)));
+    assert!(registry.contains_replay(&replay_mapping_key(successor)));
     assert!(!registry.contains(&retired));
     assert!(
         registry.contains(&successor),
@@ -1369,7 +1361,6 @@ fn exact_owner_cleanup_does_not_scan_foreign_physical_extents() {
     const FOREIGN_OWNERS: usize = 512;
     let physical = (0x5fff_2600_0000_u64, 0x4000_u64);
     let mut registry = AliasRegistry::default();
-    let mut replay = std::collections::BTreeSet::new();
     for index in 0..FOREIGN_OWNERS {
         let mut foreign = alias(0x7a00_0000 + index, 1);
         foreign.start = 0x7100_0000 + index as u64 * 0x8000;
@@ -1390,7 +1381,6 @@ fn exact_owner_cleanup_does_not_scan_foreign_physical_extents() {
     retired_alias.size = retired_alias.physical_size;
     retired_alias.owner_generation = 73;
     registry.push(retired_alias);
-    replay.insert(replay_mapping_key(retired_alias));
     let retired = RetiredStage2Projection {
         physical_ipa: physical.0,
         physical_length: physical.1,
@@ -1401,7 +1391,7 @@ fn exact_owner_cleanup_does_not_scan_foreign_physical_extents() {
     };
 
     let before = alias_state_rows_scanned();
-    let cleanup = remove_rows_for_retired_stage2_projection(&mut replay, &mut registry, retired);
+    let cleanup = remove_rows_for_retired_stage2_projection(&mut registry, retired);
     let scanned = alias_state_rows_scanned() - before;
 
     assert_eq!(cleanup.removed_aliases, vec![retired_alias]);
@@ -1435,9 +1425,6 @@ fn alias_receipts_retire_distant_same_ipa_rows_independently() {
 
     distant_receipt.retire_exact();
     assert!(!alias_registry().lock().contains(&distant));
-    replay_mappings()
-        .lock()
-        .retain(|(ipa, _, _, _, _)| *ipa != first.physical_ipa);
 }
 
 #[test]
@@ -1506,8 +1493,6 @@ fn retiring_one_owner_does_not_scan_foreign_alias_rows() {
     // measuring visited rows against carrier-global state made this
     // assertion depend on whatever other tests were running concurrently.
     let mut registry = AliasRegistry::default();
-    let mut replay = std::collections::BTreeSet::new();
-    let mut versions = AliasVersionRegistry::default();
     for index in 0..FOREIGN_OWNERS {
         let mut foreign = alias(0x3000_0000 + index, 1);
         foreign.ipa = 0x6000_0000_0000 + (index as u64) * 0x4000;
@@ -1516,19 +1501,15 @@ fn retiring_one_owner_does_not_scan_foreign_alias_rows() {
             base: 0x1000_0000_0000 + (index as u64) * 0x4000,
             size: 0x4000,
         };
-        replay.insert(replay_mapping_key(foreign));
         registry.push(foreign);
     }
     let mut mine = alias(0x9999_0000, 1);
     mine.ownership_scope = retiring_scope;
-    replay.insert(replay_mapping_key(mine));
     registry.push(mine);
 
     let before = alias_state_rows_scanned();
     retire_process_aliases_in(
         &mut registry,
-        &replay,
-        &mut versions,
         Some(retiring_root_slot),
         ContainerRootToken::ROOT,
         |_| true,
@@ -1564,8 +1545,6 @@ fn retiring_one_owner_does_not_scan_foreign_alias_rows() {
 fn exit_cost_is_bounded_by_own_rows() {
     let _test_lock = ALIAS_TEST_LOCK.lock();
     let mut registry = AliasRegistry::default();
-    let mut replay = std::collections::BTreeSet::new();
-    let mut versions = AliasVersionRegistry::default();
     let directory = HvpatchCarrierTaskStateDirectory::default();
 
     let mut target_slot = None;
@@ -1588,13 +1567,13 @@ fn exit_cost_is_bounded_by_own_rows() {
             row.ownership_scope = scope;
             let key = alias_version_key(&row);
             let rkey = replay_mapping_key(row);
-            replay.insert(rkey);
             registry.push(row);
             let id = AliasPublicationVersionId {
                 owner: owner_key(&directory, s + 1, 1),
                 ordinal: r as u32,
             };
-            versions.aliases.insert(
+            let bucket = registry.by_scope.get_mut(&scope).unwrap();
+            bucket.versions.aliases.insert(
                 key,
                 AliasVersionChain {
                     base: Some(row),
@@ -1605,8 +1584,8 @@ fn exit_cost_is_bounded_by_own_rows() {
                     }],
                 },
             );
-            versions.alias_version_owner.insert(id, key);
-            versions.replays.insert(
+            bucket.versions.alias_version_owner.insert(id, key);
+            bucket.versions.replays.insert(
                 row.physical_ipa,
                 ReplayVersionChain {
                     base: vec![rkey],
@@ -1617,15 +1596,16 @@ fn exit_cost_is_bounded_by_own_rows() {
                     }],
                 },
             );
-            versions.replay_version_owner.insert(id, row.physical_ipa);
+            bucket
+                .versions
+                .replay_version_owner
+                .insert(id, row.physical_ipa);
         }
     }
     let target_slot = target_slot.expect("target slot");
     let before = alias_state_rows_scanned();
     let retired = retire_process_aliases_in(
         &mut registry,
-        &replay,
-        &mut versions,
         Some(target_slot),
         ContainerRootToken::ROOT,
         |_| true,
@@ -1639,6 +1619,19 @@ fn exit_cost_is_bounded_by_own_rows() {
         examined <= bound,
         "retiring one scope visited {examined} rows; expected <= {bound}"
     );
+    let target_scope = AliasOwnershipScope::MmRootSlot {
+        base: target_slot.0,
+        size: target_slot.1,
+    };
+    assert!(!registry.by_scope.contains_key(&target_scope));
+    let other_scope = AliasOwnershipScope::MmRootSlot {
+        base: 0x1000_0000_0000,
+        size: 0x4000,
+    };
+    let other_bucket = registry.by_scope.get(&other_scope).unwrap();
+    assert_eq!(other_bucket.rows.len(), 64);
+    assert_eq!(other_bucket.replay.len(), 64);
+    assert_eq!(other_bucket.versions.aliases.len(), 64);
 }
 
 #[test]
@@ -1653,31 +1646,28 @@ fn alias_receipt_restores_exact_registry_and_replay_preimages() {
         AliasPublicationReceipt::commit(owner_key(&directory, 1, 1), &[replacement]).unwrap();
     assert!(alias_registry().lock().contains(&replacement));
     assert!(
-        replay_mappings()
+        alias_registry()
             .lock()
-            .contains(&replay_mapping_key(replacement))
+            .contains_replay(&replay_mapping_key(replacement))
     );
 
     receipt.retire_exact();
     assert!(alias_registry().lock().contains(&preimage));
     assert!(!alias_registry().lock().contains(&replacement));
     assert!(
-        replay_mappings()
+        alias_registry()
             .lock()
-            .contains(&replay_mapping_key(preimage))
+            .contains_replay(&replay_mapping_key(preimage))
     );
     assert!(
-        !replay_mappings()
+        !alias_registry()
             .lock()
-            .contains(&replay_mapping_key(replacement))
+            .contains_replay(&replay_mapping_key(replacement))
     );
 
     alias_registry().lock().retain(|entry| {
         !(entry.ipa == preimage.ipa && entry.ownership_scope == preimage.ownership_scope)
     });
-    replay_mappings()
-        .lock()
-        .retain(|(ipa, _, _, _, _)| *ipa != preimage.physical_ipa);
 }
 
 #[test]
@@ -1696,9 +1686,6 @@ fn alias_retirement_never_restores_over_a_later_writer() {
     alias_registry().lock().retain(|entry| {
         !(entry.ipa == later.ipa && entry.ownership_scope == later.ownership_scope)
     });
-    replay_mappings()
-        .lock()
-        .retain(|(ipa, _, _, _, _)| *ipa != later.physical_ipa);
 }
 
 #[test]
@@ -1721,9 +1708,6 @@ fn buried_alias_owner_retires_without_clobbering_successor() {
     alias_registry().lock().retain(|entry| {
         !(entry.ipa == preimage.ipa && entry.ownership_scope == preimage.ownership_scope)
     });
-    replay_mappings()
-        .lock()
-        .retain(|(ipa, _, _, _, _)| *ipa != preimage.physical_ipa);
 }
 
 #[test]
@@ -1747,9 +1731,6 @@ fn external_writer_between_owned_versions_becomes_effective_base() {
     alias_registry().lock().retain(|entry| {
         !(entry.ipa == external.ipa && entry.ownership_scope == external.ownership_scope)
     });
-    replay_mappings()
-        .lock()
-        .retain(|(ipa, _, _, _, _)| *ipa != external.physical_ipa);
 }
 
 #[test]
@@ -1760,9 +1741,10 @@ fn repeated_alias_key_exhaustion_is_preflighted_without_partial_publication() {
     let second_value = alias(0xf333_0000, 5);
     register_shared_alias(preimage);
     {
-        let mut versions = alias_version_registry().lock();
+        let mut registry = alias_registry().lock();
         let key = alias_version_key(&preimage);
-        *versions.alias_epochs.get_mut(&key).unwrap() = u64::MAX - 1;
+        let bucket = registry.by_scope.get_mut(&key.2).unwrap();
+        *bucket.versions.alias_epochs.get_mut(&key).unwrap() = u64::MAX - 1;
     }
     let directory = HvpatchCarrierTaskStateDirectory::default();
     assert!(
@@ -1772,16 +1754,14 @@ fn repeated_alias_key_exhaustion_is_preflighted_without_partial_publication() {
     assert!(alias_registry().lock().contains(&preimage));
     assert!(!alias_registry().lock().contains(&first_value));
     {
-        let mut versions = alias_version_registry().lock();
+        let mut registry = alias_registry().lock();
         let key = alias_version_key(&preimage);
-        *versions.alias_epochs.get_mut(&key).unwrap() = 1;
+        let bucket = registry.by_scope.get_mut(&key.2).unwrap();
+        *bucket.versions.alias_epochs.get_mut(&key).unwrap() = 1;
     }
     alias_registry().lock().retain(|entry| {
         !(entry.ipa == preimage.ipa && entry.ownership_scope == preimage.ownership_scope)
     });
-    replay_mappings()
-        .lock()
-        .retain(|(ipa, _, _, _, _)| *ipa != preimage.physical_ipa);
 }
 
 #[test]
@@ -2026,18 +2006,17 @@ fn unregister_alias_matches_full_snapshot_invalidation() {
                 }
             }
             let mut registry = AliasRegistry::default();
-            let mut replay = std::collections::BTreeSet::new();
-            let mut versions = AliasVersionRegistry::default();
             for (index, row) in rows.into_iter().enumerate() {
+                let scope = row.ownership_scope;
                 registry.push(row);
-                replay.insert(replay_mapping_key(row));
                 let key = alias_version_key(&row);
                 let id = AliasPublicationVersionId {
                     owner,
                     ordinal: index as u32,
                 };
+                let bucket = registry.by_scope.get_mut(&scope).unwrap();
                 if let std::collections::btree_map::Entry::Vacant(entry) =
-                    versions.aliases.entry(key)
+                    bucket.versions.aliases.entry(key)
                 {
                     let mut preimage = row;
                     preimage.host_addr += 0x4000;
@@ -2049,15 +2028,15 @@ fn unregister_alias_matches_full_snapshot_invalidation() {
                             epoch: 7,
                         }],
                     });
-                    versions.alias_epochs.insert(key, 7);
-                    versions.alias_version_owner.insert(id, key);
+                    bucket.versions.alias_epochs.insert(key, 7);
+                    bucket.versions.alias_version_owner.insert(id, key);
                 }
                 let id = AliasPublicationVersionId {
                     owner,
                     ordinal: index as u32 + 100,
                 };
                 if let std::collections::btree_map::Entry::Vacant(entry) =
-                    versions.replays.entry(row.physical_ipa)
+                    bucket.versions.replays.entry(row.physical_ipa)
                 {
                     entry.insert(ReplayVersionChain {
                         base: vec![],
@@ -2067,30 +2046,19 @@ fn unregister_alias_matches_full_snapshot_invalidation() {
                             epoch: 9,
                         }],
                     });
-                    versions.replay_epochs.insert(row.physical_ipa, 9);
-                    versions.replay_version_owner.insert(id, row.physical_ipa);
+                    bucket.versions.replay_epochs.insert(row.physical_ipa, 9);
+                    bucket
+                        .versions
+                        .replay_version_owner
+                        .insert(id, row.physical_ipa);
                 }
             }
             let mut reference_registry = registry.clone();
-            let mut reference_replay = replay.clone();
-            let mut reference_versions = versions.clone();
-            let expected = mutate_external_alias_state_in(
-                &mut reference_replay,
-                &mut reference_registry,
-                &mut reference_versions,
-                |_, registry| {
-                    unregister_alias_entries(registry, va, len, scope, ContainerRootToken::ROOT)
-                },
-            );
-            let actual = unregister_alias_in(
-                &mut registry,
-                &replay,
-                &mut versions,
-                va,
-                len,
-                scope,
-                ContainerRootToken::ROOT,
-            );
+            let expected = mutate_external_alias_state_in(&mut reference_registry, |registry| {
+                unregister_alias_entries(registry, va, len, scope, ContainerRootToken::ROOT)
+            });
+            let actual =
+                unregister_alias_in(&mut registry, va, len, scope, ContainerRootToken::ROOT);
             assert_eq!(
                 actual, expected,
                 "retired extents variant={variant} offset={offset}"
@@ -2099,7 +2067,7 @@ fn unregister_alias_matches_full_snapshot_invalidation() {
                 registry.iter().copied().collect::<Vec<_>>(),
                 reference_registry.iter().copied().collect::<Vec<_>>()
             );
-            assert_eq!(replay, reference_replay);
+            assert_eq!(registry.by_scope, reference_registry.by_scope);
             let mut reindexed = registry.clone();
             for scope in registry.by_scope.keys() {
                 reindexed.rebuild_exact_scope(*scope);
@@ -2108,17 +2076,11 @@ fn unregister_alias_matches_full_snapshot_invalidation() {
                 registry.exact_first_by_scope,
                 reindexed.exact_first_by_scope
             );
-            assert_eq!(
-                versions, reference_versions,
-                "version invalidation variant={variant} offset={offset}"
-            );
             // A checked-add overflow must leave even live receipts untouched.
-            let before = versions.clone();
+            let before = registry.clone();
             assert!(
                 unregister_alias_in(
                     &mut registry,
-                    &replay,
-                    &mut versions,
                     u64::MAX - 1,
                     4,
                     scope,
@@ -2126,7 +2088,7 @@ fn unregister_alias_matches_full_snapshot_invalidation() {
                 )
                 .is_empty()
             );
-            assert_eq!(versions, before);
+            assert_eq!(registry.by_scope, before.by_scope);
         }
     }
 }
@@ -2155,8 +2117,9 @@ fn external_unregister_and_clear_invalidate_owned_versions() {
     receipt.retire_exact();
     assert!(alias_registry().lock().is_empty());
     assert!(
-        replay_mappings()
+        alias_registry()
             .lock()
+            .all_replay_mappings()
             .iter()
             .all(|(ipa, _, _, _, _)| *ipa != owned.physical_ipa)
     );
@@ -2957,9 +2920,6 @@ fn shared_mm_retires_carrier_before_final_task_authority() {
         !(entry.ipa == alias_preimage.ipa
             && entry.ownership_scope == alias_preimage.ownership_scope)
     });
-    replay_mappings()
-        .lock()
-        .retain(|(ipa, _, _, _, _)| *ipa != alias_preimage.physical_ipa);
 }
 
 #[test]

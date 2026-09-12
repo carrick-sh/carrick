@@ -897,8 +897,10 @@ impl HvfVmState {
         } else {
             None
         };
-        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-            crate::fork_quiesce::frame_registry_lock().lock(),
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+            identity.linux_pid,
+            identity.linux_tid,
         );
         let published = sparse_materialization::publish_replacing(
             &publication,
@@ -1087,7 +1089,7 @@ impl HvfVmState {
             )));
         }
 
-        let _identity = self.cow_identity.ok_or_else(|| {
+        let identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch retained reuse has no bound mm identity".to_owned())
         })?;
         let authority = self.cow_authority.clone().ok_or_else(|| {
@@ -1371,8 +1373,10 @@ impl HvfVmState {
                 "retained reuse stage-1 TLBI failed: {error}"
             );
         }
-        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-            crate::fork_quiesce::frame_registry_lock().lock(),
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
+            identity.linux_pid,
+            identity.linux_tid,
         );
         if let Err(error) = authority.apply(reservation.commit(())) {
             carrick_fatal!(
@@ -2554,8 +2558,10 @@ impl HvfTaskState {
             );
         }
         emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Stage1Published);
-        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-            crate::fork_quiesce::frame_registry_lock().lock(),
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
+            identity.linux_pid,
+            identity.linux_tid,
         );
         if let Err(error) = authority.apply(reservation.commit(())) {
             carrick_fatal!(
@@ -2627,10 +2633,8 @@ impl HvfTaskState {
                 // must not clone/diff or retain-scan carrier-global state.
                 let retired = [RetiredStage2Projection::from(split.old)];
                 let cleanup = mutate_known_external_alias_state(
-                    |_, registry| retired_projection_mutation_keys(registry, &retired, &[]),
-                    |replay, registry| {
-                        remove_rows_for_retired_stage2_projections(replay, registry, &retired)
-                    },
+                    |registry| retired_projection_mutation_keys(registry, &retired, &[]),
+                    |registry| remove_rows_for_retired_stage2_projections(registry, &retired),
                 );
                 for alias in &cleanup.preserved_reused_aliases {
                     record_cow_alias_lifecycle(
@@ -4171,15 +4175,17 @@ impl HvfVmState {
             self.split_local_rows_for_unmap(va, len);
             return Ok(());
         }
-        let _identity = self.cow_identity.ok_or_else(|| {
+        let identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch alias retirement has no mm identity".to_owned())
         })?;
         // `GuestMemory::unmap_range` is reached only from the mmap-family
         // syscall set, whose runtime dispatch already owns the process-wide
         // MM exclusion across invalidate + TLBI + this backend retirement.
         let prepared = self.prepare_process_alias_retirement(va, len)?;
-        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-            crate::fork_quiesce::frame_registry_lock().lock(),
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
+            identity.linux_pid,
+            identity.linux_tid,
         );
         self.commit_process_alias_retirement(va, len, prepared, &registry)
     }
@@ -4390,10 +4396,8 @@ impl HvfVmState {
             self.retire_stage2_extent(ipa, length)?;
             let retired = [retired];
             let cleanup = mutate_known_external_alias_state(
-                |_, registry| retired_projection_mutation_keys(registry, &retired, &[]),
-                |replay, registry| {
-                    remove_rows_for_retired_stage2_projections(replay, registry, &retired)
-                },
+                |registry| retired_projection_mutation_keys(registry, &retired, &[]),
+                |registry| remove_rows_for_retired_stage2_projections(registry, &retired),
             );
             for alias in cleanup.removed_aliases {
                 record_cow_alias_lifecycle(

@@ -1763,8 +1763,10 @@ where
                                 "HVPatch alias inventory has no process context".to_owned(),
                             )
                         })?;
-                        let registry = crate::fork_quiesce::FrameRegistryGuard::new(
-                            crate::fork_quiesce::frame_registry_lock().lock(),
+                        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+                            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+                            process.pid(),
+                            kernel_context.task().key().id.raw(),
                         );
                         if let Err(error) = engine.begin_alias_inventory(reservation) {
                             let abandoned = kernel_context

@@ -1129,9 +1129,8 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
         "exec must retain the sibling MM alias for the shared live extent",
     );
     drop(aliases);
-    mutate_external_alias_state(|replay, registry| {
+    mutate_external_alias_state(|registry| {
         registry.retain(|alias| alias.ipa != predecessor_ipa && alias.ipa != sibling_ipa);
-        replay.retain(|(ipa, _, _, _, _)| *ipa != lease_key.0);
     });
 }
 
@@ -1360,9 +1359,9 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
         .process_visible_ordered(task.mm_root_slot, task.container_root);
     assert!(aliases.contains(&successor_alias));
     assert!(
-        replay_mappings()
+        alias_registry()
             .lock()
-            .contains(&replay_mapping_key(successor_alias)),
+            .contains_replay(&replay_mapping_key(successor_alias)),
         "delayed exec cleanup must retain the successor replay identity",
     );
     assert_eq!(

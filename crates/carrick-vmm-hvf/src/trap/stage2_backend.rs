@@ -355,8 +355,8 @@ pub(crate) unsafe fn inventory_hv_vm_map_replay(
     backing: AliasBacking,
 ) -> applevisor_sys::hv_return_t {
     let key = replay_mapping_key(backing);
-    mutate_external_alias_state(|installed, _| {
-        if installed.contains(&key) {
+    mutate_external_alias_state(|registry| {
+        if registry.contains_replay(&key) {
             return 0;
         }
         let result = unsafe {
@@ -368,7 +368,11 @@ pub(crate) unsafe fn inventory_hv_vm_map_replay(
             )
         };
         if result == 0 {
-            installed.insert(key);
+            let bucket = registry
+                .by_scope
+                .entry(backing.ownership_scope)
+                .or_default();
+            bucket.replay.insert(key);
         }
         result
     })
