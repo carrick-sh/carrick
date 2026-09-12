@@ -545,3 +545,12 @@ commits and is re-checked at the next vet.
   proof and never locks the leaf (the rule is now the signature); shape
   test red on 5149bba88, green after; live receipt = the row completing on
   the rebuilt binary, then the full probe gate.
+- Wedge FIXED and landed (c1a967fc0): `commit_process_alias_retirement`
+  takes the caller's `&FrameRegistryGuard`; live receipt — the
+  multiprocessing row that wedged on every binary since 6ede8db7d
+  completes in 6.3 s on the rebuilt binary e40b856312ac253b; `just
+  conformance-probes` EXIT 0 on main (target/perf/probes-fix-sep12.log);
+  denominator test fixed (8dfc069b7, 532 sources). The sep12 measurement
+  block is rerunning on that binary; Task 6 and the allows round dispatch
+  after it. Leaf rule for Tasks 5–6, now in the plan memory: a callee
+  never locks the frame-registry leaf; it receives the guard.
