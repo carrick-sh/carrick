@@ -411,6 +411,30 @@
     },
     {
       "kind": "env_var",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "next_mmap_address::CARRICK_FORK_DEBUG_VA",
+      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in next_mmap_address::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
+      "symbol": "next_mmap_address::CARRICK_MMAP_GRANT_DEBUG",
+      "fingerprint": "80c748ba662570f06454f1cac60f540e89547595e0d2450b758d1f396f4774c4",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_MMAP_GRANT_DEBUG read in next_mmap_address::CARRICK_MMAP_GRANT_DEBUG (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
+      "symbol": "mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED",
+      "fingerprint": "19774f51dd70100293a802b7f7ba9b5ca4a3e9815e728ed56850b06e97bb3e2c",
+      "classification": "config_debug",
+      "rationale": "Environment variable CARRICK_MMAP_FILE_BACKED read in mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED (crates/carrick-runtime/src/dispatch/mem/backing.rs) configuring carrier behavior or debug logging."
+    },
+    {
+      "kind": "env_var",
       "file": "crates/carrick-runtime/src/dispatch/mem/madvise.rs",
       "symbol": "madvise::CARRICK_MINCORE_EXACT",
       "fingerprint": "4a6206a3e2aa3f4e04f5c34445cd1c90feb37bd6c3bd184e83a49cad3b165ad6",
@@ -426,36 +450,12 @@
       "rationale": "CARRICK_MINCORE_EXACT is the bisection hatch for first-touch residency observation, which arms a fault on each private anonymous page so mincore(2) can tell a written page from an untouched one. Default ON; =0 restores the previous behaviour, where every page of a live VMA reported resident. Read-only configuration selecting whether the arm runs; it carries no per-process state, so it is carrier-wide by construction and cannot be a scope defect."
     },
     {
-      "kind": "env_var",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "next_mmap_address::CARRICK_FORK_DEBUG_VA",
-      "fingerprint": "d1a34eb1d01a21e24a1fe67ec5f906a675b02b4c687d50e7e9bbcafbb6808b70",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_FORK_DEBUG_VA read in next_mmap_address::CARRICK_FORK_DEBUG_VA (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem/backing.rs",
-      "symbol": "mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED",
-      "fingerprint": "19774f51dd70100293a802b7f7ba9b5ca4a3e9815e728ed56850b06e97bb3e2c",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_MMAP_FILE_BACKED read in mmap_file_backed_lowering_enabled::CARRICK_MMAP_FILE_BACKED (crates/carrick-runtime/src/dispatch/mem/backing.rs) configuring carrier behavior or debug logging."
-    },
-    {
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/dispatch/mem/mmap.rs",
       "symbol": "mremap::CARRICK_FAULT_DEBUG",
       "fingerprint": "4fd4e6d485b718f27cdea4b4c0b45a7d31cb4315060db3bb0c3189664414eb65",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_FAULT_DEBUG read in mremap::CARRICK_FAULT_DEBUG (crates/carrick-runtime/src/dispatch/mem/mmap.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/dispatch/mem.rs",
-      "symbol": "next_mmap_address::CARRICK_MMAP_GRANT_DEBUG",
-      "fingerprint": "80c748ba662570f06454f1cac60f540e89547595e0d2450b758d1f396f4774c4",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_MMAP_GRANT_DEBUG read in next_mmap_address::CARRICK_MMAP_GRANT_DEBUG (crates/carrick-runtime/src/dispatch/mem.rs) configuring carrier behavior or debug logging."
     },
     {
       "kind": "thread_local",
