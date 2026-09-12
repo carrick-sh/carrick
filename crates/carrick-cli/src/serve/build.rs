@@ -270,19 +270,19 @@ async fn run_build_streaming(
     )
     .await;
     let build = tokio::task::spawn_blocking(move || {
-        crate::commands::run_build(
-            &carrick_image::ImageStore::default_for_user(),
-            primary_tag,
-            std::path::PathBuf::from(parsed.dockerfile),
-            build_args,
-            parsed.nocache,
-            false,
-            None,
-            None,
-            None,
-            false,
-            ctx_dir,
-        )
+        crate::commands::run_build(crate::commands::BuildArgs {
+            store: &carrick_image::ImageStore::default_for_user(),
+            tag: primary_tag,
+            file: std::path::PathBuf::from(parsed.dockerfile),
+            build_arg: build_args,
+            no_cache: parsed.nocache,
+            cache: false,
+            cache_repo: None,
+            platform: None,
+            output: None,
+            push: false,
+            context: ctx_dir,
+        })
     })
     .await;
     match build {

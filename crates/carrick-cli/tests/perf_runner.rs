@@ -882,13 +882,15 @@ fn perf_gate() {
         }
         if case.cross_boundary {
             perf_support::xboundary::run_cross_boundary(
-                &root,
-                &bin,
-                case,
-                reps(),
-                warmup_reps().min(reps()),
-                cooldown(),
-                &date,
+                perf_support::xboundary::CrossBoundaryRequest {
+                    root: &root,
+                    bin: &bin,
+                    case,
+                    reps: reps(),
+                    warm: warmup_reps().min(reps()),
+                    cooldown: cooldown(),
+                    date: &date,
+                },
             );
         } else {
             run_case(&root, &bin, case);

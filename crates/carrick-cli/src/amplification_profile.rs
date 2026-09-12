@@ -1186,25 +1186,27 @@ mod tests {
         preflight: Option<QuietHostReceipt>,
     ) -> crate::trace_profile::V2ProfileAuthority {
         crate::trace_profile::V2ProfileAuthority::new_for_profile(
-            crate::trace_profile::TraceProfileKind::NativeAmplification,
-            "27A5295i",
-            &amp1_program_sha256(),
-            &"11".repeat(32),
-            &"22".repeat(32),
-            [
-                (
-                    "syscall".to_owned(),
-                    "exit".to_owned(),
-                    "process".to_owned(),
-                ),
-                (
-                    "syscall".to_owned(),
-                    "bsdthread_terminate".to_owned(),
-                    "thread".to_owned(),
-                ),
-            ],
-            Some(fixture_target()),
-            preflight,
+            crate::trace_profile::V2ProfileAuthorityArgs {
+                profile: crate::trace_profile::TraceProfileKind::NativeAmplification,
+                os_build: "27A5295i",
+                program_sha256: &amp1_program_sha256(),
+                birth_qualification_sha256: &"11".repeat(32),
+                terminal_qualification_sha256: &"22".repeat(32),
+                terminal_qualifications: [
+                    (
+                        "syscall".to_owned(),
+                        "exit".to_owned(),
+                        "process".to_owned(),
+                    ),
+                    (
+                        "syscall".to_owned(),
+                        "bsdthread_terminate".to_owned(),
+                        "thread".to_owned(),
+                    ),
+                ],
+                amplification_target: Some(fixture_target()),
+                preflight,
+            },
         )
         .expect("native-amplification launch authority")
     }

@@ -534,29 +534,30 @@ fn ltp_cmd(bin: &str) -> Vec<String> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn mk(
+struct SuiteSpec<'a> {
     name: String,
     eco: Ecosystem,
-    image: &str,
+    image: &'a str,
     cmd: Vec<String>,
     verdict: VerdictKind,
     tier: Tier,
     weight: Weight,
     timeout_s: u64,
     workdir: Option<String>,
-    entrypoint: Option<&str>,
-) -> Suite {
-    let flags = carrick_flags_for(&name);
+    entrypoint: Option<&'a str>,
+}
+
+fn mk(spec: SuiteSpec<'_>) -> Suite {
+    let flags = carrick_flags_for(&spec.name);
     Suite {
-        name,
-        ecosystem: eco,
-        image: image.to_string(),
-        cmd,
-        verdict,
-        tier,
-        weight,
-        timeout_s,
+        name: spec.name,
+        ecosystem: spec.eco,
+        image: spec.image.to_string(),
+        cmd: spec.cmd,
+        verdict: spec.verdict,
+        tier: spec.tier,
+        weight: spec.weight,
+        timeout_s: spec.timeout_s,
         known_gaps: Vec::new(),
         carrick_flags: flags,
         docker_flags: Vec::new(),
@@ -564,8 +565,8 @@ fn mk(
         env: Vec::new(),
         env_carrick: Vec::new(),
         env_docker: Vec::new(),
-        workdir,
-        entrypoint: entrypoint.map(|e| EnginePair {
+        workdir: spec.workdir,
+        entrypoint: spec.entrypoint.map(|e| EnginePair {
             both: Some(e.to_string()),
             carrick: None,
             docker: None,
@@ -605,24 +606,24 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
     // ---- special / hand-shaped suites --------------------------------------
     let go_build_cmd = "cd /tmp && printf 'package main\\nfunc main(){println(\"ok\")}\\n' > h.go && \
          GOCACHE=/tmp/gc /usr/local/go/bin/go build -o /tmp/h ./h.go && /tmp/h && echo BUILD_OK";
-    suites.push(mk(
-        s("go-build"),
-        Go,
-        GO_IMG,
-        vec![s("/bin/sh"), s("-c"), s(go_build_cmd)],
-        Shell,
-        Smoke,
-        Heavy,
-        120,
-        Some(s("/tmp")),
-        None,
-    ));
+    suites.push(mk(SuiteSpec {
+        name: s("go-build"),
+        eco: Go,
+        image: GO_IMG,
+        cmd: vec![s("/bin/sh"), s("-c"), s(go_build_cmd)],
+        verdict: Shell,
+        tier: Smoke,
+        weight: Heavy,
+        timeout_s: 120,
+        workdir: Some(s("/tmp")),
+        entrypoint: None,
+    }));
     for name in ["app-smoke", "v8-smoke"] {
-        suites.push(node_suite(mk(
-            format!("node-{name}"),
-            Node,
-            NODE_IMG,
-            vec![
+        suites.push(node_suite(mk(SuiteSpec {
+            name: format!("node-{name}"),
+            eco: Node,
+            image: NODE_IMG,
+            cmd: vec![
                 s("--runner"),
                 s("docker"),
                 s("--suite"),
@@ -632,19 +633,19 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
                 s("--timeout"),
                 s("120"),
             ],
-            Tap,
-            Smoke,
-            Heavy,
-            180,
-            None,
-            Some("/usr/local/bin/nodejs-conformance"),
-        )));
+            verdict: Tap,
+            tier: Smoke,
+            weight: Heavy,
+            timeout_s: 180,
+            workdir: None,
+            entrypoint: Some("/usr/local/bin/nodejs-conformance"),
+        })));
     }
-    let libuv = node_suite(mk(
-        s("node-libuv"),
-        Node,
-        NODE_IMG,
-        vec![
+    let libuv = node_suite(mk(SuiteSpec {
+        name: s("node-libuv"),
+        eco: Node,
+        image: NODE_IMG,
+        cmd: vec![
             s("--runner"),
             s("docker"),
             s("--suite"),
@@ -654,13 +655,13 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
             s("--timeout"),
             s("180"),
         ],
-        Tap,
-        Full,
-        Heavy,
-        240,
-        None,
-        Some("/usr/local/bin/nodejs-conformance"),
-    ));
+        verdict: Tap,
+        tier: Full,
+        weight: Heavy,
+        timeout_s: 240,
+        workdir: None,
+        entrypoint: Some("/usr/local/bin/nodejs-conformance"),
+    }));
     suites.push(libuv);
 
     // ---- CPython: one suite per top-level test module ----------------------
@@ -686,11 +687,11 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
     cpy.dedup();
     for m in &cpy {
         let short = m.strip_prefix("test_").unwrap_or(m);
-        let suite = mk(
-            format!("cpython-{short}"),
-            Cpython,
-            CPYTHON_IMG,
-            vec![
+        let suite = mk(SuiteSpec {
+            name: format!("cpython-{short}"),
+            eco: Cpython,
+            image: CPYTHON_IMG,
+            cmd: vec![
                 s("/usr/local/bin/python3"),
                 s("-m"),
                 s("test"),
@@ -699,13 +700,13 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
                 s("0"),
                 s(m),
             ],
-            Regrtest,
-            smoke(CPY_SMOKE.contains(&m.as_str())),
-            Heavy,
-            cpython_timeout_s(m),
-            None,
-            None,
-        );
+            verdict: Regrtest,
+            tier: smoke(CPY_SMOKE.contains(&m.as_str())),
+            weight: Heavy,
+            timeout_s: cpython_timeout_s(m),
+            workdir: None,
+            entrypoint: None,
+        });
         suites.push(suite);
     }
 
@@ -744,24 +745,24 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         // 1080 s ceiling the 6x-budget verification showed sufficient. Docker
         // and unloaded HVF usually finish much faster — upper bound only.
         let timeout_s = go_timeout_s(pkg);
-        suites.push(mk(
-            format!("go-{binn}"),
-            Go,
-            GO_IMG,
-            vec![
+        suites.push(mk(SuiteSpec {
+            name: format!("go-{binn}"),
+            eco: Go,
+            image: GO_IMG,
+            cmd: vec![
                 format!("/conformance/{binn}.test"),
                 s("-test.v"),
                 s("-test.run"),
                 s(test_run),
                 s("-test.short"),
             ],
-            Gotest,
-            smoke(GO_SMOKE.contains(&pkg.as_str())),
-            Heavy,
+            verdict: Gotest,
+            tier: smoke(GO_SMOKE.contains(&pkg.as_str())),
+            weight: Heavy,
             timeout_s,
-            Some(format!("/usr/local/go/src/{pkg}")),
-            None,
-        ));
+            workdir: Some(format!("/usr/local/go/src/{pkg}")),
+            entrypoint: None,
+        }));
     }
 
     // ---- LTP: one suite per syscall-family testcase ------------------------
@@ -781,18 +782,18 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
     ltp.sort();
     for b in &ltp {
         let cmd = ltp_cmd(b);
-        suites.push(mk(
-            format!("ltp-{b}"),
-            Ecosystem::Ltp,
-            LTP_IMG,
+        suites.push(mk(SuiteSpec {
+            name: format!("ltp-{b}"),
+            eco: Ecosystem::Ltp,
+            image: LTP_IMG,
             cmd,
-            VerdictKind::Ltp,
-            smoke(LTP_SMOKE.contains(&b.as_str())),
-            Light,
-            ltp_timeout_s(b),
-            None,
-            None,
-        ));
+            verdict: VerdictKind::Ltp,
+            tier: smoke(LTP_SMOKE.contains(&b.as_str())),
+            weight: Light,
+            timeout_s: ltp_timeout_s(b),
+            workdir: None,
+            entrypoint: None,
+        }));
     }
 
     for s in &mut suites {

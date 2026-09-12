@@ -675,31 +675,43 @@ fn run_bridge_publish_probe(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn run_native_service_pair(
-    bin: &PathBuf,
+struct NativeServiceEndpoint<'a> {
+    name: &'a str,
+    env: &'a [(&'a str, String)],
+    probe: &'a std::path::Path,
+}
+
+struct NativeServicePairRequest<'a> {
+    bin: &'a PathBuf,
     lane: Lane,
-    server_name: &str,
-    server_env: &[(&str, String)],
-    server_probe: &std::path::Path,
-    ready_line: &str,
-    pre_client: Option<(&str, &[(&str, String)], &std::path::Path)>,
-    client_name: &str,
-    client_env: &[(&str, String)],
-    client_probe: &std::path::Path,
-) -> (String, String, Option<String>) {
+    server: NativeServiceEndpoint<'a>,
+    ready_line: &'a str,
+    pre_client: Option<NativeServiceEndpoint<'a>>,
+    client: NativeServiceEndpoint<'a>,
+}
+
+fn run_native_service_pair(req: NativeServicePairRequest<'_>) -> (String, String, Option<String>) {
     use std::io::{BufRead, Read};
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
 
+    let NativeServicePairRequest {
+        bin,
+        lane,
+        server,
+        ready_line,
+        pre_client,
+        client,
+    } = req;
+
     let run_id = case_run_id();
-    let mut server = Command::new(bin)
+    let mut server_proc = Command::new(bin)
         .args(native_bound_named_probe_args(
             lane.platform,
             lane.image,
-            server_name,
-            server_probe,
-            server_env,
+            server.name,
+            server.probe,
+            server.env,
         ))
         .env("CARRICK_RUN_ID", &run_id)
         .stdin(std::process::Stdio::null())
@@ -708,9 +720,9 @@ fn run_native_service_pair(
         .process_group(0)
         .spawn()
         .expect("spawn native service probe");
-    let server_pid = server.id() as i32;
-    let stdout = server.stdout.take().expect("server stdout");
-    let stderr = server.stderr.take().expect("server stderr");
+    let server_pid = server_proc.id() as i32;
+    let stdout = server_proc.stdout.take().expect("server stdout");
+    let stderr = server_proc.stderr.take().expect("server stderr");
     let (line_tx, line_rx) = mpsc::channel::<String>();
     let stdout_reader = std::thread::spawn(move || {
         let mut out = String::new();
@@ -749,7 +761,7 @@ fn run_native_service_pair(
     if !ready {
         unsafe { libc::kill(-server_pid, libc::SIGKILL) };
         scoped_kill_guests(&run_id);
-        let _ = server.wait();
+        let _ = server_proc.wait();
         let out = stdout_reader.join().unwrap_or_default();
         let err = stderr_reader.join().unwrap_or_default();
         return (
@@ -759,12 +771,13 @@ fn run_native_service_pair(
         );
     }
 
-    let pre_client_out = pre_client
-        .map(|(name, env, probe)| run_native_bound_named_probe(bin, lane, name, env, probe));
-    let client_out = run_native_bound_named_probe(bin, lane, client_name, client_env, client_probe);
+    let pre_client_out = pre_client.map(|endpoint| {
+        run_native_bound_named_probe(bin, lane, endpoint.name, endpoint.env, endpoint.probe)
+    });
+    let client_out = run_native_bound_named_probe(bin, lane, client.name, client.env, client.probe);
     let deadline = Instant::now() + CASE_DEADLINE;
     let server_out = loop {
-        match server.try_wait().expect("poll native service probe") {
+        match server_proc.try_wait().expect("poll native service probe") {
             Some(_) => {
                 let out = stdout_reader.join().unwrap_or_default();
                 let err = stderr_reader.join().unwrap_or_default();
@@ -773,7 +786,7 @@ fn run_native_service_pair(
             None if Instant::now() >= deadline => {
                 unsafe { libc::kill(-server_pid, libc::SIGKILL) };
                 scoped_kill_guests(&run_id);
-                let _ = server.wait();
+                let _ = server_proc.wait();
                 let out = stdout_reader.join().unwrap_or_default();
                 let err = stderr_reader.join().unwrap_or_default();
                 break normalize(&format!("{out}{err}<TIMEOUT waiting for service exit>"));
@@ -1663,18 +1676,22 @@ fn conformance_native_udp_service_pair() {
         ("CARRICK_PROBE_TARGET", "udp-server".to_string()),
         ("CARRICK_PROBE_PORT", port.to_string()),
     ];
-    let (server_out, client_out, _) = run_native_service_pair(
-        &bin,
+    let (server_out, client_out, _) = run_native_service_pair(NativeServicePairRequest {
+        bin: &bin,
         lane,
-        "udp-server",
-        &server_env,
-        &server,
-        "udp_server_ready=true",
-        None,
-        "udp-client",
-        &client_env,
-        &client,
-    );
+        server: NativeServiceEndpoint {
+            name: "udp-server",
+            env: &server_env,
+            probe: &server,
+        },
+        ready_line: "udp_server_ready=true",
+        pre_client: None,
+        client: NativeServiceEndpoint {
+            name: "udp-client",
+            env: &client_env,
+            probe: &client,
+        },
+    });
     assert!(
         client_out.contains("udp_client_response=pong"),
         "UDP client failed:\nserver:\n{server_out}\nclient:\n{client_out}"
@@ -1724,18 +1741,26 @@ fn conformance_native_multi_network_roles() {
         ("CARRICK_PROBE_PORT", port.to_string()),
         ("CARRICK_PROBE_EXPECT", "success".to_string()),
     ];
-    let (server_out, client_out, dns_out) = run_native_service_pair(
-        &bin,
+    let (server_out, client_out, dns_out) = run_native_service_pair(NativeServicePairRequest {
+        bin: &bin,
         lane,
-        "multi-server",
-        &server_env,
-        &server,
-        "multi_server_bridge_server_ready=true",
-        Some(("multi-dns", &dns_env, &dns)),
-        "multi-client",
-        &client_env,
-        &client,
-    );
+        server: NativeServiceEndpoint {
+            name: "multi-server",
+            env: &server_env,
+            probe: &server,
+        },
+        ready_line: "multi_server_bridge_server_ready=true",
+        pre_client: Some(NativeServiceEndpoint {
+            name: "multi-dns",
+            env: &dns_env,
+            probe: &dns,
+        }),
+        client: NativeServiceEndpoint {
+            name: "multi-client",
+            env: &client_env,
+            probe: &client,
+        },
+    });
     let dns_out = dns_out.unwrap_or_default();
     assert!(
         dns_out.contains("multi_dns_dns_ok=true"),

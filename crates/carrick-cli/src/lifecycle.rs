@@ -1855,20 +1855,32 @@ pub(crate) fn stop_grace_secs(flag: Option<u64>, config_timeout: Option<u64>) ->
     flag.or(config_timeout).unwrap_or(10)
 }
 
+#[derive(Debug)]
+pub(crate) struct ExecArgs<'a> {
+    pub(crate) store: carrick_image::ImageStore,
+    pub(crate) spec: &'a str,
+    pub(crate) command: Vec<String>,
+    pub(crate) interactive: bool,
+    pub(crate) tty: bool,
+    pub(crate) user: Option<String>,
+    pub(crate) workdir: Option<String>,
+    pub(crate) env: Vec<String>,
+}
+
 /// `carrick exec [-u] [-w] [-e] <container> <cmd>...` — admit a fresh logical
 /// process into the running container's authenticated carrier and capture its
 /// result. Interactive and TTY transport remain explicitly unavailable.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn exec(
-    _store: carrick_image::ImageStore,
-    spec: &str,
-    command: Vec<String>,
-    interactive: bool,
-    tty: bool,
-    user: Option<String>,
-    workdir: Option<String>,
-    env: Vec<String>,
-) -> anyhow::Result<()> {
+pub(crate) fn exec(args: ExecArgs<'_>) -> anyhow::Result<()> {
+    let ExecArgs {
+        store: _store,
+        spec,
+        command,
+        interactive,
+        tty,
+        user,
+        workdir,
+        env,
+    } = args;
     if interactive || tty {
         bail!(
             "interactive/TTY exec is unavailable until carrier-control stdin and TTY framing is implemented"

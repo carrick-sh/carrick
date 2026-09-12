@@ -142,6 +142,26 @@ impl InMemNode {
     }
 }
 
+/// Metadata for host-fd backed files injected into an [`InMemoryFileVfs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostFileMetadata {
+    pub mode: u32,
+    pub uid: NsUid,
+    pub gid: NsGid,
+    pub mtime_secs: i64,
+}
+
+impl Default for HostFileMetadata {
+    fn default() -> Self {
+        Self {
+            mode: 0o666,
+            uid: NsUid::ROOT,
+            gid: NsGid::ROOT,
+            mtime_secs: 0,
+        }
+    }
+}
+
 /// An in-memory filesystem with explicit metadata, deterministic storage,
 /// configurable read-only / bounded capacity, and real write capture.
 pub struct InMemoryFileVfs {
@@ -322,20 +342,16 @@ impl InMemoryFileVfs {
         fd: RawFd,
         size: u64,
     ) -> Result<(), VfsError> {
-        self.add_host_file_with_metadata(path, fd, size, 0o666, NsUid::ROOT, NsGid::ROOT, 0)
+        self.add_host_file_with_metadata(path, fd, size, HostFileMetadata::default())
     }
 
     /// Add a host-fd-backed file with explicit metadata.
-    #[allow(clippy::too_many_arguments)]
     pub fn add_host_file_with_metadata(
         &self,
         path: impl AsRef<Path>,
         fd: RawFd,
         size: u64,
-        mode: u32,
-        uid: NsUid,
-        gid: NsGid,
-        mtime_secs: i64,
+        metadata: HostFileMetadata,
     ) -> Result<(), VfsError> {
         let path_str = normalize_path(&path.as_ref().to_string_lossy());
         if path_str == "/" {
@@ -349,10 +365,10 @@ impl InMemoryFileVfs {
             InMemNode::HostFd {
                 fd,
                 size,
-                mode,
-                uid,
-                gid,
-                mtime_secs,
+                mode: metadata.mode,
+                uid: metadata.uid,
+                gid: metadata.gid,
+                mtime_secs: metadata.mtime_secs,
             },
         );
         Ok(())
