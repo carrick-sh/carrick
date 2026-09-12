@@ -14041,18 +14041,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1201 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor/pool.rs:1177 in `start`, `std::thread::Builder::new` acts only on the bounded carrier-owned persistent executor thread used by `start` at line 2878; no guest identity selects its host target.",
     "review_id": "HA-000588",
     "source": {
-      "byte_end": 44454,
-      "byte_start": 44429,
+      "byte_end": 44257,
+      "byte_start": 44232,
       "column": 30,
       "column_end": 55,
       "column_start": 30,
-      "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-      "line": 1201,
-      "line_end": 1201,
-      "line_start": 1201
+      "file": "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs",
+      "line": 1177,
+      "line_end": 1177,
+      "line_start": 1177
     }
   },
   {
@@ -15368,18 +15368,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:2549 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1109 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
     "review_id": "HA-000638",
     "source": {
-      "byte_end": 101198,
-      "byte_start": 101176,
+      "byte_end": 47510,
+      "byte_start": 47488,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-      "line": 2549,
-      "line_end": 2549,
-      "line_start": 2549
+      "line": 1109,
+      "line_end": 1109,
+      "line_start": 1109
     }
   },
   {
