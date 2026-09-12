@@ -426,3 +426,16 @@ commits and is re-checked at the next vet.
   objects 10.2K→8.8K, executor 10.8K→6.8K, continuation 0 commits (ordered
   to commit). tma 101→66 allows. Per-mm plan: Task 1 tests and Task 2
   guards verified and queued to land.
+- Landed and pushed (night): split-executor (10,804 → 1,131 lines; two
+  continuation.rs source-shape tests repointed at the new submodules by the
+  director), split-operations (11,762 → 2,974; six submodules), per-mm
+  Task 1 tests (`perf_forkstorm` + `two_process_parallelism`, red numbers
+  pending a quiet host) and Task 2 guards (`MmMutationGuard::
+  begin_transaction`, `FrameRegistryGuard`, VM-rebuild rationale deleted).
+  Task 3 (frame publication under the registry leaf) is green on its
+  branch and on a follow-up to also take the leaf inside the fork/exec/exit
+  reservation steps before it lands (otherwise COW publication and fork
+  reservation stop excluding each other on the shared-frame registry).
+  Continuation split: the worker produced no commit in three turns; the
+  director committed its compiled `quantum` submodule (12.1K → 10.5K) and
+  started a fresh conversation on the same worktree.
