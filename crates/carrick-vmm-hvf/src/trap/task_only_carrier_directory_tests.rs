@@ -1062,9 +1062,9 @@ fn alias_registry_batch_removal_matches_rebuilt_state() {
         from_scratch.exact_first_by_scope
     );
 
-    // Verify all 5 secondary indexes
-    assert_eq!(registry.by_va_start, from_scratch.by_va_start);
-    assert_eq!(registry.by_ipa_start, from_scratch.by_ipa_start);
+    // Verify secondary indexes
+    assert_eq!(registry.va_classes, from_scratch.va_classes);
+    assert_eq!(registry.ipa_classes, from_scratch.ipa_classes);
     assert_eq!(registry.by_physical_start, from_scratch.by_physical_start);
     assert_eq!(
         registry.by_scope_physical_start,
