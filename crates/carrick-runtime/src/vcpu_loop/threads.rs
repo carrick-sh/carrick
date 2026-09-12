@@ -244,6 +244,14 @@ pub(crate) fn remove_persistent_process_member(
 /// Settle every enrolled member externally; returns how many member
 /// `ThreadDone` results this drain published (members that never finished
 /// their own job).
+///
+/// The CURRENT job's own handle is put back: it is the survivor of an exec
+/// (or the owner of an exit) and must stay a member so the process's NEXT
+/// drain waits for it. Draining it too (2026-09-12) left every process that
+/// had exec'd once with no leader entry — an exec from a non-leader thread
+/// then found an empty drain, proceeded at once, and the still-running
+/// leader became the stale `Runnable` kernel thread behind the
+/// `execfromthread`/`forkexecstorm`/go-net_http aborts and hangs.
 pub(crate) fn finish_persistent_process_handles(
     threads: &VcpuThreadRegistry,
     current: &continuation::LogicalJobCompletion,
@@ -261,6 +269,10 @@ pub(crate) fn finish_persistent_process_handles(
     }
     let mut published = 0;
     for handle in handles {
+        if handle.completion().id() == current.id() {
+            threads.register_handle(handle);
+            continue;
+        }
         if handle.finish_completed(current.id())? {
             published += 1;
         }
@@ -450,6 +462,51 @@ mod clone_tid_output_tests {
         assert!(transaction.rollback(&mut memory).is_err());
         assert_eq!(memory.bytes[&parent], 99_i32.to_le_bytes());
         assert_eq!(memory.bytes[&child], 41_i32.to_le_bytes());
+    }
+
+    /// The exec-from-thread teardown class (execfromthread, forkexecstorm,
+    /// Go `os/exec` in net_http; 2026-09-12): the sibling drain drains the
+    /// WHOLE member registry, including the surviving job's own handle, and
+    /// nothing re-enrolls the survivor. A process that has exec'd once
+    /// therefore has no leader entry in its next drain: an exec from a
+    /// non-leader thread then finds an empty drain, proceeds at once, and
+    /// the still-running leader is the stale `Runnable` kernel thread every
+    /// post-mortem showed. The survivor must remain a member.
+    #[test]
+    fn sibling_drain_keeps_the_surviving_job_enrolled() {
+        let registry = VcpuThreadRegistry::new();
+        let survivor = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            continuation::LogicalJobCompletion::pending(),
+        );
+        let sibling = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            continuation::LogicalJobCompletion::pending(),
+        );
+        assert!(registry.register(&survivor));
+        assert!(registry.register(&sibling));
+
+        let (published, completions) =
+            finish_persistent_process_handles(&registry, &survivor.completion())
+                .expect("drain settles the sibling");
+        assert_eq!(published, 1, "the sibling is settled externally");
+        assert_eq!(completions.len(), 2);
+        assert!(sibling.is_published());
+        assert!(
+            !survivor.is_published(),
+            "the survivor keeps its own settlement"
+        );
+
+        let remaining: Vec<_> = registry
+            .completions()
+            .into_iter()
+            .map(|completion| completion.id())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![survivor.completion().id()],
+            "the surviving job must stay enrolled so the NEXT exec/exit drain waits for it"
+        );
     }
 
     #[test]

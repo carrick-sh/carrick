@@ -7024,7 +7024,14 @@ mod tests {
         let (published, _) = finish_persistent_process_handles(&handles, &owner.completion())
             .expect("removed Kernel thread settles without a job repoll");
         assert_eq!(published, 1);
-        assert!(handles.is_empty());
+        // The owner (the surviving job) stays enrolled for the process's next
+        // drain; only the removed member is consumed.
+        assert_eq!(handles.len(), 1);
+        assert_eq!(
+            handles.completions()[0].id(),
+            owner.completion().id(),
+            "the drain must keep the surviving job's own handle"
+        );
         assert!(removed.result_is_ready());
         assert!(removed_completion.is_finished());
         assert!(matches!(
