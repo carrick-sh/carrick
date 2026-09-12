@@ -527,3 +527,24 @@ script's anchors must be re-qualified live before its numbers are cited.
   multiprocessing row: 6.66 s vs 6.62 s wall, 10.3 s user both — CPU
   exposure is not the limiter; parallelism ~1.9 cores. Paired five-row
   scorecard running.
+- 2026-09-12 12:35, Task 6 LANDED (4242d0229, pinned e32d0b3e1851faef):
+  `ForkQuiesce` lives in `DispatchMmAuthority`/`Mm`; executors bind it with
+  `bind_current_mm_quiesce(pt, fork)`; `is_quiescing()` reads the bound
+  per-mm barrier (the deleted `barrier::B` global had no production
+  setter left — blocking waits never saw the fork flag on main); fork
+  kicks only `ForkBarrierParticipants` sibling tids instead of every
+  vCPU. Director re-keyed three ledgers by hand (global-state
+  `CURRENT_MM_QUIESCE` re-typed, `barrier::B` row dropped; abort row
+  `prepare_in_process_fork #3` fingerprint context shifted, sink/domain
+  asserted equal). Live receipts on the worktree binary
+  (623b8cb827cdecce): `children_run_concurrently` PASS,
+  `fault_latency_is_independent_of_sibling_fork` PASS in 37 s (was
+  154 s); multiprocessing row 6.94 s wall / SUCCESS; go-net_http 1316/1316
+  PASS on 6/6 runs, alternated 4×4 against the pre-Task-6 pinned main
+  (t6 16.7–25.3 s; main 15.3–31.1 s plus ONE 125 s run on the MAIN
+  binary). OPEN observation, pre-existing: a go-net_http run can stall
+  ~100 s (once in 4 main runs, 0 in 6 t6 runs) and one t6 run logged Go's
+  "httptest.Server blocked in Close after 5 seconds … *tls.Conn … idle"
+  — an idle TLS conn not closed promptly; take a core next time it
+  reproduces rather than filing it as load. Task 5 dispatched
+  (`agy-mm-alias-scope-sep12`, base 4242d0229).
