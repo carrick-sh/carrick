@@ -427,10 +427,12 @@ impl RetiredRows {
         Self { aliases }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.aliases.len()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.aliases.is_empty()
     }
@@ -460,9 +462,26 @@ impl IntoIterator for RetiredRows {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AliasScopeBucket {
+    pub(crate) rows: Vec<(u64, AliasBacking)>,
+    pub(crate) replay: std::collections::BTreeSet<ReplayMappingKey>,
+    pub(crate) versions: AliasVersionRegistry,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for AliasScopeBucket {
+    type Target = [(u64, AliasBacking)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct AliasRegistry {
-    pub(crate) by_scope: std::collections::BTreeMap<AliasOwnershipScope, Vec<(u64, AliasBacking)>>,
+    pub(crate) by_scope: std::collections::BTreeMap<AliasOwnershipScope, AliasScopeBucket>,
     /// First row for each exact semantic key inside a scope: insertion sequence
     /// and value. Receipt publication asks exactly this question for every row;
     /// locating it through the scope `Vec` made a k-row publication O(k * rows-in-mm).
@@ -520,13 +539,13 @@ impl AliasRegistry {
     }
 
     pub(crate) fn rebuild_exact_scope(&mut self, scope: AliasOwnershipScope) {
-        let Some(rows) = self.by_scope.get(&scope) else {
+        let Some(bucket) = self.by_scope.get(&scope) else {
             self.exact_first_by_scope.remove(&scope);
             return;
         };
         let mut exact = std::collections::BTreeMap::new();
-        note_alias_state_rows_scanned(rows.len());
-        for &(seq, alias) in rows {
+        note_alias_state_rows_scanned(bucket.rows.len());
+        for &(seq, alias) in &bucket.rows {
             exact
                 .entry((alias.start, alias.ipa))
                 .or_insert((seq, alias));
@@ -808,9 +827,10 @@ impl AliasRegistry {
     /// bucket agree with the live one. Ties keep insertion order, so a split
     /// row's head still precedes its tail.
     pub(crate) fn place_in_scope_bucket(&mut self, seq: u64, alias: AliasBacking) {
-        let rows = self.by_scope.entry(alias.ownership_scope).or_default();
-        let at = rows.partition_point(|&(row_seq, _)| row_seq <= seq);
-        rows.insert(at, (seq, alias));
+        let bucket = self.by_scope.entry(alias.ownership_scope).or_default();
+        let at = bucket.rows.partition_point(|&(row_seq, _)| row_seq <= seq);
+        bucket.rows.insert(at, (seq, alias));
+        bucket.replay.insert(replay_mapping_key(alias));
     }
 
     pub(crate) fn push(&mut self, alias: AliasBacking) {
@@ -873,17 +893,17 @@ impl AliasRegistry {
     /// lane runs — the same mistake the frame-inventory counter made.
     #[cfg(test)]
     pub(crate) fn recomputed_len(&self) -> usize {
-        self.by_scope.values().map(Vec::len).sum()
+        self.by_scope.values().map(|b| b.rows.len()).sum()
     }
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.by_scope.values().all(Vec::is_empty)
+        self.by_scope.values().all(|b| b.rows.is_empty())
     }
 
     /// Rows of one scope, oldest first.
     pub(crate) fn scope_rows(&self, scope: AliasOwnershipScope) -> &[(u64, AliasBacking)] {
-        self.by_scope.get(&scope).map_or(&[], Vec::as_slice)
+        self.by_scope.get(&scope).map_or(&[], |b| b.rows.as_slice())
     }
 
     /// Rows whose physical stage-2 extent starts exactly at `physical_ipa`.
@@ -904,7 +924,7 @@ impl AliasRegistry {
         let mut rows: Vec<(u64, AliasBacking)> = self
             .by_scope
             .values()
-            .flat_map(|rows| rows.iter().copied())
+            .flat_map(|b| b.rows.iter().copied())
             .collect();
         // STABLE: a row split into fragments keeps its parent's sequence,
         // so equal keys must retain their bucket-relative emission order.
@@ -931,7 +951,7 @@ impl AliasRegistry {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &AliasBacking> {
         self.by_scope
             .values()
-            .flat_map(|rows| rows.iter().map(|(_, alias)| alias))
+            .flat_map(|b| b.rows.iter().map(|(_, alias)| alias))
     }
 
     /// The matching row registered FIRST, in global insertion order.
@@ -948,7 +968,7 @@ impl AliasRegistry {
     ) -> Option<AliasBacking> {
         self.by_scope
             .values()
-            .flatten()
+            .flat_map(|b| &b.rows)
             .filter(|(_, alias)| matches(alias))
             .min_by_key(|(seq, _)| *seq)
             .map(|(_, alias)| *alias)
@@ -963,7 +983,7 @@ impl AliasRegistry {
     ) -> Option<AliasBacking> {
         self.by_scope
             .values()
-            .flatten()
+            .flat_map(|b| &b.rows)
             .filter(|(_, alias)| matches(alias))
             .max_by_key(|(seq, _)| *seq)
             .map(|(_, alias)| *alias)
@@ -981,8 +1001,8 @@ impl AliasRegistry {
         update: impl FnOnce(&mut AliasBacking),
     ) -> bool {
         let mut best: Option<(AliasOwnershipScope, usize, u64)> = None;
-        for (scope, rows) in &self.by_scope {
-            for (position, (seq, alias)) in rows.iter().enumerate() {
+        for (scope, bucket) in &self.by_scope {
+            for (position, (seq, alias)) in bucket.rows.iter().enumerate() {
                 if matches(alias) && best.is_none_or(|(_, _, best_seq)| *seq >= best_seq) {
                     best = Some((*scope, position, *seq));
                 }
@@ -991,17 +1011,25 @@ impl AliasRegistry {
         let Some((scope, position, _)) = best else {
             return false;
         };
-        let Some(rows) = self.by_scope.get_mut(&scope) else {
-            return false;
+        let (seq, previous, updated, changed) = {
+            let Some(bucket) = self.by_scope.get_mut(&scope) else {
+                return false;
+            };
+            let Some(slot) = bucket.rows.get_mut(position) else {
+                return false;
+            };
+            let seq = slot.0;
+            let previous = slot.1;
+            update(&mut slot.1);
+            let updated = slot.1;
+            let changed = updated != previous;
+            if changed {
+                bucket.replay.remove(&replay_mapping_key(previous));
+                bucket.replay.insert(replay_mapping_key(updated));
+            }
+            (seq, previous, updated, changed)
         };
-        let Some(slot) = rows.get_mut(position) else {
-            return false;
-        };
-        let seq = slot.0;
-        let previous = slot.1;
-        update(&mut slot.1);
-        let updated = slot.1;
-        if updated != previous {
+        if changed {
             self.bump_revision();
         }
         self.index_remove(seq, previous);
@@ -1040,16 +1068,19 @@ impl AliasRegistry {
         let mut dropped = Vec::new();
         let scopes = self.by_scope.keys().copied().collect::<Vec<_>>();
         for scope in scopes {
-            let Some(rows) = self.by_scope.get_mut(&scope) else {
+            let Some(bucket) = self.by_scope.get_mut(&scope) else {
                 continue;
             };
-            rows.retain(|row| {
+            bucket.rows.retain(|row| {
                 let survives = keep(&row.1);
                 if !survives {
                     dropped.push(*row);
                 }
                 survives
             });
+            for &(_, alias) in &dropped {
+                bucket.replay.remove(&replay_mapping_key(alias));
+            }
             self.rebuild_exact_scope(scope);
         }
         self.rows = self.rows.saturating_sub(dropped.len());
@@ -1059,33 +1090,32 @@ impl AliasRegistry {
         for (seq, alias) in dropped {
             self.index_remove(seq, alias);
         }
-        self.by_scope.retain(|_, rows| !rows.is_empty());
+        self.by_scope.retain(|_, bucket| !bucket.rows.is_empty());
     }
 
     /// Remove every row of one scope and return them, oldest first. This is
     /// the process-retirement primitive: O(that scope's rows), not O(carrier).
     pub(crate) fn remove_scope(&mut self, scope: AliasOwnershipScope) -> Vec<AliasBacking> {
-        let Some(rows) = self.by_scope.remove(&scope) else {
-            return Vec::new();
-        };
-        self.exact_first_by_scope.remove(&scope);
-        self.bump_revision();
-        self.rows = self.rows.saturating_sub(rows.len());
-        for &(seq, alias) in &rows {
-            self.index_remove(seq, alias);
-        }
-        rows.into_iter().map(|(_, alias)| alias).collect()
+        self.retire_scope(scope).into_vec()
     }
 
     /// Retire all rows belonging to `scope`.
     ///
-    /// In the unpartitioned carrier-global design, retirement walks the
-    /// carrier-global replay set and version containers across all processes.
+    /// Retiring a scope drops its bucket (rows, replay set, and version chains)
+    /// in O(rows in scope) time, without visiting any foreign scopes.
     pub(crate) fn retire_scope(&mut self, scope: AliasOwnershipScope) -> RetiredRows {
-        let replay = replay_mappings().lock();
-        let versions = alias_version_registry().lock();
-        note_alias_state_rows_scanned(replay.len() + versions.aliases.len() + self.rows);
-        let aliases = self.remove_scope(scope);
+        let Some(bucket) = self.by_scope.remove(&scope) else {
+            return RetiredRows::default();
+        };
+        self.exact_first_by_scope.remove(&scope);
+        self.physical_size_counts_by_scope.remove(&scope);
+        self.bump_revision();
+        self.rows = self.rows.saturating_sub(bucket.rows.len());
+        note_alias_state_rows_scanned(bucket.rows.len());
+        for &(seq, alias) in &bucket.rows {
+            self.index_remove(seq, alias);
+        }
+        let aliases = bucket.rows.into_iter().map(|(_, alias)| alias).collect();
         RetiredRows::new(aliases)
     }
 
@@ -1096,16 +1126,19 @@ impl AliasRegistry {
         mut keep: impl FnMut(&AliasBacking) -> bool,
     ) -> Vec<AliasBacking> {
         let mut dropped = Vec::new();
-        if let Some(rows) = self.by_scope.get_mut(&scope) {
-            rows.retain(|row| {
+        if let Some(bucket) = self.by_scope.get_mut(&scope) {
+            bucket.rows.retain(|row| {
                 let survives = keep(&row.1);
                 if !survives {
                     dropped.push(*row);
                 }
                 survives
             });
+            for &(_, alias) in &dropped {
+                bucket.replay.remove(&replay_mapping_key(alias));
+            }
             self.rows = self.rows.saturating_sub(dropped.len());
-            if rows.is_empty() {
+            if bucket.rows.is_empty() {
                 self.by_scope.remove(&scope);
             }
         }
@@ -1129,7 +1162,11 @@ impl AliasRegistry {
         scope: AliasOwnershipScope,
         rebuild: impl FnOnce(Vec<(u64, AliasBacking)>) -> Vec<(u64, AliasBacking)>,
     ) {
-        let Some(previous) = self.by_scope.get_mut(&scope).map(std::mem::take) else {
+        let Some(previous) = self
+            .by_scope
+            .get_mut(&scope)
+            .map(|b| std::mem::take(&mut b.rows))
+        else {
             return;
         };
         let before = previous.len();
@@ -1141,12 +1178,19 @@ impl AliasRegistry {
             .rows
             .saturating_sub(before)
             .saturating_add(replacement.len());
-        *self.by_scope.get_mut(&scope).unwrap_or_else(|| {
+        let bucket = self.by_scope.get_mut(&scope).unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::host_alias",
                 "missing scope in AliasRegistry::rebuild_scope_rows"
             );
-        }) = replacement.clone();
+        });
+        bucket.rows = replacement.clone();
+        for &(_, alias) in &previous {
+            bucket.replay.remove(&replay_mapping_key(alias));
+        }
+        for &(_, alias) in &replacement {
+            bucket.replay.insert(replay_mapping_key(alias));
+        }
         for (seq, alias) in previous {
             self.index_remove(seq, alias);
         }
@@ -1158,7 +1202,7 @@ impl AliasRegistry {
     }
 
     pub(crate) fn drop_empty_scope(&mut self, scope: AliasOwnershipScope) {
-        if self.by_scope.get(&scope).is_some_and(Vec::is_empty) {
+        if self.by_scope.get(&scope).is_some_and(|b| b.rows.is_empty()) {
             self.by_scope.remove(&scope);
         }
     }
@@ -1198,38 +1242,46 @@ impl AliasRegistry {
             .copied();
         if let Some((seq, previous)) = exact {
             note_alias_state_rows_scanned(1);
-            let rows = self.by_scope.get_mut(&scope).unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::host_alias",
-                    "exact-key index scope absent from bucket map: scope={:?} start=0x{:x} ipa=0x{:x}",
-                    scope,
-                    alias.start,
-                    alias.ipa
-                );
-            });
-            let pos = Self::bucket_position_in(rows, seq, &previous, None).unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::host_alias",
-                    "exact-key index sequence not found in scope bucket: scope={:?} seq={} start=0x{:x} ipa=0x{:x}",
-                    scope,
-                    seq,
-                    previous.start,
-                    previous.ipa
-                );
-            });
-            let slot = &mut rows[pos];
-            if slot.0 != seq || slot.1 != previous {
-                carrick_fatal!(
-                    "hvpatch::host_alias",
-                    "exact-key index entry disagrees with scope bucket: slot_seq={} seq={} slot_ipa=0x{:x} expected_ipa=0x{:x}",
-                    slot.0,
-                    seq,
-                    slot.1.ipa,
-                    previous.ipa
-                );
-            }
-            slot.1 = alias;
-            if previous != alias {
+            let changed = {
+                let bucket = self.by_scope.get_mut(&scope).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::host_alias",
+                        "exact-key index scope absent from bucket map: scope={:?} start=0x{:x} ipa=0x{:x}",
+                        scope,
+                        alias.start,
+                        alias.ipa
+                    );
+                });
+                let pos = Self::bucket_position_in(&bucket.rows, seq, &previous, None).unwrap_or_else(|| {
+                    carrick_fatal!(
+                        "hvpatch::host_alias",
+                        "exact-key index sequence not found in scope bucket: scope={:?} seq={} start=0x{:x} ipa=0x{:x}",
+                        scope,
+                        seq,
+                        previous.start,
+                        previous.ipa
+                    );
+                });
+                let slot = &mut bucket.rows[pos];
+                if slot.0 != seq || slot.1 != previous {
+                    carrick_fatal!(
+                        "hvpatch::host_alias",
+                        "exact-key index entry disagrees with scope bucket: slot_seq={} seq={} slot_ipa=0x{:x} expected_ipa=0x{:x}",
+                        slot.0,
+                        seq,
+                        slot.1.ipa,
+                        previous.ipa
+                    );
+                }
+                slot.1 = alias;
+                let changed = previous != alias;
+                if changed {
+                    bucket.replay.remove(&replay_mapping_key(previous));
+                    bucket.replay.insert(replay_mapping_key(alias));
+                }
+                changed
+            };
+            if changed {
                 self.bump_revision();
             }
             self.index_remove(seq, previous);
@@ -1324,13 +1376,14 @@ impl AliasRegistry {
             let mut removed_positions = std::collections::BTreeSet::new();
 
             {
-                let Some(rows) = self.by_scope.get(&scope) else {
+                let Some(bucket) = self.by_scope.get(&scope) else {
                     continue;
                 };
-                if rows.is_empty() {
+                if bucket.rows.is_empty() {
                     self.drop_empty_scope(scope);
                     continue;
                 }
+                let rows = &bucket.rows;
 
                 for alias in scope_expected {
                     note_alias_state_rows_scanned(1);
@@ -1403,7 +1456,11 @@ impl AliasRegistry {
             self.bump_revision();
 
             let first_removed = removed_in_scope[0].0;
-            if let Some(rows) = self.by_scope.get_mut(&scope) {
+            if let Some(bucket) = self.by_scope.get_mut(&scope) {
+                for &(_, _, alias) in &removed_in_scope {
+                    bucket.replay.remove(&replay_mapping_key(alias));
+                }
+                let rows = &mut bucket.rows;
                 let mut remove_idx = 0;
                 let mut write = first_removed;
                 for read in first_removed..rows.len() {
@@ -2510,9 +2567,10 @@ pub(crate) fn unregister_alias_entries(
         let mut touched_keys: std::collections::BTreeSet<(u64, u64)> =
             std::collections::BTreeSet::new();
         {
-            let Some(rows) = registry.by_scope.get_mut(&scope) else {
+            let Some(bucket) = registry.by_scope.get_mut(&scope) else {
                 continue;
             };
+            let rows = &mut bucket.rows;
             // The rows this unmap splits are already known: `overlapping` is
             // the bounded guest-VA window query above, and it is exact for
             // this predicate (`va_window_rows` visits, per live size class,
@@ -2574,6 +2632,10 @@ pub(crate) fn unregister_alias_entries(
                 }
                 removed_count = removed_count.saturating_add(1);
                 inserted_count = inserted_count.saturating_add(fragments.len());
+                bucket.replay.remove(&replay_mapping_key(entry));
+                for (_, frag) in &fragments {
+                    bucket.replay.insert(replay_mapping_key(*frag));
+                }
                 match fragments.len() {
                     0 => {
                         rows.remove(pos);

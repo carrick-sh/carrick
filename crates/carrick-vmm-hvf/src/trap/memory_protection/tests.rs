@@ -1839,9 +1839,9 @@ mod alias_registry_tests {
             ..AliasRegistry::default()
         };
         for scope in AliasRegistry::process_visible_scopes(mm_root_slot, container_root) {
-            if let Some(rows) = registry.by_scope.get(&scope) {
-                visible.rows = visible.rows.saturating_add(rows.len());
-                visible.by_scope.insert(scope, rows.clone());
+            if let Some(bucket) = registry.by_scope.get(&scope) {
+                visible.rows = visible.rows.saturating_add(bucket.rows.len());
+                visible.by_scope.insert(scope, bucket.clone());
             }
         }
         visible.reindex();
@@ -2071,9 +2071,10 @@ mod alias_registry_tests {
             .collect();
         let mut out = Vec::new();
         for scope in touched {
-            let Some(rows) = registry.by_scope.get(&scope) else {
+            let Some(bucket) = registry.by_scope.get(&scope) else {
                 continue;
             };
+            let rows = &bucket.rows;
             let mut scan = Vec::new();
             for (pos, &(seq, alias)) in rows.iter().enumerate() {
                 let entry_end = alias.start.saturating_add(alias.size as u64);
@@ -2098,9 +2099,9 @@ mod alias_registry_tests {
 
     fn describe_registry(registry: &AliasRegistry) -> String {
         let mut out = String::new();
-        for (scope, rows) in &registry.by_scope {
+        for (scope, bucket) in &registry.by_scope {
             out.push_str(&format!("  scope {scope:?}\n"));
-            for (pos, (seq, alias)) in rows.iter().enumerate() {
+            for (pos, (seq, alias)) in bucket.rows.iter().enumerate() {
                 out.push_str(&format!(
                     "    [{pos}] seq={seq} va={:#x}..{:#x} phys={:#x}+{:#x}\n",
                     alias.start,
@@ -2205,7 +2206,8 @@ mod alias_registry_tests {
                     // directly: an unsorted bucket does not make
                     // `bucket_position_in` slower, it makes it answer "absent"
                     // for a row that is present.
-                    for (scope, rows) in &subject.by_scope {
+                    for (scope, bucket) in &subject.by_scope {
+                        let rows = &bucket.rows;
                         if !rows.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
                             failures.push((
                                 rows.len(),
