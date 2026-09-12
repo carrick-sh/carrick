@@ -1499,7 +1499,7 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/vcpu_loop/continuation.rs",
+      "file": "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs",
       "symbol": "NEXT_RUNNER_JOB_ID",
       "fingerprint": "fec5516a1c3b36f64558f4b6f2e518a7079351a7f20371dd20f558d9dda99d7e",
       "classification": "monotonic_allocator",
