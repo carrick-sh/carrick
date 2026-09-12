@@ -4843,7 +4843,18 @@ impl<'a> ProcView<'a> {
             remote_iov: GuestPtr, riovcnt: u64,
             flags: u64,
         ) {
-            this.process_vm_rw(cx, pid, local_iov, liovcnt, remote_iov, riovcnt, flags, true)
+            this.process_vm_rw(
+                cx,
+                ProcessVmRwArgs {
+                    pid,
+                    local_iov,
+                    liovcnt,
+                    remote_iov,
+                    riovcnt,
+                    flags,
+                    is_read: true,
+                },
+            )
         }
 
         fn process_vm_writev(
@@ -4853,9 +4864,30 @@ impl<'a> ProcView<'a> {
             remote_iov: GuestPtr, riovcnt: u64,
             flags: u64,
         ) {
-            this.process_vm_rw(cx, pid, local_iov, liovcnt, remote_iov, riovcnt, flags, false)
+            this.process_vm_rw(
+                cx,
+                ProcessVmRwArgs {
+                    pid,
+                    local_iov,
+                    liovcnt,
+                    remote_iov,
+                    riovcnt,
+                    flags,
+                    is_read: false,
+                },
+            )
         }
     }
+}
+
+pub(super) struct ProcessVmRwArgs {
+    pid: Pid,
+    local_iov: GuestPtr,
+    liovcnt: u64,
+    remote_iov: GuestPtr,
+    riovcnt: u64,
+    flags: u64,
+    is_read: bool,
 }
 
 /// Copy the flattened byte stream from `src` iovecs into `dst` iovecs WITHIN a
@@ -4947,18 +4979,20 @@ impl<'a> ProcView<'a> {
     /// Cross-process write transfers (`process_vm_writev`) acquire the target MM's real
     /// mutation authority via `MmAccessAuthority::with_foreign_mutation`, break foreign COW
     /// for each 16 KiB compound, prepare each subrange, and commit infallibly.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn process_vm_rw<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<M>,
-        pid: Pid,
-        local_iov: GuestPtr,
-        liovcnt: u64,
-        remote_iov: GuestPtr,
-        riovcnt: u64,
-        flags: u64,
-        is_read: bool,
+        args: ProcessVmRwArgs,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let ProcessVmRwArgs {
+            pid,
+            local_iov,
+            liovcnt,
+            remote_iov,
+            riovcnt,
+            flags,
+            is_read,
+        } = args;
         // Only flags == 0 is defined; anything else is EINVAL (process_vm01
         // test_flags exercises -INT_MAX/-1/1/INT_MAX). Invalid nonzero flags
         // win over a zero-byte transfer.
