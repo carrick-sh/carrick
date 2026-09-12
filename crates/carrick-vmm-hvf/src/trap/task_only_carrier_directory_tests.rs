@@ -153,16 +153,18 @@ fn pending_fork_frame_publication_authenticates_and_drains_exactly_once() {
         events,
         vec![
             carrick_observability::probes::HvpatchForkFrameShare::new(
-                123,
-                124,
-                9,
-                7,
-                carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
-                parent_mapping.raw(),
-                mapping.raw(),
-                frame.raw(),
-                ipa,
-                length,
+                carrick_observability::probes::HvpatchForkFrameShareArgs {
+                    pid: 123,
+                    tid: 124,
+                    mm: 9,
+                    asid: 7,
+                    kind: carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+                    parent_mapping: parent_mapping.raw(),
+                    child_mapping: mapping.raw(),
+                    frame: frame.raw(),
+                    ipa,
+                    length,
+                },
             )
             .unwrap()
         ]

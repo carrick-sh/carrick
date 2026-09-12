@@ -988,15 +988,17 @@ impl ProcessContext {
             return None;
         };
         match carrick_observability::probes::HvpatchGuestLifecycle::new(
-            phase,
-            identity.task.id.raw(),
-            identity.parent.map_or(0, |parent| parent.id.raw()),
-            tid.raw(),
-            u32::from(binding.asid.raw()),
-            identity.task.serial.raw(),
-            identity.parent.map_or(0, |parent| parent.serial.raw()),
-            identity.mm.raw(),
-            detail,
+            carrick_observability::probes::HvpatchGuestLifecycleArgs {
+                phase,
+                pid: identity.task.id.raw(),
+                ppid: identity.parent.map_or(0, |parent| parent.id.raw()),
+                tid: tid.raw(),
+                asid: u32::from(binding.asid.raw()),
+                task_serial: identity.task.serial.raw(),
+                parent_serial: identity.parent.map_or(0, |parent| parent.serial.raw()),
+                mm: identity.mm.raw(),
+                detail,
+            },
         ) {
             Ok(event) => Some((event, binding)),
             Err(error) => {
@@ -1022,15 +1024,17 @@ impl ProcessContext {
         let task = context.task().key();
         let parent = context.parent_at_capture();
         let lifecycle = carrick_observability::probes::HvpatchGuestLifecycle::new(
-            carrick_observability::probes::HvpatchGuestLifecyclePhase::Root,
-            task.id.raw(),
-            parent.map_or(0, |parent| parent.id.raw()),
-            tid.raw(),
-            u32::from(binding.asid.raw()),
-            task.serial.raw(),
-            parent.map_or(0, |parent| parent.serial.raw()),
-            context.shared().mm().id().raw(),
-            0,
+            carrick_observability::probes::HvpatchGuestLifecycleArgs {
+                phase: carrick_observability::probes::HvpatchGuestLifecyclePhase::Root,
+                pid: task.id.raw(),
+                ppid: parent.map_or(0, |parent| parent.id.raw()),
+                tid: tid.raw(),
+                asid: u32::from(binding.asid.raw()),
+                task_serial: task.serial.raw(),
+                parent_serial: parent.map_or(0, |parent| parent.serial.raw()),
+                mm: context.shared().mm().id().raw(),
+                detail: 0,
+            },
         )
         .map_err(|error| {
             RuntimeError::Configuration(format!("prepare HVPatch root lifecycle: {error}"))

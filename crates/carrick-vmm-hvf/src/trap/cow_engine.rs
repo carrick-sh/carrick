@@ -358,15 +358,18 @@ impl HvfVmState {
         };
         carrick_observability::probes::hvpatch_mapping_index_fault(
             carrick_observability::probes::HvpatchMappingIndexCensus::new(
-                va,
-                self.mappings.live_len() as u64,
-                self.mappings.shadowed_len() as u64,
-                hot_path_rows_scanned_live(HotPathScan::TaskMappings)
-                    .wrapping_sub(mapping_rows_before),
-                alias_rows,
-                hot_path_rows_scanned_live(HotPathScan::AliasState).wrapping_sub(alias_rows_before),
-                widest_va,
-                nanos,
+                carrick_observability::probes::HvpatchMappingIndexCensusArgs {
+                    far: va,
+                    live_rows: self.mappings.live_len() as u64,
+                    shadowed_rows: self.mappings.shadowed_len() as u64,
+                    rows_visited: hot_path_rows_scanned_live(HotPathScan::TaskMappings)
+                        .wrapping_sub(mapping_rows_before),
+                    alias_rows,
+                    alias_rows_visited: hot_path_rows_scanned_live(HotPathScan::AliasState)
+                        .wrapping_sub(alias_rows_before),
+                    widest_va_window: widest_va,
+                    nanos,
+                },
             ),
         );
         outcome
@@ -2093,15 +2096,17 @@ impl HvfTaskState {
 
         let receipt_va = align_down(fault_va, 4 * 1024);
         let trigger_event = carrick_observability::probes::HvpatchFrameCowTrigger::new(
-            trigger.class,
-            identity.linux_pid,
-            identity.linux_tid,
-            identity.mm,
-            u32::from(identity.asid),
-            receipt_va,
-            trigger.syndrome,
-            trigger.far,
-            trigger.ttbr0,
+            carrick_observability::probes::HvpatchFrameCowTriggerArgs {
+                class: trigger.class,
+                pid: identity.linux_pid,
+                tid: identity.linux_tid,
+                mm: identity.mm,
+                asid: u32::from(identity.asid),
+                va: receipt_va,
+                syndrome: trigger.syndrome,
+                far: trigger.far,
+                ttbr0: trigger.ttbr0,
+            },
         )
         .unwrap_or_else(|error| {
             carrick_fatal!(
@@ -2327,17 +2332,19 @@ impl HvfTaskState {
         };
         let emit_cow = |phase| {
             let event = carrick_observability::probes::HvpatchFrameCow::new(
-                phase,
-                receipt_intent,
-                identity.linux_pid,
-                identity.linux_tid,
-                identity.mm,
-                u32::from(identity.asid),
-                receipt_va,
-                old_frame.raw(),
-                new_frame.raw(),
-                old_physical_ipa,
-                new_physical_ipa,
+                carrick_observability::probes::HvpatchFrameCowArgs {
+                    phase,
+                    intent: receipt_intent,
+                    pid: identity.linux_pid,
+                    tid: identity.linux_tid,
+                    mm: identity.mm,
+                    asid: u32::from(identity.asid),
+                    va: receipt_va,
+                    old_frame: old_frame.raw(),
+                    new_frame: new_frame.raw(),
+                    old_ipa: old_physical_ipa,
+                    new_ipa: new_physical_ipa,
+                },
             )
             .unwrap_or_else(|error| {
                 carrick_fatal!(
