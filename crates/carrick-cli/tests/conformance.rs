@@ -4254,7 +4254,14 @@ fn conformance_probes() {
                         let name = &jobs[i].0;
                         if let Some(cached) = cached_probe_oracle(lane.label, set.libc, name) {
                             OracleSource::Cached(cached)
-                        } else if docker_available {
+                        } else if docker_available && lane.platform == same_isa_lane().platform {
+                            // A live Docker oracle is only ever the host's own
+                            // ISA. A foreign-platform container (linux/amd64 on
+                            // an arm64 host) runs under Rosetta, is not a Linux
+                            // oracle (AGENTS.md: "Oracle is native arm64 only"),
+                            // and has wedged this gate for hours on an unblessed
+                            // probe. A missing foreign oracle is Unblessed and
+                            // must be blessed on a native host.
                             OracleSource::Live(run_docker_probe_named(*lane, name, enc))
                         } else {
                             OracleSource::Unblessed
@@ -4277,7 +4284,7 @@ fn conformance_probes() {
                             );
                         } else {
                             eprintln!(
-                                "SKIP {}:{}:{name} (no cached oracle + no Docker — bless on a Docker host)",
+                                "SKIP {}:{}:{name} (no cached oracle; live Docker oracle only for the host ISA — bless on a native host)",
                                 lane.label, set.libc
                             );
                         }
