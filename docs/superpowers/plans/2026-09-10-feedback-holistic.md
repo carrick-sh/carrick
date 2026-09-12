@@ -605,3 +605,34 @@ commits and is re-checked at the next vet.
   fault-latency embed test 154 s→37 s). Probe gate running on the pinned
   main e32d0b3e1851faef; Task 5 (per-mm alias containers, delete the
   carrier topology mutex) dispatched; `tma-r2-sep12` still running.
+- 2026-09-12 13:40, probe gate on e32d0b3e1851faef (post-Task-6 main) RED:
+  2 of 46 tests. (a) `conformance_container_gate`: alpha
+  `child_comm_visible=false` — PROBE race (parent scanned /proc before the
+  forked child ran `prctl(PR_SET_NAME)`); 8/8 green standalone on both the
+  new and pre-Task-6 binaries; fixed with a pipe rendezvous + bounded poll
+  (528cc75c0), gnu probe rebuilt, both gate modes report
+  `child_renamed=true`. (b) `arm64:musl:execfromthread` kernel abort
+  `lost exact transition: thread#2:<old serial> Runnable N -> N+1 rejected
+  while the kernel graph still calls it reachable; registry view: thread
+  absent; same-tid threads=[2:136]`. PRE-EXISTING and LOAD-DEPENDENT: 8/8
+  green standalone on both binaries; under eight concurrent runs 1/24 on
+  the NEW and 1/24 on the OLD binary (post-mortems
+  `target/perf/perf2x-sep12/eftpm/efts-{new,old}-2-6/`), plus a second
+  shape on both binaries (8/48): `carrick fatal [hvpatch::mm_authority]:
+  drop HVPatch MM authority (phase=active … holder=registration-cleanup)`
+  preceded by `executor failed a claimed task … reason=AddressSpaceRetired`
+  on the retired leader (tid 2). Reading: exec-from-a-non-leader-thread
+  relies on each sibling's host loop to retire its own kernel thread
+  (`publish_persistent_sibling_stop` → `remove_all_except` + kick;
+  `finish_persistent_process_handles` settles member completions
+  externally), so a leader whose executor claim is still in flight stays
+  `Runnable{requeue_pending}` in the task graph after the exec replaced its
+  registry entry; its late requeue is a lost exact transition (exit 125)
+  and its late load fails `AddressSpaceRetired` and drops the shared MM
+  authority still `Active` (exit 134). Linux `de_thread` waits for the
+  siblings; carrick's drain does not wait for the kernel-graph settlement.
+  Evidence tooling added so the next reproduction yields a core:
+  `carrick debug lldb-run --fatal-hold-seconds` + `CARRICK_FATAL_HOLD_SECS`
+  (d6db89efc). 96 further lldb-run stress runs reproduced only the 125
+  shape (4×, post-mortem JSON, `target/perf/perf2x-sep12/eftcore{3,4}`).
+  Fix dispatched as a red-first worker task (brief `exec-sibling-settle`).
