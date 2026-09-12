@@ -1536,7 +1536,7 @@
       "domain": "kernel::guest_executor_census"
     },
     {
-      "file": "crates/carrick-runtime/src/kernel/objects.rs",
+      "file": "crates/carrick-runtime/src/kernel/objects/thread.rs",
       "function": "<CrashSafePointParticipation as Drop>::drop",
       "ordinal_in_function": 1,
       "fingerprint": "e596fdfdfef72272201092f6dd7e012162d3d1843f9d26bada5cc6bda7b0148d",
