@@ -1721,17 +1721,67 @@ where
             proc_state_started,
         );
 
-        // All hvpatch processes mutate stage-2 in one HVF VM. Keep
-        // process-local thread-group drain separate, but serialize the
-        // actual unmap/remap transaction across concurrent execs.
+        // Stage-2 edits for distinct MMs touch distinct IPA ranges owned by
+        // distinct MMs, so the exclusion is the MM's transaction guard rather
+        // than the carrier topology lock.
+        // Task 4: replaced acquire_topology_lock with mutation.begin_transaction().
         let topology_lock_started = std::time::Instant::now();
-        let _hvpatch_topology = kernel.hvpatch_process.as_ref().map(|process| {
-            crate::fork_quiesce::acquire_topology_lock(
-                carrick_observability::probes::HvpatchTopologyOperation::ExecReplace,
-                process.pid(),
-                self.this_tid.raw(),
-            )
-        });
+        let mut admitted_mm_executor = None;
+        let mut mm_authority = if kernel.hvpatch_process.is_some() {
+            let mm_executor: &mut crate::dispatch::MmExecutorParticipation = match self
+                .guest_execution
+                .as_mut()
+                .filter(|p| p.mm_id() == old_mm_id)
+            {
+                Some(participation) => participation,
+                None => match kernel.dispatcher.enter_mm_executor() {
+                    Ok(p) => admitted_mm_executor.insert(p),
+                    Err(error) => {
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("admit exact-MM exec authority: {error}"),
+                        )
+                        .map(Some);
+                    }
+                },
+            };
+            let coordinator = kernel.dispatcher.mm_mutation_coordinator();
+            let authority = match super::quiesce::acquire_mm_stage1_authority(
+                mm_executor,
+                self.this_tid,
+                super::quiesce::PtPauseBudget::DEFAULT,
+            ) {
+                Ok(auth) => auth,
+                Err(error) => {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("acquire exact-MM exec authority: {error:?}"),
+                    )
+                    .map(Some);
+                }
+            };
+            Some((authority, coordinator, old_mm_id))
+        } else {
+            None
+        };
+        let mutation =
+            mm_authority
+                .as_mut()
+                .map(|(authority, coordinator, mm_id)| match authority {
+                    super::quiesce::MmStage1Authority::Sole(sole) => {
+                        crate::dispatch::mm_mutation::from_sole_executor(
+                            sole,
+                            std::sync::Arc::clone(coordinator),
+                            *mm_id,
+                        )
+                    }
+                    super::quiesce::MmStage1Authority::Paused(pause) => {
+                        crate::dispatch::mm_mutation::from_pt_pause(pause)
+                    }
+                });
+        let _hvpatch_topology = mutation.as_ref().map(|m| m.begin_transaction());
         emit_runtime_stage(
             carrick_observability::probes::HvpatchExecRuntimeStagePhase::TopologyLock,
             topology_lock_started,
@@ -1836,6 +1886,9 @@ where
         // serialization must also be released before runtime takes its
         // frame-inventory authority lock.
         drop(_hvpatch_topology);
+        drop(mutation);
+        drop(mm_authority);
+        drop(admitted_mm_executor);
         if let Some(process) = kernel.hvpatch_process.as_ref() {
             let registry = crate::fork_quiesce::FrameRegistryGuard::new(
                 crate::fork_quiesce::frame_registry_lock().lock(),
