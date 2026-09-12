@@ -806,6 +806,11 @@ where
             }
         }
         if let Some(mut retirement) = terminal_retirement {
+            tracing::debug!(
+                pid = retirement.guest_pid(),
+                tid = ?retirement.guest_tid(),
+                "terminal address space retirement",
+            );
             if let Some(stage1) = retirement.retirement() {
                 match control.invalidate_after_exec(
                     stage1,
@@ -831,35 +836,9 @@ where
                     }
                 }
             }
-            let (_topology, stop_seen) = match acquire_process_retire_topology_lock_servicing(
-                retirement.guest_pid(),
-                retirement.guest_tid().raw(),
-                backend,
-                executor_id,
-                commands,
-                boundary,
-                receipts,
-            ) {
-                Ok(acquired) => acquired,
-                Err(error) => {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
-                    return Err(with_settlement_error(
-                        format!("terminal topology acquisition failed: {error}"),
-                        settlement,
-                    ));
-                }
-            };
-            deferred_stop |= stop_seen;
             let root_ticket = match retirement.take_root_retirement_ticket() {
                 Ok(ticket) => ticket,
                 Err(error) => {
-                    drop(_topology);
                     let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                         resolver.as_ref(),
                         scheduler,
@@ -881,7 +860,6 @@ where
             let root_receipt = match cleanup {
                 Ok(receipt) => receipt,
                 Err(error) => {
-                    drop(_topology);
                     let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                         resolver.as_ref(),
                         scheduler,
@@ -896,7 +874,6 @@ where
                 }
             };
             if let Err(error) = retirement.complete(root_receipt) {
-                drop(_topology);
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
                     scheduler,
@@ -909,7 +886,6 @@ where
                     settlement,
                 ));
             }
-            drop(_topology);
             // `retirement.complete()` can drop the terminal registration while
             // the topology guard is held. Backend maintenance is forbidden in
             // Drop and under that guard, so service its custody-local request

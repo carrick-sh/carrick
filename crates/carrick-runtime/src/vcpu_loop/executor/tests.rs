@@ -1084,9 +1084,6 @@ fn pre_fork_exec_hardware_and_shutdown_guards_are_fail_closed() {
     let terminal_invalidate = terminal
         .find("invalidate_after_exec")
         .expect("terminal exact TLBI fanout");
-    let topology_acquire = terminal
-        .find("acquire_process_retire_topology_lock_servicing")
-        .expect("terminal topology acquisition");
     let detached_cleanup = terminal
         .find("retire_detached_address_space")
         .expect("detached stage-2/inventory cleanup");
@@ -1097,11 +1094,11 @@ fn pre_fork_exec_hardware_and_shutdown_guards_are_fail_closed() {
         .find("retirement.complete(root_receipt)")
         .expect("terminal ASID/root release");
     assert!(
-        terminal_invalidate < topology_acquire
-            && topology_acquire < terminal_ticket
+        terminal_invalidate < terminal_ticket
             && terminal_ticket < detached_cleanup
             && detached_cleanup < terminal_release
     );
+    assert!(!terminal.contains("acquire_process_retire_topology_lock_servicing"));
     let pre_load = worker_loop
         .split("if let Err(error) = backend.load(&task)")
         .next()
@@ -4439,7 +4436,7 @@ fn retirement_command_invalidates_on_exact_resident_owner_worker_only() {
         .retirement()
         .expect("last MM owner retirement authority");
 
-    pool.invalidate_asid_retirement(retirement)
+    pool.invalidate_asid_retirement_timeout(retirement, Duration::from_secs(5))
         .expect("owner-thread invalidation and exact ack");
 
     assert!(retirement.pending().is_empty());
@@ -5487,7 +5484,7 @@ impl Drop for TerminalRetirementTestCleanup {
 }
 
 #[test]
-fn terminal_retirement_holds_topology_lock_across_detached_cleanup_and_release() {
+fn terminal_retirement_does_not_hold_topology_lock_across_detached_cleanup() {
     let (process, context) = crate::hvpatch::process_context_for_tests(14_990);
     let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
     let factory = Arc::new(FakeFactory::default());
@@ -5516,144 +5513,41 @@ fn terminal_retirement_holds_topology_lock_across_detached_cleanup_and_release()
         .recv_timeout(Duration::from_secs(5))
         .expect("worker must reach detached cleanup gate");
 
-    // While detached terminal cleanup is running, the executor must hold the
-    // ProcessRetire topology lock. Concurrent attempts to acquire topology
-    // locks for fork or COW must fail.
+    // While detached terminal cleanup is running, the executor does NOT hold
+    // the carrier topology lock. Concurrent attempts to acquire topology
+    // locks for fork or COW must succeed.
     let try_fork = carrick_thread::fork_quiesce::try_acquire_topology_lock(
         carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
         process.pid(),
         context.thread().key().tid.raw(),
     );
+    assert!(
+        try_fork.is_some(),
+        "while detached terminal cleanup is running, InProcessFork must succeed because carrier topology lock is not held"
+    );
+    drop(try_fork);
 
     let try_cow = carrick_thread::fork_quiesce::try_acquire_topology_lock(
         carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
         process.pid(),
         context.thread().key().tid.raw(),
     );
+    assert!(
+        try_cow.is_some(),
+        "while detached terminal cleanup is running, FrameCow must succeed because carrier topology lock is not held"
+    );
+    drop(try_cow);
 
-    // Always release the worker and shut down the pool before asserting
+    // Release the worker and shut down the pool before asserting
     if let Some(resume) = cleanup.resume_tx.take() {
         let _ = resume.send(());
     }
     let pool = cleanup.pool.take().expect("pool");
-    pool.shutdown().expect("pool shutdown");
-
-    assert!(
-        try_fork.is_none(),
-        "while detached terminal cleanup is running, InProcessFork must fail to acquire topology lock"
-    );
-    assert!(
-        try_cow.is_none(),
-        "while detached terminal cleanup is running, FrameCow must fail to acquire topology lock"
-    );
-
-    let try_after = carrick_thread::fork_quiesce::try_acquire_topology_lock(
-        carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
-        process.pid(),
-        context.thread().key().tid.raw(),
-    );
-    assert!(
-        try_after.is_some(),
-        "after terminal retirement completes, topology lock must be released"
-    );
-}
-
-struct ContendedRetirementTestCleanup {
-    held_topology: Option<carrick_thread::fork_quiesce::TopologyLockGuard>,
-    pool: Option<ExecutorPool<FakeFactory, FakeFactory>>,
-}
-
-impl Drop for ContendedRetirementTestCleanup {
-    fn drop(&mut self) {
-        drop(self.held_topology.take());
-        if let Some(pool) = self.pool.take() {
-            let _ = pool.shutdown();
-        }
-    }
-}
-
-#[test]
-fn terminal_retirement_topology_acquisition_services_owner_commands_while_contended() {
-    let (process, context) = crate::hvpatch::process_context_for_tests(14_991);
-    let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
-    let factory = Arc::new(FakeFactory::default());
-    let binding = FakeBinding::new(101, [Step::Exit]);
-    let tid = ThreadId::from_guest_supplied_tid(context.thread().key().tid.raw());
-    let pending = process
-        .begin_address_space_retirement(0, tid, None)
-        .expect("pending retirement");
-    *binding.pending_address_space_retirement.lock() = Some(pending);
-    factory.install(&context, Arc::clone(&binding));
-
-    // Hold the topology lock before the executor reaches terminal retirement
-    let held_topology = carrick_thread::fork_quiesce::acquire_topology_lock(
-        carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
-        process.pid(),
-        context.thread().key().tid.raw(),
-    );
-
-    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
-    let mut cleanup = ContendedRetirementTestCleanup {
-        held_topology: Some(held_topology),
-        pool: Some(pool),
-    };
-    let executor_id = cleanup.pool.as_ref().unwrap().executor_ids()[0];
-    let generation = publish(&context, 101);
-    let authority = enqueue_root(&scheduler, &context, generation);
-    drop(authority);
-
-    // Deterministically wait for the worker to reach the topology acquisition TryMiss retry loop
-    cleanup
-        .pool
-        .as_ref()
-        .unwrap()
-        .wait_for_event(
-            |event| {
-                matches!(
-                    event,
-                    ExecutorPoolEvent::TopologyRetrying {
-                        operation:
-                            carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
-                    }
-                )
-            },
-            Duration::from_secs(5),
-        )
-        .expect(
-            "worker must reach topology TryMiss retry loop before invalidation command is sent",
-        );
-
-    // While topology is held by a peer, perform ASID invalidation targeting this executor
-    let (proc2, _ctx2) = crate::hvpatch::process_context_for_tests(14_992);
-    let lease2 = proc2.stage1_mm_lease().expect("exact MM lease");
-    lease2
-        .begin_asid_load(executor_id)
-        .expect("load admission")
-        .mark_resident()
-        .expect("resident executor");
-    let retired2 = proc2
-        .mm_resources()
-        .retire(proc2.task_key())
-        .expect("retire process MM");
-    let retirement2 = retired2
-        .retirement()
-        .expect("last MM owner retirement authority");
-
-    cleanup
-        .pool
-        .as_ref()
-        .unwrap()
-        .invalidate_asid_retirement_timeout(retirement2, Duration::from_secs(5))
-        .expect("executor must service InvalidateAsid while waiting for topology lock");
-    assert!(retirement2.pending().is_empty());
-    retired2
-        .complete_for_test()
-        .expect("complete second retirement");
-
-    // Release the topology lock so the executor can acquire it and finish
-    drop(cleanup.held_topology.take());
-
-    let pool = cleanup.pool.take().expect("pool");
+    pool.wait_for_event(
+        |event| matches!(event, ExecutorPoolEvent::SettledExited { .. }),
+        Duration::from_secs(5),
+    )
+    .expect("worker settlement event observed");
     pool.shutdown().expect("pool shutdown");
 
     assert!(matches!(

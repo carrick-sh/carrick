@@ -253,10 +253,6 @@ pub(super) enum HvpatchProductionPhase {
 
 /// What a parked process terminal waits on before retrying its retirement.
 pub(crate) enum TerminalRetireSubscription {
-    /// The carrier-wide topology lock (another fork/exec/exit mid-edit).
-    Topology {
-        _subscription: carrick_thread::fork_quiesce::TopologyReleaseSubscription,
-    },
     /// A sibling's exec reservation owns this process's MM generation; the
     /// exit's owner-set edit is admitted once it settles.
     ExecSettlement {
@@ -960,47 +956,58 @@ where
                 }
             }
         };
-        let topology = loop {
-            let observed = crate::fork_quiesce::topology_release_generation();
-            if let Some(topology) = crate::fork_quiesce::try_acquire_topology_lock(
-                carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
-                process.pid(),
-                self.state.this_tid.raw(),
-            ) {
-                break topology;
-            }
-            let scheduler = wake_scheduler();
-            let thread = terminal_context.thread().key();
-            match crate::fork_quiesce::subscribe_topology_release(
-                observed,
-                Arc::new(move |_| {
-                    let _ = scheduler.wake(thread);
-                }),
-            ) {
-                carrick_thread::fork_quiesce::TopologyReleaseEnrollment::Ready(_) => continue,
-                carrick_thread::fork_quiesce::TopologyReleaseEnrollment::Subscribed(
-                    subscription,
-                ) => {
-                    // Release the admission while parked: the topology
-                    // holder may be the exec'er this hold is excluding.
-                    drop(owner_set_edit);
-                    self.phase = HvpatchProductionPhase::TerminalRetireRetry {
-                        terminal,
-                        context: terminal_context,
-                        _subscription: TerminalRetireSubscription::Topology {
-                            _subscription: subscription,
-                        },
+        let terminal_mm = terminal_context.shared().mm().id();
+        let mut admitted_mm_executor = None;
+        let mm_executor: &mut crate::dispatch::MmExecutorParticipation = match self
+            .state
+            .guest_execution
+            .as_mut()
+            .filter(|p| p.mm_id() == terminal_mm)
+        {
+            Some(participation) => participation,
+            None => match self.kernel.dispatcher.enter_mm_executor() {
+                Ok(entered) => admitted_mm_executor.insert(entered),
+                Err(failure) => {
+                    tracing::error!(%failure, "admit exact-MM terminal retirement authority");
+                    let outcome = match terminal {
+                        PersistentTerminal::Error(error) => Err(error),
+                        _ => Err(RuntimeError::CarrierFailed(format!(
+                            "admit exact-MM terminal retirement authority failed: {failure}"
+                        ))),
                     };
-                    return self.suspend(
-                        HvpatchLoopSuspension::TerminalSiblingDrain,
-                        executor::ExecutorExit::Blocked(
-                            crate::kernel::objects::BlockedReason::HostWait,
-                        ),
-                    );
+                    return self.finish(outcome);
                 }
+            },
+        };
+        let coordinator = self.kernel.dispatcher.mm_mutation_coordinator();
+        let mut terminal_authority = match super::quiesce::acquire_mm_stage1_authority(
+            mm_executor,
+            self.state.this_tid,
+            super::quiesce::PtPauseBudget::DEFAULT,
+        ) {
+            Ok(authority) => authority,
+            Err(failure) => {
+                tracing::error!(?failure, "acquire exact-MM terminal authority");
+                let outcome = match terminal {
+                    PersistentTerminal::Error(error) => Err(error),
+                    _ => Err(RuntimeError::CarrierFailed(format!(
+                        "acquire exact-MM terminal authority failed: {failure:?}"
+                    ))),
+                };
+                return self.finish(outcome);
             }
         };
-        let terminal_mm = terminal_context.shared().mm().id();
+        let terminal_mutation = match &mut terminal_authority {
+            super::quiesce::MmStage1Authority::Sole(sole) => {
+                crate::dispatch::mm_mutation::from_sole_executor(sole, coordinator, terminal_mm)
+            }
+            super::quiesce::MmStage1Authority::Paused(pause) => {
+                crate::dispatch::mm_mutation::from_pt_pause(pause)
+            }
+        };
+        // Task 4: replaced try_acquire_topology_lock and subscribe_topology_release with
+        // terminal_mutation.begin_transaction().
+        let topology = terminal_mutation.begin_transaction();
         let owns_final_mm = process
             .owns_final_mm_edge(terminal_context.task().key())
             .unwrap_or_else(|failure| {
@@ -1234,6 +1241,9 @@ where
         );
         drop(owner_set_edit);
         drop(topology);
+        drop(terminal_mutation);
+        drop(terminal_authority);
+        drop(admitted_mm_executor);
         self.kernel.publish_process_terminal(terminal_publication);
         self.finish(terminal.into_result())
     }
@@ -6430,8 +6440,8 @@ mod tests {
             .find(".hold_owner_set_edit(terminal_context.task().key())")
             .expect("exit admits its owner-set edit");
         let topology_at = finalize
-            .find("try_acquire_topology_lock(")
-            .expect("exit takes the topology lock");
+            .find("terminal_mutation.begin_transaction()")
+            .expect("exit takes the mm transaction guard");
         let publish_at = finalize
             .find(".publish_exit_status(")
             .expect("exit publishes into the kernel graph");
@@ -6440,7 +6450,7 @@ mod tests {
             .expect("exit retires its MM edge");
         assert!(
             hold_at < topology_at,
-            "admission precedes the topology lock"
+            "admission precedes the mm transaction guard"
         );
         assert!(
             hold_at < publish_at,
@@ -6448,22 +6458,12 @@ mod tests {
         );
         assert!(finalize.contains("TerminalRetireSubscription::ExecSettlement"));
         assert!(finalize.contains(".subscribe_exec_settlement("));
-        // The hold is also dropped when parking on the topology lock; the
-        // final release follows the retirement.
+        assert!(!finalize.contains("try_acquire_topology_lock("));
+        // The final release follows the retirement.
         let release_at = finalize
             .rfind("drop(owner_set_edit);")
             .expect("the hold is released explicitly after retirement");
         assert!(retire_at < release_at);
-        let park_release_at = finalize
-            .find("drop(owner_set_edit);")
-            .expect("the hold is dropped before parking on topology");
-        assert!(
-            park_release_at
-                < topology_at
-                    + finalize[topology_at..]
-                        .find("return self.suspend(")
-                        .unwrap()
-        );
     }
 
     #[test]
