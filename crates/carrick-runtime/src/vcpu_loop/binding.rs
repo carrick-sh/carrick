@@ -1713,10 +1713,7 @@ where
                 engine,
                 self.state.this_tid,
                 self.state.fatal_image_generation,
-                fault.signal.raw(),
-                fault.si_code,
-                fault.si_addr,
-                fault.interrupted_pc,
+                signal::FaultSignal::from(fault),
                 self.traps,
             )? {
                 return Ok(Some(self.enter_terminal_with_outcome(engine, outcome)));
@@ -4040,10 +4037,12 @@ where
                     engine,
                     self.state.this_tid,
                     self.state.fatal_image_generation,
-                    signum,
-                    si_code,
-                    si_addr,
-                    interrupted_pc,
+                    signal::FaultSignal {
+                        signum,
+                        si_code,
+                        si_addr,
+                        interrupted_pc,
+                    },
                     self.traps,
                 )? {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
@@ -4103,10 +4102,12 @@ where
                     engine,
                     self.state.this_tid,
                     self.state.fatal_image_generation,
-                    signum,
-                    si_code,
-                    fault_addr,
-                    interrupted_pc,
+                    signal::FaultSignal {
+                        signum,
+                        si_code,
+                        si_addr: fault_addr,
+                        interrupted_pc,
+                    },
                     self.traps,
                 )? {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
