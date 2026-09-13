@@ -535,7 +535,7 @@ impl ReadinessProbe {
     /// build its `pollfd` array. Everything else — a futex, a timer, a child
     /// wait, a vfork release — is woken by its producer or by its deadline, and
     /// re-examining it on every cycle is the O(live blocked tasks) scan
-    /// [`ReactorWorkSet`] exists to remove.
+    /// [`super::wait_service::ReactorWorkSet`] exists to remove.
     pub(in crate::vcpu_loop) const fn contributes_pollfds(&self) -> bool {
         matches!(self, Self::Fds { .. } | Self::HostWrite { .. })
     }
