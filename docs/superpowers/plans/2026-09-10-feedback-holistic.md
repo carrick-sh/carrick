@@ -1060,3 +1060,26 @@ commits and is re-checked at the next vet.
   reset); (b) no reset state on the in-memory stream (listener close with a
   queued connection must leave the client POLLIN|POLLERR|POLLHUP, recv
   ECONNRESET, write EPIPE — probe case 7).
+- 2026-09-13 09:50, Task 2 LANDED (5f1e12d54..3be633a98) and judged on the
+  probe worktree rebased onto it (branch `agy/inzone-probe-sep13`): the
+  blessed `inzonetcp` probe found two runtime gaps and go-net_http a
+  third, all fixed by the director on that branch:
+  - 0fc7993d2 `poll(2)`/`pselect6` all-host fast paths took readiness from
+    the host `poll(0)` alone, so a connection paired in-zone never made the
+    listener readable (probe `accept_ok=false`, 5 s cap); a listener that
+    owns an in-zone queue is now `HostPollTarget::sample_description`. And
+    a pending `so_error` is reported once by the first data-less recv/send
+    before EOF/EPIPE (probe case 7: Linux `recv` = -1/ECONNRESET, then
+    SO_ERROR 0); the worker's test had encoded "EOF or ECONNRESET" and is
+    corrected to the oracle's order.
+  - 314fd9a72 go-net_http hung 146/147 (core `target/perf/inzone-sep13/
+    nh2.9745.core`): executors 2 and 4 parked for ever in
+    `PureSocketInner::poll_mask` — `poll_mask`/`recv_stream_flags`/
+    `outq_bytes` locked "self, then peer", and a Go server+client in one
+    process poll both halves at once (ABBA). `lock_with_peer` orders the
+    pair by object address; red-first bounded stress test.
+  Receipts on pin 781e8349f09c3928: `inzonetcp` MATCH 34/34 (musl+gnu
+  oracle identical); go-net_http x2 = 1316/1316 MATCH. Running:
+  `just conformance-probes` + `just test` on that tree, then Task 5
+  paired measure `measure-sep13c.sh` (cand 781e8349f09c3928 vs the
+  pre-in-zone main pin 457da5fb6521ff7b).
