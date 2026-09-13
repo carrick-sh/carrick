@@ -1635,6 +1635,40 @@ fn test_mkdirat_under_resolved_parent_zero_openat_budget() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn test_guest_openat_1000_files_in_one_dir_host_openat_budget() {
+    let (_lower, scratch, mut dispatcher) = trusted_lower_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    std::fs::create_dir_all(scratch.path().join("walk")).unwrap();
+
+    for i in 0..1000 {
+        std::fs::write(
+            scratch.path().join("walk").join(format!("f_{i:04}")),
+            b"hello",
+        )
+        .unwrap();
+    }
+
+    crate::fs_backend::host::reset_test_host_openat_count();
+    for i in 0..1000 {
+        let fd = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            &format!("/walk/f_{i:04}"),
+            LINUX_O_RDONLY | carrick_abi::LINUX_O_NOFOLLOW,
+        );
+        assert!(fd >= 0, "open failed: {fd}");
+    }
+    let opens = crate::fs_backend::host::test_host_openat_count();
+    assert!(
+        opens <= 1002,
+        "1,000 guest opens issued {opens} host_openat calls (budget <= 1002)"
+    );
+}
+
 /// A directory listing is taken when the guest READS it, not when it opens
 /// it (Linux `getdents64` walks the live dentry tree; `rewinddir` re-reads).
 /// Two consequences the old open-time snapshot got wrong — and one cost:
