@@ -1044,3 +1044,19 @@ commits and is re-checked at the next vet.
   reactor's legitimate wake traffic. The row-level receipt folds into the
   Task 5 paired measure. Two workers alive (semantics at `just test`,
   wiring reading lifecycle.rs/unix_pure.rs).
+- 2026-09-13 08:40, Task 3 LANDED (5a5c83c0a..61c252556): in-memory INET
+  halves carry TCP semantics (EPOLLRDHUP on peer SHUT_WR without HUP,
+  EPIPE+SIGPIPE on sendmsg, MSG_PEEK, TCP_NODELAY/KEEP*/SO_*BUF/LINGER/
+  TCP_INFO(state byte only), SO_SNDBUF-bounded EPOLLOUT, FIONREAD/SIOCOUTQ).
+  Task 4 probe `inzonetcp` is written and its oracle BLESSED (branch
+  `agy/inzone-probe-sep13`, e08f729b9, worktree kept); against the
+  host-backed main it has five red lines (half-close reports HUP, client
+  never readable after peer full shutdown, reset backlog connection lacks
+  POLLERR, TCP_NODELAY reads back 4, SO_PROTOCOL reads 0). It lands with
+  Task 2 so the gate never carries a known red. Review carry-ins for after
+  Task 2: (a) `poll_mask` reports EPOLLHUP on a dropped peer for every
+  family — right for AF_UNIX, wrong for TCP (peer close is FIN = RDHUP|IN;
+  HUP only when both local directions are shut or the connection was
+  reset); (b) no reset state on the in-memory stream (listener close with a
+  queued connection must leave the client POLLIN|POLLERR|POLLHUP, recv
+  ECONNRESET, write EPIPE — probe case 7).
