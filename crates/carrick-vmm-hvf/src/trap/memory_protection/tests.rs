@@ -2484,4 +2484,47 @@ mod alias_registry_tests {
             "unmapping 1 row in 5000-row registry took {elapsed:?}, expected < 10ms"
         );
     }
+
+    #[test]
+    fn unregister_alias_entries_does_not_memmove_scope_bucket_per_row() {
+        let mut registry = AliasRegistry::default();
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: 0x5000_0000,
+            size: 0x4000,
+        };
+        const TOTAL_ROWS: u64 = 20_000;
+        for i in 0..TOTAL_ROWS {
+            let va = 0x1000_0000 + i * 0x8000;
+            let physical_ipa = 0x8000_0000 + i * 0x8000;
+            registry.push(make_test_alias(va, 0x1000, physical_ipa, 0x1000, scope));
+        }
+        assert_eq!(registry.len(), TOTAL_ROWS as usize);
+
+        // Unregister a window covering 8 rows near the FRONT (i = 0..8).
+        const ROWS_TO_UNREGISTER: usize = 8;
+        let target_va = 0x1000_0000;
+        let target_len = ROWS_TO_UNREGISTER * 0x8000;
+
+        let before_moved = alias_rows_moved();
+        let retired = unregister_alias_entries(
+            &mut registry,
+            target_va,
+            target_len,
+            Some((0x5000_0000, 0x4000)),
+            ContainerRootToken::ROOT,
+        );
+        let moved = alias_rows_moved().saturating_sub(before_moved);
+
+        assert_eq!(retired.len(), ROWS_TO_UNREGISTER);
+        assert_eq!(registry.len(), (TOTAL_ROWS as usize) - ROWS_TO_UNREGISTER);
+
+        // One linear compaction pass is allowed, k * bucket is not:
+        // rows moved <= 8 * log2(20,000) + 20,000
+        let bound =
+            (ROWS_TO_UNREGISTER as u64) * ((TOTAL_ROWS as f64).log2().ceil() as u64) + TOTAL_ROWS;
+        assert!(
+            moved <= bound,
+            "unregistering {ROWS_TO_UNREGISTER} rows near front moved {moved} rows, expected <= {bound}"
+        );
+    }
 }
