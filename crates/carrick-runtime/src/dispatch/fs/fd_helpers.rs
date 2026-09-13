@@ -798,6 +798,13 @@ impl<'a> FsView<'a> {
             // io.Copy(conn, pipe) direction); the host send enforces its own
             // errors. Without this the `_` arm below rejected it with EINVAL.
             OpenDescription::HostSocket { .. } => None,
+            OpenDescription::InMemorySocket { socket, .. } => {
+                if socket.socket_type == carrick_abi::LINUX_SOCK_STREAM {
+                    None
+                } else {
+                    Some(LINUX_EINVAL)
+                }
+            }
             // Splicing FROM a pipe INTO a regular file is valid on Linux (only
             // ONE end must be a pipe). The write + offset advance is handled by
             // write_output_fd. A read-only fd is EBADF; an O_APPEND destination
