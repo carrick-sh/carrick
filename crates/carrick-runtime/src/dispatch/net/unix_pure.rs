@@ -402,14 +402,51 @@ impl PureSocketInner {
         self.state.lock().so_linger = val;
     }
 
+    /// The live peer half, if any (own lock taken and released here).
+    fn peer_half(&self) -> Option<Arc<PureSocketInner>> {
+        self.state.lock().peer.as_ref().and_then(|p| p.upgrade())
+    }
+
+    /// Lock this half's state together with its peer's in one global order
+    /// (lower object address first). Every reader that needs both halves
+    /// (readiness, EOF, queued-output) goes through here: "self, then peer"
+    /// from both sides at once is an ABBA deadlock, and two guest threads
+    /// polling the two ends of one connection do exactly that.
+    fn lock_with_peer<'a>(
+        &'a self,
+        peer: &'a Arc<PureSocketInner>,
+    ) -> (
+        parking_lot::MutexGuard<'a, PureSocketState>,
+        parking_lot::MutexGuard<'a, PureSocketState>,
+    ) {
+        let me = self as *const Self as usize;
+        let them = Arc::as_ptr(peer) as usize;
+        debug_assert_ne!(me, them, "a stream half is never its own peer");
+        if me < them {
+            let mine = self.state.lock();
+            let theirs = peer.state.lock();
+            (mine, theirs)
+        } else {
+            let theirs = peer.state.lock();
+            let mine = self.state.lock();
+            (mine, theirs)
+        }
+    }
+
     pub(crate) fn outq_bytes(&self) -> usize {
-        let state = self.state.lock();
+        let Some(peer) = self.peer_half() else {
+            let state = self.state.lock();
+            return if state.mock_service.is_some() {
+                state.request_buf.len()
+            } else {
+                0
+            };
+        };
+        let (state, peer_state) = self.lock_with_peer(&peer);
         if state.mock_service.is_some() {
             state.request_buf.len()
-        } else if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
-            peer.state.lock().stream_buf.len()
         } else {
-            0
+            peer_state.stream_buf.len()
         }
     }
 
@@ -639,7 +676,16 @@ impl PureSocketInner {
         max_rights: usize,
         peek: bool,
     ) -> Result<(usize, Vec<Arc<OpenFile>>), LinuxErrno> {
-        let mut state = self.state.lock();
+        // The EOF answer needs the peer's shutdown state, so both halves are
+        // locked in the global pair order (never "self, then peer").
+        let peer = self.peer_half();
+        let (mut state, peer_state) = match &peer {
+            Some(peer) => {
+                let (mine, theirs) = self.lock_with_peer(peer);
+                (mine, Some(theirs))
+            }
+            None => (self.state.lock(), None),
+        };
         if state.shutdown_read {
             return Ok((0, Vec::new()));
         }
@@ -659,16 +705,13 @@ impl PureSocketInner {
                 return Err(LINUX_EAGAIN);
             }
 
-            let is_peer_alive = state
-                .peer
-                .as_ref()
-                .and_then(|p| p.upgrade())
-                .is_some_and(|p| !p.state.lock().shutdown_write);
+            let is_peer_alive = peer_state.as_ref().is_some_and(|p| !p.shutdown_write);
             if !is_peer_alive {
                 return Ok((0, Vec::new()));
             }
             return Err(LINUX_EAGAIN);
         }
+        drop(peer_state);
 
         let to_read = buf.len().min(state.stream_buf.len());
         if peek {
@@ -783,7 +826,18 @@ impl PureSocketInner {
     }
 
     pub(crate) fn poll_mask(&self) -> u32 {
-        let state = self.state.lock();
+        // Readiness of a stream half depends on the peer's state as well, so
+        // both halves are locked in the global pair order (never "self, then
+        // peer": two threads polling the two ends of one connection would
+        // deadlock).
+        let peer = self.peer_half();
+        let (state, peer_state) = match &peer {
+            Some(peer) => {
+                let (mine, theirs) = self.lock_with_peer(peer);
+                (mine, Some(theirs))
+            }
+            None => (self.state.lock(), None),
+        };
         let mut mask = 0;
 
         if state.listening {
@@ -797,15 +851,12 @@ impl PureSocketInner {
             let has_mock = state.mock_service.is_some();
             let (peer_shut_wr, peer_shut_rd, peer_dropped) = if has_mock {
                 (state.mock_peer_closed, state.mock_peer_closed, false)
-            } else if let Some(peer_weak) = &state.peer {
-                if let Some(peer) = peer_weak.upgrade() {
-                    let p = peer.state.lock();
-                    (p.shutdown_write, p.shutdown_read, false)
-                } else {
-                    (true, true, true)
-                }
-            } else {
+            } else if state.peer.is_none() {
                 (false, false, false)
+            } else if let Some(p) = peer_state.as_ref() {
+                (p.shutdown_write, p.shutdown_read, false)
+            } else {
+                (true, true, true)
             };
 
             if !state.stream_buf.is_empty() || state.shutdown_read || peer_shut_wr {
@@ -816,9 +867,8 @@ impl PureSocketInner {
                     if state.request_buf.len() < state.so_sndbuf {
                         mask |= LINUX_EPOLLOUT;
                     }
-                } else if let Some(peer) = state.peer.as_ref().and_then(|p| p.upgrade()) {
-                    let peer_used = peer.state.lock().stream_buf.len();
-                    if peer_used < state.so_sndbuf {
+                } else if let Some(p) = peer_state.as_ref() {
+                    if p.stream_buf.len() < state.so_sndbuf {
                         mask |= LINUX_EPOLLOUT;
                     }
                 }
@@ -1127,6 +1177,53 @@ mod tests {
             LINUX_EPIPE,
             "a send after the reported reset is EPIPE"
         );
+    }
+
+    /// Two guest threads polling the two halves of one connection at once
+    /// (a Go server and its client in the same process, each in
+    /// `epoll_wait`) must never deadlock: readiness on one half needs the
+    /// other half's shutdown and buffer state, and taking the two state
+    /// locks in "self, then peer" order from both sides is an ABBA. Caught
+    /// live on go-net_http with the in-zone pairing (executors 2 and 4
+    /// parked in `poll_mask` for ever). Bounded: a wedge is a failure.
+    #[test]
+    fn concurrent_poll_recv_on_both_halves_never_deadlocks() {
+        let (a, b) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let mut handles = Vec::new();
+        for (mine, other) in [
+            (Arc::clone(&a), Arc::clone(&b)),
+            (Arc::clone(&b), Arc::clone(&a)),
+        ] {
+            let done_tx = done_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                for i in 0..20_000u32 {
+                    let _ = mine.poll_mask();
+                    let _ = other.outq_bytes();
+                    if i % 8 == 0 {
+                        let _ = mine.send_stream(b"ping", Vec::new());
+                    }
+                    let _ = mine.recv_stream(&mut buf, 0);
+                }
+                let _ = done_tx.send(());
+            }));
+        }
+        drop(done_tx);
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("both halves must finish: a timeout is the ABBA deadlock");
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]
