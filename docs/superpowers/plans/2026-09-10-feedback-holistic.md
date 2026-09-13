@@ -820,3 +820,12 @@ commits and is re-checked at the next vet.
   — worker `hostfs-opens-sep12` (fchmodat/fstatat/trusted dirent stream,
   red-first host-openat counts). Director verifies by re-profiling both
   rows and the probe gate.
+- 2026-09-12 17:50, `alias-unregister` LANDED: `unregister_alias_entries`
+  rewrites the scope bucket in one linear pass instead of per-row
+  `Vec::remove/insert` (red-first rows-moved bound: k×bucket → one pass;
+  new test-only `ALIAS_ROWS_MOVED` counter, ledger row reviewed by the
+  director). Receipt on the branch binary 804e4d60b53e3de1, compile row
+  ×2 profiled: 7.3 s → 5.7/5.8 s wall; `_platform_memmove` 19.9% → 4.6%
+  of samples; munmap owner 22.3% → 11%; guest execution share 58.8% →
+  69%. Probe gate to run on the merged main together with the hostfs
+  landing.
