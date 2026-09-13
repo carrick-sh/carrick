@@ -3,7 +3,7 @@
   "scope": "production Rust sources under crates/carrick-runtime/src",
   "counts": {
     "table_guard": 137,
-    "description_guard": 210,
+    "description_guard": 209,
     "description_backing": 17,
     "epoll": 380,
     "stream": 174,
@@ -12,7 +12,7 @@
   },
   "production_counts": {
     "table_guard": 66,
-    "description_guard": 186,
+    "description_guard": 185,
     "description_backing": 6,
     "epoll": 158,
     "stream": 121,
@@ -8181,7 +8181,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 223,
+      "line": 222,
       "categories": [
         "description_guard"
       ],
@@ -8190,16 +8190,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 233,
-      "categories": [
-        "description_guard"
-      ],
-      "text": "open_file.description.read().as_deref(),",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 273,
+      "line": 261,
       "categories": [
         "epoll"
       ],
@@ -8208,7 +8199,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 278,
+      "line": 266,
       "categories": [
         "epoll"
       ],
@@ -8217,7 +8208,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 426,
+      "line": 403,
       "categories": [
         "description_guard"
       ],
@@ -8226,7 +8217,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 457,
+      "line": 434,
       "categories": [
         "epoll"
       ],
@@ -8235,7 +8226,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 459,
+      "line": 436,
       "categories": [
         "epoll"
       ],
@@ -8244,7 +8235,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 468,
+      "line": 445,
       "categories": [
         "stream"
       ],
@@ -8253,7 +8244,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 477,
+      "line": 454,
       "categories": [
         "epoll"
       ],
@@ -8262,7 +8253,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 506,
+      "line": 483,
       "categories": [
         "stream"
       ],
@@ -8271,7 +8262,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 540,
+      "line": 517,
       "categories": [
         "stream"
       ],
@@ -8280,7 +8271,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 543,
+      "line": 520,
       "categories": [
         "stream"
       ],
@@ -8289,7 +8280,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 544,
+      "line": 521,
       "categories": [
         "stream"
       ],
@@ -8298,7 +8289,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 553,
+      "line": 530,
       "categories": [
         "epoll"
       ],
@@ -8307,7 +8298,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 558,
+      "line": 535,
       "categories": [
         "table_guard"
       ],
@@ -8316,7 +8307,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 566,
+      "line": 543,
       "categories": [
         "description_guard"
       ],
@@ -8325,7 +8316,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 569,
+      "line": 546,
       "categories": [
         "epoll"
       ],
@@ -8334,7 +8325,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 722,
+      "line": 699,
       "categories": [
         "epoll"
       ],
@@ -8343,7 +8334,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 724,
+      "line": 701,
       "categories": [
         "table_guard"
       ],
@@ -8352,7 +8343,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 738,
+      "line": 715,
       "categories": [
         "epoll"
       ],
@@ -8361,7 +8352,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 779,
+      "line": 756,
       "categories": [
         "table_guard"
       ],
@@ -8370,7 +8361,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 784,
+      "line": 761,
       "categories": [
         "epoll"
       ],
@@ -8379,7 +8370,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 790,
+      "line": 767,
       "categories": [
         "epoll"
       ],
@@ -8388,7 +8379,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 815,
+      "line": 792,
       "categories": [
         "epoll"
       ],
@@ -8397,7 +8388,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 849,
+      "line": 826,
       "categories": [
         "epoll"
       ],
@@ -8406,7 +8397,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 932,
+      "line": 909,
       "categories": [
         "description_guard"
       ],
@@ -8415,7 +8406,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 935,
+      "line": 912,
       "categories": [
         "epoll"
       ],
@@ -8424,7 +8415,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 950,
+      "line": 927,
       "categories": [
         "epoll"
       ],
@@ -8433,7 +8424,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 960,
+      "line": 937,
       "categories": [
         "description_guard"
       ],
@@ -8442,7 +8433,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 963,
+      "line": 940,
       "categories": [
         "epoll"
       ],
@@ -8451,7 +8442,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 981,
+      "line": 958,
       "categories": [
         "epoll"
       ],
@@ -8460,7 +8451,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1030,
+      "line": 1007,
       "categories": [
         "epoll"
       ],
@@ -8469,7 +8460,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1038,
+      "line": 1015,
       "categories": [
         "description_guard"
       ],
@@ -8478,7 +8469,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1041,
+      "line": 1018,
       "categories": [
         "epoll"
       ],
@@ -8487,7 +8478,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1042,
+      "line": 1019,
       "categories": [
         "epoll"
       ],
@@ -8496,7 +8487,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1047,
+      "line": 1024,
       "categories": [
         "epoll"
       ],
@@ -8505,7 +8496,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1267,
+      "line": 1244,
       "categories": [
         "epoll"
       ],
@@ -8514,7 +8505,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1485,
+      "line": 1462,
       "categories": [
         "description_guard"
       ],
@@ -8523,7 +8514,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1486,
+      "line": 1463,
       "categories": [
         "epoll"
       ],
@@ -8532,7 +8523,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1603,
+      "line": 1580,
       "categories": [
         "description_guard"
       ],
@@ -8541,7 +8532,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1604,
+      "line": 1581,
       "categories": [
         "epoll"
       ],
@@ -8550,7 +8541,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1689,
+      "line": 1666,
       "categories": [
         "epoll"
       ],
@@ -8559,7 +8550,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1690,
+      "line": 1667,
       "categories": [
         "epoll"
       ],
@@ -8568,7 +8559,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1780,
+      "line": 1757,
       "categories": [
         "table_guard"
       ],
@@ -8577,7 +8568,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1809,
+      "line": 1786,
       "categories": [
         "epoll"
       ],
@@ -8586,7 +8577,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1835,
+      "line": 1812,
       "categories": [
         "epoll"
       ],
@@ -8595,7 +8586,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1837,
+      "line": 1814,
       "categories": [
         "epoll"
       ],
@@ -8604,7 +8595,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1838,
+      "line": 1815,
       "categories": [
         "epoll"
       ],
@@ -8613,7 +8604,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1853,
+      "line": 1830,
       "categories": [
         "epoll"
       ],
@@ -8622,7 +8613,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 1854,
+      "line": 1831,
       "categories": [
         "epoll"
       ],
@@ -8631,7 +8622,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2015,
+      "line": 1988,
       "categories": [
         "epoll"
       ],
@@ -8640,7 +8631,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2018,
+      "line": 1991,
       "categories": [
         "epoll"
       ],
@@ -8649,7 +8640,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2041,
+      "line": 2014,
       "categories": [
         "epoll"
       ],
@@ -8658,7 +8649,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2045,
+      "line": 2018,
       "categories": [
         "epoll"
       ],
@@ -8667,7 +8658,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2050,
+      "line": 2023,
       "categories": [
         "epoll"
       ],
@@ -8676,7 +8667,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2055,
+      "line": 2028,
       "categories": [
         "epoll"
       ],
@@ -8685,7 +8676,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2060,
+      "line": 2033,
       "categories": [
         "epoll"
       ],
@@ -8694,7 +8685,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2074,
+      "line": 2047,
       "categories": [
         "epoll"
       ],
@@ -8703,7 +8694,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2077,
+      "line": 2050,
       "categories": [
         "epoll"
       ],
@@ -8712,7 +8703,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2122,
+      "line": 2095,
       "categories": [
         "epoll"
       ],
@@ -8721,7 +8712,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2130,
+      "line": 2103,
       "categories": [
         "epoll"
       ],
@@ -8730,7 +8721,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2198,
+      "line": 2171,
       "categories": [
         "epoll"
       ],
@@ -8739,7 +8730,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2226,
+      "line": 2199,
       "categories": [
         "epoll"
       ],
@@ -8748,7 +8739,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2288,
+      "line": 2261,
       "categories": [
         "epoll"
       ],
@@ -8757,7 +8748,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2292,
+      "line": 2265,
       "categories": [
         "epoll"
       ],
@@ -8766,7 +8757,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2295,
+      "line": 2268,
       "categories": [
         "epoll"
       ],
@@ -8775,7 +8766,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2304,
+      "line": 2277,
       "categories": [
         "epoll"
       ],
@@ -8784,7 +8775,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2308,
+      "line": 2281,
       "categories": [
         "epoll"
       ],
@@ -8793,7 +8784,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2381,
+      "line": 2354,
       "categories": [
         "epoll"
       ],
@@ -8802,7 +8793,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2721,
+      "line": 2694,
       "categories": [
         "epoll"
       ],
@@ -8811,7 +8802,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2944,
+      "line": 2917,
       "categories": [
         "epoll"
       ],
@@ -8820,7 +8811,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2951,
+      "line": 2924,
       "categories": [
         "epoll"
       ],
@@ -8829,7 +8820,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2957,
+      "line": 2930,
       "categories": [
         "table_guard"
       ],
@@ -8838,7 +8829,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2960,
+      "line": 2933,
       "categories": [
         "epoll"
       ],
@@ -8847,7 +8838,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2975,
+      "line": 2948,
       "categories": [
         "epoll"
       ],
@@ -8856,7 +8847,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2988,
+      "line": 2961,
       "categories": [
         "table_guard"
       ],
@@ -8865,7 +8856,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 2991,
+      "line": 2964,
       "categories": [
         "epoll"
       ],
@@ -8874,7 +8865,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3010,
+      "line": 2983,
       "categories": [
         "epoll"
       ],
@@ -8883,7 +8874,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3011,
+      "line": 2984,
       "categories": [
         "epoll"
       ],
@@ -8892,7 +8883,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3030,
+      "line": 3003,
       "categories": [
         "epoll"
       ],
@@ -8901,7 +8892,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3037,
+      "line": 3010,
       "categories": [
         "epoll"
       ],
@@ -8910,7 +8901,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3041,
+      "line": 3014,
       "categories": [
         "epoll"
       ],
@@ -8919,7 +8910,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3045,
+      "line": 3018,
       "categories": [
         "epoll"
       ],
@@ -8928,7 +8919,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3047,
+      "line": 3020,
       "categories": [
         "table_guard"
       ],
@@ -8937,7 +8928,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3049,
+      "line": 3022,
       "categories": [
         "description_guard"
       ],
@@ -8946,7 +8937,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3052,
+      "line": 3025,
       "categories": [
         "epoll"
       ],
@@ -8955,7 +8946,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3104,
+      "line": 3077,
       "categories": [
         "epoll"
       ],
@@ -8964,7 +8955,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3263,
+      "line": 3236,
       "categories": [
         "epoll"
       ],
@@ -8973,7 +8964,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3265,
+      "line": 3238,
       "categories": [
         "epoll"
       ],
@@ -8982,7 +8973,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3267,
+      "line": 3240,
       "categories": [
         "epoll"
       ],
@@ -8991,7 +8982,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3274,
+      "line": 3247,
       "categories": [
         "epoll"
       ],
@@ -9000,7 +8991,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3397,
+      "line": 3370,
       "categories": [
         "table_guard"
       ],
@@ -9009,7 +9000,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3416,
+      "line": 3389,
       "categories": [
         "epoll"
       ],
@@ -9018,7 +9009,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 3504,
+      "line": 3477,
       "categories": [
         "table_guard"
       ],
