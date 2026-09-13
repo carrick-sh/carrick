@@ -2656,6 +2656,25 @@ pub(crate) fn lookup_live_alias_by_va_any_scope(va: u64, len: usize) -> Option<A
     })
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+thread_local! {
+    static ALIAS_ROWS_MOVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Account rows shifted or rewritten during alias bucket mutations.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline]
+pub(crate) fn note_alias_rows_moved(rows: usize) {
+    ALIAS_ROWS_MOVED.with(|cell| cell.set(cell.get().saturating_add(rows as u64)));
+}
+
+/// Total alias rows moved by bucket mutations on the calling thread.
+/// Monotonic; callers compare two reads around the operation under test.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn alias_rows_moved() -> u64 {
+    ALIAS_ROWS_MOVED.with(std::cell::Cell::get)
+}
+
 /// Drop the index entry for any alias whose guest-VA window overlaps
 /// `[va, va+len)` — called on a guest `munmap` of a high-VA alias (the only point
 /// the backing is actually freed), BEFORE the stage-1 invalidate, so a stale
@@ -2778,6 +2797,7 @@ pub(crate) fn unregister_alias_entries(
                 }
                 match fragments.len() {
                     0 => {
+                        note_alias_rows_moved(rows.len().saturating_sub(pos + 1));
                         rows.remove(pos);
                     }
                     1 => {
@@ -2785,6 +2805,7 @@ pub(crate) fn unregister_alias_entries(
                     }
                     2 => {
                         rows[pos] = fragments[0];
+                        note_alias_rows_moved(rows.len().saturating_sub(pos + 1));
                         rows.insert(pos + 1, fragments[1]);
                     }
                     _ => unreachable!(),
