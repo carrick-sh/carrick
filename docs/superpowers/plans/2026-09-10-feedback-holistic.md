@@ -1099,3 +1099,24 @@ commits and is re-checked at the next vet.
   branch does not land until all five MATCH. Task 5 measure script
   `measure-sep13c.sh` is written (cand 781e8349f09c3928 vs 457da5fb6521ff7b)
   and waits for a quiet host.
+- 2026-09-13 11:45, the four in-zone reds closed on branch
+  `agy/inzone-gaps-sep13` (from the probe branch): worker
+  `inzone-gaps-sep13` landed OOB/EPOLLPRI (265eb5faf) and splice through
+  an in-memory socket (62dd9b97f), then spent an hour building THREE host
+  readiness pipes per in-memory socket with raw `libc::write`/`read` in
+  the socket core for the blocking-read case — the host-in-the-compat-zone
+  shape the owner ruled out — so it was stopped and the attempt discarded.
+  Director: c39e20f71 blocking in-memory read/write parks on the socket's
+  own wait queue (`wait_in_memory_slot`, no host fd) and `sendto`
+  validates its ignored destination; 04410079b the LOST WAKEUP that the
+  first judge run exposed (executors all idle): `WaitQueue::enroll_callback`
+  keeps no generation, so a wake between the syscall's check and the wait
+  service's enrollment vanished — every other carrick-owned waiter had
+  hidden that gap behind a level-triggered host readiness pipe. Now a
+  host-fd-less registration carries its poll `interest` on the wait
+  authority and the wait service probes the description once right after
+  enrolling (the accept and splice waits get the same). 679dc08e7 NULL
+  `sendto` destination. Judges on the tree: epollpri, spliceunixpoll,
+  inzonetcp, socketpartialsend, streamdestmatrix MATCH; go-net_http x2
+  1316/1316. Running `just conformance-probes` + `just test` for the
+  landing.
