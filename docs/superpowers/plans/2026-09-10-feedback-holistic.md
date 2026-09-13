@@ -1025,3 +1025,22 @@ commits and is re-checked at the next vet.
   InZone`) and Task 3 `inzone-semantics-sep13` (in-memory INET stream
   semantics). Task 2 (dispatcher wiring) follows Task 1; Task 4 the
   `inzonetcp` line-exact probe.
+- 2026-09-13 07:55, Task 1 LANDED (5f0a426ab..60fe4bd8b): `network/inzone.rs`
+  registry, `ConnectTarget::InZone`, `SocketKey::for_in_memory`; the
+  dispatcher's two exhaustive matches carry inert `InZone` arms until Task 2
+  (762104fca). Task 2 `inzone-wiring-sep13` dispatched from 60fe4bd8b.
+- 2026-09-13 07:55, EPOLLET LANDED (5f576e038..fef5360f2): `Interest.mode`
+  in the HAL; the BSD multiplexer maps Edge to `EV_CLEAR` (no more
+  `EV_DISPATCH` + delete/re-add); `epoll_effective_interest` keeps read
+  armed under a latched EPOLLIN; a wait-sample rebinds the host only for a
+  write edge, a terminal edge, or cleared backpressure. Red-first test
+  `epoll_et_unread_data_does_not_spin_and_waits_for_next_edge` fails on
+  the pre-fix main at "instance kqueue fd must not be readable after edge
+  has already been delivered". Director cleanup 002a62054: the
+  `NOTE_LOWAT` plumbing that the edge made unreachable is deleted (K1 row
+  retired by hand, e0c79407c). Receipts: worker's 3x net_http 1316/1316,
+  46/46 probes; kernel-aware profile poll share 9.3% vs 9.1% baseline —
+  the spin is gone but `poll` is NOT the spin, it is the wait-service
+  reactor's legitimate wake traffic. The row-level receipt folds into the
+  Task 5 paired measure. Two workers alive (semantics at `just test`,
+  wiring reading lifecycle.rs/unix_pure.rs).
