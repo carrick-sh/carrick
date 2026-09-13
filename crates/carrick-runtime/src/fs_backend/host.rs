@@ -44,6 +44,74 @@ pub(crate) const SCRATCH_TRASH_DIRECTORY: &str = ".carrick-trash";
 const SCRATCH_CLEANUP_QUEUE_DEPTH: usize = 8;
 const SCRATCH_SYNC_CLEANUP_LIMIT: usize = 256;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_HOST_OPENAT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TEST_HOST_STAT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn record_test_host_openat() {
+    TEST_HOST_OPENAT_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+pub fn test_host_openat_count() -> u64 {
+    TEST_HOST_OPENAT_COUNT.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub fn reset_test_host_openat_count() {
+    TEST_HOST_OPENAT_COUNT.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub fn record_test_host_stat() {
+    TEST_HOST_STAT_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+pub fn test_host_stat_count() -> u64 {
+    TEST_HOST_STAT_COUNT.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub fn reset_test_host_stat_count() {
+    TEST_HOST_STAT_COUNT.with(|c| c.set(0));
+}
+
+macro_rules! host_openat {
+    ($($arg:expr),* $(,)?) => {{
+        #[cfg(test)]
+        record_test_host_openat();
+        libc::openat($($arg),*)
+    }};
+}
+
+macro_rules! host_fstatat {
+    ($($arg:expr),* $(,)?) => {{
+        #[cfg(test)]
+        record_test_host_stat();
+        libc::fstatat($($arg),*)
+    }};
+}
+
+macro_rules! host_fstat {
+    ($($arg:expr),* $(,)?) => {{
+        #[cfg(test)]
+        record_test_host_stat();
+        libc::fstat($($arg),*)
+    }};
+}
+
+macro_rules! host_open {
+    ($($arg:expr),* $(,)?) => {{
+        #[cfg(test)]
+        record_test_host_openat();
+        libc::open($($arg),*)
+    }};
+}
+
 /// Real-filesystem FsBackend rooted at a scratch directory on disk.
 ///
 /// All host syscalls go through a [`std::os::fd::OwnedFd`] root handle and
@@ -358,7 +426,7 @@ fn host_root_prefix(root_fd: &std::os::fd::OwnedFd) -> Option<String> {
 
 pub(crate) fn host_dir_identity(fd: i32) -> std::io::Result<(u64, u64)> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+    if unsafe { host_fstat!(fd, stat.as_mut_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let stat = unsafe { stat.assume_init() };
@@ -1232,7 +1300,7 @@ impl HostFsBackend {
             };
             self.path_walk_host_opens
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let raw = unsafe { libc::openat(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
+            let raw = unsafe { host_openat!(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
             if raw < 0 {
                 let err = std::io::Error::last_os_error()
                     .raw_os_error()
@@ -1244,7 +1312,7 @@ impl HostFsBackend {
                 }
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
                 let is_symlink = unsafe {
-                    libc::fstatat(
+                    host_fstatat!(
                         current.as_raw_fd(),
                         component_c.as_ptr(),
                         &mut st,
@@ -1320,14 +1388,14 @@ impl HostFsBackend {
             };
             self.path_walk_host_opens
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let raw = unsafe { libc::openat(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
+            let raw = unsafe { host_openat!(current.as_raw_fd(), component_c.as_ptr(), flags, 0) };
             if raw < 0 {
                 let err = std::io::Error::last_os_error()
                     .raw_os_error()
                     .unwrap_or(libc::EIO);
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
                 let is_symlink = unsafe {
-                    libc::fstatat(
+                    host_fstatat!(
                         current.as_raw_fd(),
                         component_c.as_ptr(),
                         &mut st,
@@ -1452,7 +1520,7 @@ impl HostFsBackend {
         #[cfg(not(target_os = "macos"))]
         let nofollow = libc::O_NOFOLLOW;
         let raw = unsafe {
-            libc::openat(
+            host_openat!(
                 parent.as_raw_fd(),
                 leaf.as_ptr(),
                 libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | nofollow,
@@ -1499,7 +1567,7 @@ impl HostFsBackend {
                     return Err(err);
                 }
             }
-            let raw = unsafe { libc::openat(current.as_raw_fd(), comp_c.as_ptr(), flags, 0) };
+            let raw = unsafe { host_openat!(current.as_raw_fd(), comp_c.as_ptr(), flags, 0) };
             if raw < 0 {
                 let err = std::io::Error::last_os_error()
                     .raw_os_error()
@@ -1622,7 +1690,7 @@ impl HostFsBackend {
         flags: i32,
         mode: libc::c_uint,
     ) -> Result<i32, i32> {
-        let raw = unsafe { libc::openat(dir_fd, name.as_ptr(), flags, mode) };
+        let raw = unsafe { host_openat!(dir_fd, name.as_ptr(), flags, mode) };
         if raw >= 0 {
             return Ok(raw);
         }
@@ -1632,7 +1700,7 @@ impl HostFsBackend {
         if !self.reclaim_for_host_refusal(errno) {
             return Err(errno);
         }
-        let raw = unsafe { libc::openat(dir_fd, name.as_ptr(), flags, mode) };
+        let raw = unsafe { host_openat!(dir_fd, name.as_ptr(), flags, mode) };
         if raw >= 0 {
             return Ok(raw);
         }
@@ -1713,7 +1781,7 @@ impl HostFsBackend {
         let (raw, proven) = match self.namei_leaf(rel) {
             Some((parent_fd, name_c)) => {
                 let raw =
-                    unsafe { libc::openat(parent_fd.as_raw_fd(), name_c.as_ptr(), oflags, 0) };
+                    unsafe { host_openat!(parent_fd.as_raw_fd(), name_c.as_ptr(), oflags, 0) };
                 (raw, !follow)
             }
             None => {
@@ -1723,7 +1791,7 @@ impl HostFsBackend {
                 // be proven contained.
                 let rel_c = std::ffi::CString::new(rel.as_os_str().as_bytes()).ok()?;
                 let raw =
-                    unsafe { libc::openat(self.root_fd.as_raw_fd(), rel_c.as_ptr(), oflags, 0) };
+                    unsafe { host_openat!(self.root_fd.as_raw_fd(), rel_c.as_ptr(), oflags, 0) };
                 (raw, false)
             }
         };
@@ -1736,7 +1804,7 @@ impl HostFsBackend {
 
         // Type via fstat on the open fd — no extra path walk.
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        if unsafe { libc::fstat(raw, &mut st) } != 0 {
+        if unsafe { host_fstat!(raw, &mut st) } != 0 {
             return None;
         }
         let typ = st.st_mode as u32 & libc::S_IFMT as u32;
@@ -1790,7 +1858,7 @@ impl HostFsBackend {
         {
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
             let rc = unsafe {
-                libc::fstatat(
+                host_fstatat!(
                     parent_fd.as_raw_fd(),
                     name_c.as_ptr(),
                     &mut st,
@@ -1948,7 +2016,7 @@ impl HostFsBackend {
         // drop, covering every early return below.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        if unsafe { libc::fstat(raw, &mut st) } != 0 {
+        if unsafe { host_fstat!(raw, &mut st) } != 0 {
             return FastGuestOpen::Fallback;
         }
         // Containment: structural containment guarantees that child paths
@@ -2058,7 +2126,7 @@ impl HostFsBackend {
             }
         };
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        if unsafe { libc::fstat(raw, &mut st) } != 0
+        if unsafe { host_fstat!(raw, &mut st) } != 0
             || st.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFREG as u32
         {
             // A raced-in FIFO/device/socket at the leaf: not the regular file
@@ -2112,7 +2180,7 @@ impl HostFsBackend {
             };
             const O_EVTONLY: libc::c_int = 0x8000;
             let raw = unsafe {
-                libc::openat(
+                host_openat!(
                     self.root_fd.as_raw_fd(),
                     parent_c.as_ptr(),
                     O_EVTONLY
@@ -2133,7 +2201,7 @@ impl HostFsBackend {
             // SAFETY: `raw` is a freshly-opened owned descriptor.
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
             let mut stat: libc::stat = unsafe { core::mem::zeroed() };
-            if unsafe { libc::fstat(raw, &mut stat) } != 0
+            if unsafe { host_fstat!(raw, &mut stat) } != 0
                 || stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32
                 || !fd_contained_under(raw, root_prefix)
                 || !self.name_matches_on_disk(parent)
@@ -2224,7 +2292,7 @@ impl HostFsBackend {
     fn root_meta_fd(&self) -> Option<std::os::fd::OwnedFd> {
         use std::os::fd::{AsRawFd, FromRawFd};
         let raw = unsafe {
-            libc::openat(
+            host_openat!(
                 self.root_fd.as_raw_fd(),
                 c".".as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
@@ -2385,7 +2453,7 @@ impl HostFsBackend {
         };
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let rc = unsafe {
-            libc::fstatat(
+            host_fstatat!(
                 self.root_fd.as_raw_fd(),
                 path.as_ptr(),
                 stat.as_mut_ptr(),
@@ -2421,7 +2489,7 @@ impl HostFsBackend {
         };
         use std::os::fd::AsRawFd as _;
         let raw = unsafe {
-            libc::openat(
+            host_openat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
@@ -2471,7 +2539,7 @@ impl HostFsBackend {
             libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0);
         }
         let raw = unsafe {
-            libc::openat(
+            host_openat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
@@ -2700,7 +2768,7 @@ impl HostFsBackend {
         if let Some((parent_fd, ino, birth, entry_meta_generation, mode_override, real)) = cached {
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
             let ok = unsafe {
-                libc::fstatat(
+                host_fstatat!(
                     parent_fd.as_raw_fd(),
                     name_c.as_ptr(),
                     &mut st,
@@ -2767,7 +2835,7 @@ impl HostFsBackend {
         // leaf is reported, not traversed).
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         if unsafe {
-            libc::fstatat(
+            host_fstatat!(
                 parent_fd.as_raw_fd(),
                 name_c.as_ptr(),
                 &mut st,
@@ -2802,7 +2870,7 @@ impl HostFsBackend {
         } else {
             let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
             let leaf_raw =
-                unsafe { libc::openat(parent_fd.as_raw_fd(), name_c.as_ptr(), leaf_flags, 0) };
+                unsafe { host_openat!(parent_fd.as_raw_fd(), name_c.as_ptr(), leaf_flags, 0) };
             if leaf_raw < 0 {
                 return None;
             }
@@ -2958,7 +3026,7 @@ impl HostFsBackend {
             .map_err(std::io::Error::from_raw_os_error)?;
         // A new open description gives each enumeration its own seek offset.
         let dup_raw = unsafe {
-            libc::openat(
+            host_openat!(
                 parent_fd.as_raw_fd(),
                 c".".as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC,
@@ -2987,7 +3055,7 @@ impl HostFsBackend {
             let size = if d_type == libc::DT_REG {
                 let mut st: libc::stat = unsafe { core::mem::zeroed() };
                 if unsafe {
-                    libc::fstatat(
+                    host_fstatat!(
                         parent_fd.as_raw_fd(),
                         d_name.as_ptr(),
                         &mut st,
@@ -3026,7 +3094,7 @@ impl HostFsBackend {
             };
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
             if unsafe {
-                libc::fstatat(
+                host_fstatat!(
                     parent_fd.as_raw_fd(),
                     leaf_c.as_ptr(),
                     &mut st,
@@ -3322,7 +3390,7 @@ pub(crate) fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
 
 pub(crate) fn fset_mode(fd: std::os::fd::RawFd, mode: u32) {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstat(fd, &mut st) };
+    let rc = unsafe { host_fstat!(fd, &mut st) };
     if rc == 0 {
         let kind = st.st_mode as u32 & libc::S_IFMT as u32;
         let owner_ok = if kind == libc::S_IFDIR as u32 {
@@ -3684,7 +3752,7 @@ fn symlink_set_u32_xattr(backend: &HostFsBackend, rel: &Path, name: &[u8], val: 
         return;
     };
     let raw = unsafe {
-        libc::openat(
+        host_openat!(
             parent.as_raw_fd(),
             leaf.as_ptr(),
             libc::O_WRONLY
@@ -3829,7 +3897,7 @@ impl FsBackend for HostFsBackend {
         let digest = Sha256::digest(name.as_bytes());
         let marker = format!("{HOST_WHITEOUT_SIDECAR_PREFIX}{digest:x}\0");
         let raw = unsafe {
-            libc::openat(
+            host_openat!(
                 parent_fd,
                 marker.as_ptr() as *const libc::c_char,
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
@@ -3882,7 +3950,7 @@ impl FsBackend for HostFsBackend {
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe {
-            libc::fstatat(
+            host_fstatat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 &mut st,
@@ -3899,7 +3967,7 @@ impl FsBackend for HostFsBackend {
         }
         if file_type == libc::S_IFREG as u32 {
             let raw_fd = unsafe {
-                libc::openat(
+                host_openat!(
                     parent_fd.as_raw_fd(),
                     leaf_c.as_ptr(),
                     libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
@@ -3961,7 +4029,7 @@ impl FsBackend for HostFsBackend {
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe {
-            libc::fstatat(
+            host_fstatat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 &mut st,
@@ -4035,7 +4103,7 @@ impl FsBackend for HostFsBackend {
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe {
-            libc::fstatat(
+            host_fstatat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 &mut st,
@@ -4247,7 +4315,7 @@ impl FsBackend for HostFsBackend {
         let rel = Self::rel_path(&normalized)?;
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let fd = unsafe {
-            libc::openat(
+            host_openat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
@@ -4271,7 +4339,7 @@ impl FsBackend for HostFsBackend {
         let rel = Self::rel_path(&normalized)?;
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let fd = unsafe {
-            libc::openat(
+            host_openat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
@@ -4296,7 +4364,7 @@ impl FsBackend for HostFsBackend {
         let rel = Self::rel_path(&normalized)?;
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let fd = unsafe {
-            libc::openat(
+            host_openat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW,
@@ -4356,7 +4424,7 @@ impl FsBackend for HostFsBackend {
                         | libc::O_NONBLOCK
                         | libc::O_NOFOLLOW;
                     let raw = unsafe {
-                        libc::openat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0)
+                        host_openat!(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0)
                     };
                     if raw >= 0 {
                         let fd =
@@ -4403,7 +4471,7 @@ impl FsBackend for HostFsBackend {
             .and_then(cstring_from_osstr)
             .ok_or(BackendError::Invalid)?;
         let flags = libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0o644) };
+        let fd = unsafe { host_openat!(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0o644) };
         if fd < 0 {
             let err = std::io::Error::last_os_error();
             return match io_open_refusal(&err) {
@@ -4478,7 +4546,7 @@ impl FsBackend for HostFsBackend {
         crate::fs_resolve_cache::bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0o600) };
+        let fd = unsafe { host_openat!(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0o600) };
         if fd < 0 {
             let err = std::io::Error::last_os_error();
             return match io_open_refusal(&err) {
@@ -4509,7 +4577,7 @@ impl FsBackend for HostFsBackend {
         crate::fs_resolve_cache::bump_generation();
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o600) };
+        let fd = unsafe { host_openat!(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o600) };
         if fd < 0 {
             let err = std::io::Error::last_os_error();
             return match io_open_refusal(&err) {
@@ -4528,7 +4596,7 @@ impl FsBackend for HostFsBackend {
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe {
-            libc::fstatat(
+            host_fstatat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 &mut st,
@@ -4570,7 +4638,7 @@ impl FsBackend for HostFsBackend {
         };
         let flags =
             libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o666) };
+        let fd = unsafe { host_openat!(parent_fd.as_raw_fd(), leaf_c.as_ptr(), flags, 0o666) };
         if fd < 0 {
             return Err(BackendError::Io);
         }
@@ -4635,7 +4703,7 @@ impl FsBackend for HostFsBackend {
 
             let final_size_i64 = i64::try_from(final_size).map_err(|_| BackendError::Invalid)?;
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
-            unsafe { libc::fstat(host_fd, &mut st) }
+            unsafe { host_fstat!(host_fd, &mut st) }
                 .host_syscall_errno()
                 .map_err(|_| BackendError::Io)?;
             if final_size_i64 > st.st_size {
@@ -4755,7 +4823,7 @@ impl FsBackend for HostFsBackend {
         // The cached capability fd's seek offset must not be touched by a
         // concurrent enumeration. Give the stream its own open description.
         let raw = unsafe {
-            libc::openat(
+            host_openat!(
                 parent.as_raw_fd(),
                 c".".as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC,
@@ -4839,7 +4907,7 @@ impl FsBackend for HostFsBackend {
                 continue;
             };
             let fd = unsafe {
-                libc::openat(
+                host_openat!(
                     parent_fd.as_raw_fd(),
                     marker_c.as_ptr(),
                     libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
@@ -5136,13 +5204,14 @@ impl FsBackend for HostFsBackend {
             return false;
         };
         let raw = unsafe {
-            libc::open(
+            host_open!(
                 path.as_ptr(),
                 libc::O_RDWR
                     | libc::O_NONBLOCK
                     | libc::O_CLOEXEC
                     | libc::O_NOFOLLOW
                     | libc::O_NOCTTY,
+                0,
             )
         };
         if raw < 0 {
@@ -5152,7 +5221,7 @@ impl FsBackend for HostFsBackend {
         // return and after the dup2 below has copied it onto `fd`.
         let new = unsafe { OwnedFd::from_raw_fd(raw) };
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        if unsafe { libc::fstat(new.as_raw_fd(), &mut st) } != 0
+        if unsafe { host_fstat!(new.as_raw_fd(), &mut st) } != 0
             || st.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFREG as u32
             || (st.st_dev as u64, st.st_ino) != old_identity
         {
@@ -5256,7 +5325,7 @@ impl FsBackend for HostFsBackend {
             HostFdOpen::Refused(refused) => return HostFdOpen::Refused(refused),
         };
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        if unsafe { host_fstat!(fd, &mut st) } != 0 {
             unsafe { libc::close(fd) };
             return HostFdOpen::Unavailable;
         }
@@ -5409,7 +5478,7 @@ impl FsBackend for HostFsBackend {
         // O_RDWR (not the guest access mode) so HVF can mmap the result with
         // write max-protection if needed; the dispatcher records writability.
         let raw_fd = unsafe {
-            libc::openat(
+            host_openat!(
                 self.root_fd.as_raw_fd(),
                 c_name.as_ptr(),
                 libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
@@ -5436,7 +5505,7 @@ impl FsBackend for HostFsBackend {
             _ => libc::O_RDWR,
         };
         let fd = unsafe {
-            libc::openat(
+            host_openat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 host_access | libc::O_NONBLOCK | libc::O_CLOEXEC,
@@ -5451,7 +5520,7 @@ impl FsBackend for HostFsBackend {
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe {
-            libc::fstatat(
+            host_fstatat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 &mut st,
@@ -5526,7 +5595,7 @@ impl FsBackend for HostFsBackend {
             .metadata_fd(&normalized, false)
             .map_err(|_| BackendError::Io)?;
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        if unsafe { host_fstat!(fd.as_raw_fd(), &mut st) } != 0 {
             return Err(BackendError::Io);
         }
         let mode = mode & 0o7777;
@@ -5570,7 +5639,7 @@ impl FsBackend for HostFsBackend {
         let (parent_fd, leaf_c) = self.namei_leaf(rel).ok_or(BackendError::Invalid)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe {
-            libc::fstatat(
+            host_fstatat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 &mut st,
@@ -5605,7 +5674,7 @@ impl FsBackend for HostFsBackend {
         let (parent_fd, leaf_c) = self.namei_leaf(rel)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe {
-            libc::fstatat(
+            host_fstatat!(
                 parent_fd.as_raw_fd(),
                 leaf_c.as_ptr(),
                 &mut st,
@@ -5700,7 +5769,7 @@ impl FsBackend for HostFsBackend {
             .into_backend_result()?;
         let cur = {
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
-            if unsafe { libc::fstat(host_fd, &mut st) } < 0 {
+            if unsafe { host_fstat!(host_fd, &mut st) } < 0 {
                 unsafe { libc::close(host_fd) };
                 return Err(BackendError::Io);
             }
@@ -5944,7 +6013,7 @@ impl FsBackend for HostFsBackend {
             // non-directory parent (or any non-dir intermediate) fail ENOTDIR.
             // Symlinks ARE followed; F_GETPATH below reveals any redirection.
             let oflags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK;
-            let fd = unsafe { libc::openat(dir_fd, parent_c.as_ptr(), oflags, 0) };
+            let fd = unsafe { host_openat!(dir_fd, parent_c.as_ptr(), oflags, 0) };
             if fd < 0 {
                 let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 // ENOTDIR ⇒ an intermediate is a non-dir. Anything else (ENOENT
@@ -6007,11 +6076,11 @@ impl FsBackend for HostFsBackend {
                 | libc::O_NONBLOCK;
             let (raw, expected) = if normalized.as_os_str().is_empty() {
                 // The sandbox root itself (guest "/"): trivially contained.
-                let raw = unsafe { libc::openat(dir_fd, c".".as_ptr(), oflags, 0) };
+                let raw = unsafe { host_openat!(dir_fd, c".".as_ptr(), oflags, 0) };
                 (raw, root_prefix.as_bytes().to_vec())
             } else {
                 let rel_c = std::ffi::CString::new(normalized.as_os_str().as_bytes()).ok()?;
-                let raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), oflags, 0) };
+                let raw = unsafe { host_openat!(dir_fd, rel_c.as_ptr(), oflags, 0) };
                 let mut expected =
                     Vec::with_capacity(root_prefix.len() + 1 + normalized.as_os_str().len());
                 expected.extend_from_slice(root_prefix.as_bytes());
@@ -6103,7 +6172,7 @@ impl FsBackend for HostFsBackend {
             Some(r) => {
                 let (parent_fd, leaf_c) = self.namei_leaf(r)?;
                 unsafe {
-                    libc::fstatat(
+                    host_fstatat!(
                         parent_fd.as_raw_fd(),
                         leaf_c.as_ptr(),
                         &mut st,
@@ -6111,7 +6180,7 @@ impl FsBackend for HostFsBackend {
                     )
                 }
             }
-            None => unsafe { libc::fstat(self.root_fd.as_raw_fd(), &mut st) },
+            None => unsafe { host_fstat!(self.root_fd.as_raw_fd(), &mut st) },
         };
         if rc != 0 {
             return None;

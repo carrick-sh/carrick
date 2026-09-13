@@ -1002,6 +1002,22 @@
       "rationale": "Carrier-wide host infrastructure static scratch_cleanup_sender::SENDER in crates/carrick-runtime/src/fs_backend/host.rs maintaining host process lifecycle or VM resources."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "symbol": "TEST_HOST_OPENAT_COUNT",
+      "fingerprint": "bfbb245cf83ae24bfa27ce2cad3d832d64ef743d233241f70f9b36cf6377a830",
+      "classification": "test_only",
+      "rationale": "The cfg(test) thread-local counter measures host openat invocations to verify open-amplification budgets under wide directory workloads."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-runtime/src/fs_backend/host.rs",
+      "symbol": "TEST_HOST_STAT_COUNT",
+      "fingerprint": "d74ab20f176ff49da181351f96947280462854d47957e5e6021f6d019d31b3c0",
+      "classification": "test_only",
+      "rationale": "The cfg(test) thread-local counter measures host stat invocations to verify stat-amplification budgets under wide directory workloads."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-runtime/src/fs_backend/tests.rs",
       "symbol": "FS_RLIMIT_TEST_LOCK",
