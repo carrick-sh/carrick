@@ -7968,6 +7968,176 @@ mod inzone_tcp {
         assert_eq!(err2, 0, "SO_ERROR second read must be 0");
     }
 
+    /// A blocking `read(2)` on an in-zone TCP half with nothing buffered must
+    /// park on the socket's wait queue (re-dispatched when the peer writes),
+    /// never hand EAGAIN to a blocking guest (probe `socketpartialsend`: a
+    /// std `read_to_end` panicked with WouldBlock). Non-blocking still gets
+    /// EAGAIN. Same for `recvfrom`.
+    #[test]
+    fn blocking_read_on_empty_in_zone_socket_parks_instead_of_eagain() {
+        const SYS_RECVFROM: u64 = 207;
+        const SYS_FCNTL: u64 = 25;
+        const F_SETFL: u64 = 4;
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        let server_fd = g.ok(
+            SYS_ACCEPT,
+            [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+        ) as i32;
+
+        // Blocking read and recvfrom on the empty half: a wait, not EAGAIN.
+        for (nr, args) in [
+            (SYS_READ, [server_fd as u64, DATA_SCRATCH, 64, 0, 0, 0]),
+            (SYS_RECVFROM, [server_fd as u64, DATA_SCRATCH, 64, 0, 0, 0]),
+        ] {
+            match g.call(nr, args) {
+                DispatchOutcome::WaitOnFds { fds, .. } => {
+                    assert!(
+                        fds.first().is_none_or(|(fd, _)| fd < 0),
+                        "an in-memory socket has no host fd to poll"
+                    );
+                }
+                other => panic!("syscall {nr} on an empty blocking in-zone socket: {other:?}"),
+            }
+        }
+
+        // The peer writes: the same read now returns the bytes.
+        g.mem.write_bytes(DATA_SCRATCH + 0x100, b"late").unwrap();
+        assert_eq!(
+            g.ok(SYS_WRITE, [client_fd as u64, DATA_SCRATCH + 0x100, 4, 0, 0, 0]),
+            4
+        );
+        assert_eq!(
+            g.ok(SYS_READ, [server_fd as u64, DATA_SCRATCH, 64, 0, 0, 0]),
+            4
+        );
+
+        // O_NONBLOCK: EAGAIN.
+        assert_eq!(
+            g.ok(
+                SYS_FCNTL,
+                [server_fd as u64, F_SETFL, carrick_abi::LINUX_O_NONBLOCK, 0, 0, 0],
+            ),
+            0
+        );
+        assert_eq!(
+            g.call(SYS_READ, [server_fd as u64, DATA_SCRATCH, 64, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_EAGAIN)
+        );
+    }
+
+    /// `sendto` on a connected in-zone stream ignores the destination but
+    /// validates it first, like Linux `move_addr_to_kernel` (probe
+    /// `streamdestmatrix` 2.8-2.10): negative or oversized addrlen is EINVAL,
+    /// an unreadable address with a positive addrlen is EFAULT, and nothing
+    /// is delivered in those cases.
+    #[test]
+    fn sendto_on_in_zone_stream_validates_the_ignored_destination() {
+        const SYS_SENDTO: u64 = 206;
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        let server_fd = g.ok(
+            SYS_ACCEPT,
+            [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+        ) as i32;
+
+        g.mem.write_bytes(DATA_SCRATCH, b"payload").unwrap();
+        let neg_len = (-1i32) as u32 as u64;
+        let unmapped = 0x10u64; // below MEM_BASE: unreadable
+        assert_eq!(
+            g.call(
+                SYS_SENDTO,
+                [client_fd as u64, DATA_SCRATCH, 7, 0, ADDR_SCRATCH, neg_len],
+            ),
+            DispatchOutcome::errno(carrick_abi::LINUX_EINVAL)
+        );
+        assert_eq!(
+            g.call(
+                SYS_SENDTO,
+                [client_fd as u64, DATA_SCRATCH, 7, 0, ADDR_SCRATCH, 129],
+            ),
+            DispatchOutcome::errno(carrick_abi::LINUX_EINVAL)
+        );
+        assert_eq!(
+            g.call(SYS_SENDTO, [client_fd as u64, DATA_SCRATCH, 7, 0, unmapped, 16]),
+            DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+        );
+        // Nothing was delivered by the rejected calls.
+        let poll_in = g.dispatcher.poll_ready_events(server_fd, LINUX_POLLIN);
+        assert_eq!(poll_in & LINUX_POLLIN, 0, "rejected sendto must not deliver");
+        // An unreadable address with addrlen 0 and a valid ignored destination both deliver.
+        assert_eq!(
+            g.ok(SYS_SENDTO, [client_fd as u64, DATA_SCRATCH, 7, 0, unmapped, 0]),
+            7
+        );
+        assert_eq!(
+            g.ok(SYS_SENDTO, [client_fd as u64, DATA_SCRATCH, 7, 0, ADDR_SCRATCH, 16]),
+            7
+        );
+    }
+
     #[test]
     fn tcp_oob_urgent_data_readiness_and_recv() {
         const SYS_SENDTO: u64 = 206;

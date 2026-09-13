@@ -818,6 +818,21 @@ impl<'a> NetView<'a> {
         }
     }
 
+    /// Park a blocking read or write on an in-memory socket (an AF_UNIX pair,
+    /// an in-zone TCP half) until the socket's own wait queue fires, then
+    /// re-dispatch the syscall. There is no host fd to poll: the socket is
+    /// carrick-owned and publishes its readiness on `wait_queue`, which the
+    /// wait service subscribes to through the slot authority. `timeout` is
+    /// the guest's SO_RCVTIMEO/SO_SNDTIMEO; on expiry the syscall returns
+    /// EAGAIN, as Linux does.
+    pub(in crate::dispatch) fn wait_in_memory_slot(
+        &self,
+        guest_fd: i32,
+        timeout: Option<std::time::Duration>,
+    ) -> DispatchOutcome {
+        wait_in_memory_slot(&self.captured_file_table(), guest_fd, timeout)
+    }
+
     /// Whether a host-I/O op on `fd` with these guest `msg_flags` should report
     /// EAGAIN (true) rather than block: the guest fd is O_NONBLOCK, or the call
     /// carries MSG_DONTWAIT.
@@ -3611,5 +3626,29 @@ impl SyscallDispatcher {
     #[inline]
     pub(in crate::dispatch) fn is_dns_gateway_addr(&self, addr: std::net::SocketAddr) -> bool {
         self.net_view().is_dns_gateway_addr(addr)
+    }
+}
+
+/// See [`NetView::wait_in_memory_slot`]; shared with the fs read/write paths.
+pub(in crate::dispatch) fn wait_in_memory_slot(
+    files: &crate::kernel::FileTable,
+    guest_fd: i32,
+    timeout: Option<std::time::Duration>,
+) -> DispatchOutcome {
+    let fds = match WaitFds::raw_one(-1, 0).with_redispatch_and_watched_slots(
+        files,
+        [guest_fd],
+        [guest_fd],
+    ) {
+        Ok(fds) => fds,
+        Err(errno) => return DispatchOutcome::errno(errno),
+    };
+    DispatchOutcome::WaitOnFds {
+        fds,
+        timeout,
+        sig_mask: carrick_abi::WaitSigMask::NONE,
+        completion: FdWaitCompletion::Fd {
+            on_timeout: LINUX_EAGAIN.guest_retval(),
+        },
     }
 }

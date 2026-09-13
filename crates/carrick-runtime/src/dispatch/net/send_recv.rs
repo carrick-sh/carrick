@@ -289,6 +289,20 @@ impl<'a> NetView<'a> {
                     OpenDescription::InMemorySocket { socket, .. } => {
                         let socket = Arc::clone(socket);
                         drop(open);
+                        // A destination on a connected stream is ignored by
+                        // Linux, but `move_addr_to_kernel` still validates it
+                        // first: a negative or oversized addrlen is EINVAL and
+                        // an unreadable address with a positive addrlen is
+                        // EFAULT, before any byte is queued (probe
+                        // `streamdestmatrix`, cases 2.8-2.10).
+                        if dest_addr != 0 || dest_len != 0 {
+                            if (dest_len as i32) < 0 || dest_len as usize > LINUX_SOCKADDR_STORAGE_MAX {
+                                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                            }
+                            if dest_len > 0 && memory.read_bytes(dest_addr, dest_len as usize).is_err() {
+                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                            }
+                        }
                         let bytes = match memory.read_bytes(buf_addr, len) {
                             Ok(b) => b,
                             Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
@@ -320,6 +334,9 @@ impl<'a> NetView<'a> {
                             Ok(written) => {
                                 this.notify_inmem_epoll();
                                 return Ok(DispatchOutcome::returned_len(written)?);
+                            }
+                            Err(LINUX_EAGAIN) if !this.io_is_nonblocking(fd, flags) => {
+                                return Ok(this.wait_in_memory_slot(fd, socket.get_sndtimeo()));
                             }
                             Err(LINUX_EPIPE) => {
                                 let outcome = DispatchOutcome::errno(LINUX_EPIPE);
@@ -704,6 +721,9 @@ impl<'a> NetView<'a> {
                                 }
                                 return Ok(DispatchOutcome::returned_len(read_len)?);
                             }
+                            Err(LINUX_EAGAIN) if !this.io_is_nonblocking(fd, flags) => {
+                                return Ok(this.wait_in_memory_slot(fd, socket.get_rcvtimeo()));
+                            }
                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         }
                     }
@@ -993,6 +1013,9 @@ impl<'a> NetView<'a> {
                 Ok(written) => {
                     self.notify_inmem_epoll();
                     return Ok(DispatchOutcome::returned_len(written)?);
+                }
+                Err(LINUX_EAGAIN) if !self.io_is_nonblocking(fd, flags) => {
+                    return Ok(self.wait_in_memory_slot(fd, socket.get_sndtimeo()));
                 }
                 Err(LINUX_EPIPE) => {
                     return Ok(DispatchOutcome::errno(LINUX_EPIPE));
@@ -1424,7 +1447,12 @@ impl<'a> NetView<'a> {
                     }
                     return Ok(DispatchOutcome::returned_len(read_len)?);
                 }
-                Err(LINUX_EAGAIN) => return Ok(DispatchOutcome::errno(LINUX_EAGAIN)),
+                Err(LINUX_EAGAIN) => {
+                    if self.io_is_nonblocking(fd, flags) {
+                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                    }
+                    return Ok(self.wait_in_memory_slot(fd, socket.get_rcvtimeo()));
+                }
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
         }
