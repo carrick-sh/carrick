@@ -992,3 +992,18 @@ commits and is re-checked at the next vet.
   its new shutdown test; one parked 55 min on a barrier from an abandoned
   run). Director killed both, stopped the turn, and sent round 5 (exit the
   reactor on a non-EINTR error; kill any test over 5 minutes).
+- 2026-09-13 06:55, `reactor-kqueue-sep13` PARKED after five rounds (branch
+  `agy/reactor-kqueue-sep13`, worktree kept; commits 904b48da2, 5eb37ee06,
+  2a6cc64eb + uncommitted round-4 EV_CLEAR edits). Findings, each with
+  evidence in this controller: (1) kqueue identity is (fd, filter), so a
+  wait service needs a fan-out map; (2) EV_ERROR events must not publish;
+  (3) delivery must be one-shot per enrollment; (4) the real livelock is the
+  instance kqueue's LEVEL registration for EPOLLET interests (software
+  latch) — `EPWAIT ready=0`/`EPWFD` spin, cores `kqcap/kqc-{2,4}`; (5) with
+  the round-4 edits a carrier wedged in KERNEL exit (`ps` state `E`, no
+  threads, unattachable) after 1203/1316 net_http tests, blocking the
+  harness in `wait4`. Verdict: the lever (~10% of one row) does not justify
+  the risk at this depth tonight; finding (4) is the durable one and should
+  be fixed on its own (EPOLLET read interest → EV_CLEAR on the instance
+  kqueue) with the line-exact epoll probes as judges before any reactor
+  change is retried.
