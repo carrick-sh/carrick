@@ -68,6 +68,8 @@ pub enum RunQueueError {
     QueueEmpty,
     #[error("executor was poked for owner-thread control work")]
     ControlPoked,
+    #[error("executor flush requested")]
+    FlushRequested,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -347,6 +349,46 @@ impl ExecutorBinding {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ResidencyFlushRequest {
+    None = 0,
+    Requested = 1,
+}
+
+#[derive(Debug)]
+pub struct AtomicResidencyFlushRequest(AtomicU8);
+
+impl AtomicResidencyFlushRequest {
+    pub const fn new(state: ResidencyFlushRequest) -> Self {
+        Self(AtomicU8::new(state as u8))
+    }
+
+    pub fn load(&self, order: Ordering) -> ResidencyFlushRequest {
+        match self.0.load(order) {
+            1 => ResidencyFlushRequest::Requested,
+            _ => ResidencyFlushRequest::None,
+        }
+    }
+
+    pub fn store(&self, state: ResidencyFlushRequest, order: Ordering) {
+        self.0.store(state as u8, order);
+    }
+
+    pub fn swap(&self, state: ResidencyFlushRequest, order: Ordering) -> ResidencyFlushRequest {
+        match self.0.swap(state as u8, order) {
+            1 => ResidencyFlushRequest::Requested,
+            _ => ResidencyFlushRequest::None,
+        }
+    }
+}
+
+impl Default for AtomicResidencyFlushRequest {
+    fn default() -> Self {
+        Self::new(ResidencyFlushRequest::None)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecutorRegistration {
     id: ExecutorId,
@@ -354,6 +396,7 @@ pub struct ExecutorRegistration {
     is_spare: bool,
     close_observation_epoch: Arc<AtomicU64>,
     control_observation_epoch: Arc<AtomicU64>,
+    flush_requested: Arc<AtomicResidencyFlushRequest>,
 }
 
 impl ExecutorRegistration {
@@ -368,6 +411,15 @@ impl ExecutorRegistration {
     pub const fn is_spare(&self) -> bool {
         self.is_spare
     }
+
+    pub fn flush_requested(&self) -> bool {
+        self.flush_requested.load(Ordering::Acquire) == ResidencyFlushRequest::Requested
+    }
+
+    pub fn clear_flush_request(&self) {
+        self.flush_requested
+            .store(ResidencyFlushRequest::None, Ordering::Release);
+    }
 }
 
 #[derive(Debug)]
@@ -376,6 +428,7 @@ struct ExecutorEntry {
     bound_cpu: Option<GuestCpuId>,
     close_observation_epoch: Arc<AtomicU64>,
     control_observation_epoch: Arc<AtomicU64>,
+    flush_requested: Arc<AtomicResidencyFlushRequest>,
 }
 
 #[derive(Debug)]
@@ -432,6 +485,7 @@ impl ExecutorDirectory {
         let id = ExecutorId::from_scheduler(raw);
         let close_observation_epoch = Arc::new(AtomicU64::new(0));
         let control_observation_epoch = Arc::new(AtomicU64::new(0));
+        let flush_requested = Arc::new(AtomicResidencyFlushRequest::default());
         state.entries.insert(
             id,
             ExecutorEntry {
@@ -439,6 +493,7 @@ impl ExecutorDirectory {
                 bound_cpu,
                 close_observation_epoch: Arc::clone(&close_observation_epoch),
                 control_observation_epoch: Arc::clone(&control_observation_epoch),
+                flush_requested: Arc::clone(&flush_requested),
             },
         );
         Ok(ExecutorRegistration {
@@ -447,6 +502,7 @@ impl ExecutorDirectory {
             is_spare,
             close_observation_epoch,
             control_observation_epoch,
+            flush_requested,
         })
     }
 
@@ -2089,6 +2145,9 @@ impl RunQueue {
         // every path out of the idle state including the early returns.
         let mut idle = IdleAnnouncement::new(&cpu);
         loop {
+            if executor.flush_requested() {
+                return Err(RunQueueError::FlushRequested);
+            }
             let control_epoch = self.inner.control_epoch.load(Ordering::Acquire);
             if executor
                 .control_observation_epoch
@@ -2156,6 +2215,7 @@ impl RunQueue {
             while local.rows.is_empty()
                 && local.wake_ticket == ticket
                 && self.inner.lifecycle() == QueueLifecycle::Open
+                && !executor.flush_requested()
             {
                 cpu.idle_condvar.wait(&mut local);
             }
@@ -2168,7 +2228,11 @@ impl RunQueue {
                     .close_observation_epoch
                     .store(observed_close_epoch, Ordering::Release);
             }
+            let flush_requested = executor.flush_requested();
             drop(local);
+            if flush_requested {
+                return Err(RunQueueError::FlushRequested);
+            }
             #[cfg(test)]
             if let Some(gate) = self.inner.post_unpark_epoch_gate.lock().clone() {
                 let _ = gate.send(());
@@ -2246,6 +2310,9 @@ impl RunQueue {
     fn park_spare(&self, executor: &ExecutorRegistration) -> Result<QueueRow, RunQueueError> {
         let mut state = self.inner.state.lock();
         loop {
+            if executor.flush_requested() {
+                return Err(RunQueueError::FlushRequested);
+            }
             let control_epoch = self.inner.control_epoch.load(Ordering::Acquire);
             if executor
                 .control_observation_epoch
@@ -2277,7 +2344,9 @@ impl RunQueue {
                 carrick_fatal!("kernel::run_queue", "spare_waiters overflow in park_spare");
             });
             let close_epoch = state.close_epoch;
-            self.inner.changed.wait(&mut state);
+            if !executor.flush_requested() {
+                self.inner.changed.wait(&mut state);
+            }
             state.spare_waiters = state.spare_waiters.checked_sub(1).unwrap_or_else(|| {
                 carrick_fatal!("kernel::run_queue", "spare_waiters underflow in park_spare");
             });
@@ -2285,6 +2354,9 @@ impl RunQueue {
                 executor
                     .close_observation_epoch
                     .store(state.close_epoch, Ordering::Release);
+            }
+            if executor.flush_requested() {
+                return Err(RunQueueError::FlushRequested);
             }
         }
     }
@@ -3480,6 +3552,24 @@ impl Scheduler {
         self.queue.inner.poke_control();
     }
 
+    pub(crate) fn request_residency_flush(&self, executor: ExecutorId) {
+        let (bound_cpu, flush_requested) = {
+            let state = self.executors.state.lock();
+            match state.entries.get(&executor) {
+                Some(entry) => (entry.bound_cpu, Arc::clone(&entry.flush_requested)),
+                None => return,
+            }
+        };
+        flush_requested.store(ResidencyFlushRequest::Requested, Ordering::Release);
+        if let Some(cpu) = bound_cpu {
+            if let Some(guest_cpu) = self.queue.inner.cpus.get(cpu.as_usize()) {
+                guest_cpu.nudge();
+            }
+        } else {
+            self.queue.inner.changed.notify_all();
+        }
+    }
+
     pub fn settle_blocked(
         &self,
         mut running: RunnableThread,
@@ -4179,6 +4269,16 @@ impl Scheduler {
         resume: Arc<std::sync::Barrier>,
     ) {
         self.queue.install_pre_park_gate(arrived, resume);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cpu_wake_ticket(&self, cpu_id: usize) -> u64 {
+        self.queue.inner.cpus[cpu_id].state.lock().wake_ticket
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cpu_waiters(&self, cpu_id: usize) -> usize {
+        self.queue.inner.cpus[cpu_id].state.lock().waiters
     }
 
     /// Non-destructive `findrunnable` steal probe: run the steal scan `cpu`

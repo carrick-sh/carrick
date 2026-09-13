@@ -24,7 +24,9 @@ use crate::kernel::objects::{
     BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
     ThreadExecutionLease, ThreadExecutionState,
 };
-use crate::kernel::scheduler::{ExecutorBinding, ExecutorKick, ExecutorKickToken};
+use crate::kernel::scheduler::{
+    CpuAffinity, ExecutorBinding, ExecutorKick, ExecutorKickToken, GuestCpuId, GuestCpuPolicy,
+};
 use crate::kernel::{
     ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler, SchedulerError,
     SubmissionAuthority, ThreadKey,
@@ -848,7 +850,7 @@ impl PersistentExecutor for FakeExecutor {
                 if executor != self.id =>
             {
                 if let Some(scheduler) = self.factory.scheduler.lock().upgrade() {
-                    scheduler.poke_executor_control();
+                    scheduler.request_residency_flush(executor);
                 }
                 task.binding().wait_for_materialized(task.thread_key())?
             }
@@ -6198,4 +6200,198 @@ fn test_lazy_vcpu_cross_executor_pool_execution() {
 
     drop(authority);
     pool.shutdown().expect("clean pool shutdown");
+}
+
+#[test]
+fn test_lazy_vcpu_targeted_flush_request_wakes_owner_and_avoids_broadcast() {
+    let (kernel, context) = bootstrap(15_008);
+    // 3 guest CPUs so executors 0, 1, 2 bind to CPUs 0, 1, 2.
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(3)),
+    ));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(209, [Step::Block, Step::Exit]);
+    factory.install(&context, Arc::clone(&binding));
+    let generation = publish(&context, 209);
+
+    // Start 3 workers bound to CPUs 0, 1, 2.
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 3);
+
+    // Pin the task to CPU 0 so Worker 0 executes it first.
+    context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let authority = enqueue_root(&scheduler, &context, generation);
+
+    // Wait until Worker 0 has executed Step::Block.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while binding.progress.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 1);
+
+    // Wait until all 3 workers are parked idle in their condvars.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (scheduler.cpu_waiters(0) == 0
+        || scheduler.cpu_waiters(1) == 0
+        || scheduler.cpu_waiters(2) == 0)
+        && Instant::now() < deadline
+    {
+        thread::yield_now();
+    }
+    assert_eq!(scheduler.cpu_waiters(0), 1, "Worker 0 must be parked idle");
+    assert_eq!(scheduler.cpu_waiters(1), 1, "Worker 1 must be parked idle");
+    assert_eq!(scheduler.cpu_waiters(2), 1, "Worker 2 must be parked idle");
+
+    // Record the baseline wake tickets for all CPUs while parked.
+    let ticket0_before = scheduler.cpu_wake_ticket(0);
+    let ticket1_before = scheduler.cpu_wake_ticket(1);
+    let ticket2_before = scheduler.cpu_wake_ticket(2);
+
+    // Pin the task to CPU 1 so Worker 1 claims it on wake.
+    context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    scheduler.wake(context.thread().key()).expect("wake task");
+
+    // Wait for the task to complete Step::Exit on Worker 1.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while binding.progress.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 2);
+
+    // Assert:
+    // 1. Worker 0 (owner) was nudged and woken by the targeted residency flush request.
+    let ticket0_after = scheduler.cpu_wake_ticket(0);
+    assert!(
+        ticket0_after > ticket0_before,
+        "Worker 0 must receive a targeted nudge to flush resident registers (before: {ticket0_before}, after: {ticket0_after})"
+    );
+
+    // 2. Worker 1 (claimer) was woken by the task submission.
+    let ticket1_after = scheduler.cpu_wake_ticket(1);
+    assert!(
+        ticket1_after > ticket1_before,
+        "Worker 1 must be woken by task submission (before: {ticket1_before}, after: {ticket1_after})"
+    );
+
+    // 3. Worker 2 (unrelated idle executor) received NO nudge / NO broadcast!
+    let ticket2_after = scheduler.cpu_wake_ticket(2);
+    assert_eq!(
+        ticket2_after, ticket2_before,
+        "Worker 2 must NOT receive any nudge or broadcast wake"
+    );
+
+    // 4. Claimer overlaid the materialized image.
+    assert_eq!(
+        factory.overlay_count.load(Ordering::SeqCst),
+        2,
+        "Initial load (1) + cross-executor load overlay (1)"
+    );
+
+    drop(authority);
+    pool.shutdown().expect("clean pool shutdown");
+}
+
+#[test]
+fn test_lazy_vcpu_same_executor_reclaim_after_block_with_empty_queue_has_zero_snapshots_and_overlays()
+ {
+    let (kernel, context) = bootstrap(15_009);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(210, [Step::Block, Step::Exit]);
+    factory.install(&context, Arc::clone(&binding));
+    let generation = publish(&context, 210);
+
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+    let authority = enqueue_root(&scheduler, &context, generation);
+
+    // Wait until the task blocks.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while binding.progress.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 1);
+
+    // Wait until the worker parks idle with an empty queue.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while scheduler.cpu_waiters(0) == 0 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(scheduler.cpu_waiters(0), 1);
+
+    // At this point, the task blocked and the executor parked on an empty queue.
+    // Because the unconditional idle flush is removed, no snapshot was taken!
+    let snapshots_before_wake = factory.snapshot_count.load(Ordering::SeqCst);
+    let overlays_before_wake = factory.overlay_count.load(Ordering::SeqCst);
+    assert_eq!(
+        snapshots_before_wake, 0,
+        "Idle park with empty queue must NOT snapshot resident task"
+    );
+    assert_eq!(
+        overlays_before_wake, 1,
+        "Only initial cold boot load performed an overlay"
+    );
+
+    // Wake the task so the same executor reclaims it.
+    scheduler.wake(context.thread().key()).expect("wake task");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while binding.progress.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 2);
+
+    // Fast-path reclaim on same executor must perform 0 new snapshots and 0 new overlays!
+    assert_eq!(
+        factory.snapshot_count.load(Ordering::SeqCst),
+        0,
+        "Same-executor reclaim after block with empty queue must have 0 snapshots"
+    );
+    assert_eq!(
+        factory.overlay_count.load(Ordering::SeqCst),
+        1,
+        "Same-executor reclaim after block with empty queue must have 0 overlays"
+    );
+
+    drop(authority);
+    pool.shutdown().expect("clean pool shutdown");
+}
+
+#[test]
+fn test_lazy_vcpu_flush_request_in_check_wait_window_not_lost() {
+    let (kernel, _context) = bootstrap(15_010);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let worker_kick = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+    let reg = scheduler.register_executor(worker_kick).unwrap();
+
+    let arrived = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    scheduler.install_pre_park_gate(Arc::clone(&arrived), Arc::clone(&resume));
+
+    let worker_scheduler = Arc::clone(&scheduler);
+    let worker_reg = reg.clone();
+    let worker_handle = thread::spawn(move || worker_scheduler.take(&worker_reg));
+
+    // Wait until worker reaches the pre-park gate (inside the check→wait window).
+    arrived.wait();
+
+    // While worker is paused in the check→wait window, request a residency flush.
+    scheduler.request_residency_flush(reg.id());
+
+    // Resume the worker.
+    resume.wait();
+
+    // The worker must observe FlushRequested and not hang or park indefinitely.
+    let outcome = worker_handle.join().unwrap();
+    assert_eq!(
+        outcome.err(),
+        Some(crate::kernel::RunQueueError::FlushRequested),
+        "Flush request in check→wait window must return FlushRequested"
+    );
+
+    reg.clear_flush_request();
+    scheduler.unregister_executor(&reg).unwrap();
 }

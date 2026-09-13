@@ -252,7 +252,6 @@ where
     // executor's own command channel is honored HERE, after the terminal that
     // consumed it has fully settled.
     let mut deferred_stop = false;
-    let mut was_control_poked = false;
     loop {
         if deferred_stop {
             return Ok(());
@@ -261,18 +260,16 @@ where
         {
             return Ok(());
         }
-        if registration.is_spare() || scheduler.queued_len() == 0 || was_control_poked {
-            backend
-                .flush_resident_task()
-                .map_err(|error| error.to_string())?;
-        }
-        was_control_poked = false;
         let mut running = match scheduler.take(registration) {
             Ok(running) => running,
-            Err(crate::kernel::RunQueueError::ControlPoked) => {
-                was_control_poked = true;
+            Err(crate::kernel::RunQueueError::FlushRequested) => {
+                backend
+                    .flush_resident_task()
+                    .map_err(|error| error.to_string())?;
+                registration.clear_flush_request();
                 continue;
             }
+            Err(crate::kernel::RunQueueError::ControlPoked) => continue,
             Err(crate::kernel::RunQueueError::Closed) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
@@ -360,7 +357,7 @@ where
         };
         if let Some(TaskCpuResidency::Resident { executor, .. }) = task.binding().cpu_residency() {
             if executor != executor_id {
-                scheduler.poke_executor_control();
+                scheduler.request_residency_flush(executor);
             }
         }
         if let Err(error) = backend.load(&task) {
