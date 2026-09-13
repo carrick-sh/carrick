@@ -7816,6 +7816,74 @@ mod inzone_tcp {
         );
     }
 
+    /// A guest that blocks in `poll(2)` on its listener (the probe's case 2,
+    /// Go's `net/http` accept loop under a non-epoll runtime, any C server)
+    /// must see POLLIN for a connection that was paired in-zone. The all-host
+    /// fast path of `ppoll` used to take readiness from the host `poll(0)`
+    /// alone, which never learns about an in-memory pairing.
+    #[test]
+    fn poll_on_listener_reports_in_zone_queued_connection() {
+        const SYS_PPOLL: u64 = 73;
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+
+        // pollfd { fd, events: POLLIN, revents: 0 }, timeout 0 (a probe, never a wait).
+        let pollfd_addr = DATA_SCRATCH;
+        let mut pollfd = Vec::with_capacity(8);
+        pollfd.extend_from_slice(&listen_fd.to_ne_bytes());
+        pollfd.extend_from_slice(&(LINUX_POLLIN as i16).to_ne_bytes());
+        pollfd.extend_from_slice(&0i16.to_ne_bytes());
+        g.mem.write_bytes(pollfd_addr, &pollfd).unwrap();
+        let timeout_addr = DATA_SCRATCH + 0x40;
+        g.mem.write_bytes(timeout_addr, &[0u8; 16]).unwrap();
+        assert_eq!(
+            g.ok(SYS_PPOLL, [pollfd_addr, 1, timeout_addr, 0, 8, 0]),
+            0,
+            "no connection queued: poll must report nothing"
+        );
+
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+
+        g.mem.write_bytes(pollfd_addr, &pollfd).unwrap();
+        assert_eq!(
+            g.ok(SYS_PPOLL, [pollfd_addr, 1, timeout_addr, 0, 8, 0]),
+            1,
+            "an in-zone queued connection must make the listener readable"
+        );
+        let out = g.mem.read_bytes(pollfd_addr, 8).unwrap();
+        let revents = i16::from_ne_bytes([out[6], out[7]]);
+        assert_eq!(revents & LINUX_POLLIN as i16, LINUX_POLLIN as i16);
+    }
+
     #[test]
     fn closing_listener_with_queued_half_gives_econnreset_eof() {
         let mut g = InZoneGuest::new();
@@ -7857,41 +7925,24 @@ mod inzone_tcp {
         // Close listener while connection is queued
         assert_eq!(g.ok(SYS_CLOSE, [listen_fd as u64, 0, 0, 0, 0, 0]), 0);
 
-        // Client read must return EOF (0 bytes) or ECONNRESET
+        // The `inzonetcp` oracle (case 7): the first recv reports the reset
+        // and consumes it, so SO_ERROR afterwards reads 0 and a later read is
+        // EOF.
         let read_res = g.call(SYS_READ, [client_fd as u64, DATA_SCRATCH, 64, 0, 0, 0]);
-        match read_res {
-            DispatchOutcome::Returned { value } => {
-                assert_eq!(value, 0, "client read must return 0 (EOF)")
-            }
-            DispatchOutcome::Errno { errno } => {
-                assert_eq!(errno, LINUX_ECONNRESET, "or ECONNRESET")
-            }
-            other => panic!("unexpected read outcome: {other:?}"),
-        }
+        assert_eq!(
+            read_res,
+            DispatchOutcome::errno(LINUX_ECONNRESET),
+            "the first read reports the pending reset"
+        );
+        assert_eq!(
+            g.ok(SYS_READ, [client_fd as u64, DATA_SCRATCH, 64, 0, 0, 0]),
+            0,
+            "the reset is consumed; the next read is EOF"
+        );
 
-        // SO_ERROR on client must read ECONNRESET once, then 0
         let optval = ADDR_SCRATCH;
         let optlen = ADDRLEN_SCRATCH;
-        g.mem.write_bytes(optlen, &4u32.to_ne_bytes()).unwrap();
-        assert_eq!(
-            g.ok(
-                SYS_GETSOCKOPT,
-                [
-                    client_fd as u64,
-                    LINUX_SOL_SOCKET as u64,
-                    LINUX_SO_ERROR as u64,
-                    optval,
-                    optlen,
-                    0,
-                ],
-            ),
-            0
-        );
-        let err_bytes = g.mem.read_bytes(optval, 4).unwrap();
-        let err = i32::from_ne_bytes([err_bytes[0], err_bytes[1], err_bytes[2], err_bytes[3]]);
-        assert_eq!(err, LINUX_ECONNRESET.get(), "SO_ERROR must be ECONNRESET");
-
-        // Second SO_ERROR reads 0
+        // SO_ERROR after the reported reset reads 0
         g.mem.write_bytes(optlen, &4u32.to_ne_bytes()).unwrap();
         assert_eq!(
             g.ok(

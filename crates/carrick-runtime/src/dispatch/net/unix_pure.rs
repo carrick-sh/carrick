@@ -537,6 +537,12 @@ impl PureSocketInner {
         rights: Vec<Arc<OpenFile>>,
     ) -> Result<usize, LinuxErrno> {
         let mut state = self.state.lock();
+        // A pending socket error is reported once, by whichever of `send`,
+        // `recv` or `SO_ERROR` asks first; after that a send on the dead
+        // connection is EPIPE.
+        if let Some(err) = state.so_error.take() {
+            return Err(LinuxErrno::new(err));
+        }
         if state.shutdown_write {
             return Err(LINUX_EPIPE);
         }
@@ -639,6 +645,13 @@ impl PureSocketInner {
         }
 
         if state.stream_buf.is_empty() {
+            // Linux reports a pending socket error (a reset while the
+            // connection sat in a closed listener's queue) from the first
+            // `recv` that finds no data, before EOF; the error is consumed by
+            // that report, exactly like `SO_ERROR`, so the next call sees EOF.
+            if let Some(err) = state.so_error.take() {
+                return Err(LinuxErrno::new(err));
+            }
             if state.mock_service.is_some() {
                 if state.mock_peer_closed {
                     return Ok((0, Vec::new()));
@@ -1074,6 +1087,45 @@ mod tests {
         assert_eq!(
             read_eof, 0,
             "subsequent read after draining buffer must return 0 (EOF)"
+        );
+    }
+
+    #[test]
+    fn inet_stream_reset_is_reported_once_by_recv_then_eof_and_epipe() {
+        let (client, server) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        // The listener closed with this connection still queued: the server
+        // half is torn down and the client carries ECONNRESET.
+        client.set_so_error(carrick_abi::LINUX_ECONNRESET.get());
+        server.shutdown(LINUX_SHUT_RDWR).unwrap();
+
+        let mask = client.poll_mask();
+        assert_eq!(
+            mask & LINUX_EPOLLERR,
+            LINUX_EPOLLERR,
+            "pending error polls ERR"
+        );
+
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            client.recv_stream(&mut buf, 0).unwrap_err(),
+            carrick_abi::LINUX_ECONNRESET,
+            "the first recv reports the pending error"
+        );
+        assert_eq!(
+            client.recv_stream(&mut buf, 0).unwrap().0,
+            0,
+            "the error is consumed; the next recv is EOF"
+        );
+        assert_eq!(
+            client.send_stream(b"x", Vec::new()).unwrap_err(),
+            LINUX_EPIPE,
+            "a send after the reported reset is EPIPE"
         );
     }
 
