@@ -850,3 +850,47 @@ commits and is re-checked at the next vet.
 - 2026-09-12 18:45, `just ci` GREEN on main 53054ebc9 (fmt, clippy,
   lint-domains, deny, check-matrix, check, doc, test, test-integration) —
   first full local gate pass since the doc links broke in the splits.
+- 2026-09-12 20:10, `hostfs-opens` round 2 reviewed and accepted (fchmodat
+  mode fidelity, per-directory marker tracking, `mkdir_under_parent`,
+  dirfd reuse) with two director fixes on the branch: rename/hard link
+  propagate the per-directory marker stamp (3956f9c2f, red-first
+  `moved_marker_node_keeps_the_destination_directory_interference_tracked`)
+  and the `set_mode` fast path guards on `serves_plain_metadata` instead of
+  the metadata flag alone (54fe48770): the branch gate read
+  `arm64:musl:bindunixnode` `chmod_bits_600=false` because socket/device
+  marker nodes carry their mode xattr under the marker-nodes root flag, so
+  chmod(0600) on a bound AF_UNIX node returned early and stat kept the
+  bind-time mode. Red-first
+  `chmod_on_a_socket_marker_node_replaces_its_creation_mode`; probe re-run
+  on the rebuilt branch binary 31a452d593dd7e6c reads `true`.
+- 2026-09-12 20:20–21:15, the same branch gate then died in shard 1 on
+  `forkexecstorm` with the mm-authority teardown abort. Post-mortem first
+  (fatal-hold core `fes2/fes2-2-8`, then LIVE captures with `carrick debug
+  lldb-run --deadline-seconds 6` eight-way, where only a hung run leaves a
+  dump): the storm never got past its FIRST vfork (`total_attempted=2,
+  total_spawned=0`), the probe's supervisor SIGKILLed the group, and the
+  teardown abort was the masking symptom. Two defects, both on main:
+  - `fes2/ref`: the fork LOSER spun forever in `prepare_in_process_fork`
+    (executor 9 in `subscribe_quiesce`) because c40654c00's "Ready when
+    the flag is low" made the loser's `Ready => continue` loop never park
+    while the winner held the fork token with the flag still low — a
+    regression introduced by this morning's vfork-child fix. Fixed
+    3dbd77c72: `QuiesceBarrier::subscribe_fork_release` (predicate = the
+    fork TOKEN, which `end_fork` publishes); red-first
+    `fork_loser_subscription_parks_until_end_fork_even_while_not_quiescing`
+    + source-shape test. 47/48 eight-way after it.
+  - `fes3cap/cap-{1-7,3-6,4-3,6-1}`: with every executor idle, the fork
+    WINNER had parked on the kernel RESERVATION epoch after
+    `try_close_for_fork` yielded to an in-flight thread-clone permit; a
+    clone that backs off (task busy / publication busy) publishes only the
+    clone-ADMISSION epoch. Fixed 36ae60e53: `ForkCloseAttempt::
+    PermitsInFlight { observed_epoch }` read under the gate lock and
+    `clone_admission.subscribe_change`; red-first
+    `fork_close_behind_a_thread_clone_permit_wakes_on_that_permits_release`
+    + source-shape test. Receipt on c54325cc70b4a47f: forkexecstorm
+    eight-way ×6 = 48/48 (was 4 hung of 48 on the previous main).
+  Lesson recorded in memory: a fix that changes a shared primitive's
+  predicate must audit every caller's loop; a lost-wakeup fix is proven
+  only by a capture with all executors idle.
+- 2026-09-12 21:20, probe gate on main c54325cc70b4a47f (36ae60e53, both
+  fork-barrier fixes): 46/46, no DIFF. `hostfs-opens` lands on top next.
