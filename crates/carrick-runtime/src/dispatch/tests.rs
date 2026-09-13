@@ -7545,8 +7545,10 @@ mod inzone_tcp {
     const POLLPRI: i16 = 2;
 
     const SYS_CLOSE: u64 = 57;
+    const SYS_PIPE2: u64 = 59;
     const SYS_READ: u64 = 63;
     const SYS_WRITE: u64 = 64;
+    const SYS_SPLICE: u64 = 76;
     const SYS_SOCKET: u64 = 198;
     const SYS_BIND: u64 = 200;
     const SYS_LISTEN: u64 = 201;
@@ -8072,6 +8074,95 @@ mod inzone_tcp {
             0,
             "epoll_ready_events must clear EPOLLPRI after OOB read"
         );
+    }
+
+    #[test]
+    fn tcp_splice_socket_to_pipe_and_pipe_to_socket() {
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        let server_fd = g.ok(
+            SYS_ACCEPT,
+            [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+        ) as i32;
+        assert!(server_fd >= 3);
+
+        let pipe_scratch = DATA_SCRATCH + 0x100;
+        assert_eq!(
+            g.ok(SYS_PIPE2, [pipe_scratch, 0, 0, 0, 0, 0]),
+            0
+        );
+        let pipe_fds = g.mem.read_bytes(pipe_scratch, 8).unwrap();
+        let pipe_r = i32::from_ne_bytes([pipe_fds[0], pipe_fds[1], pipe_fds[2], pipe_fds[3]]);
+        let pipe_w = i32::from_ne_bytes([pipe_fds[4], pipe_fds[5], pipe_fds[6], pipe_fds[7]]);
+
+        // Server writes to socket
+        g.mem.write_bytes(DATA_SCRATCH, b"spliced-data").unwrap();
+        assert_eq!(
+            g.ok(SYS_WRITE, [server_fd as u64, DATA_SCRATCH, 12, 0, 0, 0]),
+            12
+        );
+
+        // Splice from client_fd into pipe_w
+        assert_eq!(
+            g.ok(
+                SYS_SPLICE,
+                [client_fd as u64, 0, pipe_w as u64, 0, 12, 0],
+            ),
+            12
+        );
+
+        // Splice from pipe_r into server_fd
+        assert_eq!(
+            g.ok(
+                SYS_SPLICE,
+                [pipe_r as u64, 0, server_fd as u64, 0, 12, 0],
+            ),
+            12
+        );
+
+        // Client reads back what was spliced into server_fd
+        let recv_scratch = DATA_SCRATCH + 0x50;
+        assert_eq!(
+            g.ok(SYS_READ, [client_fd as u64, recv_scratch, 12, 0, 0, 0]),
+            12
+        );
+        let read_back = g.mem.read_bytes(recv_scratch, 12).unwrap();
+        assert_eq!(read_back, b"spliced-data");
     }
 }
 

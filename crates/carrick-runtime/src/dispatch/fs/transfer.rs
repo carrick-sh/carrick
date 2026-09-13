@@ -11,7 +11,9 @@ use super::LinuxSpliceFlags;
 use super::pipe::{PipeDrain, take_pipe_bytes, wait_for_pipe_readable};
 use super::*;
 use crate::dispatch::fd_table::{HostFdRef, HostWriteKind, is_anon_overlay_path};
-use crate::dispatch::{HostPipeWriteTarget, WaitFdAuthority, write_host_pipe_owned};
+use crate::dispatch::{
+    FdWaitCompletion, HostPipeWriteTarget, WaitFdAuthority, WaitFds, write_host_pipe_owned,
+};
 use crate::linux_abi::{
     LINUX_EAGAIN, LINUX_EBADF, LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EPIPE,
     LINUX_O_ACCMODE, LINUX_O_RDONLY, LINUX_O_WRONLY, LinuxOpenFlags,
@@ -1340,6 +1342,100 @@ impl<'a> FsView<'a> {
             if let Some(open_file) = this.open_file(in_fd.0)
                 && let Some(open) = open_file.description.read()
             {
+                if let OpenDescription::InMemorySocket { socket, .. } = &*open {
+                    let socket = Arc::clone(socket);
+                    drop(open);
+
+                    if off_in_address != 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    if socket.socket_type != carrick_abi::LINUX_SOCK_STREAM {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    if let Some(errno) = this.splice_output_errno(out_fd.0) {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    if off_out_address == 0
+                        && splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
+                        && let Some((pipe_read_fd, room)) =
+                            this.host_pipe_splice_staging_target(out_fd.0)
+                    {
+                        if room == 0 {
+                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                        }
+                        let want = count.min(room).min(1 << 20);
+                        let mut buf = vec![0u8; want];
+                        match socket.recv_stream(&mut buf, 0) {
+                            Ok((0, _)) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                            Ok((n, _)) => {
+                                buf.truncate(n);
+                                let consumed = buf.len();
+                                this.stage_splice_pipe_bytes_owned(pipe_read_fd, buf);
+                                this.notify_inmem_epoll();
+                                return Ok(DispatchOutcome::returned_len_or_errno(consumed));
+                            }
+                            Err(e) if e == LINUX_ENOTCONN || e == LINUX_EOPNOTSUPP => {
+                                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                            }
+                            Err(e) => return Ok(DispatchOutcome::errno(e)),
+                        }
+                    }
+
+                    // PEEK first, then consume EXACTLY what the destination accepts.
+                    let want = count.min(1 << 20);
+                    let mut buf = vec![0u8; want];
+                    match socket.recv_stream_flags(&mut buf, 0, true) {
+                        Ok((0, _)) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                        Ok((n, _)) => {
+                            buf.truncate(n);
+                            let outcome = this.splice_write_out(
+                                out_fd.0,
+                                off_out_address,
+                                &buf,
+                                cx.memory,
+                                tid,
+                                out_nonblocking,
+                            );
+                            let DispatchOutcome::Returned { value } = outcome else {
+                                return Ok(complete_wait(outcome));
+                            };
+                            let written = usize::try_from(value).unwrap_or(0);
+                            if written > 0 {
+                                let mut drain_buf = vec![0u8; written];
+                                let _ = socket.recv_stream(&mut drain_buf, 0);
+                                this.notify_inmem_epoll();
+                            }
+                            return Ok(DispatchOutcome::returned_len_or_errno(written));
+                        }
+                        Err(e) if e == LINUX_ENOTCONN || e == LINUX_EOPNOTSUPP => {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        Err(e) if e == LINUX_EAGAIN => {
+                            let in_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
+                                || this.fd_is_nonblocking(in_fd.0);
+                            if in_nonblocking {
+                                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                            }
+                            let files = this.captured_file_table();
+                            let fds = match WaitFds::raw_one(-1, 0)
+                                .with_redispatch_and_watched_slots(&files, [in_fd.0], [in_fd.0])
+                            {
+                                Ok(fds) => fds,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            return Ok(complete_wait(DispatchOutcome::WaitOnFds {
+                                fds,
+                                timeout: None,
+                                sig_mask: carrick_abi::WaitSigMask::NONE,
+                                completion: FdWaitCompletion::Fd {
+                                    on_timeout: LINUX_EAGAIN.guest_retval(),
+                                },
+                            }));
+                        }
+                        Err(e) => return Ok(DispatchOutcome::errno(e)),
+                    }
+                }
+
                 if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
                     let kind = *kind;
                     drop(open);
