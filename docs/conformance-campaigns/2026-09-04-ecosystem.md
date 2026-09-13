@@ -3698,3 +3698,18 @@ forkexecstorm eight-way ×6 = 48/48 on c54325cc70b4a47f (4 hung of 48
 before); probe gate 46/46 on c54325cc70b4a47f and on the merged main
 67e536aace35f82e. Paired scorecard (`measure-sep12d.sh`, candidate
 67e536aace35f82e vs base 3c8dbee5b686c49d) running; table follows.
+
+Paired scorecard (`measure-sep12d.sh` under zsh, candidate 67e536aace35f82e
+vs base 3c8dbee5b686c49d, 40/40 MATCH, wall seconds):
+
+| row | base w4 | cand w4 | cand/base | base w1 | cand w1 |
+|---|---|---|---|---|---|
+| cpython-compile | 6.53 | 3.12 | 0.47 | 4.95 | 2.22 |
+| cpython-tarfile | 5.14 | 3.07 | 0.60 | 4.69 | 2.73 |
+| cpython-importlib | 3.70 | 2.57 | 0.69 | 2.18 | 1.88 |
+| cpython-multiprocessing_main_handling | 3.73 | 3.16 | 0.83 | 2.61 | 2.17 |
+| go-net_http | 3.69 | 3.44 | 0.95 | 3.74 | 3.80 |
+
+Against the 17:15 table: tarfile 0.68 → 0.60 (hostfs-opens), compile 0.55
+→ 0.47, importlib 0.82 → 0.69; multiprocessing (0.83) and go-net_http
+(0.95) barely move — the fork/exec and socket lanes are the next profiles.
