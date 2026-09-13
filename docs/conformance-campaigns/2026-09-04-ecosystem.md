@@ -3713,3 +3713,27 @@ vs base 3c8dbee5b686c49d, 40/40 MATCH, wall seconds):
 Against the 17:15 table: tarfile 0.68 → 0.60 (hostfs-opens), compile 0.55
 → 0.47, importlib 0.82 → 0.69; multiprocessing (0.83) and go-net_http
 (0.95) barely move — the fork/exec and socket lanes are the next profiles.
+
+Ratio to Docker on this pin (median, seconds): go-net_http 4.10 → 14.09 at
+w4 (3.44x) / 15.56 at w1 (3.80x); cpython-multiprocessing 2.89 → 9.14
+(3.16x) / 6.28 (2.17x); cpython-compile 2.68 → 8.34 (3.12x) / 5.94 (2.22x);
+cpython-tarfile 4.76 → 14.61 (3.07x) / 12.98 (2.73x); cpython-importlib
+2.69 → 6.89 (2.57x) / 5.05 (1.88x, under the bar at one worker).
+
+Carrier user-CPU profiles on this pin (`target/perf/perf2x-sep12/prof-mpnh`,
+`prof.sh`, two runs each, w4):
+- multiprocessing: 78% of carrier user CPU is guest execution (`hv_trap`
+  leaf); named runtime work is openat 4.9% (dentry `fast_open` behind a
+  `lock_slow` convoy), frame COW 5.7%, detached retirement 2.6%. The row is
+  guest-bound: its 3.16x is VM execution cost, not runtime work.
+- go-net_http: guest 33%; executor-boundary REGISTER TRAFFIC ~30%
+  (`snapshot_vcpu_from` 21.4% inclusive with `hv_vcpu_get_reg` 12.5% and
+  `hv_vcpu_get_simd_fp_reg` 8.9%; `restore_vcpu_into` 8.3%;
+  `get_if_owning_thread` 27.7% under all of them), `__ulock_wait2` 16.7%,
+  host `poll` 14.8%, `epoll_pwait` 9.8%. Every quantum boundary reads 31
+  GPRs + 32 SIMD + ~20 sysregs through one hypervisor call each and writes
+  them all back on the next claim, on a workload that blocks and wakes in
+  futex constantly. Brief `vcpu-lazy-state.md` (worker
+  `vcpu-lazy-state-sep12`): residency-keyed lazy save/restore — snapshot only
+  when the vCPU loads a different thread, overlay only when the thread lands
+  elsewhere, one typed accessor materializes for every register consumer.
