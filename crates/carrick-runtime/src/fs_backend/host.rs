@@ -6842,24 +6842,33 @@ pub(crate) fn read_host_dir_entries(
             }
         }
     }
-    // SAFETY: dup a descriptor for DIR* to adopt without closing the caller's
-    // descriptor. The open-description seek offset remains shared.
-    let dup = unsafe { libc::dup(host_dir_fd) };
-    if dup < 0 {
+    // A NEW open-file description for the DIR* to adopt: `dup` would share
+    // the caller's seek offset, and the caller's fd may itself be a cache-hit
+    // dup shared with every other listing of this directory. Two guest
+    // processes enumerating one directory at once then advanced ONE offset
+    // and each saw a subset (a spawned interpreter lost `_struct` from
+    // `lib-dynload`, 2026-09-13). `openat(fd, ".")` re-opens the same inode
+    // (containment unchanged) with its own offset at zero.
+    let own = unsafe {
+        host_openat!(
+            host_dir_fd,
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0
+        )
+    };
+    if own < 0 {
         return None;
     }
-    let raw_dirp = unsafe { libc::fdopendir(dup) };
+    let raw_dirp = unsafe { libc::fdopendir(own) };
     if raw_dirp.is_null() {
         // SAFETY: fdopendir did not adopt the fd, so it is still ours.
         unsafe {
-            libc::close(dup);
+            libc::close(own);
         }
         return None;
     }
     let dirp = Dirp(raw_dirp);
-    // fdopendir adopts the fd's CURRENT offset; the dup shares the
-    // original's, so rewind to read the whole directory.
-    unsafe { libc::rewinddir(dirp.0) };
 
     let dir_has_markers = fget_u32_xattr(host_dir_fd, CARRICK_DIR_HAS_MARKERS_XATTR).is_some();
     let mut dir_path_buf = [0u8; libc::PATH_MAX as usize];
@@ -6959,8 +6968,10 @@ pub(crate) fn read_host_dir_entries(
                         libc::AT_SYMLINK_NOFOLLOW,
                     )
                 };
+                // A stream that cannot classify an entry must not DROP it:
+                // the layered path answers the whole directory exactly.
                 if rc != 0 {
-                    continue;
+                    return None;
                 }
                 match st.st_mode as u32 & libc::S_IFMT as u32 {
                     s if s == libc::S_IFDIR as u32 => RootFsEntryKind::Directory,
@@ -6969,7 +6980,7 @@ pub(crate) fn read_host_dir_entries(
                     s if s == libc::S_IFIFO as u32 => RootFsEntryKind::Fifo,
                     s if s == libc::S_IFSOCK as u32 => RootFsEntryKind::Socket,
                     s if s == libc::S_IFCHR as u32 => RootFsEntryKind::CharDevice,
-                    _ => continue,
+                    _ => return None,
                 }
             }
             // DT_BLK / anything else: the stream cannot answer
