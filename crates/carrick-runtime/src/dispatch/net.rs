@@ -303,6 +303,12 @@ pub(super) struct HostPollTarget {
     pub(super) host_fd: i32,
     pub(super) host_events: i16,
     pub(super) readiness_pipe: bool,
+    /// The host fd is only a WAKE source: the guest-visible events come from
+    /// `poll_ready_events` on every probe, not from the host `poll(0)` bits.
+    /// A listening socket that also owns an in-zone accept queue is the case:
+    /// a connection paired in-zone never touches the host listen socket, so
+    /// the host answer alone would report the listener idle until timeout.
+    pub(super) sample_description: bool,
 }
 
 impl<'a> NetView<'a> {
@@ -556,6 +562,7 @@ impl<'a> NetView<'a> {
                 host_fd,
                 host_events: events,
                 readiness_pipe: false,
+                sample_description: false,
             })
         };
         let readiness = |host_fd: i32| {
@@ -563,6 +570,7 @@ impl<'a> NetView<'a> {
                 host_fd,
                 host_events: libc::POLLIN,
                 readiness_pipe: true,
+                sample_description: false,
             })
         };
         if let Some(open_file) = self.open_file(fd) {
@@ -598,6 +606,8 @@ impl<'a> NetView<'a> {
                             host_fd: host_fd.raw(),
                             host_events,
                             readiness_pipe: false,
+                            sample_description: base.listening()
+                                && base.inzone_listener().is_some(),
                         })
                     }
                 }
@@ -2907,6 +2917,8 @@ impl<'a> NetView<'a> {
                         } else {
                             0
                         }
+                    } else if host_fds[i].sample_description {
+                        this.poll_ready_events(owners[i].0, events_list[i])
                     } else {
                         p.revents
                     };
@@ -3196,18 +3208,24 @@ impl<'a> NetView<'a> {
             // Map guest fds → host fds where possible. Fast path requires
             // every fd be host-backed (stdio bare, HostPipe, HostSocket) or
             // reachable through a readiness pipe; see `host_poll_target`.
-            let host_fds: Option<Vec<(i32, i16, bool)>> = fds
+            let host_fds: Option<Vec<(i32, i16, bool, bool)>> = fds
                 .iter()
                 .map(|p| {
-                    this.host_poll_target(p.fd, p.events)
-                        .map(|t| (t.host_fd, t.host_events, t.readiness_pipe))
+                    this.host_poll_target(p.fd, p.events).map(|t| {
+                        (
+                            t.host_fd,
+                            t.host_events,
+                            t.readiness_pipe,
+                            t.sample_description,
+                        )
+                    })
                 })
                 .collect();
             if let Some(host_fds) = host_fds {
                 let mut sys_pollfds: Vec<libc::pollfd> = fds
                     .iter()
                     .zip(host_fds.iter())
-                    .map(|(_, (hf, events, _))| libc::pollfd {
+                    .map(|(_, (hf, events, _, _))| libc::pollfd {
                         fd: *hf,
                         events: *events,
                         revents: 0,
@@ -3231,13 +3249,15 @@ impl<'a> NetView<'a> {
                 let mut ready = 0i64;
                 for (i, p) in sys_pollfds.iter().enumerate() {
                     let mut pollfd = fds[i];
-                    let (_, _, is_readiness_pipe) = host_fds[i];
+                    let (_, _, is_readiness_pipe, sample_description) = host_fds[i];
                     if is_readiness_pipe {
                         if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                             pollfd.revents = this.poll_ready_events(pollfd.fd, pollfd.events);
                         } else {
                             pollfd.revents = 0;
                         }
+                    } else if sample_description {
+                        pollfd.revents = this.poll_ready_events(pollfd.fd, pollfd.events);
                     } else {
                         pollfd.revents = p.revents;
                     }
