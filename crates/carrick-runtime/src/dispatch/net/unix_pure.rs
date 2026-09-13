@@ -20,8 +20,8 @@ use crate::dispatch::OpenFile;
 use crate::linux_abi::{
     LINUX_AF_UNIX, LINUX_EADDRINUSE, LINUX_EAGAIN, LINUX_ECONNREFUSED, LINUX_EDESTADDRREQ,
     LINUX_EINVAL, LINUX_ENOTCONN, LINUX_EOPNOTSUPP, LINUX_EPIPE, LINUX_EPOLLERR, LINUX_EPOLLHUP,
-    LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_EPOLLRDHUP, LINUX_SOCK_DGRAM, LINUX_SOCK_SEQPACKET,
-    LINUX_SOCK_STREAM, LinuxErrno,
+    LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_EPOLLRDHUP, LINUX_SOCK_DGRAM,
+    LINUX_SOCK_SEQPACKET, LINUX_SOCK_STREAM, LinuxErrno,
 };
 use crate::network::interposer::{ConnectionRecordState, MockService};
 
@@ -89,6 +89,8 @@ pub(crate) struct PureSocketState {
     pub tcp_keepintvl: i32,
     pub tcp_keepcnt: i32,
     pub so_linger: (i32, i32),
+    pub oob_data: Option<u8>,
+    pub so_oobinline: bool,
     pub mock_service: Option<Arc<dyn MockService>>,
     pub mock_peer_closed: bool,
     pub connection_record: Option<Arc<Mutex<ConnectionRecordState>>>,
@@ -166,6 +168,8 @@ impl PureSocketInner {
                 tcp_keepintvl: 75,
                 tcp_keepcnt: 9,
                 so_linger: (0, 0),
+                oob_data: None,
+                so_oobinline: false,
                 mock_service: None,
                 mock_peer_closed: false,
                 connection_record: None,
@@ -218,6 +222,8 @@ impl PureSocketInner {
                 tcp_keepintvl: 75,
                 tcp_keepcnt: 9,
                 so_linger: (0, 0),
+                oob_data: None,
+                so_oobinline: false,
                 mock_service: Some(mock),
                 mock_peer_closed: false,
                 connection_record: record,
@@ -825,6 +831,93 @@ impl PureSocketInner {
         Ok(())
     }
 
+    pub(crate) fn so_oobinline(&self) -> bool {
+        self.state.lock().so_oobinline
+    }
+
+    pub(crate) fn set_so_oobinline(&self, inline: bool) {
+        let mut state = self.state.lock();
+        state.so_oobinline = inline;
+    }
+
+    pub(crate) fn send_oob(&self, data: &[u8]) -> Result<usize, LinuxErrno> {
+        if data.is_empty() {
+            return Err(LINUX_EINVAL);
+        }
+        let mut state = self.state.lock();
+        if let Some(err) = state.so_error.take() {
+            return Err(LinuxErrno::new(err));
+        }
+        if state.shutdown_write {
+            return Err(LINUX_EPIPE);
+        }
+        let send_cap = state.so_sndbuf;
+        let peer_arc = {
+            let Some(peer_weak) = &state.peer else {
+                return Err(LINUX_ENOTCONN);
+            };
+            let Some(peer) = peer_weak.upgrade() else {
+                return Err(LINUX_EPIPE);
+            };
+            peer
+        };
+        drop(state);
+
+        let mut peer_state = peer_arc.state.lock();
+        if peer_state.shutdown_read {
+            return Err(LINUX_EPIPE);
+        }
+
+        let urgent_byte = data[data.len() - 1];
+        let stream_part = &data[..data.len() - 1];
+
+        if peer_state.so_oobinline {
+            let available = send_cap.saturating_sub(peer_state.stream_buf.len());
+            if available == 0 && !data.is_empty() {
+                return Err(LINUX_EAGAIN);
+            }
+            let to_write = data.len().min(available);
+            peer_state.stream_buf.extend(&data[..to_write]);
+            drop(peer_state);
+            peer_arc.notify_waiters();
+            Ok(to_write)
+        } else {
+            if !stream_part.is_empty() {
+                let available = send_cap.saturating_sub(peer_state.stream_buf.len());
+                let to_write = stream_part.len().min(available);
+                peer_state.stream_buf.extend(&stream_part[..to_write]);
+            }
+            peer_state.oob_data = Some(urgent_byte);
+            drop(peer_state);
+            peer_arc.notify_waiters();
+            Ok(data.len())
+        }
+    }
+
+    pub(crate) fn recv_oob(&self, buf: &mut [u8], peek: bool) -> Result<usize, LinuxErrno> {
+        let mut state = self.state.lock();
+        if let Some(err) = state.so_error.take() {
+            return Err(LinuxErrno::new(err));
+        }
+        if state.so_oobinline {
+            return Err(LINUX_EINVAL);
+        }
+        let Some(byte) = (if peek {
+            state.oob_data
+        } else {
+            state.oob_data.take()
+        }) else {
+            return Err(LINUX_EINVAL);
+        };
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        buf[0] = byte;
+        drop(state);
+        self.notify_waiters();
+        Ok(1)
+    }
+
     pub(crate) fn poll_mask(&self) -> u32 {
         // Readiness of a stream half depends on the peer's state as well, so
         // both halves are locked in the global pair order (never "self, then
@@ -878,6 +971,9 @@ impl PureSocketInner {
             }
             if peer_dropped || (peer_shut_wr && peer_shut_rd) {
                 mask |= LINUX_EPOLLHUP;
+            }
+            if state.oob_data.is_some() {
+                mask |= LINUX_EPOLLPRI;
             }
         } else {
             if !state.dgram_queue.is_empty() {
@@ -1267,5 +1363,40 @@ mod tests {
             "draining buffer must restore EPOLLOUT"
         );
         assert_eq!(s1.send_stream(b"more", Vec::new()).unwrap(), 4);
+    }
+
+    #[test]
+    fn inet_stream_oob_urgent_data_round_trip() {
+        let (s1, s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        // Initially no OOB data and not ready for EPOLLPRI
+        assert_eq!(s2.poll_mask() & LINUX_EPOLLPRI, 0);
+        let mut buf = [0u8; 1];
+        assert_eq!(s2.recv_oob(&mut buf, false), Err(LINUX_EINVAL));
+
+        // s1 sends 1 byte OOB
+        let sent = s1.send_oob(b"!").unwrap();
+        assert_eq!(sent, 1);
+
+        // s2 has EPOLLPRI asserted
+        assert_eq!(s2.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
+
+        // Peek does not consume
+        assert_eq!(s2.recv_oob(&mut buf, true), Ok(1));
+        assert_eq!(buf[0], b'!');
+        assert_eq!(s2.poll_mask() & LINUX_EPOLLPRI, LINUX_EPOLLPRI);
+
+        // Recv consumes
+        assert_eq!(s2.recv_oob(&mut buf, false), Ok(1));
+        assert_eq!(buf[0], b'!');
+        assert_eq!(s2.poll_mask() & LINUX_EPOLLPRI, 0);
+
+        // Subsequent recv without new OOB is EINVAL
+        assert_eq!(s2.recv_oob(&mut buf, false), Err(LINUX_EINVAL));
     }
 }

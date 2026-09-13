@@ -7538,9 +7538,11 @@ mod inzone_tcp {
     use super::*;
     use crate::compat::CompatReporter;
     use carrick_abi::{
-        LINUX_AF_INET, LINUX_ECONNRESET, LINUX_POLLIN, LINUX_SOCK_STREAM, LINUX_SOL_SOCKET,
-        LINUX_SO_ERROR,
+        LINUX_AF_INET, LINUX_ECONNRESET, LINUX_MSG_OOB, LINUX_POLLIN, LINUX_SOCK_STREAM,
+        LINUX_SOL_SOCKET, LINUX_SO_ERROR,
     };
+
+    const POLLPRI: i16 = 2;
 
     const SYS_CLOSE: u64 = 57;
     const SYS_READ: u64 = 63;
@@ -7817,7 +7819,7 @@ mod inzone_tcp {
     }
 
     /// A guest that blocks in `poll(2)` on its listener (the probe's case 2,
-    /// Go's `net/http` accept loop under a non-epoll runtime, any C server)
+    /// Go's `net/http` accept loop under poll(2), any C server)
     /// must see POLLIN for a connection that was paired in-zone. The all-host
     /// fast path of `ppoll` used to take readiness from the host `poll(0)`
     /// alone, which never learns about an in-memory pairing.
@@ -7963,8 +7965,113 @@ mod inzone_tcp {
             i32::from_ne_bytes([err_bytes2[0], err_bytes2[1], err_bytes2[2], err_bytes2[3]]);
         assert_eq!(err2, 0, "SO_ERROR second read must be 0");
     }
+
+    #[test]
+    fn tcp_oob_urgent_data_readiness_and_recv() {
+        const SYS_SENDTO: u64 = 206;
+        const SYS_RECVFROM: u64 = 207;
+
+        let mut g = InZoneGuest::new();
+        let listen_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+
+        g.make_sockaddr_in(ADDR_SCRATCH, 0, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_BIND, [listen_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            g.ok(SYS_LISTEN, [listen_fd as u64, 16, 0, 0, 0, 0]),
+            0
+        );
+
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+            ),
+            0
+        );
+        let (port, _) = g.read_sockaddr_in(ADDR_SCRATCH);
+
+        let client_fd = g.ok(
+            SYS_SOCKET,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        ) as i32;
+        g.make_sockaddr_in(ADDR_SCRATCH, port, [127, 0, 0, 1]);
+        assert_eq!(
+            g.ok(SYS_CONNECT, [client_fd as u64, ADDR_SCRATCH, 16, 0, 0, 0]),
+            0
+        );
+
+        g.mem.write_bytes(ADDRLEN_SCRATCH, &16u32.to_ne_bytes()).unwrap();
+        let server_fd = g.ok(
+            SYS_ACCEPT,
+            [listen_fd as u64, ADDR_SCRATCH, ADDRLEN_SCRATCH, 0, 0, 0],
+        ) as i32;
+        assert!(server_fd >= 3);
+
+        // Before OOB send: client not ready for POLLPRI / EPOLLPRI
+        assert_eq!(
+            g.dispatcher.poll_ready_events(client_fd, POLLPRI) & POLLPRI,
+            0
+        );
+        assert_eq!(
+            g.dispatcher.epoll_ready_events(client_fd, carrick_abi::LINUX_EPOLLPRI)
+                & carrick_abi::LINUX_EPOLLPRI,
+            0
+        );
+
+        // Server sends 1 byte with MSG_OOB
+        g.mem.write_bytes(DATA_SCRATCH, b"!").unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_SENDTO,
+                [server_fd as u64, DATA_SCRATCH, 1, LINUX_MSG_OOB as u64, 0, 0],
+            ),
+            1
+        );
+
+        // Client now reports POLLPRI and EPOLLPRI
+        assert_eq!(
+            g.dispatcher.poll_ready_events(client_fd, POLLPRI) & POLLPRI,
+            POLLPRI,
+            "poll_ready_events must report POLLPRI for pending OOB"
+        );
+        assert_eq!(
+            g.dispatcher.epoll_ready_events(client_fd, carrick_abi::LINUX_EPOLLPRI)
+                & carrick_abi::LINUX_EPOLLPRI,
+            carrick_abi::LINUX_EPOLLPRI,
+            "epoll_ready_events must report EPOLLPRI for pending OOB"
+        );
+
+        // Client reads OOB byte with recvfrom(MSG_OOB)
+        let recv_scratch = DATA_SCRATCH + 0x50;
+        assert_eq!(
+            g.ok(
+                SYS_RECVFROM,
+                [client_fd as u64, recv_scratch, 1, LINUX_MSG_OOB as u64, 0, 0],
+            ),
+            1
+        );
+        let read_back = g.mem.read_bytes(recv_scratch, 1).unwrap();
+        assert_eq!(read_back, b"!");
+
+        // After reading OOB byte, POLLPRI / EPOLLPRI are cleared
+        assert_eq!(
+            g.dispatcher.poll_ready_events(client_fd, POLLPRI) & POLLPRI,
+            0,
+            "poll_ready_events must clear POLLPRI after OOB read"
+        );
+        assert_eq!(
+            g.dispatcher.epoll_ready_events(client_fd, carrick_abi::LINUX_EPOLLPRI)
+                & carrick_abi::LINUX_EPOLLPRI,
+            0,
+            "epoll_ready_events must clear EPOLLPRI after OOB read"
+        );
+    }
 }
-
-
-
 

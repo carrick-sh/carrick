@@ -169,6 +169,17 @@ fn setsockopt_in_memory(
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
+            carrick_abi::LINUX_SO_OOBINLINE => {
+                if optlen < 4 {
+                    return DispatchOutcome::errno(LINUX_EINVAL);
+                }
+                let Ok(b) = memory.read_bytes(optval_addr, 4) else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                let val = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                socket.set_so_oobinline(val != 0);
+                DispatchOutcome::Returned { value: 0 }
+            }
             LINUX_SO_REUSEADDR | LINUX_SO_REUSEPORT | crate::linux_abi::LINUX_SO_PASSCRED => {
                 DispatchOutcome::Returned { value: 0 }
             }
@@ -311,6 +322,10 @@ fn getsockopt_in_memory<M: CurrentMmMemory>(
             }
             LINUX_SO_REUSEADDR | LINUX_SO_REUSEPORT => {
                 let val: i32 = 0;
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+            }
+            carrick_abi::LINUX_SO_OOBINLINE => {
+                let val: i32 = if socket.so_oobinline() { 1 } else { 0 };
                 write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
             }
             _ => {
