@@ -2666,6 +2666,14 @@
       "rationale": "Process-global configuration or failpoint cache exec_private_file_cache::CACHE in crates/carrick-vmm-hvf/src/trap.rs initialized from environment flags."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
+      "symbol": "ALIAS_ROWS_MOVED",
+      "fingerprint": "8ae7f3ad5c12a753b3b3b403f1e3f87169a7e25d685eb5000a247823a0726955",
+      "classification": "carrier_infra",
+      "rationale": "Host thread-local counter of rows visited by linear passes over the carrier-global alias/replay/version state, so an algorithmic-complexity regression is a TEST failure rather than a timing observation (retiring_one_owner_does_not_scan_foreign_alias_rows). Deliberately PER HOST THREAD and not process-global: a process-global counter is polluted by every other guest thread and by concurrently running tests, which made the same work report 1,539 rows under cargo test's default parallelism and 513 in isolation. It describes the measuring thread's own work and carries no Linux process semantics."
+    },
+    {
       "kind": "env_var_os",
       "file": "crates/carrick-vmm-hvf/src/trap/memory_protection/tests.rs",
       "symbol": "alias_registry_tests::scrub_run_remap_and_fallback::CARRICK_DSR_ZERO_REMAP",
@@ -2752,14 +2760,6 @@
       "fingerprint": "ab0b08b97611e117782a41f621e4ace1ab4d3cc389433a60a25ff4abe830222f",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static park_for_slot::GATE_MUTEX in crates/carrick-vmm-hvf/src/trap/vcpu_gate.rs maintaining host process lifecycle or VM resources."
-    },
-    {
-      "kind": "thread_local",
-      "file": "crates/carrick-vmm-hvf/src/trap/memory_protection.rs",
-      "symbol": "ALIAS_ROWS_MOVED",
-      "fingerprint": "8ae7f3ad5c12a753b3b3b403f1e3f87169a7e25d685eb5000a247823a0726955",
-      "classification": "carrier_infra",
-      "rationale": "Host thread-local counter of rows visited by linear passes over the carrier-global alias/replay/version state, so an algorithmic-complexity regression is a TEST failure rather than a timing observation (retiring_one_owner_does_not_scan_foreign_alias_rows). Deliberately PER HOST THREAD and not process-global: a process-global counter is polluted by every other guest thread and by concurrently running tests, which made the same work report 1,539 rows under cargo test's default parallelism and 513 in isolation. It describes the measuring thread's own work and carries no Linux process semantics."
     }
   ]
 }
