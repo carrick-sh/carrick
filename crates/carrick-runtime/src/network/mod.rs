@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub(crate) mod dns;
 pub mod interposer;
+pub mod inzone;
 pub(crate) mod model;
 pub mod socket_namespace;
 
@@ -69,6 +70,10 @@ pub enum ConnectTarget {
     Unchanged,
     Denied(LinuxErrno),
     Intercept(std::sync::Arc<dyn interposer::MockService>),
+    InZone {
+        listener: std::sync::Arc<inzone::InZoneListener>,
+        target: GuestSocketAddr,
+    },
 }
 
 impl PartialEq for ConnectTarget {
@@ -78,6 +83,16 @@ impl PartialEq for ConnectTarget {
             (Self::Unchanged, Self::Unchanged) => true,
             (Self::Denied(a), Self::Denied(b)) => a == b,
             (Self::Intercept(a), Self::Intercept(b)) => std::sync::Arc::ptr_eq(a, b),
+            (
+                Self::InZone {
+                    listener: l1,
+                    target: t1,
+                },
+                Self::InZone {
+                    listener: l2,
+                    target: t2,
+                },
+            ) => std::sync::Arc::ptr_eq(l1, l2) && t1 == t2,
             _ => false,
         }
     }
@@ -92,6 +107,11 @@ impl std::fmt::Debug for ConnectTarget {
             Self::Unchanged => write!(f, "Unchanged"),
             Self::Denied(errno) => f.debug_tuple("Denied").field(errno).finish(),
             Self::Intercept(_) => write!(f, "Intercept(<MockService>)"),
+            Self::InZone { listener, target } => f
+                .debug_struct("InZone")
+                .field("key", listener.key())
+                .field("target", target)
+                .finish(),
         }
     }
 }
@@ -118,13 +138,13 @@ impl NetworkForkGuard<'_> {
 
 /// Identifies ONE socket in the address registry.
 ///
-/// It is the **host** fd, deliberately, and it is a newtype so the domain
-/// cannot be confused again. The registry used to be keyed by the guest fd
-/// NUMBER, which is wrong in three independent ways: a guest fd number is
-/// meaningful only inside one Linux process (and under HVPatch every process
-/// shares this one registry), `dup`/`dup2` give one socket several numbers, and
-/// — decisively — nothing purged an entry on `close`, so a number handed back
-/// out by the kernel inherited the dead socket's address.
+/// It is either a host fd or an in-memory socket id, deliberately, and it is an
+/// enum/newtype so the domain cannot be confused again. The registry used to be
+/// keyed by the guest fd NUMBER, which is wrong in three independent ways: a
+/// guest fd number is meaningful only inside one Linux process (and under
+/// HVPatch every process shares this one registry), `dup`/`dup2` give one socket
+/// several numbers, and — decisively — nothing purged an entry on `close`, so a
+/// number handed back out by the kernel inherited the dead socket's address.
 ///
 /// glibc's `rfc3484_sort` does exactly that: it closes an `AF_INET` probe
 /// socket and immediately opens an `AF_INET6` one, which lands on the same fd
@@ -139,20 +159,31 @@ impl NetworkForkGuard<'_> {
 /// [`NetworkProvider::forget_socket_addresses`] must run when the last
 /// reference goes away.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SocketKey(i32);
+pub enum SocketKey {
+    HostFd(i32),
+    InMemory(u64),
+}
 
 impl SocketKey {
-    /// The ONLY constructor: name the domain at the call site.
+    /// Name the domain at the call site.
     pub fn for_host_fd(host_fd: i32) -> Self {
-        Self(host_fd)
+        Self::HostFd(host_fd)
+    }
+
+    pub fn for_in_memory(id: u64) -> Self {
+        Self::InMemory(id)
     }
 
     pub fn raw(self) -> i32 {
-        self.0
+        match self {
+            Self::HostFd(host_fd) => host_fd,
+            Self::InMemory(id) => id as i32,
+        }
     }
 }
 
 pub trait NetworkProvider: Send + Sync {
+    fn inzone(&self) -> &inzone::InZoneRegistry;
     fn capabilities(&self) -> NetworkCapabilities;
     /// Nonblocking provider fork exclusion. Returning `None` means the caller
     /// must retry until its absolute fork deadline; the default has no helper
@@ -239,9 +270,15 @@ pub trait NetworkProvider: Send + Sync {
 }
 
 #[derive(Debug, Default)]
-pub struct HostNetworkProvider;
+pub struct HostNetworkProvider {
+    inzone: inzone::InZoneRegistry,
+}
 
 impl NetworkProvider for HostNetworkProvider {
+    fn inzone(&self) -> &inzone::InZoneRegistry {
+        &self.inzone
+    }
+
     fn capabilities(&self) -> NetworkCapabilities {
         NetworkCapabilities {
             same_bridge_ip_connectivity: false,
@@ -289,18 +326,36 @@ impl NetworkProvider for HostNetworkProvider {
 
     fn resolve_connect(
         &self,
-        _namespace_id: Option<&NetworkNamespaceId>,
-        _requested: GuestSocketAddr,
-        _protocol: PortProtocol,
+        namespace_id: Option<&NetworkNamespaceId>,
+        requested: GuestSocketAddr,
+        protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
+        if protocol == PortProtocol::Tcp {
+            let scope = match namespace_id {
+                Some(id) => inzone::InZoneScope::Namespace(id.clone()),
+                None => inzone::InZoneScope::CarrierHost,
+            };
+            if let Some(listener) = self.inzone.resolve(&scope, requested) {
+                return Ok(ConnectTarget::InZone {
+                    listener,
+                    target: requested,
+                });
+            }
+        }
         Ok(ConnectTarget::Unchanged)
     }
 }
 
 #[derive(Debug, Default)]
-pub struct NoNetworkProvider;
+pub struct NoNetworkProvider {
+    inzone: inzone::InZoneRegistry,
+}
 
 impl NetworkProvider for NoNetworkProvider {
+    fn inzone(&self) -> &inzone::InZoneRegistry {
+        &self.inzone
+    }
+
     fn capabilities(&self) -> NetworkCapabilities {
         NetworkCapabilities {
             same_bridge_ip_connectivity: false,
@@ -348,10 +403,22 @@ impl NetworkProvider for NoNetworkProvider {
 
     fn resolve_connect(
         &self,
-        _namespace_id: Option<&NetworkNamespaceId>,
-        _requested: GuestSocketAddr,
-        _protocol: PortProtocol,
+        namespace_id: Option<&NetworkNamespaceId>,
+        requested: GuestSocketAddr,
+        protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
+        if protocol == PortProtocol::Tcp {
+            let scope = match namespace_id {
+                Some(id) => inzone::InZoneScope::Namespace(id.clone()),
+                None => inzone::InZoneScope::CarrierHost,
+            };
+            if let Some(listener) = self.inzone.resolve(&scope, requested) {
+                return Ok(ConnectTarget::InZone {
+                    listener,
+                    target: requested,
+                });
+            }
+        }
         Ok(ConnectTarget::Denied(carrick_abi::LINUX_ENETUNREACH))
     }
 }
@@ -485,7 +552,7 @@ impl RuntimeNetwork {
     }
 
     pub fn with_interposer(mut self, interposer: NetworkInterposer) -> Self {
-        let prev = std::mem::replace(&mut self.provider, Box::new(HostNetworkProvider));
+        let prev = std::mem::replace(&mut self.provider, Box::<HostNetworkProvider>::default());
         self.provider = Box::new(interposer.with_inner(prev));
         self
     }
