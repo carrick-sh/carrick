@@ -6,9 +6,9 @@
 use super::*;
 use crate::linux_abi::LINUX_TIOCSIG;
 
+/// `SIOCOUTQ` (`TIOCOUTQ`): unsent bytes queued on a stream socket. `SIOCINQ`
+/// is the same number as `FIONREAD` and shares that arm.
 pub const LINUX_SIOCOUTQ: u64 = 0x5411;
-#[allow(dead_code)]
-pub const LINUX_SIOCINQ: u64 = LINUX_FIONREAD;
 
 pub(crate) fn resolve_tiocspgrp(
     context: &crate::kernel::KernelContext,
@@ -1687,26 +1687,6 @@ mod tests {
             i32::from_le_bytes(bytes.try_into().unwrap()),
             15,
             "FIONREAD on receiver must report queued bytes"
-        );
-
-        // SIOCINQ on fd2 should also report 15 bytes (SIOCINQ == FIONREAD)
-        let out = dispatcher
-            .dispatch(
-                &context,
-                SyscallRequest::new(
-                    29,
-                    SyscallArgs::from([fd2 as u64, LINUX_SIOCINQ, base, 0, 0, 0]),
-                ),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap();
-        assert_eq!(out, DispatchOutcome::Returned { value: 0 });
-        let bytes = memory.read_bytes(base, 4).unwrap();
-        assert_eq!(
-            i32::from_le_bytes(bytes.try_into().unwrap()),
-            15,
-            "SIOCINQ on receiver must report queued bytes"
         );
 
         // SIOCOUTQ on fd1 (sender) should report 15 unsent/unacknowledged bytes
