@@ -792,15 +792,16 @@ fn marker_nodes_flip_dir_overlay_interference() {
     b.create_fifo("/walk/pipe", 0o644).unwrap();
     assert!(!b.dir_has_overlay_interference("/walk"));
     // A socket MARKER node (regular file whose guest type lives in an
-    // xattr) must disable streaming everywhere, durably.
+    // xattr) must disable streaming for that directory, durably.
     b.create_socket("/walk/sock", 0o755).unwrap();
     assert!(b.dir_has_overlay_interference("/walk"));
-    assert!(b.dir_has_overlay_interference("/elsewhere"));
+    assert!(!b.dir_has_overlay_interference("/elsewhere"));
     // ... including for a SIBLING backend on the same scratch (the
-    // fork-coherence property: the truth is the root xattr, not the
+    // fork-coherence property: the truth is the directory xattr, not the
     // in-process bool).
     let reattached = HostFsBackend::attach(scratch.path()).unwrap();
     assert!(reattached.dir_has_overlay_interference("/walk"));
+    assert!(!reattached.dir_has_overlay_interference("/elsewhere"));
 }
 
 #[cfg(target_os = "macos")]
@@ -2638,6 +2639,44 @@ fn test_getdents64_2000_entries_host_openat_and_stat_budget() {
     assert_eq!(
         stats, 0,
         "getdents64 over 2,000-entry dir issued {stats} host stat calls when types are known (budget 0)"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_getdents64_marker_node_per_directory_interference_budget() {
+    let (backend, _scratch) = host_backend();
+
+    // Directory /a has a marker node (socket)
+    backend.make_dir("/a").unwrap();
+    backend.create_socket("/a/sock", 0o600).unwrap();
+
+    // Directory /b has 2,000 plain files
+    backend.make_dir("/b").unwrap();
+    for i in 0..2000 {
+        let p = format!("/b/f_{i:04}");
+        backend.create_file(&p).unwrap();
+    }
+
+    reset_test_host_openat_count();
+    reset_test_host_stat_count();
+
+    // getdents64 over /b via try_layered_stream_dirents with fallback
+    let entries = try_layered_stream_dirents(&backend, None, "/b")
+        .unwrap_or_else(|| layered_directory_entries(&backend, None, "/b").unwrap());
+
+    assert_eq!(entries.len(), 2000);
+
+    let opens = test_host_openat_count();
+    let stats = test_host_stat_count();
+
+    assert!(
+        opens <= 2,
+        "getdents64 over /b issued {opens} host openat calls (budget <= 2)"
+    );
+    assert_eq!(
+        stats, 0,
+        "getdents64 over /b issued {stats} host stat calls (budget 0)"
     );
 }
 
