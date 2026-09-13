@@ -709,6 +709,56 @@ impl QuiesceBarrier {
         })
     }
 
+    /// Park a LOSING forker until the current fork token holder finishes.
+    ///
+    /// The winner owns the token from [`Self::try_begin_fork`] to
+    /// [`Self::end_fork`] and raises `quiescing` only part-way through, so
+    /// "no quiesce in progress" says nothing about whether a fork is in
+    /// progress; a loser must wait on the TOKEN. `end_fork` lowers the flag
+    /// and then publishes `Released` under the publication lock, so reading
+    /// the flag under that same lock is exact: high means a release is still
+    /// coming and the listener will be consumed by it; low means the loser
+    /// must retry `try_begin_fork` now instead of parking.
+    pub fn subscribe_fork_release(
+        self: &Arc<Self>,
+        expected_generation: u64,
+        callback: QuiesceCallback,
+    ) -> QuiesceEnrollment {
+        #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
+        let mut publication = self.publication.lock().unwrap();
+        if publication.generation != expected_generation {
+            return QuiesceEnrollment::Ready(QuiesceEvent {
+                generation: publication.generation,
+                kind: publication.kind,
+            });
+        }
+        if !self.forking.load(Ordering::SeqCst) {
+            return QuiesceEnrollment::Ready(QuiesceEvent {
+                generation: publication.generation,
+                kind: QuiesceEventKind::Released,
+            });
+        }
+        let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
+        if id == 0 || id == u64::MAX {
+            carrick_fatal!(
+                "thread::fork_quiesce",
+                "fork release listener id exhausted or wrapped: id={id}"
+            );
+        }
+        publication.listeners.insert(
+            id,
+            QuiesceListener {
+                expected_generation,
+                callback,
+            },
+        );
+        QuiesceEnrollment::Subscribed(QuiesceSubscription {
+            barrier: Arc::downgrade(self),
+            id,
+            expected_generation,
+        })
+    }
+
     fn publish_quiesce_event(&self, kind: QuiesceEventKind) {
         let (event, callbacks) = {
             #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
@@ -1674,6 +1724,53 @@ mod tests {
             }
         }
         assert!(!fired.load(Ordering::SeqCst));
+    }
+
+    /// A LOSING forker waits for the fork TOKEN, not for a quiesce. The
+    /// winner holds the token from `try_begin_fork` until `end_fork` and
+    /// raises `quiescing` only part-way through; a loser that arrives in
+    /// between must park until `end_fork` publishes. `subscribe_quiesce`
+    /// answers `Ready(Released)` there (the flag IS low), which turned the
+    /// loser loop in `prepare_in_process_fork` into a busy spin that held
+    /// its executor and its clone reservation forever — the winner was
+    /// waiting for exactly that reservation to clear (forkexecstorm
+    /// `fes2/ref` capture, 2026-09-12).
+    #[test]
+    fn fork_loser_subscription_parks_until_end_fork_even_while_not_quiescing() {
+        let barrier = Arc::new(QuiesceBarrier::new());
+        assert!(barrier.try_begin_fork());
+        assert!(!barrier.is_quiescing());
+        let observed = barrier.publication_generation();
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_cb = Arc::clone(&fired);
+        let subscription = match barrier.subscribe_fork_release(
+            observed,
+            Arc::new(move |_| fired_cb.store(true, Ordering::SeqCst)),
+        ) {
+            QuiesceEnrollment::Subscribed(subscription) => subscription,
+            QuiesceEnrollment::Ready(_) => {
+                panic!("a loser must park while the fork token is held, quiescing or not")
+            }
+        };
+        // The quiesce-oriented subscription is Ready here: it is the wrong
+        // instrument for a token wait, which is the whole point.
+        assert!(matches!(
+            barrier.subscribe_quiesce(observed, Arc::new(|_| {})),
+            QuiesceEnrollment::Ready(_)
+        ));
+        assert!(!fired.load(Ordering::SeqCst));
+        barrier.end_fork();
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "end_fork must wake the parked loser"
+        );
+        drop(subscription);
+        // Token free: the loser must not park (it would wait for a release
+        // that is never coming).
+        assert!(matches!(
+            barrier.subscribe_fork_release(barrier.publication_generation(), Arc::new(|_| {})),
+            QuiesceEnrollment::Ready(_)
+        ));
     }
 
     #[test]
