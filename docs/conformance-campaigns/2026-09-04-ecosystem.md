@@ -3644,3 +3644,25 @@ Runnable state leaves a child unreaped). The base binary logs the same
 claim failure without hanging, so the candidate has raised the rate at
 which the leak turns into a hang; the `exec-sibling-settle` round-2 fix is
 being verified live on this row before anything else lands.
+
+## 2026-09-12 17:15 — paired scorecard on the fixed main (gate 46/46)
+
+Candidate d8fbd6a94562b880 (main e4e632c07: Tasks 5+6, fork-quiesce wake
+fix, sibling-drain survivor fix, alias lock-order fix) vs base
+3c8dbee5b686c49d; `measure-sep12c.sh`, same method. Probe gate on this
+binary: 46/46, no probe DIFF (first fully green gate of the day).
+
+| row | base w4 | cand w4 | cand/base | base w1 | cand w1 | verdicts |
+|---|---|---|---|---|---|---|
+| cpython-compile | 6.69 | 3.73 | 0.55 | 4.80 | 2.62 | 40/40 MATCH |
+| cpython-tarfile | 5.30 | 3.62 | 0.68 | 4.53 | 3.12 | |
+| cpython-importlib | 3.32 | 2.71 | 0.82 | 2.11 | 1.88 | |
+| cpython-multiprocessing_main_handling | 3.74 | 3.24 | 0.87 | 2.60 | 2.17 | |
+| go-net_http | 3.74 | 3.53 | 0.95 | 3.84 | 3.55 | |
+
+go-net_http holds at four workers (3/3 MATCH; 2/3 TIMEOUT on the 16:00
+candidate) — the two hang classes behind it (exec-teardown membership,
+alias lock order) are closed. Distance to the 2x bar at w4: compile 3.73,
+tarfile 3.62, net_http 3.53, multiprocessing 3.24, importlib 2.71; at w1
+importlib 1.88 (under), multiprocessing 2.17, compile 2.62. Next targets
+are compile and tarfile, from fresh profiles on this binary.
