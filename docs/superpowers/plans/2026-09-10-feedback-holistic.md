@@ -958,3 +958,14 @@ commits and is re-checked at the next vet.
   `agy-reactor-kqueue-sep13` from 6debb1639): one persistent kqueue per wait
   service, EV_ADD/EV_DELETE on the registration lifecycle, O(ready) cycles,
   guest epoll semantics untouched (kqueue = wake source only).
+- 2026-09-13 03:30, `reactor-kqueue-sep13` round 1 (904b48da2) REJECTED on
+  receipts: probe gate 46/46, but net_http `poll` 15% (main 9.1%), `close`
+  8.9% (main 1.7%), `kevent` 4.7%, and one of two harness runs took 353 s
+  (main 14–19 s). Diagnosis from the callers: the level-triggered entry
+  keeps firing for a published-but-still-armed registration, so the guest
+  re-enters `epoll_pwait` in a loop. Two design holes found in review as
+  well: kqueue identity is (fd, filter) so two registrations on one fd need a
+  fan-out map (a lost wakeup otherwise), and `EV_ERROR` events were treated
+  as readiness. Round 2 (fan-out, error filtering, missing gates) sent;
+  round 3 (`EV_ONESHOT` per enrollment, no double publish, spin test)
+  queued behind it.
