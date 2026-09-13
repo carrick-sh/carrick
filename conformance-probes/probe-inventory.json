@@ -854,6 +854,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "inzonetcp": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "ioctlcluster": {
     "class": "conformance",
     "excluded": false,
