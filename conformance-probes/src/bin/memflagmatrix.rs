@@ -13,11 +13,17 @@
 
 use conformance_probes::{errno, report, run_bounded_bool_child};
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 const MAP_FIXED_NOREPLACE: i32 = 0x100000;
 const MADV_WIPEONFORK: i32 = 18;
 const MADV_KEEPONFORK: i32 = 19;
 const MREMAP_DONTUNMAP: i32 = 4;
+const PARTIAL_DONTFORK_PAGES: usize = 12;
+const PARTIAL_DONTFORK_OBSERVATIONS: usize = 4;
+const PARTIAL_DONTFORK_EXTRA_OFFSET: usize = 2 + PARTIAL_DONTFORK_OBSERVATIONS * 3;
+const PARTIAL_DONTFORK_PACKET_WORDS: usize = PARTIAL_DONTFORK_EXTRA_OFFSET + 7;
+const PARTIAL_DONTFORK_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn page_size() -> usize {
     let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -74,6 +80,562 @@ unsafe fn run_in_child<F: FnOnce() -> bool>(f: F) -> bool {
         }
     }
     n == 1 && val[0] == 1 && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
+#[derive(Clone, Copy)]
+struct PartialDontforkChild {
+    pipe_setup: bool,
+    forked: bool,
+    fork_errno: i32,
+    report_present: bool,
+    completed: bool,
+    exit: i32,
+    signal: i32,
+    timed_out: bool,
+    packet: [i32; PARTIAL_DONTFORK_PACKET_WORDS],
+}
+
+impl Default for PartialDontforkChild {
+    fn default() -> Self {
+        Self {
+            pipe_setup: false,
+            forked: false,
+            fork_errno: 0,
+            report_present: false,
+            completed: false,
+            exit: -1,
+            signal: -1,
+            timed_out: false,
+            packet: [0; PARTIAL_DONTFORK_PACKET_WORDS],
+        }
+    }
+}
+
+impl PartialDontforkChild {
+    fn observation(&self, slot: usize) -> String {
+        let offset = 2 + slot * 3;
+        format!(
+            "rc:{},errno:{},byte_xor_expected:{}",
+            self.packet[offset],
+            self.packet[offset + 1],
+            self.packet[offset + 2]
+        )
+    }
+
+    fn write_observation(&self) -> i32 {
+        self.packet[1]
+    }
+}
+
+fn partial_dontfork_page_marker(page_index: usize) -> u8 {
+    0x20 + page_index as u8
+}
+
+unsafe fn reap_partial_dontfork_child(pid: libc::pid_t, deadline: Instant) -> Option<(i32, i32)> {
+    loop {
+        let mut status = 0;
+        let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        if rc == pid {
+            let exit = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -1
+            };
+            let signal = if libc::WIFSIGNALED(status) {
+                libc::WTERMSIG(status)
+            } else {
+                -1
+            };
+            return Some((exit, signal));
+        }
+        if rc == -1 && errno() != libc::EINTR {
+            return Some((-1, -1));
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        libc::usleep(1_000);
+    }
+}
+
+unsafe fn run_partial_dontfork_child(
+    base: *mut u8,
+    page: usize,
+    observed_pages: [usize; PARTIAL_DONTFORK_OBSERVATIONS],
+    write_page: usize,
+    zero_expected_page: Option<usize>,
+    remap_page: Option<usize>,
+    fork_again: bool,
+) -> PartialDontforkChild {
+    let mut result = PartialDontforkChild::default();
+    let mut fds = [0; 2];
+    if libc::pipe(fds.as_mut_ptr()) != 0 {
+        return result;
+    }
+    result.pipe_setup = true;
+
+    let pid = libc::fork();
+    if pid < 0 {
+        result.fork_errno = errno();
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+        return result;
+    }
+    if pid == 0 {
+        libc::close(fds[0]);
+        let mut packet = [0i32; PARTIAL_DONTFORK_PACKET_WORDS];
+        packet[0] = 1;
+        for (slot, page_index) in observed_pages.into_iter().enumerate() {
+            let address = base.add(page_index * page);
+            let mut residency = [0u8; 1];
+            *libc::__errno_location() = 0;
+            let rc = libc::mincore(address.cast(), page, residency.as_mut_ptr());
+            let observed_errno = if rc == -1 { errno() } else { 0 };
+            let observed_byte = if rc == 0 {
+                let expected = if zero_expected_page == Some(page_index) {
+                    0
+                } else {
+                    partial_dontfork_page_marker(page_index)
+                };
+                (*address ^ expected) as i32
+            } else {
+                -1
+            };
+            let offset = 2 + slot * 3;
+            packet[offset] = rc;
+            packet[offset + 1] = observed_errno;
+            packet[offset + 2] = observed_byte;
+        }
+        let write_address = base.add(write_page * page);
+        let mut residency = [0u8; 1];
+        if libc::mincore(write_address.cast(), page, residency.as_mut_ptr()) == 0 {
+            *write_address = 0xd1;
+            packet[1] = *write_address as i32;
+        } else {
+            packet[1] = -1;
+        }
+        if let Some(remap_page) = remap_page {
+            let remap_address = base.add(remap_page * page);
+            *libc::__errno_location() = 0;
+            let remapped = libc::mmap(
+                remap_address.cast(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            );
+            packet[PARTIAL_DONTFORK_EXTRA_OFFSET] = i32::from(remapped == libc::MAP_FAILED) * -1;
+            packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 1] = if remapped == libc::MAP_FAILED {
+                errno()
+            } else {
+                0
+            };
+            if remapped != libc::MAP_FAILED {
+                *remap_address = 0xe2;
+                packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 2] = *remap_address as i32;
+                if fork_again {
+                    let nested = run_bounded_bool_child(|| {
+                        if *remap_address != 0xe2 || *write_address != 0xd1 {
+                            return false;
+                        }
+                        *remap_address = 0xe3;
+                        *write_address = 0xd2;
+                        *remap_address == 0xe3 && *write_address == 0xd2
+                    });
+                    packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 3] =
+                        i32::from(nested.result == Some(true));
+                    packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 4] = i32::from(
+                        nested.exit == Some(0) && nested.signal.is_none() && !nested.timed_out,
+                    );
+                    packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 5] = i32::from(*remap_address == 0xe2);
+                    packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 6] = i32::from(*write_address == 0xd1);
+                }
+            }
+        }
+        let bytes = core::slice::from_raw_parts(
+            packet.as_ptr().cast::<u8>(),
+            core::mem::size_of_val(&packet),
+        );
+        let written = libc::write(fds[1], bytes.as_ptr().cast(), bytes.len());
+        libc::close(fds[1]);
+        libc::_exit(i32::from(written != bytes.len() as isize));
+    }
+
+    result.forked = true;
+    libc::close(fds[1]);
+    let deadline = Instant::now() + PARTIAL_DONTFORK_TIMEOUT;
+    let mut poll_fd = libc::pollfd {
+        fd: fds[0],
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            result.timed_out = true;
+            break;
+        }
+        let remaining_ms = i32::try_from(remaining.as_millis())
+            .unwrap_or(i32::MAX)
+            .max(1);
+        let rc = libc::poll(&mut poll_fd, 1, remaining_ms);
+        if rc > 0 {
+            let bytes = core::slice::from_raw_parts_mut(
+                result.packet.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of_val(&result.packet),
+            );
+            result.report_present =
+                libc::read(fds[0], bytes.as_mut_ptr().cast(), bytes.len()) == bytes.len() as isize;
+            break;
+        }
+        if rc == 0 {
+            result.timed_out = true;
+            break;
+        }
+        if errno() != libc::EINTR {
+            break;
+        }
+    }
+    libc::close(fds[0]);
+
+    if !result.timed_out {
+        if let Some((exit, signal)) = reap_partial_dontfork_child(pid, deadline) {
+            result.exit = exit;
+            result.signal = signal;
+            result.completed = exit == 0 && signal == -1;
+            return result;
+        }
+        result.timed_out = true;
+    }
+
+    let _ = libc::kill(pid, libc::SIGKILL);
+    let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+    if let Some((exit, signal)) = reap_partial_dontfork_child(pid, cleanup_deadline) {
+        result.exit = exit;
+        result.signal = signal;
+    }
+    result
+}
+
+unsafe fn madvise_observation(address: *mut u8, page: usize, advice: i32) -> (i32, i32) {
+    *libc::__errno_location() = 0;
+    let rc = libc::madvise(address.cast(), page, advice);
+    (rc, if rc == -1 { errno() } else { 0 })
+}
+
+fn advice_text(observation: (i32, i32)) -> String {
+    format!("rc:{},errno:{}", observation.0, observation.1)
+}
+
+unsafe fn test_partial_dontfork_matrix(page: usize) {
+    let mapping_len = page * PARTIAL_DONTFORK_PAGES;
+    let mapping = libc::mmap(
+        core::ptr::null_mut(),
+        mapping_len,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    let mapping_setup = mapping != libc::MAP_FAILED;
+    let mut granule_setup = false;
+    let mut aligned_page = 0usize;
+    let mut expected = [0u8; PARTIAL_DONTFORK_PAGES];
+
+    let mut middle_setup = (-1, 0);
+    let mut middle_reset = (-1, 0);
+    let mut prefix_setup = (-1, 0);
+    let mut suffix_setup = (-1, 0);
+    let mut prefix_reset = (-1, 0);
+    let mut suffix_reset = (-1, 0);
+    let mut disjoint_first_setup = (-1, 0);
+    let mut disjoint_second_setup = (-1, 0);
+    let mut restored_setup = (-1, 0);
+    let mut disjoint_final_reset = (-1, 0);
+    let mut middle = PartialDontforkChild::default();
+    let mut prefix_suffix = PartialDontforkChild::default();
+    let mut disjoint = PartialDontforkChild::default();
+    let mut restored = PartialDontforkChild::default();
+    let mut mixed = PartialDontforkChild::default();
+    let mut middle_parent_retained = false;
+    let mut middle_parent_cow = false;
+    let mut prefix_suffix_parent_retained = false;
+    let mut prefix_suffix_parent_cow = false;
+    let mut disjoint_parent_retained = false;
+    let mut disjoint_parent_cow = false;
+    let mut restored_parent_retained = false;
+    let mut restored_parent_cow = false;
+    let mut mixed_omit_setup = (-1, 0);
+    let mut mixed_wipe_setup = (-1, 0);
+    let mut mixed_omit_reset = (-1, 0);
+    let mut mixed_wipe_reset = (-1, 0);
+    let mut mixed_parent_retained = false;
+    let mut mixed_parent_cow = false;
+
+    if mapping_setup {
+        let base = mapping as *mut u8;
+        for (index, expected_byte) in expected.iter_mut().enumerate() {
+            *expected_byte = partial_dontfork_page_marker(index);
+            *base.add(index * page) = *expected_byte;
+        }
+
+        const HOST_GRANULE: usize = 16 * 1024;
+        if page == 4096 {
+            let delta = (HOST_GRANULE - (base as usize % HOST_GRANULE)) % HOST_GRANULE;
+            aligned_page = delta / page;
+            granule_setup = aligned_page + 4 <= PARTIAL_DONTFORK_PAGES;
+        }
+
+        if granule_setup {
+            let middle_hole = aligned_page + 1;
+            middle_setup =
+                madvise_observation(base.add(middle_hole * page), page, libc::MADV_DONTFORK);
+            if middle_setup.0 == 0 {
+                middle = run_partial_dontfork_child(
+                    base,
+                    page,
+                    [
+                        aligned_page,
+                        middle_hole,
+                        aligned_page + 2,
+                        aligned_page + 3,
+                    ],
+                    aligned_page,
+                    None,
+                    None,
+                    false,
+                );
+            }
+            middle_parent_retained = expected
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *base.add(index * page) == *byte);
+            middle_parent_cow = middle.completed
+                && middle.report_present
+                && middle.write_observation() == 0xd1
+                && *base.add(aligned_page * page) == expected[aligned_page];
+            middle_reset =
+                madvise_observation(base.add(middle_hole * page), page, libc::MADV_DOFORK);
+
+            prefix_setup = madvise_observation(base, page, libc::MADV_DONTFORK);
+            suffix_setup = madvise_observation(
+                base.add((PARTIAL_DONTFORK_PAGES - 1) * page),
+                page,
+                libc::MADV_DONTFORK,
+            );
+            if prefix_setup.0 == 0 && suffix_setup.0 == 0 {
+                prefix_suffix = run_partial_dontfork_child(
+                    base,
+                    page,
+                    [0, 1, PARTIAL_DONTFORK_PAGES - 2, PARTIAL_DONTFORK_PAGES - 1],
+                    1,
+                    None,
+                    None,
+                    false,
+                );
+            }
+            prefix_suffix_parent_retained = expected
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *base.add(index * page) == *byte);
+            prefix_suffix_parent_cow = prefix_suffix.completed
+                && prefix_suffix.report_present
+                && prefix_suffix.write_observation() == 0xd1
+                && *base.add(page) == expected[1];
+            prefix_reset = madvise_observation(base, page, libc::MADV_DOFORK);
+            suffix_reset = madvise_observation(
+                base.add((PARTIAL_DONTFORK_PAGES - 1) * page),
+                page,
+                libc::MADV_DOFORK,
+            );
+
+            let first_hole = aligned_page + 1;
+            let second_hole = aligned_page + 3;
+            disjoint_first_setup =
+                madvise_observation(base.add(first_hole * page), page, libc::MADV_DONTFORK);
+            disjoint_second_setup =
+                madvise_observation(base.add(second_hole * page), page, libc::MADV_DONTFORK);
+            if disjoint_first_setup.0 == 0 && disjoint_second_setup.0 == 0 {
+                disjoint = run_partial_dontfork_child(
+                    base,
+                    page,
+                    [first_hole, aligned_page, second_hole, aligned_page + 2],
+                    aligned_page,
+                    None,
+                    None,
+                    false,
+                );
+            }
+            disjoint_parent_retained = expected
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *base.add(index * page) == *byte);
+            disjoint_parent_cow = disjoint.completed
+                && disjoint.report_present
+                && disjoint.write_observation() == 0xd1
+                && *base.add(aligned_page * page) == expected[aligned_page];
+
+            restored_setup =
+                madvise_observation(base.add(second_hole * page), page, libc::MADV_DOFORK);
+            if restored_setup.0 == 0 {
+                restored = run_partial_dontfork_child(
+                    base,
+                    page,
+                    [first_hole, aligned_page, second_hole, aligned_page + 2],
+                    second_hole,
+                    None,
+                    None,
+                    false,
+                );
+            }
+            restored_parent_retained = expected
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *base.add(index * page) == *byte);
+            restored_parent_cow = restored.completed
+                && restored.report_present
+                && restored.write_observation() == 0xd1
+                && *base.add(second_hole * page) == expected[second_hole];
+            disjoint_final_reset =
+                madvise_observation(base.add(first_hole * page), page, libc::MADV_DOFORK);
+
+            let mixed_omit = aligned_page + 1;
+            let mixed_wipe = aligned_page + 2;
+            let mixed_write = aligned_page + 3;
+            mixed_omit_setup =
+                madvise_observation(base.add(mixed_omit * page), page, libc::MADV_DONTFORK);
+            mixed_wipe_setup =
+                madvise_observation(base.add(mixed_wipe * page), page, MADV_WIPEONFORK);
+            if mixed_omit_setup.0 == 0 && mixed_wipe_setup.0 == 0 {
+                mixed = run_partial_dontfork_child(
+                    base,
+                    page,
+                    [aligned_page, mixed_omit, mixed_wipe, mixed_write],
+                    mixed_write,
+                    Some(mixed_wipe),
+                    Some(mixed_omit),
+                    true,
+                );
+            }
+            mixed_parent_retained = expected
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *base.add(index * page) == *byte);
+            mixed_parent_cow = mixed.completed
+                && mixed.report_present
+                && mixed.write_observation() == 0xd1
+                && *base.add(mixed_write * page) == expected[mixed_write];
+            mixed_omit_reset =
+                madvise_observation(base.add(mixed_omit * page), page, libc::MADV_DOFORK);
+            mixed_wipe_reset =
+                madvise_observation(base.add(mixed_wipe * page), page, MADV_KEEPONFORK);
+        }
+
+        libc::munmap(mapping, mapping_len);
+    }
+
+    report!(
+        madvise_partial_mapping_setup = mapping_setup,
+        madvise_partial_4k_inside_aligned_16k_setup = granule_setup,
+        madvise_partial_middle_setup = advice_text(middle_setup),
+        madvise_partial_middle_pipe_setup = middle.pipe_setup,
+        madvise_partial_middle_forked = middle.forked,
+        madvise_partial_middle_fork_errno = middle.fork_errno,
+        madvise_partial_middle_child_report = middle.report_present && middle.packet[0] == 1,
+        madvise_partial_middle_child_completed = middle.completed,
+        madvise_partial_middle_child_exit = middle.exit,
+        madvise_partial_middle_child_signal = middle.signal,
+        madvise_partial_middle_child_timeout = middle.timed_out,
+        madvise_partial_middle_prefix = middle.observation(0),
+        madvise_partial_middle_hole = middle.observation(1),
+        madvise_partial_middle_suffix_first = middle.observation(2),
+        madvise_partial_middle_suffix_second = middle.observation(3),
+        madvise_partial_middle_child_write = middle.write_observation(),
+        madvise_partial_middle_parent_retained = middle_parent_retained,
+        madvise_partial_middle_parent_cow_isolated = middle_parent_cow,
+        madvise_partial_middle_reset = advice_text(middle_reset),
+        madvise_partial_edges_prefix_setup = advice_text(prefix_setup),
+        madvise_partial_edges_suffix_setup = advice_text(suffix_setup),
+        madvise_partial_edges_pipe_setup = prefix_suffix.pipe_setup,
+        madvise_partial_edges_forked = prefix_suffix.forked,
+        madvise_partial_edges_fork_errno = prefix_suffix.fork_errno,
+        madvise_partial_edges_child_report =
+            prefix_suffix.report_present && prefix_suffix.packet[0] == 1,
+        madvise_partial_edges_child_completed = prefix_suffix.completed,
+        madvise_partial_edges_child_exit = prefix_suffix.exit,
+        madvise_partial_edges_child_signal = prefix_suffix.signal,
+        madvise_partial_edges_child_timeout = prefix_suffix.timed_out,
+        madvise_partial_edges_prefix = prefix_suffix.observation(0),
+        madvise_partial_edges_retained_first = prefix_suffix.observation(1),
+        madvise_partial_edges_retained_last = prefix_suffix.observation(2),
+        madvise_partial_edges_suffix = prefix_suffix.observation(3),
+        madvise_partial_edges_child_write = prefix_suffix.write_observation(),
+        madvise_partial_edges_parent_retained = prefix_suffix_parent_retained,
+        madvise_partial_edges_parent_cow_isolated = prefix_suffix_parent_cow,
+        madvise_partial_edges_prefix_reset = advice_text(prefix_reset),
+        madvise_partial_edges_suffix_reset = advice_text(suffix_reset),
+        madvise_partial_disjoint_first_setup = advice_text(disjoint_first_setup),
+        madvise_partial_disjoint_second_setup = advice_text(disjoint_second_setup),
+        madvise_partial_disjoint_pipe_setup = disjoint.pipe_setup,
+        madvise_partial_disjoint_forked = disjoint.forked,
+        madvise_partial_disjoint_fork_errno = disjoint.fork_errno,
+        madvise_partial_disjoint_child_report = disjoint.report_present && disjoint.packet[0] == 1,
+        madvise_partial_disjoint_child_completed = disjoint.completed,
+        madvise_partial_disjoint_child_exit = disjoint.exit,
+        madvise_partial_disjoint_child_signal = disjoint.signal,
+        madvise_partial_disjoint_child_timeout = disjoint.timed_out,
+        madvise_partial_disjoint_first_hole = disjoint.observation(0),
+        madvise_partial_disjoint_retained_first = disjoint.observation(1),
+        madvise_partial_disjoint_second_hole = disjoint.observation(2),
+        madvise_partial_disjoint_retained_second = disjoint.observation(3),
+        madvise_partial_disjoint_child_write = disjoint.write_observation(),
+        madvise_partial_disjoint_parent_retained = disjoint_parent_retained,
+        madvise_partial_disjoint_parent_cow_isolated = disjoint_parent_cow,
+        madvise_partial_dofork_restore_setup = advice_text(restored_setup),
+        madvise_partial_dofork_pipe_setup = restored.pipe_setup,
+        madvise_partial_dofork_forked = restored.forked,
+        madvise_partial_dofork_fork_errno = restored.fork_errno,
+        madvise_partial_dofork_child_report = restored.report_present && restored.packet[0] == 1,
+        madvise_partial_dofork_child_completed = restored.completed,
+        madvise_partial_dofork_child_exit = restored.exit,
+        madvise_partial_dofork_child_signal = restored.signal,
+        madvise_partial_dofork_child_timeout = restored.timed_out,
+        madvise_partial_dofork_remaining_hole = restored.observation(0),
+        madvise_partial_dofork_retained_first = restored.observation(1),
+        madvise_partial_dofork_restored_page = restored.observation(2),
+        madvise_partial_dofork_retained_second = restored.observation(3),
+        madvise_partial_dofork_child_write = restored.write_observation(),
+        madvise_partial_dofork_parent_retained = restored_parent_retained,
+        madvise_partial_dofork_parent_cow_isolated = restored_parent_cow,
+        madvise_partial_disjoint_final_reset = advice_text(disjoint_final_reset),
+        madvise_partial_mixed_omit_setup = advice_text(mixed_omit_setup),
+        madvise_partial_mixed_wipe_setup = advice_text(mixed_wipe_setup),
+        madvise_partial_mixed_pipe_setup = mixed.pipe_setup,
+        madvise_partial_mixed_forked = mixed.forked,
+        madvise_partial_mixed_fork_errno = mixed.fork_errno,
+        madvise_partial_mixed_child_report = mixed.report_present && mixed.packet[0] == 1,
+        madvise_partial_mixed_child_completed = mixed.completed,
+        madvise_partial_mixed_child_exit = mixed.exit,
+        madvise_partial_mixed_child_signal = mixed.signal,
+        madvise_partial_mixed_child_timeout = mixed.timed_out,
+        madvise_partial_mixed_preserved = mixed.observation(0),
+        madvise_partial_mixed_omitted = mixed.observation(1),
+        madvise_partial_mixed_wiped = mixed.observation(2),
+        madvise_partial_mixed_retained = mixed.observation(3),
+        madvise_partial_mixed_child_write = mixed.write_observation(),
+        madvise_partial_mixed_remap_rc = mixed.packet[PARTIAL_DONTFORK_EXTRA_OFFSET],
+        madvise_partial_mixed_remap_errno = mixed.packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 1],
+        madvise_partial_mixed_remap_write = mixed.packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 2],
+        madvise_partial_mixed_nested_result = mixed.packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 3],
+        madvise_partial_mixed_nested_completed = mixed.packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 4],
+        madvise_partial_mixed_nested_remap_cow = mixed.packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 5],
+        madvise_partial_mixed_nested_retained_cow = mixed.packet[PARTIAL_DONTFORK_EXTRA_OFFSET + 6],
+        madvise_partial_mixed_parent_retained = mixed_parent_retained,
+        madvise_partial_mixed_parent_cow_isolated = mixed_parent_cow,
+        madvise_partial_mixed_omit_reset = advice_text(mixed_omit_reset),
+        madvise_partial_mixed_wipe_reset = advice_text(mixed_wipe_reset),
+    );
 }
 
 unsafe fn test_mmap_matrix(page: usize) {
@@ -521,6 +1083,7 @@ unsafe fn test_madvise_matrix(page: usize) {
         madvise_wipeonfork_lifecycle = wipe_lifecycle_ok,
         madvise_dontfork_dofork_lifecycle = df_lifecycle_ok,
     );
+    test_partial_dontfork_matrix(page);
 }
 
 unsafe fn test_mincore_matrix(page: usize) {

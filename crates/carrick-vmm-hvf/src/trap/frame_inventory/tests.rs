@@ -84,13 +84,11 @@ fn bootstrap_exec_predecessor_uses_bound_kernel_identity_without_registration() 
         .expect("bind bootstrap predecessor identity");
     let mut duplicate = identity;
     duplicate.thread_serial += 1;
-    assert!(
-            bind_exec_predecessor_identity_slot(
-                &mut task.pending_exec_predecessor_identity,
-                duplicate,
-            )
-            .is_err()
-        );
+    assert!(bind_exec_predecessor_identity_slot(
+        &mut task.pending_exec_predecessor_identity,
+        duplicate,
+    )
+    .is_err());
     assert_eq!(
         task.pending_exec_predecessor_identity,
         Some(identity),
@@ -5648,6 +5646,258 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         ),
         ForkMappingPlan::PartialOmit,
     );
+
+    let mut coarse = guest.clone();
+    coarse.owner_generation = 77;
+    coarse.shared_key_base = 0x9900_0000;
+    coarse.shared_key_offset = 0x3000;
+    let leaf = 0x1000;
+    let mixed = [
+        carrick_hal::ForkProjectionRange {
+            va: coarse.start,
+            len: leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Preserve,
+        },
+        carrick_hal::ForkProjectionRange {
+            va: coarse.start + leaf,
+            len: leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Omit,
+        },
+        carrick_hal::ForkProjectionRange {
+            va: coarse.start + 2 * leaf,
+            len: leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Zero,
+        },
+        carrick_hal::ForkProjectionRange {
+            va: coarse.start + 3 * leaf,
+            len: leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Preserve,
+        },
+    ];
+    let projected = projected_fork_mappings(&coarse, false, &mixed)
+        .expect("mixed preserve/omit/wipe projection");
+    assert_eq!(projected.len(), 2);
+    assert_eq!(
+        (projected[0].mapping.start, projected[0].mapping.end),
+        (coarse.start, coarse.start + leaf),
+    );
+    assert_eq!(
+        projected[0].plan,
+        ForkMappingPlan::preserved(ForkMappingDisposition::SharedFrameReadOnly),
+    );
+    assert_eq!(
+        (projected[1].mapping.start, projected[1].mapping.end),
+        (coarse.start + 2 * leaf, coarse.end),
+    );
+    assert_eq!(
+        projected[1].plan,
+        ForkMappingPlan::Map {
+            disposition: ForkMappingDisposition::IndependentGuestZeroed,
+            wiped: vec![(0, leaf)],
+        },
+    );
+    for segment in &projected {
+        assert_eq!(segment.mapping.physical_ipa, coarse.physical_ipa);
+        assert_eq!(
+            segment.mapping.physical_host_addr,
+            coarse.physical_host_addr
+        );
+        assert_eq!(segment.mapping.physical_size, coarse.physical_size);
+        assert_eq!(segment.mapping.owner_generation, coarse.owner_generation);
+    }
+    assert_eq!(
+        projected[1].mapping.ipa,
+        coarse.ipa + 2 * leaf,
+        "semantic IPA must advance independently of the retained physical owner",
+    );
+    assert_eq!(
+        projected[1].mapping.host_addr,
+        coarse.host_addr.wrapping_add((2 * leaf) as usize),
+    );
+    assert_eq!(
+        projected[1].mapping.shared_key_offset,
+        coarse.shared_key_offset + 2 * leaf,
+    );
+
+    let disjoint_omits = [
+        carrick_hal::ForkProjectionRange {
+            va: coarse.start + leaf,
+            len: leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Omit,
+        },
+        carrick_hal::ForkProjectionRange {
+            va: coarse.start + 3 * leaf,
+            len: leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Omit,
+        },
+    ];
+    let projected = projected_fork_mappings(&coarse, false, &disjoint_omits)
+        .expect("disjoint omitted semantic leaves");
+    assert_eq!(
+        projected
+            .iter()
+            .map(|segment| (segment.mapping.start, segment.mapping.end))
+            .collect::<Vec<_>>(),
+        vec![
+            (coarse.start, coarse.start + leaf),
+            (coarse.start + 2 * leaf, coarse.start + 3 * leaf),
+        ],
+        "each omitted leaf must be absent without collapsing retained neighbours",
+    );
+    assert!(projected.iter().all(|segment| {
+        segment.mapping.physical_ipa == coarse.physical_ipa
+            && segment.mapping.owner_generation == coarse.owner_generation
+            && segment.plan
+                == ForkMappingPlan::preserved(ForkMappingDisposition::SharedFrameReadOnly)
+    }));
+
+    let unsorted_overlapping_omits = [
+        carrick_hal::ForkProjectionRange {
+            va: coarse.start + 2 * leaf,
+            len: leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Omit,
+        },
+        carrick_hal::ForkProjectionRange {
+            va: coarse.start + leaf,
+            len: 2 * leaf,
+            disposition: carrick_hal::ForkLeafDisposition::Omit,
+        },
+    ];
+    let projected = projected_fork_mappings(&coarse, false, &unsorted_overlapping_omits)
+        .expect("unsorted overlapping omitted leaves");
+    assert_eq!(
+        projected
+            .iter()
+            .map(|segment| (segment.mapping.start, segment.mapping.end))
+            .collect::<Vec<_>>(),
+        vec![
+            (coarse.start, coarse.start + leaf),
+            (coarse.start + 3 * leaf, coarse.end),
+        ],
+        "projection must normalize overlapping Omit ranges before slicing",
+    );
+    assert!(projected.iter().all(|segment| {
+        segment.mapping.physical_ipa == coarse.physical_ipa
+            && segment.mapping.owner_generation == coarse.owner_generation
+            && segment.plan
+                == ForkMappingPlan::preserved(ForkMappingDisposition::SharedFrameReadOnly)
+    }));
+
+    let shared_mm = projected_fork_mappings(&coarse, true, &mixed)
+        .expect("CLONE_VM projection must remain shared");
+    assert_eq!(shared_mm.len(), 1);
+    assert_eq!(
+        (shared_mm[0].mapping.start, shared_mm[0].mapping.end),
+        (coarse.start, coarse.end),
+    );
+    assert_eq!(
+        shared_mm[0].plan,
+        ForkMappingPlan::preserved(ForkMappingDisposition::SharedFrameWritable),
+        "fork-only leaf policies must not punch holes in a shared mm",
+    );
+
+    let mut copied_tables = crate::page_table::PageTableManager::new(
+        carrick_mem::memory::stage1_hvpatch_page_tables(),
+        crate::memory::LINUX_PAGE_TABLES_BASE,
+    );
+    copied_tables
+        .map_aliased(coarse.start, coarse.ipa, coarse.size as u64, true, None)
+        .expect("map coarse copied-mm projection");
+    invalidate_projected_fork_omissions(&mut copied_tables, false, &mixed)
+        .expect("invalidate copied-mm omitted leaf");
+    assert_eq!(copied_tables.translate(coarse.start), Some(coarse.ipa));
+    assert_eq!(
+        copied_tables.translate(coarse.start + leaf),
+        None,
+        "the omitted semantic VA must have no child stage-1 translation",
+    );
+    assert_eq!(
+        copied_tables.translate(coarse.start + 2 * leaf),
+        Some(coarse.ipa + 2 * leaf),
+        "the wiped neighbour remains mapped for its independent-zero plan",
+    );
+
+    let mut shared_tables = crate::page_table::PageTableManager::new(
+        carrick_mem::memory::stage1_hvpatch_page_tables(),
+        crate::memory::LINUX_PAGE_TABLES_BASE,
+    );
+    shared_tables
+        .map_aliased(coarse.start, coarse.ipa, coarse.size as u64, true, None)
+        .expect("map coarse shared-mm projection");
+    invalidate_projected_fork_omissions(&mut shared_tables, true, &mixed)
+        .expect("shared-mm projection bypass");
+    assert_eq!(
+        shared_tables.translate(coarse.start + leaf),
+        Some(coarse.ipa + leaf),
+        "CLONE_VM must retain the parent's exact stage-1 graph",
+    );
+
+    let full_cow_range = carrick_aarch64::vmm::ForkCowRange {
+        va: coarse.start,
+        len: coarse.size,
+        executable: false,
+        kernel_only: false,
+        granule: carrick_aarch64::vmm::CowGranule::Compound,
+    };
+    let mut copied_armed = CowArmedRanges::default();
+    copied_armed.arm(&[full_cow_range]);
+    disarm_projected_fork_omissions(&mut copied_armed, false, &mixed)
+        .expect("copied-mm omitted COW subtraction");
+    assert_eq!(
+        copied_armed
+            .ranges
+            .iter()
+            .map(|range| (range.va, range.len))
+            .collect::<Vec<_>>(),
+        vec![
+            (coarse.start, leaf as usize),
+            (coarse.start + 2 * leaf, (2 * leaf) as usize),
+        ],
+        "the omitted VA must not retain stale child COW authority",
+    );
+    let process_mapping = |start, size, inherited_frame| ProcessMappingDesc {
+        start,
+        ipa: coarse.ipa + (start - coarse.start),
+        end: start + size as u64,
+        stage2_lease: None,
+        host: ProcessMappingHost::Borrowed {
+            pointer: coarse.physical_host_addr,
+            structural_owner: None,
+        },
+        size,
+        physical_ipa: coarse.physical_ipa,
+        physical_host_addr: coarse.physical_host_addr,
+        physical_size: coarse.physical_size,
+        inventory_backing: InventoryBackingIdentity::Private(coarse.physical_ipa),
+        perms: coarse.perms,
+        is_dynamic_alias: true,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: true,
+        inherited_frame,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+        owner_generation: coarse.owner_generation,
+    };
+    let child_mappings = vec![
+        process_mapping(coarse.start, leaf as usize, Some(frame)),
+        process_mapping(coarse.start + 2 * leaf, (2 * leaf) as usize, None),
+    ];
+    disarm_independent_fork_mappings(&mut copied_armed, false, &child_mappings);
+    assert_eq!(
+        copied_armed
+            .ranges
+            .iter()
+            .map(|range| (range.va, range.len))
+            .collect::<Vec<_>>(),
+        vec![(coarse.start, leaf as usize)],
+        "a WIPE-created private frame must not retain parent-frame COW authority",
+    );
+    let mut shared_armed = CowArmedRanges::default();
+    shared_armed.arm(&[full_cow_range]);
+    disarm_projected_fork_omissions(&mut shared_armed, true, &mixed)
+        .expect("shared-mm COW projection bypass");
+    disarm_independent_fork_mappings(&mut shared_armed, true, &child_mappings);
+    assert_eq!(shared_armed.ranges, vec![full_cow_range]);
 
     // A partial WIPEONFORK IS representable: the child's own frame is
     // seeded from the parent and zeroed across exactly the advised bytes.

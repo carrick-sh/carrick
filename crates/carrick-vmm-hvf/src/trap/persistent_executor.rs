@@ -113,6 +113,42 @@ impl ThreadMappingDesc {
         }
     }
 
+    /// Restrict the guest-visible semantic projection while retaining the exact
+    /// physical backing identity and lifetime owner. This is the representation
+    /// needed when fork omits leaves inside a coarse 16 KiB physical mapping:
+    /// each retained child span gets its own semantic descriptor, but all spans
+    /// continue to name the same authenticated stage-2 owner.
+    pub(crate) fn semantic_slice(&self, start: u64, end: u64) -> Option<Self> {
+        if start < self.start || end > self.end || end <= start {
+            return None;
+        }
+        let offset = start.checked_sub(self.start)?;
+        let size = usize::try_from(end.checked_sub(start)?).ok()?;
+        let host_offset = usize::try_from(offset).ok()?;
+        Some(Self {
+            start,
+            ipa: self.ipa.checked_add(offset)?,
+            end,
+            host_addr: self.host_addr.wrapping_add(host_offset),
+            size,
+            physical_ipa: self.physical_ipa,
+            physical_host_addr: self.physical_host_addr,
+            physical_size: self.physical_size,
+            perms: self.perms,
+            is_dynamic_alias: self.is_dynamic_alias,
+            sharing: self.sharing,
+            guest_writable: self.guest_writable,
+            shared_key_base: self.shared_key_base,
+            shared_key_offset: if self.shared_key_base == 0 && self.shared_key_offset == 0 {
+                0
+            } else {
+                self.shared_key_offset.checked_add(offset)?
+            },
+            owner_generation: self.owner_generation,
+            structural_owner: self.structural_owner.clone(),
+        })
+    }
+
     pub(crate) fn from_alias(alias: AliasBacking) -> Option<Self> {
         let perms = match alias.perms {
             0 => applevisor::memory::MemPerms::None,

@@ -7,6 +7,86 @@
 use super::*;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn invalidate_projected_fork_omissions(
+    page_tables: &mut crate::page_table::PageTableManager,
+    shares_mm: bool,
+    ranges: &[carrick_hal::ForkProjectionRange],
+) -> Result<(), TrapError> {
+    if shares_mm {
+        return Ok(());
+    }
+    for range in ranges
+        .iter()
+        .filter(|range| range.disposition == carrick_hal::ForkLeafDisposition::Omit)
+    {
+        let len = usize::try_from(range.len).map_err(|_| {
+            TrapError::Hypervisor(format!(
+                "hvpatch fork omitted semantic range at VA 0x{:x} is too large: 0x{:x}",
+                range.va, range.len
+            ))
+        })?;
+        page_tables.invalidate(range.va, len, None).map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "invalidate hvpatch child MADV_DONTFORK leaves at semantic VA 0x{:x}+0x{:x}: {error:?}",
+                range.va, range.len
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn disarm_projected_fork_omissions(
+    armed: &mut CowArmedRanges,
+    shares_mm: bool,
+    ranges: &[carrick_hal::ForkProjectionRange],
+) -> Result<(), TrapError> {
+    if shares_mm {
+        return Ok(());
+    }
+    for range in ranges
+        .iter()
+        .filter(|range| range.disposition == carrick_hal::ForkLeafDisposition::Omit)
+    {
+        let len = usize::try_from(range.len).map_err(|_| {
+            TrapError::Hypervisor(format!(
+                "hvpatch fork omitted COW range at VA 0x{:x} is too large: 0x{:x}",
+                range.va, range.len
+            ))
+        })?;
+        armed.disarm(CowArmedSpan {
+            va: range.va,
+            len,
+            executable: false,
+            kernel_only: false,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn disarm_independent_fork_mappings(
+    armed: &mut CowArmedRanges,
+    shares_mm: bool,
+    mappings: &[ProcessMappingDesc],
+) {
+    if shares_mm {
+        return;
+    }
+    for mapping in mappings
+        .iter()
+        .filter(|mapping| mapping.inherited_frame.is_none())
+    {
+        armed.disarm(CowArmedSpan {
+            va: mapping.start,
+            len: mapping.size,
+            executable: u64::from(mapping.perms) & 4 != 0,
+            kernel_only: is_kernel_only_stage1_range(mapping.start, mapping.size),
+        });
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn thread_mapping_semantic_ipa_at(
     mapping: &ThreadMappingDesc,
     address: u64,
@@ -494,22 +574,28 @@ impl HvfTaskState {
             &parent_inventory_by_stage2,
         );
         let projection_ranges = std::sync::Arc::clone(request.projection_plan());
+        invalidate_projected_fork_omissions(page_tables, request.shares_mm(), &projection_ranges)?;
         let parent_extension_bases = self
             .page_tables_authority()
             .with_manager(|pt| pt.extension_arena_bases())
             .unwrap_or_default();
+        let mut projected_source_mappings = Vec::with_capacity(source_mappings.len());
         for index in order {
-            let mapping = &source_mappings[index];
-            if parent_extension_bases.contains(&mapping.start) {
+            let source = &source_mappings[index];
+            if parent_extension_bases.contains(&source.start) {
                 // Parent extension page-table arenas are Carrick stage-1 backing, not guest VMAs;
                 // child extension arenas are allocated and installed into stage-2 below.
                 continue;
             }
-            let (disposition, wiped_subranges) = match projected_fork_mapping_disposition(
-                mapping,
-                request.shares_mm(),
-                &projection_ranges,
-            ) {
+            for projected in
+                projected_fork_mappings(source, request.shares_mm(), &projection_ranges)?
+            {
+                projected_source_mappings.push((index, projected));
+            }
+        }
+        for (source_index, projected) in projected_source_mappings {
+            let mapping = &projected.mapping;
+            let (disposition, wiped_subranges) = match projected.plan {
                 // `MADV_DONTFORK`: the child gets no mapping, no stage-1 leaf
                 // and no inventory row here, which is what makes its `mincore`
                 // answer ENOMEM the way Linux's does.
@@ -517,9 +603,8 @@ impl HvfTaskState {
                 ForkMappingPlan::Map { disposition, wiped } => (disposition, wiped),
                 ForkMappingPlan::PartialOmit => {
                     return Err(TrapError::Hypervisor(format!(
-                        "hvpatch fork: MADV_DONTFORK covers only part of the physical mapping \
-                         at VA 0x{:x}..0x{:x}; a hole inside one mapping is not representable, \
-                         and inheriting it would hand the child memory the guest excluded",
+                        "hvpatch fork retained an unresolved partial MADV_DONTFORK projection \
+                         at VA 0x{:x}..0x{:x}",
                         mapping.start, mapping.end,
                     )));
                 }
@@ -652,7 +737,7 @@ impl HvfTaskState {
                     let authenticated_overlay = live_translation.is_some_and(|translated| {
                         overlay_owner_index.has_overlay_owner(
                             &source_mappings,
-                            index,
+                            source_index,
                             mapping.start,
                             translated,
                         )
@@ -1318,6 +1403,12 @@ impl HvfTaskState {
         };
         let mut child_cow_armed = self.cow_armed.lock().clone();
         child_cow_armed.arm(cow_ranges);
+        disarm_projected_fork_omissions(
+            &mut child_cow_armed,
+            request.shares_mm(),
+            &projection_ranges,
+        )?;
+        disarm_independent_fork_mappings(&mut child_cow_armed, request.shares_mm(), &mappings);
         if let Some(debug_va) = fork_debug_va() {
             let covered = child_cow_armed
                 .ranges

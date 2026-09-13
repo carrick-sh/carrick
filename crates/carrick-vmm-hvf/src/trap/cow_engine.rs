@@ -5536,6 +5536,113 @@ pub(crate) enum ForkMappingPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectedForkMapping {
+    pub(crate) mapping: ThreadMappingDesc,
+    pub(crate) plan: ForkMappingPlan,
+}
+
+/// Partition one coarse physical mapping into the semantic spans the child may
+/// inherit. Every retained descriptor keeps the original physical owner and
+/// generation; only its guest VA/IPA/host window changes. Omitted spans produce
+/// no descriptor, so later inventory deduplication retains the backing exactly
+/// once without making the excluded leaves visible through semantic metadata.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn projected_fork_mappings(
+    mapping: &ThreadMappingDesc,
+    shares_mm: bool,
+    ranges: &[carrick_hal::ForkProjectionRange],
+) -> Result<Vec<ProjectedForkMapping>, TrapError> {
+    let base = fork_mapping_disposition(mapping, shares_mm);
+    if shares_mm
+        || !matches!(
+            base,
+            ForkMappingDisposition::SharedFrameWritable
+                | ForkMappingDisposition::SharedFrameReadOnly
+        )
+    {
+        return Ok(vec![ProjectedForkMapping {
+            mapping: mapping.clone(),
+            plan: ForkMappingPlan::preserved(base),
+        }]);
+    }
+
+    let mut omitted: Vec<(u64, u64)> = ranges
+        .iter()
+        .filter(|range| range.disposition == carrick_hal::ForkLeafDisposition::Omit)
+        .filter_map(|range| {
+            let start = range.va.max(mapping.start);
+            let end = range.va.saturating_add(range.len).min(mapping.end);
+            (start < end).then_some((start, end))
+        })
+        .collect();
+    omitted.sort_unstable_by_key(|range| range.0);
+    let mut merged_omitted: Vec<(u64, u64)> = Vec::with_capacity(omitted.len());
+    for (start, end) in omitted {
+        if let Some(last) = merged_omitted.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged_omitted.push((start, end));
+        }
+    }
+
+    if merged_omitted.is_empty() {
+        return Ok(vec![ProjectedForkMapping {
+            mapping: mapping.clone(),
+            plan: projected_fork_mapping_disposition(mapping, shares_mm, ranges),
+        }]);
+    }
+    if merged_omitted.len() == 1 && merged_omitted[0] == (mapping.start, mapping.end) {
+        return Ok(Vec::new());
+    }
+
+    let mut retained = Vec::new();
+    let mut cursor = mapping.start;
+    for (omit_start, omit_end) in merged_omitted {
+        if cursor < omit_start {
+            let projected = mapping.semantic_slice(cursor, omit_start).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "fork semantic projection 0x{cursor:x}..0x{omit_start:x} escapes mapping 0x{:x}..0x{:x}",
+                    mapping.start, mapping.end
+                ))
+            })?;
+            let plan = projected_fork_mapping_disposition(&projected, false, ranges);
+            retained.push(ProjectedForkMapping {
+                mapping: projected,
+                plan,
+            });
+        }
+        cursor = cursor.max(omit_end);
+    }
+    if cursor < mapping.end {
+        let projected = mapping.semantic_slice(cursor, mapping.end).ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "fork semantic projection 0x{cursor:x}..0x{:x} escapes mapping 0x{:x}..0x{:x}",
+                mapping.end, mapping.start, mapping.end
+            ))
+        })?;
+        let plan = projected_fork_mapping_disposition(&projected, false, ranges);
+        retained.push(ProjectedForkMapping {
+            mapping: projected,
+            plan,
+        });
+    }
+    if retained.iter().any(|mapping| {
+        matches!(
+            mapping.plan,
+            ForkMappingPlan::Omit | ForkMappingPlan::PartialOmit
+        )
+    }) {
+        return Err(TrapError::Hypervisor(
+            "fork semantic projection retained an omitted child span".to_owned(),
+        ));
+    }
+    Ok(retained)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ForkMappingPlan {
     pub(crate) fn preserved(disposition: ForkMappingDisposition) -> Self {
         Self::Map {
