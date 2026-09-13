@@ -2295,6 +2295,14 @@ impl HostFsBackend {
     /// re-open `.` relative to it — valid on every host OS.
     fn root_meta_fd(&self) -> Option<std::os::fd::OwnedFd> {
         use std::os::fd::{AsRawFd, FromRawFd};
+        #[cfg(target_os = "macos")]
+        {
+            let dup_raw =
+                unsafe { libc::fcntl(self.root_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            if dup_raw >= 0 {
+                return Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup_raw) });
+            }
+        }
         let raw = unsafe {
             host_openat!(
                 self.root_fd.as_raw_fd(),
@@ -4498,6 +4506,20 @@ impl FsBackend for HostFsBackend {
                             libc::AT_SYMLINK_NOFOLLOW,
                         );
                     }
+                    let flags = libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK
+                        | libc::O_NOFOLLOW;
+                    let raw = unsafe {
+                        host_openat!(parent_fd.as_raw_fd(), leaf_name.as_ptr(), flags, 0)
+                    };
+                    if raw >= 0 {
+                        let fd =
+                            std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+                        let generation = crate::fs_resolve_cache::current_dir_generation();
+                        self.publish_dir_fd(rel.as_path(), &fd, generation);
+                    }
                 }
                 self.clear_whiteout_normalized(rel.as_path());
                 crate::fs_resolve_cache::bump_generation();
@@ -6097,7 +6119,7 @@ impl FsBackend for HostFsBackend {
     fn validate_parents_fast(&self, abs: &str) -> ParentResolve {
         #[cfg(target_os = "macos")]
         {
-            use std::os::fd::AsRawFd;
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
             use std::os::unix::ffi::OsStrExt;
             if !self.fast_fs {
                 return ParentResolve::Slow;
@@ -6114,6 +6136,47 @@ impl FsBackend for HostFsBackend {
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => return ParentResolve::AllDirsNoSymlink,
             };
+
+            let mut expected = Vec::with_capacity(root_prefix.len() + 1 + parent.as_os_str().len());
+            expected.extend_from_slice(root_prefix.as_bytes());
+            expected.push(b'/');
+            expected.extend_from_slice(parent.as_os_str().as_bytes());
+
+            let generation = crate::fs_resolve_cache::current_dir_generation();
+            let proc_gen = crate::fs_resolve_cache::current_process_generation();
+
+            // Check dir_cache first: if parent is cached and valid, it is already proven
+            {
+                let mut cache = self.dir_cache.lock();
+                if self
+                    .dir_cache_proc_gen
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    != proc_gen
+                {
+                    cache.clear();
+                    self.dir_cache_proc_gen
+                        .store(proc_gen, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(entry) = cache.get(parent)
+                    && entry.is_valid(generation)
+                {
+                    let mut buf = [0u8; libc::PATH_MAX as usize];
+                    let getpath_ok = unsafe {
+                        libc::fcntl(
+                            entry.fd.as_raw_fd(),
+                            libc::F_GETPATH,
+                            buf.as_mut_ptr() as *mut libc::c_char,
+                        )
+                    } >= 0;
+                    if getpath_ok {
+                        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                        if &buf[..end] == expected.as_slice() {
+                            return ParentResolve::AllDirsNoSymlink;
+                        }
+                    }
+                }
+            }
+
             let Ok(parent_c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
                 return ParentResolve::Slow;
             };
@@ -6137,8 +6200,8 @@ impl FsBackend for HostFsBackend {
             let getpath_ok =
                 unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) }
                     >= 0;
-            unsafe { libc::close(fd) };
             if !getpath_ok {
+                unsafe { libc::close(fd) };
                 return ParentResolve::Slow;
             }
             let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -6147,13 +6210,12 @@ impl FsBackend for HostFsBackend {
             // parent. ANY difference (an intermediate symlink the kernel followed,
             // a Unicode-normalized alias, a sandbox escape) ⇒ the slow path, which
             // resolves symlinks and rejects aliases exactly.
-            let mut expected = Vec::with_capacity(root_prefix.len() + 1 + parent.as_os_str().len());
-            expected.extend_from_slice(root_prefix.as_bytes());
-            expected.push(b'/');
-            expected.extend_from_slice(parent.as_os_str().as_bytes());
             if got == expected.as_slice() {
+                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                self.publish_dir_fd(parent, &std::sync::Arc::new(owned), generation);
                 ParentResolve::AllDirsNoSymlink
             } else {
+                unsafe { libc::close(fd) };
                 ParentResolve::Slow
             }
         }
@@ -6174,7 +6236,54 @@ impl FsBackend for HostFsBackend {
             }
             let root_prefix = self.root_prefix.as_deref()?;
             let normalized = normalize(path)?;
-            let dir_fd = self.root_fd.as_raw_fd();
+            let generation = crate::fs_resolve_cache::current_dir_generation();
+            let proc_gen = crate::fs_resolve_cache::current_process_generation();
+
+            let mut expected =
+                Vec::with_capacity(root_prefix.len() + 1 + normalized.as_os_str().len());
+            expected.extend_from_slice(root_prefix.as_bytes());
+            if !normalized.as_os_str().is_empty() {
+                expected.push(b'/');
+                expected.extend_from_slice(normalized.as_os_str().as_bytes());
+            }
+
+            // Reuse cached dirfd from dir_cache if valid for current generation
+            {
+                let mut cache = self.dir_cache.lock();
+                if self
+                    .dir_cache_proc_gen
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    != proc_gen
+                {
+                    cache.clear();
+                    self.dir_cache_proc_gen
+                        .store(proc_gen, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(entry) = cache.get(&normalized)
+                    && entry.is_valid(generation)
+                {
+                    let mut buf = [0u8; libc::PATH_MAX as usize];
+                    let rc = unsafe {
+                        libc::fcntl(
+                            entry.fd.as_raw_fd(),
+                            libc::F_GETPATH,
+                            buf.as_mut_ptr() as *mut libc::c_char,
+                        )
+                    };
+                    if rc >= 0 {
+                        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                        if &buf[..end] == expected.as_slice() {
+                            let dup_raw = unsafe {
+                                libc::fcntl(entry.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0)
+                            };
+                            if dup_raw >= 0 {
+                                return Some(unsafe { OwnedFd::from_raw_fd(dup_raw) });
+                            }
+                        }
+                    }
+                }
+            }
+
             // O_NOFOLLOW: the dispatcher hands us an already symlink-resolved
             // path, so a symlink leaf here is unexpected — reject rather than
             // traverse. O_NONBLOCK is moot for a directory but harmless.
@@ -6183,19 +6292,32 @@ impl FsBackend for HostFsBackend {
                 | libc::O_NOFOLLOW
                 | libc::O_CLOEXEC
                 | libc::O_NONBLOCK;
-            let (raw, expected) = if normalized.as_os_str().is_empty() {
+
+            let (raw, publish_path) = if normalized.as_os_str().is_empty() {
                 // The sandbox root itself (guest "/"): trivially contained.
-                let raw = unsafe { host_openat!(dir_fd, c".".as_ptr(), oflags, 0) };
-                (raw, root_prefix.as_bytes().to_vec())
+                let raw =
+                    unsafe { host_openat!(self.root_fd.as_raw_fd(), c".".as_ptr(), oflags, 0) };
+                (raw, normalized)
+            } else if let Some(parent) = normalized.parent() {
+                if let Ok(parent_fd) = self.dir_fd_for(parent)
+                    && let Some(name) = normalized.file_name()
+                    && let Some(name_c) = cstring_from_osstr(name)
+                {
+                    let raw =
+                        unsafe { host_openat!(parent_fd.as_raw_fd(), name_c.as_ptr(), oflags, 0) };
+                    (raw, normalized)
+                } else {
+                    let rel_c = std::ffi::CString::new(normalized.as_os_str().as_bytes()).ok()?;
+                    let raw = unsafe {
+                        host_openat!(self.root_fd.as_raw_fd(), rel_c.as_ptr(), oflags, 0)
+                    };
+                    (raw, normalized)
+                }
             } else {
                 let rel_c = std::ffi::CString::new(normalized.as_os_str().as_bytes()).ok()?;
-                let raw = unsafe { host_openat!(dir_fd, rel_c.as_ptr(), oflags, 0) };
-                let mut expected =
-                    Vec::with_capacity(root_prefix.len() + 1 + normalized.as_os_str().len());
-                expected.extend_from_slice(root_prefix.as_bytes());
-                expected.push(b'/');
-                expected.extend_from_slice(normalized.as_os_str().as_bytes());
-                (raw, expected)
+                let raw =
+                    unsafe { host_openat!(self.root_fd.as_raw_fd(), rel_c.as_ptr(), oflags, 0) };
+                (raw, normalized)
             };
             if raw < 0 {
                 return None;
@@ -6222,6 +6344,11 @@ impl FsBackend for HostFsBackend {
             let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
             if &buf[..end] != expected.as_slice() {
                 return None;
+            }
+            let dup_raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            if dup_raw >= 0 {
+                let cached_fd = std::sync::Arc::new(unsafe { OwnedFd::from_raw_fd(dup_raw) });
+                self.publish_dir_fd(&publish_path, &cached_fd, generation);
             }
             Some(fd)
         }

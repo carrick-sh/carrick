@@ -761,6 +761,39 @@ fn open_trusted_dir_fd_trusts_only_byte_exact_paths() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn test_open_trusted_dir_fd_reuses_cached_dir_fd() {
+    let (b, _scratch) = host_backend();
+    b.make_dir("/cached_dir").unwrap();
+    b.make_dir("/cached_dir/sub").unwrap();
+
+    // Prime the directory in dir_cache
+    let first = b.open_trusted_dir_fd("/cached_dir");
+    assert!(first.is_some());
+
+    reset_test_host_openat_count();
+
+    // Opening the same trusted directory again should reuse the dir_cache (0 host openat)
+    let second = b.open_trusted_dir_fd("/cached_dir");
+    assert!(second.is_some());
+    let opens = test_host_openat_count();
+    assert_eq!(
+        opens, 0,
+        "repeated open_trusted_dir_fd of cached directory should issue 0 host openat (got {opens})"
+    );
+
+    // Opening sub-directory reuses the parent dirfd (at most 1 host openat for the leaf)
+    reset_test_host_openat_count();
+    let sub = b.open_trusted_dir_fd("/cached_dir/sub");
+    assert!(sub.is_some());
+    let sub_opens = test_host_openat_count();
+    assert!(
+        sub_opens <= 1,
+        "open_trusted_dir_fd of sub directory should issue <= 1 host openat (got {sub_opens})"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn sparse_upper_fast_absence_disarms_before_a_symlink_is_visible() {
     let (mut b, _scratch) = host_backend();
     b.enable_sparse_upper_fast_miss();
