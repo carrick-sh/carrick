@@ -2686,3 +2686,49 @@ fn test_stat_existing_path_namei_zero_host_openat() {
         "stat of existing path issued {stats} host stat calls (expected 1 fstatat)"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_mkdir_mode_fidelity_under_host_umask() {
+    use crate::vfs::Vfs as _;
+    let (backend, scratch) = host_backend();
+    let mut vfs = crate::vfs::RootFsVfs::new();
+    vfs.set_overlay(Box::new(backend));
+
+    let old_umask = unsafe { libc::umask(0o022) };
+    struct UmaskGuard(libc::mode_t);
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.0) };
+        }
+    }
+    let _guard = UmaskGuard(old_umask);
+
+    let test_modes: &[(u32, &str)] = &[
+        (0o777, "/d777"),
+        (0o775, "/d775"),
+        (0o2775, "/d2775"),
+        (0o700, "/d700"),
+    ];
+
+    for &(mode, path) in test_modes {
+        vfs.mkdir(path, mode).unwrap();
+        let disk_path = scratch.path().join(path.trim_start_matches('/'));
+        let c_path = std::ffi::CString::new(disk_path.to_str().unwrap()).unwrap();
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(rc, 0);
+        let on_disk_mode = (st.st_mode as u32) & 0o7777;
+        assert_eq!(
+            on_disk_mode, mode,
+            "on-disk mode for {path} requested {mode:#o} got {on_disk_mode:#o}"
+        );
+    }
+}
