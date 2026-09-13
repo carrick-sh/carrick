@@ -1132,3 +1132,13 @@ commits and is re-checked at the next vet.
   457da5fb6521ff7b, five rows, w4 x3 alternating + w1), log
   `target/conformance/eco-load/measure-sep13c.log`. Probe worktree and
   branch removed; worktrees clean.
+- 2026-09-13 12:15, Task 5 measured (`measure-sep13c.sh`, 40/40): FLAT —
+  net_http w4 3.18 → 3.14 (paired 0.99), other rows within noise. The
+  profile explains it (ecosystem doc "2026-09-13 12:10"): host-socket
+  syscalls left the row (~3% of carrier CPU) but `poll` 9.6% and `write`
+  4.5% are the wait-service reactor's per-cycle poll set and control-pipe
+  wakes, not host sockets — the plan misattributed them. The in-zone
+  landing is correct on its own terms (probe-pinned Linux semantics, no
+  host socket per guest connection) and is the prerequisite for the next
+  lever: the reactor (parked `reactor-kqueue`), now that its two findings
+  (EPOLLET EV_CLEAR; lost wake = probe-after-enroll) are landed shapes.
