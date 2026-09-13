@@ -2921,7 +2921,7 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// `generic`, moving the authoritative inventory to 531 probe sources: 504
 /// conformance sources (481 generic, 23 dedicated), 26 performance sources,
 /// and one helper. Both libc lanes gate 1008 rows.
-const PROBE_SOURCE_COUNT: usize = 532;
+const PROBE_SOURCE_COUNT: usize = 533;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4694,9 +4694,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 481);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 504);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1008);
+    assert_eq!(generic.len(), 482);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 505);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 1010);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
