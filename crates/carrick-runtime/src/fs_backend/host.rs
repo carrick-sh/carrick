@@ -2409,6 +2409,23 @@ impl HostFsBackend {
         }
     }
 
+    /// A marker node (socket/device: a host regular file whose guest type
+    /// lives in xattrs) that is renamed or linked out of a directory carrying
+    /// `CARRICK_DIR_HAS_MARKERS_XATTR` may land in a directory that never saw
+    /// `create_socket`/`create_device`; without the stamp the trusted dirent
+    /// stream would report it as a regular file there. Stamp the destination
+    /// whenever the SOURCE directory has markers: an over-approximation that
+    /// only costs the destination the per-entry xattr classification, never
+    /// a wrong `d_type`.
+    fn propagate_marker_dir(&self, src_parent_fd: i32, dst_parent_fd: i32, dst_rel: &Path) {
+        if fget_u32_xattr(src_parent_fd, CARRICK_DIR_HAS_MARKERS_XATTR).is_none() {
+            return;
+        }
+        fset_u32_xattr(dst_parent_fd, CARRICK_DIR_HAS_MARKERS_XATTR, 1);
+        let parent_rel = dst_rel.parent().unwrap_or_else(|| Path::new(""));
+        self.marker_dirs.write().insert(parent_rel.to_path_buf());
+    }
+
     fn may_have_whiteouts(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         if self.whiteout_seen.load(Relaxed) {
@@ -5094,6 +5111,7 @@ impl FsBackend for HostFsBackend {
             }
             return Err(BackendError::Io);
         }
+        self.propagate_marker_dir(src_pfd, dst_pfd, dst_rel.as_path());
 
         #[cfg(not(target_os = "macos"))]
         {
@@ -5682,6 +5700,11 @@ impl FsBackend for HostFsBackend {
         if rc != 0 {
             return Err(BackendError::Io);
         }
+        self.propagate_marker_dir(
+            src_parent_fd.as_raw_fd(),
+            dst_parent_fd.as_raw_fd(),
+            dst_rel,
+        );
         crate::fs_resolve_cache::bump_generation();
         Ok(())
     }
