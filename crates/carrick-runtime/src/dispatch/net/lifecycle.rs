@@ -2002,6 +2002,11 @@ impl<'a> NetView<'a> {
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
+                    // Task 1 of the in-zone loopback plan: the registry can
+                    // name a guest listener, but nothing registers one until
+                    // Task 2 wires listen/accept/connect. Until then an
+                    // in-zone answer is served exactly like `Unchanged`.
+                    Ok(ConnectTarget::InZone { .. }) => {}
                     Ok(ConnectTarget::Unchanged) => {
                     }
                     Ok(ConnectTarget::Denied(errno)) => {

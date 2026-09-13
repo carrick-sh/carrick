@@ -274,6 +274,14 @@ pub struct HostNetworkProvider {
     inzone: inzone::InZoneRegistry,
 }
 
+impl HostNetworkProvider {
+    pub fn new() -> Self {
+        Self {
+            inzone: inzone::InZoneRegistry::default(),
+        }
+    }
+}
+
 impl NetworkProvider for HostNetworkProvider {
     fn inzone(&self) -> &inzone::InZoneRegistry {
         &self.inzone
@@ -552,7 +560,7 @@ impl RuntimeNetwork {
     }
 
     pub fn with_interposer(mut self, interposer: NetworkInterposer) -> Self {
-        let prev = std::mem::replace(&mut self.provider, Box::<HostNetworkProvider>::default());
+        let prev = std::mem::replace(&mut self.provider, Box::new(HostNetworkProvider::new()));
         self.provider = Box::new(interposer.with_inner(prev));
         self
     }
