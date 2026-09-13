@@ -2721,9 +2721,8 @@ impl HostFsBackend {
     /// — i.e. anything not a plain contained regular file or directory.
     #[cfg(target_os = "macos")]
     pub(crate) fn stat_cache_get_or_fill(&self, rel: &Path) -> Option<RealStat> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
-        const O_EVTONLY: libc::c_int = 0x8000;
 
         let name = rel.file_name()?; // leaf is always a single component here
         let name_c = std::ffi::CString::new(name.as_bytes()).ok()?;
@@ -2868,14 +2867,15 @@ impl HostFsBackend {
         let (override_mode, uid, gid, is_socket) = if self.serves_plain_metadata() {
             (None, None, None, false)
         } else {
-            let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-            let leaf_raw =
-                unsafe { host_openat!(parent_fd.as_raw_fd(), name_c.as_ptr(), leaf_flags, 0) };
-            if leaf_raw < 0 {
-                return None;
+            let root_prefix = self.root_prefix.as_deref()?;
+            let mut full = Vec::with_capacity(root_prefix.len() + 1 + rel.as_os_str().len() + 1);
+            full.extend_from_slice(root_prefix.as_bytes());
+            if !rel.as_os_str().is_empty() {
+                full.push(b'/');
+                full.extend_from_slice(rel.as_os_str().as_bytes());
             }
-            let leaf_fd = unsafe { OwnedFd::from_raw_fd(leaf_raw) };
-            fd_carrick_meta(leaf_fd.as_raw_fd())
+            full.push(0);
+            path_carrick_meta(full.as_ptr() as *const libc::c_char)
         };
         let kind = if is_dir {
             RootFsEntryKind::Directory
@@ -3349,6 +3349,21 @@ fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
     (n == 4).then(|| u32::from_le_bytes(v))
 }
 
+fn lget_u32_xattr(path: *const libc::c_char, name: &[u8]) -> Option<u32> {
+    #[cfg(test)]
+    HOST_XATTR_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut v = [0u8; 4];
+    let n = unsafe {
+        carrick_portable::lgetxattr(
+            path,
+            name.as_ptr() as *const libc::c_char,
+            v.as_mut_ptr() as *mut libc::c_void,
+            v.len(),
+        )
+    };
+    (n == 4).then(|| u32::from_le_bytes(v))
+}
+
 pub(crate) fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
     let v = val.to_le_bytes();
     // Portable fd-xattr (Linux fsetxattr / macOS f*xattr+position / FreeBSD extattr_set_fd).
@@ -3480,6 +3495,35 @@ pub(crate) fn fd_carrick_meta(
     let listed = &names[..n as usize];
     let has = |name: &[u8]| listed.split_inclusive(|&b| b == 0).any(|s| s == name);
     let read_if = |present: bool, name| present.then(|| fget_u32_xattr(fd, name)).flatten();
+    (
+        read_if(has(CARRICK_MODE_XATTR), CARRICK_MODE_XATTR),
+        read_if(has(CARRICK_UID_XATTR), CARRICK_UID_XATTR).map(NsUid::new),
+        read_if(has(CARRICK_GID_XATTR), CARRICK_GID_XATTR).map(NsGid::new),
+        has(CARRICK_SOCKET_XATTR),
+    )
+}
+
+/// Read carrick's guest metadata (mode / owner uid+gid / AF_UNIX-socket marker)
+/// for a path in ONE `llistxattr` plus a targeted `lgetxattr` for only the
+/// attributes actually present — without opening a file descriptor.
+pub(crate) fn path_carrick_meta(
+    path: *const libc::c_char,
+) -> (Option<u32>, Option<NsUid>, Option<NsGid>, bool) {
+    let mut names = [0u8; 1024];
+    let n = unsafe {
+        carrick_portable::llistxattr(path, names.as_mut_ptr() as *mut libc::c_char, names.len())
+    };
+    if n < 0 || n as usize > names.len() {
+        return (
+            lget_u32_xattr(path, CARRICK_MODE_XATTR),
+            lget_u32_xattr(path, CARRICK_UID_XATTR).map(NsUid::new),
+            lget_u32_xattr(path, CARRICK_GID_XATTR).map(NsGid::new),
+            lget_u32_xattr(path, CARRICK_SOCKET_XATTR).is_some(),
+        );
+    }
+    let listed = &names[..n as usize];
+    let has = |name: &[u8]| listed.split_inclusive(|&b| b == 0).any(|s| s == name);
+    let read_if = |present: bool, name| present.then(|| lget_u32_xattr(path, name)).flatten();
     (
         read_if(has(CARRICK_MODE_XATTR), CARRICK_MODE_XATTR),
         read_if(has(CARRICK_UID_XATTR), CARRICK_UID_XATTR).map(NsUid::new),
@@ -4381,7 +4425,7 @@ impl FsBackend for HostFsBackend {
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = NormalizedRelPath::from_normalized_relative(normalized);
-        self.make_dir_at(None, None, &rel)
+        self.make_dir_at(None, None, &rel, 0o755)
     }
 
     fn make_dir_at(
@@ -4389,9 +4433,16 @@ impl FsBackend for HostFsBackend {
         parent_fd: Option<&std::os::fd::OwnedFd>,
         leaf_c: Option<&std::ffi::CStr>,
         rel: &NormalizedRelPath,
+        mode: u32,
     ) -> Result<(), BackendError> {
         use std::os::fd::AsRawFd;
         let _mutation = self.archive_mutation_gate.mutation();
+        let effective_mode = if mode == 0 { 0o755 } else { mode & 0o7777 };
+        let native_mode = if effective_mode & 0o700 == 0o700 {
+            effective_mode as libc::mode_t
+        } else {
+            ((effective_mode | 0o700) & 0o7777) as libc::mode_t
+        };
         let (pfd, name_c) = match (parent_fd, leaf_c) {
             (Some(fd), Some(name)) => (fd.as_raw_fd(), name),
             _ => {
@@ -4408,7 +4459,9 @@ impl FsBackend for HostFsBackend {
                     .file_name()
                     .and_then(cstring_from_osstr)
                     .ok_or(BackendError::Invalid)?;
-                let rc = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), 0o755) };
+                let rc = unsafe {
+                    libc::mkdirat(parent_fd.as_raw_fd(), leaf_name.as_ptr(), native_mode)
+                };
                 if rc != 0 {
                     let err = std::io::Error::last_os_error();
                     if err.kind() != std::io::ErrorKind::AlreadyExists {
@@ -4438,7 +4491,7 @@ impl FsBackend for HostFsBackend {
                 return Ok(());
             }
         };
-        let rc = unsafe { libc::mkdirat(pfd, name_c.as_ptr(), 0o755) };
+        let rc = unsafe { libc::mkdirat(pfd, name_c.as_ptr(), native_mode) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::AlreadyExists {
@@ -5591,6 +5644,40 @@ impl FsBackend for HostFsBackend {
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
         let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let mode = mode & 0o7777;
+        let owner_ok_dir = mode & 0o700 == 0o700;
+        let owner_ok_file = mode & 0o600 == 0o600;
+        if let Some(rel) = Self::rel_path(&normalized)
+            && let Some((parent_fd, leaf_c)) = self.namei_leaf(rel)
+        {
+            use std::os::fd::AsRawFd;
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            if unsafe {
+                host_fstatat!(
+                    parent_fd.as_raw_fd(),
+                    leaf_c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                let kind = st.st_mode as u32 & libc::S_IFMT as u32;
+                if kind != libc::S_IFLNK as u32 && kind != libc::S_IFIFO as u32 {
+                    let is_dir = kind == libc::S_IFDIR as u32;
+                    let owner_ok = if is_dir { owner_ok_dir } else { owner_ok_file };
+                    let on_disk_mode = st.st_mode as u32 & 0o7777;
+                    let native_mode = if owner_ok { mode } else { mode | 0o700 };
+                    if on_disk_mode == native_mode
+                        && owner_ok
+                        && !self
+                            .meta_xattr_seen
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let fd = self
             .metadata_fd(&normalized, false)
             .map_err(|_| BackendError::Io)?;
@@ -5598,7 +5685,6 @@ impl FsBackend for HostFsBackend {
         if unsafe { host_fstat!(fd.as_raw_fd(), &mut st) } != 0 {
             return Err(BackendError::Io);
         }
-        let mode = mode & 0o7777;
         let kind = st.st_mode as u32 & libc::S_IFMT as u32;
         if kind == libc::S_IFIFO as u32 {
             return unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) }
@@ -6634,7 +6720,31 @@ pub(crate) fn read_host_dir_entries(
             libc::DT_FIFO => RootFsEntryKind::Fifo,
             libc::DT_SOCK => RootFsEntryKind::Socket,
             libc::DT_CHR => RootFsEntryKind::CharDevice,
-            // DT_UNKNOWN / DT_BLK / anything else: the stream cannot answer
+            libc::DT_UNKNOWN => {
+                let name_c = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                let rc = unsafe {
+                    host_fstatat!(
+                        host_dir_fd,
+                        name_c.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc != 0 {
+                    continue;
+                }
+                match st.st_mode as u32 & libc::S_IFMT as u32 {
+                    s if s == libc::S_IFDIR as u32 => RootFsEntryKind::Directory,
+                    s if s == libc::S_IFREG as u32 => RootFsEntryKind::File,
+                    s if s == libc::S_IFLNK as u32 => RootFsEntryKind::Symlink,
+                    s if s == libc::S_IFIFO as u32 => RootFsEntryKind::Fifo,
+                    s if s == libc::S_IFSOCK as u32 => RootFsEntryKind::Socket,
+                    s if s == libc::S_IFCHR as u32 => RootFsEntryKind::CharDevice,
+                    _ => continue,
+                }
+            }
+            // DT_BLK / anything else: the stream cannot answer
             // d_type faithfully — layered path for the WHOLE directory.
             _ => return None,
         };
@@ -6682,11 +6792,34 @@ pub(crate) fn try_layered_stream_dirents(
     rootfs: Option<&RootFs>,
     dir: &str,
 ) -> Option<Vec<RootFsDirEntry>> {
-    let upper = overlay.stream_dirents(dir)?;
+    let upper = match overlay.stream_dirents(dir) {
+        Some(u) => u,
+        None => {
+            if overlay.lookup_kind(dir) == Some(OverlayEntryKind::Dir) {
+                return None;
+            }
+            Vec::new()
+        }
+    };
     let lower = match rootfs {
-        Some(rootfs) => rootfs.stream_dirents(dir)?,
+        Some(rootfs) => match rootfs.stream_dirents(dir) {
+            Some(l) => l,
+            None => {
+                if rootfs.directory_entries_bounded(dir, 0).is_ok() {
+                    return None;
+                }
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     };
+    if upper.is_empty() && lower.is_empty() {
+        let upper_has = overlay.lookup_kind(dir) == Some(OverlayEntryKind::Dir);
+        let lower_has = rootfs.is_some_and(|r| r.directory_entries_bounded(dir, 0).is_ok());
+        if !upper_has && !lower_has {
+            return None;
+        }
+    }
     let deleted: HashSet<String> = overlay.deleted_child_names(dir).into_iter().collect();
     let upper_names: HashSet<&str> = upper.iter().map(|row| row.name.as_str()).collect();
     let mut out: Vec<_> = lower

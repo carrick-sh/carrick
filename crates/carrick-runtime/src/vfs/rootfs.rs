@@ -1733,7 +1733,7 @@ impl Vfs for RootFsVfs {
         Ok(out)
     }
 
-    fn mkdir(&self, path: &str, _mode: u32) -> Result<(), VfsError> {
+    fn mkdir(&self, path: &str, mode: u32) -> Result<(), VfsError> {
         // Layered EEXIST: an existing overlay or rootfs entry (file
         // or dir) at `path` blocks mkdir. A tombstone clears the
         // rootfs view so a re-create is allowed.
@@ -1753,7 +1753,12 @@ impl Vfs for RootFsVfs {
         }
         let parent = self.resolved_parent(path)?;
         self.overlay
-            .make_dir_at(parent.parent_fd.as_deref(), Some(&parent.leaf), &parent.rel)
+            .make_dir_at(
+                parent.parent_fd.as_deref(),
+                Some(&parent.leaf),
+                &parent.rel,
+                mode,
+            )
             .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         self.dentry_cache.entry_created(path, None);
         Ok(())
