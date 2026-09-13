@@ -335,6 +335,17 @@
     },
     {
       "file": "crates/carrick-thread/src/fork_quiesce.rs",
+      "function": "QuiesceBarrier::subscribe_fork_release",
+      "ordinal_in_function": 1,
+      "fingerprint": "8ce8d196bed6e4a684afe3100b3f0b5a1d18121d3fa88db909a111c8cbfdb5e0",
+      "verdict": "carrier_fault",
+      "failure_domain": "thread::fork_quiesce",
+      "rationale": "Fork-release listener ID was zero or wrapped, violating the non-zero one-shot listener invariant.",
+      "sink": "fatal",
+      "domain": "thread::fork_quiesce"
+    },
+    {
+      "file": "crates/carrick-thread/src/fork_quiesce.rs",
       "function": "QuiesceBarrier::publish_quiesce_event",
       "ordinal_in_function": 1,
       "fingerprint": "b0d182ebcb9cbc669f1ccaeec9f82785bff045d00a9658c0150e9db4189f4d73",
