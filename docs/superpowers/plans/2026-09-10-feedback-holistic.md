@@ -795,3 +795,13 @@ commits and is re-checked at the next vet.
   binary, 2/3 TIMEOUT paired at w4). Probe gate + paired five-row
   re-measure (`measure-sep12c.sh`, cand d8fbd6a94562b880 vs base
   3c8dbee5b686c49d) queued behind it.
+- 2026-09-12 17:15, CLOSE OF THE DAY: probe gate on d8fbd6a94562b880 =
+  46/46 (no probe DIFF; execfromthread and container_gate both green);
+  paired scorecard 40/40 MATCH — compile 0.55, tarfile 0.68, importlib
+  0.82, multiprocessing 0.87, net_http 0.95 of base at w4 (ecosystem doc
+  "2026-09-12 17:15"). Three director runtime fixes today (fork-quiesce
+  wake, sibling-drain survivor membership, alias lock order), each from a
+  core taken with the new `lldb-run --fatal-hold-seconds`; two worker
+  rounds on the exec class were rejected live. Worktrees clean. Next:
+  fresh dtrace rankings on the compile and tarfile rows on this binary,
+  then the next per-row cluster.
