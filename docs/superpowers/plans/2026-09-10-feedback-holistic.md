@@ -831,3 +831,19 @@ commits and is re-checked at the next vet.
   landing.
 - 2026-09-12 18:00, probe gate on the merged main fe4e624d9815d209 (with
   the alias-unregister landing): 46/46, no probe DIFF.
+- 2026-09-12 18:30, `hostfs-opens` round 1 REJECTED for landing (branch
+  binary 6267db84299a9db9): a guest-visible REGRESSION — with guest
+  umask 0, mkdir(0o777/0o775/0o2775) lands as 0o755 (setgid lost) because
+  host `mkdirat` applies the host umask and the new fast path skips
+  `set_mode` for owner-rwx modes; main and the Docker oracle both give
+  777/775/2775. Gain was partial: host `__openat` 51.5% → 40%, tarfile
+  15.2 → 14.2 s; the layered directory listing still costs 22% because
+  `dir_has_overlay_interference` is tree-wide (one marker node anywhere
+  refuses the trusted stream for every directory), mkdir still opens the
+  parent for containment (`validate_parents_fast`) and stats it through
+  the dentry cache, and every guest open re-opens the parent
+  (`open_trusted_dir_fd`, 9.8%). Round 2 brief sent (mode fidelity first,
+  red against the oracle table; per-directory interference; mkdir and
+  open bounds). Also fixed on main: `just doc` red from three intra-doc
+  links broken by the splits (b9f4feeeb) — `just ci` is green-capable
+  again.
