@@ -324,7 +324,13 @@ pub(super) struct OpenDescriptionBase {
     /// after a datagram is sent. Store that errno here and copy it into
     /// `pending_socket_error` after each successful connected send.
     socket_error_after_send: Option<i32>,
+    /// Weak reference to an in-zone listener for listening host stream sockets.
+    inzone_listener: Option<std::sync::Weak<crate::network::inzone::InZoneListener>>,
+    inzone_cleanup: Option<std::sync::Arc<dyn InZoneCleanup>>,
 }
+
+pub(crate) trait InZoneCleanup: std::fmt::Debug + Send + Sync {}
+impl<T: std::fmt::Debug + Send + Sync> InZoneCleanup for T {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct SocketMulticastMembership {
@@ -352,6 +358,8 @@ impl OpenDescriptionBase {
             send_timeout: None,
             pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
             pipe_capacity_shared: None,
+            inzone_listener: None,
+            inzone_cleanup: None,
         }
     }
 
@@ -482,6 +490,23 @@ impl OpenDescriptionBase {
     }
     pub(super) fn clear_socket_error_after_send(&mut self) {
         self.socket_error_after_send = None;
+    }
+    pub(super) fn inzone_listener(
+        &self,
+    ) -> Option<std::sync::Arc<crate::network::inzone::InZoneListener>> {
+        self.inzone_listener.as_ref().and_then(|w| w.upgrade())
+    }
+    pub(super) fn set_inzone_listener(
+        &mut self,
+        listener: Option<std::sync::Weak<crate::network::inzone::InZoneListener>>,
+    ) {
+        self.inzone_listener = listener;
+    }
+    pub(super) fn set_inzone_cleanup(
+        &mut self,
+        cleanup: Option<std::sync::Arc<dyn InZoneCleanup>>,
+    ) {
+        self.inzone_cleanup = cleanup;
     }
 }
 
@@ -1498,6 +1523,7 @@ impl OpenDescription {
             Self::Epoll { wait_queue, .. } => Some(Arc::clone(wait_queue)),
             Self::Netlink { wait_queue, .. } => Some(Arc::clone(wait_queue)),
             Self::Packet { socket, .. } => Some(Arc::clone(&socket.wait_queue)),
+            Self::HostSocket { base, .. } => base.inzone_listener().map(|l| l.wait_queue()),
             _ => None,
         }
     }
@@ -2066,6 +2092,12 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                     || *type_ == carrick_abi::LINUX_SOCK_SEQPACKET;
                 if is_stream_like {
                     if base.listening() {
+                        let inzone_has_pending =
+                            base.inzone_listener().is_some_and(|l| l.pending() > 0);
+                        let mut ready = LinuxEpollEvents::empty();
+                        if inzone_has_pending && interest.contains(LinuxEpollEvents::IN) {
+                            ready |= LinuxEpollEvents::IN;
+                        }
                         let mut pfd = libc::pollfd {
                             fd: host_fd.raw(),
                             events: 0,
@@ -2075,7 +2107,6 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                             pfd.events |= libc::POLLIN;
                         }
                         let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                        let mut ready = LinuxEpollEvents::empty();
                         if rc > 0 {
                             if pfd.revents & libc::POLLIN != 0 {
                                 ready |= LinuxEpollEvents::IN;

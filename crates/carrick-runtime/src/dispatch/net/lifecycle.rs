@@ -24,6 +24,61 @@ use crate::dispatch::{
 };
 use carrick_spec::PortProtocol;
 
+struct InZoneListenerGuard {
+    network: Arc<crate::network::RuntimeNetwork>,
+    listener: Arc<crate::network::inzone::InZoneListener>,
+}
+
+impl std::fmt::Debug for InZoneListenerGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InZoneListenerGuard")
+            .field("listener", &self.listener)
+            .finish()
+    }
+}
+
+impl Drop for InZoneListenerGuard {
+    fn drop(&mut self) {
+        self.network.provider.inzone().unregister(&self.listener);
+        while let Some(server_half) = self.listener.dequeue() {
+            if let Some(client_half) = server_half
+                .state
+                .lock()
+                .peer
+                .as_ref()
+                .and_then(|p| p.upgrade())
+            {
+                client_half.set_so_error(carrick_abi::LINUX_ECONNRESET.get());
+            }
+            let _ = server_half.shutdown(crate::dispatch::net::unix_pure::LINUX_SHUT_RDWR);
+        }
+    }
+}
+
+struct InZoneEphemeralGuard {
+    network: Arc<crate::network::RuntimeNetwork>,
+    scope: crate::network::inzone::InZoneScope,
+    port: crate::network::inzone::InZonePort,
+}
+
+impl std::fmt::Debug for InZoneEphemeralGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InZoneEphemeralGuard")
+            .field("scope", &self.scope)
+            .field("port", &self.port)
+            .finish()
+    }
+}
+
+impl Drop for InZoneEphemeralGuard {
+    fn drop(&mut self) {
+        self.network
+            .provider
+            .inzone()
+            .release_ephemeral(&self.scope, self.port);
+    }
+}
+
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut chunks = bytes.chunks_exact(2);
@@ -1031,7 +1086,7 @@ impl<'a> NetView<'a> {
         let fd = fd.0;
         let addr_addr = addr.0;
         let addrlen_addr = addrlen.0;
-        let (host_fd, family, type_, protocol) = {
+        let (host_fd, family, type_, protocol, inzone_listener) = {
             let Some(open_file) = self.open_file(fd) else {
                 return DispatchOutcome::errno(LINUX_EBADF);
             };
@@ -1048,13 +1103,76 @@ impl<'a> NetView<'a> {
                     family,
                     type_,
                     protocol,
+                    base,
                     ..
-                }) => (host_fd.raw(), *family, *type_, *protocol),
+                }) => (
+                    host_fd.raw(),
+                    *family,
+                    *type_,
+                    *protocol,
+                    base.inzone_listener(),
+                ),
                 _ => {
                     return DispatchOutcome::errno(LINUX_ENOTSOCK);
                 }
             }
         };
+
+        if let Some(listener) = &inzone_listener {
+            if let Some(server_half) = listener.dequeue() {
+                if addr_addr != 0 && addrlen_addr != 0 {
+                    let linux_bytes = server_half
+                        .peer_addr()
+                        .and_then(socket_addr_to_linux_sockaddr);
+                    let Some(linux_bytes) = linux_bytes else {
+                        return DispatchOutcome::errno(carrick_abi::LINUX_EFAULT);
+                    };
+                    if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err()
+                    {
+                        return DispatchOutcome::errno(carrick_abi::LINUX_EFAULT);
+                    }
+                }
+                let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
+                let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
+                let status_flags = carrick_abi::LINUX_O_RDWR
+                    | if nonblock {
+                        carrick_abi::LINUX_O_NONBLOCK
+                    } else {
+                        0
+                    };
+                let fd_flags = if cloexec {
+                    carrick_abi::LINUX_FD_CLOEXEC
+                } else {
+                    0
+                };
+                let in_memory_id = Arc::as_ptr(&server_half) as usize as u64;
+                let socket_key = crate::network::SocketKey::for_in_memory(in_memory_id);
+                let _ = self.network.provider.record_socket_addresses(
+                    self.network.spec.namespace_id.as_ref(),
+                    socket_key,
+                    server_half.local_addr().map(GuestSocketAddr),
+                    None,
+                    server_half.peer_addr().map(GuestSocketAddr),
+                    carrick_spec::PortProtocol::Tcp,
+                );
+                let mut base = OpenDescriptionBase::new(status_flags);
+                base.set_connected(true);
+                let open_desc = OpenDescription::InMemorySocket {
+                    base,
+                    socket: server_half,
+                };
+                let open_file = OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(open_desc)),
+                    status_flags,
+                    fd_flags,
+                );
+                let linux_fd = match self.install_fd_at_or_above(3, open_file) {
+                    Ok(n) => n,
+                    Err(_) => return DispatchOutcome::errno(carrick_abi::LINUX_EMFILE),
+                };
+                return DispatchOutcome::returned_i32(linux_fd);
+            }
+        }
         // accept(2) has no per-call non-blocking flag, but listen() already put
         // the host listen socket in non-blocking mode, so this never blocks.
         // Whether EAGAIN becomes a wait or an EAGAIN to the guest is decided by
@@ -1104,6 +1222,29 @@ impl<'a> NetView<'a> {
             }
             last
         });
+        let outcome = match outcome {
+            DispatchOutcome::WaitOnFds {
+                fds: _,
+                timeout,
+                sig_mask,
+                completion,
+            } if inzone_listener.is_some() => {
+                let files = self.captured_file_table();
+                let fds = match WaitFds::raw_one(host_fd, libc::POLLIN)
+                    .with_redispatch_and_watched_slots(&files, [fd], [fd])
+                {
+                    Ok(fds) => fds,
+                    Err(errno) => return DispatchOutcome::errno(errno),
+                };
+                DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout,
+                    sig_mask,
+                    completion,
+                }
+            }
+            other => other,
+        };
         let new_host = match outcome {
             DispatchOutcome::Returned { value } => value as i32,
             // WaitOnFds (block) or Errno — propagate; the runtime re-dispatches
@@ -1636,6 +1777,19 @@ impl<'a> NetView<'a> {
             };
             let mut host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
             let mut rewritten_bind: Option<(std::net::SocketAddr, PortProtocol)> = None;
+            if (family == LINUX_AF_INET || family == LINUX_AF_INET6)
+                && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
+            {
+                let scope = match this.network.spec.namespace_id.as_ref() {
+                    Some(id) => crate::network::inzone::InZoneScope::Namespace(id.clone()),
+                    None => crate::network::inzone::InZoneScope::CarrierHost,
+                };
+                if requested.port() != 0
+                    && this.network.provider.inzone().port_in_use(&scope, requested.port())
+                {
+                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRINUSE));
+                }
+            }
             if family == LINUX_AF_INET
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
@@ -1830,7 +1984,7 @@ impl<'a> NetView<'a> {
 
             let fd: Fd = fd;
             let backlog = backlog as i32;
-            let (host_fd, _family) = this.host_socket_lookup(fd.0)?;
+            let (host_fd, family) = this.host_socket_lookup(fd.0)?;
             if let Some(protocol) = this.socket_port_protocol(fd.0)
                 && let Some(host_local) = host_socket_addr(host_fd.get(), libc::AF_INET, false)
                 && let Err(errno) = this.network.provider.prepare_listen(
@@ -1856,10 +2010,49 @@ impl<'a> NetView<'a> {
             }
             if let Some(open_file) = this.open_file(fd.0)
                 && let Some(mut open) = open_file.description.write()
-                && let OpenDescription::HostSocket { base, .. } =
+                && let OpenDescription::HostSocket { base, type_, .. } =
                     &mut *open
             {
                 base.set_listening(true);
+                if *type_ == LINUX_SOCK_STREAM {
+                    let scope = match this.network.spec.namespace_id.as_ref() {
+                        Some(id) => crate::network::inzone::InZoneScope::Namespace(id.clone()),
+                        None => crate::network::inzone::InZoneScope::CarrierHost,
+                    };
+                    let guest_local = this
+                        .network
+                        .provider
+                        .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(
+                            host_fd.get(),
+                        ))
+                        .ok()
+                        .flatten()
+                        .or_else(|| {
+                            host_socket_addr(host_fd.get(), family, false)
+                                .map(crate::network::GuestSocketAddr)
+                        });
+                    if let Some(guest_local) = guest_local {
+                        if let Some(existing) = base.inzone_listener() {
+                            existing.set_backlog(backlog.max(0) as usize);
+                        } else {
+                            let key = crate::network::inzone::InZoneListenerKey {
+                                scope,
+                                addr: guest_local,
+                            };
+                            let inzone_listener = this
+                                .network
+                                .provider
+                                .inzone()
+                                .register(key, backlog.max(0) as usize);
+                            let cleanup_guard = Arc::new(InZoneListenerGuard {
+                                network: Arc::clone(this.network),
+                                listener: Arc::clone(&inzone_listener),
+                            });
+                            base.set_inzone_listener(Some(Arc::downgrade(&inzone_listener)));
+                            base.set_inzone_cleanup(Some(cleanup_guard));
+                        }
+                    }
+                }
             }
             crate::event_ring::rec(crate::event_ring::LISTEN, host_fd.get(), 0, 0);
             // A listen socket exists only to accept(2); make the HOST socket
@@ -1925,7 +2118,7 @@ impl<'a> NetView<'a> {
                 PortProtocol,
             )> = None;
             let mut synthetic_error_after_send = false;
-            if family == LINUX_AF_INET
+            if matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
             {
@@ -2002,11 +2195,114 @@ impl<'a> NetView<'a> {
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    // Task 1 of the in-zone loopback plan: the registry can
-                    // name a guest listener, but nothing registers one until
-                    // Task 2 wires listen/accept/connect. Until then an
-                    // in-zone answer is served exactly like `Unchanged`.
-                    Ok(ConnectTarget::InZone { .. }) => {}
+                    Ok(ConnectTarget::InZone { listener, target }) => {
+                        let Some(open_file) = this.open_file(fd) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        };
+                        let file_desc = open_file.description();
+                        let status_flags = file_desc.common().status_flags();
+                        let old_host_fd = {
+                            let open = file_desc.read();
+                            if let Some(OpenDescription::HostSocket { host_fd, .. }) = open.as_deref() {
+                                Some(host_fd.raw())
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(hfd) = old_host_fd {
+                            this.network.provider.forget_socket_addresses(crate::network::SocketKey::for_host_fd(hfd));
+                        }
+                        let scope = match this.network.spec.namespace_id.as_ref() {
+                            Some(id) => crate::network::inzone::InZoneScope::Namespace(id.clone()),
+                            None => crate::network::inzone::InZoneScope::CarrierHost,
+                        };
+                        let addr_family = match target.0 {
+                            std::net::SocketAddr::V4(_) => crate::network::inzone::AddrFamily::V4,
+                            std::net::SocketAddr::V6(_) => crate::network::inzone::AddrFamily::V6,
+                        };
+                        let Some(ephemeral_port) = this
+                            .network
+                            .provider
+                            .inzone()
+                            .allocate_ephemeral(&scope, addr_family)
+                        else {
+                            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRNOTAVAIL));
+                        };
+                        let client_local = match target.0 {
+                            std::net::SocketAddr::V4(_) => std::net::SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                ephemeral_port.raw(),
+                            ),
+                            std::net::SocketAddr::V6(_) => std::net::SocketAddr::new(
+                                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                                ephemeral_port.raw(),
+                            ),
+                        };
+                        let creds = this.cred_snapshot();
+                        let ucred = crate::dispatch::net::unix_pure::LinuxUcred {
+                            pid: this.identity_pid() as i32,
+                            uid: creds.euid.raw(),
+                            gid: creds.egid.raw(),
+                        };
+                        let (client_half, server_half) =
+                            crate::dispatch::net::unix_pure::PureSocketInner::pair_with_family(
+                                family,
+                                LINUX_SOCK_STREAM,
+                                LINUX_IPPROTO_TCP,
+                                ucred,
+                                ucred,
+                            );
+                        {
+                            let mut c = client_half.state.lock();
+                            c.local_sockaddr = Some(client_local);
+                            c.peer_sockaddr = Some(target.0);
+                        }
+                        {
+                            let mut s = server_half.state.lock();
+                            s.local_sockaddr = Some(target.0);
+                            s.peer_sockaddr = Some(client_local);
+                        }
+                        let enqueue_res = listener.enqueue(Arc::clone(&server_half));
+                        if enqueue_res == crate::network::inzone::InZoneEnqueue::BacklogFull {
+                            this.network.provider.inzone().release_ephemeral(&scope, ephemeral_port);
+                            if this.io_is_nonblocking(fd, 0) {
+                                this.set_socket_pending_error(fd, carrick_abi::LINUX_ECONNREFUSED);
+                                return Ok(DispatchOutcome::errno(LINUX_EINPROGRESS));
+                            } else {
+                                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED));
+                            }
+                        }
+                        let in_memory_id = Arc::as_ptr(&client_half) as usize as u64;
+                        let socket_key = crate::network::SocketKey::for_in_memory(in_memory_id);
+                        let _ = this.network.provider.record_socket_addresses(
+                            this.network.spec.namespace_id.as_ref(),
+                            socket_key,
+                            Some(GuestSocketAddr(client_local)),
+                            None,
+                            Some(target),
+                            carrick_spec::PortProtocol::Tcp,
+                        );
+                        let ephemeral_guard = Arc::new(InZoneEphemeralGuard {
+                            network: Arc::clone(this.network),
+                            scope,
+                            port: ephemeral_port,
+                        });
+                        let mut base = OpenDescriptionBase::new(status_flags);
+                        base.set_connected(true);
+                        base.set_inzone_cleanup(Some(ephemeral_guard));
+                        if let Some(mut open) = file_desc.write() {
+                            *open = OpenDescription::InMemorySocket {
+                                base,
+                                socket: Arc::clone(&client_half),
+                            };
+                        }
+                        this.notify_inmem_epoll();
+                        if this.io_is_nonblocking(fd, 0) {
+                            return Ok(DispatchOutcome::errno(LINUX_EINPROGRESS));
+                        } else {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                    }
                     Ok(ConnectTarget::Unchanged) => {
                     }
                     Ok(ConnectTarget::Denied(errno)) => {
