@@ -1154,10 +1154,17 @@ where
             .continuation_services(parent_context.kernel())
             .0;
         let wake_thread = parent_context.thread().key();
-        let subscribe_barrier = || loop {
+        // A losing forker waits for the fork TOKEN (`end_fork`), not for a
+        // quiesce: the winner raises `quiescing` only part-way through its
+        // fork, so a quiesce-oriented subscription answers `Ready` in that
+        // window and looping on it spun the loser on its executor forever,
+        // holding the clone reservation the winner was waiting to close
+        // (forkexecstorm, 2026-09-12). `None` means the token was free at the
+        // subscribe instant: retry `try_begin_fork` instead of parking.
+        let subscribe_barrier = || {
             let observed = process_barrier.publication_generation();
             let wake_scheduler = Arc::clone(&scheduler);
-            match process_barrier.subscribe_quiesce(
+            match process_barrier.subscribe_fork_release(
                 observed,
                 Arc::new(move |_| {
                     let _ = if is_external_exec {
@@ -1167,11 +1174,11 @@ where
                     };
                 }),
             ) {
-                carrick_thread::fork_quiesce::QuiesceEnrollment::Ready(_) => continue,
+                carrick_thread::fork_quiesce::QuiesceEnrollment::Ready(_) => None,
                 carrick_thread::fork_quiesce::QuiesceEnrollment::Subscribed(subscription) => {
-                    break ProcessForkRetrySubscription::Barrier {
+                    Some(ProcessForkRetrySubscription::Barrier {
                         _subscription: subscription,
-                    };
+                    })
                 }
             }
         };
@@ -1221,7 +1228,9 @@ where
                 ProcessForkStart::AdmissionDeferred { observed_epoch } => {
                     return Ok(defer_on_admission(observed_epoch, request, external_exec));
                 }
-                ProcessForkStart::Busy => {
+                ProcessForkStart::Busy => loop {
+                    // Subscribe, THEN retry the token: a release published
+                    // between the two consumes the subscription and wakes us.
                     let subscription = subscribe_barrier();
                     match try_begin_hvpatch_process_fork_with_admission(
                         process_barrier,
@@ -1230,7 +1239,10 @@ where
                     ) {
                         ProcessForkStart::Admitted { admission } => {
                             drop(subscription);
-                            ProcessForkCoordinator::new(Arc::clone(process_barrier), admission)
+                            break ProcessForkCoordinator::new(
+                                Arc::clone(process_barrier),
+                                admission,
+                            );
                         }
                         ProcessForkStart::AdmissionClosed => {
                             return Ok(PreparedInProcessFork::Complete(Some(
@@ -1241,16 +1253,22 @@ where
                             drop(subscription);
                             return Ok(defer_on_admission(observed_epoch, request, external_exec));
                         }
-                        ProcessForkStart::Busy => {
-                            return Ok(PreparedInProcessFork::Retry {
-                                request,
-                                coordinator: None,
-                                external_exec,
-                                _subscription: subscription,
-                            });
-                        }
+                        ProcessForkStart::Busy => match subscription {
+                            Some(subscription) => {
+                                return Ok(PreparedInProcessFork::Retry {
+                                    request,
+                                    coordinator: None,
+                                    external_exec,
+                                    _subscription: subscription,
+                                });
+                            }
+                            // The token was free when we looked and another
+                            // forker took it since; its `end_fork` publishes,
+                            // so the next subscription parks.
+                            None => continue,
+                        },
                     }
-                }
+                },
             },
         };
         let process_fork_admission = coordinator.process_admission.as_ref().unwrap_or_else(|| {
@@ -2885,6 +2903,32 @@ mod pt_pause_tests {
             Some(val) => val,
             None => unreachable!(),
         }
+    }
+
+    /// The losing forker parks on the fork TOKEN (`subscribe_fork_release`),
+    /// never on the quiesce publication: `subscribe_quiesce` is `Ready`
+    /// whenever the flag is low, and the winner holds the token with the
+    /// flag low between `try_begin_fork` and `set_quiescing`, so a loser
+    /// looping on it spun its executor and never released the clone
+    /// reservation the winner was waiting on (forkexecstorm hang,
+    /// 2026-09-12).
+    #[test]
+    fn process_fork_loser_waits_on_the_fork_token_not_the_quiesce() {
+        let source = include_str!("quiesce.rs");
+        let prepare = expect_test(
+            expect_test(
+                source.split("pub(super) fn prepare_in_process_fork").nth(1),
+                "prepare_in_process_fork missing from quiesce.rs",
+            )
+            .split("\n#[cfg(test)]")
+            .next(),
+            "prepare_in_process_fork body missing from quiesce.rs",
+        );
+        assert!(prepare.contains("process_barrier.subscribe_fork_release("));
+        assert!(!prepare.contains("process_barrier.subscribe_quiesce("));
+        // A `Ready` answer (token free) must fall through to a token retry,
+        // never re-subscribe in place.
+        assert!(!prepare.contains("QuiesceEnrollment::Ready(_) => continue"));
     }
 
     #[test]
