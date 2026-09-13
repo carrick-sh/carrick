@@ -1007,3 +1007,9 @@ commits and is re-checked at the next vet.
   be fixed on its own (EPOLLET read interest → EV_CLEAR on the instance
   kqueue) with the line-exact epoll probes as judges before any reactor
   change is retried.
+- 2026-09-13 07:05, brief `epollet-evclear.md` dispatched (worker
+  `epollet-evclear-sep13`, worktree from d18d6dc67): the parked reactor's
+  durable finding on its own — EPOLLET read interests register EV_CLEAR on
+  the instance kqueue; red-first "instance fd not readable after a
+  delivered edge with unread data"; epoll/ppoll line-exact probes judge;
+  three net_http timings + poll share receipt. Wait service untouched.
