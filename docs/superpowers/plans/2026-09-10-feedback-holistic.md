@@ -805,3 +805,18 @@ commits and is re-checked at the next vet.
   rounds on the exec class were rejected live. Worktrees clean. Next:
   fresh dtrace rankings on the compile and tarfile rows on this binary,
   then the next per-row cluster.
+- 2026-09-12 17:25, fresh carrier user-CPU rankings on d8fbd6a94562b880
+  (`target/perf/perf2x-sep12/prof-final/{compile,tarfile}.rank`):
+  compile (7.3 s): 58.8% guest execution; 22.3% munmap of which 19.9%
+  of ALL samples is `_platform_memmove` in `unregister_alias_entries`'s
+  per-row `rows.remove/insert` on the scope bucket — worker
+  `alias-unregister-sep12` (single-pass compaction, red-first rows-moved
+  bound). tarfile (15.2 s): 13.2% guest, 51.5% host `__openat` —
+  `child_names_bounded` 15.5%, `stat_cache_get_or_fill` 10.7%,
+  `open_trusted_dir_fd` 8.6%, dentry `construct_positive_from_stat`
+  5.9%, `dir_fd_for_hops` 4.0%, `metadata_fd` for `set_mode` 3.3%;
+  mkdirat 28% (RootFsVfs::mkdir → set_mode opens the new dir to chmod),
+  getdents64 22% via the layered listing fallback that stats every child
+  — worker `hostfs-opens-sep12` (fchmodat/fstatat/trusted dirent stream,
+  red-first host-openat counts). Director verifies by re-profiling both
+  rows and the probe gate.
