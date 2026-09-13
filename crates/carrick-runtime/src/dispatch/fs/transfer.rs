@@ -1417,7 +1417,7 @@ impl<'a> FsView<'a> {
                                 return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                             }
                             let files = this.captured_file_table();
-                            let fds = match WaitFds::raw_one(-1, 0)
+                            let fds = match WaitFds::raw_one(-1, libc::POLLIN)
                                 .with_redispatch_and_watched_slots(&files, [in_fd.0], [in_fd.0])
                             {
                                 Ok(fds) => fds,

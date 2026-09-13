@@ -438,8 +438,16 @@ fn fd_authority_diagnostic(authority: &WaitFdAuthority) -> String {
     match authority {
         WaitFdAuthority::Empty => "slots=empty".to_owned(),
         WaitFdAuthority::Missing => "slots=missing".to_owned(),
-        WaitFdAuthority::Logical { strict, watched } => {
-            format!("slots=[{}] watched=[{}]", render(strict), render(watched))
+        WaitFdAuthority::Logical {
+            strict,
+            watched,
+            interest,
+        } => {
+            format!(
+                "slots=[{}] watched=[{}] interest={interest:#x}",
+                render(strict),
+                render(watched)
+            )
         }
         WaitFdAuthority::Internal(_) => "slots=internal".to_owned(),
     }
@@ -925,12 +933,15 @@ impl BlockedContinuation {
         let file_table = Arc::clone(&authority.file_table);
         let exact_slot_authorities = |fds: &WaitFds| match fds.authority() {
             WaitFdAuthority::Empty if fds.is_empty() => Ok(WaitFdAuthority::Empty),
-            WaitFdAuthority::Logical { strict, watched } if !strict.is_empty() => {
-                Ok(WaitFdAuthority::Logical {
-                    strict: strict.clone(),
-                    watched: watched.clone(),
-                })
-            }
+            WaitFdAuthority::Logical {
+                strict,
+                watched,
+                interest,
+            } if !strict.is_empty() => Ok(WaitFdAuthority::Logical {
+                strict: strict.clone(),
+                watched: watched.clone(),
+                interest: *interest,
+            }),
             WaitFdAuthority::Internal(authority) => Ok(WaitFdAuthority::Internal(*authority)),
             WaitFdAuthority::Empty | WaitFdAuthority::Missing | WaitFdAuthority::Logical { .. } => {
                 Err(ContinuationBuildError::FdPinFailed)

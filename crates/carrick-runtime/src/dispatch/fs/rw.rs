@@ -974,7 +974,7 @@ impl<'a> FsView<'a> {
                             }
                             return Ok(crate::dispatch::net::wait_in_memory_slot(
                                 &this.captured_file_table(),
-                                fd.0,
+                                fd.0, libc::POLLIN,
                                 socket.get_rcvtimeo(),
                             ));
                         }
@@ -1195,7 +1195,7 @@ impl<'a> FsView<'a> {
                                 }
                                 return Ok(crate::dispatch::net::wait_in_memory_slot(
                                     &this.captured_file_table(),
-                                    fd.0,
+                                    fd.0, libc::POLLIN,
                                     socket.get_rcvtimeo(),
                                 ));
                             }
@@ -2474,7 +2474,7 @@ impl<'a> FsView<'a> {
                                 Err(LINUX_EAGAIN) if !nonblocking => {
                                     return Ok(crate::dispatch::net::wait_in_memory_slot(
                                         &this.captured_file_table(),
-                                        fd,
+                                        fd, libc::POLLOUT,
                                         socket.get_sndtimeo(),
                                     ));
                                 }
@@ -3137,7 +3137,7 @@ impl<'a> FsView<'a> {
                                     Err(LINUX_EAGAIN) if !nonblocking => {
                                         outcome = crate::dispatch::net::wait_in_memory_slot(
                                             &this.captured_file_table(),
-                                            fd,
+                                            fd, libc::POLLOUT,
                                             socket.get_sndtimeo(),
                                         );
                                     }

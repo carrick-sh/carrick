@@ -36,6 +36,13 @@ pub(crate) enum WaitFdAuthority {
     Logical {
         strict: Vec<crate::kernel::objects::FileSlotAuthority>,
         watched: Vec<crate::kernel::objects::FileSlotAuthority>,
+        /// Poll interest (`POLLIN`/`POLLOUT`/...) of the registrations that have
+        /// NO host fd (a carrick-owned object such as an in-memory socket).
+        /// The wait service probes the slots' description readiness with it
+        /// once, right after enrolling on their wait queues, so a wake that
+        /// fired between the syscall's own check and the enrollment is not
+        /// lost. `0` when every registration is a host fd.
+        interest: i16,
     },
     Internal(InternalWaitAuthority),
 }
@@ -45,6 +52,7 @@ impl WaitFdAuthority {
         Self::Logical {
             strict: vec![authority],
             watched: Vec::new(),
+            interest: 0,
         }
     }
 
@@ -151,6 +159,7 @@ impl WaitFds {
             self.authority = WaitFdAuthority::Logical {
                 strict: slot_authorities,
                 watched: Vec::new(),
+                interest: self.logical_interest(),
             };
         }
         self
@@ -210,6 +219,7 @@ impl WaitFds {
             self.authority = WaitFdAuthority::Logical {
                 strict: slot_authorities,
                 watched: Vec::new(),
+                interest: self.logical_interest(),
             };
         }
         Ok(self)
@@ -242,8 +252,23 @@ impl WaitFds {
         if strict.is_empty() {
             return Err(LINUX_EBADF);
         }
-        self.authority = WaitFdAuthority::Logical { strict, watched };
+        let interest = self.logical_interest();
+        self.authority = WaitFdAuthority::Logical {
+            strict,
+            watched,
+            interest,
+        };
         Ok(self)
+    }
+
+    /// The union of the poll events requested on registrations without a host
+    /// fd (`fd < 0`): the interest a carrick-owned object's readiness is probed
+    /// with after the wait service enrolls on its wait queue.
+    fn logical_interest(&self) -> i16 {
+        self.fds
+            .iter()
+            .filter(|fd| fd.fd() < 0)
+            .fold(0i16, |acc, fd| acc | fd.events())
     }
 }
 
@@ -269,6 +294,38 @@ mod wait_fds_tests {
         files
             .capture_slot_authority(number)
             .expect("installed file slot authority")
+    }
+
+    /// A registration without a host fd (`-1`) contributes its poll events as
+    /// the logical interest the wait service probes the description with after
+    /// enrolling; host-fd registrations contribute nothing.
+    #[test]
+    fn logical_interest_comes_only_from_host_fd_less_registrations() {
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        let files =
+            crate::kernel::objects::FileTable::new(ids.file_table_id().expect("file table ID"));
+        install_slot(&files, &ids, 20);
+        let logical = WaitFds::raw_one(-1, libc::POLLIN)
+            .with_redispatch_and_watched_slots(&files, [20], [20])
+            .expect("logical wait");
+        assert!(matches!(
+            logical.authority(),
+            WaitFdAuthority::Logical { interest, .. } if *interest == libc::POLLIN
+        ));
+        let host = WaitFds::raw_one(7, libc::POLLIN)
+            .with_guest_slots(&files, [20])
+            .expect("host wait");
+        assert!(matches!(
+            host.authority(),
+            WaitFdAuthority::Logical { interest, .. } if *interest == 0
+        ));
+        let mixed = WaitFds::raw(vec![(7, libc::POLLIN), (-1, libc::POLLOUT)])
+            .with_redispatch_and_watched_slots(&files, [20], [20])
+            .expect("mixed wait");
+        assert!(matches!(
+            mixed.authority(),
+            WaitFdAuthority::Logical { interest, .. } if *interest == libc::POLLOUT
+        ));
     }
 
     #[test]

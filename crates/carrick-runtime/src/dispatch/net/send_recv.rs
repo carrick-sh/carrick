@@ -336,7 +336,7 @@ impl<'a> NetView<'a> {
                                 return Ok(DispatchOutcome::returned_len(written)?);
                             }
                             Err(LINUX_EAGAIN) if !this.io_is_nonblocking(fd, flags) => {
-                                return Ok(this.wait_in_memory_slot(fd, socket.get_sndtimeo()));
+                                return Ok(this.wait_in_memory_slot(fd, libc::POLLOUT, socket.get_sndtimeo()));
                             }
                             Err(LINUX_EPIPE) => {
                                 let outcome = DispatchOutcome::errno(LINUX_EPIPE);
@@ -722,7 +722,7 @@ impl<'a> NetView<'a> {
                                 return Ok(DispatchOutcome::returned_len(read_len)?);
                             }
                             Err(LINUX_EAGAIN) if !this.io_is_nonblocking(fd, flags) => {
-                                return Ok(this.wait_in_memory_slot(fd, socket.get_rcvtimeo()));
+                                return Ok(this.wait_in_memory_slot(fd, libc::POLLIN, socket.get_rcvtimeo()));
                             }
                             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                         }
@@ -1015,7 +1015,7 @@ impl<'a> NetView<'a> {
                     return Ok(DispatchOutcome::returned_len(written)?);
                 }
                 Err(LINUX_EAGAIN) if !self.io_is_nonblocking(fd, flags) => {
-                    return Ok(self.wait_in_memory_slot(fd, socket.get_sndtimeo()));
+                    return Ok(self.wait_in_memory_slot(fd, libc::POLLOUT, socket.get_sndtimeo()));
                 }
                 Err(LINUX_EPIPE) => {
                     return Ok(DispatchOutcome::errno(LINUX_EPIPE));
@@ -1451,7 +1451,7 @@ impl<'a> NetView<'a> {
                     if self.io_is_nonblocking(fd, flags) {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
-                    return Ok(self.wait_in_memory_slot(fd, socket.get_rcvtimeo()));
+                    return Ok(self.wait_in_memory_slot(fd, libc::POLLIN, socket.get_rcvtimeo()));
                 }
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
