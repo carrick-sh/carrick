@@ -461,8 +461,9 @@ pub trait FsBackend: Send + Sync {
         parent_fd: Option<&std::os::fd::OwnedFd>,
         leaf_c: Option<&std::ffi::CStr>,
         rel: &NormalizedRelPath,
+        mode: u32,
     ) -> Result<(), BackendError> {
-        let _ = (parent_fd, leaf_c);
+        let _ = (parent_fd, leaf_c, mode);
         self.make_dir(rel.as_path().to_str().ok_or(BackendError::Invalid)?)
     }
 
