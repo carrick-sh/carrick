@@ -60,25 +60,18 @@ fn merge_epoll_edge_sample(
 fn epoll_wait_sample_needs_host_rebind(
     before: u32,
     raw: u32,
-    read_avail_changed: bool,
     clear_write_backpressure: bool,
-    edge_drained: bool,
-    masked_ready: bool,
-    masked_arrival_source: bool,
 ) -> bool {
-    // BSD edge filters use EV_DISPATCH and therefore need an explicit rebind
-    // after a delivered event. A masked event whose readiness snapshot did not
-    // change is different: re-adding the filter can immediately reproduce the
-    // same event when NOTE_LOWAT cannot express `last_read_avail + 1` (for
-    // example, a stream socket already at its receive-buffer ceiling, or a
-    // consumption path rebinds it through `epoll_rearm_after_io`. Listening
-    // sockets are different: EVFILT_READ `data` is the pending-connection
-    // count, and the filter must stay armed so NOTE_LOWAT can observe a later
-    // arrival even when a redundant delivery did not change the current count.
-    before != raw
-        || read_avail_changed
-        || clear_write_backpressure
-        || (edge_drained && (!masked_ready || masked_arrival_source))
+    // BSD edge read filters use native EV_CLEAR, clearing on drain and
+    // re-arming in-kernel when new data arrives. Re-adding the filter on read
+    // delivery would re-evaluate unread data and spin. Rebind only when the host
+    // registration actually changes: write-side ET drops EVFILT_WRITE upon edge
+    // delivery (and restores it on cleared backpressure), and terminal edges
+    // (HUP/ERR) drop filters.
+    let write_edge_delivered = before & LINUX_EPOLLOUT == 0 && raw & LINUX_EPOLLOUT != 0;
+    let terminal_edge_delivered = before & (LINUX_EPOLLHUP | LINUX_EPOLLERR) == 0
+        && raw & (LINUX_EPOLLHUP | LINUX_EPOLLERR) != 0;
+    clear_write_backpressure || write_edge_delivered || terminal_edge_delivered
 }
 
 fn epoll_io_progress_needs_host_rebind(
@@ -114,50 +107,46 @@ mod epoll_edge_sample_tests {
 
     #[test]
     fn unchanged_masked_edge_stays_disarmed_until_io_progress() {
+        // Unchanged read edge: no rebind
         assert!(!epoll_wait_sample_needs_host_rebind(
             LINUX_EPOLLIN,
             LINUX_EPOLLIN,
             false,
-            false,
-            true,
-            true,
-            false,
         ));
+        // Delivered read edge: no rebind (kqueue EV_CLEAR re-arms in-kernel on next edge)
         assert!(!epoll_wait_sample_needs_host_rebind(
-            LINUX_EPOLLIN,
-            LINUX_EPOLLIN,
-            false,
-            false,
-            false,
-            true,
-            false,
-        ));
-        assert!(epoll_wait_sample_needs_host_rebind(
             0,
             LINUX_EPOLLIN,
-            true,
-            false,
-            true,
-            false,
             false,
         ));
+        // Delivered write edge: rebinds to drop EVFILT_WRITE
         assert!(epoll_wait_sample_needs_host_rebind(
-            LINUX_EPOLLIN,
-            LINUX_EPOLLIN,
+            0,
+            LINUX_EPOLLOUT,
             false,
+        ));
+        // Unchanged write edge: no rebind
+        assert!(!epoll_wait_sample_needs_host_rebind(
+            LINUX_EPOLLOUT,
+            LINUX_EPOLLOUT,
             false,
-            true,
-            true,
+        ));
+        // Clearing write backpressure: rebinds to restore EVFILT_WRITE
+        assert!(epoll_wait_sample_needs_host_rebind(
+            LINUX_EPOLLOUT,
+            LINUX_EPOLLOUT,
             true,
         ));
-
+        // Terminal HUP edge: rebinds to drop filters
         assert!(epoll_wait_sample_needs_host_rebind(
-            LINUX_EPOLLIN,
-            LINUX_EPOLLIN,
+            0,
+            LINUX_EPOLLHUP,
             false,
-            false,
-            true,
-            false,
+        ));
+        // Terminal ERR edge: rebinds to drop filters
+        assert!(epoll_wait_sample_needs_host_rebind(
+            0,
+            LINUX_EPOLLERR,
             false,
         ));
     }
@@ -225,6 +214,7 @@ impl<'a> NetView<'a> {
         )
     }
 
+    #[allow(dead_code)]
     fn fd_supports_read_lowat(&self, fd: i32) -> bool {
         let Some(open_file) = self.open_file(fd) else {
             return false;
@@ -277,7 +267,7 @@ impl<'a> NetView<'a> {
         fd: i32,
         events: u32,
         last_ready: u32,
-        last_read_avail: u64,
+        _last_read_avail: u64,
         write_backpressured: bool,
     ) -> carrick_hal::event::Interest {
         // Wire→typed seam: the guest event word is a raw u32; epoll ACCEPTS
@@ -298,16 +288,8 @@ impl<'a> NetView<'a> {
             {
                 interest.write = false;
             }
-            if interest.read {
-                if last_ready & (LINUX_EPOLLHUP | LINUX_EPOLLERR) != 0 {
-                    interest.read = false;
-                } else if last_ready & LINUX_EPOLLIN != 0 {
-                    if last_read_avail > 0 && self.fd_supports_read_lowat(fd) {
-                        interest.read_lowat = Some(last_read_avail.saturating_add(1));
-                    } else {
-                        interest.read = false;
-                    }
-                }
+            if interest.read && last_ready & (LINUX_EPOLLHUP | LINUX_EPOLLERR) != 0 {
+                interest.read = false;
             }
         }
         // A one-way pipe/FIFO read end is never writable under Linux, so it must
@@ -357,10 +339,17 @@ impl<'a> NetView<'a> {
         let mut survivor: Option<(i32, u32)> = None;
         let mut union_events = 0u32;
         let mut union_interest = carrick_hal::event::Interest::default();
+        let mut any_level = false;
+        let mut any_edge = false;
         let mut read_lowat: Option<Option<u64>> = None;
         for (&other, slot) in interest.iter() {
             if self.host_fd_for_poll(other) != Some(host_fd) {
                 continue;
+            }
+            if slot.event.events & LINUX_EPOLLET != 0 {
+                any_edge = true;
+            } else {
+                any_level = true;
             }
             if Some(other) != excluded_survivor_fd {
                 survivor.get_or_insert((other, slot.reg_gen));
@@ -385,6 +374,11 @@ impl<'a> NetView<'a> {
                 };
             }
         }
+        union_interest.mode = if any_edge && !any_level {
+            carrick_hal::event::TriggerMode::Edge
+        } else {
+            carrick_hal::event::TriggerMode::Level
+        };
         union_interest.read_lowat = read_lowat.flatten();
         let (survivor_fd, survivor_gen) = survivor.unwrap_or((-1, 0));
         let effective_bits = u32::from(union_interest.read)
@@ -405,7 +399,7 @@ impl<'a> NetView<'a> {
                     host_fd.get(),
                     pack_epoll_udata(sfd, sgen),
                     union_interest,
-                    epoll_host_trigger_mode(LinuxEpollEvents::from_bits_retain(union_events)),
+                    union_interest.mode,
                 );
             }
             None => {
@@ -1538,11 +1532,7 @@ impl<'a> NetView<'a> {
                                     && epoll_wait_sample_needs_host_rebind(
                                         before,
                                         raw,
-                                        read_avail_changed,
                                         clear_write_backpressure,
-                                        edge_drained,
-                                        masked_ready,
-                                        this.fd_is_listening_socket(fd),
                                     )
                                     && let Some(host_fd) = this.host_fd_for_poll(fd)
                                 {
@@ -1950,7 +1940,7 @@ mod epoll_interest_tests {
 
         let in_latched_zero =
             dispatcher.epoll_effective_interest(12345, events, LINUX_EPOLLIN, 0, false);
-        assert!(!in_latched_zero.read);
+        assert!(in_latched_zero.read);
         assert!(in_latched_zero.write);
     }
 }

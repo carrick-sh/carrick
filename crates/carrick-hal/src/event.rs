@@ -9,6 +9,14 @@ use crate::error::OsError;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
+/// Edge- vs level-triggered delivery (`EPOLLET` ↔ `EV_CLEAR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriggerMode {
+    Edge,
+    #[default]
+    Level,
+}
+
 /// IO readiness the caller wants (`EPOLLIN`/`EPOLLOUT`/`EPOLLPRI`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Interest {
@@ -19,12 +27,17 @@ pub struct Interest {
     /// Optional read low-water mark for backends that can arm "wake when at
     /// least N bytes are readable" (`NOTE_LOWAT` on kqueue).
     pub read_lowat: Option<u64>,
+    /// Trigger mode for this interest (`Edge` ↔ `EV_CLEAR` / `EPOLLET`, `Level`).
+    pub mode: TriggerMode,
 }
 
 impl Interest {
     /// Helper to check if read/write/oob is requested.
     pub fn contains(&self, other: Self) -> bool {
-        (self.read || !other.read) && (self.write || !other.write) && (self.oob || !other.oob)
+        (self.read || !other.read)
+            && (self.write || !other.write)
+            && (self.oob || !other.oob)
+            && (self.mode == other.mode)
     }
 
     pub const READ: Self = Self {
@@ -32,26 +45,22 @@ impl Interest {
         write: false,
         oob: false,
         read_lowat: None,
+        mode: TriggerMode::Level,
     };
     pub const WRITE: Self = Self {
         read: false,
         write: true,
         oob: false,
         read_lowat: None,
+        mode: TriggerMode::Level,
     };
     pub const OOB: Self = Self {
         read: false,
         write: false,
         oob: true,
         read_lowat: None,
+        mode: TriggerMode::Level,
     };
-}
-
-/// Edge- vs level-triggered delivery (`EPOLLET` ↔ `EV_CLEAR`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TriggerMode {
-    Edge,
-    Level,
 }
 
 /// Filesystem-event mask (`EVFILT_VNODE` ↔ inotify).

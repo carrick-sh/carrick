@@ -2238,6 +2238,310 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn epoll_et_unread_data_does_not_spin_and_waits_for_next_edge() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK) -> listen_fd (3)
+    let socket_type = (LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC) as u64;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    198,
+                    SyscallArgs::from([LINUX_AF_INET as u64, socket_type, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    write_sockaddr_in(&mut memory, 0x4000, 0);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(200, SyscallArgs::from([3, 0x4000, 16, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(201, SyscallArgs::from([3, 128, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    memory.write_bytes(0x4020, &16_u32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(204, SyscallArgs::from([3, 0x4010, 0x4020, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let port = read_sockaddr_in_port(&memory, 0x4010);
+    let listen_fd = 3u64;
+
+    // epoll_create1(0) -> epfd 4
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    let epfd = 4u64;
+
+    // epoll_ctl(ADD, listen_fd, EPOLLIN | EPOLLET)
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN | LINUX_EPOLLET,
+        _pad: 0,
+        data: listen_fd,
+    };
+    memory.write_bytes(0x4040, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([epfd, LINUX_EPOLL_CTL_ADD, listen_fd, 0x4040, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // Client 1 connects
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    198,
+                    SyscallArgs::from([LINUX_AF_INET as u64, socket_type, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 5 }
+    );
+    let client1_fd = 5u64;
+    write_sockaddr_in(&mut memory, 0x4030, port);
+    let _ = dispatcher.dispatch(
+        &dispatcher.capture_one_task_context().unwrap(),
+        SyscallRequest::new(203, SyscallArgs::from([client1_fd, 0x4030, 16, 0, 0, 0])),
+        &mut memory,
+        &reporter,
+    );
+
+    // Give host network stack time to establish connection
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // First epoll_pwait returns the edge for client 1
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 100, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let first = read_epoll_event(&memory, 0x4100);
+    let first_data = first.data;
+    let first_events = first.events;
+    assert_eq!(first_data, listen_fd);
+    assert_eq!(first_events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+
+    // (b) Decisively, the instance kqueue fd is NOT readable in that state:
+    let outcome = dispatcher
+        .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 50, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::WaitOnFds {
+        fds,
+        timeout,
+        sig_mask,
+        completion: FdWaitCompletion::Poll { on_timeout },
+    } = outcome
+    else {
+        panic!("expected latch-masked edge to park on kqueue edge, got {outcome:?}");
+    };
+    assert_eq!(fds.len(), 1);
+    let kq_fd = fds[0].fd();
+    assert!(kq_fd >= 0);
+    assert_eq!(fds[0].events() & libc::POLLIN, libc::POLLIN);
+    assert_eq!(timeout, Some(std::time::Duration::from_millis(50)));
+    assert_eq!(on_timeout, 0);
+    assert_eq!(sig_mask.raw_block_bits(), 0);
+
+    let mut host_pollfd = libc::pollfd {
+        fd: kq_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let host_ready = unsafe { libc::poll(&mut host_pollfd, 1, 0) };
+    assert_eq!(
+        host_ready, 0,
+        "instance kqueue fd must not be readable after edge has already been delivered"
+    );
+
+    // (a) A subsequent epoll_pwait with a 50 ms timeout returns 0 after ~50 ms:
+    let t0 = std::time::Instant::now();
+    let wait_outcome = dispatch_with_wait(
+        &mut dispatcher,
+        SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 50, 0, 0])),
+        &mut memory,
+        &reporter,
+    );
+    let elapsed = t0.elapsed();
+    assert_eq!(wait_outcome, DispatchOutcome::Returned { value: 0 });
+    assert!(
+        elapsed >= std::time::Duration::from_millis(40),
+        "epoll_pwait with 50 ms timeout returned too quickly: {elapsed:?}"
+    );
+
+    // (c) New data arriving makes the next wait return the fd exactly once:
+    // Client 2 connects: new edge arrives
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    198,
+                    SyscallArgs::from([LINUX_AF_INET as u64, socket_type, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 6 }
+    );
+    let client2_fd = 6u64;
+    write_sockaddr_in(&mut memory, 0x4030, port);
+    let _ = dispatcher.dispatch(
+        &dispatcher.capture_one_task_context().unwrap(),
+        SyscallRequest::new(203, SyscallArgs::from([client2_fd, 0x4030, 16, 0, 0, 0])),
+        &mut memory,
+        &reporter,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // Now kq_fd MUST be readable because new connection arrived!
+    let host_ready_after_connect = unsafe { libc::poll(&mut host_pollfd, 1, 100) };
+    assert_eq!(
+        host_ready_after_connect, 1,
+        "instance kqueue fd must become readable when new connection arrives"
+    );
+
+    // Next wait returns the fd exactly once:
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let second = read_epoll_event(&memory, 0x4100);
+    let second_data = second.data;
+    let second_events = second.events;
+    assert_eq!(second_data, listen_fd);
+    assert_eq!(second_events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+
+    // And subsequent wait returns 0 (timeout):
+    let wait_after_second = dispatch_with_wait(
+        &mut dispatcher,
+        SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 25, 0, 0])),
+        &mut memory,
+        &reporter,
+    );
+    assert_eq!(wait_after_second, DispatchOutcome::Returned { value: 0 });
+
+    // (d) A level (non-ET) interest in the same state still returns the fd immediately:
+    // MOD listen_fd to level EPOLLIN (no EPOLLET):
+    let level_wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN,
+        _pad: 0,
+        data: listen_fd,
+    };
+    memory.write_bytes(0x4040, level_wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([
+                        epfd,
+                        carrick_abi::LINUX_EPOLL_CTL_MOD as u64,
+                        listen_fd,
+                        0x4040,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // Because unaccepted connections remain, level interest returns immediately:
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4100, 4, 50, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let level_event = read_epoll_event(&memory, 0x4100);
+    let level_data = level_event.data;
+    let level_events = level_event.events;
+    assert_eq!(level_data, listen_fd);
+    assert_eq!(level_events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn epoll_latched_eof_hup_disarms_kqueue_and_leaves_fd_not_readable() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     let reporter = CompatReporter::default();
