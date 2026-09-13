@@ -2416,11 +2416,11 @@
     },
     {
       "file": "crates/carrick-runtime/src/dispatch/net/epoll_ops.rs",
-      "line": 212,
+      "line": 211,
       "categories": [
         "description_guard"
       ],
-      "text": "open_file.description.read().as_deref(),",
+      "text": "match open_file.description.read().as_deref() {",
       "scope_kind": "production_callsite",
       "enclosing_function": "fd_supports_epoll_oob",
       "migration_family": "epoll_wait"
