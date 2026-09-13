@@ -909,3 +909,15 @@ commits and is re-checked at the next vet.
   registration + single-CPU nudge, checked as the park predicate; no idle
   flush; no broadcast. Two wedged interactive `lldb --batch` sessions killed
   to unwedge the worker; the brief now mandates `carrick debug lldb-run`.
+- 2026-09-13 01:40, `vcpu-lazy-state` LANDED (598c987be..aeec3e384, three
+  worker rounds): residency-keyed lazy vCPU register save/restore — a
+  parked thread's registers stay on the executor's vCPU until that vCPU
+  loads a different thread; the thread's own token (executor, residency
+  generation) gates the reaffirm; a claim by another executor sets a
+  targeted flush request on the owner's registration and nudges only its
+  CPU, checked as the owner's park predicate; no idle flush, no broadcast.
+  Director receipts on the branch binary f687c8b3f3079d53: net_http
+  register traffic `snapshot_vcpu_from` 21.4% → 8.5%, `restore_vcpu_into`
+  8.3% → 3.7% of carrier CPU (two runs); windowcoherence, forkexecstorm,
+  execfromthread eight-way ×3 under lldb-run = 72/72 clean. Gate and
+  paired scorecard on the merged main follow.
